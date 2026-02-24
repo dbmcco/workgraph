@@ -1004,6 +1004,7 @@ fn defer_self_mutation(op: &EvolverOperation, dir: &Path, run_id: &str) -> Resul
         ready_after: None,
         paused: false,
         visibility: "internal".to_string(),
+        context_scope: None,
         cycle_config: None,
     };
 
@@ -1079,6 +1080,7 @@ fn apply_create_role(
             created_by: format!("evolver-{}", run_id),
             created_at: chrono::Utc::now(),
         },
+        default_context_scope: None,
     };
 
     let path = agency::save_role(&role, roles_dir).context("Failed to save new role")?;
@@ -1160,6 +1162,7 @@ fn apply_modify_role(
             evaluations: vec![],
         },
         lineage,
+        default_context_scope: None,
     };
 
     let path = agency::save_role(&role, roles_dir).context("Failed to save modified role")?;
@@ -1571,6 +1574,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         }];
         let motivations = vec![Motivation {
             id: "m1".into(),
@@ -1649,6 +1653,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         };
 
         let op = EvolverOperation {
@@ -1697,6 +1702,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         };
         let role_b = Role {
             id: "role-b".into(),
@@ -1710,6 +1716,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         };
 
         agency::save_role(&role_a, &roles_dir).unwrap();
@@ -1754,6 +1761,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         };
         agency::save_role(&role, &roles_dir).unwrap();
 
@@ -2441,6 +2449,7 @@ Let me know if you'd like me to adjust anything."#;
                 created_by: "evolver-run-1".into(),
                 created_at: chrono::Utc::now(),
             },
+            default_context_scope: None,
         };
 
         let parent_b = Role {
@@ -2460,6 +2469,7 @@ Let me know if you'd like me to adjust anything."#;
                 created_by: "evolver-run-0".into(),
                 created_at: chrono::Utc::now(),
             },
+            default_context_scope: None,
         };
 
         let op = EvolverOperation {
@@ -2690,6 +2700,7 @@ Let me know if you'd like me to adjust anything."#;
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         }]
     }
 
@@ -2925,6 +2936,7 @@ Let me know if you'd like me to adjust anything."#;
                     evaluations: vec![],
                 },
                 lineage: Lineage::default(),
+                default_context_scope: None,
             },
             Role {
                 id: "r2".into(),
@@ -2938,6 +2950,7 @@ Let me know if you'd like me to adjust anything."#;
                     evaluations: vec![],
                 },
                 lineage: Lineage::default(),
+                default_context_scope: None,
             },
         ];
         let motivations = vec![Motivation {
@@ -3053,6 +3066,7 @@ Let me know if you'd like me to adjust anything."#;
                 created_by: "evolver-run-old".into(),
                 created_at: chrono::Utc::now(),
             },
+            default_context_scope: None,
         };
 
         let op = EvolverOperation {
@@ -3103,6 +3117,7 @@ Let me know if you'd like me to adjust anything."#;
                 created_by: "x".into(),
                 created_at: chrono::Utc::now(),
             },
+            default_context_scope: None,
         };
         let parent_b = Role {
             id: "pb".into(),
@@ -3121,6 +3136,7 @@ Let me know if you'd like me to adjust anything."#;
                 created_by: "x".into(),
                 created_at: chrono::Utc::now(),
             },
+            default_context_scope: None,
         };
 
         let op = EvolverOperation {

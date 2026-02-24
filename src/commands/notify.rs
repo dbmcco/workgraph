@@ -346,6 +346,7 @@ mod tests {
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),
+            context_scope: None,
             cycle_config: None,
         }
     }

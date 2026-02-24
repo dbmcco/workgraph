@@ -923,6 +923,7 @@ fn merge_role(target: &Role, source: &Role) -> Role {
         desired_outcome: target.desired_outcome.clone(),
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
+        default_context_scope: target.default_context_scope.clone(),
     }
 }
 
@@ -1002,6 +1003,7 @@ mod tests {
             desired_outcome: "test outcome".to_string(),
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
+            default_context_scope: None,
         }
     }
 

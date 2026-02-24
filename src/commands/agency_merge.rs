@@ -162,6 +162,7 @@ mod tests {
             desired_outcome: "test outcome".to_string(),
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
+            default_context_scope: None,
         }
     }
 

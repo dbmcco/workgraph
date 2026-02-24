@@ -704,6 +704,7 @@ mod tests {
                 evaluations: vec![],
             },
             lineage: Lineage::default(),
+            default_context_scope: None,
         }];
         let motivations = vec![Motivation {
             id: "m1".into(),

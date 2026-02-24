@@ -150,6 +150,7 @@ wg service resume           # Resume dispatching
 | `wg add "X" --after a,b,c` | Multiple dependencies (comma-separated) |
 | `wg add "X" --skill rust --input src/foo.rs --deliverable docs/out.md` | Task with skills, inputs, deliverables |
 | `wg add "X" --model haiku` | Task with preferred model |
+| `wg add "X" --context-scope clean` | Set prompt context scope (clean/task/graph/full) |
 | `wg add "X" --verify "Tests pass"` | Task requiring review before completion |
 | `wg add "X" --tag important --hours 2` | Tags and estimates |
 | `wg add "X" --after Y --max-iterations 3` | Create cycle header with max 3 iterations |
@@ -159,6 +160,7 @@ wg service resume           # Resume dispatching
 | `wg edit <id> --add-tag T --remove-tag T` | Modify tags |
 | `wg edit <id> --add-skill S --remove-skill S` | Modify skills |
 | `wg edit <id> --model sonnet` | Change preferred model |
+| `wg edit <id> --context-scope graph` | Change context scope |
 
 ### Task state transitions
 
@@ -414,6 +416,25 @@ Calibrate your approach to your model tier:
 - **Fast models** (haiku): Best for simple, well-defined tasks — lookups, single-file edits, formatting.
 
 If a task feels beyond your model's capability, use `wg fail` with a clear reason rather than producing low-quality output.
+
+### Context scopes
+
+Tasks can specify a `--context-scope` that controls how much context the agent receives in its prompt:
+
+| Scope | Description | Use Case |
+|-------|-------------|----------|
+| `clean` | Bare executor — no wg CLI instructions | Pure computation, translation, writing |
+| `task` | Task-aware with wg workflow instructions (default) | Standard implementation, bug fixes |
+| `graph` | Adds project description, 1-hop neighborhood, status summary | Integration, cross-component review |
+| `full` | Adds full graph summary, CLAUDE.md, system preamble | Meta-tasks, workflow design |
+
+Set scope when creating or editing tasks:
+```bash
+wg add "Translate document" --context-scope clean
+wg edit <task-id> --context-scope graph
+```
+
+Resolution priority: task > role default > coordinator config > "task" (default).
 
 ### Amplifier bundles (amplifier executor only)
 

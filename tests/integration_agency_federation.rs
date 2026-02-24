@@ -36,6 +36,7 @@ fn make_role(id: &str, name: &str) -> Role {
         desired_outcome: format!("{} outcome", name),
         performance: PerformanceRecord::default(),
         lineage: Lineage::default(),
+        default_context_scope: None,
     }
 }
 
