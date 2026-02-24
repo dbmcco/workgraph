@@ -3677,3 +3677,67 @@ fn test_viz_cycle_members_shown_without_all_flag() {
         output
     );
 }
+
+// ===========================================================================
+// Guard authority: converged tag vs cycle guard
+// ===========================================================================
+
+#[test]
+fn test_reactivate_ignores_converged_tag_when_guard_is_set() {
+    // Even if the config owner has a "converged" tag (e.g., injected somehow),
+    // reactivate_cycle should ignore it when a non-trivial guard is present.
+    // The guard is the authority on convergence, not the tag.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: Some(LoopGuard::TaskStatus {
+            task: "sentinel".to_string(),
+            status: Status::Failed,
+        }),
+        delay: None,
+    });
+    a.tags = vec!["converged".to_string()]; // Injected converged tag
+
+    let mut b = make_task_with_status("b", "B", Status::Done);
+    b.after = vec!["a".to_string()];
+
+    // Sentinel is failed → guard says "iterate"
+    let sentinel = make_task_with_status("sentinel", "Sentinel", Status::Failed);
+
+    let mut graph = build_graph(vec![a, b, sentinel]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+
+    assert!(
+        !reactivated.is_empty(),
+        "Cycle should reactivate despite converged tag — guard is authoritative"
+    );
+}
+
+#[test]
+fn test_reactivate_respects_converged_tag_when_no_guard() {
+    // Without a guard (guard = None), the converged tag SHOULD stop iteration.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+    });
+    a.tags = vec!["converged".to_string()];
+
+    let mut b = make_task_with_status("b", "B", Status::Done);
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Cycle should NOT reactivate when converged tag is set and no guard"
+    );
+}

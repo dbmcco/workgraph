@@ -60,23 +60,42 @@ pub fn run(dir: &Path, id: &str, converged: bool) -> Result<()> {
         }
     }
 
-    // Re-acquire mutable reference after immutable borrow
-    let task = graph
-        .get_task_mut(id)
-        .ok_or_else(|| anyhow::anyhow!("Task '{}' disappeared from graph", id))?;
-
-    task.status = Status::Done;
-    task.completed_at = Some(Utc::now().to_rfc3339());
-
-    // When --converged is passed, check if a non-trivial guard is set.
-    // If so, the guard is authoritative — ignore the converged flag.
-    if converged {
-        let has_guard = task
-            .cycle_config
-            .as_ref()
+    // When --converged is passed, determine whether the task's cycle has a
+    // non-trivial guard. If so, the guard is authoritative — ignore the
+    // converged flag. This prevents workers from bypassing external
+    // validation by self-declaring convergence.
+    //
+    // We do this check with immutable access before mutating the task.
+    let converged_accepted = if converged {
+        // Check 1: the task itself has a guarded cycle_config
+        let own_guard = graph
+            .get_task(id)
+            .and_then(|t| t.cycle_config.as_ref())
             .and_then(|c| c.guard.as_ref())
             .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
             .unwrap_or(false);
+
+        // Check 2: the task is a non-header member of a cycle whose header
+        // has a non-trivial guard. This covers workers trying to converge
+        // a cycle they don't own.
+        let cycle_guard = if !own_guard {
+            let ca = graph.compute_cycle_analysis();
+            ca.task_to_cycle.get(id).map(|&idx| {
+                let cycle = &ca.cycles[idx];
+                cycle.members.iter().any(|mid| {
+                    graph
+                        .get_task(mid)
+                        .and_then(|t| t.cycle_config.as_ref())
+                        .and_then(|c| c.guard.as_ref())
+                        .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
+                        .unwrap_or(false)
+                })
+            }).unwrap_or(false)
+        } else {
+            false
+        };
+
+        let has_guard = own_guard || cycle_guard;
 
         if has_guard {
             eprintln!(
@@ -84,16 +103,33 @@ pub fn run(dir: &Path, id: &str, converged: bool) -> Result<()> {
                  Only the guard condition determines convergence.",
                 id
             );
-        } else if !task.tags.contains(&"converged".to_string()) {
-            task.tags.push("converged".to_string());
+            false
+        } else {
+            true
         }
+    } else {
+        false
+    };
+
+    // Now mutate the task
+    let task = graph
+        .get_task_mut(id)
+        .ok_or_else(|| anyhow::anyhow!("Task '{}' disappeared from graph", id))?;
+
+    task.status = Status::Done;
+    task.completed_at = Some(Utc::now().to_rfc3339());
+
+    if converged_accepted && !task.tags.contains(&"converged".to_string()) {
+        task.tags.push("converged".to_string());
     }
 
     task.log.push(LogEntry {
         timestamp: Utc::now().to_rfc3339(),
         actor: task.assigned.clone(),
-        message: if converged {
+        message: if converged_accepted {
             "Task marked as done (converged)".to_string()
+        } else if converged {
+            "Task marked as done (--converged ignored, guard is authoritative)".to_string()
         } else {
             "Task marked as done".to_string()
         },
@@ -405,5 +441,159 @@ mod tests {
 
         let last_log = task.log.last().unwrap();
         assert_eq!(last_log.message, "Task marked as done (converged)");
+    }
+
+    #[test]
+    fn test_done_converged_ignored_when_cycle_guard_set_on_self() {
+        // When the task itself has a cycle guard, --converged should be ignored.
+        // The guard is authoritative — the agent cannot self-converge.
+        use workgraph::graph::{CycleConfig, LoopGuard};
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut header = make_task("header", "Cycle header", Status::Open);
+        header.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: Some(LoopGuard::TaskStatus {
+                task: "validator".to_string(),
+                status: Status::Failed,
+            }),
+            delay: None,
+        });
+
+        setup_workgraph(dir_path, vec![header]);
+
+        let result = run(dir_path, "header", true);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("header").unwrap();
+
+        // Converged tag should NOT be present
+        assert!(
+            !task.tags.contains(&"converged".to_string()),
+            "converged tag should not be added when cycle guard is set"
+        );
+
+        // Log should reflect that --converged was ignored
+        let last_log = task.log.last().unwrap();
+        assert_eq!(
+            last_log.message,
+            "Task marked as done (--converged ignored, guard is authoritative)"
+        );
+    }
+
+    #[test]
+    fn test_done_converged_ignored_for_non_header_in_guarded_cycle() {
+        // When a task is a non-header member of a cycle whose header has a guard,
+        // --converged should also be ignored.
+        use workgraph::graph::{CycleConfig, LoopGuard};
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create cycle: header ↔ worker (both depend on each other)
+        let mut header = make_task("header", "Cycle header", Status::Done);
+        header.after = vec!["worker".to_string()];
+        header.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: Some(LoopGuard::TaskStatus {
+                task: "validator".to_string(),
+                status: Status::Failed,
+            }),
+            delay: None,
+        });
+
+        let mut worker = make_task("worker", "Worker in cycle", Status::Open);
+        worker.after = vec!["header".to_string()];
+
+        setup_workgraph(dir_path, vec![header, worker]);
+
+        let result = run(dir_path, "worker", true);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("worker").unwrap();
+
+        // Converged tag should NOT be present
+        assert!(
+            !task.tags.contains(&"converged".to_string()),
+            "converged tag should not be added for non-header in guarded cycle"
+        );
+
+        // Log should reflect that --converged was ignored
+        let last_log = task.log.last().unwrap();
+        assert_eq!(
+            last_log.message,
+            "Task marked as done (--converged ignored, guard is authoritative)"
+        );
+    }
+
+    #[test]
+    fn test_done_converged_accepted_when_guard_is_always() {
+        // When cycle_config has guard = Always (trivial), --converged should work.
+        use workgraph::graph::{CycleConfig, LoopGuard};
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut header = make_task("header", "Cycle header", Status::Open);
+        header.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: Some(LoopGuard::Always),
+            delay: None,
+        });
+
+        setup_workgraph(dir_path, vec![header]);
+
+        let result = run(dir_path, "header", true);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("header").unwrap();
+
+        // Converged tag SHOULD be present (Always guard is trivial)
+        assert!(
+            task.tags.contains(&"converged".to_string()),
+            "converged tag should be added when guard is Always"
+        );
+
+        let last_log = task.log.last().unwrap();
+        assert_eq!(last_log.message, "Task marked as done (converged)");
+    }
+
+    #[test]
+    fn test_done_converged_accepted_when_no_guard() {
+        // When cycle_config has no guard, --converged should work.
+        use workgraph::graph::CycleConfig;
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut header = make_task("header", "Cycle header", Status::Open);
+        header.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+        });
+
+        setup_workgraph(dir_path, vec![header]);
+
+        let result = run(dir_path, "header", true);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("header").unwrap();
+
+        // Converged tag SHOULD be present
+        assert!(
+            task.tags.contains(&"converged".to_string()),
+            "converged tag should be added when no guard is set"
+        );
     }
 }
