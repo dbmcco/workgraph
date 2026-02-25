@@ -3593,9 +3593,8 @@ fn test_deep_cli_viz_no_duplicate_nodes() {
 #[test]
 fn test_viz_cycle_back_edge_no_duplicate_node_rendering() {
     // Cycle: A → B → C → A (back-edge from C to A).
-    // The back-edge line should show "↺ (cycles back to a)" — NOT the full
-    // format_node output like "a  (open)  (cycle back-edge)" which duplicates
-    // the node already rendered higher in the tree.
+    // Back-edges are now rendered as right-side arcs (◀╮ / →╯), NOT as
+    // duplicate child nodes. Verify no duplicate node lines appear.
     let tmp = TempDir::new().unwrap();
     let a = make_task("a", "Task A");
     let mut b = make_task("b", "Task B");
@@ -3614,25 +3613,24 @@ fn test_viz_cycle_back_edge_no_duplicate_node_rendering() {
     let wg_dir = setup_workgraph(&tmp, vec![a_with_back, b, c]);
     let output = wg_ok(&wg_dir, &["viz", "--all"]);
 
-    // The back-edge line should use compact format: "↺ (cycles back to ...)"
+    // Back-edges should produce right-side arcs, not duplicate nodes
     assert!(
-        output.contains("cycles back to"),
-        "Back-edge should show compact '↺ (cycles back to ...)' not full node. Output:\n{}",
+        output.contains("◀╮") || output.contains("→╯"),
+        "Back-edge should render as right-side arc (◀╮ / →╯). Output:\n{}",
         output
     );
 
-    // Back-edge lines must NOT contain status labels like "(open)" or "(done)"
-    // which would indicate format_node was called (duplicating the node).
-    for line in output.lines() {
-        if line.contains("cycles back to") {
-            assert!(
-                !line.contains("(open)") && !line.contains("(done)") && !line.contains("(in-progress)"),
-                "Back-edge line should not contain status (duplicate node rendering): {:?}\nFull output:\n{}",
-                line,
-                output
-            );
-        }
-    }
+    // Node "a" should appear exactly once as a rendered node (not duplicated by back-edge)
+    let a_node_lines: Vec<&str> = output.lines()
+        .filter(|l| l.contains("(open)") && l.trim_start().starts_with("a "))
+        .collect();
+    assert!(
+        a_node_lines.len() <= 1,
+        "Node 'a' should not be duplicated by back-edge rendering. Found {} lines: {:?}\nFull output:\n{}",
+        a_node_lines.len(),
+        a_node_lines,
+        output
+    );
 }
 
 #[test]

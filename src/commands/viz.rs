@@ -643,19 +643,21 @@ fn render_dot(dot_content: &str, output_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Back-edge arc info for Phase 2 rendering of right-side arcs.
+struct BackEdgeArc {
+    source_line: usize, // line index where source node was rendered (below)
+    target_line: usize, // line index where target node was rendered (above)
+}
+
 /// Generate an ASCII visualization that shows the dependency graph
-/// as a proper tree with indentation and branching characters.
+/// as a tree with right-side arc channels for non-tree edges.
 ///
-/// Layout strategy:
-/// - Find root nodes (no parents in active set) and DFS from each
-/// - Tree structure with ├─→, └─→, │ box-drawing chars
-/// - Status shown in parens after each task ID
-/// - Fan-out: siblings shown with ├/└ branching
-/// - Fan-in: when a node has multiple parents, show it under its first
-///   parent and annotate with "(also ← parent2, parent3)"
-/// - Connected components grouped together, separated by blank lines
-/// - Independent tasks listed at bottom
-/// - Color coding by status via ANSI escape codes
+/// Layout:
+/// - LEFT: tree structure (├→, └→, │) shows primary forward edges flowing down
+/// - RIGHT: arc channels (◀╮, →┤, →╯, │) show all other edges flowing up
+///   (both back-edges and fan-in from secondary parents)
+/// - Arrowheads: → on left (tree connectors), ← on right (arc targets)
+/// - Dash fill (─) connects node text to right-side arcs
 #[allow(clippy::only_used_in_recursion)]
 fn generate_ascii(
     graph: &WorkGraph,
@@ -671,8 +673,6 @@ fn generate_ascii(
     let cycle_analysis = graph.compute_cycle_analysis();
 
     // Build adjacency within the active set
-    // forward: parent → children (parent blocks children)
-    // reverse: child → parents (child is blocked by parents)
     let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
     for task in tasks {
@@ -689,7 +689,6 @@ fn generate_ascii(
             }
         }
     }
-    // Sort adjacency lists for deterministic output
     for v in forward.values_mut() {
         v.sort();
     }
@@ -798,44 +797,106 @@ fn generate_ascii(
     let mut components: HashMap<usize, Vec<&str>> = HashMap::new();
     for &id in &all_ids {
         if is_independent(id) {
-            continue; // handle independently at the bottom
+            continue;
         }
         let root = find(&mut parent_uf, id_to_idx[id]);
         components.entry(root).or_default().push(id);
     }
 
-    // For each component, find roots (tasks with no parents in active set)
-    // and perform DFS tree traversal
+    let mut back_edge_arcs: Vec<BackEdgeArc> = Vec::new();
+    let mut node_line_map: HashMap<&str, usize> = HashMap::new();
+
     let mut lines: Vec<String> = Vec::new();
     let mut rendered: HashSet<&str> = HashSet::new();
 
-    // Sort components deterministically by their first root's name
+    // Sort components deterministically by creation time
     let mut component_list: Vec<Vec<&str>> = components.into_values().collect();
     component_list.retain(|c| !c.is_empty());
     component_list.sort_by(|a, b| {
-        let a_min = a.iter().min().unwrap_or(&"");
-        let b_min = b.iter().min().unwrap_or(&"");
-        a_min.cmp(b_min)
+        let a_time = a
+            .iter()
+            .filter_map(|id| task_map.get(id).and_then(|t| t.created_at.as_deref()))
+            .min();
+        let b_time = b
+            .iter()
+            .filter_map(|id| task_map.get(id).and_then(|t| t.created_at.as_deref()))
+            .min();
+        a_time.cmp(&b_time).then_with(|| {
+            let a_min = a.iter().min().unwrap_or(&"");
+            let b_min = b.iter().min().unwrap_or(&"");
+            a_min.cmp(b_min)
+        })
     });
 
     for component in &component_list {
-        // Find roots in this component (no parents in active set)
+        // Find roots: tasks with no parents outside their SCC
         let mut roots: Vec<&str> = component
             .iter()
-            .filter(|&&id| reverse.get(id).map(Vec::is_empty).unwrap_or(true))
+            .filter(|&&id| {
+                let parents = reverse.get(id).map(Vec::as_slice).unwrap_or(&[]);
+                parents.iter().all(|&p| {
+                    match cycle_analysis.task_to_cycle.get(id) {
+                        Some(idx) => cycle_analysis.task_to_cycle.get(p) == Some(idx),
+                        None => false,
+                    }
+                })
+            })
             .copied()
             .collect();
-        roots.sort();
+        roots.sort_by(|a, b| {
+            let a_time = task_map.get(a).and_then(|t| t.created_at.as_deref());
+            let b_time = task_map.get(b).and_then(|t| t.created_at.as_deref());
+            a_time.cmp(&b_time).then_with(|| a.cmp(b))
+        });
+        // Keep only one root per SCC
+        {
+            let mut seen_sccs: HashSet<usize> = HashSet::new();
+            roots.retain(|root| match cycle_analysis.task_to_cycle.get(*root) {
+                Some(&scc_idx) => seen_sccs.insert(scc_idx),
+                None => true,
+            });
+        }
 
-        // If no roots found (cycle), pick the alphabetically first
         if roots.is_empty() {
             let mut sorted = component.clone();
-            sorted.sort();
+            sorted.sort_by(|a, b| {
+                let a_time = task_map.get(a).and_then(|t| t.created_at.as_deref());
+                let b_time = task_map.get(b).and_then(|t| t.created_at.as_deref());
+                a_time.cmp(&b_time).then_with(|| a.cmp(b))
+            });
             roots.push(sorted[0]);
         }
 
         if !lines.is_empty() {
-            lines.push(String::new()); // blank line between components
+            lines.push(String::new());
+        }
+
+        // Pre-compute invisible visits via DFS simulation
+        let mut invisible_visits: HashSet<(String, String)> = HashSet::new();
+        {
+            fn simulate_dfs<'a>(
+                id: &'a str,
+                parent_id: Option<&'a str>,
+                sim_rendered: &mut HashSet<&'a str>,
+                invisible: &mut HashSet<(String, String)>,
+                forward: &HashMap<&str, Vec<&'a str>>,
+            ) {
+                if sim_rendered.contains(id) {
+                    // ALL re-visits are invisible (both back-edges and fan-in)
+                    if let Some(pid) = parent_id {
+                        invisible.insert((pid.to_string(), id.to_string()));
+                    }
+                    return;
+                }
+                sim_rendered.insert(id);
+                for &child in forward.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+                    simulate_dfs(child, Some(id), sim_rendered, invisible, forward);
+                }
+            }
+            let mut sim_rendered: HashSet<&str> = HashSet::new();
+            for root in &roots {
+                simulate_dfs(root, None, &mut sim_rendered, &mut invisible_visits, &forward);
+            }
         }
 
         // DFS from each root
@@ -850,14 +911,13 @@ fn generate_ascii(
                 lines: &mut Vec<String>,
                 rendered: &mut HashSet<&'a str>,
                 forward: &HashMap<&str, Vec<&'a str>>,
-                reverse: &HashMap<&str, Vec<&'a str>>,
                 format_node: &dyn Fn(&str) -> String,
                 task_map: &HashMap<&str, &workgraph::graph::Task>,
-                graph: &WorkGraph,
-                back_edges: &HashSet<(String, String)>,
                 use_color: bool,
+                node_line_map: &mut HashMap<&'a str, usize>,
+                back_edge_arcs: &mut Vec<BackEdgeArc>,
+                invisible_visits: &HashSet<(String, String)>,
             ) {
-                // Build the connector for this node
                 let connector = if is_root {
                     String::new()
                 } else if is_last {
@@ -866,68 +926,26 @@ fn generate_ascii(
                     "├→ ".to_string()
                 };
 
-                // Check if already rendered
+                // Already rendered: record arc, emit nothing
                 if rendered.contains(id) {
-                    // Distinguish cycle back-edges from fan-in (diamond joins).
-                    // Check structural back-edges first, then fall back to implicit
-                    // cycle detection (parent has cycle_config and id is in its after list).
-                    let is_back_edge = if let Some(pid) = parent_id {
-                        // Structural back-edge: (parent, id) in back_edges means
-                        // the graph edge parent→id is a back-edge in the DFS.
-                        // In the `after` representation, id.after contains parent,
-                        // creating graph edge parent→id.
-                        back_edges.contains(&(pid.to_string(), id.to_string()))
-                            || back_edges.contains(&(id.to_string(), pid.to_string()))
-                            || {
-                                // Implicit cycle: parent or id has cycle_config
-                                // and both are connected via after
-                                let parent_has_cycle = task_map
-                                    .get(pid)
-                                    .map(|t| t.cycle_config.is_some())
-                                    .unwrap_or(false);
-                                let id_has_cycle = task_map
-                                    .get(id)
-                                    .map(|t| t.cycle_config.is_some())
-                                    .unwrap_or(false);
-                                parent_has_cycle || id_has_cycle
+                    if let Some(pid) = parent_id {
+                        if let Some(&source_line) = node_line_map.get(pid) {
+                            if let Some(&target_line) = node_line_map.get(id) {
+                                back_edge_arcs.push(BackEdgeArc {
+                                    source_line,
+                                    target_line,
+                                });
                             }
-                    } else {
-                        false
-                    };
-
-                    if is_back_edge {
-                        lines.push(format!(
-                            "{}{}↺ (cycles back to {})",
-                            prefix, connector, id
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "{}{}{} ...",
-                            prefix,
-                            connector,
-                            format_node(id)
-                        ));
+                        }
                     }
                     return;
                 }
 
                 rendered.insert(id);
 
-                // Check for additional parents (fan-in annotation)
-                let parents = reverse.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                let fan_in_note = if parents.len() > 1 {
-                    // We're being shown under one parent; note the others
-                    let others: Vec<&str> = parents.to_vec();
-                    format!("  (← {})", others.join(", "))
-                } else {
-                    String::new()
-                };
-
                 let node_str = format_node(id);
-                lines.push(format!(
-                    "{}{}{}{}",
-                    prefix, connector, node_str, fan_in_note
-                ));
+                lines.push(format!("{}{}{}", prefix, connector, node_str));
+                node_line_map.insert(id, lines.len() - 1);
 
                 // Compute child prefix
                 let child_prefix = if is_root {
@@ -940,9 +958,11 @@ fn generate_ascii(
 
                 // Get children and recurse
                 let children = forward.get(id).map(Vec::as_slice).unwrap_or(&[]);
-                let child_count = children.len();
                 for (i, &child) in children.iter().enumerate() {
-                    let child_is_last = i == child_count - 1;
+                    // Effective is_last: skip invisible subsequent siblings
+                    let child_is_last = children[i + 1..].iter().all(|&sib| {
+                        invisible_visits.contains(&(id.to_string(), sib.to_string()))
+                    });
                     render_tree(
                         child,
                         Some(id),
@@ -952,12 +972,12 @@ fn generate_ascii(
                         lines,
                         rendered,
                         forward,
-                        reverse,
                         format_node,
                         task_map,
-                        graph,
-                        back_edges,
                         use_color,
+                        node_line_map,
+                        back_edge_arcs,
+                        invisible_visits,
                     );
                 }
             }
@@ -971,17 +991,17 @@ fn generate_ascii(
                 &mut lines,
                 &mut rendered,
                 &forward,
-                &reverse,
                 &format_node,
                 &task_map,
-                graph,
-                &cycle_analysis.back_edges,
                 use_color,
+                &mut node_line_map,
+                &mut back_edge_arcs,
+                &invisible_visits,
             );
         }
     }
 
-    // Render independent tasks (no edges in active set)
+    // Render independent tasks
     let mut independents: Vec<&str> = tasks
         .iter()
         .filter(|t| is_independent(t.id.as_str()))
@@ -998,7 +1018,142 @@ fn generate_ascii(
         }
     }
 
+    // Phase 2: Draw right-side arcs for all non-tree edges
+    draw_back_edge_arcs(&mut lines, &back_edge_arcs, use_color);
+
     lines.join("\n")
+}
+
+/// Pad a line with spaces so its visible length reaches at least `target_len`.
+fn pad_line_to(line: &mut String, target_len: usize) {
+    let current = visible_len(line);
+    if current < target_len {
+        line.push_str(&" ".repeat(target_len - current));
+    }
+}
+
+/// Fill a line with `─` for arc dash-fill. Adds a space separator first.
+fn fill_line_to(line: &mut String, target_len: usize, dim: &str, reset: &str) {
+    let current = visible_len(line);
+    if current < target_len {
+        let gap = target_len - current;
+        if gap > 1 {
+            line.push(' ');
+            line.push_str(&format!("{}{}{}", dim, "─".repeat(gap - 1), reset));
+        } else {
+            line.push_str(&format!("{}{}{}", dim, "─", reset));
+        }
+    }
+}
+
+/// Phase 2: Draw right-side arcs for non-tree edges.
+///
+/// Same-target arcs are collapsed into a single column:
+/// - Target line: `◀╮` (arrowhead at target)
+/// - Intermediate sources: `→┤` (departs here, vertical continues)
+/// - Furthest source: `→╯` (departs here, bottom of arc)
+/// - Between: `│` (vertical channel)
+/// Dash fill (`─`) connects node text to the arc column.
+fn draw_back_edge_arcs(lines: &mut Vec<String>, arcs: &[BackEdgeArc], use_color: bool) {
+    if arcs.is_empty() {
+        return;
+    }
+
+    // Separate self-loops from real arcs
+    let mut self_loops: Vec<usize> = Vec::new();
+    let mut real_arcs: Vec<&BackEdgeArc> = Vec::new();
+    for arc in arcs {
+        if arc.source_line == arc.target_line {
+            self_loops.push(arc.source_line);
+        } else {
+            real_arcs.push(arc);
+        }
+    }
+
+    for line_idx in self_loops {
+        if line_idx < lines.len() {
+            lines[line_idx].push_str(" ↺");
+        }
+    }
+
+    if real_arcs.is_empty() {
+        return;
+    }
+
+    // Group arcs by target line, collapse same-target into one column
+    let mut by_target: HashMap<usize, Vec<usize>> = HashMap::new();
+    for arc in &real_arcs {
+        let target = arc.target_line.min(arc.source_line);
+        let source = arc.target_line.max(arc.source_line);
+        by_target.entry(target).or_default().push(source);
+    }
+    for sources in by_target.values_mut() {
+        sources.sort();
+        sources.dedup();
+    }
+
+    struct ArcColumn {
+        target: usize,
+        sources: Vec<usize>,
+    }
+
+    let mut columns: Vec<ArcColumn> = by_target
+        .into_iter()
+        .map(|(target, sources)| ArcColumn { target, sources })
+        .collect();
+
+    // Sort by span (shortest first → innermost)
+    columns.sort_by_key(|c| {
+        let max_source = *c.sources.last().unwrap();
+        max_source - c.target
+    });
+
+    let max_width = lines.iter().map(|l| visible_len(l)).max().unwrap_or(0);
+    let margin_start = max_width + 2; // +2 = space + at least one dash
+
+    let dim = if use_color { "\x1b[90m" } else { "" };
+    let reset = if use_color { "\x1b[0m" } else { "" };
+
+    let source_set: HashSet<(usize, usize)> = columns
+        .iter()
+        .enumerate()
+        .flat_map(|(col_idx, c)| c.sources.iter().map(move |&s| (col_idx, s)))
+        .collect();
+
+    for (col_idx, column) in columns.iter().enumerate() {
+        let col_x = margin_start + col_idx * 2;
+        let max_source = *column.sources.last().unwrap();
+
+        // Target line: ◀╮ (arrowhead points left toward node = destination)
+        if column.target < lines.len() {
+            fill_line_to(&mut lines[column.target], col_x, dim, reset);
+            lines[column.target].push_str(&format!("{}◀╮{}", dim, reset));
+        }
+
+        // Source lines: ─╯ (furthest) or ─┤ (intermediate)
+        for (i, &source) in column.sources.iter().enumerate() {
+            if source < lines.len() {
+                if i == column.sources.len() - 1 {
+                    fill_line_to(&mut lines[source], col_x, dim, reset);
+                    lines[source].push_str(&format!("{}→╯{}", dim, reset));
+                } else {
+                    fill_line_to(&mut lines[source], col_x, dim, reset);
+                    lines[source].push_str(&format!("{}→┤{}", dim, reset));
+                }
+            }
+        }
+
+        // Vertical segments
+        for line_idx in (column.target + 1)..max_source {
+            if line_idx < lines.len() && !source_set.contains(&(col_idx, line_idx)) {
+                pad_line_to(&mut lines[line_idx], col_x + 1);
+                let current_vis = visible_len(&lines[line_idx]);
+                if current_vis == col_x + 1 {
+                    lines[line_idx].push_str(&format!("{}│{}", dim, reset));
+                }
+            }
+        }
+    }
 }
 
 /// Generate a 2D spatial graph layout with Unicode box-drawing characters.
@@ -1828,9 +1983,14 @@ mod tests {
         let no_annots = HashMap::new();
         let result = generate_ascii(&graph, &tasks, &task_ids, &no_annots);
 
-        // c should appear under one parent with a fan-in annotation
+        // c should appear, and the fan-in edge should be shown as a right-side arc
         assert!(result.contains('c'));
-        assert!(result.contains("(←"));
+        // Fan-in is now shown via right-side arcs (◀╮/→╯) instead of text annotations
+        assert!(
+            result.contains("◀╮") || result.contains("→╯"),
+            "Fan-in should produce a right-side arc.\nOutput:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -2542,5 +2702,182 @@ mod tests {
         assert!(!ids.contains(&"done-a"), "Fully done tree: hidden");
         assert!(!ids.contains(&"done-b"), "Fully done tree: hidden");
         assert!(!ids.contains(&"task-abandoned"), "Abandoned: hidden");
+    }
+
+    // --- Right-side arc rendering tests ---
+
+    #[test]
+    fn test_arc_back_edge_cycle() {
+        // A→B→A cycle: back-edge should produce right-side arcs with arrows
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("design", "Design");
+        a.cycle_config = Some(workgraph::graph::CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("verify", "Verify");
+        b.after = vec!["design".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        a.after = vec!["verify".to_string()]; // back-edge
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(&graph, &tasks, &task_ids, &HashMap::new());
+
+        // Should have ◀╮ at target and →╯ at source
+        assert!(result.contains("◀╮"), "Back-edge target should have ◀╮\nOutput:\n{}", result);
+        assert!(result.contains("→╯"), "Back-edge source should have →╯\nOutput:\n{}", result);
+        // Should NOT have old-style cycle-back text
+        assert!(!result.contains("cycles back"), "No old-style text\nOutput:\n{}", result);
+        // Should NOT have fan-in annotations
+        assert!(!result.contains("(←"), "No fan-in text annotations\nOutput:\n{}", result);
+    }
+
+    #[test]
+    fn test_arc_fan_in_diamond() {
+        // Diamond: A→{B,C}→D — D has fan-in from secondary parent
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("root", "Root");
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("left", "Left");
+        b.after = vec!["root".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        let mut c = make_task("right", "Right");
+        c.after = vec!["root".to_string()];
+        c.created_at = Some("2024-01-01T00:02:00Z".to_string());
+        let mut d = make_task("join", "Join");
+        d.after = vec!["left".to_string(), "right".to_string()];
+        d.created_at = Some("2024-01-01T00:03:00Z".to_string());
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(c));
+        graph.add_node(Node::Task(d));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(&graph, &tasks, &task_ids, &HashMap::new());
+
+        // Fan-in should produce a right-side arc (not a text annotation)
+        assert!(result.contains("◀╮") || result.contains("→╯"),
+            "Diamond fan-in should have right-side arcs\nOutput:\n{}", result);
+        assert!(!result.contains("(←"), "No fan-in text annotation\nOutput:\n{}", result);
+        assert!(!result.contains("..."), "No duplicate 'already shown' entries\nOutput:\n{}", result);
+    }
+
+    #[test]
+    fn test_arc_no_orphaned_continuation() {
+        // A has children [B, C] where C is a back-edge (already rendered).
+        // B should use └→ (not ├→), no orphaned │.
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("parent", "Parent");
+        a.cycle_config = Some(workgraph::graph::CycleConfig {
+            max_iterations: 2,
+            guard: None,
+            delay: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("child", "Child");
+        b.after = vec!["parent".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        // child→parent back-edge (parent depends on child for cycle)
+        a.after = vec!["child".to_string()];
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(&graph, &tasks, &task_ids, &HashMap::new());
+
+        let tree_lines: Vec<&str> = result.lines().collect();
+        // The child should use └→ (last visible child), not ├→
+        let child_line = tree_lines.iter().find(|l| l.contains("child"));
+        assert!(child_line.is_some(), "Child should appear\nOutput:\n{}", result);
+        assert!(
+            child_line.unwrap().contains("└→"),
+            "Child should use └→ (no orphaned ├→)\nLine: '{}'\nOutput:\n{}",
+            child_line.unwrap(), result
+        );
+    }
+
+    #[test]
+    fn test_arc_same_target_collapse() {
+        // Target with multiple sources should collapse into one column
+        let mut graph = WorkGraph::new();
+        let mut target = make_task("hub", "Hub");
+        target.cycle_config = Some(workgraph::graph::CycleConfig {
+            max_iterations: 2,
+            guard: None,
+            delay: None,
+        });
+        target.created_at = Some("2024-01-01T00:00:00Z".to_string());
+
+        let mut s1 = make_task("spoke-a", "Spoke A");
+        s1.after = vec!["hub".to_string()];
+        s1.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        let mut s2 = make_task("spoke-b", "Spoke B");
+        s2.after = vec!["hub".to_string()];
+        s2.created_at = Some("2024-01-01T00:02:00Z".to_string());
+        let mut s3 = make_task("spoke-c", "Spoke C");
+        s3.after = vec!["hub".to_string()];
+        s3.created_at = Some("2024-01-01T00:03:00Z".to_string());
+
+        // All spokes cycle back to hub
+        target.after = vec!["spoke-a".to_string(), "spoke-b".to_string(), "spoke-c".to_string()];
+
+        graph.add_node(Node::Task(target));
+        graph.add_node(Node::Task(s1));
+        graph.add_node(Node::Task(s2));
+        graph.add_node(Node::Task(s3));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(&graph, &tasks, &task_ids, &HashMap::new());
+
+        // Should have exactly one ◀╮ (same-target collapse)
+        let target_count = result.matches("◀╮").count();
+        assert_eq!(target_count, 1,
+            "Multiple sources to same target should collapse to 1 column\nOutput:\n{}", result);
+        // Should have →┤ for intermediate sources and →╯ for the last
+        assert!(result.contains("→┤"), "Intermediate sources should have →┤\nOutput:\n{}", result);
+        assert!(result.contains("→╯"), "Last source should have →╯\nOutput:\n{}", result);
+    }
+
+    #[test]
+    fn test_arc_dash_fill_with_space() {
+        // Arcs should have a space between node text and dash fill
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("aa", "AA");
+        a.cycle_config = Some(workgraph::graph::CycleConfig {
+            max_iterations: 2,
+            guard: None,
+            delay: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("bb", "BB");
+        b.after = vec!["aa".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        a.after = vec!["bb".to_string()];
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(&graph, &tasks, &task_ids, &HashMap::new());
+
+        // Lines with arcs should have space before the dash fill
+        for line in result.lines() {
+            if line.contains("◀╮") || line.contains("→╯") {
+                // The text content shouldn't run directly into ─
+                assert!(
+                    !line.contains(")─") && !line.contains(")←"),
+                    "Should have space between text and arc fill\nLine: '{}'",
+                    line
+                );
+            }
+        }
     }
 }
