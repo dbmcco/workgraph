@@ -34,13 +34,16 @@ pub fn update_performance(record: &mut PerformanceRecord, eval_ref: EvaluationRe
     record.avg_score = recalculate_avg_score(&record.evaluations);
 }
 
-/// Record an evaluation: persist the eval JSON, and update agent, role, and tradeoff performance.
+/// Record an evaluation: persist the eval JSON, and update agent, role, tradeoff, component,
+/// and outcome performance.
 ///
 /// Steps:
 /// 1. Save the `Evaluation` as JSON in `agency_dir/evaluations/eval-{task_id}-{timestamp}.json`.
 /// 2. Load the agent (if agent_id is set), add an `EvaluationRef`, recalculate scores, save.
 /// 3. Load the role, add an `EvaluationRef` (with tradeoff_id as context), recalculate scores, save.
 /// 4. Load the tradeoff, add an `EvaluationRef` (with role_id as context), recalculate scores, save.
+/// 5. Propagate to each role component (with role_id as context), recalculate scores, save.
+/// 6. Propagate to the role's desired outcome (with agent_id as context), recalculate scores, save.
 ///
 /// Returns the path to the saved evaluation JSON.
 pub fn record_evaluation(
@@ -76,7 +79,11 @@ pub fn record_evaluation(
     }
 
     // 3. Update role performance (look up by prefix to support both full and short IDs)
+    let mut role_component_ids: Vec<String> = Vec::new();
+    let mut role_outcome_id = String::new();
     if let Ok(mut role) = find_role_by_prefix(&roles_dir, &evaluation.role_id) {
+        role_component_ids = role.component_ids.clone();
+        role_outcome_id = role.outcome_id.clone();
         let role_eval_ref = EvaluationRef {
             score: evaluation.score,
             task_id: evaluation.task_id.clone(),
@@ -99,6 +106,55 @@ pub fn record_evaluation(
         };
         update_performance(&mut tradeoff.performance, tradeoff_eval_ref);
         save_tradeoff(&tradeoff, &tradeoffs_dir)?;
+    }
+
+    // 5. Propagate to each role component (context_id = role_id)
+    let components_dir = agency_dir.join("primitives/components");
+    for comp_id in &role_component_ids {
+        if comp_id.is_empty() {
+            continue;
+        }
+        match find_component_by_prefix(&components_dir, comp_id) {
+            Ok(mut component) => {
+                let comp_eval_ref = EvaluationRef {
+                    score: evaluation.score,
+                    task_id: evaluation.task_id.clone(),
+                    timestamp: evaluation.timestamp.clone(),
+                    context_id: evaluation.role_id.clone(),
+                };
+                update_performance(&mut component.performance, comp_eval_ref);
+                save_component(&component, &components_dir)?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not propagate eval to component '{}': {}",
+                    comp_id, e
+                );
+            }
+        }
+    }
+
+    // 6. Propagate to the role's desired outcome (context_id = agent_id)
+    let outcomes_dir = agency_dir.join("primitives/outcomes");
+    if !role_outcome_id.is_empty() {
+        match find_outcome_by_prefix(&outcomes_dir, &role_outcome_id) {
+            Ok(mut outcome) => {
+                let outcome_eval_ref = EvaluationRef {
+                    score: evaluation.score,
+                    task_id: evaluation.task_id.clone(),
+                    timestamp: evaluation.timestamp.clone(),
+                    context_id: evaluation.agent_id.clone(),
+                };
+                update_performance(&mut outcome.performance, outcome_eval_ref);
+                save_outcome(&outcome, &outcomes_dir)?;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not propagate eval to outcome '{}': {}",
+                    role_outcome_id, e
+                );
+            }
+        }
     }
 
     Ok(eval_path)
@@ -211,7 +267,7 @@ pub fn record_org_evaluation(
 
 #[cfg(test)]
 mod tests {
-    use super::super::starters::{build_role, build_tradeoff};
+    use super::super::starters::{build_component, build_outcome, build_role, build_tradeoff};
     use super::*;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -496,5 +552,278 @@ mod tests {
         assert_eq!(ref0.task_id, "task-abc");
         assert_eq!(ref0.timestamp, "2025-05-01T12:00:00Z");
         assert_eq!(ref0.context_id, "motivation-xyz");
+    }
+
+    #[test]
+    fn test_record_evaluation_propagates_to_components() {
+        let tmp = TempDir::new().unwrap();
+        let agency_dir = tmp.path().join("agency");
+        init(&agency_dir).unwrap();
+
+        // Create two components
+        let comp1 = build_component(
+            "Rust coding",
+            "Write idiomatic Rust",
+            ComponentCategory::Translated,
+            ContentRef::Inline("fn main() {}".into()),
+        );
+        let comp2 = build_component(
+            "Testing",
+            "Write thorough tests",
+            ComponentCategory::Enhanced,
+            ContentRef::Inline("assert!(true)".into()),
+        );
+        save_component(&comp1, &agency_dir.join("primitives/components")).unwrap();
+        save_component(&comp2, &agency_dir.join("primitives/components")).unwrap();
+
+        // Create an outcome
+        let outcome = build_outcome(
+            "Merged code",
+            "Working, tested code merged to main.",
+            vec!["Tests pass".into()],
+        );
+        save_outcome(&outcome, &agency_dir.join("primitives/outcomes")).unwrap();
+
+        // Create a role referencing those components and outcome
+        let role = build_role(
+            "Implementer",
+            "Writes code",
+            vec![comp1.id.clone(), comp2.id.clone()],
+            &outcome.id,
+        );
+        let role_id = role.id.clone();
+        save_role(&role, &agency_dir.join("cache/roles")).unwrap();
+
+        let tradeoff = sample_tradeoff();
+        let tradeoff_id = tradeoff.id.clone();
+        save_tradeoff(&tradeoff, &agency_dir.join("primitives/tradeoffs")).unwrap();
+
+        let eval = Evaluation {
+            id: "eval-comp-1".into(),
+            task_id: "task-50".into(),
+            agent_id: "agent-abc".into(),
+            role_id: role_id.clone(),
+            tradeoff_id: tradeoff_id.clone(),
+            score: 0.9,
+            dimensions: HashMap::new(),
+            notes: "Great".into(),
+            evaluator: "test".into(),
+            timestamp: "2025-06-01T12:00:00Z".into(),
+            model: None,
+            source: "llm".to_string(),
+        };
+
+        record_evaluation(&eval, &agency_dir).unwrap();
+
+        // Verify component 1 was updated
+        let updated_comp1 = find_component_by_prefix(
+            &agency_dir.join("primitives/components"),
+            &comp1.id,
+        )
+        .unwrap();
+        assert_eq!(updated_comp1.performance.task_count, 1);
+        assert!((updated_comp1.performance.avg_score.unwrap() - 0.9).abs() < f64::EPSILON);
+        assert_eq!(updated_comp1.performance.evaluations[0].context_id, role_id);
+
+        // Verify component 2 was updated
+        let updated_comp2 = find_component_by_prefix(
+            &agency_dir.join("primitives/components"),
+            &comp2.id,
+        )
+        .unwrap();
+        assert_eq!(updated_comp2.performance.task_count, 1);
+        assert!((updated_comp2.performance.avg_score.unwrap() - 0.9).abs() < f64::EPSILON);
+        assert_eq!(updated_comp2.performance.evaluations[0].context_id, role_id);
+    }
+
+    #[test]
+    fn test_record_evaluation_propagates_to_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let agency_dir = tmp.path().join("agency");
+        init(&agency_dir).unwrap();
+
+        let outcome = build_outcome(
+            "Merged code",
+            "Working, tested code merged to main.",
+            vec!["Tests pass".into()],
+        );
+        save_outcome(&outcome, &agency_dir.join("primitives/outcomes")).unwrap();
+
+        let role = build_role(
+            "Implementer",
+            "Writes code",
+            vec![],
+            &outcome.id,
+        );
+        let role_id = role.id.clone();
+        save_role(&role, &agency_dir.join("cache/roles")).unwrap();
+
+        let tradeoff = sample_tradeoff();
+        let tradeoff_id = tradeoff.id.clone();
+        save_tradeoff(&tradeoff, &agency_dir.join("primitives/tradeoffs")).unwrap();
+
+        let eval = Evaluation {
+            id: "eval-out-1".into(),
+            task_id: "task-51".into(),
+            agent_id: "agent-xyz".into(),
+            role_id: role_id.clone(),
+            tradeoff_id: tradeoff_id.clone(),
+            score: 0.75,
+            dimensions: HashMap::new(),
+            notes: "Decent".into(),
+            evaluator: "test".into(),
+            timestamp: "2025-06-01T13:00:00Z".into(),
+            model: None,
+            source: "llm".to_string(),
+        };
+
+        record_evaluation(&eval, &agency_dir).unwrap();
+
+        // Verify outcome was updated with agent_id as context_id
+        let updated_outcome = find_outcome_by_prefix(
+            &agency_dir.join("primitives/outcomes"),
+            &outcome.id,
+        )
+        .unwrap();
+        assert_eq!(updated_outcome.performance.task_count, 1);
+        assert!((updated_outcome.performance.avg_score.unwrap() - 0.75).abs() < f64::EPSILON);
+        assert_eq!(
+            updated_outcome.performance.evaluations[0].context_id,
+            "agent-xyz"
+        );
+    }
+
+    #[test]
+    fn test_record_evaluation_missing_component_does_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let agency_dir = tmp.path().join("agency");
+        init(&agency_dir).unwrap();
+
+        // Create a role with component_ids that don't exist on disk
+        let role = build_role(
+            "Implementer",
+            "Writes code",
+            vec!["nonexistent-comp-id".into()],
+            "",
+        );
+        let role_id = role.id.clone();
+        save_role(&role, &agency_dir.join("cache/roles")).unwrap();
+
+        let tradeoff = sample_tradeoff();
+        let tradeoff_id = tradeoff.id.clone();
+        save_tradeoff(&tradeoff, &agency_dir.join("primitives/tradeoffs")).unwrap();
+
+        let eval = Evaluation {
+            id: "eval-miss-1".into(),
+            task_id: "task-52".into(),
+            agent_id: String::new(),
+            role_id: role_id.clone(),
+            tradeoff_id: tradeoff_id.clone(),
+            score: 0.5,
+            dimensions: HashMap::new(),
+            notes: "".into(),
+            evaluator: "test".into(),
+            timestamp: "2025-06-01T14:00:00Z".into(),
+            model: None,
+            source: "llm".to_string(),
+        };
+
+        // Should not error — missing components/outcomes are warned, not failed
+        let result = record_evaluation(&eval, &agency_dir);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_record_evaluation_full_4_level_cascade() {
+        let tmp = TempDir::new().unwrap();
+        let agency_dir = tmp.path().join("agency");
+        init(&agency_dir).unwrap();
+
+        // Build all 4 levels
+        let comp = build_component(
+            "Rust coding",
+            "Write idiomatic Rust",
+            ComponentCategory::Translated,
+            ContentRef::Inline("fn main() {}".into()),
+        );
+        save_component(&comp, &agency_dir.join("primitives/components")).unwrap();
+
+        let outcome = build_outcome(
+            "Merged code",
+            "Working, tested code merged to main.",
+            vec!["Tests pass".into()],
+        );
+        save_outcome(&outcome, &agency_dir.join("primitives/outcomes")).unwrap();
+
+        let tradeoff = sample_tradeoff();
+        let tradeoff_id = tradeoff.id.clone();
+        save_tradeoff(&tradeoff, &agency_dir.join("primitives/tradeoffs")).unwrap();
+
+        let role = build_role(
+            "Implementer",
+            "Writes code",
+            vec![comp.id.clone()],
+            &outcome.id,
+        );
+        let role_id = role.id.clone();
+        save_role(&role, &agency_dir.join("cache/roles")).unwrap();
+
+        // Record two evaluations to test accumulation
+        for (i, score) in [(1, 0.7), (2, 0.9)] {
+            let eval = Evaluation {
+                id: format!("eval-full-{}", i),
+                task_id: format!("task-{}", i),
+                agent_id: "agent-full".into(),
+                role_id: role_id.clone(),
+                tradeoff_id: tradeoff_id.clone(),
+                score,
+                dimensions: HashMap::new(),
+                notes: "".into(),
+                evaluator: "test".into(),
+                timestamp: format!("2025-06-01T1{}:00:00Z", i),
+                model: None,
+                source: "llm".to_string(),
+            };
+            record_evaluation(&eval, &agency_dir).unwrap();
+        }
+
+        let expected_avg = (0.7 + 0.9) / 2.0;
+
+        // Check role
+        let updated_role = find_role_by_prefix(&agency_dir.join("cache/roles"), &role_id).unwrap();
+        assert_eq!(updated_role.performance.task_count, 2);
+        assert!((updated_role.performance.avg_score.unwrap() - expected_avg).abs() < f64::EPSILON);
+
+        // Check tradeoff
+        let updated_tradeoff =
+            find_tradeoff_by_prefix(&agency_dir.join("primitives/tradeoffs"), &tradeoff_id)
+                .unwrap();
+        assert_eq!(updated_tradeoff.performance.task_count, 2);
+        assert!(
+            (updated_tradeoff.performance.avg_score.unwrap() - expected_avg).abs() < f64::EPSILON
+        );
+
+        // Check component
+        let updated_comp =
+            find_component_by_prefix(&agency_dir.join("primitives/components"), &comp.id).unwrap();
+        assert_eq!(updated_comp.performance.task_count, 2);
+        assert!(
+            (updated_comp.performance.avg_score.unwrap() - expected_avg).abs() < f64::EPSILON
+        );
+        // Component context_id should be role_id
+        assert_eq!(updated_comp.performance.evaluations[0].context_id, role_id);
+
+        // Check outcome
+        let updated_outcome =
+            find_outcome_by_prefix(&agency_dir.join("primitives/outcomes"), &outcome.id).unwrap();
+        assert_eq!(updated_outcome.performance.task_count, 2);
+        assert!(
+            (updated_outcome.performance.avg_score.unwrap() - expected_avg).abs() < f64::EPSILON
+        );
+        // Outcome context_id should be agent_id
+        assert_eq!(
+            updated_outcome.performance.evaluations[0].context_id,
+            "agent-full"
+        );
     }
 }
