@@ -266,9 +266,14 @@ fn is_u64_zero(val: &u64) -> bool {
 }
 
 impl TokenUsage {
-    /// Total tokens (input + output + cache read + cache creation)
+    /// Total input tokens (uncached + cache read + cache creation)
+    pub fn total_input(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+
+    /// Total tokens (all input + output)
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens + self.output_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+        self.total_input() + self.output_tokens
     }
 }
 
@@ -395,6 +400,48 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
         })
     } else {
         None
+    }
+}
+
+/// Format token usage in compact slash notation: in/out or in/out/val
+/// Input = total input (uncached + cache_read + cache_creation).
+/// Validation shown only when > 0.
+/// `usage` is the work task's token usage, `validation` is the optional assign+eval token usage.
+pub fn format_token_display(usage: Option<&TokenUsage>, validation: Option<&TokenUsage>) -> Option<String> {
+    match (usage, validation) {
+        (Some(u), Some(v)) => {
+            let vtok = v.total_input() + v.output_tokens;
+            if vtok > 0 {
+                Some(format!(
+                    "{}/{}/{}",
+                    format_tokens(u.total_input()),
+                    format_tokens(u.output_tokens),
+                    format_tokens(vtok),
+                ))
+            } else {
+                Some(format!(
+                    "{}/{}",
+                    format_tokens(u.total_input()),
+                    format_tokens(u.output_tokens),
+                ))
+            }
+        }
+        (Some(u), None) => {
+            Some(format!(
+                "{}/{}",
+                format_tokens(u.total_input()),
+                format_tokens(u.output_tokens),
+            ))
+        }
+        (None, Some(v)) => {
+            let vtok = v.total_input() + v.output_tokens;
+            if vtok > 0 {
+                Some(format!("val:{}", format_tokens(vtok)))
+            } else {
+                None
+            }
+        }
+        (None, None) => None,
     }
 }
 
@@ -1563,6 +1610,53 @@ mod tests {
     }
 
     #[test]
+    fn test_format_token_display() {
+        // Usage with cache tokens — total input = 4600 + 100000 + 5000 = 109600
+        let usage = TokenUsage {
+            cost_usd: 0.0,
+            input_tokens: 4600,
+            output_tokens: 3900,
+            cache_read_input_tokens: 100_000,
+            cache_creation_input_tokens: 5_000,
+        };
+        let validation = TokenUsage {
+            cost_usd: 0.0,
+            input_tokens: 800,
+            output_tokens: 400,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        // in/out/val format, total input includes cache
+        assert_eq!(
+            format_token_display(Some(&usage), Some(&validation)),
+            Some("110k/3.9k/1.2k".to_string())
+        );
+        assert_eq!(
+            format_token_display(Some(&usage), None),
+            Some("110k/3.9k".to_string())
+        );
+        assert_eq!(
+            format_token_display(None, Some(&validation)),
+            Some("val:1.2k".to_string())
+        );
+        assert_eq!(format_token_display(None, None), None);
+
+        // Zero validation tokens should not show val
+        let zero_val = TokenUsage {
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        assert_eq!(
+            format_token_display(Some(&usage), Some(&zero_val)),
+            Some("110k/3.9k".to_string())
+        );
+        assert_eq!(format_token_display(None, Some(&zero_val)), None);
+    }
+
+    #[test]
     fn test_token_usage_total() {
         let usage = TokenUsage {
             cost_usd: 1.0,
@@ -1571,6 +1665,7 @@ mod tests {
             cache_read_input_tokens: 300,
             cache_creation_input_tokens: 400,
         };
+        assert_eq!(usage.total_input(), 800);
         assert_eq!(usage.total_tokens(), 1000);
     }
 

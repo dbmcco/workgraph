@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use workgraph::format_hours;
-use workgraph::graph::{format_tokens, parse_token_usage_live, Status, Task, TokenUsage, WorkGraph};
+use workgraph::graph::{format_token_display, format_tokens, parse_token_usage_live, Status, Task, TokenUsage, WorkGraph};
 
 /// Output format for visualization
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1037,17 +1037,8 @@ fn generate_ascii(
         let usage = task
             .and_then(|t| t.token_usage.as_ref().or_else(|| live_token_usage.get(&t.id)));
         let vtok_usage = validation_token_usage.get(id);
-        let status_with_tokens = if let Some(u) = usage {
-            let wtok = format_tokens(u.output_tokens);
-            if let Some(v) = vtok_usage {
-                let vtok = format_tokens(v.output_tokens);
-                format!("{} · {} wtok, {} vtok", status, wtok, vtok)
-            } else {
-                format!("{} · {} tok", status, wtok)
-            }
-        } else if let Some(v) = vtok_usage {
-            let vtok = format_tokens(v.output_tokens);
-            format!("{} · {} vtok", status, vtok)
+        let status_with_tokens = if let Some(tok_str) = format_token_display(usage, vtok_usage) {
+            format!("{} · {}", status, tok_str)
         } else {
             status.to_string()
         };
@@ -1425,28 +1416,35 @@ fn format_wcc_summary(
     // Aggregate token usage and cost (including live data from in-progress agents)
     // Include validation (assign + evaluate) costs in the total
     let mut total_cost = 0.0f64;
-    let mut total_tokens = 0u64;
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_validation = 0u64;
     let mut has_usage = false;
     for &id in task_ids {
         if let Some(task) = task_map.get(id) {
             let usage = task.token_usage.as_ref().or_else(|| live_token_usage.get(id));
             if let Some(usage) = usage {
                 total_cost += usage.cost_usd;
-                total_tokens += usage.output_tokens;
+                total_input += usage.total_input();
+                total_output += usage.output_tokens;
                 has_usage = true;
             }
         }
         // Add validation costs (assign + evaluate agents)
         if let Some(vtok) = validation_token_usage.get(id) {
             total_cost += vtok.cost_usd;
-            total_tokens += vtok.output_tokens;
+            total_validation += vtok.total_input() + vtok.output_tokens;
             has_usage = true;
         }
     }
     if has_usage {
+        let mut tok_parts = format!("{}/{}", format_tokens(total_input), format_tokens(total_output));
+        if total_validation > 0 {
+            tok_parts.push_str(&format!("/{}", format_tokens(total_validation)));
+        }
         summary.push_str(&format!(
-            " ╌╌ {} tokens, ${:.2}",
-            format_tokens(total_tokens),
+            " ╌╌ {}, ${:.2}",
+            tok_parts,
             total_cost,
         ));
     }
@@ -1910,14 +1908,9 @@ pub fn generate_graph_with_overrides(
 
         let usage = task.token_usage.as_ref().or_else(|| live_token_usage.get(id));
         let vtok_usage = validation_token_usage.get(id);
-        let token_info = match (usage, vtok_usage) {
-            (Some(u), Some(v)) => {
-                format!(" · {} wtok, {} vtok", format_tokens(u.output_tokens), format_tokens(v.output_tokens))
-            }
-            (Some(u), None) => format!(" · {} tok", format_tokens(u.output_tokens)),
-            (None, Some(v)) => format!(" · {} vtok", format_tokens(v.output_tokens)),
-            (None, None) => String::new(),
-        };
+        let token_info = format_token_display(usage, vtok_usage)
+            .map(|s| format!(" · {}", s))
+            .unwrap_or_default();
 
         let line1 = display_id;
         let line2 = format!("{}{}{}{}", status, token_info, phase, loop_info);
