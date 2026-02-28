@@ -130,20 +130,20 @@ pub fn run(
         }
     }
 
-    // Step 2: Load the task's agent and resolve its role + motivation
+    // Step 2: Load the task's agent and resolve its role + tradeoff
     let agency_dir = dir.join("agency");
     let roles_dir = agency_dir.join("cache/roles");
-    let motivations_dir = agency_dir.join("primitives/tradeoffs");
+    let tradeoffs_dir = agency_dir.join("primitives/tradeoffs");
     let agents_dir = agency_dir.join("cache/agents");
 
-    let (resolved_agent, role, resolved_tradeoff, agent_role_id, agent_motivation_id) = if let Some(
+    let (resolved_agent, role, resolved_tradeoff, agent_role_id, agent_tradeoff_id) = if let Some(
         ref agent_hash,
     ) = task.agent
     {
         match agency::find_agent_by_prefix(&agents_dir, agent_hash) {
             Ok(agent) => {
                 let role_path = roles_dir.join(format!("{}.yaml", agent.role_id));
-                let tradeoff_path = motivations_dir.join(format!("{}.yaml", agent.tradeoff_id));
+                let tradeoff_path = tradeoffs_dir.join(format!("{}.yaml", agent.tradeoff_id));
 
                 let role = if role_path.exists() {
                     Some(load_role(&role_path).context("Failed to load role")?)
@@ -166,8 +166,8 @@ pub fn run(
                 };
 
                 let role_id = agent.role_id.clone();
-                let motivation_id = agent.tradeoff_id.clone();
-                (Some(agent), role, resolved_tradeoff, role_id, motivation_id)
+                let tradeoff_id = agent.tradeoff_id.clone();
+                (Some(agent), role, resolved_tradeoff, role_id, tradeoff_id)
             }
             Err(e) => {
                 eprintln!(
@@ -184,7 +184,7 @@ pub fn run(
             }
         }
     } else {
-        eprintln!("Note: task has no assigned agent — evaluating without role/motivation context");
+        eprintln!("Note: task has no assigned agent — evaluating without role/tradeoff context");
         (
             None,
             None,
@@ -208,7 +208,7 @@ pub fn run(
         let eval_agent = agency::load_agent(&agent_path).ok()?;
         let eval_role_path = roles_dir.join(format!("{}.yaml", eval_agent.role_id));
         let eval_role = load_role(&eval_role_path).ok()?;
-        let eval_tradeoff_path = motivations_dir.join(format!("{}.yaml", eval_agent.tradeoff_id));
+        let eval_tradeoff_path = tradeoffs_dir.join(format!("{}.yaml", eval_agent.tradeoff_id));
         let eval_tradeoff = load_tradeoff(&eval_tradeoff_path).ok()?;
         let workgraph_root = dir;
         let resolved_skills = resolve_all_skills(&eval_role, workgraph_root);
@@ -266,7 +266,7 @@ pub fn run(
         if let Some(ref agent_hash) = task.agent {
             println!("Agent: {}", agent_hash);
             println!("Role: {}", agent_role_id);
-            println!("Motivation: {}", agent_motivation_id);
+            println!("Tradeoff: {}", agent_tradeoff_id);
         } else {
             println!("Agent: (none)");
         }
@@ -314,13 +314,13 @@ pub fn run(
     let parsed: EvalOutput = serde_json::from_str(&eval_json)
         .with_context(|| format!("Failed to parse evaluator JSON:\n{}", eval_json))?;
 
-    // Build the Evaluation record using the agent/role/motivation resolved above
+    // Build the Evaluation record using the agent/role/tradeoff resolved above
     let agent_id = resolved_agent
         .as_ref()
         .map(|a| a.id.clone())
         .unwrap_or_default();
     let role_id = agent_role_id;
-    let motivation_id = agent_motivation_id;
+    let tradeoff_id = agent_tradeoff_id;
 
     // Resolve the model that was used to execute this task.
     // Best source: the spawn log entry which records the effective model.
@@ -335,7 +335,7 @@ pub fn run(
         task_id: task_id.to_string(),
         agent_id,
         role_id: role_id.clone(),
-        tradeoff_id: motivation_id.clone(),
+        tradeoff_id: tradeoff_id.clone(),
         score: parsed.score,
         dimensions: parsed.dimensions,
         notes: parsed.notes,
@@ -346,7 +346,7 @@ pub fn run(
     };
 
     // Step 8: Save evaluation, update performance records, and trigger retrospective inference
-    if role_id != "unknown" && motivation_id != "unknown" {
+    if role_id != "unknown" && tradeoff_id != "unknown" {
         let eval_path =
             record_evaluation_with_inference(&evaluation, &agency_dir, &config.agency)
                 .context("Failed to record evaluation")?;
@@ -427,7 +427,7 @@ pub fn run(
             println!("Evaluator:  {}", evaluation.evaluator);
             println!("Saved to:   {}", eval_path.display());
             println!(
-                "Warning: no identity assigned — role/motivation performance records not updated"
+                "Warning: no identity assigned — role/tradeoff performance records not updated"
             );
         }
     }
@@ -502,7 +502,7 @@ pub fn run_record(
     let agency_dir = dir.join("agency");
     let agents_dir = agency_dir.join("cache/agents");
 
-    let (agent_id, role_id, motivation_id) = if let Some(ref agent_hash) = task.agent {
+    let (agent_id, role_id, tradeoff_id) = if let Some(ref agent_hash) = task.agent {
         match agency::find_agent_by_prefix(&agents_dir, agent_hash) {
             Ok(agent) => (
                 agent.id.clone(),
@@ -539,7 +539,7 @@ pub fn run_record(
         task_id: task_id.to_string(),
         agent_id,
         role_id: role_id.clone(),
-        tradeoff_id: motivation_id.clone(),
+        tradeoff_id: tradeoff_id.clone(),
         score,
         dimensions: dim_map,
         notes: notes.unwrap_or("").to_string(),
@@ -551,7 +551,7 @@ pub fn run_record(
 
     // Save evaluation and trigger retrospective inference for learning assignments
     let config = Config::load_or_default(dir);
-    if !role_id.is_empty() && !motivation_id.is_empty() {
+    if !role_id.is_empty() && !tradeoff_id.is_empty() {
         let eval_path =
             record_evaluation_with_inference(&evaluation, &agency_dir, &config.agency)
                 .context("Failed to record evaluation")?;
@@ -804,7 +804,7 @@ pub fn run_org(
     let agents_dir = agency_dir.join("cache/agents");
     let evals_dir = agency_dir.join("evaluations");
 
-    let (agent_id, role_id, motivation_id) = if let Some(ref agent_hash) = task.agent {
+    let (agent_id, role_id, tradeoff_id) = if let Some(ref agent_hash) = task.agent {
         match agency::find_agent_by_prefix(&agents_dir, agent_hash) {
             Ok(agent) => (agent.id.clone(), agent.role_id.clone(), agent.tradeoff_id.clone()),
             Err(_) => (String::new(), String::new(), String::new()),
@@ -881,7 +881,7 @@ pub fn run_org(
         task_id: task_id.to_string(),
         agent_id: agent_id.clone(),
         role_id: role_id.clone(),
-        tradeoff_id: motivation_id.clone(),
+        tradeoff_id: tradeoff_id.clone(),
         score: composite_score,
         dimensions: dimension_scores.clone(),
         observation_window,

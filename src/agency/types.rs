@@ -418,6 +418,62 @@ fn is_default_executor(executor: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Rubric spectrum
+// ---------------------------------------------------------------------------
+
+/// Discrete rubric level for an evaluation score.
+///
+/// Maps a continuous [0, 1] score onto a five-level spectrum used
+/// in prompt rendering and human-readable reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RubricLevel {
+    /// 0.0–0.2: fundamental failures
+    Failing,
+    /// 0.2–0.4: significant deficiencies
+    BelowExpectations,
+    /// 0.4–0.6: acceptable but unremarkable
+    MeetsExpectations,
+    /// 0.6–0.8: solid, reliable work
+    ExceedsExpectations,
+    /// 0.8–1.0: exceptional, best-in-class
+    Exceptional,
+}
+
+impl RubricLevel {
+    /// Human-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Failing => "Failing",
+            Self::BelowExpectations => "Below Expectations",
+            Self::MeetsExpectations => "Meets Expectations",
+            Self::ExceedsExpectations => "Exceeds Expectations",
+            Self::Exceptional => "Exceptional",
+        }
+    }
+}
+
+impl std::fmt::Display for RubricLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+/// Classify a score in [0, 1] to a rubric level.
+///
+/// Boundary convention: lower-inclusive, upper-exclusive except for the
+/// top bucket which is upper-inclusive.
+pub fn classify_rubric_level(score: f64) -> RubricLevel {
+    match score {
+        s if s < 0.2 => RubricLevel::Failing,
+        s if s < 0.4 => RubricLevel::BelowExpectations,
+        s if s < 0.6 => RubricLevel::MeetsExpectations,
+        s if s < 0.8 => RubricLevel::ExceedsExpectations,
+        _ => RubricLevel::Exceptional,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
 

@@ -189,6 +189,128 @@ pub fn record_evaluation_with_inference(
     Ok(eval_path)
 }
 
+// ---------------------------------------------------------------------------
+// Proper scoring rules (Brier accuracy, calibration, resolution)
+// ---------------------------------------------------------------------------
+
+/// Brier score for a single prediction: (prediction - outcome)^2.
+///
+/// `prediction` is the evaluator's score (0–1) and `outcome` is the
+/// ground-truth outcome (0 or 1, e.g. did the task actually succeed?).
+/// Lower is better. Perfect prediction on a binary outcome gives 0.0.
+pub fn brier_score(prediction: f64, outcome: f64) -> f64 {
+    (prediction - outcome).powi(2)
+}
+
+/// Average Brier score across multiple (prediction, outcome) pairs.
+///
+/// Used to assess evaluator accuracy: are the scores calibrated
+/// against actual task outcomes?
+pub fn brier_accuracy(pairs: &[(f64, f64)]) -> Option<f64> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let sum: f64 = pairs.iter().map(|(p, o)| brier_score(*p, *o)).sum();
+    Some(sum / pairs.len() as f64)
+}
+
+/// Calibration error: average absolute difference between predicted
+/// probability and observed frequency within bins.
+///
+/// Bins scores into `n_bins` equal-width buckets and computes:
+///   (1/K) * Σ |avg_prediction_in_bin - fraction_positive_in_bin|
+///
+/// Perfect calibration returns 0.0. Scores are expected in [0, 1].
+pub fn calibration_error(pairs: &[(f64, f64)], n_bins: usize) -> Option<f64> {
+    if pairs.is_empty() || n_bins == 0 {
+        return None;
+    }
+    let bin_width = 1.0 / n_bins as f64;
+    let mut total_error = 0.0;
+    let mut bins_used = 0;
+
+    for i in 0..n_bins {
+        let lower = i as f64 * bin_width;
+        let upper = if i == n_bins - 1 { 1.0 + f64::EPSILON } else { (i + 1) as f64 * bin_width };
+
+        let in_bin: Vec<&(f64, f64)> = pairs
+            .iter()
+            .filter(|(p, _)| *p >= lower && *p < upper)
+            .collect();
+
+        if in_bin.is_empty() {
+            continue;
+        }
+
+        let avg_pred = in_bin.iter().map(|(p, _)| p).sum::<f64>() / in_bin.len() as f64;
+        let frac_positive = in_bin.iter().map(|(_, o)| o).sum::<f64>() / in_bin.len() as f64;
+
+        total_error += (avg_pred - frac_positive).abs();
+        bins_used += 1;
+    }
+
+    if bins_used == 0 {
+        return None;
+    }
+    Some(total_error / bins_used as f64)
+}
+
+/// Resolution: the variance of the observed frequencies across bins.
+///
+/// Higher resolution means the evaluator can discriminate between
+/// events that happen and those that don't. Computed as:
+///   (1/K) * Σ (fraction_positive_in_bin - base_rate)^2 * n_in_bin / N
+///
+/// Returns a value in [0, 0.25] (maximum when base_rate is 0.5).
+pub fn resolution(pairs: &[(f64, f64)], n_bins: usize) -> Option<f64> {
+    if pairs.is_empty() || n_bins == 0 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let base_rate = pairs.iter().map(|(_, o)| o).sum::<f64>() / n;
+    let bin_width = 1.0 / n_bins as f64;
+    let mut total = 0.0;
+
+    for i in 0..n_bins {
+        let lower = i as f64 * bin_width;
+        let upper = if i == n_bins - 1 { 1.0 + f64::EPSILON } else { (i + 1) as f64 * bin_width };
+
+        let in_bin: Vec<&(f64, f64)> = pairs
+            .iter()
+            .filter(|(p, _)| *p >= lower && *p < upper)
+            .collect();
+
+        if in_bin.is_empty() {
+            continue;
+        }
+
+        let frac_positive = in_bin.iter().map(|(_, o)| o).sum::<f64>() / in_bin.len() as f64;
+        total += (frac_positive - base_rate).powi(2) * in_bin.len() as f64 / n;
+    }
+
+    Some(total)
+}
+
+/// Combined scoring metrics for an evaluator.
+#[derive(Debug, Clone)]
+pub struct ScoringMetrics {
+    pub brier: f64,
+    pub calibration: f64,
+    pub resolution: f64,
+}
+
+/// Compute all three proper scoring metrics for a set of (prediction, outcome) pairs.
+pub fn compute_scoring_metrics(pairs: &[(f64, f64)], n_bins: usize) -> Option<ScoringMetrics> {
+    let brier = brier_accuracy(pairs)?;
+    let cal = calibration_error(pairs, n_bins)?;
+    let res = resolution(pairs, n_bins)?;
+    Some(ScoringMetrics {
+        brier,
+        calibration: cal,
+        resolution: res,
+    })
+}
+
 /// Recalculate the average score from a list of OrgEvalRefs.
 pub fn recalculate_org_avg_score(evaluations: &[OrgEvalRef]) -> Option<f64> {
     let valid: Vec<f64> = evaluations.iter().map(|e| e.score).filter(|s| s.is_finite()).collect();
@@ -272,6 +394,66 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
+    #[test]
+    fn test_brier_score_perfect() {
+        assert!((brier_score(1.0, 1.0)).abs() < f64::EPSILON);
+        assert!((brier_score(0.0, 0.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_brier_score_worst() {
+        assert!((brier_score(0.0, 1.0) - 1.0).abs() < f64::EPSILON);
+        assert!((brier_score(1.0, 0.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_brier_accuracy_basic() {
+        let pairs = vec![(0.9, 1.0), (0.1, 0.0)];
+        let b = brier_accuracy(&pairs).unwrap();
+        // (0.01 + 0.01) / 2 = 0.01
+        assert!((b - 0.01).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_brier_accuracy_empty() {
+        assert!(brier_accuracy(&[]).is_none());
+    }
+
+    #[test]
+    fn test_calibration_error_perfect() {
+        // All predictions in one bin that perfectly match outcomes
+        let pairs = vec![(0.5, 0.5), (0.5, 0.5)];
+        let c = calibration_error(&pairs, 5).unwrap();
+        assert!(c.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_calibration_error_empty() {
+        assert!(calibration_error(&[], 5).is_none());
+    }
+
+    #[test]
+    fn test_resolution_empty() {
+        assert!(resolution(&[], 5).is_none());
+    }
+
+    #[test]
+    fn test_resolution_no_discrimination() {
+        // All outcomes the same, so no discrimination possible
+        let pairs = vec![(0.1, 1.0), (0.5, 1.0), (0.9, 1.0)];
+        let r = resolution(&pairs, 5).unwrap();
+        // base_rate = 1.0, all bin fractions = 1.0, so resolution = 0
+        assert!(r.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compute_scoring_metrics() {
+        let pairs = vec![(0.8, 1.0), (0.2, 0.0), (0.9, 1.0), (0.1, 0.0)];
+        let metrics = compute_scoring_metrics(&pairs, 5).unwrap();
+        assert!(metrics.brier < 0.05); // Good predictions
+        assert!(metrics.calibration < 0.5); // Reasonable calibration
+    }
+
     fn sample_role() -> Role {
         build_role(
             "Implementer",
@@ -300,6 +482,34 @@ mod tests {
             timestamp: "2025-05-01T12:00:00Z".into(),
             context_id: context_id.into(),
         }
+    }
+
+    #[test]
+    fn test_classify_rubric_level() {
+        use super::super::types::{classify_rubric_level, RubricLevel};
+        assert_eq!(classify_rubric_level(0.0), RubricLevel::Failing);
+        assert_eq!(classify_rubric_level(0.1), RubricLevel::Failing);
+        assert_eq!(classify_rubric_level(0.19), RubricLevel::Failing);
+        assert_eq!(classify_rubric_level(0.2), RubricLevel::BelowExpectations);
+        assert_eq!(classify_rubric_level(0.39), RubricLevel::BelowExpectations);
+        assert_eq!(classify_rubric_level(0.4), RubricLevel::MeetsExpectations);
+        assert_eq!(classify_rubric_level(0.59), RubricLevel::MeetsExpectations);
+        assert_eq!(classify_rubric_level(0.6), RubricLevel::ExceedsExpectations);
+        assert_eq!(classify_rubric_level(0.79), RubricLevel::ExceedsExpectations);
+        assert_eq!(classify_rubric_level(0.8), RubricLevel::Exceptional);
+        assert_eq!(classify_rubric_level(1.0), RubricLevel::Exceptional);
+    }
+
+    #[test]
+    fn test_rubric_level_display() {
+        use super::super::types::{classify_rubric_level, RubricLevel};
+        assert_eq!(RubricLevel::Failing.to_string(), "Failing");
+        assert_eq!(RubricLevel::BelowExpectations.to_string(), "Below Expectations");
+        assert_eq!(RubricLevel::MeetsExpectations.to_string(), "Meets Expectations");
+        assert_eq!(RubricLevel::ExceedsExpectations.to_string(), "Exceeds Expectations");
+        assert_eq!(RubricLevel::Exceptional.to_string(), "Exceptional");
+        // label() and Display should match
+        assert_eq!(classify_rubric_level(0.5).label(), "Meets Expectations");
     }
 
     #[test]

@@ -522,6 +522,20 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
          - blocking_impact: 5%\n\n",
     );
 
+    // -- Rubric spectrum --
+    out.push_str(
+        "### Rubric Spectrum\n\n\
+         Map your overall score to one of these levels:\n\n\
+         | Score Range | Level | Meaning |\n\
+         |------------|-------|--------|\n\
+         | 0.0–0.2 | Failing | Fundamental failures; output unusable |\n\
+         | 0.2–0.4 | Below Expectations | Significant deficiencies; major rework needed |\n\
+         | 0.4–0.6 | Meets Expectations | Acceptable but unremarkable |\n\
+         | 0.6–0.8 | Exceeds Expectations | Solid, reliable work |\n\
+         | 0.8–1.0 | Exceptional | Best-in-class output |\n\n\
+         Calibrate your scores against this spectrum. Most competent work falls in 0.6–0.8.\n\n",
+    );
+
     if input.downstream_tasks.is_empty() {
         out.push_str(
             "Note: No downstream tasks are listed. Score organizational dimensions based\n\

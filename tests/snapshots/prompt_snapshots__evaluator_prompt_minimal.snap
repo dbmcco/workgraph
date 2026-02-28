@@ -1,6 +1,5 @@
 ---
 source: tests/prompt_snapshots.rs
-assertion_line: 205
 expression: output
 ---
 # Evaluator Instructions
@@ -63,6 +62,20 @@ Compute an overall **score** as a weighted average:
 - downstream_usability: 15%
 - coordination_overhead: 10%
 - blocking_impact: 5%
+
+### Rubric Spectrum
+
+Map your overall score to one of these levels:
+
+| Score Range | Level | Meaning |
+|------------|-------|--------|
+| 0.0–0.2 | Failing | Fundamental failures; output unusable |
+| 0.2–0.4 | Below Expectations | Significant deficiencies; major rework needed |
+| 0.4–0.6 | Meets Expectations | Acceptable but unremarkable |
+| 0.6–0.8 | Exceeds Expectations | Solid, reliable work |
+| 0.8–1.0 | Exceptional | Best-in-class output |
+
+Calibrate your scores against this spectrum. Most competent work falls in 0.6–0.8.
 
 Note: No downstream tasks are listed. Score organizational dimensions based
 on general output quality: is the work self-contained, well-documented, and
