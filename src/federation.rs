@@ -1815,6 +1815,155 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Primitive type federation tests
+    // -----------------------------------------------------------------------
+
+    fn make_component(id: &str, name: &str) -> RoleComponent {
+        RoleComponent {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: format!("test component {}", name),
+            category: agency::ComponentCategory::Translated,
+            content: agency::ContentRef::Inline("test content".into()),
+            performance: PerformanceRecord::default(),
+            lineage: Lineage::default(),
+            access_control: agency::AccessControl::default(),
+            former_agents: Vec::new(),
+            former_deployments: Vec::new(),
+        }
+    }
+
+    fn make_outcome(id: &str, name: &str) -> DesiredOutcome {
+        DesiredOutcome {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: format!("test outcome {}", name),
+            success_criteria: vec!["criterion 1".into()],
+            performance: PerformanceRecord::default(),
+            lineage: Lineage::default(),
+            access_control: agency::AccessControl::default(),
+            requires_human_oversight: true,
+            former_agents: Vec::new(),
+            former_deployments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transfer_components_between_stores() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        source.save_component(&make_component("c1", "coding")).unwrap();
+        source.save_component(&make_component("c2", "testing")).unwrap();
+
+        let summary = transfer(&source, &target, &TransferOptions::default()).unwrap();
+        assert_eq!(summary.components_added, 2);
+        assert!(target.exists_component("c1"));
+        assert!(target.exists_component("c2"));
+    }
+
+    #[test]
+    fn transfer_outcomes_between_stores() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        source.save_outcome(&make_outcome("o1", "Working code")).unwrap();
+
+        let summary = transfer(&source, &target, &TransferOptions::default()).unwrap();
+        assert_eq!(summary.outcomes_added, 1);
+        assert!(target.exists_outcome("o1"));
+    }
+
+    #[test]
+    fn transfer_tradeoffs_between_stores() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        source.save_tradeoff(&make_motivation("t1", "Careful")).unwrap();
+        source.save_tradeoff(&make_motivation("t2", "Fast")).unwrap();
+
+        let opts = TransferOptions {
+            entity_filter: EntityFilter::Tradeoffs,
+            ..Default::default()
+        };
+        let summary = transfer(&source, &target, &opts).unwrap();
+        assert_eq!(summary.tradeoffs_added, 2);
+        assert!(target.exists_tradeoff("t1"));
+        assert!(target.exists_tradeoff("t2"));
+    }
+
+    #[test]
+    fn transfer_component_with_private_access_denied() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        let mut comp = make_component("c1", "private-comp");
+        comp.access_control.policy = AccessPolicy::Private;
+        source.save_component(&comp).unwrap();
+
+        let summary = transfer(&source, &target, &TransferOptions::default()).unwrap();
+        assert_eq!(summary.components_added, 0);
+        assert_eq!(summary.components_access_denied, 1);
+        assert!(!target.exists_component("c1"));
+    }
+
+    #[test]
+    fn transfer_component_skips_identical() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        let comp = make_component("c1", "coding");
+        source.save_component(&comp).unwrap();
+        target.save_component(&comp).unwrap();
+
+        let summary = transfer(&source, &target, &TransferOptions::default()).unwrap();
+        assert_eq!(summary.components_added, 0);
+        assert_eq!(summary.components_skipped, 1);
+    }
+
+    #[test]
+    fn transfer_component_merges_performance() {
+        let tmp = TempDir::new().unwrap();
+        let source = setup_store(&tmp, "source");
+        let target = setup_store(&tmp, "target");
+
+        let mut comp_src = make_component("c1", "coding");
+        comp_src.performance.task_count = 3;
+        comp_src.performance.avg_score = Some(0.8);
+        comp_src.performance.evaluations.push(EvaluationRef {
+            score: 0.8,
+            task_id: "t1".into(),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            context_id: "ctx1".into(),
+        });
+        source.save_component(&comp_src).unwrap();
+
+        let mut comp_tgt = make_component("c1", "coding");
+        comp_tgt.performance.task_count = 1;
+        comp_tgt.performance.avg_score = Some(0.6);
+        comp_tgt.performance.evaluations.push(EvaluationRef {
+            score: 0.6,
+            task_id: "t0".into(),
+            timestamp: "2024-12-01T00:00:00Z".into(),
+            context_id: "ctx0".into(),
+        });
+        target.save_component(&comp_tgt).unwrap();
+
+        let summary = transfer(&source, &target, &TransferOptions::default()).unwrap();
+        assert_eq!(summary.components_updated, 1);
+
+        // Merged component should have evaluations from both
+        let merged = target.load_components().unwrap();
+        let merged_comp = merged.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(merged_comp.performance.evaluations.len(), 2);
+    }
+
     #[test]
     fn resolve_remote_task_status_unknown_peer() {
         let tmp = TempDir::new().unwrap();
