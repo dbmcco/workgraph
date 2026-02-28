@@ -1,8 +1,8 @@
 # Agency System
 
-The agency system gives workgraph agents composable identities. Instead of every agent being a generic assistant, you define **roles** (what an agent does), **motivations** (why it acts that way), and pair them into **agents** that are assigned to tasks, evaluated, and evolved over time.
+The agency system gives workgraph agents composable identities. Instead of every agent being a generic assistant, you define **roles** (what an agent does), **tradeoffs** (why it acts that way), and pair them into **agents** that are assigned to tasks, evaluated, and evolved over time.
 
-Agents can be **human or AI**. The difference is the executor: AI agents use `claude` (or similar), human agents use `matrix`, `email`, or `shell`. Both share the same identity model — roles, motivations, capabilities, trust levels, and performance tracking all work uniformly regardless of who (or what) is doing the work.
+Agents can be **human or AI**. The difference is the executor: AI agents use `claude` (or similar), human agents use `matrix`, `email`, or `shell`. Both share the same identity model — roles, tradeoffs, capabilities, trust levels, and performance tracking all work uniformly regardless of who (or what) is doing the work.
 
 ## Core Concepts
 
@@ -20,14 +20,14 @@ A role defines **what** an agent does.
 | `lineage` | Evolutionary history | No (mutable) |
 | `default_context_scope` | Default context scope for tasks dispatched with this role (`clean`, `task`, `graph`, `full`) | No (mutable) |
 
-### Motivation
+### Tradeoff
 
-A motivation defines **why** an agent acts the way it does.
+A tradeoff defines **why** an agent acts the way it does.
 
 | Field | Description | Identity-defining? |
 |-------|-------------|--------------------|
 | `name` | Human-readable label (e.g. "Careful") | No |
-| `description` | What this motivation prioritizes | Yes |
+| `description` | What this tradeoff prioritizes | Yes |
 | `acceptable_tradeoffs` | Compromises the agent may make | Yes |
 | `unacceptable_tradeoffs` | Hard constraints the agent must never violate | Yes |
 | `performance` | Aggregated evaluation scores | No (mutable) |
@@ -35,13 +35,13 @@ A motivation defines **why** an agent acts the way it does.
 
 ### Agent
 
-An agent is the **unified identity** in workgraph — it can represent a human or an AI. For AI agents, it is a named pairing of a role and a motivation. For human agents, role and motivation are optional.
+An agent is the **unified identity** in workgraph — it can represent a human or an AI. For AI agents, it is a named pairing of a role and a tradeoff. For human agents, role and tradeoff are optional.
 
 | Field | Description |
 |-------|-------------|
 | `name` | Human-readable label |
 | `role_id` | Content-hash ID of the role (required for AI, optional for human) |
-| `motivation_id` | Content-hash ID of the motivation (required for AI, optional for human) |
+| `tradeoff_id` | Content-hash ID of the tradeoff (required for AI, optional for human) |
 | `capabilities` | Skills/capabilities for task matching (e.g., `rust`, `testing`) |
 | `rate` | Hourly rate for cost forecasting |
 | `capacity` | Maximum concurrent task capacity |
@@ -51,13 +51,13 @@ An agent is the **unified identity** in workgraph — it can represent a human o
 | `performance` | Agent-level aggregated evaluation scores |
 | `lineage` | Evolutionary history |
 
-The same role paired with different motivations produces different agents. A "Programmer" role with a "Careful" motivation produces a different agent than with a "Fast" motivation.
+The same role paired with different tradeoffs produces different agents. A "Programmer" role with a "Careful" tradeoff produces a different agent than with a "Fast" tradeoff.
 
-Human agents are distinguished by their executor. Agents with a human executor (`matrix`, `email`, `shell`) don't need a role or motivation — they're real people who bring their own judgment. AI agents (executor `claude`) require both, because the role and motivation are injected into the prompt to shape behavior.
+Human agents are distinguished by their executor. Agents with a human executor (`matrix`, `email`, `shell`) don't need a role or tradeoff — they're real people who bring their own judgment. AI agents (executor `claude`) require both, because the role and tradeoff are injected into the prompt to shape behavior.
 
 ## Content-Hash IDs
 
-Every role, motivation, and agent is identified by a **SHA-256 content hash** of its identity-defining fields.
+Every role, tradeoff, and agent is identified by a **SHA-256 content hash** of its identity-defining fields.
 
 - **Deterministic**: Same content → same ID
 - **Deduplication**: Can't create two entities with identical content
@@ -66,8 +66,8 @@ Every role, motivation, and agent is identified by a **SHA-256 content hash** of
 | Entity | Hashed fields |
 |--------|---------------|
 | Role | `skills` + `desired_outcome` + `description` |
-| Motivation | `acceptable_tradeoffs` + `unacceptable_tradeoffs` + `description` |
-| Agent | `role_id` + `motivation_id` |
+| Tradeoff | `acceptable_tradeoffs` + `unacceptable_tradeoffs` + `description` |
+| Agent | `role_id` + `tradeoff_id` |
 
 For display, IDs are shown as 8-character prefixes (e.g. `a3f7c21d`). All commands accept unique prefixes.
 
@@ -121,7 +121,7 @@ wg evolve
 
 ## Lifecycle
 
-### 1. Create roles and motivations
+### 1. Create roles and tradeoffs
 
 ```bash
 # Create a role
@@ -131,8 +131,8 @@ wg role add "Programmer" \
   --skill testing \
   --description "Writes, tests, and debugs code"
 
-# Create a motivation
-wg motivation add "Careful" \
+# Create a tradeoff
+wg tradeoff add "Careful" \
   --accept "Slow" \
   --accept "Verbose" \
   --reject "Unreliable" \
@@ -146,22 +146,22 @@ Or seed the built-in starters:
 wg agency init
 ```
 
-This creates four starter roles (Programmer, Reviewer, Documenter, Architect) and four starter motivations (Careful, Fast, Thorough, Balanced).
+This creates four starter roles (Programmer, Reviewer, Documenter, Architect) and four starter tradeoffs (Careful, Fast, Thorough, Balanced).
 
 ### 2. Pair into agents
 
 ```bash
-# AI agent (role + motivation required)
-wg agent create "Careful Programmer" --role <role-hash> --motivation <motivation-hash>
+# AI agent (role + tradeoff required)
+wg agent create "Careful Programmer" --role <role-hash> --tradeoff <tradeoff-hash>
 
 # AI agent with operational fields
 wg agent create "Careful Programmer" \
   --role <role-hash> \
-  --motivation <motivation-hash> \
+  --tradeoff <tradeoff-hash> \
   --capabilities rust,testing \
   --rate 50.0
 
-# Human agent (role + motivation optional)
+# Human agent (role + tradeoff optional)
 wg agent create "Erik" \
   --executor matrix \
   --contact "@erik:server" \
@@ -175,7 +175,7 @@ wg agent create "Erik" \
 wg assign <task-id> <agent-hash>
 ```
 
-When the service spawns that task, the agent's role and motivation are rendered into the prompt as an identity section:
+When the service spawns that task, the agent's role and tradeoff are rendered into the prompt as an identity section:
 
 ```markdown
 # Task Assignment
@@ -237,11 +237,11 @@ The evaluator scores across four dimensions:
 | `correctness` | 40% | Does the output match the desired outcome? |
 | `completeness` | 30% | Were all aspects of the task addressed? |
 | `efficiency` | 15% | Was work done without unnecessary steps? |
-| `style_adherence` | 15% | Were project conventions and motivation constraints followed? |
+| `style_adherence` | 15% | Were project conventions and tradeoff constraints followed? |
 
 The evaluator receives:
 - The task definition (title, description, deliverables)
-- The agent's identity (role + motivation)
+- The agent's identity (role + tradeoff)
 - Task artifacts and log entries
 - The evaluation rubric
 
@@ -261,8 +261,8 @@ It outputs a JSON evaluation:
 
 Scores propagate to three levels:
 1. The **agent's** performance record
-2. The **role's** performance record (with `motivation_id` as context)
-3. The **motivation's** performance record (with `role_id` as context)
+2. The **role's** performance record (with `tradeoff_id` as context)
+3. The **tradeoff's** performance record (with `role_id` as context)
 
 ### 5. Evolve
 
@@ -288,16 +288,16 @@ wg evolve --dry-run                           # preview without applying
 | `wg role rm <id>` | Delete a role |
 | `wg role lineage <id>` | Show evolutionary ancestry |
 
-### `wg motivation`
+### `wg tradeoff`
 
 | Command | Description |
 |---------|-------------|
-| `wg motivation add <name> --accept <text> --reject <text> [-d <text>]` | Create a new motivation |
-| `wg motivation list` | List all motivations |
-| `wg motivation show <id>` | Show details |
-| `wg motivation edit <id>` | Edit in `$EDITOR` (re-hashes on save) |
-| `wg motivation rm <id>` | Delete a motivation |
-| `wg motivation lineage <id>` | Show evolutionary ancestry |
+| `wg tradeoff add <name> --accept <text> --reject <text> [-d <text>]` | Create a new tradeoff |
+| `wg tradeoff list` | List all tradeoffs |
+| `wg tradeoff show <id>` | Show details |
+| `wg tradeoff edit <id>` | Edit in `$EDITOR` (re-hashes on save) |
+| `wg tradeoff rm <id>` | Delete a tradeoff |
+| `wg tradeoff lineage <id>` | Show evolutionary ancestry |
 
 ### `wg agent`
 
@@ -305,9 +305,9 @@ wg evolve --dry-run                           # preview without applying
 |---------|-------------|
 | `wg agent create <name> [OPTIONS]` | Create an agent (see options below) |
 | `wg agent list` | List all agents |
-| `wg agent show <id>` | Show details with resolved role/motivation |
+| `wg agent show <id>` | Show details with resolved role/tradeoff |
 | `wg agent rm <id>` | Remove an agent |
-| `wg agent lineage <id>` | Show agent + role + motivation ancestry |
+| `wg agent lineage <id>` | Show agent + role + tradeoff ancestry |
 | `wg agent performance <id>` | Show evaluation history |
 
 **`wg agent create` options:**
@@ -315,7 +315,7 @@ wg evolve --dry-run                           # preview without applying
 | Option | Description |
 |--------|-------------|
 | `--role <ID>` | Role ID or prefix (required for AI agents) |
-| `--motivation <ID>` | Motivation ID or prefix (required for AI agents) |
+| `--tradeoff <ID>` | Tradeoff ID or prefix (required for AI agents) |
 | `--capabilities <SKILLS>` | Comma-separated skills for task matching |
 | `--rate <FLOAT>` | Hourly rate for cost tracking |
 | `--capacity <FLOAT>` | Maximum concurrent task capacity |
@@ -356,7 +356,7 @@ wg evolve [--strategy <name>] [--budget <N>] [--model <model>] [--dry-run]
 wg agency stats [--min-evals <N>] [--by-model]
 ```
 
-Shows: role leaderboard, motivation leaderboard, synergy matrix, tag breakdown, under-explored combinations.
+Shows: role leaderboard, tradeoff leaderboard, synergy matrix, tag breakdown, under-explored combinations.
 
 | Flag | Description |
 |------|-------------|
@@ -419,9 +419,9 @@ The evolution system improves agency performance by analyzing evaluation data an
 |----------|-------------|
 | `mutation` | Modify a single existing role to improve weak dimensions |
 | `crossover` | Combine traits from two high-performing roles into a new one |
-| `gap-analysis` | Create entirely new roles/motivations for unmet needs |
-| `retirement` | Remove consistently poor-performing roles/motivations |
-| `motivation-tuning` | Adjust trade-offs and constraints on existing motivations |
+| `gap-analysis` | Create entirely new roles/tradeoffs for unmet needs |
+| `retirement` | Remove consistently poor-performing roles/tradeoffs |
+| `tradeoff-tuning` | Adjust trade-offs and constraints on existing tradeoffs |
 | `all` | Use all strategies as appropriate (default) |
 
 ### Operations
@@ -432,14 +432,14 @@ The evolver outputs structured JSON operations:
 |-----------|--------|
 | `create_role` | Creates a new role (typically from gap-analysis) |
 | `modify_role` | Mutates or crosses over an existing role into a new one |
-| `create_motivation` | Creates a new motivation |
-| `modify_motivation` | Tunes an existing motivation into a new variant |
+| `create_tradeoff` | Creates a new tradeoff |
+| `modify_tradeoff` | Tunes an existing tradeoff into a new variant |
 | `retire_role` | Retires a poor-performing role (renamed to `.yaml.retired`) |
-| `retire_motivation` | Retires a poor-performing motivation |
+| `retire_tradeoff` | Retires a poor-performing tradeoff |
 
 ### Safety guardrails
 
-- The last remaining role or motivation cannot be retired
+- The last remaining role or tradeoff cannot be retired
 - Retired entities are preserved as `.yaml.retired` files, not deleted
 - `--dry-run` shows the full evolver prompt without making changes
 - `--budget` limits the number of operations applied
@@ -469,7 +469,7 @@ wg config --retention-heuristics "Retire roles scoring below 0.3 after 10 evalua
 ```
 
 The evolver prompt includes:
-- Performance summaries for all roles and motivations
+- Performance summaries for all roles and tradeoffs
 - Strategy-specific skill documents from `.workgraph/agency/evolver-skills/`
 - The evolver's own identity (if configured)
 - References to the assigner, evaluator, and evolver agent hashes
@@ -483,7 +483,7 @@ Strategy-specific guidance documents live in `.workgraph/agency/evolver-skills/`
 - `role-crossover.md` — procedures for combining two roles
 - `gap-analysis.md` — procedures for identifying missing capabilities
 - `retirement.md` — procedures for removing underperformers
-- `motivation-tuning.md` — procedures for adjusting trade-offs
+- `tradeoff-tuning.md` — procedures for adjusting trade-offs
 
 ## Performance Tracking
 
@@ -492,8 +492,8 @@ Strategy-specific guidance documents live in `.workgraph/agency/evolver-skills/`
 1. Task completes → evaluation is created (4 dimensions + overall score)
 2. Evaluation saved as YAML in `.workgraph/agency/evaluations/`
 3. **Agent's** performance record updated (task count, avg score, eval history)
-4. **Role's** performance record updated (with motivation_id as `context_id`)
-5. **Motivation's** performance record updated (with role_id as `context_id`)
+4. **Role's** performance record updated (with tradeoff_id as `context_id`)
+5. **Tradeoff's** performance record updated (with role_id as `context_id`)
 
 ### Performance records
 
@@ -507,10 +507,10 @@ performance:
     - score: 0.85
       task_id: "implement-feature-x"
       timestamp: "2026-01-15T10:30:00Z"
-      context_id: "<motivation_id>"  # on roles; role_id on motivations
+      context_id: "<tradeoff_id>"  # on roles; role_id on tradeoffs
 ```
 
-The `context_id` cross-references create a performance matrix: how a role performs with different motivations, and vice versa. `wg agency stats` uses this to build a synergy matrix.
+The `context_id` cross-references create a performance matrix: how a role performs with different tradeoffs, and vice versa. `wg agency stats` uses this to build a synergy matrix.
 
 ### Trend indicators
 
@@ -522,7 +522,7 @@ The `context_id` cross-references create a performance matrix: how a role perfor
 
 ## Lineage
 
-Every role, motivation, and agent tracks evolutionary history:
+Every role, tradeoff, and agent tracks evolutionary history:
 
 ```yaml
 lineage:
@@ -544,8 +544,8 @@ lineage:
 
 ```bash
 wg role lineage <id>
-wg motivation lineage <id>
-wg agent lineage <id>        # shows agent + role + motivation ancestry
+wg tradeoff lineage <id>
+wg agent lineage <id>        # shows agent + role + tradeoff ancestry
 ```
 
 ## Storage Layout
@@ -555,11 +555,11 @@ wg agent lineage <id>        # shows agent + role + motivation ancestry
 ├── roles/
 │   ├── <sha256>.yaml            # Role definitions
 │   └── <sha256>.yaml.retired    # Retired roles
-├── motivations/
-│   ├── <sha256>.yaml            # Motivation definitions
-│   └── <sha256>.yaml.retired    # Retired motivations
+├── tradeoffs/
+│   ├── <sha256>.yaml            # Tradeoff definitions
+│   └── <sha256>.yaml.retired    # Retired tradeoffs
 ├── agents/
-│   └── <sha256>.yaml            # Agent definitions (role+motivation pairs)
+│   └── <sha256>.yaml            # Agent definitions (role+tradeoff pairs)
 ├── evaluations/
 │   └── eval-<task-id>-<timestamp>.json  # Evaluation records
 └── evolver-skills/
@@ -567,14 +567,14 @@ wg agent lineage <id>        # shows agent + role + motivation ancestry
     ├── role-crossover.md
     ├── gap-analysis.md
     ├── retirement.md
-    └── motivation-tuning.md
+    └── tradeoff-tuning.md
 ```
 
-Roles, motivations, and agents are stored as YAML. Evaluations are stored as JSON. All filenames are based on the entity's content-hash ID.
+Roles, tradeoffs, and agents are stored as YAML. Evaluations are stored as JSON. All filenames are based on the entity's content-hash ID.
 
 ## Federation
 
-Federation lets you share agency entities (roles, motivations, agents) and their performance data across workgraph projects. Because entities use content-hash IDs, the same role in two projects has the same ID — pull/push merges performance records automatically.
+Federation lets you share agency entities (roles, tradeoffs, agents) and their performance data across workgraph projects. Because entities use content-hash IDs, the same role in two projects has the same ID — pull/push merges performance records automatically.
 
 ### Remotes
 
@@ -610,7 +610,7 @@ wg agency pull <source> --global                     # pull into ~/.workgraph/ag
 
 # Push local entities to another store
 wg agency push <target>                              # push all to path or named remote
-wg agency push <target> --type motivation            # only motivations
+wg agency push <target> --type tradeoff            # only tradeoffs
 wg agency push <target> --entity <id-prefix>         # specific entities
 wg agency push <target> --dry-run                    # preview without writing
 wg agency push <target> --global                     # push from ~/.workgraph/agency/

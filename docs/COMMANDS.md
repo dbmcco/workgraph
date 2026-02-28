@@ -127,6 +127,7 @@ wg edit <ID> [OPTIONS]
 | `--cycle-delay <DUR>` | Set delay between cycle iterations |
 | `--visibility <LEVEL>` | Set task visibility zone: `internal`, `peer`, `public` |
 | `--context-scope <SCOPE>` | Set context scope for prompt assembly: `clean`, `task`, `graph`, `full` |
+| `--exec-mode <MODE>` | Set execution mode: `full` (default) or `bare` (lightweight, no file I/O tools) |
 
 Triggers a `graph_changed` IPC notification to the service daemon, so the coordinator picks up changes immediately.
 
@@ -152,6 +153,9 @@ wg edit my-task --cycle-delay "5m"
 
 # Reduce context for a simple task
 wg edit my-task --context-scope clean
+
+# Use bare execution mode (no file I/O tools)
+wg edit my-task --exec-mode bare
 ```
 
 ---
@@ -323,7 +327,7 @@ wg assign <TASK> <AGENT-HASH>    # Assign agent to task
 wg assign <TASK> --clear         # Remove assignment
 ```
 
-When the service spawns that task, the agent's role and motivation are injected into the prompt. The agent hash can be a prefix (minimum 4 characters).
+When the service spawns that task, the agent's role and tradeoff are injected into the prompt. The agent hash can be a prefix (minimum 4 characters).
 
 **Example:**
 ```bash
@@ -638,48 +642,6 @@ Summary: 1 active, 1 converged
 | Option | Description |
 |--------|-------------|
 | `--json` | Output cycle data as JSON |
-
----
-
-### `wg loops`
-
-**DEPRECATED**: Redirects to `wg cycles` with a deprecation warning. Use `wg cycles` instead.
-
-```bash
-wg loops    # prints deprecation warning and runs wg cycles
-```
-
----
-
-### `wg migrate-loops`
-
-Migrate legacy `loops_to` edges to structural cycles (`after` edges + `CycleConfig`).
-
-```bash
-wg migrate-loops [--dry-run]
-```
-
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `--dry-run` | Show what would be migrated without making changes |
-
-For each `loops_to` edge on a source task targeting a target task:
-1. Adds the source task to the target's `after` list (creating the back-edge)
-2. Sets `CycleConfig` on the target task (preserving `max_iterations`, `guard`, and `delay`)
-3. Removes the `loops_to` edge from the source
-
-**Example:**
-```bash
-wg migrate-loops --dry-run
-# Found 2 loops_to edge(s) to migrate:
-#   review --loops_to--> write (max: 3, guard: None, delay: None)
-#   test --loops_to--> spec (max: 5, guard: Always, delay: Some("5m"))
-# Dry run — no changes made.
-
-wg migrate-loops
-# Migrated 2 loops_to edge(s) to structural cycles.
-```
 
 ---
 
@@ -1206,11 +1168,11 @@ Notifies configured Matrix room(s) about task status changes.
 
 ## Agency Commands
 
-The agency system manages composable agent identities (roles + motivations). See [AGENCY.md](AGENCY.md) for the full design.
+The agency system manages composable agent identities (roles + tradeoffs). See [AGENCY.md](AGENCY.md) for the full design.
 
 ### `wg agency init`
 
-Seed the agency with starter roles (Programmer, Reviewer, Documenter, Architect) and motivations (Careful, Fast, Thorough, Balanced).
+Seed the agency with starter roles (Programmer, Reviewer, Documenter, Architect) and tradeoffs (Careful, Fast, Thorough, Balanced).
 
 ```bash
 wg agency init
@@ -1219,7 +1181,7 @@ wg agency init
 **Example:**
 ```bash
 wg agency init
-# Creates default roles and motivations to get started with agent identities
+# Creates default roles and tradeoffs to get started with agent identities
 ```
 
 ---
@@ -1238,7 +1200,7 @@ wg agency stats [--min-evals <N>]
 | `--min-evals <N>` | Minimum evaluations to consider a pair "explored" (default: 3) |
 | `--by-model` | Group stats by model (shows per-model score breakdown) |
 
-Shows role leaderboard, motivation leaderboard, synergy matrix, tag breakdown, and under-explored combinations.
+Shows role leaderboard, tradeoff leaderboard, synergy matrix, tag breakdown, and under-explored combinations.
 
 ---
 
@@ -1263,18 +1225,18 @@ Manage roles — the "what" of agent identity.
 
 ---
 
-### `wg motivation`
+### `wg tradeoff`
 
-Manage motivations — the "why" of agent identity. Also aliased as `wg mot`.
+Manage tradeoffs — acceptable and unacceptable constraints for agent identity.
 
 | Command | Description |
 |---------|-------------|
-| `wg motivation add <name> --accept <text> --reject <text> [-d <text>]` | Create a new motivation |
-| `wg motivation list` | List all motivations |
-| `wg motivation show <id>` | Show details |
-| `wg motivation edit <id>` | Edit in `$EDITOR` (re-hashes on save) |
-| `wg motivation rm <id>` | Delete a motivation |
-| `wg motivation lineage <id>` | Show evolutionary ancestry |
+| `wg tradeoff add <name> --accept <text> --reject <text> [-d <text>]` | Create a new tradeoff |
+| `wg tradeoff list` | List all tradeoffs |
+| `wg tradeoff show <id>` | Show details |
+| `wg tradeoff edit <id>` | Edit in `$EDITOR` (re-hashes on save) |
+| `wg tradeoff rm <id>` | Delete a tradeoff |
+| `wg tradeoff lineage <id>` | Show evolutionary ancestry |
 
 ---
 
@@ -1290,7 +1252,7 @@ wg agent create <NAME> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--role <ROLE-ID>` | Role ID or prefix (required for AI agents, optional for human) |
-| `--motivation <MOTIVATION-ID>` | Motivation ID or prefix (required for AI agents, optional for human) |
+| `--tradeoff <TRADEOFF-ID>` | Tradeoff ID or prefix (required for AI agents, optional for human) |
 | `--capabilities <SKILLS>` | Comma-separated skills for task matching |
 | `--rate <FLOAT>` | Hourly rate for cost tracking |
 | `--capacity <FLOAT>` | Maximum concurrent task capacity |
@@ -1302,17 +1264,17 @@ IDs can be prefixes (minimum unique match).
 
 **Examples:**
 ```bash
-# AI agent (role + motivation required)
-wg agent create "Careful Coder" --role programmer --motivation careful
+# AI agent (role + tradeoff required)
+wg agent create "Careful Coder" --role programmer --tradeoff careful
 
 # AI agent with operational fields
 wg agent create "Rust Expert" \
   --role programmer \
-  --motivation careful \
+  --tradeoff careful \
   --capabilities rust,testing \
   --rate 50.0
 
-# Human agent (role + motivation optional)
+# Human agent (role + tradeoff optional)
 wg agent create "Erik" \
   --executor matrix \
   --contact "@erik:server" \
@@ -1327,9 +1289,9 @@ wg agent create "Erik" \
 | Command | Description |
 |---------|-------------|
 | `wg agent list` | List all agents |
-| `wg agent show <id>` | Show agent details with resolved role/motivation |
+| `wg agent show <id>` | Show agent details with resolved role/tradeoff |
 | `wg agent rm <id>` | Remove an agent |
-| `wg agent lineage <id>` | Show agent + role + motivation ancestry |
+| `wg agent lineage <id>` | Show agent + role + tradeoff ancestry |
 | `wg agent performance <id>` | Show evaluation history for an agent |
 
 ---
@@ -1371,7 +1333,7 @@ The task must be done or failed. Spawns an evaluator agent that scores the task 
 - **efficiency** (15%) — no unnecessary steps
 - **style_adherence** (15%) — project conventions and constraints followed
 
-Scores propagate to the agent, role, and motivation performance records.
+Scores propagate to the agent, role, and tradeoff performance records.
 
 **Example:**
 ```bash
@@ -1433,10 +1395,22 @@ wg evaluate show --source "outcome:*"
 
 ### `wg evolve`
 
-Trigger an evolution cycle to improve roles and motivations based on performance data.
+Trigger an evolution cycle, or review deferred operations.
 
 ```bash
-wg evolve [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-run]
+wg evolve <SUBCOMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `run` | Trigger an evolution cycle on agency roles and tradeoffs |
+| `review` | Review deferred evolver operations (list, approve, reject) |
+
+#### `wg evolve run`
+
+```bash
+wg evolve run [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-run]
 ```
 
 **Options:**
@@ -1445,17 +1419,29 @@ wg evolve [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-run]
 | `--strategy <name>` | Evolution strategy (default: `all`) |
 | `--budget <N>` | Maximum number of operations to apply |
 | `--model <MODEL>` | LLM model for the evolver agent |
-| `--dry-run` | Show the evolver prompt without executing |
+| `--dry-run` | Show proposed changes without applying them |
 
 **Strategies:**
 | Strategy | Description |
 |----------|-------------|
 | `mutation` | Modify a single existing role to improve weak dimensions |
 | `crossover` | Combine traits from two high-performing roles |
-| `gap-analysis` | Create entirely new roles/motivations for unmet needs |
+| `gap-analysis` | Create entirely new roles/tradeoffs for unmet needs |
 | `retirement` | Remove consistently poor-performing entities |
-| `motivation-tuning` | Adjust trade-offs on existing motivations |
+| `tradeoff-tuning` | Adjust constraints on existing tradeoffs |
 | `all` | Use all strategies as appropriate (default) |
+
+#### `wg evolve review`
+
+```bash
+wg evolve review <SUBCOMMAND>
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List pending deferred operations awaiting human review |
+| `approve <ID>` | Approve a deferred evolver operation and apply it |
+| `reject <ID>` | Reject a deferred evolver operation |
 
 ---
 
