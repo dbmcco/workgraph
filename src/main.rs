@@ -144,11 +144,11 @@ enum Commands {
         description: Option<String>,
 
         /// Add an after dependency
-        #[arg(long = "add-after", alias = "add-blocked-by")]
+        #[arg(long = "add-after", alias = "add-blocked-by", value_delimiter = ',')]
         add_after: Vec<String>,
 
         /// Remove an after dependency
-        #[arg(long = "remove-after", alias = "remove-blocked-by")]
+        #[arg(long = "remove-after", alias = "remove-blocked-by", value_delimiter = ',')]
         remove_after: Vec<String>,
 
         /// Add a tag
@@ -1224,7 +1224,7 @@ enum TraceCommands {
         prefix: Option<String>,
         #[arg(long)]
         dry_run: bool,
-        #[arg(long = "after", alias = "blocked-by")]
+        #[arg(long = "after", alias = "blocked-by", value_delimiter = ',')]
         after: Vec<String>,
         #[arg(long)]
         model: Option<String>,
@@ -1348,7 +1348,7 @@ enum FuncCommands {
         dry_run: bool,
 
         /// Make all root tasks depend on this task (repeatable)
-        #[arg(long = "after", alias = "blocked-by")]
+        #[arg(long = "after", alias = "blocked-by", value_delimiter = ',')]
         after: Vec<String>,
 
         /// Set model for all created tasks
@@ -1719,10 +1719,10 @@ enum RoleCommands {
 }
 
 #[derive(Subcommand)]
-enum MotivationCommands {
-    /// Create a new motivation
+enum TradeoffCommands {
+    /// Create a new tradeoff
     Add {
-        /// Motivation name
+        /// Tradeoff name
         name: String,
 
         /// Acceptable tradeoffs (can be repeated)
@@ -1733,35 +1733,35 @@ enum MotivationCommands {
         #[arg(long)]
         reject: Vec<String>,
 
-        /// Motivation description
+        /// Tradeoff description
         #[arg(long, short = 'd')]
         description: Option<String>,
     },
 
-    /// List all motivations
+    /// List all tradeoffs
     List,
 
-    /// Show full motivation details
+    /// Show full tradeoff details
     Show {
-        /// Motivation ID
+        /// Tradeoff ID
         id: String,
     },
 
-    /// Open motivation YAML in EDITOR for manual editing
+    /// Open tradeoff YAML in EDITOR for manual editing
     Edit {
-        /// Motivation ID
+        /// Tradeoff ID
         id: String,
     },
 
-    /// Remove a motivation
+    /// Remove a tradeoff
     Rm {
-        /// Motivation ID
+        /// Tradeoff ID
         id: String,
     },
 
-    /// Show evolutionary lineage/ancestry tree for a motivation
+    /// Show evolutionary lineage/ancestry tree for a tradeoff
     Lineage {
-        /// Motivation ID
+        /// Tradeoff ID
         id: String,
     },
 }
