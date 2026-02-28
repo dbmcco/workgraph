@@ -12,6 +12,7 @@ use super::ascii::visible_len;
 /// 3. Each node is rendered as a box: ┌─┐ │id│ │status│ └─┘
 /// 4. Vertical lines connect parent layer to child layer
 /// 5. Fan-out uses ┬ splitters, fan-in uses ┴ mergers
+#[allow(clippy::too_many_arguments)]
 pub fn generate_graph(
     graph: &WorkGraph,
     tasks: &[&Task],
@@ -27,6 +28,7 @@ pub fn generate_graph(
 
 /// Like generate_graph but allows overriding the displayed status for each task.
 /// Used by trace animation to show historical snapshots.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_graph_with_overrides(
     _graph: &WorkGraph,
     tasks: &[&Task],

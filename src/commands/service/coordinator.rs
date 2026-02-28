@@ -114,6 +114,8 @@ fn check_ready_or_return(
 fn build_auto_assign_tasks(graph: &mut workgraph::graph::WorkGraph, config: &Config, dir: &Path) -> bool {
     let mut modified = false;
 
+    let grace_seconds = config.agency.auto_assign_grace_seconds;
+
     // Collect task data to avoid holding references while mutating graph
     let ready_task_data: Vec<_> = {
         let cycle_analysis = graph.compute_cycle_analysis();
@@ -131,6 +133,7 @@ fn build_auto_assign_tasks(graph: &mut workgraph::graph::WorkGraph, config: &Con
                     t.tags.clone(),
                     t.after.clone(),
                     t.context_scope.clone(),
+                    t.created_at.clone(),
                 )
             })
             .collect()
@@ -140,7 +143,7 @@ fn build_auto_assign_tasks(graph: &mut workgraph::graph::WorkGraph, config: &Con
     let agency_dir = dir.join("agency");
     let total_assignments = count_assignment_records(&agency_dir.join("assignments")) as u32;
 
-    for (task_id, task_title, task_desc, task_skills, task_agent, task_assigned, task_tags, task_after, task_context_scope) in
+    for (task_id, task_title, task_desc, task_skills, task_agent, task_assigned, task_tags, task_after, task_context_scope, task_created_at) in
         ready_task_data
     {
         // Skip tasks that already have an agent or are already claimed
@@ -157,6 +160,22 @@ fn build_auto_assign_tasks(graph: &mut workgraph::graph::WorkGraph, config: &Con
         {
             continue;
         }
+
+        // Grace period: skip tasks created less than `auto_assign_grace_seconds` ago.
+        // This prevents premature assignment when tasks are created and then have
+        // dependencies wired shortly after (e.g., `wg add` then `wg edit --add-after`).
+        if grace_seconds > 0
+            && let Some(ref created_str) = task_created_at
+                && let Ok(created) = created_str.parse::<chrono::DateTime<chrono::Utc>>() {
+                    let age = Utc::now().signed_duration_since(created);
+                    if age.num_seconds() < grace_seconds as i64 {
+                        eprintln!(
+                            "[coordinator] Skipping auto-assign for '{}': created {}s ago (grace period: {}s)",
+                            task_id, age.num_seconds(), grace_seconds,
+                        );
+                        continue;
+                    }
+                }
 
         let assign_task_id = format!("assign-{}", task_id);
 
@@ -639,11 +658,10 @@ fn build_auto_evaluate_tasks(
         graph.add_node(Node::Task(eval_task));
 
         // Tag the source task so we never recreate the eval task after gc.
-        if let Some(source) = graph.get_task_mut(task_id) {
-            if !source.tags.iter().any(|t| t == "eval-scheduled") {
+        if let Some(source) = graph.get_task_mut(task_id)
+            && !source.tags.iter().any(|t| t == "eval-scheduled") {
                 source.tags.push("eval-scheduled".to_string());
             }
-        }
 
         eprintln!(
             "[coordinator] Created evaluation task '{}' blocked by '{}'",

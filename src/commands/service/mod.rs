@@ -953,13 +953,12 @@ pub fn run_daemon(
         let mut should_tick = false;
         if !daemon_cfg.paused {
             // Settled tick: the settling deadline has passed after GraphChanged events.
-            if let Some(deadline) = settling_deadline {
-                if Instant::now() >= deadline {
+            if let Some(deadline) = settling_deadline
+                && Instant::now() >= deadline {
                     settling_deadline = None;
                     should_tick = true;
                     logger.info("Settling delay elapsed, running coordinator tick now");
                 }
-            }
             // Background safety-net tick: runs on poll_interval even without IPC events.
             if last_coordinator_tick.elapsed() >= daemon_cfg.poll_interval {
                 should_tick = true;

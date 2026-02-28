@@ -41,7 +41,7 @@ pub fn determine_assignment_path(
     // Forced exploration takes precedence
     if config.exploration_interval > 0
         && task_count > 0
-        && task_count % config.exploration_interval == 0
+        && task_count.is_multiple_of(config.exploration_interval)
     {
         return AssignmentPath::ForcedExploration;
     }
@@ -148,7 +148,7 @@ pub fn design_experiment(
     // Check bizarre ideation schedule
     if config.bizarre_ideation_interval > 0
         && learning_assignment_count > 0
-        && learning_assignment_count % config.bizarre_ideation_interval == 0
+        && learning_assignment_count.is_multiple_of(config.bizarre_ideation_interval)
     {
         return AssignmentExperiment {
             base_composition: None,
@@ -336,8 +336,8 @@ pub fn process_retrospective_inference(
         | ExperimentDimension::TradeoffConfig { introduced, .. } => {
             // Propagate score to the introduced primitive
             let component_path = components_dir.join(format!("{}.yaml", introduced));
-            if component_path.exists() {
-                if let Ok(mut component) = load_component(&component_path) {
+            if component_path.exists()
+                && let Ok(mut component) = load_component(&component_path) {
                     let eval_ref = EvaluationRef {
                         score: eval_score,
                         task_id: task_id.to_string(),
@@ -347,13 +347,12 @@ pub fn process_retrospective_inference(
                     super::eval::update_performance(&mut component.performance, eval_ref);
                     let _ = save_component(&component, &components_dir);
                 }
-            }
 
             // Update attractor weight on agent
             if let Some(base_id) = &experiment.base_composition {
                 let agent_path = agents_dir.join(format!("{}.yaml", base_id));
-                if agent_path.exists() {
-                    if let Ok(agent) = load_agent(&agent_path) {
+                if agent_path.exists()
+                    && let Ok(agent) = load_agent(&agent_path) {
                         let base_avg = agent.performance.avg_score.unwrap_or(0.5);
                         // Adjust attractor weights on the agent
                         // If experiment score > base avg, increase weight; otherwise decrease
@@ -368,7 +367,6 @@ pub fn process_retrospective_inference(
                         }
                         let _ = save_agent(&updated_agent, &agents_dir);
                     }
-                }
             }
         }
         ExperimentDimension::NovelComposition => {
@@ -379,8 +377,8 @@ pub fn process_retrospective_inference(
                 if let Ok(role) = find_role_by_prefix(&roles_dir, &agent.role_id) {
                     for comp_id in &role.component_ids {
                         let comp_path = components_dir.join(format!("{}.yaml", comp_id));
-                        if comp_path.exists() {
-                            if let Ok(mut comp) = load_component(&comp_path) {
+                        if comp_path.exists()
+                            && let Ok(mut comp) = load_component(&comp_path) {
                                 let eval_ref = EvaluationRef {
                                     score: eval_score,
                                     task_id: task_id.to_string(),
@@ -390,7 +388,6 @@ pub fn process_retrospective_inference(
                                 super::eval::update_performance(&mut comp.performance, eval_ref);
                                 let _ = save_component(&comp, &components_dir);
                             }
-                        }
                     }
                 }
             }
@@ -402,8 +399,8 @@ pub fn process_retrospective_inference(
         // The agent already exists in the cache by definition (it was deployed),
         // but update its performance to reflect this high score
         let agent_path = agents_dir.join(format!("{}.yaml", record.agent_id));
-        if agent_path.exists() {
-            if let Ok(mut agent) = load_agent(&agent_path) {
+        if agent_path.exists()
+            && let Ok(mut agent) = load_agent(&agent_path) {
                 let eval_ref = EvaluationRef {
                     score: eval_score,
                     task_id: task_id.to_string(),
@@ -413,7 +410,6 @@ pub fn process_retrospective_inference(
                 super::eval::update_performance(&mut agent.performance, eval_ref);
                 let _ = save_agent(&agent, &agents_dir);
             }
-        }
     }
 
     Ok(())

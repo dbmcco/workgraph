@@ -19,7 +19,7 @@ struct BackEdgeArc {
 ///   ← always marks the dependent node regardless of vertical position
 /// - Arrowheads: → on left (tree connectors), ← on right (arc dependents)
 /// - Dash fill (─) connects node text to right-side arcs
-#[allow(clippy::only_used_in_recursion)]
+#[allow(clippy::only_used_in_recursion, clippy::too_many_arguments)]
 pub(crate) fn generate_ascii(
     graph: &WorkGraph,
     tasks: &[&Task],
@@ -489,16 +489,14 @@ pub(crate) fn generate_ascii(
 
                 // Already rendered: record arc, emit nothing
                 if rendered.contains(id) {
-                    if let Some(pid) = parent_id {
-                        if let Some(&blocker_line) = node_line_map.get(pid) {
-                            if let Some(&dependent_line) = node_line_map.get(id) {
+                    if let Some(pid) = parent_id
+                        && let Some(&blocker_line) = node_line_map.get(pid)
+                            && let Some(&dependent_line) = node_line_map.get(id) {
                                 back_edge_arcs.push(BackEdgeArc {
                                     blocker_line,
                                     dependent_line,
                                 });
                             }
-                        }
-                    }
                     return;
                 }
 
@@ -562,11 +560,10 @@ pub(crate) fn generate_ascii(
         }
 
         // For single-node independent WCCs, append "(independent)" label
-        if component.len() == 1 && is_independent(component[0]) {
-            if let Some(last_line) = lines.last_mut() {
+        if component.len() == 1 && is_independent(component[0])
+            && let Some(last_line) = lines.last_mut() {
                 last_line.push_str("  (independent)");
             }
-        }
     }
 
     // Add arcs for fan-in edges that were moved during diamond restructuring
@@ -621,7 +618,7 @@ fn fill_line_to(line: &mut String, target_len: usize, dim: &str, reset: &str) {
 ///
 /// Corner characters: `┐` at top, `┘` at bottom, `┤` at intermediate.
 /// Dash fill (`─`) connects node text to the arc column.
-fn draw_back_edge_arcs(lines: &mut Vec<String>, arcs: &[BackEdgeArc], use_color: bool) {
+fn draw_back_edge_arcs(lines: &mut [String], arcs: &[BackEdgeArc], use_color: bool) {
     if arcs.is_empty() {
         return;
     }
@@ -796,9 +793,7 @@ fn draw_back_edge_arcs(lines: &mut Vec<String>, arcs: &[BackEdgeArc], use_color:
                         if is_dep { "←┐" } else { "─┐" }
                     } else if is_bottom {
                         if is_dep { "←┘" } else { "─┘" }
-                    } else {
-                        if is_dep { "←┤" } else { "─┤" }
-                    };
+                    } else if is_dep { "←┤" } else { "─┤" };
 
                     let current = visible_len(line);
                     if current < end {

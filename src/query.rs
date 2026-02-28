@@ -364,17 +364,13 @@ pub fn ready_tasks_cycle_aware<'a>(
                 // is a loop-back edge; the iterator should not block the worker.
                 // But the cycle header (task with cycle_config) must NEVER skip
                 // its own forward dependencies — it must wait for workers to finish.
-                if task.cycle_config.is_none() {
-                    if let Some(blocker) = graph.get_task(blocker_id) {
-                        if blocker.cycle_config.is_some() {
-                            if let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id) {
-                                if cycle_analysis.task_to_cycle.get(&task.id) == Some(bc) {
+                if task.cycle_config.is_none()
+                    && let Some(blocker) = graph.get_task(blocker_id)
+                        && blocker.cycle_config.is_some()
+                            && let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id)
+                                && cycle_analysis.task_to_cycle.get(&task.id) == Some(bc) {
                                     return true;
                                 }
-                            }
-                        }
-                    }
-                }
                 false
             })
         })
@@ -407,17 +403,13 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
                 // Cycle-aware: only exempt WORKERS from back-edge blockers.
                 // The cycle header (task with cycle_config) must wait for its
                 // forward dependencies (workers) to complete.
-                if task.cycle_config.is_none() {
-                    if let Some(blocker) = graph.get_task(blocker_id) {
-                        if blocker.cycle_config.is_some() {
-                            if let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id) {
-                                if cycle_analysis.task_to_cycle.get(&task.id) == Some(bc) {
+                if task.cycle_config.is_none()
+                    && let Some(blocker) = graph.get_task(blocker_id)
+                        && blocker.cycle_config.is_some()
+                            && let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id)
+                                && cycle_analysis.task_to_cycle.get(&task.id) == Some(bc) {
                                     return true;
                                 }
-                            }
-                        }
-                    }
-                }
                 false
             })
         })

@@ -11,6 +11,7 @@ use super::meta::{
     apply_meta_swap_role, apply_meta_swap_tradeoff, apply_meta_compose_agent,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_operation(
     op: &EvolverOperation,
     existing_roles: &[Role],

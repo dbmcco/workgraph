@@ -109,6 +109,7 @@ impl Default for EvolverTarget {
 
 /// A single evolution operation returned by the evolver agent.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Default)]
 pub struct EvolverOperation {
     /// Operation type: create_role, modify_role, create_motivation, modify_motivation,
     /// retire_role, retire_motivation, wording_mutation, component_substitution,
@@ -213,39 +214,6 @@ pub struct EvolverOperation {
     pub ideation_prompt: Option<String>,
 }
 
-impl Default for EvolverOperation {
-    fn default() -> Self {
-        Self {
-            op: String::new(),
-            entity_type: None,
-            target_id: None,
-            add_component_id: None,
-            remove_component_id: None,
-            new_outcome_id: None,
-            new_tradeoff_id: None,
-            new_name: None,
-            new_description: None,
-            new_content: None,
-            new_category: None,
-            new_success_criteria: None,
-            new_acceptable_tradeoffs: None,
-            new_unacceptable_tradeoffs: None,
-            selection_method: None,
-            new_id: None,
-            name: None,
-            description: None,
-            component_ids: None,
-            outcome_id: None,
-            role_id: None,
-            tradeoff_id: None,
-            acceptable_tradeoffs: None,
-            unacceptable_tradeoffs: None,
-            meta_role: None,
-            rationale: None,
-            ideation_prompt: None,
-        }
-    }
-}
 
 /// Top-level structured output from the evolver agent.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]

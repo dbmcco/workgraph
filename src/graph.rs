@@ -427,8 +427,8 @@ pub fn format_token_display(
     eval_usage: Option<&TokenUsage>,
 ) -> Option<String> {
     let has_work = usage.is_some();
-    let has_assign = assign_usage.map_or(false, |a| a.total_input() + a.output_tokens > 0);
-    let has_eval = eval_usage.map_or(false, |e| e.total_input() + e.output_tokens > 0);
+    let has_assign = assign_usage.is_some_and(|a| a.total_input() + a.output_tokens > 0);
+    let has_eval = eval_usage.is_some_and(|e| e.total_input() + e.output_tokens > 0);
 
     if !has_work && !has_assign && !has_eval {
         return None;
@@ -1112,13 +1112,12 @@ fn reactivate_cycle(
     let guard_is_set = cycle_config.guard.is_some()
         && !matches!(cycle_config.guard, Some(LoopGuard::Always));
 
-    if !guard_is_set {
-        if let Some(owner) = graph.get_task(config_owner_id)
+    if !guard_is_set
+        && let Some(owner) = graph.get_task(config_owner_id)
             && owner.tags.contains(&"converged".to_string())
         {
             return vec![];
         }
-    }
 
     // Check max_iterations
     let current_iter = graph

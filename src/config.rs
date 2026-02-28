@@ -154,6 +154,7 @@ fn default_ucb_exploration_constant() -> f64 { std::f64::consts::SQRT_2 }
 fn default_novelty_bonus_multiplier() -> f64 { 1.5 }
 fn default_bizarre_ideation_interval() -> u32 { 10 }
 fn default_performance_threshold() -> f64 { 0.7 }
+fn default_auto_assign_grace_seconds() -> u64 { 10 }
 
 
 /// Agency (evolutionary identity system) configuration
@@ -276,6 +277,13 @@ pub struct AgencyConfig {
     /// Default: 0.7
     #[serde(default = "default_performance_threshold")]
     pub performance_threshold: f64,
+
+    /// Grace period in seconds after task creation before auto-assignment
+    /// is eligible. Prevents premature assignment when tasks are created
+    /// and then have dependencies wired shortly after.
+    /// Default: 10
+    #[serde(default = "default_auto_assign_grace_seconds")]
+    pub auto_assign_grace_seconds: u64,
 }
 
 impl Default for AgencyConfig {
@@ -306,6 +314,7 @@ impl Default for AgencyConfig {
             novelty_bonus_multiplier: default_novelty_bonus_multiplier(),
             bizarre_ideation_interval: default_bizarre_ideation_interval(),
             performance_threshold: default_performance_threshold(),
+            auto_assign_grace_seconds: default_auto_assign_grace_seconds(),
         }
     }
 }

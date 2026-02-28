@@ -2187,12 +2187,11 @@ fn print_curated_help(subcommands: &[(String, String)], show_all: bool) {
 
         // First pull from DEFAULT_ORDER (preserving curated priority)
         for &default_cmd in usage::DEFAULT_ORDER {
-            if !shown.contains(&default_cmd.to_string()) {
-                if let Some(entry) = subcommands.iter().find(|(n, _)| n == default_cmd) {
+            if !shown.contains(default_cmd)
+                && let Some(entry) = subcommands.iter().find(|(n, _)| n == default_cmd) {
                     extra.push(entry);
                     shown.insert(entry.0.clone());
                 }
-            }
         }
 
         // Then any remaining commands alphabetically
@@ -2590,11 +2589,7 @@ fn main() -> Result<()> {
         } => {
             let layout_mode: commands::viz::LayoutMode = layout.parse().unwrap_or_default();
             let _explicit_static_format = dot || mermaid || graph || output.is_some();
-            let use_tui = if tui_mode {
-                true
-            } else {
-                false
-            };
+            let use_tui = tui_mode;
 
             if use_tui {
                 let options = commands::viz::VizOptions {

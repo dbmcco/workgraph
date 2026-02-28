@@ -177,12 +177,11 @@ fn gather_project_context(workgraph_dir: &Path) -> String {
 
     // Try CLAUDE.md
     let claude_md = project_root.join("CLAUDE.md");
-    if claude_md.exists() {
-        if let Ok(content) = std::fs::read_to_string(&claude_md) {
+    if claude_md.exists()
+        && let Ok(content) = std::fs::read_to_string(&claude_md) {
             let truncated = if content.len() > 3000 { &content[..3000] } else { &content };
             context_parts.push(format!("### CLAUDE.md\n{}", truncated));
         }
-    }
 
     // Try README.md or README
     for name in &["README.md", "README", "README.txt"] {
@@ -198,8 +197,8 @@ fn gather_project_context(workgraph_dir: &Path) -> String {
 
     // Try Cargo.toml or package.json for project description
     let cargo_toml = project_root.join("Cargo.toml");
-    if cargo_toml.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
+    if cargo_toml.exists()
+        && let Ok(content) = std::fs::read_to_string(&cargo_toml) {
             // Just the [package] section
             if let Some(pkg_start) = content.find("[package]") {
                 let section_end = content[pkg_start + 9..]
@@ -209,7 +208,6 @@ fn gather_project_context(workgraph_dir: &Path) -> String {
                 context_parts.push(format!("### Cargo.toml [package]\n{}", &content[pkg_start..section_end]));
             }
         }
-    }
 
     if context_parts.is_empty() {
         "No project context files found.".to_string()
@@ -291,7 +289,7 @@ fn parse_creator_output(raw: &str) -> Result<CreatorOutput> {
         (Some(start), Some(end)) if end > start => {
             let json_slice = &json_str[start..=end];
             serde_json::from_str(json_slice)
-                .with_context(|| format!("Failed to parse creator JSON output"))
+                .with_context(|| "Failed to parse creator JSON output".to_string())
         }
         _ => bail!("No JSON object found in creator output"),
     }

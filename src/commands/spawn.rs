@@ -213,13 +213,11 @@ fn build_scope_context(
     }
 
     // Graph+ scope: project description
-    if scope >= ContextScope::Graph {
-        if let Some(ref desc) = config.project.description {
-            if !desc.is_empty() {
+    if scope >= ContextScope::Graph
+        && let Some(ref desc) = config.project.description
+            && !desc.is_empty() {
                 ctx.project_description = desc.clone();
             }
-        }
-    }
 
     // Graph+ scope: 1-hop neighborhood subgraph summary
     if scope >= ContextScope::Graph {
@@ -436,10 +434,9 @@ fn build_graph_summary(
 fn build_full_graph_summary(graph: &workgraph::WorkGraph) -> String {
     let mut parts = vec!["## Full Graph Summary\n".to_string()];
     let mut budget = 4000i32;
-    let mut task_count = 0u32;
     let total = graph.tasks().count();
 
-    for t in graph.tasks() {
+    for (task_count, t) in graph.tasks().enumerate() {
         let deps = if t.after.is_empty() {
             String::new()
         } else {
@@ -448,12 +445,11 @@ fn build_full_graph_summary(graph: &workgraph::WorkGraph) -> String {
         let line = format!("- **{}** [{}]: {}{}\n", t.id, t.status, t.title, deps);
         budget -= line.len() as i32;
         if budget < 0 {
-            let remaining = total - task_count as usize;
+            let remaining = total - task_count;
             parts.push(format!("... and {} more tasks", remaining));
             break;
         }
         parts.push(line);
-        task_count += 1;
     }
 
     parts.join("")
@@ -472,10 +468,7 @@ fn read_claude_md(workgraph_dir: &Path) -> String {
     };
 
     let claude_md_path = project_root.join("CLAUDE.md");
-    match std::fs::read_to_string(&claude_md_path) {
-        Ok(content) => content,
-        Err(_) => String::new(),
-    }
+    std::fs::read_to_string(&claude_md_path).unwrap_or_default()
 }
 
 /// Resolve the context scope for a task using the priority hierarchy:

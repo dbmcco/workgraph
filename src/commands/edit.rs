@@ -248,6 +248,29 @@ pub fn run(
         }
     } // task borrow released here
 
+    // When new dependencies are added, clear any existing auto-assignment.
+    // This prevents the race where a task gets assigned before its real
+    // dependencies are wired (e.g., `wg add` then `wg edit --add-after`).
+    if !add_after.is_empty() && changed {
+        let assign_task_id = format!("assign-{}", task_id);
+        if let Some(assign_task) = graph.get_task_mut(&assign_task_id) {
+            match assign_task.status {
+                workgraph::graph::Status::Open | workgraph::graph::Status::InProgress => {
+                    assign_task.status = workgraph::graph::Status::Abandoned;
+                    println!("Abandoned assignment task '{}' (dependencies changed)", assign_task_id);
+                }
+                _ => {}
+            }
+        }
+
+        // Clear the agent field so the task gets re-assigned when actually ready
+        let task = graph.get_task_mut_or_err(task_id)?;
+        if task.agent.is_some() {
+            task.agent = None;
+            println!("Cleared agent assignment (dependencies changed, will re-assign when ready)");
+        }
+    }
+
     // Maintain bidirectional consistency: update `blocks` on referenced tasks
     let task_id_owned = task_id.to_string();
     for dep in add_after {
@@ -860,6 +883,173 @@ mod tests {
         assert!(
             !blocker.before.contains(&"test-task".to_string()),
             "blocker-task.before should NOT contain test-task after removal"
+        );
+    }
+
+    #[test]
+    fn test_add_after_clears_agent_assignment() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_graph_with_two_tasks(temp_dir.path()).unwrap();
+
+        // Set an agent on test-task
+        let path = graph_path(temp_dir.path());
+        {
+            let mut graph = load_graph(&path).unwrap();
+            let task = graph.get_task_mut("test-task").unwrap();
+            task.agent = Some("some-agent-hash".to_string());
+            save_graph(&graph, &path).unwrap();
+        }
+
+        // Add a new dependency
+        run(
+            temp_dir.path(),
+            "test-task",
+            None,
+            None,
+            &["blocker-task".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("test-task").unwrap();
+        assert!(
+            task.agent.is_none(),
+            "agent should be cleared when new dependencies are added"
+        );
+        assert!(
+            task.after.contains(&"blocker-task".to_string()),
+            "dependency should be added"
+        );
+    }
+
+    #[test]
+    fn test_add_after_abandons_assign_task() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_graph_with_two_tasks(temp_dir.path()).unwrap();
+
+        // Create an assign task for test-task
+        let path = graph_path(temp_dir.path());
+        {
+            let mut graph = load_graph(&path).unwrap();
+            let assign_task = workgraph::graph::Task {
+                id: "assign-test-task".to_string(),
+                title: "Assign agent for: Test Task".to_string(),
+                status: workgraph::graph::Status::Open,
+                tags: vec!["assignment".to_string()],
+                before: vec!["test-task".to_string()],
+                ..workgraph::graph::Task::default()
+            };
+            graph.add_node(workgraph::graph::Node::Task(assign_task));
+            save_graph(&graph, &path).unwrap();
+        }
+
+        // Add a new dependency
+        run(
+            temp_dir.path(),
+            "test-task",
+            None,
+            None,
+            &["blocker-task".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let graph = load_graph(&path).unwrap();
+        let assign = graph.get_task("assign-test-task").unwrap();
+        assert_eq!(
+            assign.status,
+            workgraph::graph::Status::Abandoned,
+            "assign task should be abandoned when deps change"
+        );
+    }
+
+    #[test]
+    fn test_add_duplicate_dep_does_not_clear_agent() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_graph_with_two_tasks(temp_dir.path()).unwrap();
+
+        // First add the dependency
+        run(
+            temp_dir.path(),
+            "test-task",
+            None,
+            None,
+            &["blocker-task".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Now set an agent
+        let path = graph_path(temp_dir.path());
+        {
+            let mut graph = load_graph(&path).unwrap();
+            let task = graph.get_task_mut("test-task").unwrap();
+            task.agent = Some("some-agent-hash".to_string());
+            save_graph(&graph, &path).unwrap();
+        }
+
+        // Try to add the same dep again (no actual new dep)
+        run(
+            temp_dir.path(),
+            "test-task",
+            None,
+            None,
+            &["blocker-task".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Agent should NOT be cleared since no new deps were actually added
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("test-task").unwrap();
+        assert!(
+            task.agent.is_some(),
+            "agent should NOT be cleared when no new deps are actually added"
         );
     }
 }

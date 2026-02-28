@@ -400,15 +400,14 @@ impl VizApp {
         if let Some(match_idx) = self.current_match {
             let orig_line = self.fuzzy_matches[match_idx].line_idx;
             // Convert to visible position.
-            if let Some(visible_pos) = self.original_to_visible(orig_line) {
-                if visible_pos < self.scroll.offset_y
-                    || visible_pos >= self.scroll.offset_y + self.scroll.viewport_height
+            if let Some(visible_pos) = self.original_to_visible(orig_line)
+                && (visible_pos < self.scroll.offset_y
+                    || visible_pos >= self.scroll.offset_y + self.scroll.viewport_height)
                 {
                     let half = self.scroll.viewport_height / 2;
                     self.scroll.offset_y = visible_pos.saturating_sub(half);
                     self.scroll.clamp();
                 }
-            }
         }
     }
 
@@ -583,15 +582,12 @@ impl VizApp {
         let mut seen = HashSet::new();
         for visible_idx in 0..visible_count {
             let orig_idx = self.visible_to_original(visible_idx);
-            if let Some(plain) = self.plain_lines.get(orig_idx) {
-                if let Some(task_id) = extract_task_id(plain) {
-                    if seen.insert(task_id.clone()) {
-                        if let Some(task_usage) = self.task_token_map.get(&task_id) {
+            if let Some(plain) = self.plain_lines.get(orig_idx)
+                && let Some(task_id) = extract_task_id(plain)
+                    && seen.insert(task_id.clone())
+                        && let Some(task_usage) = self.task_token_map.get(&task_id) {
                             usage.accumulate(task_usage);
                         }
-                    }
-                }
-            }
         }
         usage
     }
@@ -686,15 +682,14 @@ fn compute_filtered_indices(
                 if is_summary_line(&plain_lines[ancestor_idx]) {
                     continue;
                 }
-                if let Some(indent) = line_indent_level(&plain_lines[ancestor_idx]) {
-                    if indent < need_below {
+                if let Some(indent) = line_indent_level(&plain_lines[ancestor_idx])
+                    && indent < need_below {
                         visible.insert(ancestor_idx);
                         need_below = indent;
                         if indent == 0 {
                             break; // reached root
                         }
                     }
-                }
             }
         }
 

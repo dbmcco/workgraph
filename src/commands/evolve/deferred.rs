@@ -155,11 +155,10 @@ pub(crate) fn should_defer(op: &EvolverOperation, agency_dir: &Path) -> Option<D
             let outcome_path = agency_dir
                 .join("primitives/outcomes")
                 .join(format!("{}.yaml", target_id));
-            if let Ok(outcome) = agency::load_outcome(&outcome_path) {
-                if outcome.requires_human_oversight {
+            if let Ok(outcome) = agency::load_outcome(&outcome_path)
+                && outcome.requires_human_oversight {
                     return Some(DeferralReason::ObjectiveChange);
                 }
-            }
         }
         // For bizarre_ideation outcomes (already handled above), or new outcomes
         // with requires_human_oversight default = true
@@ -169,18 +168,16 @@ pub(crate) fn should_defer(op: &EvolverOperation, agency_dir: &Path) -> Option<D
     }
 
     // random_compose_role: check if the selected outcome has requires_human_oversight
-    if op.op == "random_compose_role" {
-        if let Some(ref oid) = op.outcome_id {
+    if op.op == "random_compose_role"
+        && let Some(ref oid) = op.outcome_id {
             let outcome_path = agency_dir
                 .join("primitives/outcomes")
                 .join(format!("{}.yaml", oid));
-            if let Ok(outcome) = agency::load_outcome(&outcome_path) {
-                if outcome.requires_human_oversight {
+            if let Ok(outcome) = agency::load_outcome(&outcome_path)
+                && outcome.requires_human_oversight {
                     return Some(DeferralReason::ObjectiveChange);
                 }
-            }
         }
-    }
 
     None
 }
@@ -246,11 +243,10 @@ pub fn run_deferred_list(dir: &Path, json: bool) -> Result<()> {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let contents = fs::read_to_string(&path)?;
-            if let Ok(deferred) = serde_json::from_str::<DeferredOperation>(&contents) {
-                if deferred.human_decision.is_none() {
+            if let Ok(deferred) = serde_json::from_str::<DeferredOperation>(&contents)
+                && deferred.human_decision.is_none() {
                     ops.push(deferred);
                 }
-            }
         }
     }
 

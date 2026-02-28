@@ -10,11 +10,10 @@ use workgraph::graph::{format_tokens, TokenUsage};
 
 pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     // Clear expired jump targets (>2 seconds old).
-    if let Some((_, when)) = app.jump_target {
-        if when.elapsed() > std::time::Duration::from_secs(2) {
+    if let Some((_, when)) = app.jump_target
+        && when.elapsed() > std::time::Duration::from_secs(2) {
             app.jump_target = None;
         }
-    }
 
     let area = frame.area();
 

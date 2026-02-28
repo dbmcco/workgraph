@@ -16,17 +16,15 @@ const INTERNAL_PREFIXES: &[&str] = &["assign-", "evaluate-"];
 /// started_at, then created_at.
 fn terminal_timestamp(task: &workgraph::graph::Task) -> Option<DateTime<chrono::FixedOffset>> {
     // Done tasks have completed_at set by the done command
-    if let Some(ref s) = task.completed_at {
-        if let Ok(ts) = DateTime::parse_from_rfc3339(s) {
+    if let Some(ref s) = task.completed_at
+        && let Ok(ts) = DateTime::parse_from_rfc3339(s) {
             return Some(ts);
         }
-    }
     // Failed/Abandoned: the fail/abandon command adds a log entry with timestamp
-    if let Some(entry) = task.log.last() {
-        if let Ok(ts) = DateTime::parse_from_rfc3339(&entry.timestamp) {
+    if let Some(entry) = task.log.last()
+        && let Ok(ts) = DateTime::parse_from_rfc3339(&entry.timestamp) {
             return Some(ts);
         }
-    }
     // Fallback chain
     let ts = task
         .started_at
@@ -136,11 +134,10 @@ pub fn run(dir: &Path, dry_run: bool, include_done: bool, older: Option<&str>) -
             continue;
         }
         // Apply --older filter
-        if let Some(ref min_age) = older_duration {
-            if !is_old_enough(task, min_age) {
+        if let Some(ref min_age) = older_duration
+            && !is_old_enough(task, min_age) {
                 continue;
             }
-        }
         to_gc.insert(task.id.clone());
     }
 
@@ -198,11 +195,10 @@ pub fn run(dir: &Path, dry_run: bool, include_done: bool, older: Option<&str>) -
             .any(|prefix| task.id.starts_with(prefix));
         if is_internal && task.status.is_terminal() && !has_open_dependent.contains(&task.id) {
             // Apply --older filter to orphaned internal tasks too
-            if let Some(ref min_age) = older_duration {
-                if !is_old_enough(task, min_age) {
+            if let Some(ref min_age) = older_duration
+                && !is_old_enough(task, min_age) {
                     continue;
                 }
-            }
             to_gc.insert(task.id.clone());
         }
     }

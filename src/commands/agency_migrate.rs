@@ -585,13 +585,13 @@ pub fn run(workgraph_dir: &Path, dry_run: bool) -> Result<()> {
     // Check if old-format directories exist
     let has_old_roles = old_roles_dir.is_dir()
         && fs::read_dir(&old_roles_dir)?
-            .any(|e| e.ok().map_or(false, |e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
+            .any(|e| e.ok().is_some_and(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
     let has_old_motivations = old_motivations_dir.is_dir()
         && fs::read_dir(&old_motivations_dir)?
-            .any(|e| e.ok().map_or(false, |e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
+            .any(|e| e.ok().is_some_and(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
     let has_old_agents = old_agents_dir.is_dir()
         && fs::read_dir(&old_agents_dir)?
-            .any(|e| e.ok().map_or(false, |e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
+            .any(|e| e.ok().is_some_and(|e| e.path().extension().and_then(|x| x.to_str()) == Some("yaml")));
 
     if !has_old_roles && !has_old_motivations && !has_old_agents {
         println!("Nothing to migrate — no old-format agency data found.");

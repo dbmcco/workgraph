@@ -176,9 +176,23 @@ fn build_assign_subgraph(dir: &Path) {
     let mut mutable_graph = load_graph(&graph_path).unwrap();
     let mut graph_modified = false;
 
+    let grace_seconds = config.agency.auto_assign_grace_seconds;
+
     for ready_task in &ready {
         if ready_task.agent.is_some() || ready_task.assigned.is_some() {
             continue;
+        }
+
+        // Grace period: skip tasks created less than grace_seconds ago
+        if grace_seconds > 0 {
+            if let Some(ref created_str) = ready_task.created_at {
+                if let Ok(created) = created_str.parse::<chrono::DateTime<chrono::Utc>>() {
+                    let age = chrono::Utc::now().signed_duration_since(created);
+                    if age.num_seconds() < grace_seconds as i64 {
+                        continue;
+                    }
+                }
+            }
         }
 
         let assign_task_id = format!("assign-{}", ready_task.id);
@@ -1326,3 +1340,87 @@ Begin working on the task now.
         );
     }
 }
+
+// ===========================================================================
+// Grace period tests: auto-assignment skips freshly created tasks
+// ===========================================================================
+
+/// Write a config with auto_assign enabled and a custom grace period.
+fn write_config_with_grace(dir: &Path, grace_seconds: u64) {
+    let content = format!(
+        r#"[agency]
+auto_assign = true
+auto_assign_grace_seconds = {}
+"#,
+        grace_seconds
+    );
+    fs::write(dir.join("config.toml"), content).unwrap();
+}
+
+#[test]
+fn test_grace_period_skips_freshly_created_task() {
+    // A task created just now should NOT get an assign task when grace > 0
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let mut task = make_task("fresh-task", "Just created");
+    task.created_at = Some(chrono::Utc::now().to_rfc3339());
+
+    setup_workgraph(dir, vec![task]);
+    write_config_with_grace(dir, 60); // 60-second grace period
+    setup_agency(dir);
+
+    build_assign_subgraph(dir);
+
+    let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+    assert!(
+        graph.get_task("assign-fresh-task").is_none(),
+        "freshly created task should NOT get assign task during grace period"
+    );
+}
+
+#[test]
+fn test_grace_period_allows_old_task() {
+    // A task created long ago should get an assign task
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let mut task = make_task("old-task", "Created long ago");
+    task.created_at = Some("2020-01-01T00:00:00Z".to_string());
+
+    setup_workgraph(dir, vec![task]);
+    write_config_with_grace(dir, 10);
+
+    build_assign_subgraph(dir);
+
+    let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+    assert!(
+        graph.get_task("assign-old-task").is_some(),
+        "old task should get assign task (past grace period)"
+    );
+}
+
+#[test]
+fn test_grace_period_zero_skips_check() {
+    // With grace_seconds = 0, even fresh tasks get assigned immediately
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let mut task = make_task("fresh-task-2", "Just created");
+    task.created_at = Some(chrono::Utc::now().to_rfc3339());
+
+    setup_workgraph(dir, vec![task]);
+    write_config_with_grace(dir, 0);
+
+    build_assign_subgraph(dir);
+
+    let graph = load_graph(dir.join("graph.jsonl")).unwrap();
+    assert!(
+        graph.get_task("assign-fresh-task-2").is_some(),
+        "grace_seconds=0 should allow immediate assignment"
+    );
+}
+
+// NOTE: Dependency-change tests (clearing assignment when --add-after is used)
+// are in src/commands/edit.rs as unit tests since the edit module is part of
+// the binary crate and not accessible from integration tests.

@@ -144,8 +144,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
 
     // Extract token usage from output.log for dead agents' tasks
     for (_agent_id, task_id, _pid, output_file, _reason) in &dead {
-        if let Some(task) = graph.get_task_mut(task_id) {
-            if task.token_usage.is_none() {
+        if let Some(task) = graph.get_task_mut(task_id)
+            && task.token_usage.is_none() {
                 let output_path = std::path::Path::new(output_file);
                 let abs_path = if output_path.is_absolute() {
                     output_path.to_path_buf()
@@ -157,7 +157,6 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     tasks_modified = true;
                 }
             }
-        }
     }
 
     // Evaluate structural cycle iterations for tasks triaged as done

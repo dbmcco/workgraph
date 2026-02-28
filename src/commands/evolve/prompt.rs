@@ -168,9 +168,9 @@ pub(crate) fn build_evolver_prompt(
     if let Some(ref agent_hash) = config.agency.evolver_agent {
         let agents_dir = agency_dir.join("cache/agents");
         let agent_path = agents_dir.join(format!("{}.yaml", agent_hash));
-        if let Ok(agent) = agency::load_agent(&agent_path) {
-            if let Some(role) = roles.iter().find(|r| r.id == agent.role_id) {
-                if let Some(tradeoff) = tradeoffs.iter().find(|m| m.id == agent.tradeoff_id) {
+        if let Ok(agent) = agency::load_agent(&agent_path)
+            && let Some(role) = roles.iter().find(|r| r.id == agent.role_id)
+                && let Some(tradeoff) = tradeoffs.iter().find(|m| m.id == agent.tradeoff_id) {
                     // Use the project root (parent of agency dir) for skill resolution
                     let workgraph_root = agency_dir.parent().unwrap_or(agency_dir);
                     let resolved_skills = resolve_all_components(role, workgraph_root, agency_dir);
@@ -178,8 +178,6 @@ pub(crate) fn build_evolver_prompt(
                     out.push_str(&render_identity_prompt_rich(role, tradeoff, &resolved_skills, outcome.as_ref()));
                     out.push_str("\n\n");
                 }
-            }
-        }
     }
 
     // Meta-agent assignments (assigner, evaluator, evolver)

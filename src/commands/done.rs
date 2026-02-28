@@ -137,9 +137,9 @@ pub fn run(dir: &Path, id: &str, converged: bool) -> Result<()> {
     });
 
     // Extract token usage from agent output.log if available
-    if task.token_usage.is_none() {
-        if let Ok(registry) = AgentRegistry::load(dir) {
-            if let Some(agent) = registry.get_agent_by_task(id) {
+    if task.token_usage.is_none()
+        && let Ok(registry) = AgentRegistry::load(dir)
+            && let Some(agent) = registry.get_agent_by_task(id) {
                 let output_path = std::path::Path::new(&agent.output_file);
                 // output_file may be relative to the project root (parent of .workgraph)
                 let abs_path = if output_path.is_absolute() {
@@ -151,8 +151,6 @@ pub fn run(dir: &Path, id: &str, converged: bool) -> Result<()> {
                     task.token_usage = Some(usage);
                 }
             }
-        }
-    }
 
     // Evaluate structural cycle iteration
     let id_owned = id.to_string();

@@ -38,19 +38,16 @@ impl std::str::FromStr for OutputFormat {
 
 /// Layout strategy for the ASCII tree visualization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum LayoutMode {
     /// Classic DFS-order tree: fan-in nodes claimed by first parent visited.
     Tree,
     /// Diamond-aware layout: fan-in nodes placed under their lowest common
     /// ancestor so arcs flow downward instead of upward.
+    #[default]
     Diamond,
 }
 
-impl Default for LayoutMode {
-    fn default() -> Self {
-        LayoutMode::Diamond
-    }
-}
 
 impl std::str::FromStr for LayoutMode {
     type Err = String;
@@ -207,18 +204,17 @@ pub fn generate_viz_output_from_graph(
     } else {
         let mut active = HashSet::new();
         for task in graph.tasks() {
-            if task.status != Status::Done {
-                if let Some(&ci) = cycle_analysis.task_to_cycle.get(&task.id) {
+            if task.status != Status::Done
+                && let Some(&ci) = cycle_analysis.task_to_cycle.get(&task.id) {
                     active.insert(ci);
                 }
-            }
         }
         active
     };
 
     // Compute weakly connected components via union-find.
     // Used for both active-tree filtering and --focus subgraph selection.
-    fn uf_find<'a>(comp: &mut HashMap<&'a str, usize>, merged: &mut Vec<Option<usize>>, id: &'a str) -> usize {
+    fn uf_find<'a>(comp: &mut HashMap<&'a str, usize>, merged: &mut [Option<usize>], id: &'a str) -> usize {
         let mut c = comp[id];
         while let Some(parent) = merged[c] { c = parent; }
         let root = c;
@@ -328,11 +324,10 @@ pub fn generate_viz_output_from_graph(
 
                     // Keep walking up unless this ancestor matches the status filter
                     // (status-matching ancestors are already context but we stop climbing past them)
-                    if let Some(ancestor) = graph.get_task(dep) {
-                        if status_str(&ancestor.status) != filter_lower {
+                    if let Some(ancestor) = graph.get_task(dep)
+                        && status_str(&ancestor.status) != filter_lower {
                             to_visit.push(dep.clone());
                         }
-                    }
                 }
             }
         }
@@ -343,11 +338,10 @@ pub fn generate_viz_output_from_graph(
         let mut tasks_to_show = tasks_to_show;
         let existing_ids: HashSet<&str> = tasks_to_show.iter().map(|t| t.id.as_str()).collect();
         for ctx_id in &context_ids {
-            if !existing_ids.contains(ctx_id.as_str()) {
-                if let Some(task) = graph.get_task(ctx_id) {
+            if !existing_ids.contains(ctx_id.as_str())
+                && let Some(task) = graph.get_task(ctx_id) {
                     tasks_to_show.push(task);
                 }
-            }
         }
         tasks_to_show
     } else {
@@ -371,8 +365,7 @@ pub fn generate_viz_output_from_graph(
             for dep in &task.after {
                 if let Some((peer_name, remote_task_id)) =
                     workgraph::federation::parse_remote_ref(dep)
-                {
-                    if seen.insert(dep.clone()) {
+                    && seen.insert(dep.clone()) {
                         let remote = workgraph::federation::resolve_remote_task_status(
                             peer_name,
                             remote_task_id,
@@ -388,7 +381,6 @@ pub fn generate_viz_output_from_graph(
                             ..Task::default()
                         });
                     }
-                }
             }
         }
         peers
