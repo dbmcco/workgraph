@@ -182,11 +182,17 @@ fn handle_normal_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Char('n') => app.next_match(),
         KeyCode::Char('N') | KeyCode::BackTab => app.prev_match(),
 
-        // HUD panel scroll (Shift+Up/Down/PgUp/PgDn) — must come before generic Up/Down.
-        KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+        // HUD panel scroll (Shift or Alt + Up/Down/PgUp/PgDn) — must come before generic Up/Down.
+        KeyCode::Up
+            if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT) =>
+        {
             app.hud_scroll_up(1);
         }
-        KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::Down
+            if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT) =>
+        {
             let max = app
                 .hud_detail
                 .as_ref()
@@ -194,10 +200,16 @@ fn handle_normal_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 .unwrap_or(0);
             app.hud_scroll_down(1, max, app.scroll.viewport_height);
         }
-        KeyCode::PageUp if modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::PageUp
+            if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT) =>
+        {
             app.hud_scroll_up(10);
         }
-        KeyCode::PageDown if modifiers.contains(KeyModifiers::SHIFT) => {
+        KeyCode::PageDown
+            if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT) =>
+        {
             let max = app
                 .hud_detail
                 .as_ref()
