@@ -195,13 +195,13 @@ wg add "Implement feature B" --id feature-b --after setup-ci
 
 ## 4. Control Rules
 
-Control patterns describe how you stay coordinated without direct agent-to-agent communication.
+Control patterns describe how you stay coordinated through the graph as a shared medium.
 
 ### 4.1 Stigmergic Coordination — the graph is truth
 
 **Read `wg show` and `wg context`. Don't assume — the graph is the single source of truth.**
 
-Agents coordinate indirectly through the shared graph. There are no agent-to-agent messages. Every `wg done`, `wg log`, and `wg artifact` call modifies the graph, which stimulates downstream agents.
+Agents coordinate indirectly through the shared graph. Every `wg done`, `wg log`, `wg artifact`, and `wg msg send` call modifies the graph, which stimulates downstream agents and makes your work discoverable.
 
 ```bash
 # You (Agent A) complete work, leaving traces
@@ -219,6 +219,66 @@ wg context write-tests
 - Use `wg log` to leave progress traces — they become context for dependent tasks
 - Use `wg artifact` to mark outputs — they appear in `wg context` for successors
 - Always check `wg context <your-task>` before starting work — it shows what predecessors produced
+- **You are expected to create tasks** when you discover work. Bugs, missing docs, needed refactors — create them with `wg add`. The coordinator dispatches automatically.
+
+### 4.1.1 Discovery — see what's new
+
+At session start, run `wg discover` to see what other agents have recently completed. This gives you awareness of the broader system state beyond your direct dependencies:
+
+```bash
+wg discover                          # Last 24h of completions
+wg discover --since 7d               # Wider window
+wg discover --with-artifacts         # Show artifact paths
+wg discover --since 24h --json       # Machine-readable output
+```
+
+Output is grouped by tag, showing task ID, title, completion time, artifacts, and the last log entry. Use this to:
+- Avoid duplicating work another agent already did
+- Find artifacts that may be relevant to your task
+- Understand the pace and direction of the project
+
+### 4.1.2 Breadcrumbs — leave trails for future agents
+
+Every log entry and artifact you create is a breadcrumb for future agents. Write them with your successors in mind:
+
+```bash
+# Good: specific, actionable, references files
+wg log my-task "Implemented auth middleware in src/middleware/auth.rs using JWT validation"
+wg log my-task "Design decision: chose HMAC-SHA256 over RSA because tokens are short-lived"
+wg artifact my-task src/middleware/auth.rs
+wg artifact my-task docs/auth-design.md
+
+# Bad: vague, no context
+wg log my-task "Done with auth"
+```
+
+Detailed breadcrumbs compound — each agent builds on the last, and the graph accumulates institutional knowledge.
+
+### 4.1.3 Agent-to-Agent Messages
+
+Send messages to tasks being worked on by other agents. This enables real-time coordination for related or overlapping work:
+
+```bash
+# Send a message to another task's agent
+wg msg send <task-id> "Hey, I found this is related to your work: ..."
+wg msg send <task-id> "FYI: I changed the API signature in src/api.rs"
+
+# Check for messages on your task
+wg msg list <task-id>
+
+# Read unread messages (advances cursor)
+wg msg read <task-id> --agent $WG_AGENT_ID
+
+# Poll without advancing cursor
+wg msg poll <task-id> --agent $WG_AGENT_ID
+```
+
+**When to send messages:**
+- You discover your work affects another in-progress task
+- You find a bug or pattern relevant to another agent's work
+- You need to coordinate shared resource access (e.g., a shared config file)
+
+**Messages are persistent** — they survive agent restarts and are visible to future agents who work on the same task.
 
 ### 4.2 After Code Changes: Rebuild
 

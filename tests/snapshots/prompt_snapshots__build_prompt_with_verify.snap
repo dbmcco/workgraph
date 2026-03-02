@@ -1,6 +1,5 @@
 ---
 source: tests/prompt_snapshots.rs
-assertion_line: 352
 expression: output
 ---
 # Task Assignment
@@ -88,6 +87,8 @@ wg msg read test-task-123 --agent $WG_AGENT_ID
 ```
 Messages may contain updated requirements, context from other agents,
 or instructions from the user. Check at natural breakpoints in your work.
+
+**Note:** Messages are also automatically surfaced when you run `wg log`. When you see messages in your log output, respond to them via `wg msg send`.
 
 
 ## The Graph is Alive
