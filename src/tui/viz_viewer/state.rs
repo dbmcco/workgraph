@@ -137,6 +137,10 @@ pub struct VizApp {
     /// Scroll offset within the HUD panel (vertical).
     pub hud_scroll: usize,
 
+    // ── Double-tap detection ──
+    /// Timestamp of the last Tab key press, for double-tap recenter detection.
+    pub last_tab_press: Option<Instant>,
+
     // ── Live refresh ──
     /// Last observed modification time of graph.jsonl.
     last_graph_mtime: Option<SystemTime>,
@@ -222,6 +226,7 @@ impl VizApp {
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
+            last_tab_press: None,
             last_graph_mtime: graph_mtime,
             last_refresh: Instant::now(),
             last_refresh_display: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -477,6 +482,23 @@ impl VizApp {
             && (visible_pos < self.scroll.offset_y
                 || visible_pos >= self.scroll.offset_y + self.scroll.viewport_height)
         {
+            let half = self.scroll.viewport_height / 2;
+            self.scroll.offset_y = visible_pos.saturating_sub(half);
+            self.scroll.clamp();
+        }
+    }
+
+    /// Center the viewport on the selected task (unconditional — always recenters).
+    pub fn center_on_selected_task(&mut self) {
+        let task_id = match self.selected_task_idx.and_then(|i| self.task_order.get(i)) {
+            Some(id) => id,
+            None => return,
+        };
+        let orig_line = match self.node_line_map.get(task_id) {
+            Some(&line) => line,
+            None => return,
+        };
+        if let Some(visible_pos) = self.original_to_visible(orig_line) {
             let half = self.scroll.viewport_height / 2;
             self.scroll.offset_y = visible_pos.saturating_sub(half);
             self.scroll.clamp();
@@ -1205,6 +1227,7 @@ impl VizApp {
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
+            last_tab_press: None,
             last_graph_mtime: None,
             last_refresh: Instant::now(),
             last_refresh_display: String::new(),

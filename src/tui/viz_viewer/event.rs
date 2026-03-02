@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -156,8 +156,27 @@ fn handle_normal_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.update_scroll_bounds();
         }
 
-        // Toggle edge trace highlighting.
-        KeyCode::Tab => app.toggle_trace(),
+        // Tab: single press toggles edge trace, double-tap recenters on selected task.
+        KeyCode::Tab => {
+            let now = Instant::now();
+            let is_double_tap = app
+                .last_tab_press
+                .map(|prev| now.duration_since(prev) < Duration::from_millis(300))
+                .unwrap_or(false);
+            app.last_tab_press = Some(now);
+
+            if is_double_tap {
+                // Double-tap: recenter viewport on selected task.
+                // If the first tap toggled trace off, turn it back on so the
+                // user sees the selection they're centering on.
+                if !app.trace_visible {
+                    app.toggle_trace();
+                }
+                app.center_on_selected_task();
+            } else {
+                app.toggle_trace();
+            }
+        }
 
         // Navigate between matches.
         KeyCode::Char('n') => app.next_match(),
