@@ -416,6 +416,12 @@ fn main() -> Result<()> {
         Commands::Unclaim { id } => commands::claim::unclaim(&workgraph_dir, &id),
         Commands::Pause { id } => commands::pause::run(&workgraph_dir, &id),
         Commands::Resume { id } => commands::resume::run(&workgraph_dir, &id),
+        Commands::AddDep { task, dependency } => {
+            commands::link::run_link(&workgraph_dir, &task, &dependency)
+        }
+        Commands::RmDep { task, dependency } => {
+            commands::link::run_unlink(&workgraph_dir, &task, &dependency)
+        }
         Commands::Reclaim { id, from, to } => {
             commands::reclaim::run(&workgraph_dir, &id, &from, &to)
         }
@@ -839,14 +845,24 @@ fn main() -> Result<()> {
                     from,
                     priority,
                     stdin,
-                } => commands::msg::run_send(
-                    &workgraph_dir,
-                    &task_id,
-                    message.as_deref(),
-                    &from,
-                    &priority,
-                    stdin,
-                ),
+                } => {
+                    // Auto-detect sender: if --from is default "user" and WG_TASK_ID
+                    // is set, use the task ID (slug) as the sender identity so agents
+                    // identify by their task name rather than a generic "user" label.
+                    let sender = if from == "user" {
+                        std::env::var("WG_TASK_ID").unwrap_or(from)
+                    } else {
+                        from
+                    };
+                    commands::msg::run_send(
+                        &workgraph_dir,
+                        &task_id,
+                        message.as_deref(),
+                        &sender,
+                        &priority,
+                        stdin,
+                    )
+                }
                 MsgCommands::List { task_id } => {
                     commands::msg::run_list(&workgraph_dir, &task_id, cli.json)
                 }

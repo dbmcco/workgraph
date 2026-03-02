@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
+use workgraph::graph::Status;
 use workgraph::parser::{load_graph, save_graph};
 
 use super::graph_path;
@@ -25,6 +26,17 @@ pub fn run_link(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
     // Validate both tasks exist
     graph.get_task_or_err(task_id)?;
     graph.get_task_or_err(dependency_id)?;
+
+    // Warn if the task is in-progress
+    if graph
+        .get_task(task_id)
+        .is_some_and(|t| t.status == Status::InProgress)
+    {
+        eprintln!(
+            "Warning: '{}' is currently in-progress. Adding a dependency on '{}' anyway.",
+            task_id, dependency_id
+        );
+    }
 
     // Add the forward edge: task.after includes dependency
     {
@@ -159,6 +171,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             "internal",
             None,
             None,
@@ -185,6 +198,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             "internal",
             None,
             None,
@@ -211,6 +225,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             "internal",
             None,
             None,
@@ -258,7 +273,12 @@ mod tests {
 
         let result = run_link(tmp.path(), "task-a", "task-a");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot depend on itself"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot depend on itself")
+        );
     }
 
     #[test]

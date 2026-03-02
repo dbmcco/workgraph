@@ -278,6 +278,30 @@ pub enum Commands {
         id: String,
     },
 
+    /// Add a dependency: task depends on (waits for) dependency
+    #[command(name = "add-dep", alias = "add-after")]
+    AddDep {
+        /// The task that will depend on the dependency
+        #[arg(value_name = "TASK")]
+        task: String,
+
+        /// The dependency (blocker) task
+        #[arg(value_name = "DEPENDENCY")]
+        dependency: String,
+    },
+
+    /// Remove a dependency edge between two tasks
+    #[command(name = "rm-dep")]
+    RmDep {
+        /// The task to remove the dependency from
+        #[arg(value_name = "TASK")]
+        task: String,
+
+        /// The dependency to remove
+        #[arg(value_name = "DEPENDENCY")]
+        dependency: String,
+    },
+
     /// Reclaim a task from a dead/unresponsive agent
     Reclaim {
         /// Task ID to reclaim
@@ -2176,6 +2200,8 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Unclaim { .. } => "unclaim",
         Commands::Pause { .. } => "pause",
         Commands::Resume { .. } => "resume",
+        Commands::AddDep { .. } => "add-dep",
+        Commands::RmDep { .. } => "rm-dep",
         Commands::Reclaim { .. } => "reclaim",
         Commands::Ready => "ready",
         Commands::Discover { .. } => "discover",

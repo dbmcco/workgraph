@@ -48,6 +48,7 @@ pub mod heartbeat;
 pub mod impact;
 pub mod init;
 pub mod kill;
+pub mod link;
 pub mod list;
 pub mod log;
 pub mod match_cmd;
