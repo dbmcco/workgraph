@@ -302,6 +302,7 @@ pub fn run(
     // Save atomically (temp file + rename)
     save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
+    super::notify_new_task_focus(dir, &task_id);
 
     // Record operation (include agent_id if running in agent context for guardrail tracking)
     let mut detail = serde_json::json!({ "title": title });

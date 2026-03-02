@@ -19,6 +19,7 @@ pub mod artifact;
 pub mod assign;
 pub mod blocked;
 pub mod bottlenecks;
+pub mod chat;
 pub mod check;
 pub mod claim;
 pub mod config_cmd;
@@ -28,6 +29,7 @@ pub mod cost;
 pub mod critical_path;
 pub mod cycles;
 pub mod dead_agents;
+pub mod discover;
 pub mod done;
 pub mod edit;
 pub mod evaluate;
@@ -52,6 +54,7 @@ pub mod match_cmd;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod matrix;
 pub mod msg;
+pub mod native_exec;
 pub mod next;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod notify;
@@ -140,6 +143,12 @@ pub fn collect_transitive_dependents(
 /// Silently ignores all errors (daemon not running, socket unavailable, etc.)
 pub fn notify_graph_changed(dir: &Path) {
     let _ = service::send_request(dir, &service::IpcRequest::GraphChanged);
+}
+
+/// Write a marker file so the TUI can auto-focus on a newly created task.
+/// Best-effort: silently ignores errors.
+pub fn notify_new_task_focus(dir: &Path, task_id: &str) {
+    let _ = std::fs::write(dir.join(".new_task_focus"), task_id);
 }
 
 /// Check service status and print a hint for the user/agent.

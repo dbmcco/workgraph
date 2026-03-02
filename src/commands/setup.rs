@@ -2,11 +2,48 @@
 //!
 //! Creates/updates ~/.workgraph/config.toml via guided prompts using dialoguer.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use dialoguer::{Confirm, Input, Select};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use workgraph::config::Config;
+
+/// Marker used to detect whether workgraph directives are already present in CLAUDE.md.
+const CLAUDE_MD_MARKER: &str = "<!-- workgraph-managed -->";
+
+/// The workgraph directives block appended to CLAUDE.md.
+const CLAUDE_MD_DIRECTIVES: &str = r#"<!-- workgraph-managed -->
+# Workgraph
+
+Use workgraph for task management.
+
+**At the start of each session, run `wg quickstart` in your terminal to orient yourself.**
+Use `wg service start` to dispatch work — do not manually claim tasks.
+
+## For All Agents (Including the Orchestrating Agent)
+
+CRITICAL: Do NOT use built-in TaskCreate/TaskUpdate/TaskList/TaskGet tools.
+These are a separate system that does NOT interact with workgraph.
+Always use `wg` CLI commands for all task management.
+
+CRITICAL: Do NOT use the built-in **Task tool** (subagents). NEVER spawn Explore, Plan,
+general-purpose, or any other subagent type. The Task tool creates processes outside
+workgraph, which defeats the entire system. If you need research, exploration, or planning
+done — create a `wg add` task and let the coordinator dispatch it.
+
+ALL tasks — including research, exploration, and planning — should be workgraph tasks.
+
+### Orchestrating agent role
+
+The orchestrating agent (the one the user interacts with directly) does ONLY:
+- **Conversation** with the user
+- **Inspection** via `wg show`, `wg viz`, `wg list`, `wg status`, and reading files
+- **Task creation** via `wg add` with descriptions, dependencies, and context
+- **Monitoring** via `wg agents`, `wg service status`, `wg watch`
+
+It NEVER writes code, implements features, or does research itself.
+Everything gets dispatched through `wg add` and `wg service start`.
+"#;
 
 /// Choices gathered from the interactive wizard.
 #[derive(Debug, Clone)]
@@ -66,6 +103,82 @@ pub fn format_summary(choices: &SetupChoices) -> String {
         lines.push(format!("  assigner_model = \"{}\"", m));
     }
     lines.join("\n")
+}
+
+/// Check whether a CLAUDE.md file already contains workgraph directives.
+pub fn has_workgraph_directives(path: &Path) -> bool {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        content.contains(CLAUDE_MD_MARKER)
+    } else {
+        false
+    }
+}
+
+/// Configure ~/.claude/CLAUDE.md with workgraph directives.
+///
+/// - If ~/.claude/ doesn't exist, it is created.
+/// - If CLAUDE.md doesn't exist, it is created with the directives.
+/// - If CLAUDE.md exists but has no workgraph marker, directives are appended.
+/// - If CLAUDE.md already contains the marker, it is left unchanged (idempotent).
+///
+/// Returns a status string for display and whether changes were made.
+pub fn configure_claude_md() -> Result<(String, bool)> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let claude_dir = PathBuf::from(&home).join(".claude");
+    let claude_md = claude_dir.join("CLAUDE.md");
+
+    configure_claude_md_at(&claude_md)
+}
+
+/// Configure a CLAUDE.md at the given project directory.
+///
+/// Creates or updates `<project_dir>/CLAUDE.md` with workgraph directives.
+/// Same idempotency rules as `configure_claude_md`.
+pub fn configure_project_claude_md(project_dir: &Path) -> Result<(String, bool)> {
+    let claude_md = project_dir.join("CLAUDE.md");
+    configure_claude_md_at(&claude_md)
+}
+
+/// Shared implementation for configuring a CLAUDE.md at a specific path.
+fn configure_claude_md_at(claude_md: &Path) -> Result<(String, bool)> {
+    if has_workgraph_directives(claude_md) {
+        return Ok((
+            format!("{} already configured", claude_md.display()),
+            false,
+        ));
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = claude_md.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    if claude_md.exists() {
+        // Append to existing file
+        let existing = std::fs::read_to_string(claude_md)
+            .with_context(|| format!("Failed to read {}", claude_md.display()))?;
+        let separator = if existing.ends_with('\n') || existing.is_empty() {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        let new_content = format!("{}{}{}", existing, separator, CLAUDE_MD_DIRECTIVES);
+        std::fs::write(claude_md, new_content)
+            .with_context(|| format!("Failed to write {}", claude_md.display()))?;
+        Ok((
+            format!("Updated {} with workgraph directives", claude_md.display()),
+            true,
+        ))
+    } else {
+        // Create new file
+        std::fs::write(claude_md, CLAUDE_MD_DIRECTIVES)
+            .with_context(|| format!("Failed to create {}", claude_md.display()))?;
+        Ok((
+            format!("Created {} with workgraph directives", claude_md.display()),
+            true,
+        ))
+    }
 }
 
 /// Run the interactive setup wizard.
@@ -239,14 +352,23 @@ pub fn run() -> Result<()> {
     println!();
     let skill_status = guide_skill_bundle_install(&choices.executor)?;
 
+    // Configure ~/.claude/CLAUDE.md for Claude Code executor
+    let claude_md_status = if choices.executor == "claude" {
+        println!();
+        guide_claude_md_install()?
+    } else {
+        "N/A (non-Claude executor)".to_string()
+    };
+
     println!();
     println!("Setup complete.");
     println!();
     println!("Summary:");
-    println!("  Executor: {}", choices.executor);
-    println!("  Model:    {}", choices.model);
-    println!("  Agents:   {} max parallel", choices.max_agents);
-    println!("  Skill:    {}", skill_status);
+    println!("  Executor:  {}", choices.executor);
+    println!("  Model:     {}", choices.model);
+    println!("  Agents:    {} max parallel", choices.max_agents);
+    println!("  Skill:     {}", skill_status);
+    println!("  CLAUDE.md: {}", claude_md_status);
     println!();
     println!("Run `wg init` in a project directory to get started.");
 
@@ -337,6 +459,47 @@ fn guide_skill_bundle_install(executor: &str) -> Result<String> {
                 executor
             ))
         }
+    }
+}
+
+/// Guide the user through configuring ~/.claude/CLAUDE.md.
+/// Returns a status string for the summary.
+fn guide_claude_md_install() -> Result<String> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let claude_md = PathBuf::from(&home).join(".claude/CLAUDE.md");
+
+    if has_workgraph_directives(&claude_md) {
+        return Ok("already configured ✓".to_string());
+    }
+
+    println!(
+        "Claude Code's built-in task and agent tools conflict with workgraph."
+    );
+    println!(
+        "Configuring ~/.claude/CLAUDE.md suppresses them so Claude uses `wg` commands instead."
+    );
+
+    let action = if claude_md.exists() {
+        "Append workgraph directives to"
+    } else {
+        "Create"
+    };
+
+    let install = Confirm::new()
+        .with_prompt(format!(
+            "{} ~/.claude/CLAUDE.md? (recommended)",
+            action
+        ))
+        .default(true)
+        .interact()?;
+
+    if install {
+        let (status, _changed) = configure_claude_md()?;
+        println!("  {}", status);
+        Ok("configured ✓".to_string())
+    } else {
+        println!("  You can configure it later with: wg setup");
+        Ok("NOT configured — Claude may use its own task tools".to_string())
     }
 }
 
@@ -569,5 +732,149 @@ mod tests {
         let config = build_config(&choices, None);
         assert_eq!(config.coordinator.executor, "my-custom-executor");
         assert_eq!(config.agent.executor, "my-custom-executor");
+    }
+
+    #[test]
+    fn test_configure_claude_md_creates_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+
+        let (status, changed) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(changed);
+        assert!(status.contains("Created"));
+
+        let content = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(content.contains(CLAUDE_MD_MARKER));
+        assert!(content.contains("Do NOT use built-in TaskCreate"));
+        assert!(content.contains("Do NOT use the built-in **Task tool**"));
+        assert!(content.contains("wg quickstart"));
+    }
+
+    #[test]
+    fn test_configure_claude_md_appends_to_existing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+
+        let existing_content = "# My Existing Config\n\nSome custom rules here.\n";
+        std::fs::write(&claude_md, existing_content).unwrap();
+
+        let (status, changed) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(changed);
+        assert!(status.contains("Updated"));
+
+        let content = std::fs::read_to_string(&claude_md).unwrap();
+        // Original content preserved
+        assert!(content.contains("# My Existing Config"));
+        assert!(content.contains("Some custom rules here."));
+        // Workgraph directives appended
+        assert!(content.contains(CLAUDE_MD_MARKER));
+        assert!(content.contains("Do NOT use built-in TaskCreate"));
+    }
+
+    #[test]
+    fn test_configure_claude_md_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+
+        // First call creates
+        let (_status, changed1) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(changed1);
+
+        let content_after_first = std::fs::read_to_string(&claude_md).unwrap();
+
+        // Second call is a no-op
+        let (status, changed2) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(!changed2);
+        assert!(status.contains("already configured"));
+
+        let content_after_second = std::fs::read_to_string(&claude_md).unwrap();
+        assert_eq!(content_after_first, content_after_second);
+    }
+
+    #[test]
+    fn test_configure_claude_md_idempotent_with_existing_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+
+        std::fs::write(&claude_md, "# Pre-existing\n").unwrap();
+
+        let (_status, changed1) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(changed1);
+
+        let content_after_first = std::fs::read_to_string(&claude_md).unwrap();
+
+        // Second call doesn't duplicate
+        let (_status, changed2) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(!changed2);
+
+        let content_after_second = std::fs::read_to_string(&claude_md).unwrap();
+        assert_eq!(content_after_first, content_after_second);
+        assert_eq!(
+            content_after_second.matches(CLAUDE_MD_MARKER).count(),
+            1,
+            "marker should appear exactly once"
+        );
+    }
+
+    #[test]
+    fn test_configure_claude_md_creates_parent_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("nested").join("dir").join("CLAUDE.md");
+
+        let (_, changed) = configure_claude_md_at(&claude_md).unwrap();
+        assert!(changed);
+        assert!(claude_md.exists());
+    }
+
+    #[test]
+    fn test_has_workgraph_directives_false_for_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        assert!(!has_workgraph_directives(&claude_md));
+    }
+
+    #[test]
+    fn test_has_workgraph_directives_false_for_plain_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "# Just some markdown\n").unwrap();
+        assert!(!has_workgraph_directives(&claude_md));
+    }
+
+    #[test]
+    fn test_has_workgraph_directives_true_after_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        configure_claude_md_at(&claude_md).unwrap();
+        assert!(has_workgraph_directives(&claude_md));
+    }
+
+    #[test]
+    fn test_configure_project_claude_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path();
+
+        let (status, changed) = configure_project_claude_md(project_dir).unwrap();
+        assert!(changed);
+        assert!(status.contains("Created"));
+
+        let claude_md = project_dir.join("CLAUDE.md");
+        let content = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(content.contains(CLAUDE_MD_MARKER));
+        assert!(content.contains("wg quickstart"));
+    }
+
+    #[test]
+    fn test_claude_md_directives_contain_critical_rules() {
+        // Verify the template contains all the critical rules from the task description
+        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskCreate"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskUpdate"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskList"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskGet"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("Task tool"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("subagent"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("wg quickstart"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("Orchestrating agent"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("wg service start"));
     }
 }

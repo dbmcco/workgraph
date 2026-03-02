@@ -271,6 +271,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let workgraph_dir = cli.dir.unwrap_or_else(|| PathBuf::from(".workgraph"));
+    let workgraph_dir = workgraph_dir.canonicalize().unwrap_or(workgraph_dir);
 
     // Handle help flags (top-level custom help with usage-based ordering)
     if cli.help || cli.help_all || cli.command.is_none() {
@@ -419,6 +420,10 @@ fn main() -> Result<()> {
             commands::reclaim::run(&workgraph_dir, &id, &from, &to)
         }
         Commands::Ready => commands::ready::run(&workgraph_dir, cli.json),
+        Commands::Discover {
+            since,
+            with_artifacts,
+        } => commands::discover::run(&workgraph_dir, Some(&since), with_artifacts, cli.json),
         Commands::Blocked { id } => commands::blocked::run(&workgraph_dir, &id, cli.json),
         Commands::WhyBlocked { id } => commands::why_blocked::run(&workgraph_dir, &id, cli.json),
         Commands::Check => commands::check::run(&workgraph_dir, cli.json),
@@ -812,7 +817,14 @@ fn main() -> Result<()> {
                 if agent {
                     commands::log::run_agent(&workgraph_dir, id, cli.json)
                 } else if let (false, Some(msg)) = (list, &message) {
-                    commands::log::run_add(&workgraph_dir, id, msg, actor.as_deref())
+                    let agent_id = std::env::var("WG_AGENT_ID").ok();
+                    commands::log::run_add(
+                        &workgraph_dir,
+                        id,
+                        msg,
+                        actor.as_deref(),
+                        agent_id.as_deref(),
+                    )
                 } else {
                     commands::log::run_list(&workgraph_dir, id, cli.json)
                 }
@@ -855,6 +867,26 @@ fn main() -> Result<()> {
                     }
                     Ok(())
                 }
+            }
+        }
+        Commands::Chat {
+            message,
+            interactive,
+            history,
+            clear,
+            timeout,
+        } => {
+            if clear {
+                commands::chat::run_clear(&workgraph_dir)
+            } else if history {
+                commands::chat::run_history(&workgraph_dir, cli.json)
+            } else if interactive {
+                commands::chat::run_interactive(&workgraph_dir, timeout)
+            } else if let Some(msg) = message {
+                commands::chat::run_send(&workgraph_dir, &msg, timeout)
+            } else {
+                // No message and no flags → default to interactive
+                commands::chat::run_interactive(&workgraph_dir, timeout)
             }
         }
         Commands::Resource { command } => match command {
@@ -1437,6 +1469,7 @@ fn main() -> Result<()> {
                 interval,
                 model,
                 force,
+                no_coordinator_agent,
             } => commands::service::run_start(
                 &workgraph_dir,
                 socket.as_deref(),
@@ -1447,6 +1480,7 @@ fn main() -> Result<()> {
                 model.as_deref(),
                 cli.json,
                 force,
+                no_coordinator_agent,
             ),
             ServiceCommands::Stop { force, kill_agents } => {
                 commands::service::run_stop(&workgraph_dir, force, kill_agents, cli.json)
@@ -1484,6 +1518,7 @@ fn main() -> Result<()> {
                 executor,
                 interval,
                 model,
+                no_coordinator_agent,
             } => commands::service::run_daemon(
                 &workgraph_dir,
                 &socket,
@@ -1491,6 +1526,7 @@ fn main() -> Result<()> {
                 executor.as_deref(),
                 interval,
                 model.as_deref(),
+                no_coordinator_agent,
             ),
         },
         Commands::Tui { no_mouse } => {
@@ -1541,5 +1577,19 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::NativeExec {
+            prompt_file,
+            exec_mode,
+            task_id,
+            model,
+            max_turns,
+        } => commands::native_exec::run(
+            &workgraph_dir,
+            &prompt_file,
+            &exec_mode,
+            &task_id,
+            model.as_deref(),
+            max_turns,
+        ),
     }
 }

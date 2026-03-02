@@ -296,6 +296,17 @@ pub enum Commands {
     /// List tasks that are ready to work on
     Ready,
 
+    /// Show recently completed tasks and their artifacts (stigmergic discovery)
+    Discover {
+        /// Time window (e.g. "24h", "7d", "30m"). Default: 24h
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Include artifact paths in output
+        #[arg(long)]
+        with_artifacts: bool,
+    },
+
     /// Show what's blocking a task
     Blocked {
         /// Task ID
@@ -614,6 +625,28 @@ pub enum Commands {
     Msg {
         #[command(subcommand)]
         command: MsgCommands,
+    },
+
+    /// Chat with the coordinator agent
+    Chat {
+        /// Message to send (omit for interactive mode)
+        message: Option<String>,
+
+        /// Interactive REPL mode
+        #[arg(long, short = 'i')]
+        interactive: bool,
+
+        /// Show chat history
+        #[arg(long)]
+        history: bool,
+
+        /// Clear chat history
+        #[arg(long)]
+        clear: bool,
+
+        /// Timeout in seconds waiting for response (default: 120)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Manage resources
@@ -1053,6 +1086,30 @@ pub enum Commands {
     Matrix {
         #[command(subcommand)]
         command: MatrixCommands,
+    },
+
+    /// Run the native executor agent loop (internal, called by spawn)
+    #[command(name = "native-exec", hide = true)]
+    NativeExec {
+        /// Path to the prompt file
+        #[arg(long)]
+        prompt_file: String,
+
+        /// Exec mode for bundle resolution (bare/light/full)
+        #[arg(long, default_value = "full")]
+        exec_mode: String,
+
+        /// Task ID being worked on
+        #[arg(long)]
+        task_id: String,
+
+        /// Model to use (e.g., claude-sonnet-4-5-20250514)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Maximum agent turns before stopping
+        #[arg(long, default_value = "100")]
+        max_turns: usize,
     },
 }
 
@@ -1974,6 +2031,10 @@ pub enum ServiceCommands {
         /// Kill existing daemon before starting (prevents stacked daemons)
         #[arg(long)]
         force: bool,
+
+        /// Disable the persistent coordinator agent (LLM chat session)
+        #[arg(long)]
+        no_coordinator_agent: bool,
     },
 
     /// Stop the agent service daemon
@@ -2058,6 +2119,10 @@ pub enum ServiceCommands {
         /// Model to use for spawned agents (overrides config.toml coordinator.model)
         #[arg(long)]
         model: Option<String>,
+
+        /// Disable the persistent coordinator agent (LLM chat session)
+        #[arg(long)]
+        no_coordinator_agent: bool,
     },
 }
 
@@ -2113,6 +2178,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Resume { .. } => "resume",
         Commands::Reclaim { .. } => "reclaim",
         Commands::Ready => "ready",
+        Commands::Discover { .. } => "discover",
         Commands::Blocked { .. } => "blocked",
         Commands::WhyBlocked { .. } => "why-blocked",
         Commands::Check => "check",
@@ -2175,6 +2241,8 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Notify { .. } => "notify",
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Matrix { .. } => "matrix",
+        Commands::Chat { .. } => "chat",
+        Commands::NativeExec { .. } => "native-exec",
     }
 }
 
@@ -2183,6 +2251,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
     matches!(
         cmd,
         Commands::Ready
+            | Commands::Discover { .. }
             | Commands::Blocked { .. }
             | Commands::WhyBlocked { .. }
             | Commands::List { .. }
@@ -2233,6 +2302,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Cycles
             | Commands::Quickstart
             | Commands::Status
+            | Commands::Chat { .. }
     ) || {
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         {
