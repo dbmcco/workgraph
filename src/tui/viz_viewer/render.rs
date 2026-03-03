@@ -6,8 +6,8 @@ use ratatui::widgets::{
 };
 
 use super::state::{
-    ConfirmAction, FocusedPanel, InputMode, RightPanelTab, SortMode, TaskFormField, TaskFormState,
-    TextPromptAction, VizApp,
+    ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, LayoutMode, RightPanelTab, SortMode,
+    TaskFormField, TaskFormState, TextPromptAction, VizApp,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -65,63 +65,90 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         app.load_agency_lifecycle();
     }
 
-    // Determine if right panel is shown.
-    if app.right_panel_visible {
-        if area.width >= SIDE_MIN_WIDTH {
-            // Side-by-side: viz left, right panel right.
-            let right_width = (area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
-            let split = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(1), Constraint::Length(right_width)])
-                .split(main_area);
+    // Layout based on layout mode.
+    match app.layout_mode {
+        LayoutMode::FullPanel => {
+            // Full-width panel: right panel takes entire main area, no graph.
+            app.last_graph_area = Rect::default();
+            app.scroll.viewport_height = 0;
+            app.scroll.viewport_width = 0;
 
-            let viz_area = split[0];
-            let right_area = split[1];
-
-            app.last_graph_area = viz_area;
-            app.scroll.viewport_height = viz_area.height as usize;
-            app.scroll.viewport_width = viz_area.width as usize;
-
-            draw_viz_content(frame, app, viz_area);
-            if app.scroll.content_height > app.scroll.viewport_height {
-                draw_scrollbar(frame, app, viz_area);
-            }
-            draw_right_panel(frame, app, right_area);
-        } else {
-            // Narrow: viz on top, right panel on bottom.
-            let panel_height = (main_area.height as u32 * app.hud_size.bottom_percent() as u32
-                / 100)
-                .max(5) as u16;
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(panel_height)])
-                .split(main_area);
-
-            let viz_area = split[0];
-            let right_area = split[1];
-
-            app.last_graph_area = viz_area;
-            app.scroll.viewport_height = viz_area.height as usize;
-            app.scroll.viewport_width = viz_area.width as usize;
-
-            draw_viz_content(frame, app, viz_area);
-            if app.scroll.content_height > app.scroll.viewport_height {
-                draw_scrollbar(frame, app, viz_area);
-            }
-            draw_right_panel(frame, app, right_area);
+            draw_right_panel(frame, app, main_area);
         }
-    } else {
-        // No right panel — full width viz.
-        app.last_graph_area = main_area;
-        app.last_right_panel_area = Rect::default();
-        app.last_tab_bar_area = Rect::default();
-        app.last_right_content_area = Rect::default();
-        app.scroll.viewport_height = main_area.height as usize;
-        app.scroll.viewport_width = main_area.width as usize;
+        LayoutMode::FullGraph => {
+            // Full-width graph: graph takes entire main area, no panel.
+            app.last_graph_area = main_area;
+            app.last_right_panel_area = Rect::default();
+            app.last_tab_bar_area = Rect::default();
+            app.last_right_content_area = Rect::default();
+            app.scroll.viewport_height = main_area.height as usize;
+            app.scroll.viewport_width = main_area.width as usize;
 
-        draw_viz_content(frame, app, main_area);
-        if app.scroll.content_height > app.scroll.viewport_height {
-            draw_scrollbar(frame, app, main_area);
+            draw_viz_content(frame, app, main_area);
+            if app.scroll.content_height > app.scroll.viewport_height {
+                draw_scrollbar(frame, app, main_area);
+            }
+        }
+        LayoutMode::Split => {
+            if app.right_panel_visible {
+                if area.width >= SIDE_MIN_WIDTH {
+                    // Side-by-side: viz left, right panel right.
+                    let right_width =
+                        (area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
+                    let split = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Min(1), Constraint::Length(right_width)])
+                        .split(main_area);
+
+                    let viz_area = split[0];
+                    let right_area = split[1];
+
+                    app.last_graph_area = viz_area;
+                    app.scroll.viewport_height = viz_area.height as usize;
+                    app.scroll.viewport_width = viz_area.width as usize;
+
+                    draw_viz_content(frame, app, viz_area);
+                    if app.scroll.content_height > app.scroll.viewport_height {
+                        draw_scrollbar(frame, app, viz_area);
+                    }
+                    draw_right_panel(frame, app, right_area);
+                } else {
+                    // Narrow: viz on top, right panel on bottom.
+                    let panel_height =
+                        (main_area.height as u32 * app.hud_size.bottom_percent() as u32 / 100)
+                            .max(5) as u16;
+                    let split = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(1), Constraint::Length(panel_height)])
+                        .split(main_area);
+
+                    let viz_area = split[0];
+                    let right_area = split[1];
+
+                    app.last_graph_area = viz_area;
+                    app.scroll.viewport_height = viz_area.height as usize;
+                    app.scroll.viewport_width = viz_area.width as usize;
+
+                    draw_viz_content(frame, app, viz_area);
+                    if app.scroll.content_height > app.scroll.viewport_height {
+                        draw_scrollbar(frame, app, viz_area);
+                    }
+                    draw_right_panel(frame, app, right_area);
+                }
+            } else {
+                // No right panel — full width viz.
+                app.last_graph_area = main_area;
+                app.last_right_panel_area = Rect::default();
+                app.last_tab_bar_area = Rect::default();
+                app.last_right_content_area = Rect::default();
+                app.scroll.viewport_height = main_area.height as usize;
+                app.scroll.viewport_width = main_area.width as usize;
+
+                draw_viz_content(frame, app, main_area);
+                if app.scroll.content_height > app.scroll.viewport_height {
+                    draw_scrollbar(frame, app, main_area);
+                }
+            }
         }
     }
 
@@ -175,10 +202,12 @@ fn splash_progress_for_line(app: &VizApp, orig_idx: usize) -> Option<f64> {
     None
 }
 
-/// Apply a splash-and-fade background color to a line.
+/// Apply a splash-and-fade background color to the task text portion of a line.
 /// `progress` ranges from 0.0 (bright splash) to 1.0 (fully faded/transparent).
 /// Uses a warm yellow-to-transparent fade via RGB interpolation.
-fn apply_splash_style(line: Line<'_>, progress: f64) -> Line<'_> {
+/// Only the task text (ID, title, status) gets the splash — tree connectors,
+/// metadata, and trailing content are left unchanged.
+fn apply_splash_style<'a>(line: Line<'a>, progress: f64, plain_line: &str) -> Line<'a> {
     // Ease-out curve for a smoother fade (fast initial dim, slow tail-off).
     let t = progress * progress;
 
@@ -194,7 +223,54 @@ fn apply_splash_style(line: Line<'_>, progress: f64) -> Line<'_> {
         return line;
     }
 
-    line.style(Style::default().bg(Color::Rgb(r, g, b)))
+    let splash_bg = Color::Rgb(r, g, b);
+
+    // Only apply splash to the task text range (not tree chars, metadata, etc.).
+    let (text_start, text_end) = match find_text_range(plain_line) {
+        Some(range) => range,
+        None => return line,
+    };
+
+    // Flatten spans into per-character (char, style) pairs.
+    let mut chars_with_styles: Vec<(char, Style)> = Vec::new();
+    for span in &line.spans {
+        for c in span.content.chars() {
+            chars_with_styles.push((c, span.style));
+        }
+    }
+
+    // Rebuild spans, applying splash bg only within the text range.
+    let mut new_spans: Vec<Span<'a>> = Vec::new();
+    let mut current_buf = String::new();
+    let mut current_style = Style::default();
+    let mut first = true;
+
+    for (char_idx, (c, base_style)) in chars_with_styles.iter().enumerate() {
+        let style = if char_idx >= text_start && char_idx < text_end {
+            base_style.bg(splash_bg)
+        } else {
+            *base_style
+        };
+
+        if first {
+            current_style = style;
+            first = false;
+        } else if style != current_style {
+            new_spans.push(Span::styled(
+                std::mem::take(&mut current_buf),
+                current_style,
+            ));
+            current_style = style;
+        }
+
+        current_buf.push(*c);
+    }
+
+    if !current_buf.is_empty() {
+        new_spans.push(Span::styled(current_buf, current_style));
+    }
+
+    Line::from(new_spans)
 }
 
 fn classify_task_line(app: &VizApp, orig_idx: usize) -> LineTraceCategory {
@@ -328,8 +404,13 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
             && let Some(progress) = splash_progress_for_line(app, orig_idx)
             && progress < 1.0
         {
+            let splash_plain = app
+                .plain_lines
+                .get(orig_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("");
             let last = text_lines.last_mut().unwrap();
-            *last = apply_splash_style(std::mem::take(last), progress);
+            *last = apply_splash_style(std::mem::take(last), progress, splash_plain);
         }
     }
 
@@ -725,6 +806,9 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         RightPanelTab::Agency => {
             draw_agents_tab(frame, app, content_area);
         }
+        RightPanelTab::Config => {
+            draw_config_tab(frame, app, content_area);
+        }
     }
 }
 
@@ -805,7 +889,7 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 
-    if total_lines > viewport_h {
+    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
         let mut state =
             ScrollbarState::new(total_lines.saturating_sub(viewport_h)).position(app.hud_scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -901,7 +985,11 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     // Build rendered lines from messages with word-wrapping.
-    let content_width = width.saturating_sub(1); // leave 1 col for scrollbar
+    let content_width = if app.layout_mode == LayoutMode::FullPanel {
+        width // no scrollbar in full-panel mode
+    } else {
+        width.saturating_sub(1) // leave 1 col for scrollbar
+    };
     let mut rendered_lines: Vec<Line> = Vec::new();
 
     for msg in &app.chat.messages {
@@ -913,7 +1001,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             super::state::ChatRole::Coordinator => (
-                "↯",
+                "↯↯↯",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -924,7 +1012,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             ),
         };
 
-        // Inline prefix: "↯: message text" with continuation lines indented.
+        // Inline prefix: "↯↯↯: message text" with continuation lines indented.
         let prefix = format!("{}: ", role_label);
         let prefix_len = prefix.len();
         let indent = " ".repeat(prefix_len);
@@ -982,8 +1070,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
 
-    // Scrollbar if content overflows.
-    if total_lines > viewport_h {
+    // Scrollbar if content overflows (hidden in full-panel mode for cleaner reading).
+    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
         let mut state = ScrollbarState::new(total_lines).position(scroll_from_top);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, msg_area, &mut state);
@@ -1256,8 +1344,8 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, area);
 
-    // Scrollbar if content overflows.
-    if total_lines > viewport_h {
+    // Scrollbar if content overflows (hidden in full-panel mode for cleaner reading).
+    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
         let mut scrollbar_state =
             ScrollbarState::new(total_lines.saturating_sub(viewport_h)).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -1346,7 +1434,11 @@ fn draw_messages_tab(frame: &mut Frame, app: &VizApp, area: Rect) {
     }
 
     let viewport_h = msg_area.height as usize;
-    let wrap_width = width.saturating_sub(1); // leave 1 col for scrollbar
+    let wrap_width = if app.layout_mode == LayoutMode::FullPanel {
+        width // no scrollbar in full-panel mode
+    } else {
+        width.saturating_sub(1) // leave 1 col for scrollbar
+    };
 
     // Build rendered lines with conversational styling.
     // Format: "[timestamp] sender[priority]: body"
@@ -1493,7 +1585,7 @@ fn draw_messages_tab(frame: &mut Frame, app: &VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
 
-    if total_lines > viewport_h {
+    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
         let mut state = ScrollbarState::new(total_lines).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, msg_area, &mut state);
@@ -2355,6 +2447,14 @@ fn draw_action_hints(frame: &mut Frame, app: &VizApp, area: Rect) {
                 Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
             ]
         }
+        InputMode::ConfigEdit => {
+            vec![
+                Span::styled(" Enter", Style::default().fg(Color::Yellow)),
+                Span::styled(":save ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
+            ]
+        }
         InputMode::Normal => match app.focused_panel {
             FocusedPanel::Graph => {
                 let mut hints = vec![
@@ -2371,6 +2471,11 @@ fn draw_action_hints(frame: &mut Frame, app: &VizApp, area: Rect) {
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::styled(":panel ", Style::default().fg(Color::DarkGray)),
                 ];
+                hints.push(Span::styled("=", Style::default().fg(Color::Yellow)));
+                hints.push(Span::styled(
+                    ":layout ",
+                    Style::default().fg(Color::DarkGray),
+                ));
                 if app.right_panel_visible {
                     hints.push(Span::styled("\\", Style::default().fg(Color::Yellow)));
                     hints.push(Span::styled(
@@ -2401,7 +2506,12 @@ fn draw_action_hints(frame: &mut Frame, app: &VizApp, area: Rect) {
                     hints.push(Span::styled("Enter", Style::default().fg(Color::Yellow)));
                     hints.push(Span::styled(":type", Style::default().fg(Color::DarkGray)));
                 }
-                hints.push(Span::styled(" Esc", Style::default().fg(Color::Yellow)));
+                hints.push(Span::styled(" =", Style::default().fg(Color::Yellow)));
+                hints.push(Span::styled(
+                    ":layout ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                hints.push(Span::styled("Esc", Style::default().fg(Color::Yellow)));
                 hints.push(Span::styled(":back", Style::default().fg(Color::DarkGray)));
                 hints
             }
@@ -2608,6 +2718,25 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         ));
     }
 
+    // Layout mode indicator (show when not default split view)
+    match app.layout_mode {
+        LayoutMode::FullPanel => {
+            spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "FULL PANEL ",
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        LayoutMode::FullGraph => {
+            spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "FULL GRAPH ",
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        LayoutMode::Split => {}
+    }
+
     // Help hint
     spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled(
@@ -2669,7 +2798,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         heading("Panels"),
         binding("Tab", "Switch focus: Graph ↔ Right Panel"),
         binding("\\", "Toggle right panel visible"),
-        binding("=", "Cycle HUD size: 1/3 ↔ 2/3"),
+        binding("=", "Cycle layout: split/panel/graph"),
         binding("0-4", "Switch tab: Chat/Detail/Log/Msg/Agency"),
         binding("R", "Toggle raw JSON in Detail tab"),
         blank(),
@@ -2742,6 +2871,191 @@ fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, lab
             format!("${:.2} ", usage.cost_usd),
             Style::default().fg(Color::Cyan),
         ));
+    }
+}
+
+/// Draw the Config tab content: list of settings with current values.
+fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    if app.config_panel.entries.is_empty() {
+        app.load_config_panel();
+    }
+
+    let entries = &app.config_panel.entries;
+    if entries.is_empty() {
+        let msg =
+            Paragraph::new("No configuration found").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let viewport_h = area.height as usize;
+    let selected = app.config_panel.selected;
+
+    // Build display lines grouped by section.
+    let mut lines: Vec<(Line, bool)> = Vec::new(); // (line, is_selectable)
+    let mut entry_line_map: Vec<usize> = Vec::new(); // entry_idx -> display line index
+    let mut current_section: Option<&str> = None;
+
+    for (i, entry) in entries.iter().enumerate() {
+        // Section header if changed.
+        if current_section != Some(entry.section) {
+            if current_section.is_some() {
+                lines.push((Line::from(""), false)); // blank separator
+            }
+            lines.push((
+                Line::from(Span::styled(
+                    format!("── {} ──", entry.section),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                false,
+            ));
+            current_section = Some(entry.section);
+        }
+
+        entry_line_map.push(lines.len());
+
+        let is_selected = i == selected;
+        let is_editing = is_selected && app.config_panel.editing;
+
+        // Format the value display.
+        let value_display = if is_editing {
+            match &entry.edit_kind {
+                ConfigEditKind::TextInput => {
+                    format!("[{}▏]", app.config_panel.edit_buffer)
+                }
+                ConfigEditKind::Choice(choices) => {
+                    let ci = app.config_panel.choice_index;
+                    choices
+                        .iter()
+                        .enumerate()
+                        .map(|(j, c)| {
+                            if j == ci {
+                                format!("[{}]", c)
+                            } else {
+                                c.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+                ConfigEditKind::Toggle => entry.value.clone(),
+            }
+        } else {
+            match &entry.edit_kind {
+                ConfigEditKind::Toggle => {
+                    if entry.value == "on" {
+                        "on".to_string()
+                    } else {
+                        "off".to_string()
+                    }
+                }
+                _ => entry.value.clone(),
+            }
+        };
+
+        let label_width = 22;
+        let label = format!("{:<width$}", entry.label, width = label_width);
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let value_color = match &entry.edit_kind {
+            ConfigEditKind::Toggle => {
+                if entry.value == "on" {
+                    Color::Green
+                } else {
+                    Color::Red
+                }
+            }
+            _ => {
+                if is_selected {
+                    Color::Yellow
+                } else {
+                    Color::Gray
+                }
+            }
+        };
+
+        let cursor = if is_selected { "▸ " } else { "  " };
+
+        let line = Line::from(vec![
+            Span::styled(cursor, style),
+            Span::styled(label, style),
+            Span::styled(value_display, Style::default().fg(value_color)),
+        ]);
+
+        lines.push((line, true));
+    }
+
+    // Add help text at the bottom.
+    lines.push((Line::from(""), false));
+
+    // Show save notification if recent.
+    let show_saved = app
+        .config_panel
+        .save_notification
+        .map(|t| t.elapsed() < std::time::Duration::from_secs(2))
+        .unwrap_or(false);
+
+    if show_saved {
+        lines.push((
+            Line::from(Span::styled(
+                " Saved to config.toml",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            false,
+        ));
+    } else {
+        let help_text = if app.config_panel.editing {
+            match &entries[selected].edit_kind {
+                ConfigEditKind::TextInput => "Enter: save  Esc: cancel",
+                ConfigEditKind::Choice(_) => "Left/Right: choose  Enter: save  Esc: cancel",
+                ConfigEditKind::Toggle => "Enter/Space: toggle",
+            }
+        } else {
+            "j/k: navigate  Enter: edit  Space: toggle"
+        };
+        lines.push((
+            Line::from(Span::styled(
+                format!(" {}", help_text),
+                Style::default().fg(Color::DarkGray),
+            )),
+            false,
+        ));
+    }
+
+    // Scrolling: ensure selected entry is visible.
+    let selected_line = entry_line_map.get(selected).copied().unwrap_or(0);
+    if selected_line < app.config_panel.scroll {
+        app.config_panel.scroll = selected_line;
+    }
+    if selected_line >= app.config_panel.scroll + viewport_h {
+        app.config_panel.scroll = selected_line.saturating_sub(viewport_h - 1);
+    }
+
+    let start = app.config_panel.scroll;
+    let end = (start + viewport_h).min(lines.len());
+
+    let visible_lines: Vec<Line> = lines[start..end].iter().map(|(l, _)| l.clone()).collect();
+
+    let paragraph = Paragraph::new(visible_lines);
+    frame.render_widget(paragraph, area);
+
+    // Scrollbar if content exceeds viewport.
+    if lines.len() > viewport_h {
+        let mut state = ScrollbarState::new(lines.len().saturating_sub(viewport_h))
+            .position(app.config_panel.scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(scrollbar, area, &mut state);
     }
 }
 

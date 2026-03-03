@@ -12,8 +12,8 @@ use ratatui::layout::Position;
 
 use super::render;
 use super::state::{
-    CommandEffect, ConfirmAction, FocusedPanel, InputMode, RightPanelTab, TaskFormField,
-    TextPromptAction, VizApp,
+    CommandEffect, ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, RightPanelTab,
+    TaskFormField, TextPromptAction, VizApp,
 };
 
 /// Input poll timeout — short for responsive scrolling.
@@ -87,6 +87,7 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         InputMode::TextPrompt(_) => handle_text_prompt_input(app, code, modifiers),
         InputMode::ChatInput => handle_chat_input(app, code, modifiers),
         InputMode::MessageInput => handle_message_input(app, code, modifiers),
+        InputMode::ConfigEdit => handle_config_edit_input(app, code, modifiers),
         InputMode::Normal => {
             // Also check legacy search_active flag for backward compat
             if app.search_active {
@@ -139,6 +140,10 @@ fn handle_paste(app: &mut VizApp, text: &str) {
                     }
                 }
             }
+        }
+        InputMode::ConfigEdit => {
+            let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            app.config_panel.edit_buffer.push_str(&clean);
         }
         _ => {} // Normal/Confirm modes: ignore paste
     }
@@ -797,9 +802,9 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.toggle_right_panel();
         }
 
-        // Cycle HUD panel size (1/3 ↔ 2/3)
+        // Cycle layout mode: split → full panel → full graph
         KeyCode::Char('=') => {
-            app.cycle_hud_size();
+            app.cycle_layout_mode();
         }
 
         // Navigate between matches
@@ -934,7 +939,7 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         }
 
         // Digit keys 0-4: switch right panel tab
-        KeyCode::Char(d @ '0'..='4') => {
+        KeyCode::Char(d @ '0'..='5') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
                 app.right_panel_visible = true;
@@ -970,9 +975,9 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.toggle_right_panel();
         }
 
-        // Cycle HUD panel size (1/3 ↔ 2/3)
+        // Cycle layout mode: split → full panel → full graph
         KeyCode::Char('=') => {
-            app.cycle_hud_size();
+            app.cycle_layout_mode();
         }
 
         // Esc: go back to graph focus
@@ -983,7 +988,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         }
 
         // Number keys 0-4 switch tabs
-        KeyCode::Char(d @ '0'..='4') => {
+        KeyCode::Char(d @ '0'..='5') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
                 // Reset dismissed flag when navigating away from Chat tab
@@ -1037,8 +1042,8 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             right_panel_scroll_down(app, 10);
         }
 
-        // Enter: in chat tab, enter chat input mode; in messages tab, enter message input mode
-        // Preserves any in-progress chat input from previous editing.
+        // Enter: in chat tab, enter chat input mode; in messages tab, enter message input mode;
+        // in config tab, start editing the selected setting.
         KeyCode::Enter => {
             if app.right_panel_tab == RightPanelTab::Chat {
                 app.chat_input_dismissed = false;
@@ -1047,7 +1052,29 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                 app.messages_panel.input.clear();
                 app.messages_panel.cursor = 0;
                 app.input_mode = InputMode::MessageInput;
+            } else if app.right_panel_tab == RightPanelTab::Config {
+                config_enter_edit(app);
             }
+        }
+
+        // Config tab: Space toggles boolean entries
+        KeyCode::Char(' ') if app.right_panel_tab == RightPanelTab::Config => {
+            let idx = app.config_panel.selected;
+            if idx < app.config_panel.entries.len() {
+                if matches!(
+                    app.config_panel.entries[idx].edit_kind,
+                    ConfigEditKind::Toggle
+                ) {
+                    app.toggle_config_entry();
+                } else {
+                    config_enter_edit(app);
+                }
+            }
+        }
+
+        // Config tab: 'r' reloads config from disk
+        KeyCode::Char('r') if app.right_panel_tab == RightPanelTab::Config => {
+            app.load_config_panel();
         }
 
         // Agency tab: 'a' = view assignment task detail, 'e' = view evaluation task detail
@@ -1096,6 +1123,9 @@ fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
         RightPanelTab::Agency => {
             app.agent_monitor.scroll = app.agent_monitor.scroll.saturating_sub(amount);
         }
+        RightPanelTab::Config => {
+            app.config_panel.selected = app.config_panel.selected.saturating_sub(amount);
+        }
     }
 }
 
@@ -1115,6 +1145,10 @@ fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
         }
         RightPanelTab::Agency => {
             app.agent_monitor.scroll += amount;
+        }
+        RightPanelTab::Config => {
+            let max = app.config_panel.entries.len().saturating_sub(1);
+            app.config_panel.selected = (app.config_panel.selected + amount).min(max);
         }
     }
 }
@@ -1146,11 +1180,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if in_tab_bar {
-                // Click on tab header: switch to that tab.
+                // Click on tab header: always focus right panel, switch tab if hit.
+                app.focused_panel = FocusedPanel::RightPanel;
                 let col_in_tabs = column.saturating_sub(app.last_tab_bar_area.x);
                 if let Some(tab) = tab_at_column(col_in_tabs) {
                     app.right_panel_tab = tab;
-                    app.focused_panel = FocusedPanel::RightPanel;
                 }
             } else if in_right_content {
                 // Click in right panel content: focus the right panel.
@@ -1202,16 +1236,101 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         }
                     }
                 }
+            } else if app.last_right_panel_area.contains(pos) {
+                // Click on right panel border area: focus right panel.
+                app.focused_panel = FocusedPanel::RightPanel;
             }
         }
         _ => {}
     }
 }
 
+/// Enter edit mode for the currently selected config entry.
+fn config_enter_edit(app: &mut VizApp) {
+    let idx = app.config_panel.selected;
+    if idx >= app.config_panel.entries.len() {
+        return;
+    }
+    match &app.config_panel.entries[idx].edit_kind {
+        ConfigEditKind::Toggle => {
+            app.toggle_config_entry();
+        }
+        ConfigEditKind::TextInput => {
+            app.config_panel.edit_buffer = app.config_panel.entries[idx].value.clone();
+            app.config_panel.editing = true;
+            app.input_mode = InputMode::ConfigEdit;
+        }
+        ConfigEditKind::Choice(choices) => {
+            let current = &app.config_panel.entries[idx].value;
+            app.config_panel.choice_index = choices.iter().position(|c| c == current).unwrap_or(0);
+            app.config_panel.editing = true;
+            app.input_mode = InputMode::ConfigEdit;
+        }
+    }
+}
+
+/// Handle key events in ConfigEdit input mode (editing a text field or choosing from a list).
+fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, _modifiers: KeyModifiers) {
+    let idx = app.config_panel.selected;
+    if idx >= app.config_panel.entries.len() {
+        app.config_panel.editing = false;
+        app.input_mode = InputMode::Normal;
+        return;
+    }
+
+    match &app.config_panel.entries[idx].edit_kind {
+        ConfigEditKind::TextInput => match code {
+            KeyCode::Esc => {
+                app.config_panel.editing = false;
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                app.save_config_entry();
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                app.config_panel.edit_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                app.config_panel.edit_buffer.push(c);
+            }
+            _ => {}
+        },
+        ConfigEditKind::Choice(choices) => match code {
+            KeyCode::Esc => {
+                app.config_panel.editing = false;
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Enter => {
+                app.save_config_entry();
+                app.input_mode = InputMode::Normal;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if app.config_panel.choice_index > 0 {
+                    app.config_panel.choice_index -= 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if app.config_panel.choice_index + 1 < choices.len() {
+                    app.config_panel.choice_index += 1;
+                }
+            }
+            _ => {}
+        },
+        ConfigEditKind::Toggle => {
+            // Should not reach here — toggles are immediate.
+            app.config_panel.editing = false;
+            app.input_mode = InputMode::Normal;
+        }
+    }
+}
+
 /// Determine which tab was clicked based on column position within the tab bar.
 /// Returns None if the click is on a divider or beyond the last tab.
 fn tab_at_column(col: u16) -> Option<RightPanelTab> {
-    let labels = ["0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency"];
+    let labels = [
+        "0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency", "5:Config",
+    ];
     let mut pos: u16 = 0;
     for (i, label) in labels.iter().enumerate() {
         if i > 0 {

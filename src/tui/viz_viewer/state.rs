@@ -12,6 +12,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::layout::Rect;
 
 use crate::commands::viz::{VizOptions, VizOutput};
+use workgraph::config::Config;
 use workgraph::graph::{Status, TokenUsage, format_tokens, parse_token_usage_live};
 use workgraph::parser::load_graph;
 use workgraph::{AgentRegistry, AgentStatus};
@@ -38,6 +39,7 @@ pub enum RightPanelTab {
     Log,      // 2
     Messages, // 3
     Agency,   // 4
+    Config,   // 5
 }
 
 impl RightPanelTab {
@@ -48,6 +50,7 @@ impl RightPanelTab {
             Self::Log => "Log",
             Self::Messages => "Msg",
             Self::Agency => "Agency",
+            Self::Config => "Config",
         }
     }
 
@@ -58,6 +61,7 @@ impl RightPanelTab {
             Self::Log => 2,
             Self::Messages => 3,
             Self::Agency => 4,
+            Self::Config => 5,
         }
     }
 
@@ -68,24 +72,26 @@ impl RightPanelTab {
             2 => Some(Self::Log),
             3 => Some(Self::Messages),
             4 => Some(Self::Agency),
+            5 => Some(Self::Config),
             _ => None,
         }
     }
 
     pub fn next(&self) -> Self {
-        Self::from_index((self.index() + 1) % 5).unwrap()
+        Self::from_index((self.index() + 1) % 6).unwrap()
     }
 
     pub fn prev(&self) -> Self {
-        Self::from_index((self.index() + 4) % 5).unwrap()
+        Self::from_index((self.index() + 5) % 6).unwrap()
     }
 
-    pub const ALL: [RightPanelTab; 5] = [
+    pub const ALL: [RightPanelTab; 6] = [
         Self::Chat,
         Self::Detail,
         Self::Log,
         Self::Messages,
         Self::Agency,
+        Self::Config,
     ];
 }
 
@@ -120,6 +126,7 @@ impl SortMode {
 
 /// HUD panel size preset.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum HudSize {
     /// ~1/3 of terminal (default).
     Normal,
@@ -127,6 +134,7 @@ pub enum HudSize {
     Expanded,
 }
 
+#[allow(dead_code)]
 impl HudSize {
     pub fn cycle(&self) -> Self {
         match self {
@@ -152,6 +160,27 @@ impl HudSize {
     }
 }
 
+/// Layout mode for the three-state cycle (= key).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Split view: graph on left, right panel on right (default).
+    Split,
+    /// Full-width panel: right panel takes entire screen width, graph hidden.
+    FullPanel,
+    /// Full-width graph: graph takes entire screen width, panels hidden.
+    FullGraph,
+}
+
+impl LayoutMode {
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Split => Self::FullPanel,
+            Self::FullPanel => Self::FullGraph,
+            Self::FullGraph => Self::Split,
+        }
+    }
+}
+
 /// Input modes — at most one is active at a time.
 #[derive(Clone, PartialEq, Eq)]
 pub enum InputMode {
@@ -169,6 +198,8 @@ pub enum InputMode {
     Confirm(ConfirmAction),
     /// Text prompt dialog (e.g., fail reason, message text).
     TextPrompt(TextPromptAction),
+    /// Config panel text editing mode.
+    ConfigEdit,
 }
 
 /// What action the confirmation dialog is for.
@@ -422,6 +453,49 @@ pub struct MessagesPanelState {
     pub cursor: usize,
 }
 
+/// A single setting entry displayed in the Config panel.
+pub struct ConfigEntry {
+    /// Setting key used for saving (e.g., "coordinator.max_agents").
+    pub key: String,
+    /// Human-readable label for display.
+    pub label: String,
+    /// Current value as a displayable string.
+    pub value: String,
+    /// What kind of editing this entry supports.
+    pub edit_kind: ConfigEditKind,
+    /// Section header this entry belongs to.
+    pub section: &'static str,
+}
+
+/// How a config entry can be edited.
+pub enum ConfigEditKind {
+    /// Simple boolean toggle.
+    Toggle,
+    /// Choose from a fixed list of options.
+    Choice(Vec<String>),
+    /// Free-form text/number input.
+    TextInput,
+}
+
+/// State for the Config panel (panel 5).
+#[derive(Default)]
+pub struct ConfigPanelState {
+    /// All config entries to display.
+    pub entries: Vec<ConfigEntry>,
+    /// Currently selected entry index.
+    pub selected: usize,
+    /// Scroll offset for the list.
+    pub scroll: usize,
+    /// Whether we're currently editing the selected entry.
+    pub editing: bool,
+    /// Input buffer when editing a TextInput entry.
+    pub edit_buffer: String,
+    /// Selected choice index when editing a Choice entry.
+    pub choice_index: usize,
+    /// Notification message (e.g., "Saved!" shown briefly).
+    pub save_notification: Option<std::time::Instant>,
+}
+
 /// A background command result received from a spawned thread.
 pub struct CommandResult {
     pub success: bool,
@@ -601,6 +675,8 @@ pub struct VizApp {
     pub right_panel_percent: u16,
     /// HUD panel size preset (Normal = ~1/3, Expanded = ~2/3).
     pub hud_size: HudSize,
+    /// Layout mode for three-state cycle (split → full panel → full graph).
+    pub layout_mode: LayoutMode,
     /// Current input mode.
     pub input_mode: InputMode,
     /// True when user explicitly dismissed chat input with Esc.
@@ -629,6 +705,9 @@ pub struct VizApp {
 
     // ── Messages panel state (panel 3) ──
     pub messages_panel: MessagesPanelState,
+
+    // ── Config panel state (panel 5) ──
+    pub config_panel: ConfigPanelState,
 
     // ── Command queue ──
     /// Channel receiver for background command results.
@@ -758,6 +837,7 @@ impl VizApp {
             right_panel_tab: RightPanelTab::Detail,
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
+            layout_mode: LayoutMode::Split,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
             task_form: None,
@@ -769,6 +849,7 @@ impl VizApp {
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             messages_panel: MessagesPanelState::default(),
+            config_panel: ConfigPanelState::default(),
             cmd_rx,
             cmd_tx,
             notification: None,
@@ -1211,10 +1292,10 @@ impl VizApp {
         // Find the task in the current task_order.
         if let Some(idx) = self.task_order.iter().position(|id| id == &task_id) {
             self.selected_task_idx = Some(idx);
-            // Set a transient highlight so the new task visually flashes.
-            if let Some(&orig_line) = self.node_line_map.get(&task_id) {
-                self.jump_target = Some((orig_line, Instant::now()));
-            }
+            // The splash animation (registered earlier in refresh_data) provides
+            // the visual highlight for new tasks. Don't also set jump_target here
+            // — its 2s lifetime outlasts the 1.5s splash, causing a yellow flash
+            // after the smooth fade finishes.
             self.notification = Some((format!("New task: {}", task_id), Instant::now()));
             true
         } else {
@@ -2499,6 +2580,7 @@ impl VizApp {
             right_panel_tab: RightPanelTab::Detail,
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
+            layout_mode: LayoutMode::Split,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
             task_form: None,
@@ -2522,6 +2604,7 @@ impl VizApp {
             last_refresh: Instant::now(),
             last_refresh_display: String::new(),
             refresh_interval: std::time::Duration::from_secs(3600),
+            config_panel: ConfigPanelState::default(),
         }
     }
 
@@ -2544,7 +2627,21 @@ impl VizApp {
     // ── Multi-panel methods ──
 
     /// Toggle focus between Graph and RightPanel.
+    /// In full-panel or full-graph mode, focus stays locked to the visible content.
     pub fn toggle_panel_focus(&mut self) {
+        match self.layout_mode {
+            LayoutMode::FullPanel => {
+                // Only the panel is visible; stay focused on it.
+                self.focused_panel = FocusedPanel::RightPanel;
+                return;
+            }
+            LayoutMode::FullGraph => {
+                // Only the graph is visible; stay focused on it.
+                self.focused_panel = FocusedPanel::Graph;
+                return;
+            }
+            LayoutMode::Split => {}
+        }
         self.focused_panel = match self.focused_panel {
             FocusedPanel::Graph => {
                 if self.right_panel_visible {
@@ -2558,7 +2655,12 @@ impl VizApp {
     }
 
     /// Toggle right panel visibility.
+    /// If in a non-split layout mode, resets to split mode first.
     pub fn toggle_right_panel(&mut self) {
+        if self.layout_mode != LayoutMode::Split {
+            // Reset to split mode, then apply the toggle.
+            self.layout_mode = LayoutMode::Split;
+        }
         self.right_panel_visible = !self.right_panel_visible;
         if !self.right_panel_visible {
             self.focused_panel = FocusedPanel::Graph;
@@ -2566,9 +2668,29 @@ impl VizApp {
     }
 
     /// Cycle HUD panel size between Normal (~1/3) and Expanded (~2/3).
+    #[allow(dead_code)]
     pub fn cycle_hud_size(&mut self) {
         self.hud_size = self.hud_size.cycle();
         self.right_panel_percent = self.hud_size.side_percent();
+    }
+
+    /// Cycle layout mode: split → full panel → full graph → split.
+    pub fn cycle_layout_mode(&mut self) {
+        self.layout_mode = self.layout_mode.cycle();
+        match self.layout_mode {
+            LayoutMode::Split => {
+                self.right_panel_visible = true;
+            }
+            LayoutMode::FullPanel => {
+                self.right_panel_visible = true;
+                // Focus the right panel since it's the only visible content.
+                self.focused_panel = FocusedPanel::RightPanel;
+            }
+            LayoutMode::FullGraph => {
+                self.right_panel_visible = false;
+                self.focused_panel = FocusedPanel::Graph;
+            }
+        }
     }
 
     /// Execute a wg command in a background thread.
@@ -3099,6 +3221,220 @@ impl VizApp {
             vec!["kill".to_string(), agent_id.clone()],
             CommandEffect::RefreshAndNotify(format!("Killed {} on task '{}'", agent_id, task_id)),
         );
+    }
+
+    // ── Config panel ──
+
+    /// Load configuration from disk and populate config panel entries.
+    pub fn load_config_panel(&mut self) {
+        let config = Config::load_or_default(&self.workgraph_dir);
+        let mut entries = Vec::new();
+
+        // ── Service Configuration ──
+        entries.push(ConfigEntry {
+            key: "coordinator.max_agents".into(),
+            label: "Max agents".into(),
+            value: config.coordinator.max_agents.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Service",
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.poll_interval".into(),
+            label: "Poll interval (s)".into(),
+            value: config.coordinator.poll_interval.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Service",
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.executor".into(),
+            label: "Executor".into(),
+            value: config.coordinator.executor.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "claude".into(),
+                "amplifier".into(),
+                "opencode".into(),
+                "codex".into(),
+                "shell".into(),
+            ]),
+            section: "Service",
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.model".into(),
+            label: "Model".into(),
+            value: config
+                .coordinator
+                .model
+                .clone()
+                .unwrap_or_else(|| config.agent.model.clone()),
+            edit_kind: ConfigEditKind::Choice(vec!["opus".into(), "sonnet".into(), "haiku".into()]),
+            section: "Service",
+        });
+        entries.push(ConfigEntry {
+            key: "agency.auto_evaluate".into(),
+            label: "Auto-evaluate".into(),
+            value: if config.agency.auto_evaluate {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: "Service",
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.agent_timeout".into(),
+            label: "Agent timeout".into(),
+            value: config.coordinator.agent_timeout.clone(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Service",
+        });
+
+        // ── Agent Configuration ──
+        entries.push(ConfigEntry {
+            key: "agent.heartbeat_timeout".into(),
+            label: "Heartbeat timeout (min)".into(),
+            value: config.agent.heartbeat_timeout.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Agent",
+        });
+
+        // ── Visualization ──
+        entries.push(ConfigEntry {
+            key: "viz.edge_color".into(),
+            label: "Edge color".into(),
+            value: config.viz.edge_color.clone(),
+            edit_kind: ConfigEditKind::Choice(vec!["gray".into(), "white".into(), "mixed".into()]),
+            section: "Display",
+        });
+
+        // ── Guardrails ──
+        entries.push(ConfigEntry {
+            key: "guardrails.max_child_tasks_per_agent".into(),
+            label: "Max subtasks/agent".into(),
+            value: config.guardrails.max_child_tasks_per_agent.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Guardrails",
+        });
+        entries.push(ConfigEntry {
+            key: "guardrails.max_task_depth".into(),
+            label: "Max chain depth".into(),
+            value: config.guardrails.max_task_depth.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: "Guardrails",
+        });
+
+        self.config_panel.entries = entries;
+        // Preserve selection if valid, otherwise reset.
+        if self.config_panel.selected >= self.config_panel.entries.len() {
+            self.config_panel.selected = 0;
+        }
+    }
+
+    /// Apply the current edit to the config and save to disk.
+    pub fn save_config_entry(&mut self) {
+        let idx = self.config_panel.selected;
+        if idx >= self.config_panel.entries.len() {
+            return;
+        }
+
+        let new_value = if self.config_panel.editing {
+            match &self.config_panel.entries[idx].edit_kind {
+                ConfigEditKind::TextInput => self.config_panel.edit_buffer.clone(),
+                ConfigEditKind::Choice(choices) => choices
+                    .get(self.config_panel.choice_index)
+                    .cloned()
+                    .unwrap_or_default(),
+                ConfigEditKind::Toggle => {
+                    // Toggled already — value is already updated.
+                    return;
+                }
+            }
+        } else {
+            return;
+        };
+
+        // Update the display value.
+        self.config_panel.entries[idx].value = new_value.clone();
+
+        // Load, mutate, and save the config.
+        let mut config = Config::load_or_default(&self.workgraph_dir);
+        let key = &self.config_panel.entries[idx].key;
+        match key.as_str() {
+            "coordinator.max_agents" => {
+                if let Ok(v) = new_value.parse::<usize>() {
+                    config.coordinator.max_agents = v;
+                }
+            }
+            "coordinator.poll_interval" => {
+                if let Ok(v) = new_value.parse::<u64>() {
+                    config.coordinator.poll_interval = v;
+                }
+            }
+            "coordinator.executor" => {
+                config.coordinator.executor = new_value;
+            }
+            "coordinator.model" => {
+                config.coordinator.model = Some(new_value);
+            }
+            "agency.auto_evaluate" => {
+                config.agency.auto_evaluate = new_value == "on";
+            }
+            "coordinator.agent_timeout" => {
+                config.coordinator.agent_timeout = new_value;
+            }
+            "agent.heartbeat_timeout" => {
+                if let Ok(v) = new_value.parse::<u64>() {
+                    config.agent.heartbeat_timeout = v;
+                }
+            }
+            "viz.edge_color" => {
+                config.viz.edge_color = new_value;
+            }
+            "guardrails.max_child_tasks_per_agent" => {
+                if let Ok(v) = new_value.parse::<u32>() {
+                    config.guardrails.max_child_tasks_per_agent = v;
+                }
+            }
+            "guardrails.max_task_depth" => {
+                if let Ok(v) = new_value.parse::<u32>() {
+                    config.guardrails.max_task_depth = v;
+                }
+            }
+            _ => {}
+        }
+        if config.save(&self.workgraph_dir).is_ok() {
+            self.config_panel.save_notification = Some(Instant::now());
+        }
+
+        self.config_panel.editing = false;
+    }
+
+    /// Toggle a boolean config entry and save immediately.
+    pub fn toggle_config_entry(&mut self) {
+        let idx = self.config_panel.selected;
+        if idx >= self.config_panel.entries.len() {
+            return;
+        }
+        if !matches!(
+            self.config_panel.entries[idx].edit_kind,
+            ConfigEditKind::Toggle
+        ) {
+            return;
+        }
+        let new_val = if self.config_panel.entries[idx].value == "on" {
+            "off"
+        } else {
+            "on"
+        };
+        self.config_panel.entries[idx].value = new_val.to_string();
+
+        // Persist.
+        let mut config = Config::load_or_default(&self.workgraph_dir);
+        if self.config_panel.entries[idx].key.as_str() == "agency.auto_evaluate" {
+            config.agency.auto_evaluate = new_val == "on";
+        }
+        if config.save(&self.workgraph_dir).is_ok() {
+            self.config_panel.save_notification = Some(Instant::now());
+        }
     }
 }
 
