@@ -877,28 +877,58 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Char('n') => app.next_match(),
         KeyCode::Char('N') | KeyCode::BackTab => app.prev_match(),
 
-        // HUD panel scroll (Shift or Alt + Up/Down/PgUp/PgDn)
-        KeyCode::Up
-            if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
-        {
+        // Alt+Up/Down: toggle focus between graph and right panel
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => {
+            app.toggle_panel_focus();
+            if app.focused_panel == FocusedPanel::RightPanel
+                && app.right_panel_tab == RightPanelTab::Chat
+                && !app.chat_input_dismissed
+            {
+                app.input_mode = InputMode::ChatInput;
+            }
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::ALT) => {
+            app.toggle_panel_focus();
+            if app.focused_panel == FocusedPanel::RightPanel
+                && app.right_panel_tab == RightPanelTab::Chat
+                && !app.chat_input_dismissed
+            {
+                app.input_mode = InputMode::ChatInput;
+            }
+        }
+
+        // Alt+Left/Right: cycle tabs
+        KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+            let old_tab = app.right_panel_tab;
+            app.right_panel_visible = true;
+            app.right_panel_tab = app.right_panel_tab.prev();
+            if old_tab == RightPanelTab::Chat && app.right_panel_tab != RightPanelTab::Chat {
+                app.chat_input_dismissed = false;
+            }
+        }
+        KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+            let old_tab = app.right_panel_tab;
+            app.right_panel_visible = true;
+            app.right_panel_tab = app.right_panel_tab.next();
+            if old_tab == RightPanelTab::Chat && app.right_panel_tab != RightPanelTab::Chat {
+                app.chat_input_dismissed = false;
+            }
+        }
+
+        // HUD panel scroll (Shift + Up/Down/PgUp/PgDn)
+        KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
             app.record_scroll_activity();
             app.hud_scroll_up(1);
         }
-        KeyCode::Down
-            if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
-        {
+        KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
             app.record_scroll_activity();
             app.hud_scroll_down(1);
         }
-        KeyCode::PageUp
-            if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
-        {
+        KeyCode::PageUp if modifiers.contains(KeyModifiers::SHIFT) => {
             app.record_scroll_activity();
             app.hud_scroll_up(10);
         }
-        KeyCode::PageDown
-            if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
-        {
+        KeyCode::PageDown if modifiers.contains(KeyModifiers::SHIFT) => {
             app.record_scroll_activity();
             app.hud_scroll_down(10);
         }
@@ -1139,6 +1169,42 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                 if tab == RightPanelTab::Chat && !app.chat_input_dismissed {
                     app.input_mode = InputMode::ChatInput;
                 }
+            }
+        }
+
+        // Alt+Up/Down: toggle panel focus
+        KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => {
+            app.toggle_panel_focus();
+            if app.focused_panel == FocusedPanel::Graph {
+                app.chat_input_dismissed = false;
+            }
+        }
+        KeyCode::Down if modifiers.contains(KeyModifiers::ALT) => {
+            app.toggle_panel_focus();
+            if app.focused_panel == FocusedPanel::Graph {
+                app.chat_input_dismissed = false;
+            }
+        }
+
+        // Alt+Left/Right: cycle tabs (same as bare Left/Right)
+        KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+            let old_tab = app.right_panel_tab;
+            app.right_panel_tab = app.right_panel_tab.prev();
+            if old_tab == RightPanelTab::Chat && app.right_panel_tab != RightPanelTab::Chat {
+                app.chat_input_dismissed = false;
+            }
+            if app.right_panel_tab == RightPanelTab::Chat && !app.chat_input_dismissed {
+                app.input_mode = InputMode::ChatInput;
+            }
+        }
+        KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+            let old_tab = app.right_panel_tab;
+            app.right_panel_tab = app.right_panel_tab.next();
+            if old_tab == RightPanelTab::Chat && app.right_panel_tab != RightPanelTab::Chat {
+                app.chat_input_dismissed = false;
+            }
+            if app.right_panel_tab == RightPanelTab::Chat && !app.chat_input_dismissed {
+                app.input_mode = InputMode::ChatInput;
             }
         }
 

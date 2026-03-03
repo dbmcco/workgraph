@@ -2851,7 +2851,7 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
 fn draw_help_overlay(frame: &mut Frame) {
     let size = frame.area();
     let width = 56.min(size.width.saturating_sub(4));
-    let height = 48.min(size.height.saturating_sub(4));
+    let height = 50.min(size.height.saturating_sub(4));
     let x = (size.width.saturating_sub(width)) / 2;
     let y = (size.height.saturating_sub(height)) / 2;
     let area = Rect::new(x, y, width, height);
@@ -2897,15 +2897,17 @@ fn draw_help_overlay(frame: &mut Frame) {
         blank(),
         heading("Panels"),
         binding("Tab", "Switch focus: Graph ↔ Right Panel"),
+        binding("Alt-↑/↓", "Switch focus: Graph ↔ Right Panel"),
+        binding("Alt-←/→", "Cycle tabs (prev / next)"),
         binding("\\", "Toggle right panel visible"),
         binding("=", "Cycle layout: split/panel/graph"),
-        binding("0-4", "Switch tab: Chat/Detail/Log/Msg/Agency"),
+        binding("0-6", "Switch tab: Chat/.../Config/Files"),
         binding("R", "Toggle raw JSON in Detail tab"),
         blank(),
         heading("Edge Tracing"),
         binding("t", "Toggle trace on/off"),
         binding("T", "Toggle view/total tokens"),
-        binding("Shift/Alt-↑/↓", "Scroll detail panel"),
+        binding("Shift-↑/↓", "Scroll detail panel"),
         binding("", "Bold=selected  Magenta=upstream"),
         binding("", "Cyan=downstream"),
         blank(),
