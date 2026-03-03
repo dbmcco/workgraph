@@ -17,8 +17,149 @@ use workgraph::graph::{Status, TokenUsage, format_tokens, parse_token_usage_live
 use workgraph::parser::load_graph;
 use workgraph::{AgentRegistry, AgentStatus};
 
-/// Duration of the splash-and-fade animation for newly added tasks (seconds).
-const SPLASH_DURATION_SECS: f64 = 1.5;
+/// Maximum simultaneous animations before oldest are dropped.
+const MAX_ANIMATIONS: usize = 50;
+
+/// Token-count bucket size for debouncing token-usage animations.
+/// Changes smaller than this are ignored.
+const TOKEN_DEBOUNCE_BUCKET: u64 = 1000;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Animation system
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Animation speed preset, controlling the fade duration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnimationSpeed {
+    Fast,
+    Normal,
+    Slow,
+}
+
+impl AnimationSpeed {
+    /// Duration of the splash-and-fade animation in seconds.
+    pub fn duration_secs(self) -> f64 {
+        match self {
+            Self::Fast => 0.8,
+            Self::Normal => 1.5,
+            Self::Slow => 2.5,
+        }
+    }
+}
+
+/// What kind of change triggered this animation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnimationKind {
+    /// A brand-new task appeared in the graph.
+    NewTask,
+    /// Task status changed (e.g. open → in-progress → done → failed).
+    StatusChange,
+    /// Non-status text changed (token counts, timestamps, etc.).
+    ContentChange,
+    /// An agent was assigned or changed on the task.
+    Assignment,
+    /// A new dependency edge appeared on the task.
+    EdgeChange,
+}
+
+/// A single active flash-and-fade animation on a task.
+#[derive(Clone)]
+pub struct Animation {
+    /// When the animation started.
+    pub start: Instant,
+    /// The flash color (at full brightness).
+    pub flash_color: (u8, u8, u8),
+    /// What triggered this animation.
+    #[allow(dead_code)]
+    pub kind: AnimationKind,
+}
+
+/// Animation mode from config.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnimationMode {
+    /// Normal animated flash-and-fade.
+    Normal,
+    /// Fast animation.
+    Fast,
+    /// Slow animation.
+    Slow,
+    /// Reduced motion: instant color change, no fade.
+    Reduced,
+    /// Animations disabled entirely.
+    Off,
+}
+
+impl AnimationMode {
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "fast" => Self::Fast,
+            "slow" => Self::Slow,
+            "reduced" => Self::Reduced,
+            "off" => Self::Off,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn speed(self) -> AnimationSpeed {
+        match self {
+            Self::Fast => AnimationSpeed::Fast,
+            Self::Normal | Self::Reduced => AnimationSpeed::Normal,
+            Self::Slow => AnimationSpeed::Slow,
+            Self::Off => AnimationSpeed::Normal, // unused when off
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Fast => "fast",
+            Self::Slow => "slow",
+            Self::Reduced => "reduced",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Flash color for a given status transition.
+fn flash_color_for_status(status: &Status) -> (u8, u8, u8) {
+    match status {
+        Status::Done => (80, 220, 100),       // green
+        Status::Failed => (220, 60, 60),      // red
+        Status::InProgress => (60, 200, 220), // cyan
+        Status::Open => (200, 200, 80),       // yellow
+        Status::Blocked => (180, 120, 60),    // orange
+        Status::Abandoned => (140, 100, 160), // muted purple
+    }
+}
+
+/// Flash color for non-status changes.
+fn flash_color_for_kind(kind: AnimationKind) -> (u8, u8, u8) {
+    match kind {
+        AnimationKind::NewTask => (220, 200, 80), // warm yellow
+        AnimationKind::StatusChange => (200, 200, 200), // white (overridden by status)
+        AnimationKind::ContentChange => (160, 160, 200), // soft blue-gray
+        AnimationKind::Assignment => (200, 120, 220), // magenta
+        AnimationKind::EdgeChange => (100, 180, 200), // teal
+    }
+}
+
+/// Lightweight snapshot of per-task state for change detection.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub status: Status,
+    pub assigned: Option<String>,
+    /// Token count bucketed to TOKEN_DEBOUNCE_BUCKET for debounce.
+    pub token_bucket: u64,
+    /// Number of dependency edges (after).
+    pub edge_count: usize,
+    /// The plain-text rendered line for this task (detects any content change).
+    pub plain_line: String,
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Panel state types
@@ -40,6 +181,7 @@ pub enum RightPanelTab {
     Messages, // 3
     Agency,   // 4
     Config,   // 5
+    Files,    // 6
 }
 
 impl RightPanelTab {
@@ -51,6 +193,7 @@ impl RightPanelTab {
             Self::Messages => "Msg",
             Self::Agency => "Agency",
             Self::Config => "Config",
+            Self::Files => "Files",
         }
     }
 
@@ -62,6 +205,7 @@ impl RightPanelTab {
             Self::Messages => 3,
             Self::Agency => 4,
             Self::Config => 5,
+            Self::Files => 6,
         }
     }
 
@@ -73,25 +217,27 @@ impl RightPanelTab {
             3 => Some(Self::Messages),
             4 => Some(Self::Agency),
             5 => Some(Self::Config),
+            6 => Some(Self::Files),
             _ => None,
         }
     }
 
     pub fn next(&self) -> Self {
-        Self::from_index((self.index() + 1) % 6).unwrap()
+        Self::from_index((self.index() + 1) % 7).unwrap()
     }
 
     pub fn prev(&self) -> Self {
-        Self::from_index((self.index() + 5) % 6).unwrap()
+        Self::from_index((self.index() + 6) % 7).unwrap()
     }
 
-    pub const ALL: [RightPanelTab; 6] = [
+    pub const ALL: [RightPanelTab; 7] = [
         Self::Chat,
         Self::Detail,
         Self::Log,
         Self::Messages,
         Self::Agency,
         Self::Config,
+        Self::Files,
     ];
 }
 
@@ -216,6 +362,7 @@ pub enum TextPromptAction {
     #[allow(dead_code)]
     SendMessage(String), // task_id
     EditDescription(String), // task_id
+    AttachFile,         // attach a file to the next chat message
 }
 
 /// State for the task creation form overlay.
@@ -341,11 +488,28 @@ pub struct ChatState {
     pub last_request_id: Option<String>,
     /// Whether the service coordinator is currently active.
     pub coordinator_active: bool,
+    /// Pending attachments for the next message (file paths, already stored in .workgraph/attachments/).
+    pub pending_attachments: Vec<PendingAttachment>,
+}
+
+/// A pending attachment waiting to be sent with the next chat message.
+#[allow(dead_code)]
+pub struct PendingAttachment {
+    /// Display filename (e.g. "screenshot.png").
+    pub filename: String,
+    /// Relative path to the stored copy (e.g. ".workgraph/attachments/20260303-...png").
+    pub stored_path: String,
+    /// MIME type.
+    pub mime_type: String,
+    /// Size in bytes.
+    pub size_bytes: u64,
 }
 
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: String,
+    /// Attachment filenames for display (just the filename portion).
+    pub attachments: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -463,8 +627,8 @@ pub struct ConfigEntry {
     pub value: String,
     /// What kind of editing this entry supports.
     pub edit_kind: ConfigEditKind,
-    /// Section header this entry belongs to.
-    pub section: &'static str,
+    /// Section this entry belongs to.
+    pub section: ConfigSection,
 }
 
 /// How a config entry can be edited.
@@ -475,6 +639,47 @@ pub enum ConfigEditKind {
     Choice(Vec<String>),
     /// Free-form text/number input.
     TextInput,
+    /// Sensitive text input (API key — shows masked).
+    SecretInput,
+}
+
+/// Config dashboard sections.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ConfigSection {
+    Endpoints,
+    ApiKeys,
+    Service,
+    TuiSettings,
+    AgentDefaults,
+    Agency,
+    Guardrails,
+}
+
+impl ConfigSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Endpoints => "LLM Endpoints",
+            Self::ApiKeys => "API Keys",
+            Self::Service => "Service Settings",
+            Self::TuiSettings => "TUI Settings",
+            Self::AgentDefaults => "Agent Defaults",
+            Self::Agency => "Agency",
+            Self::Guardrails => "Guardrails",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn all() -> &'static [ConfigSection] {
+        &[
+            Self::Endpoints,
+            Self::ApiKeys,
+            Self::Service,
+            Self::TuiSettings,
+            Self::AgentDefaults,
+            Self::Agency,
+            Self::Guardrails,
+        ]
+    }
 }
 
 /// State for the Config panel (panel 5).
@@ -494,6 +699,28 @@ pub struct ConfigPanelState {
     pub choice_index: usize,
     /// Notification message (e.g., "Saved!" shown briefly).
     pub save_notification: Option<std::time::Instant>,
+    /// Which sections are collapsed.
+    pub collapsed: std::collections::HashSet<ConfigSection>,
+    /// Whether we're in the "add endpoint" flow.
+    pub adding_endpoint: bool,
+    /// Fields for new endpoint being added.
+    pub new_endpoint: NewEndpointFields,
+    /// Which field in the new-endpoint form is active (0-4).
+    pub new_endpoint_field: usize,
+    /// Service running status (cached, updated on load).
+    pub service_running: bool,
+    /// Service PID if running.
+    pub service_pid: Option<u32>,
+}
+
+/// Fields for the "add new endpoint" form.
+#[derive(Default, Clone)]
+pub struct NewEndpointFields {
+    pub name: String,
+    pub provider: String,
+    pub url: String,
+    pub model: String,
+    pub api_key: String,
 }
 
 /// A background command result received from a spawned thread.
@@ -709,6 +936,9 @@ pub struct VizApp {
     // ── Config panel state (panel 5) ──
     pub config_panel: ConfigPanelState,
 
+    // ── File browser state (panel 6) ──
+    pub file_browser: Option<super::file_browser::FileBrowser>,
+
     // ── Command queue ──
     /// Channel receiver for background command results.
     pub cmd_rx: mpsc::Receiver<CommandResult>,
@@ -733,11 +963,19 @@ pub struct VizApp {
     /// Whether this is the initial load (first load scrolls to bottom by default).
     initial_load: bool,
 
-    // ── Splash animations ──
-    /// Tracks splash-and-fade animations for newly added tasks.
-    /// Maps task ID to the Instant when the task first appeared.
-    /// Animations run for SPLASH_DURATION_SECS then get cleaned up.
-    pub splash_animations: HashMap<String, Instant>,
+    // ── Animations ──
+    /// Active flash-and-fade animations keyed by task ID.
+    /// Each task can have at most one active animation; newer changes replace older ones.
+    pub splash_animations: HashMap<String, Animation>,
+    /// Previous per-task snapshots for change detection.
+    /// Populated on each refresh; compared to current state to detect changes.
+    pub task_snapshots: HashMap<String, TaskSnapshot>,
+    /// Animation mode (from config: normal/fast/slow/reduced/off).
+    pub animation_mode: AnimationMode,
+
+    // ── Scrollbar auto-hide ──
+    /// Timestamp of the last scroll activity. Scrollbar is shown for 2 seconds after activity.
+    pub last_scroll_activity: Option<Instant>,
 
     // ── Live refresh ──
     /// Last observed modification time of graph.jsonl.
@@ -783,6 +1021,8 @@ impl VizApp {
         let graph_mtime = std::fs::metadata(workgraph_dir.join("graph.jsonl"))
             .and_then(|m| m.modified())
             .ok();
+        let config = Config::load_or_default(&workgraph_dir);
+        let animation_mode = AnimationMode::from_config(&config.viz.animations);
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let mut app = Self {
             workgraph_dir,
@@ -850,6 +1090,7 @@ impl VizApp {
             log_pane: LogPaneState::default(),
             messages_panel: MessagesPanelState::default(),
             config_panel: ConfigPanelState::default(),
+            file_browser: None,
             cmd_rx,
             cmd_tx,
             notification: None,
@@ -858,6 +1099,9 @@ impl VizApp {
             smart_follow_active: true,
             initial_load: true,
             splash_animations: HashMap::new(),
+            task_snapshots: HashMap::new(),
+            animation_mode,
+            last_scroll_activity: None,
             last_graph_mtime: graph_mtime,
             last_refresh: Instant::now(),
             last_refresh_display: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -926,7 +1170,7 @@ impl VizApp {
 
                 // Detect newly appeared tasks and register splash animations.
                 // Skip on initial load (old_task_order is empty).
-                if !old_task_order.is_empty() {
+                if !old_task_order.is_empty() && self.animation_mode.is_enabled() {
                     let old_set: HashSet<&str> =
                         old_task_order.iter().map(|s| s.as_str()).collect();
                     let now = Instant::now();
@@ -934,10 +1178,49 @@ impl VizApp {
                         if !old_set.contains(id.as_str())
                             && !self.splash_animations.contains_key(id)
                         {
-                            self.splash_animations.insert(id.clone(), now);
+                            self.splash_animations.insert(
+                                id.clone(),
+                                Animation {
+                                    start: now,
+                                    flash_color: flash_color_for_kind(AnimationKind::NewTask),
+                                    kind: AnimationKind::NewTask,
+                                },
+                            );
+                        }
+                    }
+
+                    // Detect per-task content changes (plain line text differs).
+                    for (task_id, snap) in &self.task_snapshots {
+                        if self.splash_animations.contains_key(task_id) {
+                            continue; // already animating (e.g., new task)
+                        }
+                        if let Some(&line_idx) = self.node_line_map.get(task_id)
+                            && let Some(plain) = self.plain_lines.get(line_idx)
+                            && *plain != snap.plain_line
+                        {
+                            // Content changed but we don't know what — register
+                            // a soft content-change animation. The more specific
+                            // status/assignment detection in detect_state_changes()
+                            // will overwrite this with a stronger color if applicable.
+                            self.splash_animations.insert(
+                                task_id.clone(),
+                                Animation {
+                                    start: now,
+                                    flash_color: flash_color_for_kind(AnimationKind::ContentChange),
+                                    kind: AnimationKind::ContentChange,
+                                },
+                            );
                         }
                     }
                 }
+
+                // Re-apply the current sort mode so task_order reflects the
+                // user's selected ordering (e.g. StatusGrouped) immediately,
+                // rather than staying in raw viz line order until the next
+                // manual sort-cycle.  This prevents new tasks from briefly
+                // appearing at their dependency position before jumping to
+                // their correct sorted position on the next refresh.
+                self.apply_sort_mode();
 
                 // Preserve selection by task ID (not index) across refreshes.
                 // The task_order may have changed, so resolve the old ID to
@@ -1309,26 +1592,52 @@ impl VizApp {
     /// 0.0 = animation just started (full brightness), 1.0 = fully faded.
     /// Returns None if the task has no active animation.
     pub fn splash_progress(&self, task_id: &str) -> Option<f64> {
-        self.splash_animations.get(task_id).map(|start| {
-            let elapsed = start.elapsed().as_secs_f64();
-            (elapsed / SPLASH_DURATION_SECS).min(1.0)
-        })
+        let anim = self.splash_animations.get(task_id)?;
+        let duration = self.animation_mode.speed().duration_secs();
+        let elapsed = anim.start.elapsed().as_secs_f64();
+        Some((elapsed / duration).min(1.0))
+    }
+
+    /// Returns the flash color for a task's active animation, or None.
+    pub fn splash_color(&self, task_id: &str) -> Option<(u8, u8, u8)> {
+        self.splash_animations.get(task_id).map(|a| a.flash_color)
     }
 
     /// Whether any splash animations are currently active (not yet fully faded).
     #[allow(dead_code)]
     pub fn has_active_animations(&self) -> bool {
-        let cutoff = std::time::Duration::from_secs_f64(SPLASH_DURATION_SECS);
+        let duration = self.animation_mode.speed().duration_secs();
+        let cutoff = std::time::Duration::from_secs_f64(duration);
         self.splash_animations
             .values()
-            .any(|start| start.elapsed() < cutoff)
+            .any(|anim| anim.start.elapsed() < cutoff)
     }
 
     /// Remove expired splash animations.
     pub fn cleanup_splash_animations(&mut self) {
-        let cutoff = std::time::Duration::from_secs_f64(SPLASH_DURATION_SECS);
+        let duration = self.animation_mode.speed().duration_secs();
+        let cutoff = std::time::Duration::from_secs_f64(duration);
         self.splash_animations
-            .retain(|_, start| start.elapsed() < cutoff);
+            .retain(|_, anim| anim.start.elapsed() < cutoff);
+    }
+
+    /// Enforce the maximum animation count by dropping oldest animations.
+    fn enforce_animation_cap(&mut self) {
+        if self.splash_animations.len() <= MAX_ANIMATIONS {
+            return;
+        }
+        // Collect (id, start_time) and sort by start time ascending (oldest first).
+        let mut entries: Vec<(String, Instant)> = self
+            .splash_animations
+            .iter()
+            .map(|(k, a)| (k.clone(), a.start))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        // Remove oldest until we're at the cap.
+        let to_remove = entries.len() - MAX_ANIMATIONS;
+        for (id, _) in entries.into_iter().take(to_remove) {
+            self.splash_animations.remove(&id);
+        }
     }
 
     // ── Search ──
@@ -1590,6 +1899,9 @@ impl VizApp {
             }
         }
 
+        let mut new_snapshots: HashMap<String, TaskSnapshot> = HashMap::new();
+        let now = Instant::now();
+
         for task in graph.tasks() {
             counts.total += 1;
             match task.status {
@@ -1612,11 +1924,89 @@ impl VizApp {
                 total_usage.accumulate(usage);
                 task_token_map.insert(task.id.clone(), usage.clone());
             }
+
+            // Build snapshot for change detection.
+            let total_tokens = usage.map(|u| u.input_tokens + u.output_tokens).unwrap_or(0);
+            let plain_line = self
+                .node_line_map
+                .get(&task.id)
+                .and_then(|&idx| self.plain_lines.get(idx))
+                .cloned()
+                .unwrap_or_default();
+
+            let snapshot = TaskSnapshot {
+                status: task.status,
+                assigned: task.assigned.clone(),
+                token_bucket: total_tokens / TOKEN_DEBOUNCE_BUCKET,
+                edge_count: task.after.len(),
+                plain_line,
+            };
+
+            // Compare with previous snapshot and create animations for changes.
+            if self.animation_mode.is_enabled()
+                && let Some(old) = self.task_snapshots.get(&task.id)
+            {
+                // Status change — most important, overrides other animations.
+                if old.status != snapshot.status {
+                    self.splash_animations.insert(
+                        task.id.clone(),
+                        Animation {
+                            start: now,
+                            flash_color: flash_color_for_status(&snapshot.status),
+                            kind: AnimationKind::StatusChange,
+                        },
+                    );
+                }
+                // Agent assignment change.
+                else if old.assigned != snapshot.assigned && snapshot.assigned.is_some() {
+                    self.splash_animations.insert(
+                        task.id.clone(),
+                        Animation {
+                            start: now,
+                            flash_color: flash_color_for_kind(AnimationKind::Assignment),
+                            kind: AnimationKind::Assignment,
+                        },
+                    );
+                }
+                // Edge count change (new dependency).
+                else if old.edge_count != snapshot.edge_count
+                    && !self.splash_animations.contains_key(&task.id)
+                {
+                    self.splash_animations.insert(
+                        task.id.clone(),
+                        Animation {
+                            start: now,
+                            flash_color: flash_color_for_kind(AnimationKind::EdgeChange),
+                            kind: AnimationKind::EdgeChange,
+                        },
+                    );
+                }
+                // Token usage changed significantly (debounced by bucket).
+                else if old.token_bucket != snapshot.token_bucket
+                    && !self.splash_animations.contains_key(&task.id)
+                {
+                    self.splash_animations.insert(
+                        task.id.clone(),
+                        Animation {
+                            start: now,
+                            flash_color: flash_color_for_kind(AnimationKind::ContentChange),
+                            kind: AnimationKind::ContentChange,
+                        },
+                    );
+                }
+                // Note: new tasks (not in old snapshots) are already handled in load_viz().
+            }
+
+            new_snapshots.insert(task.id.clone(), snapshot);
         }
 
+        self.task_snapshots = new_snapshots;
         self.task_counts = counts;
         self.total_usage = total_usage;
         self.task_token_map = task_token_map;
+
+        // Enforce animation cap: drop oldest if we exceed MAX_ANIMATIONS.
+        self.enforce_animation_cap();
     }
 
     /// Check if the graph has changed on disk and refresh if needed.
@@ -1669,6 +2059,12 @@ impl VizApp {
             if self.right_panel_tab == RightPanelTab::Agency {
                 self.invalidate_agency_lifecycle();
                 self.load_agency_lifecycle();
+            }
+            // Refresh file browser tree if Files tab is active.
+            if self.right_panel_tab == RightPanelTab::Files
+                && let Some(ref mut fb) = self.file_browser
+            {
+                fb.refresh();
             }
             self.last_refresh_display = chrono::Local::now().format("%H:%M:%S").to_string();
         }
@@ -2334,6 +2730,19 @@ impl VizApp {
         self.hud_scroll = (self.hud_scroll + amount).min(max_scroll);
     }
 
+    /// Record scroll activity for auto-hiding scrollbar.
+    pub fn record_scroll_activity(&mut self) {
+        self.last_scroll_activity = Some(Instant::now());
+    }
+
+    /// Whether the scrollbar should be visible (within 2 seconds of last scroll activity).
+    pub fn scrollbar_visible(&self) -> bool {
+        match self.last_scroll_activity {
+            Some(when) => when.elapsed() < std::time::Duration::from_secs(2),
+            None => false,
+        }
+    }
+
     // ── Log pane ──
 
     /// Load log entries for the currently selected task into the log pane.
@@ -2600,11 +3009,15 @@ impl VizApp {
             smart_follow_active: true,
             initial_load: false,
             splash_animations: HashMap::new(),
+            task_snapshots: HashMap::new(),
+            animation_mode: AnimationMode::Normal,
+            last_scroll_activity: None,
             last_graph_mtime: None,
             last_refresh: Instant::now(),
             last_refresh_display: String::new(),
             refresh_interval: std::time::Duration::from_secs(3600),
             config_panel: ConfigPanelState::default(),
+            file_browser: None,
         }
     }
 
@@ -2780,6 +3193,7 @@ impl VizApp {
                         self.chat.messages.push(ChatMessage {
                             role: ChatRole::System,
                             text: format!("Error: {}", error_line),
+                            attachments: vec![],
                         });
                     }
                     // Clear awaiting state — the response arrives via poll_chat_messages.
@@ -3034,9 +3448,21 @@ impl VizApp {
                 "coordinator" => ChatRole::Coordinator,
                 _ => ChatRole::System,
             };
+            let att_names: Vec<String> = msg
+                .attachments
+                .iter()
+                .map(|a| {
+                    std::path::Path::new(&a.path)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(&a.path)
+                        .to_string()
+                })
+                .collect();
             self.chat.messages.push(ChatMessage {
                 role,
                 text: msg.content.clone(),
+                attachments: att_names,
             });
         }
 
@@ -3064,9 +3490,21 @@ impl VizApp {
         }
 
         for msg in &new_msgs {
+            let att_names: Vec<String> = msg
+                .attachments
+                .iter()
+                .map(|a| {
+                    std::path::Path::new(&a.path)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(&a.path)
+                        .to_string()
+                })
+                .collect();
             self.chat.messages.push(ChatMessage {
                 role: ChatRole::Coordinator,
                 text: msg.content.clone(),
+                attachments: att_names,
             });
         }
 
@@ -3093,7 +3531,8 @@ impl VizApp {
     /// Send a chat message to the coordinator via IPC.
     /// Appends the user message to display immediately and starts background send.
     pub fn send_chat_message(&mut self, text: String) {
-        if text.trim().is_empty() {
+        let has_attachments = !self.chat.pending_attachments.is_empty();
+        if text.trim().is_empty() && !has_attachments {
             return;
         }
 
@@ -3103,10 +3542,19 @@ impl VizApp {
             .unwrap_or_default();
         let request_id = format!("tui-{}-{}", now.as_millis(), now.subsec_nanos() % 100_000);
 
+        // Collect attachment display names for the local message.
+        let att_names: Vec<String> = self
+            .chat
+            .pending_attachments
+            .iter()
+            .map(|a| a.filename.clone())
+            .collect();
+
         // Add user message to display immediately.
         self.chat.messages.push(ChatMessage {
             role: ChatRole::User,
             text: text.clone(),
+            attachments: att_names,
         });
 
         // Reset scroll to bottom.
@@ -3116,12 +3564,81 @@ impl VizApp {
         self.chat.awaiting_response = true;
         self.chat.last_request_id = Some(request_id.clone());
 
+        // Build `wg chat` command args, including --attachment flags.
+        let mut args = vec!["chat".to_string(), text];
+        for att in &self.chat.pending_attachments {
+            args.push("--attachment".to_string());
+            args.push(att.stored_path.clone());
+        }
+
+        // Clear pending attachments after sending.
+        self.chat.pending_attachments.clear();
+
         // Send via `wg chat` command in background.
-        // The command writes to inbox and sends IPC UserChat to daemon.
-        self.exec_command(
-            vec!["chat".to_string(), text],
-            CommandEffect::ChatResponse(request_id),
-        );
+        self.exec_command(args, CommandEffect::ChatResponse(request_id));
+    }
+
+    /// Attempt to attach a file at the given path to the pending chat message.
+    /// Validates and copies to .workgraph/attachments/.
+    pub fn attach_file(&mut self, path_str: &str) {
+        let source = std::path::Path::new(path_str.trim());
+        match workgraph::chat::store_attachment(&self.workgraph_dir, source) {
+            Ok(att) => {
+                let filename = std::path::Path::new(&att.path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&att.path)
+                    .to_string();
+                self.chat.pending_attachments.push(PendingAttachment {
+                    filename: source
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or(path_str)
+                        .to_string(),
+                    stored_path: att.path,
+                    mime_type: att.mime_type,
+                    size_bytes: att.size_bytes,
+                });
+                self.notification =
+                    Some((format!("Attached: {}", filename), std::time::Instant::now()));
+            }
+            Err(e) => {
+                self.notification =
+                    Some((format!("Attach failed: {}", e), std::time::Instant::now()));
+            }
+        }
+    }
+
+    /// Try to paste an image from the system clipboard.
+    /// Returns `true` if an image was found and attached, `false` if no image
+    /// (caller should fall through to text paste).
+    pub fn try_paste_clipboard_image(&mut self) -> bool {
+        match clipboard_grab_image(&self.workgraph_dir) {
+            Ok(Some(att)) => {
+                let filename = std::path::Path::new(&att.path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&att.path)
+                    .to_string();
+                self.chat.pending_attachments.push(PendingAttachment {
+                    filename: filename.clone(),
+                    stored_path: att.path,
+                    mime_type: att.mime_type,
+                    size_bytes: att.size_bytes,
+                });
+                self.notification = Some((
+                    format!("Image pasted: {}", filename),
+                    std::time::Instant::now(),
+                ));
+                true
+            }
+            Ok(None) => false, // no image on clipboard — fall through to text paste
+            Err(e) => {
+                self.notification =
+                    Some((format!("Clipboard error: {}", e), std::time::Instant::now()));
+                false // fall through to text paste on error
+            }
+        }
     }
 
     /// Open the task creation form.
@@ -3230,20 +3747,113 @@ impl VizApp {
         let config = Config::load_or_default(&self.workgraph_dir);
         let mut entries = Vec::new();
 
-        // ── Service Configuration ──
+        // ── 1. LLM Endpoints ──
+        for (i, ep) in config.llm_endpoints.endpoints.iter().enumerate() {
+            let status_icon = if ep.is_default { "✓ " } else { "  " };
+            entries.push(ConfigEntry {
+                key: format!("endpoint.{}.name", i),
+                label: format!("{}{}  ({})", status_icon, ep.name, ep.provider),
+                value: ep.url.clone().unwrap_or_else(|| {
+                    workgraph::config::EndpointConfig::default_url_for_provider(&ep.provider)
+                        .to_string()
+                }),
+                edit_kind: ConfigEditKind::TextInput,
+                section: ConfigSection::Endpoints,
+            });
+            entries.push(ConfigEntry {
+                key: format!("endpoint.{}.model", i),
+                label: "  Model".into(),
+                value: ep.model.clone().unwrap_or_else(|| "(default)".into()),
+                edit_kind: ConfigEditKind::TextInput,
+                section: ConfigSection::Endpoints,
+            });
+            entries.push(ConfigEntry {
+                key: format!("endpoint.{}.api_key", i),
+                label: "  API Key".into(),
+                value: ep.masked_key(),
+                edit_kind: ConfigEditKind::SecretInput,
+                section: ConfigSection::Endpoints,
+            });
+            entries.push(ConfigEntry {
+                key: format!("endpoint.{}.is_default", i),
+                label: "  Set as default".into(),
+                value: if ep.is_default {
+                    "on".into()
+                } else {
+                    "off".into()
+                },
+                edit_kind: ConfigEditKind::Toggle,
+                section: ConfigSection::Endpoints,
+            });
+            entries.push(ConfigEntry {
+                key: format!("endpoint.{}.remove", i),
+                label: "  Remove endpoint".into(),
+                value: "▸".into(),
+                edit_kind: ConfigEditKind::Toggle,
+                section: ConfigSection::Endpoints,
+            });
+        }
+        entries.push(ConfigEntry {
+            key: "endpoint.add".into(),
+            label: "+ Add endpoint".into(),
+            value: String::new(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Endpoints,
+        });
+
+        // ── 2. API Keys (from environment) ──
+        let mask_env = |var: &str| -> String {
+            match std::env::var(var).ok().filter(|k| !k.is_empty()) {
+                Some(key) if key.len() > 8 => {
+                    format!("{}****...{}", &key[..3], &key[key.len() - 4..])
+                }
+                Some(_) => "****".into(),
+                None => "(not set)".into(),
+            }
+        };
+        entries.push(ConfigEntry {
+            key: "apikey.anthropic".into(),
+            label: "Anthropic".into(),
+            value: mask_env("ANTHROPIC_API_KEY"),
+            edit_kind: ConfigEditKind::SecretInput,
+            section: ConfigSection::ApiKeys,
+        });
+        entries.push(ConfigEntry {
+            key: "apikey.openai".into(),
+            label: "OpenAI".into(),
+            value: mask_env("OPENAI_API_KEY"),
+            edit_kind: ConfigEditKind::SecretInput,
+            section: ConfigSection::ApiKeys,
+        });
+        entries.push(ConfigEntry {
+            key: "apikey.openrouter".into(),
+            label: "OpenRouter".into(),
+            value: mask_env("OPENROUTER_API_KEY"),
+            edit_kind: ConfigEditKind::SecretInput,
+            section: ConfigSection::ApiKeys,
+        });
+
+        // ── 3. Service Settings ──
+        {
+            use crate::commands::service::{ServiceState, is_service_alive};
+            let ss = ServiceState::load(&self.workgraph_dir).ok().flatten();
+            self.config_panel.service_running =
+                ss.as_ref().is_some_and(|s| is_service_alive(s.pid));
+            self.config_panel.service_pid = ss.as_ref().map(|s| s.pid);
+        }
         entries.push(ConfigEntry {
             key: "coordinator.max_agents".into(),
             label: "Max agents".into(),
             value: config.coordinator.max_agents.to_string(),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Service",
+            section: ConfigSection::Service,
         });
         entries.push(ConfigEntry {
             key: "coordinator.poll_interval".into(),
             label: "Poll interval (s)".into(),
             value: config.coordinator.poll_interval.to_string(),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Service",
+            section: ConfigSection::Service,
         });
         entries.push(ConfigEntry {
             key: "coordinator.executor".into(),
@@ -3256,7 +3866,7 @@ impl VizApp {
                 "codex".into(),
                 "shell".into(),
             ]),
-            section: "Service",
+            section: ConfigSection::Service,
         });
         entries.push(ConfigEntry {
             key: "coordinator.model".into(),
@@ -3267,7 +3877,136 @@ impl VizApp {
                 .clone()
                 .unwrap_or_else(|| config.agent.model.clone()),
             edit_kind: ConfigEditKind::Choice(vec!["opus".into(), "sonnet".into(), "haiku".into()]),
-            section: "Service",
+            section: ConfigSection::Service,
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.agent_timeout".into(),
+            label: "Agent timeout".into(),
+            value: config.coordinator.agent_timeout.clone(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Service,
+        });
+        entries.push(ConfigEntry {
+            key: "coordinator.settling_delay_ms".into(),
+            label: "Settling delay (ms)".into(),
+            value: config.coordinator.settling_delay_ms.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Service,
+        });
+
+        // ── 4. TUI Settings ──
+        entries.push(ConfigEntry {
+            key: "tui.mouse_mode".into(),
+            label: "Mouse mode".into(),
+            value: match config.tui.mouse_mode {
+                Some(true) => "on".into(),
+                Some(false) => "off".into(),
+                None => "auto".into(),
+            },
+            edit_kind: ConfigEditKind::Choice(vec!["auto".into(), "on".into(), "off".into()]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "viz.animations".into(),
+            label: "Animation speed".into(),
+            value: config.viz.animations.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "normal".into(),
+                "fast".into(),
+                "slow".into(),
+                "reduced".into(),
+                "off".into(),
+            ]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "tui.default_layout".into(),
+            label: "Default layout".into(),
+            value: config.tui.default_layout.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "auto".into(),
+                "horizontal".into(),
+                "vertical".into(),
+            ]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "tui.color_theme".into(),
+            label: "Color theme".into(),
+            value: config.tui.color_theme.clone(),
+            edit_kind: ConfigEditKind::Choice(vec!["dark".into(), "light".into()]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "tui.timestamp_format".into(),
+            label: "Timestamp format".into(),
+            value: config.tui.timestamp_format.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "relative".into(),
+                "iso".into(),
+                "local".into(),
+                "off".into(),
+            ]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "tui.show_token_counts".into(),
+            label: "Token counts".into(),
+            value: if config.tui.show_token_counts {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
+            key: "viz.edge_color".into(),
+            label: "Edge color".into(),
+            value: config.viz.edge_color.clone(),
+            edit_kind: ConfigEditKind::Choice(vec!["gray".into(), "white".into(), "mixed".into()]),
+            section: ConfigSection::TuiSettings,
+        });
+
+        // ── 5. Agent Defaults ──
+        entries.push(ConfigEntry {
+            key: "agent.heartbeat_timeout".into(),
+            label: "Heartbeat timeout (min)".into(),
+            value: config.agent.heartbeat_timeout.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::AgentDefaults,
+        });
+        entries.push(ConfigEntry {
+            key: "agent.executor".into(),
+            label: "Default executor".into(),
+            value: config.agent.executor.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "claude".into(),
+                "amplifier".into(),
+                "opencode".into(),
+                "codex".into(),
+                "shell".into(),
+            ]),
+            section: ConfigSection::AgentDefaults,
+        });
+        entries.push(ConfigEntry {
+            key: "agent.model".into(),
+            label: "Default model".into(),
+            value: config.agent.model.clone(),
+            edit_kind: ConfigEditKind::Choice(vec!["opus".into(), "sonnet".into(), "haiku".into()]),
+            section: ConfigSection::AgentDefaults,
+        });
+        // ── 6. Agency ──
+        entries.push(ConfigEntry {
+            key: "agency.auto_assign".into(),
+            label: "Auto-assign".into(),
+            value: if config.agency.auto_assign {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
             key: "agency.auto_evaluate".into(),
@@ -3278,52 +4017,219 @@ impl VizApp {
                 "off".into()
             },
             edit_kind: ConfigEditKind::Toggle,
-            section: "Service",
+            section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
-            key: "coordinator.agent_timeout".into(),
-            label: "Agent timeout".into(),
-            value: config.coordinator.agent_timeout.clone(),
+            key: "agency.auto_triage".into(),
+            label: "Auto-triage".into(),
+            value: if config.agency.auto_triage {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.auto_create".into(),
+            label: "Auto-create".into(),
+            value: if config.agency.auto_create {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.run_mode".into(),
+            label: "Run mode".into(),
+            value: format!("{:.1}", config.agency.run_mode),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Service",
+            section: ConfigSection::Agency,
         });
-
-        // ── Agent Configuration ──
         entries.push(ConfigEntry {
-            key: "agent.heartbeat_timeout".into(),
-            label: "Heartbeat timeout (min)".into(),
-            value: config.agent.heartbeat_timeout.to_string(),
+            key: "agency.assigner_model".into(),
+            label: "Assigner model".into(),
+            value: config
+                .agency
+                .assigner_model
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "(default)".into(),
+                "opus".into(),
+                "sonnet".into(),
+                "haiku".into(),
+            ]),
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.evaluator_model".into(),
+            label: "Evaluator model".into(),
+            value: config
+                .agency
+                .evaluator_model
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "(default)".into(),
+                "opus".into(),
+                "sonnet".into(),
+                "haiku".into(),
+            ]),
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.evolver_model".into(),
+            label: "Evolver model".into(),
+            value: config
+                .agency
+                .evolver_model
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "(default)".into(),
+                "opus".into(),
+                "sonnet".into(),
+                "haiku".into(),
+            ]),
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.creator_model".into(),
+            label: "Creator model".into(),
+            value: config
+                .agency
+                .creator_model
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "(default)".into(),
+                "opus".into(),
+                "sonnet".into(),
+                "haiku".into(),
+            ]),
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.triage_model".into(),
+            label: "Triage model".into(),
+            value: config
+                .agency
+                .triage_model
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "(default)".into(),
+                "opus".into(),
+                "sonnet".into(),
+                "haiku".into(),
+            ]),
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.assigner_agent".into(),
+            label: "Assigner agent".into(),
+            value: config
+                .agency
+                .assigner_agent
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Agent",
+            section: ConfigSection::Agency,
         });
-
-        // ── Visualization ──
         entries.push(ConfigEntry {
-            key: "viz.edge_color".into(),
-            label: "Edge color".into(),
-            value: config.viz.edge_color.clone(),
-            edit_kind: ConfigEditKind::Choice(vec!["gray".into(), "white".into(), "mixed".into()]),
-            section: "Display",
+            key: "agency.evaluator_agent".into(),
+            label: "Evaluator agent".into(),
+            value: config
+                .agency
+                .evaluator_agent
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.evolver_agent".into(),
+            label: "Evolver agent".into(),
+            value: config
+                .agency
+                .evolver_agent
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.creator_agent".into(),
+            label: "Creator agent".into(),
+            value: config
+                .agency
+                .creator_agent
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.auto_create_threshold".into(),
+            label: "Auto-create threshold".into(),
+            value: config.agency.auto_create_threshold.to_string(),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.triage_timeout".into(),
+            label: "Triage timeout (s)".into(),
+            value: config
+                .agency
+                .triage_timeout
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "30".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.triage_max_log_bytes".into(),
+            label: "Triage max log bytes".into(),
+            value: config
+                .agency
+                .triage_max_log_bytes
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "50000".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
+        });
+        entries.push(ConfigEntry {
+            key: "agency.retention_heuristics".into(),
+            label: "Retention heuristics".into(),
+            value: config
+                .agency
+                .retention_heuristics
+                .clone()
+                .unwrap_or_else(|| "(not set)".into()),
+            edit_kind: ConfigEditKind::TextInput,
+            section: ConfigSection::Agency,
         });
 
-        // ── Guardrails ──
+        // ── 7. Guardrails ──
         entries.push(ConfigEntry {
             key: "guardrails.max_child_tasks_per_agent".into(),
             label: "Max subtasks/agent".into(),
             value: config.guardrails.max_child_tasks_per_agent.to_string(),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Guardrails",
+            section: ConfigSection::Guardrails,
         });
         entries.push(ConfigEntry {
             key: "guardrails.max_task_depth".into(),
             label: "Max chain depth".into(),
             value: config.guardrails.max_task_depth.to_string(),
             edit_kind: ConfigEditKind::TextInput,
-            section: "Guardrails",
+            section: ConfigSection::Guardrails,
         });
 
         self.config_panel.entries = entries;
-        // Preserve selection if valid, otherwise reset.
         if self.config_panel.selected >= self.config_panel.entries.len() {
             self.config_panel.selected = 0;
         }
@@ -3338,13 +4244,14 @@ impl VizApp {
 
         let new_value = if self.config_panel.editing {
             match &self.config_panel.entries[idx].edit_kind {
-                ConfigEditKind::TextInput => self.config_panel.edit_buffer.clone(),
+                ConfigEditKind::TextInput | ConfigEditKind::SecretInput => {
+                    self.config_panel.edit_buffer.clone()
+                }
                 ConfigEditKind::Choice(choices) => choices
                     .get(self.config_panel.choice_index)
                     .cloned()
                     .unwrap_or_default(),
                 ConfigEditKind::Toggle => {
-                    // Toggled already — value is already updated.
                     return;
                 }
             }
@@ -3352,12 +4259,10 @@ impl VizApp {
             return;
         };
 
-        // Update the display value.
         self.config_panel.entries[idx].value = new_value.clone();
 
-        // Load, mutate, and save the config.
         let mut config = Config::load_or_default(&self.workgraph_dir);
-        let key = &self.config_panel.entries[idx].key;
+        let key = self.config_panel.entries[idx].key.clone();
         match key.as_str() {
             "coordinator.max_agents" => {
                 if let Ok(v) = new_value.parse::<usize>() {
@@ -3369,26 +4274,128 @@ impl VizApp {
                     config.coordinator.poll_interval = v;
                 }
             }
-            "coordinator.executor" => {
-                config.coordinator.executor = new_value;
-            }
-            "coordinator.model" => {
-                config.coordinator.model = Some(new_value);
-            }
-            "agency.auto_evaluate" => {
-                config.agency.auto_evaluate = new_value == "on";
-            }
-            "coordinator.agent_timeout" => {
-                config.coordinator.agent_timeout = new_value;
+            "coordinator.executor" => config.coordinator.executor = new_value,
+            "coordinator.model" => config.coordinator.model = Some(new_value),
+            "coordinator.agent_timeout" => config.coordinator.agent_timeout = new_value,
+            "coordinator.settling_delay_ms" => {
+                if let Ok(v) = new_value.parse::<u64>() {
+                    config.coordinator.settling_delay_ms = v;
+                }
             }
             "agent.heartbeat_timeout" => {
                 if let Ok(v) = new_value.parse::<u64>() {
                     config.agent.heartbeat_timeout = v;
                 }
             }
-            "viz.edge_color" => {
-                config.viz.edge_color = new_value;
+            "agent.executor" => config.agent.executor = new_value,
+            "agent.model" => config.agent.model = new_value,
+            "agency.auto_evaluate" => config.agency.auto_evaluate = new_value == "on",
+            "agency.auto_assign" => config.agency.auto_assign = new_value == "on",
+            "agency.auto_triage" => config.agency.auto_triage = new_value == "on",
+            "agency.auto_create" => config.agency.auto_create = new_value == "on",
+            "agency.run_mode" => {
+                if let Ok(v) = new_value.parse::<f64>() {
+                    config.agency.run_mode = v.clamp(0.0, 1.0);
+                }
             }
+            "agency.assigner_model" => {
+                config.agency.assigner_model = if new_value == "(default)" {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.evaluator_model" => {
+                config.agency.evaluator_model = if new_value == "(default)" {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.evolver_model" => {
+                config.agency.evolver_model = if new_value == "(default)" {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.creator_model" => {
+                config.agency.creator_model = if new_value == "(default)" {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.triage_model" => {
+                config.agency.triage_model = if new_value == "(default)" {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.assigner_agent" => {
+                config.agency.assigner_agent = if new_value == "(none)" || new_value.is_empty() {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.evaluator_agent" => {
+                config.agency.evaluator_agent = if new_value == "(none)" || new_value.is_empty() {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.evolver_agent" => {
+                config.agency.evolver_agent = if new_value == "(none)" || new_value.is_empty() {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.creator_agent" => {
+                config.agency.creator_agent = if new_value == "(none)" || new_value.is_empty() {
+                    None
+                } else {
+                    Some(new_value)
+                };
+            }
+            "agency.auto_create_threshold" => {
+                if let Ok(v) = new_value.parse::<u32>() {
+                    config.agency.auto_create_threshold = v;
+                }
+            }
+            "agency.triage_timeout" => {
+                config.agency.triage_timeout = new_value.parse::<u64>().ok();
+            }
+            "agency.triage_max_log_bytes" => {
+                config.agency.triage_max_log_bytes = new_value.parse::<usize>().ok();
+            }
+            "agency.retention_heuristics" => {
+                config.agency.retention_heuristics =
+                    if new_value == "(not set)" || new_value.is_empty() {
+                        None
+                    } else {
+                        Some(new_value)
+                    };
+            }
+            "viz.edge_color" => config.viz.edge_color = new_value,
+            "viz.animations" => {
+                config.viz.animations = new_value.clone();
+                self.animation_mode = AnimationMode::from_config(&new_value);
+            }
+            "tui.mouse_mode" => {
+                config.tui.mouse_mode = match new_value.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+            }
+            "tui.default_layout" => config.tui.default_layout = new_value,
+            "tui.color_theme" => config.tui.color_theme = new_value,
+            "tui.timestamp_format" => config.tui.timestamp_format = new_value,
+            "tui.show_token_counts" => config.tui.show_token_counts = new_value == "on",
             "guardrails.max_child_tasks_per_agent" => {
                 if let Ok(v) = new_value.parse::<u32>() {
                     config.guardrails.max_child_tasks_per_agent = v;
@@ -3399,7 +4406,40 @@ impl VizApp {
                     config.guardrails.max_task_depth = v;
                 }
             }
-            _ => {}
+            _ => {
+                // Endpoint fields: endpoint.N.field
+                if let Some(rest) = key.strip_prefix("endpoint.") {
+                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
+                    if parts.len() == 2
+                        && let Ok(ep_idx) = parts[0].parse::<usize>()
+                        && ep_idx < config.llm_endpoints.endpoints.len()
+                    {
+                        match parts[1] {
+                            "name" => {
+                                config.llm_endpoints.endpoints[ep_idx].name = new_value
+                            }
+                            "model" => {
+                                config.llm_endpoints.endpoints[ep_idx].model =
+                                    Some(new_value)
+                            }
+                            "api_key" => {
+                                config.llm_endpoints.endpoints[ep_idx].api_key =
+                                    Some(new_value.clone());
+                                self.config_panel.entries[idx].value =
+                                    config.llm_endpoints.endpoints[ep_idx].masked_key();
+                            }
+                            _ => {
+                                config.llm_endpoints.endpoints[ep_idx].url = Some(new_value)
+                            }
+                        }
+                    }
+                }
+                // API keys from env are read-only in the TUI
+                if key.starts_with("apikey.") {
+                    self.config_panel.editing = false;
+                    return;
+                }
+            }
         }
         if config.save(&self.workgraph_dir).is_ok() {
             self.config_panel.save_notification = Some(Instant::now());
@@ -3420,6 +4460,43 @@ impl VizApp {
         ) {
             return;
         }
+
+        let key = self.config_panel.entries[idx].key.clone();
+
+        // Handle endpoint removal
+        if key.ends_with(".remove") {
+            if let Some(rest) = key.strip_prefix("endpoint.")
+                && let Some(idx_str) = rest.strip_suffix(".remove")
+                && let Ok(ep_idx) = idx_str.parse::<usize>()
+            {
+                let mut config = Config::load_or_default(&self.workgraph_dir);
+                if ep_idx < config.llm_endpoints.endpoints.len() {
+                    config.llm_endpoints.endpoints.remove(ep_idx);
+                    let _ = config.save(&self.workgraph_dir);
+                    self.config_panel.save_notification = Some(Instant::now());
+                    self.load_config_panel();
+                }
+            }
+            return;
+        }
+
+        // Handle set-as-default
+        if key.ends_with(".is_default") {
+            if let Some(rest) = key.strip_prefix("endpoint.")
+                && let Some(idx_str) = rest.strip_suffix(".is_default")
+                && let Ok(ep_idx) = idx_str.parse::<usize>()
+            {
+                let mut config = Config::load_or_default(&self.workgraph_dir);
+                for (i, ep) in config.llm_endpoints.endpoints.iter_mut().enumerate() {
+                    ep.is_default = i == ep_idx;
+                }
+                let _ = config.save(&self.workgraph_dir);
+                self.config_panel.save_notification = Some(Instant::now());
+                self.load_config_panel();
+            }
+            return;
+        }
+
         let new_val = if self.config_panel.entries[idx].value == "on" {
             "off"
         } else {
@@ -3427,15 +4504,296 @@ impl VizApp {
         };
         self.config_panel.entries[idx].value = new_val.to_string();
 
-        // Persist.
         let mut config = Config::load_or_default(&self.workgraph_dir);
-        if self.config_panel.entries[idx].key.as_str() == "agency.auto_evaluate" {
-            config.agency.auto_evaluate = new_val == "on";
+        match key.as_str() {
+            "agency.auto_evaluate" => config.agency.auto_evaluate = new_val == "on",
+            "agency.auto_assign" => config.agency.auto_assign = new_val == "on",
+            "agency.auto_triage" => config.agency.auto_triage = new_val == "on",
+            "agency.auto_create" => config.agency.auto_create = new_val == "on",
+            "tui.show_token_counts" => config.tui.show_token_counts = new_val == "on",
+            _ => {}
         }
         if config.save(&self.workgraph_dir).is_ok() {
             self.config_panel.save_notification = Some(Instant::now());
         }
     }
+
+    /// Add a new endpoint from the new-endpoint form fields.
+    pub fn add_endpoint(&mut self) {
+        let fields = &self.config_panel.new_endpoint;
+        if fields.name.trim().is_empty() {
+            self.notification = Some(("Endpoint name is required".to_string(), Instant::now()));
+            return;
+        }
+        let mut config = Config::load_or_default(&self.workgraph_dir);
+        let provider = if fields.provider.is_empty() {
+            "anthropic".to_string()
+        } else {
+            fields.provider.clone()
+        };
+        let is_first = config.llm_endpoints.endpoints.is_empty();
+        config
+            .llm_endpoints
+            .endpoints
+            .push(workgraph::config::EndpointConfig {
+                name: fields.name.trim().to_string(),
+                provider,
+                url: if fields.url.is_empty() {
+                    None
+                } else {
+                    Some(fields.url.clone())
+                },
+                model: if fields.model.is_empty() {
+                    None
+                } else {
+                    Some(fields.model.clone())
+                },
+                api_key: if fields.api_key.is_empty() {
+                    None
+                } else {
+                    Some(fields.api_key.clone())
+                },
+                is_default: is_first,
+            });
+        if config.save(&self.workgraph_dir).is_ok() {
+            self.config_panel.save_notification = Some(Instant::now());
+        }
+        self.config_panel.adding_endpoint = false;
+        self.config_panel.new_endpoint = NewEndpointFields::default();
+        self.config_panel.new_endpoint_field = 0;
+        self.load_config_panel();
+    }
+
+    /// Toggle collapse state for a config section.
+    pub fn toggle_config_section(&mut self, section: ConfigSection) {
+        if self.config_panel.collapsed.contains(&section) {
+            self.config_panel.collapsed.remove(&section);
+        } else {
+            self.config_panel.collapsed.insert(section);
+        }
+    }
+
+    /// Get the section of the currently selected config entry.
+    pub fn selected_config_section(&self) -> Option<ConfigSection> {
+        self.config_panel
+            .entries
+            .get(self.config_panel.selected)
+            .map(|e| e.section)
+    }
+
+    /// Return entries filtered by collapsed state, with original indices.
+    pub fn visible_config_entries(&self) -> Vec<(usize, &ConfigEntry)> {
+        self.config_panel
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !self.config_panel.collapsed.contains(&e.section))
+            .collect()
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Clipboard image detection
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Detect the clipboard environment and attempt to extract image data.
+///
+/// Returns `Ok(Some(attachment))` if an image was found and saved,
+/// `Ok(None)` if the clipboard contains no image (caller should fall through to text paste),
+/// or `Err` on unexpected failures.
+///
+/// Strategy (shell-out, no extra deps):
+/// - **Linux X11**: `xclip -selection clipboard -t TARGETS -o` to check, then extract PNG
+/// - **Linux Wayland**: `wl-paste --list-types` to check, then extract PNG
+/// - **macOS**: `osascript` to check clipboard type, then extract via `pngpaste` or `osascript`
+fn clipboard_grab_image(
+    workgraph_dir: &std::path::Path,
+) -> Result<Option<workgraph::chat::Attachment>> {
+    // Detect environment
+    if cfg!(target_os = "macos") {
+        clipboard_grab_macos(workgraph_dir)
+    } else if cfg!(target_os = "linux") {
+        // Check Wayland first ($WAYLAND_DISPLAY), then X11 ($DISPLAY)
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            clipboard_grab_wayland(workgraph_dir)
+        } else if std::env::var("DISPLAY").is_ok() {
+            clipboard_grab_x11(workgraph_dir)
+        } else {
+            // Pure SSH / no display server — can't access clipboard
+            Ok(None)
+        }
+    } else {
+        // Unsupported platform
+        Ok(None)
+    }
+}
+
+/// Generate a temp file path for clipboard image extraction.
+fn clipboard_temp_path(workgraph_dir: &std::path::Path) -> std::path::PathBuf {
+    let now = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    workgraph_dir
+        .join("attachments")
+        .join(format!("clipboard-{}-{}.png", now, nanos % 100_000))
+}
+
+/// Linux X11: use xclip to detect and extract clipboard image.
+fn clipboard_grab_x11(
+    workgraph_dir: &std::path::Path,
+) -> Result<Option<workgraph::chat::Attachment>> {
+    // Check if xclip is available and clipboard has image data
+    let targets = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        .output();
+
+    let targets = match targets {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Ok(None), // xclip not available or clipboard empty
+    };
+
+    // Look for image MIME types in the targets list
+    let has_image = targets.lines().any(|line| {
+        let t = line.trim();
+        t == "image/png" || t == "image/jpeg" || t == "image/bmp"
+    });
+
+    if !has_image {
+        return Ok(None);
+    }
+
+    // Extract the image data (prefer PNG)
+    let mime = if targets.lines().any(|l| l.trim() == "image/png") {
+        "image/png"
+    } else if targets.lines().any(|l| l.trim() == "image/jpeg") {
+        "image/jpeg"
+    } else {
+        "image/bmp"
+    };
+
+    let output = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", mime, "-o"])
+        .output()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    save_clipboard_image(workgraph_dir, &output.stdout)
+}
+
+/// Linux Wayland: use wl-paste to detect and extract clipboard image.
+fn clipboard_grab_wayland(
+    workgraph_dir: &std::path::Path,
+) -> Result<Option<workgraph::chat::Attachment>> {
+    // Check available MIME types
+    let types = Command::new("wl-paste").arg("--list-types").output();
+
+    let types = match types {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Ok(None), // wl-paste not available or clipboard empty
+    };
+
+    let has_image = types.lines().any(|line| {
+        let t = line.trim();
+        t == "image/png" || t == "image/jpeg" || t == "image/bmp"
+    });
+
+    if !has_image {
+        return Ok(None);
+    }
+
+    // Extract as PNG (wl-paste can convert)
+    let output = Command::new("wl-paste")
+        .args(["--type", "image/png"])
+        .output()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(None);
+    }
+
+    save_clipboard_image(workgraph_dir, &output.stdout)
+}
+
+/// macOS: use osascript/pngpaste to detect and extract clipboard image.
+fn clipboard_grab_macos(
+    workgraph_dir: &std::path::Path,
+) -> Result<Option<workgraph::chat::Attachment>> {
+    // Check clipboard type via osascript
+    let check = Command::new("osascript")
+        .args(["-e", "clipboard info"])
+        .output();
+
+    let info = match check {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Ok(None),
+    };
+
+    // Look for image types in clipboard info (e.g. «class PNGf», «class TIFF»)
+    let has_image = info.contains("PNGf")
+        || info.contains("TIFF")
+        || info.contains("JPEG")
+        || info.contains("public.png")
+        || info.contains("public.tiff");
+
+    if !has_image {
+        return Ok(None);
+    }
+
+    // Try pngpaste first (cleaner, widely available via Homebrew)
+    let tmp = clipboard_temp_path(workgraph_dir);
+    if let Some(parent) = tmp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let pngpaste_result = Command::new("pngpaste").arg(&tmp).output();
+
+    if let Ok(o) = pngpaste_result {
+        if o.status.success() && tmp.exists() {
+            let att = workgraph::chat::store_attachment(workgraph_dir, &tmp)?;
+            // Clean up temp file (store_attachment copies it)
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(Some(att));
+        }
+    }
+
+    // Fallback: use osascript to extract PNG data
+    let script = format!(
+        "set imgData to the clipboard as \u{ab}class PNGf\u{bb}\nset fp to open for access POSIX file \"{}\" with write permission\nwrite imgData to fp\nclose access fp",
+        tmp.display()
+    );
+
+    let result = Command::new("osascript").args(["-e", &script]).output();
+
+    match result {
+        Ok(o) if o.status.success() && tmp.exists() => {
+            let att = workgraph::chat::store_attachment(workgraph_dir, &tmp)?;
+            let _ = std::fs::remove_file(&tmp);
+            Ok(Some(att))
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(None)
+        }
+    }
+}
+
+/// Save raw image bytes to a temp file, then store as an attachment.
+fn save_clipboard_image(
+    workgraph_dir: &std::path::Path,
+    image_bytes: &[u8],
+) -> Result<Option<workgraph::chat::Attachment>> {
+    let tmp = clipboard_temp_path(workgraph_dir);
+    if let Some(parent) = tmp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&tmp, image_bytes)?;
+    let att = workgraph::chat::store_attachment(workgraph_dir, &tmp)?;
+    // Clean up the temp file (store_attachment copies it with content-addressed name)
+    let _ = std::fs::remove_file(&tmp);
+    Ok(Some(att))
 }
 
 /// Detect if we're running inside a tmux split pane.

@@ -40,11 +40,15 @@ walkdir = "2"
 ansi-to-tui = "7"
 strip-ansi-escapes = "0.2"
 fuzzy-matcher = "0.3"
+tui-tree-widget = "0.23"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+syntect-tui = { version = "3", default-features = false }
 regex = "1"
 async-trait = "0.1"
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 glob = "0.3"
+unicode-width = "0.2"
 
 # Optional Matrix integration (requires sqlite3)
 matrix-sdk = { version = "0.16", features = ["e2e-encryption", "sqlite"], optional = true }

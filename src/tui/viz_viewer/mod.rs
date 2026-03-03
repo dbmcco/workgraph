@@ -1,4 +1,6 @@
 pub mod event;
+pub mod file_browser;
+pub mod file_browser_render;
 pub mod render;
 pub mod state;
 
@@ -7,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste},
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -49,16 +51,15 @@ pub fn run(
 }
 
 fn restore_terminal() -> Result<()> {
+    use io::Write;
     // Best-effort cleanup: don't short-circuit on individual failures
     // so that later steps still run even if an earlier one fails.
     let r1 = disable_raw_mode();
-    let r2 = execute!(
-        io::stdout(),
-        DisableMouseCapture,
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    );
+    // Disable mouse modes with raw escape sequences (matching event.rs)
+    let r2 = io::stdout().write_all(b"\x1b[?1006l\x1b[?1000l");
+    let r3 = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
     r1?;
     r2?;
+    r3?;
     Ok(())
 }

@@ -3,10 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use crossterm::execute;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Position;
 
@@ -20,12 +18,21 @@ use super::state::{
 const INPUT_POLL: Duration = Duration::from_millis(50);
 
 /// Apply the current mouse capture state to the terminal.
+///
+/// Uses only modes 1000 (button tracking) and 1006 (SGR extended coordinates)
+/// instead of crossterm's EnableMouseCapture which also enables 1002 (drag)
+/// and 1003 (any-event). Mode 1003 breaks mosh compatibility because mosh
+/// disables earlier modes when a new mode arrives, and Termux doesn't support
+/// 1003 — leaving no tracking mode active.
 fn set_mouse_capture(enabled: bool) -> Result<()> {
+    use io::Write;
+    let mut stdout = io::stdout();
     if enabled {
-        execute!(io::stdout(), EnableMouseCapture)?;
+        stdout.write_all(b"\x1b[?1000h\x1b[?1006h")?;
     } else {
-        execute!(io::stdout(), DisableMouseCapture)?;
+        stdout.write_all(b"\x1b[?1006l\x1b[?1000l")?;
     }
+    stdout.flush()?;
     Ok(())
 }
 
@@ -48,18 +55,28 @@ fn run_event_loop_inner(terminal: &mut DefaultTerminal, app: &mut VizApp) -> Res
         terminal.draw(|frame| render::draw(frame, app))?;
 
         if event::poll(INPUT_POLL)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key(app, key.code, key.modifiers);
+            // Drain all immediately available events before redrawing.
+            // This batches rapid input (e.g. pasted text when the terminal
+            // doesn't support bracketed paste and sends individual KeyEvents)
+            // so we only redraw once for the entire batch.
+            loop {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        handle_key(app, key.code, key.modifiers);
+                    }
+                    Event::Paste(text) => {
+                        handle_paste(app, &text);
+                    }
+                    Event::Mouse(mouse) if app.mouse_enabled => {
+                        handle_mouse(app, mouse.kind, mouse.row, mouse.column);
+                    }
+                    Event::Resize(_, _) => {} // re-render on next iteration
+                    _ => {}
                 }
-                Event::Paste(text) => {
-                    handle_paste(app, &text);
+
+                if app.should_quit || !event::poll(Duration::ZERO)? {
+                    break;
                 }
-                Event::Mouse(mouse) if app.mouse_enabled => {
-                    handle_mouse(app, mouse.kind, mouse.row, mouse.column);
-                }
-                Event::Resize(_, _) => {} // re-render on next iteration
-                _ => {}
             }
         }
 
@@ -141,6 +158,14 @@ fn handle_paste(app: &mut VizApp, text: &str) {
                 }
             }
         }
+        InputMode::MessageInput => {
+            // Strip newlines for message input — it's single-line.
+            let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            app.messages_panel
+                .input
+                .insert_str(app.messages_panel.cursor, &clean);
+            app.messages_panel.cursor += clean.len();
+        }
         InputMode::ConfigEdit => {
             let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
             app.config_panel.edit_buffer.push_str(&clean);
@@ -180,10 +205,22 @@ fn handle_search_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::BackTab => app.prev_match(),
         KeyCode::Tab => app.next_match(),
-        KeyCode::Left => app.scroll.scroll_left(4),
-        KeyCode::Right => app.scroll.scroll_right(4),
-        KeyCode::Up => app.scroll.scroll_up(1),
-        KeyCode::Down => app.scroll.scroll_down(1),
+        KeyCode::Left => {
+            app.record_scroll_activity();
+            app.scroll.scroll_left(4);
+        }
+        KeyCode::Right => {
+            app.record_scroll_activity();
+            app.scroll.scroll_right(4);
+        }
+        KeyCode::Up => {
+            app.record_scroll_activity();
+            app.scroll.scroll_up(1);
+        }
+        KeyCode::Down => {
+            app.record_scroll_activity();
+            app.scroll.scroll_down(1);
+        }
         _ => {}
     }
 }
@@ -228,13 +265,22 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
     match code {
         KeyCode::Esc => {
             app.text_prompt.input.clear();
-            app.input_mode = InputMode::Normal;
+            // Return to ChatInput mode if cancelling an attach prompt.
+            if action == TextPromptAction::AttachFile {
+                app.input_mode = InputMode::ChatInput;
+            } else {
+                app.input_mode = InputMode::Normal;
+            }
         }
         KeyCode::Enter => {
             let text = app.text_prompt.input.clone();
             app.text_prompt.input.clear();
             if text.trim().is_empty() {
-                app.input_mode = InputMode::Normal;
+                if action == TextPromptAction::AttachFile {
+                    app.input_mode = InputMode::ChatInput;
+                } else {
+                    app.input_mode = InputMode::Normal;
+                }
                 return;
             }
             match action {
@@ -267,6 +313,12 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                         vec!["edit".to_string(), task_id.clone(), "-d".to_string(), text],
                         CommandEffect::RefreshAndNotify(format!("Updated '{}'", task_id)),
                     );
+                }
+                TextPromptAction::AttachFile => {
+                    app.attach_file(&text);
+                    // Return to chat input mode, not normal mode.
+                    app.input_mode = InputMode::ChatInput;
+                    return;
                 }
             }
             app.input_mode = InputMode::Normal;
@@ -417,9 +469,10 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 app.chat.input.drain(app.chat.cursor..next);
             }
         }
-        // Ctrl+A: move to beginning of current line
+        // Ctrl+A: attach file
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.chat.cursor = line_start(&app.chat.input, app.chat.cursor);
+            app.text_prompt.input.clear();
+            app.input_mode = InputMode::TextPrompt(TextPromptAction::AttachFile);
         }
         // Ctrl+E: move to end of current line
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -469,6 +522,13 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.chat.input_scroll = 0;
             app.input_mode = InputMode::Normal;
         }
+        // Ctrl+V: check clipboard for image before falling through to text paste.
+        // In terminals with bracketed paste, Ctrl+V triggers Event::Paste for text.
+        // This handler catches the KeyEvent variant to probe for image data first.
+        KeyCode::Char('v') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.try_paste_clipboard_image();
+            // If no image was found, text paste will arrive via Event::Paste — nothing more to do.
+        }
         // Arrow keys: Left/Right move within text
         KeyCode::Left => {
             app.chat.cursor = prev_char_boundary(&app.chat.input, app.chat.cursor);
@@ -478,9 +538,11 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         }
         // Alt+Up/Down: always scroll chat history
         KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => {
+            app.record_scroll_activity();
             app.chat.scroll = app.chat.scroll.saturating_add(1);
         }
         KeyCode::Down if modifiers.contains(KeyModifiers::ALT) => {
+            app.record_scroll_activity();
             app.chat.scroll = app.chat.scroll.saturating_sub(1);
         }
         // Up/Down: navigate between lines in multi-line input
@@ -488,6 +550,7 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             let new_pos = move_cursor_up(&app.chat.input, app.chat.cursor);
             if new_pos == app.chat.cursor {
                 // Already on first line: scroll chat history instead.
+                app.record_scroll_activity();
                 app.chat.scroll = app.chat.scroll.saturating_add(1);
             } else {
                 app.chat.cursor = new_pos;
@@ -497,6 +560,7 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             let new_pos = move_cursor_down(&app.chat.input, app.chat.cursor);
             if new_pos == app.chat.cursor {
                 // Already on last line: scroll chat history instead.
+                app.record_scroll_activity();
                 app.chat.scroll = app.chat.scroll.saturating_sub(1);
             } else {
                 app.chat.cursor = new_pos;
@@ -683,9 +747,11 @@ fn handle_message_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers
         }
         // Scroll message history while typing
         KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => {
+            app.record_scroll_activity();
             app.messages_panel.scroll = app.messages_panel.scroll.saturating_sub(1);
         }
         KeyCode::Down if modifiers.contains(KeyModifiers::ALT) => {
+            app.record_scroll_activity();
             app.messages_panel.scroll += 1;
         }
         KeyCode::Char(c) => {
@@ -815,21 +881,25 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Up
             if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
         {
+            app.record_scroll_activity();
             app.hud_scroll_up(1);
         }
         KeyCode::Down
             if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
         {
+            app.record_scroll_activity();
             app.hud_scroll_down(1);
         }
         KeyCode::PageUp
             if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
         {
+            app.record_scroll_activity();
             app.hud_scroll_up(10);
         }
         KeyCode::PageDown
             if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT) =>
         {
+            app.record_scroll_activity();
             app.hud_scroll_down(10);
         }
 
@@ -838,6 +908,7 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             if app.trace_visible {
                 app.select_prev_task();
             } else {
+                app.record_scroll_activity();
                 app.scroll.scroll_up(1);
             }
         }
@@ -845,26 +916,53 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             if app.trace_visible {
                 app.select_next_task();
             } else {
+                app.record_scroll_activity();
                 app.scroll.scroll_down(1);
             }
         }
 
         // Vertical scroll (vim-style)
-        KeyCode::Char('k') => app.scroll.scroll_up(1),
-        KeyCode::Char('j') => app.scroll.scroll_down(1),
-        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll.page_up(),
-        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => app.scroll.page_down(),
-        KeyCode::PageUp => app.scroll.page_up(),
-        KeyCode::PageDown => app.scroll.page_down(),
+        KeyCode::Char('k') => {
+            app.record_scroll_activity();
+            app.scroll.scroll_up(1);
+        }
+        KeyCode::Char('j') => {
+            app.record_scroll_activity();
+            app.scroll.scroll_down(1);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.record_scroll_activity();
+            app.scroll.page_up();
+        }
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.record_scroll_activity();
+            app.scroll.page_down();
+        }
+        KeyCode::PageUp => {
+            app.record_scroll_activity();
+            app.scroll.page_up();
+        }
+        KeyCode::PageDown => {
+            app.record_scroll_activity();
+            app.scroll.page_down();
+        }
 
         // Jump to top/bottom
-        KeyCode::Char('g') => app.scroll.go_top(),
-        KeyCode::Char('G') => app.scroll.go_bottom(),
+        KeyCode::Char('g') => {
+            app.record_scroll_activity();
+            app.scroll.go_top();
+        }
+        KeyCode::Char('G') => {
+            app.record_scroll_activity();
+            app.scroll.go_bottom();
+        }
         KeyCode::Home => {
+            app.record_scroll_activity();
             app.scroll.go_top();
             app.select_first_task();
         }
         KeyCode::End => {
+            app.record_scroll_activity();
             app.scroll.go_bottom();
             app.select_last_task();
         }
@@ -938,8 +1036,8 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.input_mode = InputMode::ChatInput;
         }
 
-        // Digit keys 0-4: switch right panel tab
-        KeyCode::Char(d @ '0'..='5') => {
+        // Digit keys 0-6: switch right panel tab
+        KeyCode::Char(d @ '0'..='6') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
                 app.right_panel_visible = true;
@@ -952,6 +1050,46 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
 }
 
 fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+    // Files tab has its own key handler — intercept early.
+    // When search mode is active, only Ctrl+C stays global; everything else
+    // (including Esc, character keys) goes to the file browser handler.
+    if app.right_panel_tab == RightPanelTab::Files {
+        let is_searching = app.file_browser.as_ref().is_some_and(|fb| fb.searching);
+        if is_searching {
+            match code {
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.kill_focused_agent();
+                }
+                _ => handle_files_key(app, code),
+            }
+        } else {
+            match code {
+                KeyCode::Char('?') => app.show_help = true,
+                KeyCode::Char('q') => app.should_quit = true,
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.kill_focused_agent();
+                }
+                KeyCode::Char('\\') => app.toggle_right_panel(),
+                KeyCode::Char('=') => app.cycle_layout_mode(),
+                KeyCode::Esc => {
+                    app.focused_panel = FocusedPanel::Graph;
+                    app.chat_input_dismissed = false;
+                }
+                KeyCode::Char(d @ '0'..='6') => {
+                    let idx = (d as u8 - b'0') as usize;
+                    if let Some(tab) = RightPanelTab::from_index(idx) {
+                        app.right_panel_tab = tab;
+                        if tab == RightPanelTab::Chat && !app.chat_input_dismissed {
+                            app.input_mode = InputMode::ChatInput;
+                        }
+                    }
+                }
+                _ => handle_files_key(app, code),
+            }
+        }
+        return;
+    }
+
     match code {
         // Global keys that work in right panel too
         KeyCode::Char('?') => app.show_help = true,
@@ -987,8 +1125,8 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.chat_input_dismissed = false;
         }
 
-        // Number keys 0-4 switch tabs
-        KeyCode::Char(d @ '0'..='5') => {
+        // Number keys 0-6 switch tabs
+        KeyCode::Char(d @ '0'..='6') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
                 // Reset dismissed flag when navigating away from Chat tab
@@ -1077,6 +1215,15 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.load_config_panel();
         }
 
+        // Config tab: 'a' starts the add-endpoint flow
+        KeyCode::Char('a') if app.right_panel_tab == RightPanelTab::Config => {
+            app.config_panel.adding_endpoint = true;
+            app.config_panel.new_endpoint = super::state::NewEndpointFields::default();
+            app.config_panel.new_endpoint_field = 0;
+            app.config_panel.editing = false;
+            app.input_mode = InputMode::ConfigEdit;
+        }
+
         // Agency tab: 'a' = view assignment task detail, 'e' = view evaluation task detail
         KeyCode::Char('a') if app.right_panel_tab == RightPanelTab::Agency => {
             if let Some(ref lifecycle) = app.agency_lifecycle
@@ -1109,6 +1256,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
 }
 
 fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
+    app.record_scroll_activity();
     match app.right_panel_tab {
         RightPanelTab::Detail => app.hud_scroll_up(amount),
         RightPanelTab::Chat => {
@@ -1124,12 +1272,23 @@ fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
             app.agent_monitor.scroll = app.agent_monitor.scroll.saturating_sub(amount);
         }
         RightPanelTab::Config => {
-            app.config_panel.selected = app.config_panel.selected.saturating_sub(amount);
+            // Skip collapsed entries when navigating up
+            let visible = app.visible_config_entries();
+            if let Some(pos) = visible
+                .iter()
+                .rposition(|(orig_idx, _)| *orig_idx < app.config_panel.selected)
+            {
+                app.config_panel.selected = visible[pos.saturating_sub(amount.saturating_sub(1))].0;
+            }
+        }
+        RightPanelTab::Files => {
+            // File browser handles its own scrolling.
         }
     }
 }
 
 fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
+    app.record_scroll_activity();
     match app.right_panel_tab {
         RightPanelTab::Detail => {
             app.hud_scroll_down(amount);
@@ -1147,8 +1306,18 @@ fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
             app.agent_monitor.scroll += amount;
         }
         RightPanelTab::Config => {
-            let max = app.config_panel.entries.len().saturating_sub(1);
-            app.config_panel.selected = (app.config_panel.selected + amount).min(max);
+            // Skip collapsed entries when navigating down
+            let visible = app.visible_config_entries();
+            if let Some(pos) = visible
+                .iter()
+                .position(|(orig_idx, _)| *orig_idx > app.config_panel.selected)
+            {
+                let target = (pos + amount - 1).min(visible.len().saturating_sub(1));
+                app.config_panel.selected = visible[target].0;
+            }
+        }
+        RightPanelTab::Files => {
+            // File browser handles its own scrolling.
         }
     }
 }
@@ -1161,6 +1330,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
 
     match kind {
         MouseEventKind::ScrollUp => {
+            app.record_scroll_activity();
             if in_graph {
                 app.scroll.scroll_up(3);
             } else if in_right_content || in_tab_bar {
@@ -1170,6 +1340,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             }
         }
         MouseEventKind::ScrollDown => {
+            app.record_scroll_activity();
             if in_graph {
                 app.scroll.scroll_down(3);
             } else if in_right_content || in_tab_bar {
@@ -1251,12 +1422,35 @@ fn config_enter_edit(app: &mut VizApp) {
     if idx >= app.config_panel.entries.len() {
         return;
     }
+
+    // Special case: "+ Add endpoint" entry
+    if app.config_panel.entries[idx].key == "endpoint.add" {
+        app.config_panel.adding_endpoint = true;
+        app.config_panel.new_endpoint = super::state::NewEndpointFields::default();
+        app.config_panel.new_endpoint_field = 0;
+        app.config_panel.editing = false;
+        app.input_mode = InputMode::ConfigEdit;
+        return;
+    }
+
+    // Special case: "Remove endpoint" — just toggle (which triggers removal)
+    if app.config_panel.entries[idx].key.ends_with(".remove") {
+        app.toggle_config_entry();
+        return;
+    }
+
     match &app.config_panel.entries[idx].edit_kind {
         ConfigEditKind::Toggle => {
             app.toggle_config_entry();
         }
         ConfigEditKind::TextInput => {
             app.config_panel.edit_buffer = app.config_panel.entries[idx].value.clone();
+            app.config_panel.editing = true;
+            app.input_mode = InputMode::ConfigEdit;
+        }
+        ConfigEditKind::SecretInput => {
+            // Start with empty buffer for secrets (don't show masked value)
+            app.config_panel.edit_buffer = String::new();
             app.config_panel.editing = true;
             app.input_mode = InputMode::ConfigEdit;
         }
@@ -1270,7 +1464,13 @@ fn config_enter_edit(app: &mut VizApp) {
 }
 
 /// Handle key events in ConfigEdit input mode (editing a text field or choosing from a list).
-fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, _modifiers: KeyModifiers) {
+fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+    // Add-endpoint form mode
+    if app.config_panel.adding_endpoint {
+        handle_add_endpoint_input(app, code, modifiers);
+        return;
+    }
+
     let idx = app.config_panel.selected;
     if idx >= app.config_panel.entries.len() {
         app.config_panel.editing = false;
@@ -1279,7 +1479,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, _modifiers: KeyModi
     }
 
     match &app.config_panel.entries[idx].edit_kind {
-        ConfigEditKind::TextInput => match code {
+        ConfigEditKind::TextInput | ConfigEditKind::SecretInput => match code {
             KeyCode::Esc => {
                 app.config_panel.editing = false;
                 app.input_mode = InputMode::Normal;
@@ -1318,10 +1518,255 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, _modifiers: KeyModi
             _ => {}
         },
         ConfigEditKind::Toggle => {
-            // Should not reach here — toggles are immediate.
             app.config_panel.editing = false;
             app.input_mode = InputMode::Normal;
         }
+    }
+}
+
+/// Handle key events for the add-endpoint form.
+fn handle_add_endpoint_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+    let field = app.config_panel.new_endpoint_field;
+
+    match code {
+        KeyCode::Esc => {
+            app.config_panel.adding_endpoint = false;
+            app.config_panel.editing = false;
+            app.input_mode = InputMode::Normal;
+        }
+        // Ctrl+S saves the endpoint
+        KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+            // Copy edit buffer to current field before saving
+            if app.config_panel.editing {
+                set_endpoint_field(
+                    &mut app.config_panel.new_endpoint,
+                    field,
+                    &app.config_panel.edit_buffer.clone(),
+                );
+                app.config_panel.editing = false;
+            }
+            app.add_endpoint();
+            app.input_mode = InputMode::Normal;
+        }
+        // Tab moves to next field
+        KeyCode::Tab => {
+            if app.config_panel.editing {
+                let buf = app.config_panel.edit_buffer.clone();
+                set_endpoint_field(&mut app.config_panel.new_endpoint, field, &buf);
+                app.config_panel.editing = false;
+            }
+            app.config_panel.new_endpoint_field = (field + 1) % 5;
+        }
+        // BackTab moves to previous field
+        KeyCode::BackTab => {
+            if app.config_panel.editing {
+                let buf = app.config_panel.edit_buffer.clone();
+                set_endpoint_field(&mut app.config_panel.new_endpoint, field, &buf);
+                app.config_panel.editing = false;
+            }
+            app.config_panel.new_endpoint_field = if field == 0 { 4 } else { field - 1 };
+        }
+        KeyCode::Enter => {
+            if app.config_panel.editing {
+                // Confirm current field value, move to next
+                let buf = app.config_panel.edit_buffer.clone();
+                set_endpoint_field(&mut app.config_panel.new_endpoint, field, &buf);
+                app.config_panel.editing = false;
+                if field < 4 {
+                    app.config_panel.new_endpoint_field = field + 1;
+                } else {
+                    // On last field, save the endpoint
+                    app.add_endpoint();
+                    app.input_mode = InputMode::Normal;
+                }
+            } else {
+                // Start editing this field
+                app.config_panel.edit_buffer =
+                    get_endpoint_field(&app.config_panel.new_endpoint, field);
+                app.config_panel.editing = true;
+            }
+        }
+        KeyCode::Backspace if app.config_panel.editing => {
+            app.config_panel.edit_buffer.pop();
+        }
+        KeyCode::Char(c) if app.config_panel.editing => {
+            app.config_panel.edit_buffer.push(c);
+        }
+        KeyCode::Up | KeyCode::Char('k') if !app.config_panel.editing => {
+            app.config_panel.new_endpoint_field = if field == 0 { 4 } else { field - 1 };
+        }
+        KeyCode::Down | KeyCode::Char('j') if !app.config_panel.editing => {
+            app.config_panel.new_endpoint_field = (field + 1) % 5;
+        }
+        _ => {}
+    }
+}
+
+/// Set a field on the new-endpoint form by index.
+fn set_endpoint_field(fields: &mut super::state::NewEndpointFields, idx: usize, val: &str) {
+    match idx {
+        0 => fields.name = val.to_string(),
+        1 => fields.provider = val.to_string(),
+        2 => fields.url = val.to_string(),
+        3 => fields.model = val.to_string(),
+        4 => fields.api_key = val.to_string(),
+        _ => {}
+    }
+}
+
+/// Get a field from the new-endpoint form by index.
+fn get_endpoint_field(fields: &super::state::NewEndpointFields, idx: usize) -> String {
+    match idx {
+        0 => fields.name.clone(),
+        1 => fields.provider.clone(),
+        2 => fields.url.clone(),
+        3 => fields.model.clone(),
+        4 => fields.api_key.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Determine which tab was clicked based on column position within the tab bar.
+/// Returns None if the click is on a divider or beyond the last tab.
+/// Handle key events for the Files tab.
+fn handle_files_key(app: &mut VizApp, code: KeyCode) {
+    use super::file_browser::FileBrowserFocus;
+
+    let fb = match app.file_browser.as_mut() {
+        Some(fb) => fb,
+        None => return,
+    };
+
+    // When search mode is active in the tree pane, handle search input first.
+    if fb.searching && fb.focus == FileBrowserFocus::Tree {
+        match code {
+            KeyCode::Esc => {
+                fb.exit_search();
+            }
+            KeyCode::Backspace => {
+                fb.search_pop();
+            }
+            // Allow navigating the filtered tree while searching
+            KeyCode::Up => {
+                fb.tree_state.key_up();
+                fb.load_preview();
+            }
+            KeyCode::Down => {
+                fb.tree_state.key_down();
+                fb.load_preview();
+            }
+            KeyCode::Enter => {
+                // Confirm search: exit search input mode but keep the filter
+                fb.searching = false;
+            }
+            KeyCode::Char(ch) => {
+                fb.search_push(ch);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match fb.focus {
+        FileBrowserFocus::Tree => match code {
+            // '/' enters search mode
+            KeyCode::Char('/') => {
+                fb.enter_search();
+            }
+            // Tab: switch focus to preview pane
+            KeyCode::Tab => {
+                fb.focus = FileBrowserFocus::Preview;
+            }
+            // Navigation: move selection up/down
+            KeyCode::Up | KeyCode::Char('k') => {
+                fb.tree_state.key_up();
+                fb.load_preview();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                fb.tree_state.key_down();
+                fb.load_preview();
+            }
+            // Expand / open: Enter, l, Right arrow
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                // If it's a directory, expand it. If file, just load preview.
+                let selected = fb.tree_state.selected().to_vec();
+                if !selected.is_empty() {
+                    let mut path = fb.root.clone();
+                    for seg in &selected {
+                        path.push(seg);
+                    }
+                    if path.is_dir() {
+                        fb.tree_state.toggle_selected();
+                    }
+                }
+                fb.load_preview();
+            }
+            // Collapse / parent: Backspace, h, Left arrow
+            KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+                fb.tree_state.key_left();
+                fb.load_preview();
+            }
+            // Toggle expand/collapse without moving
+            KeyCode::Char(' ') => {
+                fb.tree_state.toggle_selected();
+            }
+            // Jump to first/last
+            KeyCode::Home => {
+                fb.tree_state.select_first();
+                fb.load_preview();
+            }
+            KeyCode::End => {
+                fb.tree_state.select_last();
+                fb.load_preview();
+            }
+            // Page up/down for tree
+            KeyCode::PageUp => {
+                for _ in 0..10 {
+                    fb.tree_state.key_up();
+                }
+                fb.load_preview();
+            }
+            KeyCode::PageDown => {
+                for _ in 0..10 {
+                    fb.tree_state.key_down();
+                }
+                fb.load_preview();
+            }
+            _ => {}
+        },
+        FileBrowserFocus::Preview => match code {
+            // Tab: switch focus back to tree pane
+            KeyCode::Tab => {
+                fb.focus = FileBrowserFocus::Tree;
+            }
+            // Scroll preview
+            KeyCode::Up | KeyCode::Char('k') => {
+                fb.preview_scroll_up(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                fb.preview_scroll_down(1);
+            }
+            KeyCode::PageUp => {
+                fb.preview_scroll_up(20);
+            }
+            KeyCode::PageDown => {
+                fb.preview_scroll_down(20);
+            }
+            // Jump to top/bottom
+            KeyCode::Char('g') => {
+                fb.preview_go_top();
+            }
+            KeyCode::Char('G') => {
+                fb.preview_go_bottom();
+            }
+            KeyCode::Home => {
+                fb.preview_go_top();
+            }
+            KeyCode::End => {
+                fb.preview_go_bottom();
+            }
+            _ => {}
+        },
     }
 }
 
@@ -1329,7 +1774,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, _modifiers: KeyModi
 /// Returns None if the click is on a divider or beyond the last tab.
 fn tab_at_column(col: u16) -> Option<RightPanelTab> {
     let labels = [
-        "0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency", "5:Config",
+        "0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency", "5:Config", "6:Files",
     ];
     let mut pos: u16 = 0;
     for (i, label) in labels.iter().enumerate() {

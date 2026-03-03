@@ -4,10 +4,11 @@ use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, LayoutMode, RightPanelTab, SortMode,
-    TaskFormField, TaskFormState, TextPromptAction, VizApp,
+    ConfigEditKind, ConfigSection, ConfirmAction, FocusedPanel, InputMode, LayoutMode,
+    RightPanelTab, SortMode, TaskFormField, TaskFormState, TextPromptAction, VizApp,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -64,6 +65,10 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     {
         app.load_agency_lifecycle();
     }
+    // Lazy-init file browser on first switch to Files tab.
+    if app.right_panel_tab == RightPanelTab::Files && app.file_browser.is_none() {
+        app.file_browser = Some(super::file_browser::FileBrowser::new(&app.workgraph_dir));
+    }
 
     // Layout based on layout mode.
     match app.layout_mode {
@@ -85,7 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
             app.scroll.viewport_width = main_area.width as usize;
 
             draw_viz_content(frame, app, main_area);
-            if app.scroll.content_height > app.scroll.viewport_height {
+            if app.scroll.content_height > app.scroll.viewport_height && app.scrollbar_visible() {
                 draw_scrollbar(frame, app, main_area);
             }
         }
@@ -108,7 +113,9 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     app.scroll.viewport_width = viz_area.width as usize;
 
                     draw_viz_content(frame, app, viz_area);
-                    if app.scroll.content_height > app.scroll.viewport_height {
+                    if app.scroll.content_height > app.scroll.viewport_height
+                        && app.scrollbar_visible()
+                    {
                         draw_scrollbar(frame, app, viz_area);
                     }
                     draw_right_panel(frame, app, right_area);
@@ -130,7 +137,9 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     app.scroll.viewport_width = viz_area.width as usize;
 
                     draw_viz_content(frame, app, viz_area);
-                    if app.scroll.content_height > app.scroll.viewport_height {
+                    if app.scroll.content_height > app.scroll.viewport_height
+                        && app.scrollbar_visible()
+                    {
                         draw_scrollbar(frame, app, viz_area);
                     }
                     draw_right_panel(frame, app, right_area);
@@ -145,7 +154,8 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 app.scroll.viewport_width = main_area.width as usize;
 
                 draw_viz_content(frame, app, main_area);
-                if app.scroll.content_height > app.scroll.viewport_height {
+                if app.scroll.content_height > app.scroll.viewport_height && app.scrollbar_visible()
+                {
                     draw_scrollbar(frame, app, main_area);
                 }
             }
@@ -192,11 +202,14 @@ enum LineTraceCategory {
 }
 
 /// Check if an original line index belongs to a task with an active splash animation.
-/// Returns the fade progress (0.0 = fully bright, approaching 1.0 = nearly faded out).
-fn splash_progress_for_line(app: &VizApp, orig_idx: usize) -> Option<f64> {
+/// Returns (fade_progress, flash_color) where progress is 0.0 = fully bright,
+/// approaching 1.0 = nearly faded out.
+fn splash_info_for_line(app: &VizApp, orig_idx: usize) -> Option<(f64, (u8, u8, u8))> {
     for (task_id, &line) in &app.node_line_map {
         if line == orig_idx {
-            return app.splash_progress(task_id);
+            let progress = app.splash_progress(task_id)?;
+            let color = app.splash_color(task_id).unwrap_or((180, 160, 60));
+            return Some((progress, color));
         }
     }
     None
@@ -204,19 +217,39 @@ fn splash_progress_for_line(app: &VizApp, orig_idx: usize) -> Option<f64> {
 
 /// Apply a splash-and-fade background color to the task text portion of a line.
 /// `progress` ranges from 0.0 (bright splash) to 1.0 (fully faded/transparent).
-/// Uses a warm yellow-to-transparent fade via RGB interpolation.
+/// `flash_color` is the (r, g, b) color at full brightness.
 /// Only the task text (ID, title, status) gets the splash — tree connectors,
 /// metadata, and trailing content are left unchanged.
-fn apply_splash_style<'a>(line: Line<'a>, progress: f64, plain_line: &str) -> Line<'a> {
+fn apply_splash_style<'a>(
+    line: Line<'a>,
+    progress: f64,
+    plain_line: &str,
+    flash_color: (u8, u8, u8),
+    reduced_motion: bool,
+) -> Line<'a> {
+    // In reduced motion mode, show full-brightness color for first 50% of duration,
+    // then snap to no background.
+    if reduced_motion {
+        if progress > 0.5 {
+            return line;
+        }
+        // Use the flash color at a moderate intensity (no fade).
+        let splash_bg = Color::Rgb(
+            (flash_color.0 as f64 * 0.6) as u8,
+            (flash_color.1 as f64 * 0.6) as u8,
+            (flash_color.2 as f64 * 0.6) as u8,
+        );
+        return apply_bg_to_text_range(line, plain_line, splash_bg);
+    }
+
     // Ease-out curve for a smoother fade (fast initial dim, slow tail-off).
     let t = progress * progress;
 
-    // Interpolate from bright splash color to no background.
-    // Splash: warm yellow (180, 160, 60) → terminal default (via reduced alpha).
-    // Since terminals don't have true alpha, we fade toward a dark neutral.
-    let r = (180.0 * (1.0 - t)) as u8;
-    let g = (160.0 * (1.0 - t)) as u8;
-    let b = (60.0 * (1.0 - t)) as u8;
+    // Interpolate from the flash color to no background.
+    // Since terminals don't have true alpha, we fade toward black (0,0,0).
+    let r = (flash_color.0 as f64 * (1.0 - t)) as u8;
+    let g = (flash_color.1 as f64 * (1.0 - t)) as u8;
+    let b = (flash_color.2 as f64 * (1.0 - t)) as u8;
 
     // At very low intensity, skip to avoid barely-visible artifacts.
     if r < 15 && g < 15 && b < 5 {
@@ -224,7 +257,11 @@ fn apply_splash_style<'a>(line: Line<'a>, progress: f64, plain_line: &str) -> Li
     }
 
     let splash_bg = Color::Rgb(r, g, b);
+    apply_bg_to_text_range(line, plain_line, splash_bg)
+}
 
+/// Apply a background color to the task text range of a line.
+fn apply_bg_to_text_range<'a>(line: Line<'a>, plain_line: &str, bg: Color) -> Line<'a> {
     // Only apply splash to the task text range (not tree chars, metadata, etc.).
     let (text_start, text_end) = match find_text_range(plain_line) {
         Some(range) => range,
@@ -247,7 +284,7 @@ fn apply_splash_style<'a>(line: Line<'a>, progress: f64, plain_line: &str) -> Li
 
     for (char_idx, (c, base_style)) in chars_with_styles.iter().enumerate() {
         let style = if char_idx >= text_start && char_idx < text_end {
-            base_style.bg(splash_bg)
+            base_style.bg(bg)
         } else {
             *base_style
         };
@@ -360,7 +397,7 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
                 text_lines.push(dimmed);
             }
         } else if jump_target_line == Some(orig_idx)
-            && splash_progress_for_line(app, orig_idx).is_none()
+            && splash_info_for_line(app, orig_idx).is_none()
         {
             // Transient highlight on the line we jumped to after Enter.
             // Skipped when a splash animation is active (splash provides a smoother fade).
@@ -401,7 +438,8 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
 
         // Apply splash-and-fade animation overlay if this line belongs to an animated task.
         if !app.splash_animations.is_empty()
-            && let Some(progress) = splash_progress_for_line(app, orig_idx)
+            && app.animation_mode.is_enabled()
+            && let Some((progress, flash_color)) = splash_info_for_line(app, orig_idx)
             && progress < 1.0
         {
             let splash_plain = app
@@ -409,8 +447,15 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
                 .get(orig_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("");
+            let reduced = matches!(app.animation_mode, super::state::AnimationMode::Reduced);
             let last = text_lines.last_mut().unwrap();
-            *last = apply_splash_style(std::mem::take(last), progress, splash_plain);
+            *last = apply_splash_style(
+                std::mem::take(last),
+                progress,
+                splash_plain,
+                flash_color,
+                reduced,
+            );
         }
     }
 
@@ -756,19 +801,26 @@ fn draw_scrollbar(frame: &mut Frame, app: &VizApp, area: Rect) {
 fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.last_right_panel_area = area;
 
-    let is_focused = app.focused_panel == FocusedPanel::RightPanel;
-    let border_color = if is_focused {
-        Color::Yellow
+    let is_full_panel = app.layout_mode == LayoutMode::FullPanel;
+
+    // In full-panel mode: no borders (edge-to-edge content for clean copy-paste).
+    // In split mode: minimal single-line border, dim when unfocused.
+    let inner = if is_full_panel {
+        area
     } else {
-        Color::DarkGray
+        let is_focused = app.focused_panel == FocusedPanel::RightPanel;
+        let border_color = if is_focused {
+            Color::White
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        inner
     };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     if inner.height < 2 || inner.width < 4 {
         return;
@@ -808,6 +860,9 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
         RightPanelTab::Config => {
             draw_config_tab(frame, app, content_area);
+        }
+        RightPanelTab::Files => {
+            super::file_browser_render::draw_files_tab(frame, app, content_area);
         }
     }
 }
@@ -889,7 +944,7 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 
-    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
+    if total_lines > viewport_h && app.scrollbar_visible() {
         let mut state =
             ScrollbarState::new(total_lines.saturating_sub(viewport_h)).position(app.hud_scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -906,6 +961,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     // Reserve space for input area.
     // When in chat input mode, compute wrapped line count so the input grows vertically.
+    let has_pending_att = !app.chat.pending_attachments.is_empty();
     let input_height: u16 = if app.input_mode == InputMode::ChatInput {
         let prompt_prefix = 2; // "> " takes 2 columns
         let usable = (area.width as usize).saturating_sub(prompt_prefix).max(1);
@@ -915,7 +971,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         // Cap so input never eats more than half the area.
         let max_input = (area.height / 2).max(2);
         let lines = wrapped_lines.min(max_input);
-        lines + 1 // +1 for separator line
+        let att_line = if has_pending_att { 1 } else { 0 };
+        lines + 1 + att_line // +1 for separator line, +1 for attachment indicator
     } else {
         1
     };
@@ -985,10 +1042,11 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     // Build rendered lines from messages with word-wrapping.
-    let content_width = if app.layout_mode == LayoutMode::FullPanel {
-        width // no scrollbar in full-panel mode
-    } else {
+    // When scrollbar is hidden, content gets the full width.
+    let content_width = if app.scrollbar_visible() {
         width.saturating_sub(1) // leave 1 col for scrollbar
+    } else {
+        width
     };
     let mut rendered_lines: Vec<Line> = Vec::new();
 
@@ -1014,7 +1072,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
         // Inline prefix: "↯↯↯: message text" with continuation lines indented.
         let prefix = format!("{}: ", role_label);
-        let prefix_len = prefix.len();
+        let prefix_len = prefix.width();
         let indent = " ".repeat(prefix_len);
         let text_width = content_width.saturating_sub(prefix_len);
         let mut first_line = true;
@@ -1037,13 +1095,23 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 }
             }
         }
+        // Show attachment indicators.
+        for att_name in &msg.attachments {
+            let att_text = format!("{}[Attached: {}]", indent, att_name);
+            rendered_lines.push(Line::from(Span::styled(
+                att_text,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
         rendered_lines.push(Line::from("")); // blank line between messages
     }
 
     // Streaming indicator when awaiting response.
     if app.chat.awaiting_response {
         rendered_lines.push(Line::from(Span::styled(
-            "c/: ...",
+            "↯↯↯: ...",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::SLOW_BLINK),
@@ -1070,8 +1138,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
 
-    // Scrollbar if content overflows (hidden in full-panel mode for cleaner reading).
-    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
+    // Scrollbar if content overflows (auto-hides after 2 seconds of inactivity).
+    if total_lines > viewport_h && app.scrollbar_visible() {
         let mut state = ScrollbarState::new(total_lines).position(scroll_from_top);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, msg_area, &mut state);
@@ -1178,10 +1246,41 @@ fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let cy = input_y + cursor_screen_line.min(input_h.saturating_sub(1));
         let cx = area.x + (prefix_len + cursor_col as u16).min(area.width.saturating_sub(1));
         frame.set_cursor_position((cx, cy));
+        // Show pending attachments below the input.
+        if !app.chat.pending_attachments.is_empty() {
+            let att_text: String = app
+                .chat
+                .pending_attachments
+                .iter()
+                .map(|a| format!("[{}]", a.filename))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let att_line = Line::from(Span::styled(
+                format!(" {} {}", "📎", att_text),
+                Style::default().fg(Color::Green),
+            ));
+            // Render above the cursor line, or at the bottom.
+            let att_y = (input_y + input_h).min(area.y + area.height.saturating_sub(1));
+            frame.render_widget(
+                Paragraph::new(att_line),
+                Rect {
+                    x: area.x,
+                    y: att_y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
     } else {
         // Hint line when not in input mode.
+        let hint_text = if app.chat.pending_attachments.is_empty() {
+            " ↯↯↯/Enter: type  ↑↓: scroll".to_string()
+        } else {
+            let att_count = app.chat.pending_attachments.len();
+            format!(" ↯↯↯/Enter: type  ↑↓: scroll  📎 {} attached", att_count)
+        };
         let hint = Line::from(Span::styled(
-            " c/Enter: type  ↑↓: scroll",
+            hint_text,
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(hint), area);
@@ -1344,8 +1443,8 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, area);
 
-    // Scrollbar if content overflows (hidden in full-panel mode for cleaner reading).
-    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
+    // Scrollbar if content overflows (auto-hides after 2 seconds of inactivity).
+    if total_lines > viewport_h && app.scrollbar_visible() {
         let mut scrollbar_state =
             ScrollbarState::new(total_lines.saturating_sub(viewport_h)).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -1434,10 +1533,10 @@ fn draw_messages_tab(frame: &mut Frame, app: &VizApp, area: Rect) {
     }
 
     let viewport_h = msg_area.height as usize;
-    let wrap_width = if app.layout_mode == LayoutMode::FullPanel {
-        width // no scrollbar in full-panel mode
-    } else {
+    let wrap_width = if app.scrollbar_visible() {
         width.saturating_sub(1) // leave 1 col for scrollbar
+    } else {
+        width
     };
 
     // Build rendered lines with conversational styling.
@@ -1585,7 +1684,7 @@ fn draw_messages_tab(frame: &mut Frame, app: &VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
 
-    if total_lines > viewport_h && app.layout_mode != LayoutMode::FullPanel {
+    if total_lines > viewport_h && app.scrollbar_visible() {
         let mut state = ScrollbarState::new(total_lines).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, msg_area, &mut state);
@@ -2218,6 +2317,7 @@ fn draw_text_prompt(frame: &mut Frame, action: &TextPromptAction, input: &str) {
         TextPromptAction::MarkFailed(id) => format!("Fail '{}' — enter reason:", id),
         TextPromptAction::SendMessage(id) => format!("Message to '{}':", id),
         TextPromptAction::EditDescription(id) => format!("Edit description for '{}':", id),
+        TextPromptAction::AttachFile => "Attach file — enter path:".to_string(),
     };
 
     let size = frame.area();
@@ -2874,7 +2974,7 @@ fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, lab
     }
 }
 
-/// Draw the Config tab content: list of settings with current values.
+/// Draw the Config tab content: full configuration dashboard.
 fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     if app.config_panel.entries.is_empty() {
         app.load_config_panel();
@@ -2891,10 +2991,16 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let viewport_h = area.height as usize;
     let selected = app.config_panel.selected;
 
-    // Build display lines grouped by section.
+    // If in add-endpoint mode, draw the form instead.
+    if app.config_panel.adding_endpoint {
+        draw_add_endpoint_form(frame, app, area);
+        return;
+    }
+
+    // Build display lines grouped by section with collapsible headers.
     let mut lines: Vec<(Line, bool)> = Vec::new(); // (line, is_selectable)
     let mut entry_line_map: Vec<usize> = Vec::new(); // entry_idx -> display line index
-    let mut current_section: Option<&str> = None;
+    let mut current_section: Option<ConfigSection> = None;
 
     for (i, entry) in entries.iter().enumerate() {
         // Section header if changed.
@@ -2902,16 +3008,55 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             if current_section.is_some() {
                 lines.push((Line::from(""), false)); // blank separator
             }
+            let is_collapsed = app.config_panel.collapsed.contains(&entry.section);
+            let arrow = if is_collapsed { "▶" } else { "▼" };
+
+            // Service status indicator on the Service section header
+            let extra = if entry.section == ConfigSection::Service {
+                if app.config_panel.service_running {
+                    format!(
+                        "  ● running (PID {})",
+                        app.config_panel
+                            .service_pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    "  ○ stopped".to_string()
+                }
+            } else {
+                String::new()
+            };
+
+            let header_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+
+            let status_color = if entry.section == ConfigSection::Service {
+                if app.config_panel.service_running {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                }
+            } else {
+                Color::DarkGray
+            };
+
             lines.push((
-                Line::from(Span::styled(
-                    format!("── {} ──", entry.section),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
+                Line::from(vec![
+                    Span::styled(format!("{} ", arrow), header_style),
+                    Span::styled(entry.section.label().to_string(), header_style),
+                    Span::styled(extra, Style::default().fg(status_color)),
+                ]),
                 false,
             ));
             current_section = Some(entry.section);
+        }
+
+        // Skip entries in collapsed sections
+        if app.config_panel.collapsed.contains(&entry.section) {
+            entry_line_map.push(lines.len().saturating_sub(1));
+            continue;
         }
 
         entry_line_map.push(lines.len());
@@ -2923,6 +3068,10 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let value_display = if is_editing {
             match &entry.edit_kind {
                 ConfigEditKind::TextInput => {
+                    format!("[{}▏]", app.config_panel.edit_buffer)
+                }
+                ConfigEditKind::SecretInput => {
+                    // Show actual text while editing, mask when not
                     format!("[{}▏]", app.config_panel.edit_buffer)
                 }
                 ConfigEditKind::Choice(choices) => {
@@ -2951,11 +3100,12 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                         "off".to_string()
                     }
                 }
+                ConfigEditKind::SecretInput => entry.value.clone(), // already masked
                 _ => entry.value.clone(),
             }
         };
 
-        let label_width = 22;
+        let label_width = 24;
         let label = format!("{:<width$}", entry.label, width = label_width);
 
         let style = if is_selected {
@@ -2972,6 +3122,13 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     Color::Green
                 } else {
                     Color::Red
+                }
+            }
+            ConfigEditKind::SecretInput => {
+                if entry.value == "(not set)" {
+                    Color::DarkGray
+                } else {
+                    Color::Magenta
                 }
             }
             _ => {
@@ -3007,7 +3164,7 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     if show_saved {
         lines.push((
             Line::from(Span::styled(
-                " Saved to config.toml",
+                " ✓ Saved to config.toml",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -3017,12 +3174,14 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     } else {
         let help_text = if app.config_panel.editing {
             match &entries[selected].edit_kind {
-                ConfigEditKind::TextInput => "Enter: save  Esc: cancel",
-                ConfigEditKind::Choice(_) => "Left/Right: choose  Enter: save  Esc: cancel",
+                ConfigEditKind::TextInput | ConfigEditKind::SecretInput => {
+                    "Enter: save  Esc: cancel"
+                }
+                ConfigEditKind::Choice(_) => "←/→: choose  Enter: save  Esc: cancel",
                 ConfigEditKind::Toggle => "Enter/Space: toggle",
             }
         } else {
-            "j/k: navigate  Enter: edit  Space: toggle"
+            "j/k: navigate  Enter: edit  Space: toggle  Tab: collapse/expand  a: add endpoint  r: reload"
         };
         lines.push((
             Line::from(Span::styled(
@@ -3050,8 +3209,8 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, area);
 
-    // Scrollbar if content exceeds viewport.
-    if lines.len() > viewport_h {
+    // Scrollbar if content exceeds viewport (auto-hides after 2 seconds of inactivity).
+    if lines.len() > viewport_h && app.scrollbar_visible() {
         let mut state = ScrollbarState::new(lines.len().saturating_sub(viewport_h))
             .position(app.config_panel.scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
@@ -3059,6 +3218,78 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 }
 
+/// Draw the "Add endpoint" form overlay.
+fn draw_add_endpoint_form(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let fields = &app.config_panel.new_endpoint;
+    let active = app.config_panel.new_endpoint_field;
+
+    let field_labels = ["Name", "Provider", "URL", "Model", "API Key"];
+    let field_values = [
+        &fields.name,
+        &fields.provider,
+        &fields.url,
+        &fields.model,
+        &fields.api_key,
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "── Add LLM Endpoint ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, (label, value)) in field_labels.iter().zip(field_values.iter()).enumerate() {
+        let is_active = i == active;
+        let cursor = if is_active { "▸ " } else { "  " };
+        let style = if is_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let display = if is_active && app.config_panel.editing {
+            format!("[{}▏]", app.config_panel.edit_buffer)
+        } else if value.is_empty() {
+            match i {
+                1 => "(anthropic/openai/openrouter/local)".to_string(),
+                2 => "(auto-detected from provider)".to_string(),
+                _ => "(empty)".to_string(),
+            }
+        } else {
+            value.to_string()
+        };
+
+        let value_color = if value.is_empty() && !is_active {
+            Color::DarkGray
+        } else if is_active {
+            Color::Yellow
+        } else {
+            Color::Gray
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(cursor, style),
+            Span::styled(format!("{:<16}", label), style),
+            Span::styled(display, Style::default().fg(value_color)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter: confirm field  Tab: next field  Esc: cancel  Ctrl+S: save endpoint",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
