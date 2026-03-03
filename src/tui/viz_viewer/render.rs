@@ -1125,6 +1125,9 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         height: input_height,
     };
 
+    // Store the message area for click-to-focus hit testing.
+    app.last_chat_message_area = msg_area;
+
     // Empty state.
     if app.chat.messages.is_empty() && !app.chat.awaiting_response {
         let lines = if app.chat.coordinator_active {
@@ -1179,8 +1182,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Scrollbar overlays the rightmost column when visible.
     let content_width = width;
     let mut rendered_lines: Vec<Line> = Vec::new();
+    // Map each rendered line to its source message index (for click-to-toggle).
+    let mut line_to_message: Vec<Option<usize>> = Vec::new();
 
-    for msg in &app.chat.messages {
+    for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
+        let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
+        let is_expanded = app.chat.expanded_messages.contains(&msg_idx);
+
         let (role_label, role_style) = match msg.role {
             super::state::ChatRole::User => (
                 "you",
@@ -1200,42 +1208,82 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             ),
         };
 
-        // Inline prefix: "↯↯↯: message text" with continuation lines indented.
-        let prefix = format!("{}: ", role_label);
+        // For coordinator messages, prepend a toggle indicator.
+        let toggle_indicator = if is_coordinator {
+            if is_expanded { "▼ " } else { "▶ " }
+        } else {
+            ""
+        };
+
+        // Inline prefix: "▶ ↯↯↯: message text" with continuation lines indented.
+        let prefix = format!("{}{}: ", toggle_indicator, role_label);
         let prefix_len = prefix.width();
         let indent = " ".repeat(prefix_len);
         let text_width = content_width.saturating_sub(prefix_len);
-        let mut first_line = true;
 
-        for paragraph in msg.text.trim_end_matches('\n').split('\n') {
-            if paragraph.is_empty() {
-                rendered_lines.push(Line::from(""));
-                continue;
-            }
-            let wrapped = word_wrap(paragraph, text_width);
-            for wl in wrapped {
-                if first_line {
-                    rendered_lines.push(Line::from(vec![
-                        Span::styled(prefix.clone(), role_style),
-                        Span::raw(wl.to_string()),
-                    ]));
-                    first_line = false;
-                } else {
-                    rendered_lines.push(Line::from(Span::raw(format!("{}{}", indent, wl))));
+        if is_coordinator && !is_expanded {
+            // Collapsed: show only a single summary line (first line of text, truncated).
+            let summary = msg
+                .text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(text_width)
+                .collect::<String>();
+            rendered_lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), role_style),
+                Span::raw(summary),
+            ]));
+            line_to_message.push(Some(msg_idx));
+            // Blank line separator.
+            rendered_lines.push(Line::from(""));
+            line_to_message.push(Some(msg_idx));
+        } else {
+            // Expanded (or non-coordinator): render full content.
+            let mut first_line = true;
+
+            for paragraph in msg.text.trim_end_matches('\n').split('\n') {
+                if paragraph.is_empty() {
+                    rendered_lines.push(Line::from(""));
+                    line_to_message.push(Some(msg_idx));
+                    continue;
+                }
+                let wrapped = word_wrap(paragraph, text_width);
+                for wl in wrapped {
+                    if first_line {
+                        rendered_lines.push(Line::from(vec![
+                            Span::styled(prefix.clone(), role_style),
+                            Span::raw(wl.to_string()),
+                        ]));
+                        first_line = false;
+                    } else if is_coordinator && is_expanded {
+                        // Expanded coordinator: show detail lines with │ gutter.
+                        rendered_lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(wl.to_string()),
+                        ]));
+                    } else {
+                        rendered_lines.push(Line::from(Span::raw(format!("{}{}", indent, wl))));
+                    }
+                    line_to_message.push(Some(msg_idx));
                 }
             }
+            // Show attachment indicators.
+            for att_name in &msg.attachments {
+                let att_text = format!("{}[Attached: {}]", indent, att_name);
+                rendered_lines.push(Line::from(Span::styled(
+                    att_text,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+                line_to_message.push(Some(msg_idx));
+            }
+            // Blank line between messages.
+            rendered_lines.push(Line::from(""));
+            line_to_message.push(None);
         }
-        // Show attachment indicators.
-        for att_name in &msg.attachments {
-            let att_text = format!("{}[Attached: {}]", indent, att_name);
-            rendered_lines.push(Line::from(Span::styled(
-                att_text,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
-        rendered_lines.push(Line::from("")); // blank line between messages
     }
 
     // Streaming indicator when awaiting response.
@@ -1246,8 +1294,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
+        line_to_message.push(None);
         rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
     }
+
+    // Store line-to-message mapping for click handling.
+    app.chat.line_to_message = line_to_message;
 
     // Scrolling: `scroll` is lines from bottom (0 = fully scrolled down).
     let total_lines = rendered_lines.len();
@@ -1264,11 +1317,37 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         max_scroll_from_bottom - clamped_scroll
     };
 
+    app.chat.scroll_from_top = scroll_from_top;
+
     let end = (scroll_from_top + viewport_h).min(total_lines);
     let visible_lines: Vec<Line> = rendered_lines[scroll_from_top..end].to_vec();
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
+
+    // Visual indicator: show a cyan "▌" column on the left edge when chat history
+    // has sub-focus and the right panel is focused.
+    if app.focused_panel == super::state::FocusedPanel::RightPanel
+        && app.inspector_sub_focus == super::state::InspectorSubFocus::ChatHistory
+        && app.input_mode == super::state::InputMode::Normal
+        && msg_area.height > 0
+    {
+        let indicator_height = msg_area.height.min(3);
+        for dy in 0..indicator_height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "▌",
+                    Style::default().fg(Color::Cyan),
+                ))),
+                Rect {
+                    x: msg_area.x,
+                    y: msg_area.y + dy,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+    }
 
     // Scrollbar if content overflows (auto-hides after 2 seconds of inactivity).
     if total_lines > viewport_h && app.panel_scrollbar_visible() {
@@ -1732,6 +1811,8 @@ fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 }
 
 /// Draw the Messages tab content (panel 3) — message queue for selected task.
+/// Uses chat-app style: incoming messages left-aligned, outgoing right-aligned,
+/// with a stats header showing sent/received/reply status.
 fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let width = area.width as usize;
     if width < 4 || area.height < 3 {
@@ -1789,10 +1870,7 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     // Empty state.
-    if app.messages_panel.rendered_lines.is_empty()
-        || (app.messages_panel.rendered_lines.len() == 1
-            && app.messages_panel.rendered_lines[0] == "(no messages)")
-    {
+    if app.messages_panel.entries.is_empty() {
         let msg = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Messages",
@@ -1812,18 +1890,9 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     let viewport_h = msg_area.height as usize;
-    // Scrollbar overlays the rightmost column when visible.
     let wrap_width = width;
 
-    // Build rendered lines with conversational styling.
-    // Format: "[timestamp] sender[priority]: body"
-    // Map senders to display labels and use distinct colors.
-    // Track distinct senders for color rotation in multi-agent conversations.
-    let mut wrapped_lines: Vec<Line> = Vec::new();
-    let msg_count = app.messages_panel.rendered_lines.len();
-    let mut sender_color_map: std::collections::HashMap<String, Color> =
-        std::collections::HashMap::new();
-    // Color palette for distinct non-outgoing senders (task names, agent IDs, etc.)
+    // Color palette for distinct incoming senders.
     const SENDER_COLORS: [Color; 6] = [
         Color::Cyan,
         Color::Magenta,
@@ -1832,150 +1901,191 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         Color::LightRed,
         Color::LightGreen,
     ];
+
+    let mut wrapped_lines: Vec<Line> = Vec::new();
+    let msg_count = app.messages_panel.entries.len();
+    let summary = &app.messages_panel.summary;
+
+    // ── Stats header ──
+    // e.g., "3 sent, 2 replies  ✓ responded" or "3 sent, 1 reply  ⧖ awaiting reply"
+    {
+        let mut header_spans: Vec<Span> = Vec::new();
+
+        // Incoming count (messages sent TO the task).
+        if summary.incoming > 0 {
+            header_spans.push(Span::styled(
+                format!("{} sent", summary.incoming,),
+                Style::default().fg(Color::Green),
+            ));
+        }
+
+        // Outgoing count (replies FROM the task's agent).
+        if summary.outgoing > 0 {
+            if !header_spans.is_empty() {
+                header_spans.push(Span::styled(", ", Style::default().fg(Color::DarkGray)));
+            }
+            header_spans.push(Span::styled(
+                format!(
+                    "{} {}",
+                    summary.outgoing,
+                    if summary.outgoing == 1 {
+                        "reply"
+                    } else {
+                        "replies"
+                    }
+                ),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
+        // Response status indicator.
+        if summary.incoming > 0 {
+            header_spans.push(Span::styled("  ", Style::default()));
+            if summary.responded {
+                header_spans.push(Span::styled(
+                    "✓ responded",
+                    Style::default().fg(Color::Green),
+                ));
+            } else if summary.unanswered > 0 {
+                header_spans.push(Span::styled(
+                    format!("⧖ {} awaiting reply", summary.unanswered,),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+
+        if !header_spans.is_empty() {
+            wrapped_lines.push(Line::from(header_spans));
+            wrapped_lines.push(Line::from(Span::styled(
+                "─".repeat(wrap_width.min(40)),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    // ── Render each message entry ──
+    let mut sender_color_map: std::collections::HashMap<String, Color> =
+        std::collections::HashMap::new();
     let mut next_color_idx: usize = 0;
 
-    for (msg_idx, s) in app.messages_panel.rendered_lines.iter().enumerate() {
-        if let Some(bracket_end) = s.find(']') {
-            let timestamp = &s[..=bracket_end];
-            let rest = &s[bracket_end + 1..].trim_start();
-
-            // Parse "sender[priority]: body" from rest.
-            let (sender_raw, body) = if let Some(colon_pos) = rest.find(": ") {
-                (&rest[..colon_pos], &rest[colon_pos + 2..])
-            } else {
-                ("", *rest)
-            };
-
-            // Check for urgent priority marker and clean sender.
-            let is_urgent = sender_raw.contains("[!]");
-            let sender_clean = sender_raw.replace(" [!]", "");
-
-            // Map sender to display label:
-            // "user"/"tui"/"coordinator" -> "you", anything else stays as-is.
-            let is_outgoing = matches!(sender_clean.as_str(), "user" | "tui" | "coordinator");
-            let display_label = if is_outgoing {
-                "you".to_string()
-            } else {
-                sender_clean.clone()
-            };
-
-            // Distinct colors: outgoing (you) = green, each unique sender gets a
-            // rotating color from the palette for multi-agent readability.
-            let sender_style = if is_outgoing {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                let color = *sender_color_map
-                    .entry(sender_clean.clone())
-                    .or_insert_with(|| {
-                        let c = SENDER_COLORS[next_color_idx % SENDER_COLORS.len()];
-                        next_color_idx += 1;
-                        c
-                    });
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            };
-
-            // Strip any ANSI escape sequences from body.
-            let clean_body = String::from_utf8(strip_ansi_escapes::strip(body.as_bytes()))
-                .unwrap_or_else(|_| body.to_string());
-
-            // Decide inline vs above-line based on display_label length.
-            let name_threshold = app.message_name_threshold as usize;
-            let name_display_len = display_label.len() + if is_urgent { 4 } else { 0 };
-
-            if name_display_len > name_threshold {
-                // Long name: put on its own line, body with fixed indent.
-                let mut name_spans: Vec<Span> = vec![Span::styled(display_label, sender_style)];
-                if is_urgent {
-                    name_spans.push(Span::styled(
-                        " [!]",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                name_spans.push(Span::styled(":", Style::default().fg(Color::DarkGray)));
-                name_spans.push(Span::styled(
-                    format!("  {}", timestamp),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                wrapped_lines.push(Line::from(name_spans));
-
-                let fixed_indent = app.message_indent as usize;
-                let indent = " ".repeat(fixed_indent);
-                let text_width = wrap_width.saturating_sub(fixed_indent);
-
-                if text_width == 0 || clean_body.is_empty() {
-                    wrapped_lines.push(Line::from(Span::raw(format!("{}{}", indent, clean_body))));
-                } else {
-                    let wrapped = word_wrap(&clean_body, text_width);
-                    for wl in &wrapped {
-                        wrapped_lines.push(Line::from(Span::raw(format!("{}{}", indent, wl))));
-                    }
-                }
-            } else {
-                // Short name: inline "name: body" with matching indentation.
-                let mut prefix_spans: Vec<Span> = vec![Span::styled(display_label, sender_style)];
-                if is_urgent {
-                    prefix_spans.push(Span::styled(
-                        " [!]",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                prefix_spans.push(Span::styled(": ", Style::default().fg(Color::DarkGray)));
-
-                let prefix_display_len: usize =
-                    prefix_spans.iter().map(|sp| sp.content.len()).sum();
-                let indent = " ".repeat(prefix_display_len);
-                let text_width = wrap_width.saturating_sub(prefix_display_len);
-
-                if text_width == 0 || clean_body.is_empty() {
-                    let mut line_spans = prefix_spans;
-                    line_spans.push(Span::raw(clean_body.clone()));
-                    line_spans.push(Span::styled(
-                        format!("  {}", timestamp),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                    wrapped_lines.push(Line::from(line_spans));
-                } else {
-                    let wrapped = word_wrap(&clean_body, text_width);
-                    for (i, wl) in wrapped.iter().enumerate() {
-                        if i == 0 {
-                            let mut line_spans = prefix_spans.clone();
-                            line_spans.push(Span::raw(wl.to_string()));
-                            if wrapped.len() == 1 {
-                                line_spans.push(Span::styled(
-                                    format!("  {}", timestamp),
-                                    Style::default().fg(Color::DarkGray),
-                                ));
-                            }
-                            wrapped_lines.push(Line::from(line_spans));
-                        } else {
-                            wrapped_lines.push(Line::from(Span::raw(format!("{}{}", indent, wl))));
-                        }
-                    }
-                    if wrapped.len() > 1 {
-                        wrapped_lines.push(Line::from(Span::styled(
-                            format!("{}{}", indent, timestamp),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
+    // Compute which incoming messages are unanswered (last N without a following outgoing).
+    let mut unanswered_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    {
+        let mut pending: Vec<usize> = Vec::new();
+        for (i, entry) in app.messages_panel.entries.iter().enumerate() {
+            match entry.direction {
+                super::state::MessageDirection::Incoming => pending.push(i),
+                super::state::MessageDirection::Outgoing => pending.clear(),
             }
+        }
+        unanswered_set.extend(pending);
+    }
 
-            // Visual separator between messages (thin dim line), not after the last one.
-            if msg_idx + 1 < msg_count {
-                wrapped_lines.push(Line::from(""));
-            }
+    // Right-indent for outgoing messages (chat bubble effect).
+    let outgoing_indent = (wrap_width / 5).clamp(2, 8);
+
+    for (msg_idx, entry) in app.messages_panel.entries.iter().enumerate() {
+        let is_outgoing = entry.direction == super::state::MessageDirection::Outgoing;
+
+        // Strip ANSI from body.
+        let clean_body = String::from_utf8(strip_ansi_escapes::strip(entry.body.as_bytes()))
+            .unwrap_or_else(|_| entry.body.clone());
+
+        // Sender style: outgoing = green, incoming = rotating palette.
+        let sender_style = if is_outgoing {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
-            // No timestamp — plain word wrap.
-            if wrap_width > 0 && s.len() > wrap_width {
-                let wrapped = word_wrap(s, wrap_width);
-                for wl in wrapped {
-                    wrapped_lines.push(Line::from(wl));
-                }
-            } else {
-                wrapped_lines.push(Line::from(s.as_str()));
+            let color = *sender_color_map
+                .entry(entry.sender.clone())
+                .or_insert_with(|| {
+                    let c = SENDER_COLORS[next_color_idx % SENDER_COLORS.len()];
+                    next_color_idx += 1;
+                    c
+                });
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+
+        // Direction arrow and margin.
+        let (dir_arrow, margin) = if is_outgoing {
+            ("→ ", " ".repeat(outgoing_indent))
+        } else {
+            ("← ", String::new())
+        };
+
+        let dir_style = if is_outgoing {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+
+        // Unanswered marker for incoming messages without a reply.
+        let unanswered_marker = if !is_outgoing && unanswered_set.contains(&msg_idx) {
+            " ⧖"
+        } else {
+            ""
+        };
+
+        // Header line: [margin][arrow] sender  timestamp [unanswered]
+        let mut header_spans: Vec<Span> = Vec::new();
+        if !margin.is_empty() {
+            header_spans.push(Span::raw(margin.clone()));
+        }
+        header_spans.push(Span::styled(dir_arrow, dir_style));
+        header_spans.push(Span::styled(entry.display_label.clone(), sender_style));
+        if entry.is_urgent {
+            header_spans.push(Span::styled(
+                " [!]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        header_spans.push(Span::styled(
+            format!("  {}", entry.timestamp),
+            Style::default().fg(Color::DarkGray),
+        ));
+        if !unanswered_marker.is_empty() {
+            header_spans.push(Span::styled(
+                unanswered_marker,
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        wrapped_lines.push(Line::from(header_spans));
+
+        // Body lines with indent matching the margin + arrow.
+        let body_indent_len = if is_outgoing {
+            outgoing_indent + 2 // margin + "→ "
+        } else {
+            2 // "← "
+        };
+        let body_indent = " ".repeat(body_indent_len);
+        let text_width = wrap_width.saturating_sub(body_indent_len);
+
+        // Body style: outgoing gets a subtle dimming, incoming is default.
+        let body_style = if is_outgoing {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        if text_width == 0 || clean_body.is_empty() {
+            wrapped_lines.push(Line::from(Span::styled(
+                format!("{}{}", body_indent, clean_body),
+                body_style,
+            )));
+        } else {
+            let wrapped = word_wrap(&clean_body, text_width);
+            for wl in &wrapped {
+                wrapped_lines.push(Line::from(Span::styled(
+                    format!("{}{}", body_indent, wl),
+                    body_style,
+                )));
             }
+        }
+
+        // Visual separator between messages.
+        if msg_idx + 1 < msg_count {
+            wrapped_lines.push(Line::from(""));
         }
     }
 

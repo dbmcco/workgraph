@@ -170,6 +170,16 @@ pub enum FocusedPanel {
     RightPanel,
 }
 
+/// Which sub-zone within the inspector (right panel) has focus.
+/// Only meaningful when the Chat tab is active and focused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InspectorSubFocus {
+    /// Chat message history area — arrow keys scroll messages.
+    ChatHistory,
+    /// Text entry field — arrow keys move cursor within text.
+    TextEntry,
+}
+
 /// Which tab is active in the right panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RightPanelTab {
@@ -512,6 +522,13 @@ pub struct ChatState {
     pub total_rendered_lines: usize,
     /// Viewport height for the message area (set each frame by renderer).
     pub viewport_height: usize,
+    /// Set of message indices that are expanded (coordinator messages are collapsed by default).
+    pub expanded_messages: HashSet<usize>,
+    /// Map from rendered line index → message index, populated each frame by the renderer.
+    /// Used for click-to-toggle on coordinator messages.
+    pub line_to_message: Vec<Option<usize>>,
+    /// Scroll offset from top (set each frame by renderer for click hit-testing).
+    pub scroll_from_top: usize,
 }
 
 /// A pending attachment waiting to be sent with the next chat message.
@@ -654,11 +671,54 @@ impl Default for CoordLogState {
     }
 }
 
+/// Direction of a message relative to the task's assigned agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageDirection {
+    /// Sent TO the task (by user, coordinator, or another agent).
+    Incoming,
+    /// Sent BY the task's assigned agent.
+    Outgoing,
+}
+
+/// A single parsed message with direction metadata for rendering.
+#[derive(Clone, Debug)]
+pub struct MessageEntry {
+    /// Sender identifier as stored in the message.
+    pub sender: String,
+    /// Display label (e.g., "you" for user/tui/coordinator).
+    pub display_label: String,
+    /// Message body text.
+    pub body: String,
+    /// Relative timestamp string (e.g., "2m ago").
+    pub timestamp: String,
+    /// Whether this is an urgent-priority message.
+    pub is_urgent: bool,
+    /// Direction: incoming to the task, or outgoing from the task's agent.
+    pub direction: MessageDirection,
+}
+
+/// Summary stats for the messages panel header.
+#[derive(Clone, Debug, Default)]
+pub struct MessageSummary {
+    /// Number of incoming messages (sent to the task).
+    pub incoming: usize,
+    /// Number of outgoing messages (sent by the task's agent).
+    pub outgoing: usize,
+    /// Whether the agent has responded after the latest incoming message.
+    pub responded: bool,
+    /// Number of incoming messages that have no subsequent outgoing reply.
+    pub unanswered: usize,
+}
+
 /// State for the Messages panel (panel 3) — shows message queue for the selected task.
 #[derive(Default)]
 pub struct MessagesPanelState {
-    /// Cached rendered log lines.
+    /// Cached rendered log lines (kept for fallback/compat).
     pub rendered_lines: Vec<String>,
+    /// Structured message entries with direction metadata.
+    pub entries: Vec<MessageEntry>,
+    /// Summary statistics for the header.
+    pub summary: MessageSummary,
     /// Task ID these lines were rendered for (to detect staleness).
     pub task_id: Option<String>,
     /// Scroll offset.
@@ -930,6 +990,8 @@ pub struct VizApp {
     pub last_right_content_area: Rect,
     /// The chat input area from the last render frame (for click-to-resume editing).
     pub last_chat_input_area: Rect,
+    /// The chat message history area from the last render frame (for click-to-focus).
+    pub last_chat_message_area: Rect,
 
     /// Maps config entry index → screen Y position (set each frame by renderer).
     /// Used for mouse click → config entry selection.
@@ -999,6 +1061,8 @@ pub struct VizApp {
     /// True when user explicitly dismissed chat input with Esc.
     /// Prevents auto-re-entering ChatInput until user navigates away from Chat tab.
     pub chat_input_dismissed: bool,
+    /// Which sub-zone within the inspector has focus (chat history vs text entry).
+    pub inspector_sub_focus: InspectorSubFocus,
 
     // ── Task form ──
     /// Task creation form state (populated when form is open).
@@ -1171,6 +1235,7 @@ impl VizApp {
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
+            last_chat_message_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
             jump_target: None,
             task_order: Vec::new(),
@@ -1198,6 +1263,7 @@ impl VizApp {
             layout_mode: LayoutMode::Split,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
+            inspector_sub_focus: InspectorSubFocus::ChatHistory,
             task_form: None,
             text_prompt: TextPromptState {
                 input: String::new(),
@@ -3177,6 +3243,8 @@ impl VizApp {
             Some(id) => id.to_string(),
             None => {
                 self.messages_panel.rendered_lines.clear();
+                self.messages_panel.entries.clear();
+                self.messages_panel.summary = MessageSummary::default();
                 self.messages_panel.task_id = None;
                 return;
             }
@@ -3188,6 +3256,17 @@ impl VizApp {
         }
 
         self.messages_panel.rendered_lines.clear();
+        self.messages_panel.entries.clear();
+        self.messages_panel.summary = MessageSummary::default();
+
+        // Look up the assigned agent for direction detection.
+        let assigned_agent = load_graph(self.workgraph_dir.join("graph.jsonl"))
+            .ok()
+            .and_then(|g| {
+                g.tasks()
+                    .find(|t| t.id == task_id)
+                    .and_then(|t| t.assigned.clone())
+            });
 
         match workgraph::messages::list_messages(&self.workgraph_dir, &task_id) {
             Ok(msgs) if msgs.is_empty() => {
@@ -3197,14 +3276,76 @@ impl VizApp {
             }
             Ok(msgs) => {
                 let now = chrono::Utc::now();
-                for msg in &msgs {
+                let mut incoming = 0usize;
+                let mut outgoing = 0usize;
+                let mut last_incoming_idx: Option<usize> = None;
+                let mut last_outgoing_idx: Option<usize> = None;
+                let mut unanswered_incoming: Vec<usize> = Vec::new();
+
+                for (i, msg) in msgs.iter().enumerate() {
                     let time_str = format_relative_time(&msg.timestamp, &now);
-                    let priority_tag = if msg.priority == "urgent" { " [!]" } else { "" };
+                    let is_urgent = msg.priority == "urgent";
+
+                    // Determine direction: message from the assigned agent = outgoing.
+                    let is_from_agent = assigned_agent.as_ref().is_some_and(|a| msg.sender == *a);
+                    let direction = if is_from_agent {
+                        MessageDirection::Outgoing
+                    } else {
+                        MessageDirection::Incoming
+                    };
+
+                    // Map sender to display label.
+                    let is_user_sender =
+                        matches!(msg.sender.as_str(), "user" | "tui" | "coordinator");
+                    let display_label = if is_user_sender {
+                        "you".to_string()
+                    } else if is_from_agent {
+                        "agent".to_string()
+                    } else {
+                        msg.sender.clone()
+                    };
+
+                    match direction {
+                        MessageDirection::Incoming => {
+                            incoming += 1;
+                            last_incoming_idx = Some(i);
+                            unanswered_incoming.push(i);
+                        }
+                        MessageDirection::Outgoing => {
+                            outgoing += 1;
+                            last_outgoing_idx = Some(i);
+                            unanswered_incoming.clear();
+                        }
+                    }
+
+                    // Keep rendered_lines for compat.
+                    let priority_tag = if is_urgent { " [!]" } else { "" };
                     self.messages_panel.rendered_lines.push(format!(
                         "[{}] {}{}: {}",
                         time_str, msg.sender, priority_tag, msg.body
                     ));
+
+                    self.messages_panel.entries.push(MessageEntry {
+                        sender: msg.sender.clone(),
+                        display_label,
+                        body: msg.body.clone(),
+                        timestamp: time_str,
+                        is_urgent,
+                        direction,
+                    });
                 }
+
+                // Compute summary.
+                let responded = match (last_incoming_idx, last_outgoing_idx) {
+                    (Some(li), Some(lo)) => lo > li,
+                    _ => outgoing > 0 && incoming == 0,
+                };
+                self.messages_panel.summary = MessageSummary {
+                    incoming,
+                    outgoing,
+                    responded,
+                    unanswered: unanswered_incoming.len(),
+                };
             }
             Err(_) => {
                 self.messages_panel
@@ -3275,6 +3416,7 @@ impl VizApp {
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
+            last_chat_message_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
             jump_target: None,
             task_order,
@@ -3302,6 +3444,7 @@ impl VizApp {
             layout_mode: LayoutMode::Split,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
+            inspector_sub_focus: InspectorSubFocus::ChatHistory,
             task_form: None,
             text_prompt: TextPromptState {
                 input: String::new(),

@@ -11,8 +11,8 @@ use ratatui::layout::Position;
 
 use super::render;
 use super::state::{
-    CommandEffect, ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, RightPanelTab,
-    TaskFormField, TextPromptAction, VizApp,
+    CommandEffect, ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, InspectorSubFocus,
+    RightPanelTab, TaskFormField, TextPromptAction, VizApp,
 };
 
 /// Input poll timeout — short for responsive scrolling.
@@ -299,6 +299,7 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
             // Return to ChatInput mode if cancelling an attach prompt.
             if action == TextPromptAction::AttachFile {
                 app.input_mode = InputMode::ChatInput;
+                app.inspector_sub_focus = InspectorSubFocus::TextEntry;
             } else {
                 app.input_mode = InputMode::Normal;
             }
@@ -309,6 +310,7 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
             if text.trim().is_empty() {
                 if action == TextPromptAction::AttachFile {
                     app.input_mode = InputMode::ChatInput;
+                    app.inspector_sub_focus = InspectorSubFocus::TextEntry;
                 } else {
                     app.input_mode = InputMode::Normal;
                 }
@@ -349,6 +351,7 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     app.attach_file(&text);
                     // Return to chat input mode, not normal mode.
                     app.input_mode = InputMode::ChatInput;
+                    app.inspector_sub_focus = InspectorSubFocus::TextEntry;
                     return;
                 }
             }
@@ -473,8 +476,10 @@ fn handle_task_form_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
 fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     match code {
         KeyCode::Esc => {
+            // Exit text entry, but stay in the chat panel with history sub-focus.
             app.input_mode = InputMode::Normal;
             app.chat_input_dismissed = true;
+            app.inspector_sub_focus = InspectorSubFocus::ChatHistory;
         }
         KeyCode::Enter => {
             // Enter sends the message (newlines from paste are preserved in the content).
@@ -552,6 +557,7 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.chat.cursor = 0;
             app.chat.input_scroll = 0;
             app.input_mode = InputMode::Normal;
+            app.inspector_sub_focus = InspectorSubFocus::ChatHistory;
         }
         // Ctrl+V: check clipboard for image before falling through to text paste.
         // In terminals with bracketed paste, Ctrl+V triggers Event::Paste for text.
@@ -576,24 +582,18 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.record_panel_scroll_activity();
             app.chat.scroll = app.chat.scroll.saturating_sub(1);
         }
-        // Up/Down: navigate between lines in multi-line input
+        // Up/Down: navigate between lines in multi-line input.
+        // Arrow keys stay within the text entry; use Alt+Up/Down to scroll history.
         KeyCode::Up => {
             let new_pos = move_cursor_up(&app.chat.input, app.chat.cursor);
-            if new_pos == app.chat.cursor {
-                // Already on first line: scroll chat history instead.
-                app.record_panel_scroll_activity();
-                app.chat.scroll = app.chat.scroll.saturating_add(1);
-            } else {
+            if new_pos != app.chat.cursor {
                 app.chat.cursor = new_pos;
             }
+            // At first line: no-op (don't fall through to history scroll).
         }
         KeyCode::Down => {
             let new_pos = move_cursor_down(&app.chat.input, app.chat.cursor);
-            if new_pos == app.chat.cursor {
-                // Already on last line: scroll chat history instead.
-                app.record_panel_scroll_activity();
-                app.chat.scroll = app.chat.scroll.saturating_sub(1);
-            } else {
+            if new_pos != app.chat.cursor {
                 app.chat.cursor = new_pos;
             }
         }
@@ -1078,6 +1078,7 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.focused_panel = FocusedPanel::RightPanel;
             app.chat_input_dismissed = false;
             app.input_mode = InputMode::ChatInput;
+            app.inspector_sub_focus = InspectorSubFocus::TextEntry;
         }
 
         // Digit keys 0-6: switch right panel tab
@@ -1221,6 +1222,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             if app.right_panel_tab == RightPanelTab::Chat {
                 app.chat_input_dismissed = false;
                 app.input_mode = InputMode::ChatInput;
+                app.inspector_sub_focus = InspectorSubFocus::TextEntry;
                 // Place cursor at end of existing text.
                 app.chat.cursor = app.chat.input.len();
             } else if app.right_panel_tab == RightPanelTab::Messages {
@@ -1517,8 +1519,37 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.focused_panel = FocusedPanel::RightPanel;
                 app.chat_input_dismissed = false;
                 app.input_mode = InputMode::ChatInput;
+                app.inspector_sub_focus = InspectorSubFocus::TextEntry;
                 // Place cursor at end of existing text.
                 app.chat.cursor = app.chat.input.len();
+            } else if in_right_content
+                && app.right_panel_tab == RightPanelTab::Chat
+                && app.last_chat_message_area.height > 0
+                && app.last_chat_message_area.contains(pos)
+            {
+                // Click on chat message history area: focus history, exit text editing.
+                app.focused_panel = FocusedPanel::RightPanel;
+                app.inspector_sub_focus = InspectorSubFocus::ChatHistory;
+                if app.input_mode == InputMode::ChatInput {
+                    app.input_mode = InputMode::Normal;
+                    app.chat_input_dismissed = true;
+                }
+
+                // Check if click landed on a coordinator message → toggle expand/collapse.
+                let click_row_in_area = (row.saturating_sub(app.last_chat_message_area.y)) as usize;
+                let rendered_line_idx = app.chat.scroll_from_top + click_row_in_area;
+                if let Some(Some(msg_idx)) = app.chat.line_to_message.get(rendered_line_idx) {
+                    let msg_idx = *msg_idx;
+                    if msg_idx < app.chat.messages.len()
+                        && app.chat.messages[msg_idx].role == super::state::ChatRole::Coordinator
+                    {
+                        if app.chat.expanded_messages.contains(&msg_idx) {
+                            app.chat.expanded_messages.remove(&msg_idx);
+                        } else {
+                            app.chat.expanded_messages.insert(msg_idx);
+                        }
+                    }
+                }
             } else if in_right_content {
                 // Click in right panel content: focus the right panel.
                 app.focused_panel = FocusedPanel::RightPanel;
