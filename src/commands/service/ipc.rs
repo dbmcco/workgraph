@@ -110,6 +110,9 @@ pub enum IpcRequest {
         message: String,
         /// Unique request ID for correlating this request with a response
         request_id: String,
+        /// Optional file attachments
+        #[serde(default)]
+        attachments: Vec<workgraph::chat::Attachment>,
     },
 }
 
@@ -370,9 +373,10 @@ fn handle_request(
         IpcRequest::UserChat {
             message,
             request_id,
+            attachments,
         } => {
             logger.info(&format!("IPC UserChat: request_id={}", request_id));
-            match append_chat_inbox(dir, &message, &request_id) {
+            match append_chat_inbox(dir, &message, &request_id, attachments) {
                 Ok(msg_id) => {
                     // Signal urgent wake — bypasses settling delay entirely
                     *urgent_wake = true;
@@ -796,9 +800,18 @@ fn handle_query_task(dir: &Path, task_id: &str) -> IpcResponse {
 }
 
 /// Append a user chat message to the inbox.
-/// Delegates to workgraph::chat::append_inbox for the actual storage.
-fn append_chat_inbox(dir: &Path, content: &str, request_id: &str) -> Result<u64> {
-    workgraph::chat::append_inbox(dir, content, request_id)
+/// Delegates to workgraph::chat for the actual storage.
+fn append_chat_inbox(
+    dir: &Path,
+    content: &str,
+    request_id: &str,
+    attachments: Vec<workgraph::chat::Attachment>,
+) -> Result<u64> {
+    if attachments.is_empty() {
+        workgraph::chat::append_inbox(dir, content, request_id)
+    } else {
+        workgraph::chat::append_inbox_with_attachments(dir, content, request_id, attachments)
+    }
 }
 
 #[cfg(test)]
@@ -1024,6 +1037,7 @@ poll_interval = 120
         let req = IpcRequest::UserChat {
             message: "help me plan the auth system".to_string(),
             request_id: "chat-123-abcd".to_string(),
+            attachments: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"user_chat\""));
@@ -1035,6 +1049,7 @@ poll_interval = 120
             IpcRequest::UserChat {
                 message,
                 request_id,
+                ..
             } => {
                 assert_eq!(message, "help me plan the auth system");
                 assert_eq!(request_id, "chat-123-abcd");
@@ -1049,6 +1064,7 @@ poll_interval = 120
             IpcRequest::UserChat {
                 message,
                 request_id,
+                ..
             } => {
                 assert_eq!(message, "hello");
                 assert_eq!(request_id, "req-1");
@@ -1083,6 +1099,7 @@ poll_interval = 120
             IpcRequest::UserChat {
                 message: "test message".to_string(),
                 request_id: "req-test-1".to_string(),
+                attachments: vec![],
             },
             &mut running,
             &mut wake_coordinator,

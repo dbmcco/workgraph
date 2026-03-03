@@ -671,6 +671,10 @@ pub enum Commands {
         /// Timeout in seconds waiting for response (default: 120)
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Attach a file (copied to .workgraph/attachments/)
+        #[arg(long)]
+        attachment: Vec<String>,
     },
 
     /// Manage resources

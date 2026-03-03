@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use workgraph::chat;
+use workgraph::chat::{self, Attachment};
 
 use super::service;
 
@@ -30,8 +30,30 @@ fn generate_request_id() -> String {
     format!("chat-{}-{}{:05}", millis, pid, nanos_suffix)
 }
 
+/// Process --attachment flags: validate each file, copy to .workgraph/attachments/,
+/// and return the list of Attachment structs.
+fn process_attachments(dir: &Path, paths: &[String]) -> Result<Vec<Attachment>> {
+    let mut attachments = Vec::new();
+    for path_str in paths {
+        let source = std::path::Path::new(path_str);
+        let att = chat::store_attachment(dir, source)
+            .with_context(|| format!("Failed to attach file: {}", path_str))?;
+        eprintln!(
+            "Attached: {} ({}, {} bytes)",
+            att.path, att.mime_type, att.size_bytes
+        );
+        attachments.push(att);
+    }
+    Ok(attachments)
+}
+
 /// Send a single chat message and wait for a response.
-pub fn run_send(dir: &Path, message: &str, timeout_secs: Option<u64>) -> Result<()> {
+pub fn run_send(
+    dir: &Path,
+    message: &str,
+    timeout_secs: Option<u64>,
+    attachment_paths: &[String],
+) -> Result<()> {
     // Validate message size
     if message.len() > MAX_MESSAGE_SIZE {
         eprintln!(
@@ -46,19 +68,44 @@ pub fn run_send(dir: &Path, message: &str, timeout_secs: Option<u64>) -> Result<
         message
     };
 
-    if msg.trim().is_empty() {
+    if msg.trim().is_empty() && attachment_paths.is_empty() {
         anyhow::bail!("Message cannot be empty");
     }
 
+    // Process attachments
+    let attachments = process_attachments(dir, attachment_paths)?;
+
     let request_id = generate_request_id();
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
+
+    // Build the message content, appending attachment references.
+    let full_message = if attachments.is_empty() {
+        msg.to_string()
+    } else {
+        let att_lines: Vec<String> = attachments
+            .iter()
+            .map(|a| {
+                let filename = std::path::Path::new(&a.path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&a.path);
+                format!("[Attached: {}]", filename)
+            })
+            .collect();
+        if msg.trim().is_empty() {
+            att_lines.join("\n")
+        } else {
+            format!("{}\n{}", msg, att_lines.join("\n"))
+        }
+    };
 
     // Send UserChat IPC request to the daemon
     let ipc_response = service::send_request(
         dir,
         &service::IpcRequest::UserChat {
-            message: msg.to_string(),
+            message: full_message,
             request_id: request_id.clone(),
+            attachments: attachments.clone(),
         },
     )
     .context("Failed to connect to service. Is it running? Start with: wg service start")?;
@@ -150,6 +197,7 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
             &service::IpcRequest::UserChat {
                 message: msg.to_string(),
                 request_id: request_id.clone(),
+                attachments: vec![],
             },
         ) {
             Ok(resp) => resp,
@@ -219,6 +267,13 @@ pub fn run_history(dir: &Path, json: bool) -> Result<()> {
         };
 
         println!("[{}] {}: {}", time, msg.role, msg.content);
+        for att in &msg.attachments {
+            let filename = std::path::Path::new(&att.path)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(&att.path);
+            println!("        [Attached: {} ({})]", filename, att.mime_type);
+        }
     }
 
     Ok(())
@@ -311,7 +366,7 @@ mod tests {
     #[test]
     fn test_send_empty_message_fails() {
         let (_tmp, dir) = setup();
-        let result = run_send(&dir, "  ", None);
+        let result = run_send(&dir, "  ", None, &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }

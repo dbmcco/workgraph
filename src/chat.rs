@@ -13,10 +13,22 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// A file attachment on a chat message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    /// Path relative to the workgraph root (e.g. ".workgraph/attachments/20260303-143022-a1b2c3.png")
+    pub path: String,
+    /// MIME type (e.g. "image/png")
+    pub mime_type: String,
+    /// File size in bytes
+    pub size_bytes: u64,
+}
 
 /// A single chat message between user and coordinator.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,6 +43,9 @@ pub struct ChatMessage {
     pub content: String,
     /// Correlates a user request with the coordinator's response.
     pub request_id: String,
+    /// Optional file attachments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 /// Directory for chat files.
@@ -62,7 +77,13 @@ fn coordinator_cursor_path(workgraph_dir: &Path) -> PathBuf {
 ///
 /// Opens the file with O_APPEND, acquires an exclusive lock,
 /// reads the current max ID, assigns the next ID, and appends.
-fn append_message(path: &Path, role: &str, content: &str, request_id: &str) -> Result<u64> {
+fn append_message(
+    path: &Path,
+    role: &str,
+    content: &str,
+    request_id: &str,
+    attachments: Vec<Attachment>,
+) -> Result<u64> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create chat directory: {}", parent.display()))?;
@@ -114,6 +135,7 @@ fn append_message(path: &Path, role: &str, content: &str, request_id: &str) -> R
         role: role.to_string(),
         content: content.to_string(),
         request_id: request_id.to_string(),
+        attachments,
     };
 
     let mut json = serde_json::to_string(&msg).context("Failed to serialize chat message")?;
@@ -196,7 +218,20 @@ fn write_cursor_file(path: &Path, cursor: u64) -> Result<()> {
 /// Returns the assigned inbox message ID.
 pub fn append_inbox(workgraph_dir: &Path, content: &str, request_id: &str) -> Result<u64> {
     let path = inbox_path(workgraph_dir);
-    append_message(&path, "user", content, request_id)
+    append_message(&path, "user", content, request_id, vec![])
+}
+
+/// Append a user message with attachments to the inbox.
+///
+/// Returns the assigned inbox message ID.
+pub fn append_inbox_with_attachments(
+    workgraph_dir: &Path,
+    content: &str,
+    request_id: &str,
+    attachments: Vec<Attachment>,
+) -> Result<u64> {
+    let path = inbox_path(workgraph_dir);
+    append_message(&path, "user", content, request_id, attachments)
 }
 
 /// Append a coordinator response to the outbox.
@@ -204,7 +239,7 @@ pub fn append_inbox(workgraph_dir: &Path, content: &str, request_id: &str) -> Re
 /// Returns the assigned outbox message ID.
 pub fn append_outbox(workgraph_dir: &Path, content: &str, request_id: &str) -> Result<u64> {
     let path = outbox_path(workgraph_dir);
-    append_message(&path, "coordinator", content, request_id)
+    append_message(&path, "coordinator", content, request_id, vec![])
 }
 
 /// Read all inbox messages (user → coordinator).
@@ -340,6 +375,131 @@ fn rotate_file(path: &Path, keep_count: usize) -> Result<()> {
         .with_context(|| format!("Failed to rename rotated file: {}", path.display()))?;
 
     Ok(())
+}
+
+// --- Attachment support ---
+
+/// Directory for storing attached files.
+fn attachments_dir(workgraph_dir: &Path) -> PathBuf {
+    workgraph_dir.join("attachments")
+}
+
+/// Known image extensions and their MIME types.
+fn mime_for_extension(ext: &str) -> Option<&'static str> {
+    match ext.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "tiff" | "tif" => Some("image/tiff"),
+        "ico" => Some("image/x-icon"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain"),
+        "json" => Some("application/json"),
+        "yaml" | "yml" => Some("text/yaml"),
+        "toml" => Some("text/toml"),
+        "md" => Some("text/markdown"),
+        "log" => Some("text/plain"),
+        _ => None,
+    }
+}
+
+/// Detect MIME type from file magic bytes (first few bytes).
+fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" {
+        return Some("image/png");
+    }
+    if bytes.len() >= 3 && &bytes[..3] == b"\xff\xd8\xff" {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 4 && &bytes[..4] == b"RIFF" && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 2 && &bytes[..2] == b"BM" {
+        return Some("image/bmp");
+    }
+    if bytes.len() >= 5 && &bytes[..5] == b"%PDF-" {
+        return Some("application/pdf");
+    }
+    None
+}
+
+/// Validate that a file exists and determine its MIME type.
+/// Returns `(mime_type, file_size)`.
+pub fn validate_attachment(path: &Path) -> Result<(String, u64)> {
+    if !path.exists() {
+        anyhow::bail!("File not found: {}", path.display());
+    }
+    if !path.is_file() {
+        anyhow::bail!("Not a regular file: {}", path.display());
+    }
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata: {}", path.display()))?;
+    let size = metadata.len();
+
+    // Try extension first, then magic bytes.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if let Some(mime) = mime_for_extension(ext) {
+        return Ok((mime.to_string(), size));
+    }
+
+    // Read first 12 bytes for magic detection.
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut header = [0u8; 12];
+    let n = file.read(&mut header).unwrap_or(0);
+    if let Some(mime) = mime_from_magic(&header[..n]) {
+        return Ok((mime.to_string(), size));
+    }
+
+    // Default to octet-stream for unknown types.
+    Ok(("application/octet-stream".to_string(), size))
+}
+
+/// Copy a file into `.workgraph/attachments/` with a content-addressed name.
+/// Returns the `Attachment` with the relative path.
+pub fn store_attachment(workgraph_dir: &Path, source: &Path) -> Result<Attachment> {
+    let (mime_type, size_bytes) = validate_attachment(source)?;
+
+    let att_dir = attachments_dir(workgraph_dir);
+    fs::create_dir_all(&att_dir)
+        .with_context(|| format!("Failed to create attachments dir: {}", att_dir.display()))?;
+
+    // Generate content hash for deduplication.
+    let file_bytes =
+        fs::read(source).with_context(|| format!("Failed to read file: {}", source.display()))?;
+    let hash = Sha256::digest(&file_bytes);
+    let hash_hex = format!("{:x}", hash);
+    let short_hash = &hash_hex[..8];
+
+    // Timestamp prefix for sortability.
+    let now = Utc::now().format("%Y%m%d-%H%M%S");
+
+    let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let filename = format!("{}-{}.{}", now, short_hash, ext);
+    let dest = att_dir.join(&filename);
+
+    // If the exact file already exists (same hash), skip copy.
+    if !dest.exists() {
+        fs::write(&dest, &file_bytes)
+            .with_context(|| format!("Failed to write attachment: {}", dest.display()))?;
+    }
+
+    // Return path relative to workgraph dir's parent (project root).
+    let relative = format!(".workgraph/attachments/{}", filename);
+
+    Ok(Attachment {
+        path: relative,
+        mime_type,
+        size_bytes,
+    })
 }
 
 /// Clear all chat data (inbox, outbox, cursors).

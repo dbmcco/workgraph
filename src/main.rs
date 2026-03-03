@@ -891,6 +891,7 @@ fn main() -> Result<()> {
             history,
             clear,
             timeout,
+            attachment,
         } => {
             if clear {
                 commands::chat::run_clear(&workgraph_dir)
@@ -899,7 +900,7 @@ fn main() -> Result<()> {
             } else if interactive {
                 commands::chat::run_interactive(&workgraph_dir, timeout)
             } else if let Some(msg) = message {
-                commands::chat::run_send(&workgraph_dir, &msg, timeout)
+                commands::chat::run_send(&workgraph_dir, &msg, timeout, &attachment)
             } else {
                 // No message and no flags → default to interactive
                 commands::chat::run_interactive(&workgraph_dir, timeout)
