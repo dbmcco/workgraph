@@ -978,9 +978,10 @@ pub struct VizApp {
     /// Cached: indent for message body when name is on its own line.
     pub message_indent: u16,
 
-    // ── Scrollbar auto-hide ──
-    /// Timestamp of the last scroll activity. Scrollbar is shown for 2 seconds after activity.
+    // ── Scrollbar auto-hide (per-pane) ──
+    /// Timestamp of the last scroll activity in the graph pane.
     pub graph_scroll_activity: Option<Instant>,
+    /// Timestamp of the last scroll activity in the right panel.
     pub panel_scroll_activity: Option<Instant>,
 
     // ── Live refresh ──
@@ -2745,14 +2746,27 @@ impl VizApp {
         self.hud_scroll = (self.hud_scroll + amount).min(max_scroll);
     }
 
-    /// Record scroll activity for auto-hiding scrollbar.
-    pub fn record_scroll_activity(&mut self) {
-        self.last_scroll_activity = Some(Instant::now());
+    /// Record scroll activity in the graph pane for auto-hiding scrollbar.
+    pub fn record_graph_scroll_activity(&mut self) {
+        self.graph_scroll_activity = Some(Instant::now());
     }
 
-    /// Whether the scrollbar should be visible (within 2 seconds of last scroll activity).
-    pub fn scrollbar_visible(&self) -> bool {
-        match self.last_scroll_activity {
+    /// Record scroll activity in the right panel for auto-hiding scrollbar.
+    pub fn record_panel_scroll_activity(&mut self) {
+        self.panel_scroll_activity = Some(Instant::now());
+    }
+
+    /// Whether the graph pane scrollbar should be visible (within 2s of last graph scroll).
+    pub fn graph_scrollbar_visible(&self) -> bool {
+        match self.graph_scroll_activity {
+            Some(when) => when.elapsed() < std::time::Duration::from_secs(2),
+            None => false,
+        }
+    }
+
+    /// Whether the right panel scrollbar should be visible (within 2s of last panel scroll).
+    pub fn panel_scrollbar_visible(&self) -> bool {
+        match self.panel_scroll_activity {
             Some(when) => when.elapsed() < std::time::Duration::from_secs(2),
             None => false,
         }

@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -49,40 +50,72 @@ pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut VizApp) -> Resul
 }
 
 fn run_event_loop_inner(terminal: &mut DefaultTerminal, app: &mut VizApp) -> Result<()> {
+    // Read crossterm events in a background thread and feed them through a
+    // channel.  This prevents event::read() from blocking the main loop when
+    // the terminal layers (e.g. mosh) deliver a bracketed-paste slowly —
+    // crossterm blocks until the closing ESC[201~ arrives, and in a
+    // Termux → Mosh → Tmux → TUI chain that can stall for seconds.
+    let (tx, rx) = mpsc::sync_channel::<Event>(512);
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(ev) => {
+                    if tx.send(ev).is_err() {
+                        break; // receiver dropped — main loop exited
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     loop {
         app.maybe_refresh();
         app.drain_commands();
         terminal.draw(|frame| render::draw(frame, app))?;
 
-        if event::poll(INPUT_POLL)? {
-            // Drain all immediately available events before redrawing.
-            // This batches rapid input (e.g. pasted text when the terminal
-            // doesn't support bracketed paste and sends individual KeyEvents)
-            // so we only redraw once for the entire batch.
-            loop {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        handle_key(app, key.code, key.modifiers);
+        // Wait for the first event (up to INPUT_POLL), then drain all
+        // immediately queued events before redrawing — same batching
+        // strategy as before, but via the channel instead of raw polling.
+        match rx.recv_timeout(INPUT_POLL) {
+            Ok(ev) => {
+                dispatch_event(app, ev);
+                // Drain remaining queued events so we only redraw once
+                // for a rapid burst (e.g. pasted text arriving as
+                // individual KeyEvents when bracketed paste is absent).
+                while let Ok(ev) = rx.try_recv() {
+                    dispatch_event(app, ev);
+                    if app.should_quit {
+                        break;
                     }
-                    Event::Paste(text) => {
-                        handle_paste(app, &text);
-                    }
-                    Event::Mouse(mouse) if app.mouse_enabled => {
-                        handle_mouse(app, mouse.kind, mouse.row, mouse.column);
-                    }
-                    Event::Resize(_, _) => {} // re-render on next iteration
-                    _ => {}
                 }
-
-                if app.should_quit || !event::poll(Duration::ZERO)? {
-                    break;
-                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {} // no events — just redraw
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("terminal event reader thread exited unexpectedly");
             }
         }
 
         if app.should_quit {
             return Ok(());
         }
+    }
+}
+
+/// Route a single crossterm event to the appropriate handler.
+fn dispatch_event(app: &mut VizApp, ev: Event) {
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            handle_key(app, key.code, key.modifiers);
+        }
+        Event::Paste(text) => {
+            handle_paste(app, &text);
+        }
+        Event::Mouse(mouse) if app.mouse_enabled => {
+            handle_mouse(app, mouse.kind, mouse.row, mouse.column);
+        }
+        Event::Resize(_, _) => {} // handled by next redraw
+        _ => {}
     }
 }
 
@@ -120,8 +153,7 @@ fn handle_paste(app: &mut VizApp, text: &str) {
     match &app.input_mode {
         InputMode::ChatInput => {
             // Insert pasted text at cursor position, preserving newlines.
-            app.chat.input.insert_str(app.chat.cursor, text);
-            app.chat.cursor += text.len();
+            app.chat.textarea.insert_str(text);
         }
         InputMode::Search => {
             // Strip newlines for search — it's single-line.
@@ -933,22 +965,12 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.hud_scroll_down(10);
         }
 
-        // Arrow keys: navigate tasks when trace is visible, scroll viewport when off
+        // Arrow keys: always navigate tasks in graph view
         KeyCode::Up => {
-            if app.trace_visible {
-                app.select_prev_task();
-            } else {
-                app.record_scroll_activity();
-                app.scroll.scroll_up(1);
-            }
+            app.select_prev_task();
         }
         KeyCode::Down => {
-            if app.trace_visible {
-                app.select_next_task();
-            } else {
-                app.record_scroll_activity();
-                app.scroll.scroll_down(1);
-            }
+            app.select_next_task();
         }
 
         // Vertical scroll (vim-style)
@@ -969,12 +991,13 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.scroll.page_down();
         }
         KeyCode::PageUp => {
-            app.record_scroll_activity();
-            app.scroll.page_up();
+            // Jump by half a screenful of tasks
+            let jump = (app.scroll.viewport_height / 2).max(1);
+            app.select_prev_task_n(jump);
         }
         KeyCode::PageDown => {
-            app.record_scroll_activity();
-            app.scroll.page_down();
+            let jump = (app.scroll.viewport_height / 2).max(1);
+            app.select_next_task_n(jump);
         }
 
         // Jump to top/bottom
