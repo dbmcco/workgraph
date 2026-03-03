@@ -980,7 +980,8 @@ pub struct VizApp {
 
     // ── Scrollbar auto-hide ──
     /// Timestamp of the last scroll activity. Scrollbar is shown for 2 seconds after activity.
-    pub last_scroll_activity: Option<Instant>,
+    pub graph_scroll_activity: Option<Instant>,
+    pub panel_scroll_activity: Option<Instant>,
 
     // ── Live refresh ──
     /// Last observed modification time of graph.jsonl.
@@ -1108,7 +1109,8 @@ impl VizApp {
             animation_mode,
             message_name_threshold: config.tui.message_name_threshold,
             message_indent: config.tui.message_indent,
-            last_scroll_activity: None,
+            graph_scroll_activity: None,
+            panel_scroll_activity: None,
             last_graph_mtime: graph_mtime,
             last_refresh: Instant::now(),
             last_refresh_display: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -1382,6 +1384,35 @@ impl VizApp {
         let idx = match self.selected_task_idx {
             Some(i) if i + 1 >= self.task_order.len() => return, // already at bottom, do nothing
             Some(i) => i + 1,
+            None => 0,
+        };
+        self.selected_task_idx = Some(idx);
+        self.recompute_trace();
+        self.scroll_to_selected_task();
+    }
+
+    /// Move task selection up by `n` tasks in the viz order.
+    pub fn select_prev_task_n(&mut self, n: usize) {
+        if self.task_order.is_empty() {
+            return;
+        }
+        let idx = match self.selected_task_idx {
+            Some(i) => i.saturating_sub(n),
+            None => 0,
+        };
+        self.selected_task_idx = Some(idx);
+        self.recompute_trace();
+        self.scroll_to_selected_task();
+    }
+
+    /// Move task selection down by `n` tasks in the viz order.
+    pub fn select_next_task_n(&mut self, n: usize) {
+        if self.task_order.is_empty() {
+            return;
+        }
+        let last = self.task_order.len() - 1;
+        let idx = match self.selected_task_idx {
+            Some(i) => (i + n).min(last),
             None => 0,
         };
         self.selected_task_idx = Some(idx);
@@ -3010,7 +3041,8 @@ impl VizApp {
             animation_mode: AnimationMode::Normal,
             message_name_threshold: 8,
             message_indent: 2,
-            last_scroll_activity: None,
+            graph_scroll_activity: None,
+            panel_scroll_activity: None,
             last_graph_mtime: None,
             last_refresh: Instant::now(),
             last_refresh_display: String::new(),
