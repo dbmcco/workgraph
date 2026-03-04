@@ -46,3 +46,23 @@ The orchestrating agent (the one the user interacts with directly) does ONLY:
 
 It NEVER writes code, implements features, or does research itself.
 Everything gets dispatched through `wg add` and `wg service start`.
+
+### Task description requirements
+
+Every **code task** description MUST include a `## Validation` section with concrete test criteria. Use `--verify` to attach machine-checkable criteria that agents see as a hard gate.
+
+Template:
+```
+wg add "Implement feature X" --after <dep> \
+  --verify "cargo test test_feature_x passes" \
+  -d "## Description
+<what to implement>
+
+## Validation
+- [ ] Failing test written first (TDD): test_feature_x_<scenario>
+- [ ] Implementation makes the test pass
+- [ ] cargo build + cargo test pass with no regressions
+- [ ] <any additional acceptance criteria>"
+```
+
+Research/design tasks should specify what artifacts to produce and how to verify completeness instead of test criteria.

@@ -32,6 +32,8 @@ pub enum AgentStatus {
     Idle,
     /// Agent is stopping gracefully
     Stopping,
+    /// Agent voluntarily parked via `wg wait` (exited cleanly, task is Waiting)
+    Parked,
     /// Agent has completed its task
     Done,
     /// Agent failed
@@ -387,7 +389,7 @@ impl AgentRegistry {
             // Record completion time on terminal transitions
             if matches!(
                 status,
-                AgentStatus::Done | AgentStatus::Failed | AgentStatus::Dead
+                AgentStatus::Parked | AgentStatus::Done | AgentStatus::Failed | AgentStatus::Dead
             ) && agent.completed_at.is_none()
             {
                 agent.completed_at = Some(chrono::Utc::now().to_rfc3339());

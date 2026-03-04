@@ -12,13 +12,75 @@ use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage};
 use workgraph::parser::{load_graph, save_graph};
 use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
+use workgraph::stream_event::{self, StreamEvent};
 
 use crate::commands::is_process_alive;
+
+/// Extract session_id from an agent's stream files (stream.jsonl or raw_stream.jsonl).
+fn extract_session_id(agent: &AgentEntry) -> Option<String> {
+    let output_path = std::path::Path::new(&agent.output_file);
+    let agent_dir = output_path.parent()?;
+
+    // Try unified stream.jsonl first
+    let stream_path = agent_dir.join(stream_event::STREAM_FILE_NAME);
+    if stream_path.exists() {
+        if let Ok((events, _)) = stream_event::read_stream_events(&stream_path, 0) {
+            for event in &events {
+                if let StreamEvent::Init { session_id: Some(sid), .. } = event {
+                    return Some(sid.clone());
+                }
+            }
+        }
+    }
+
+    // Try raw_stream.jsonl (Claude CLI)
+    let raw_path = agent_dir.join(stream_event::RAW_STREAM_FILE_NAME);
+    if raw_path.exists() {
+        if let Ok((events, _)) = stream_event::translate_claude_stream(&raw_path, 0) {
+            for event in &events {
+                if let StreamEvent::Init { session_id: Some(sid), .. } = event {
+                    return Some(sid.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Reason an agent was detected as dead
 enum DeadReason {
     /// Process is no longer running
     ProcessExited,
+}
+
+/// Check stream file activity for an agent. Returns the timestamp of the last
+/// stream event (if any stream file exists), and whether the stream is stale.
+///
+/// Staleness threshold: 5 minutes with no stream events while PID is alive.
+const STREAM_STALE_THRESHOLD_MS: i64 = 5 * 60 * 1000;
+
+fn check_stream_liveness(agent: &AgentEntry) -> Option<i64> {
+    let output_path = std::path::Path::new(&agent.output_file);
+    let agent_dir = output_path.parent()?;
+
+    // Try unified stream.jsonl first (native executor, amplifier/shell bookends)
+    let stream_path = agent_dir.join(stream_event::STREAM_FILE_NAME);
+    if stream_path.exists() {
+        if let Ok((events, _)) = stream_event::read_stream_events(&stream_path, 0) {
+            return events.last().map(|e| e.timestamp_ms());
+        }
+    }
+
+    // Try raw_stream.jsonl (Claude CLI)
+    let raw_path = agent_dir.join(stream_event::RAW_STREAM_FILE_NAME);
+    if raw_path.exists() {
+        if let Ok((events, _)) = stream_event::translate_claude_stream(&raw_path, 0) {
+            return events.last().map(|e| e.timestamp_ms());
+        }
+    }
+
+    None
 }
 
 /// Check if an agent should be considered dead
@@ -57,10 +119,24 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
         })
         .collect();
 
-    // Auto-bump heartbeat for agents whose process is still alive
+    // Auto-bump heartbeat for agents whose process is still alive.
+    // Also check stream file activity for more precise liveness tracking.
     for agent in locked_registry.agents.values_mut() {
         if agent.is_alive() && is_process_alive(agent.pid) {
             agent.last_heartbeat = Utc::now().to_rfc3339();
+
+            // Check stream for staleness warning (PID alive but no stream activity)
+            if let Some(last_event_ms) = check_stream_liveness(agent) {
+                let now_ms = stream_event::now_ms();
+                if now_ms - last_event_ms > STREAM_STALE_THRESHOLD_MS {
+                    eprintln!(
+                        "[triage] WARNING: Agent {} (task {}) PID alive but stream stale for {}s",
+                        agent.id,
+                        agent.task_id,
+                        (now_ms - last_event_ms) / 1000
+                    );
+                }
+            }
         }
     }
 
@@ -146,8 +222,21 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
         }
     }
 
-    // Extract token usage from output.log for dead agents' tasks
-    for (_agent_id, task_id, _pid, output_file, _reason) in &dead {
+    // Extract token usage and session_id from dead agents' stream files
+    for (agent_id, task_id, _pid, output_file, _reason) in &dead {
+        // Extract session_id from stream events
+        if let Some(agent) = locked_registry.get_agent(agent_id) {
+            if let Some(sid) = extract_session_id(agent) {
+                if let Some(task) = graph.get_task_mut(task_id)
+                    && task.session_id.is_none()
+                {
+                    task.session_id = Some(sid);
+                    tasks_modified = true;
+                }
+            }
+        }
+
+        // Extract token usage from output.log
         if let Some(task) = graph.get_task_mut(task_id)
             && task.token_usage.is_none()
         {

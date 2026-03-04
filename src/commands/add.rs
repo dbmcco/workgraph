@@ -299,6 +299,9 @@ pub fn run(
         context_scope: context_scope.map(String::from),
         exec_mode: exec_mode.map(String::from),
         token_usage: None,
+        session_id: None,
+        wait_condition: None,
+        checkpoint: None,
     };
 
     // Add task to graph
@@ -542,6 +545,9 @@ fn add_task_directly(
         cycle_config: None,
         exec_mode: None,
         token_usage: None,
+        session_id: None,
+        wait_condition: None,
+        checkpoint: None,
     };
 
     graph.add_node(Node::Task(task));

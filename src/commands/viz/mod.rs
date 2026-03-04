@@ -322,6 +322,7 @@ pub fn generate_viz_output_from_graph(
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
+            Status::Waiting => "waiting",
         }
     };
 

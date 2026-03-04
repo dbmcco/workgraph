@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::prelude::*;
 use ratatui::widgets::{
@@ -1066,12 +1066,49 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let mut current_section: Option<String> = None;
     let mut in_collapsed = false;
 
+    // First pass: collect content lines per section for summary when collapsed.
+    let mut section_content: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut cur_sec: Option<String> = None;
+        for line in &detail.rendered_lines {
+            if let Some(name) = extract_section_name(line) {
+                cur_sec = Some(name);
+            } else if line.is_empty() {
+                cur_sec = None;
+            } else if let Some(ref sec) = cur_sec {
+                section_content
+                    .entry(sec.clone())
+                    .or_default()
+                    .push(line.clone());
+            }
+        }
+    }
+
     for line in &detail.rendered_lines {
         if let Some(name) = extract_section_name(line) {
             let collapsed = app.detail_collapsed_sections.contains(&name);
             let indicator = if collapsed { "▸" } else { "▾" };
             // Replace the original header with an indicator-prefixed version.
             visible_lines.push(format!("{} ── {} ──", indicator, name));
+            if collapsed {
+                // Add a summary line showing content stats.
+                let content_lines = section_content.get(&name);
+                let line_count = content_lines.map_or(0, |v| v.len());
+                let (word_count, byte_count) = content_lines.map_or((0, 0), |lines| {
+                    let words: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+                    let bytes: usize = lines.iter().map(|l| l.len()).sum();
+                    (words, bytes)
+                });
+                let size_str = if byte_count >= 1024 {
+                    format!("{:.1} KB", byte_count as f64 / 1024.0)
+                } else {
+                    format!("{} B", byte_count)
+                };
+                visible_lines.push(format!(
+                    "  [{} lines · {} words · {}]",
+                    line_count, word_count, size_str
+                ));
+            }
             current_section = Some(name);
             in_collapsed = collapsed;
         } else if in_collapsed {
@@ -1124,17 +1161,37 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
     };
 
+    // Track section header positions for mouse click hit-testing.
+    let mut section_header_positions: Vec<(usize, String)> = Vec::new();
+
     for line in &visible_lines {
         let is_header = line.starts_with("▸ ──") || line.starts_with("▾ ──");
+        let is_summary = line.starts_with("  [") && line.contains("lines ·");
 
         if is_header {
             flush_md(&mut md_buffer, &mut all_lines, wrap_width);
             in_md_section = is_md_header(line);
+            // Extract section name from the indicator-prefixed header.
+            let section_name = line
+                .trim_start_matches("▸ ")
+                .trim_start_matches("▾ ")
+                .trim_start_matches("── ")
+                .trim_end_matches(" ──")
+                .to_string();
+            section_header_positions.push((all_lines.len(), section_name));
             all_lines.push(Line::from(Span::styled(
                 line.clone(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
+            )));
+        } else if is_summary {
+            // Collapsed section summary line — render in dim italic style.
+            all_lines.push(Line::from(Span::styled(
+                line.clone(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )));
         } else if line.is_empty() {
             flush_md(&mut md_buffer, &mut all_lines, wrap_width);
@@ -1164,6 +1221,7 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Cache wrapped line count and viewport height for scroll calculations.
     app.hud_wrapped_line_count = total_lines;
     app.hud_detail_viewport_height = viewport_h;
+    app.detail_section_header_lines = section_header_positions;
 
     // Clamp HUD scroll.
     let max_scroll = total_lines.saturating_sub(viewport_h);

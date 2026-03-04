@@ -14,6 +14,7 @@ use super::client::{
     ContentBlock, LlmClient, Message, MessagesRequest, MessagesResponse, Role, StopReason, Usage,
 };
 use super::tools::ToolRegistry;
+use crate::stream_event::{self, StreamWriter, TotalUsage, TurnUsage};
 
 /// Record of a single tool call.
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +41,7 @@ pub struct AgentLoop {
     system_prompt: String,
     max_turns: usize,
     output_log: PathBuf,
+    stream_writer: Option<StreamWriter>,
 }
 
 /// NDJSON log entry types for the output file.
@@ -103,17 +105,29 @@ impl AgentLoop {
         max_turns: usize,
         output_log: PathBuf,
     ) -> Self {
+        // Derive stream.jsonl path from output_log (same directory)
+        let stream_path = output_log
+            .parent()
+            .map(|p| p.join(stream_event::STREAM_FILE_NAME));
+        let stream_writer = stream_path.map(StreamWriter::new);
+
         Self {
             client,
             tools,
             system_prompt,
             max_turns,
             output_log,
+            stream_writer,
         }
     }
 
     /// Run the agent loop to completion.
     pub async fn run(&self, initial_message: &str) -> Result<AgentResult> {
+        // Write Init stream event
+        if let Some(ref sw) = self.stream_writer {
+            sw.write_init("native", Some(self.client.model()), None);
+        }
+
         let mut messages: Vec<Message> = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -155,6 +169,34 @@ impl AgentLoop {
             // Log the assistant turn
             self.log_turn(turns, &response);
 
+            // Write Turn stream event
+            if let Some(ref sw) = self.stream_writer {
+                let tool_names: Vec<String> = response
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                sw.write_turn(
+                    turns as u32,
+                    tool_names,
+                    Some(TurnUsage {
+                        input_tokens: u64::from(response.usage.input_tokens),
+                        output_tokens: u64::from(response.usage.output_tokens),
+                        cache_read_input_tokens: response
+                            .usage
+                            .cache_read_input_tokens
+                            .map(u64::from),
+                        cache_creation_input_tokens: response
+                            .usage
+                            .cache_creation_input_tokens
+                            .map(u64::from),
+                    }),
+                );
+            }
+
             // Add assistant response to conversation
             messages.push(Message {
                 role: Role::Assistant,
@@ -181,6 +223,7 @@ impl AgentLoop {
                         tool_calls,
                     };
                     self.log_result(&result);
+                    self.write_stream_result(true, &result);
                     return Ok(result);
                 }
                 Some(StopReason::ToolUse) => {
@@ -188,7 +231,22 @@ impl AgentLoop {
                     let mut results = Vec::new();
                     for block in &response.content {
                         if let ContentBlock::ToolUse { id, name, input } = block {
+                            // Stream: tool start
+                            if let Some(ref sw) = self.stream_writer {
+                                sw.write_tool_start(name);
+                            }
+                            let tool_start = std::time::Instant::now();
+
                             let output = self.tools.execute(name, input).await;
+
+                            // Stream: tool end
+                            if let Some(ref sw) = self.stream_writer {
+                                sw.write_tool_end(
+                                    name,
+                                    output.is_error,
+                                    tool_start.elapsed().as_millis() as u64,
+                                );
+                            }
 
                             // Log the tool call
                             self.log_tool_call(name, input, &output.content, output.is_error);
@@ -240,6 +298,7 @@ impl AgentLoop {
                         tool_calls,
                     };
                     self.log_result(&result);
+                    self.write_stream_result(true, &result);
                     return Ok(result);
                 }
             }
@@ -253,6 +312,7 @@ impl AgentLoop {
             tool_calls,
         };
         self.log_result(&result);
+        self.write_stream_result(false, &result);
         Ok(result)
     }
 
@@ -285,6 +345,28 @@ impl AgentLoop {
             total_usage: result.total_usage.clone(),
         };
         self.write_log_event(&event);
+    }
+
+    fn write_stream_result(&self, success: bool, result: &AgentResult) {
+        if let Some(ref sw) = self.stream_writer {
+            sw.write_result(
+                success,
+                TotalUsage {
+                    input_tokens: u64::from(result.total_usage.input_tokens),
+                    output_tokens: u64::from(result.total_usage.output_tokens),
+                    cache_read_input_tokens: result
+                        .total_usage
+                        .cache_read_input_tokens
+                        .map(u64::from),
+                    cache_creation_input_tokens: result
+                        .total_usage
+                        .cache_creation_input_tokens
+                        .map(u64::from),
+                    cost_usd: None, // Native executor doesn't track cost (no price table yet)
+                    model: Some(self.client.model().to_string()),
+                },
+            );
+        }
     }
 
     fn write_log_event(&self, event: &LogEvent) {

@@ -134,6 +134,7 @@ fn flash_color_for_status(status: &Status) -> (u8, u8, u8) {
         Status::Open => (200, 200, 80),       // yellow
         Status::Blocked => (180, 120, 60),    // orange
         Status::Abandoned => (140, 100, 160), // muted purple
+        Status::Waiting => (60, 160, 220),    // blue
     }
 }
 
@@ -333,12 +334,14 @@ impl HudSize {
     }
 }
 
-/// Layout mode for the four-state cycle (=/i/Shift+Tab key).
-/// Cycle: ThirdInspector → TwoThirdsInspector → FullInspector → Off → ...
+/// Layout mode for the five-state cycle (i/I/=/Shift+Tab key).
+/// Cycle: ThirdInspector → HalfInspector → TwoThirdsInspector → FullInspector → Off → ...
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LayoutMode {
     /// 1/3 inspector (2/3 graph + 1/3 inspector).
     ThirdInspector,
+    /// 1/2 inspector (1/2 graph + 1/2 inspector).
+    HalfInspector,
     /// 2/3 inspector (1/3 graph + 2/3 inspector).
     #[default]
     TwoThirdsInspector,
@@ -351,10 +354,55 @@ pub enum LayoutMode {
 impl LayoutMode {
     pub fn cycle(&self) -> Self {
         match self {
-            Self::ThirdInspector => Self::TwoThirdsInspector,
+            Self::ThirdInspector => Self::HalfInspector,
+            Self::HalfInspector => Self::TwoThirdsInspector,
             Self::TwoThirdsInspector => Self::FullInspector,
             Self::FullInspector => Self::Off,
             Self::Off => Self::ThirdInspector,
+        }
+    }
+
+    pub fn cycle_reverse(&self) -> Self {
+        match self {
+            Self::ThirdInspector => Self::Off,
+            Self::HalfInspector => Self::ThirdInspector,
+            Self::TwoThirdsInspector => Self::HalfInspector,
+            Self::FullInspector => Self::TwoThirdsInspector,
+            Self::Off => Self::FullInspector,
+        }
+    }
+
+    /// Convert a config string to a LayoutMode (for default inspector size).
+    pub fn from_config_str(s: &str) -> Self {
+        match s {
+            "1/3" => Self::ThirdInspector,
+            "1/2" => Self::HalfInspector,
+            "2/3" => Self::TwoThirdsInspector,
+            "full" => Self::FullInspector,
+            _ => Self::TwoThirdsInspector,
+        }
+    }
+
+    /// Convert to a config string.
+    #[allow(dead_code)]
+    pub fn to_config_str(&self) -> &'static str {
+        match self {
+            Self::ThirdInspector => "1/3",
+            Self::HalfInspector => "1/2",
+            Self::TwoThirdsInspector => "2/3",
+            Self::FullInspector => "full",
+            Self::Off => "2/3", // Off isn't a valid default; fall back
+        }
+    }
+
+    /// The panel percentage for this mode.
+    pub fn panel_percent(&self) -> u16 {
+        match self {
+            Self::ThirdInspector => 33,
+            Self::HalfInspector => 50,
+            Self::TwoThirdsInspector => 67,
+            Self::FullInspector => 100,
+            Self::Off => 0,
         }
     }
 
@@ -362,7 +410,7 @@ impl LayoutMode {
     pub fn has_inspector(&self) -> bool {
         matches!(
             self,
-            Self::ThirdInspector | Self::TwoThirdsInspector | Self::FullInspector
+            Self::ThirdInspector | Self::HalfInspector | Self::TwoThirdsInspector | Self::FullInspector
         )
     }
 
@@ -370,7 +418,7 @@ impl LayoutMode {
     pub fn has_graph(&self) -> bool {
         matches!(
             self,
-            Self::ThirdInspector | Self::TwoThirdsInspector | Self::Off
+            Self::ThirdInspector | Self::HalfInspector | Self::TwoThirdsInspector | Self::Off
         )
     }
 }
@@ -836,6 +884,9 @@ pub struct MessagesPanelState {
     pub input: String,
     /// Cursor position (byte offset) within `input`.
     pub cursor: usize,
+    /// Scroll offset within the input box (visual line index from top).
+    /// Used when input content exceeds the visible input area height.
+    pub input_scroll: usize,
     /// Total wrapped lines (set each frame by renderer, for scrollbar dragging).
     pub total_wrapped_lines: usize,
     /// Viewport height for the message area (set each frame by renderer).
@@ -973,6 +1024,10 @@ pub enum CommandEffect {
 /// Text prompt state (shared input buffer for fail reason, message, etc.)
 pub struct TextPromptState {
     pub input: String,
+    /// Byte-offset cursor position within `input`.
+    pub cursor: usize,
+    /// Vertical scroll offset (number of lines scrolled from top).
+    pub scroll: usize,
 }
 
 /// Loaded detail for the HUD panel showing info about the selected task.
@@ -1102,6 +1157,9 @@ pub struct VizApp {
     /// The chat message history area from the last render frame (for click-to-focus).
     pub last_chat_message_area: Rect,
 
+    /// The text prompt overlay area from the last render frame (for mouse scroll).
+    pub last_text_prompt_area: Rect,
+
     /// The file browser tree pane area from the last render frame (for mouse clicks).
     pub last_file_tree_area: Rect,
     /// The file browser preview pane area from the last render frame (for mouse clicks).
@@ -1156,6 +1214,9 @@ pub struct VizApp {
     pub detail_raw_json: bool,
     /// Set of collapsed section names in the Detail view (persists across task switches).
     pub detail_collapsed_sections: std::collections::HashSet<String>,
+    /// Map from wrapped line index → section name for section headers in the Detail view.
+    /// Populated each frame by the renderer; used for mouse click hit-testing.
+    pub detail_section_header_lines: Vec<(usize, String)>,
 
     // ── Multi-panel layout ──
     /// Whether the right panel is visible (toggle with `\`).
@@ -1168,12 +1229,14 @@ pub struct VizApp {
     pub right_panel_percent: u16,
     /// HUD panel size preset (Normal = ~1/3, Expanded = ~2/3).
     pub hud_size: HudSize,
-    /// Layout mode for three-state cycle (split → full panel → full graph).
+    /// Layout mode for five-state cycle (1/3 → 1/2 → 2/3 → full → off).
     pub layout_mode: LayoutMode,
     /// Current input mode.
     pub input_mode: InputMode,
     /// Deferred centering: set during state refresh, consumed by render after viewport_height is known.
     pub needs_center_on_selected: bool,
+    /// Deferred scroll-into-view: only scrolls if the task is off-screen (centers when it does).
+    pub needs_scroll_into_view: bool,
     /// True when user explicitly dismissed chat input with Esc.
     /// Prevents auto-re-entering ChatInput until user navigates away from Chat tab.
     pub chat_input_dismissed: bool,
@@ -1363,6 +1426,7 @@ impl VizApp {
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_text_prompt_area: Rect::default(),
             last_file_tree_area: Rect::default(),
             last_file_preview_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
@@ -1384,19 +1448,24 @@ impl VizApp {
             hud_detail_viewport_height: 0,
             detail_raw_json: false,
             detail_collapsed_sections: std::collections::HashSet::new(),
+            detail_section_header_lines: Vec::new(),
             right_panel_visible: true,
             focused_panel: FocusedPanel::Graph,
             right_panel_tab: RightPanelTab::Chat,
-            right_panel_percent: config.tui.panel_ratio.clamp(10, 90),
+            right_panel_percent: LayoutMode::from_config_str(&config.tui.default_inspector_size).panel_percent(),
             hud_size: HudSize::Normal,
-            layout_mode: LayoutMode::TwoThirdsInspector,
+            layout_mode: LayoutMode::from_config_str(&config.tui.default_inspector_size),
+
             input_mode: InputMode::Normal,
             needs_center_on_selected: false,
+            needs_scroll_into_view: false,
             chat_input_dismissed: false,
             inspector_sub_focus: InspectorSubFocus::ChatHistory,
             task_form: None,
             text_prompt: TextPromptState {
                 input: String::new(),
+                cursor: 0,
+                scroll: 0,
             },
             chat: ChatState::default(),
             agent_monitor: AgentMonitorState::default(),
@@ -1610,8 +1679,8 @@ impl VizApp {
                     // New task appeared — defer centering until render sets viewport_height.
                     self.needs_center_on_selected = true;
                 } else {
-                    // Selection changed (different task) — defer centering until render.
-                    self.needs_center_on_selected = true;
+                    // Selection changed (different task) — only scroll if off-screen.
+                    self.needs_scroll_into_view = true;
                 }
             }
             Err(_) => {
@@ -1828,7 +1897,7 @@ impl VizApp {
     /// Scroll the viewport so the selected task stays within the middle 60% of
     /// the viewport (a "comfort zone"). If the task is in the top or bottom 20%,
     /// recenter it to the middle — similar to vim's `scrolloff`.
-    fn scroll_to_selected_task(&mut self) {
+    pub fn scroll_to_selected_task(&mut self) {
         let task_id = match self.selected_task_idx.and_then(|i| self.task_order.get(i)) {
             Some(id) => id,
             None => return,
@@ -2261,6 +2330,7 @@ impl VizApp {
                 Status::Failed => counts.failed += 1,
                 Status::Blocked => counts.blocked += 1,
                 Status::Abandoned => counts.done += 1, // count with done
+                Status::Waiting => counts.blocked += 1, // count with blocked
             }
 
             // Use stored token_usage if available, otherwise check live agent data
@@ -2556,6 +2626,7 @@ impl VizApp {
                                 Status::Blocked => 3,
                                 Status::Done => 4,
                                 Status::Abandoned => 5,
+                                Status::Waiting => 3, // same priority as blocked
                             };
                             (t.id.clone(), priority)
                         })
@@ -2758,23 +2829,30 @@ impl VizApp {
         // ── Token usage (execution) ──
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
+            let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            if cache_total > 0 {
+                lines.push(format!(
+                    "  Input:  {} new + {} cached",
+                    format_tokens(usage.input_tokens),
+                    format_tokens(cache_total)
+                ));
+            } else {
+                lines.push(format!(
+                    "  Input:  {}",
+                    format_tokens(usage.input_tokens)
+                ));
+            }
             lines.push(format!(
-                "  Input:  {} (→{})",
-                format_tokens(usage.total_input()),
-                format_tokens(usage.input_tokens)
-            ));
-            lines.push(format!(
-                "  Output: {} (←{})",
-                format_tokens(usage.output_tokens),
+                "  Output: {}",
                 format_tokens(usage.output_tokens)
             ));
             if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
                 lines.push(format!(
-                    "  Cache read:  {} (◎)",
+                    "  Cache read:  {}",
                     format_tokens(usage.cache_read_input_tokens)
                 ));
                 lines.push(format!(
-                    "  Cache write: {} (⊳)",
+                    "  Cache write: {}",
                     format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
@@ -2811,31 +2889,33 @@ impl VizApp {
             if assign_usage.is_some() || eval_usage.is_some() {
                 lines.push("── Phase Costs ──".to_string());
                 if let Some(ref u) = assign_usage {
-                    let total = u.total_input() + u.output_tokens;
+                    let cache = u.cache_read_input_tokens + u.cache_creation_input_tokens;
                     let mut detail = format!(
-                        "  ⊳ Assignment: {} (→{} ←{}",
-                        format_tokens(total),
-                        format_tokens(u.total_input()),
+                        "  ⊳ Assignment: →{} ←{}",
+                        format_tokens(u.input_tokens),
                         format_tokens(u.output_tokens)
                     );
+                    if cache > 0 {
+                        detail.push_str(&format!(" +{} cached", format_tokens(cache)));
+                    }
                     if u.cost_usd > 0.0 {
                         detail.push_str(&format!(" ${:.4}", u.cost_usd));
                     }
-                    detail.push(')');
                     lines.push(detail);
                 }
                 if let Some(ref u) = eval_usage {
-                    let total = u.total_input() + u.output_tokens;
+                    let cache = u.cache_read_input_tokens + u.cache_creation_input_tokens;
                     let mut detail = format!(
-                        "  ∴ Evaluation: {} (→{} ←{}",
-                        format_tokens(total),
-                        format_tokens(u.total_input()),
+                        "  ∴ Evaluation: →{} ←{}",
+                        format_tokens(u.input_tokens),
                         format_tokens(u.output_tokens)
                     );
+                    if cache > 0 {
+                        detail.push_str(&format!(" +{} cached", format_tokens(cache)));
+                    }
                     if u.cost_usd > 0.0 {
                         detail.push_str(&format!(" ${:.4}", u.cost_usd));
                     }
-                    detail.push(')');
                     lines.push(detail);
                 }
                 // Show combined total
@@ -2992,23 +3072,30 @@ impl VizApp {
         // ── Token usage ──
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
+            let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            if cache_total > 0 {
+                lines.push(format!(
+                    "  Input:  {} new + {} cached",
+                    format_tokens(usage.input_tokens),
+                    format_tokens(cache_total)
+                ));
+            } else {
+                lines.push(format!(
+                    "  Input:  {}",
+                    format_tokens(usage.input_tokens)
+                ));
+            }
             lines.push(format!(
-                "  Input:  {} (→{})",
-                format_tokens(usage.total_input()),
-                format_tokens(usage.input_tokens)
-            ));
-            lines.push(format!(
-                "  Output: {} (←{})",
-                format_tokens(usage.output_tokens),
+                "  Output: {}",
                 format_tokens(usage.output_tokens)
             ));
             if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
                 lines.push(format!(
-                    "  Cache read:  {} (◎)",
+                    "  Cache read:  {}",
                     format_tokens(usage.cache_read_input_tokens)
                 ));
                 lines.push(format!(
-                    "  Cache write: {} (⊳)",
+                    "  Cache write: {}",
                     format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
@@ -3102,6 +3189,30 @@ impl VizApp {
             }
         }
         current_section
+    }
+
+    /// Toggle collapse state of a section by name.
+    pub fn toggle_detail_section_by_name(&mut self, name: &str) {
+        if self.detail_collapsed_sections.contains(name) {
+            self.detail_collapsed_sections.remove(name);
+        } else {
+            self.detail_collapsed_sections.insert(name.to_string());
+        }
+    }
+
+    /// Toggle the section header at the given screen row (relative to the detail content area).
+    /// Uses the section_header_positions populated by the renderer.
+    /// Returns the section name if a header was found and toggled.
+    pub fn toggle_detail_section_at_screen_row(&mut self, screen_row: usize) -> Option<String> {
+        let line_idx = self.hud_scroll + screen_row;
+        // Find a header at this wrapped line index.
+        let name = self
+            .detail_section_header_lines
+            .iter()
+            .find(|(idx, _)| *idx == line_idx)
+            .map(|(_, name)| name.clone())?;
+        self.toggle_detail_section_by_name(&name);
+        Some(name)
     }
 
     /// Record scroll activity in the graph pane for auto-hiding scrollbar.
@@ -3565,6 +3676,7 @@ impl VizApp {
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_text_prompt_area: Rect::default(),
             last_file_tree_area: Rect::default(),
             last_file_preview_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
@@ -3586,19 +3698,24 @@ impl VizApp {
             hud_detail_viewport_height: 0,
             detail_raw_json: false,
             detail_collapsed_sections: std::collections::HashSet::new(),
+            detail_section_header_lines: Vec::new(),
             right_panel_visible: false,
             focused_panel: FocusedPanel::Graph,
             right_panel_tab: RightPanelTab::Detail,
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
             layout_mode: LayoutMode::ThirdInspector,
+
             input_mode: InputMode::Normal,
             needs_center_on_selected: false,
+            needs_scroll_into_view: false,
             chat_input_dismissed: false,
             inspector_sub_focus: InspectorSubFocus::ChatHistory,
             task_form: None,
             text_prompt: TextPromptState {
                 input: String::new(),
+                cursor: 0,
+                scroll: 0,
             },
             chat: ChatState::default(),
             agent_monitor: AgentMonitorState::default(),
@@ -3671,7 +3788,7 @@ impl VizApp {
                 self.focused_panel = FocusedPanel::Graph;
                 return;
             }
-            LayoutMode::ThirdInspector | LayoutMode::TwoThirdsInspector => {}
+            LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {}
         }
         self.focused_panel = match self.focused_panel {
             FocusedPanel::Graph => {
@@ -3705,17 +3822,23 @@ impl VizApp {
         self.right_panel_percent = self.hud_size.side_percent();
     }
 
-    /// Cycle layout mode: 1/3 inspector → 2/3 inspector → full inspector → off → 1/3.
+    /// Cycle layout mode forward: 1/3 → 1/2 → 2/3 → full → off → 1/3.
     pub fn cycle_layout_mode(&mut self) {
-        self.layout_mode = self.layout_mode.cycle();
-        match self.layout_mode {
-            LayoutMode::ThirdInspector => {
+        self.apply_layout_mode(self.layout_mode.cycle());
+    }
+
+    /// Cycle layout mode in reverse: off → full → 2/3 → 1/2 → 1/3 → off.
+    pub fn cycle_layout_mode_reverse(&mut self) {
+        self.apply_layout_mode(self.layout_mode.cycle_reverse());
+    }
+
+    /// Apply a layout mode, updating panel visibility and focus.
+    fn apply_layout_mode(&mut self, mode: LayoutMode) {
+        self.layout_mode = mode;
+        match mode {
+            LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
                 self.right_panel_visible = true;
-                self.right_panel_percent = 33;
-            }
-            LayoutMode::TwoThirdsInspector => {
-                self.right_panel_visible = true;
-                self.right_panel_percent = 67;
+                self.right_panel_percent = mode.panel_percent();
             }
             LayoutMode::FullInspector => {
                 self.right_panel_visible = true;
@@ -4728,6 +4851,18 @@ impl VizApp {
             section: ConfigSection::TuiSettings,
         });
         entries.push(ConfigEntry {
+            key: "tui.default_inspector_size".into(),
+            label: "Default inspector size".into(),
+            value: config.tui.default_inspector_size.clone(),
+            edit_kind: ConfigEditKind::Choice(vec![
+                "1/3".into(),
+                "1/2".into(),
+                "2/3".into(),
+                "full".into(),
+            ]),
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
             key: "tui.color_theme".into(),
             label: "Color theme".into(),
             value: config.tui.color_theme.clone(),
@@ -5204,6 +5339,7 @@ impl VizApp {
                 };
             }
             "tui.default_layout" => config.tui.default_layout = new_value,
+            "tui.default_inspector_size" => config.tui.default_inspector_size = new_value,
             "tui.color_theme" => config.tui.color_theme = new_value,
             "tui.timestamp_format" => config.tui.timestamp_format = new_value,
             "tui.show_token_counts" => config.tui.show_token_counts = new_value == "on",
@@ -6804,5 +6940,51 @@ mod hud_tests {
         let toggled = app.toggle_detail_section_at_scroll();
         assert_eq!(toggled, Some("Description".to_string()));
         assert!(!app.detail_collapsed_sections.contains("Description"));
+    }
+
+    #[test]
+    fn hud_section_toggle_by_name() {
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status("toggle-name", "Toggle Name", Status::Open);
+        task.description = Some("Some content\nSecond line".to_string());
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let mut app = build_app(&viz, "toggle-name", tmp.path());
+        app.load_hud_detail();
+
+        // Toggle by name
+        app.toggle_detail_section_by_name("Description");
+        assert!(app.detail_collapsed_sections.contains("Description"));
+
+        // Toggle again to expand
+        app.toggle_detail_section_by_name("Description");
+        assert!(!app.detail_collapsed_sections.contains("Description"));
+
+        // State persists across task switches (same session)
+        app.toggle_detail_section_by_name("Description");
+        assert!(app.detail_collapsed_sections.contains("Description"));
+        // Collapsed state stays even if we reload hud_detail
+        app.load_hud_detail();
+        assert!(app.detail_collapsed_sections.contains("Description"));
     }
 }

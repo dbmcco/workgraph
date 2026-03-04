@@ -77,6 +77,9 @@ pub(crate) fn spawn_agent_inner(
         Status::Abandoned => {
             anyhow::bail!("Cannot spawn on task '{}': task is Abandoned", task_id);
         }
+        Status::Waiting => {
+            anyhow::bail!("Cannot spawn on task '{}': task is Waiting", task_id);
+        }
     }
 
     // Resolve context scope
@@ -201,6 +204,7 @@ pub(crate) fn spawn_agent_inner(
         &output_file_str,
         &timed_command,
         effective_timeout_secs,
+        &settings.executor_type,
     )?;
 
     // Run the wrapper script
@@ -397,7 +401,6 @@ fn build_inner_command(
             cmd_parts.push(shell_escape("Bash(wg:*)"));
             cmd_parts.push("--allowedTools".to_string());
             cmd_parts.push(shell_escape("Bash(wg:*)"));
-            cmd_parts.push("--no-session-persistence".to_string());
             cmd_parts.push("--disable-slash-commands".to_string());
             cmd_parts.push("--system-prompt".to_string());
             cmd_parts.push(shell_escape(&prompt_content));
@@ -433,7 +436,7 @@ fn build_inner_command(
             cmd_parts.push(shell_escape("Bash(wg:*),Read,Glob,Grep,WebFetch,WebSearch"));
             cmd_parts.push("--disallowedTools".to_string());
             cmd_parts.push(shell_escape("Edit,Write,NotebookEdit,Agent"));
-            cmd_parts.push("--no-session-persistence".to_string());
+
             cmd_parts.push("--disable-slash-commands".to_string());
             // Add model flag if specified
             if let Some(m) = effective_model {
@@ -462,7 +465,7 @@ fn build_inner_command(
             // Prevent agents from spawning sub-agents outside workgraph
             cmd_parts.push("--disallowedTools".to_string());
             cmd_parts.push(shell_escape("Agent"));
-            cmd_parts.push("--no-session-persistence".to_string());
+
             cmd_parts.push("--disable-slash-commands".to_string());
             // Add model flag if specified
             if let Some(m) = effective_model {
@@ -568,6 +571,7 @@ fn write_wrapper_script(
     output_file_str: &str,
     timed_command: &str,
     effective_timeout_secs: Option<u64>,
+    executor_type: &str,
 ) -> Result<std::path::PathBuf> {
     let complete_cmd = "wg done \"$TASK_ID\" 2>> \"$OUTPUT_FILE\" || echo \"[wrapper] WARNING: 'wg done' failed with exit code $?\" >> \"$OUTPUT_FILE\"".to_string();
     let complete_msg = "[wrapper] Agent exited successfully, marking task done";
@@ -581,6 +585,66 @@ fn write_wrapper_script(
         String::new()
     };
 
+    let stream_file = output_dir.join("stream.jsonl");
+    let stream_file_str = stream_file.to_string_lossy().to_string();
+
+    // For Claude executor: split stdout (JSONL) to raw_stream.jsonl, stderr to output.log.
+    // Also tee stdout to output.log for backward compatibility.
+    // For native: the agent loop writes stream.jsonl directly; wrapper just adds bookends.
+    // For amplifier/shell/other: wrapper emits Init+Result bookend events.
+    let (run_command, stream_init, stream_result) = match executor_type {
+        "claude" => {
+            let raw_stream_file = output_dir.join("raw_stream.jsonl");
+            let raw_str = raw_stream_file.to_string_lossy().to_string();
+            // Capture Claude's JSONL stdout to raw_stream.jsonl and also copy to output.log.
+            // stderr goes to output.log only.
+            let cmd = format!(
+                "{timed_command} > >(tee -a {raw} >> \"$OUTPUT_FILE\") 2>> \"$OUTPUT_FILE\"",
+                timed_command = timed_command,
+                raw = shell_escape(&raw_str),
+            );
+            (cmd, String::new(), String::new())
+        }
+        "native" => {
+            // Native executor writes stream.jsonl itself; wrapper just runs the command.
+            let cmd = format!(
+                "{timed_command} >> \"$OUTPUT_FILE\" 2>&1",
+                timed_command = timed_command,
+            );
+            (cmd, String::new(), String::new())
+        }
+        _ => {
+            // Amplifier, shell, and custom executors: wrapper writes bookend events.
+            let cmd = format!(
+                "{timed_command} >> \"$OUTPUT_FILE\" 2>&1",
+                timed_command = timed_command,
+            );
+            let ts_cmd = "date +%s%3N"; // milliseconds since epoch
+            let init = format!(
+                "echo '{{\"type\":\"init\",\"executor_type\":\"{etype}\",\"timestamp_ms\":'$({ts})'}}' >> {sf}",
+                etype = executor_type,
+                ts = ts_cmd,
+                sf = shell_escape(&stream_file_str),
+            );
+            let result_ok = format!(
+                "echo '{{\"type\":\"result\",\"success\":true,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}},\"timestamp_ms\":'$({ts})'}}' >> {sf}",
+                ts = ts_cmd,
+                sf = shell_escape(&stream_file_str),
+            );
+            let result_fail = format!(
+                "echo '{{\"type\":\"result\",\"success\":false,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}},\"timestamp_ms\":'$({ts})'}}' >> {sf}",
+                ts = ts_cmd,
+                sf = shell_escape(&stream_file_str),
+            );
+            let result_block = format!(
+                "if [ $EXIT_CODE -eq 0 ]; then\n    {result_ok}\nelse\n    {result_fail}\nfi",
+                result_ok = result_ok,
+                result_fail = result_fail,
+            );
+            (cmd, init, result_block)
+        }
+    };
+
     let wrapper_script = format!(
         r#"#!/bin/bash
 TASK_ID={escaped_task_id}
@@ -590,9 +654,11 @@ OUTPUT_FILE={escaped_output_file}
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
 {timeout_note}
+{stream_init}
 # Run the agent command
-{timed_command} >> "$OUTPUT_FILE" 2>&1
+{run_command}
 EXIT_CODE=$?
+{stream_result}
 
 # Check if task is still in progress (agent didn't mark it done/failed)
 TASK_STATUS=$(wg show "$TASK_ID" --json 2>/dev/null | grep -o '"status": *"[^"]*"' | head -1 | sed 's/.*"status": *"//;s/"//' || echo "unknown")
@@ -623,8 +689,10 @@ exit $EXIT_CODE
 "#,
         escaped_task_id = shell_escape(task_id),
         escaped_output_file = shell_escape(output_file_str),
-        timed_command = timed_command,
+        run_command = run_command,
         timeout_note = timeout_note,
+        stream_init = stream_init,
+        stream_result = stream_result,
         complete_cmd = complete_cmd,
         complete_msg = complete_msg,
     );

@@ -201,6 +201,7 @@ fn format_notification(task: &Task, custom_message: Option<&str>) -> (String, St
         Status::Blocked => "🚫",
         Status::Failed => "❌",
         Status::Abandoned => "🗑️",
+        Status::Waiting => "⏸️",
     };
 
     let status_str = task.status.to_string();
@@ -351,6 +352,9 @@ mod tests {
             exec_mode: None,
             cycle_config: None,
             token_usage: None,
+            session_id: None,
+            wait_condition: None,
+            checkpoint: None,
         }
     }
 

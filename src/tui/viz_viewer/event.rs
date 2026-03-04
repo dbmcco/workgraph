@@ -1735,6 +1735,14 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         fb.focus = super::file_browser::FileBrowserFocus::Preview;
                     }
                 }
+            } else if in_right_content
+                && app.right_panel_tab == RightPanelTab::Detail
+            {
+                // Click in Detail tab: toggle section collapse if clicking a header.
+                app.focused_panel = FocusedPanel::RightPanel;
+                let content_row =
+                    row.saturating_sub(app.last_right_content_area.y) as usize;
+                app.toggle_detail_section_at_screen_row(content_row);
             } else if in_right_content {
                 // Click in right panel content: focus the right panel.
                 app.focused_panel = FocusedPanel::RightPanel;

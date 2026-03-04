@@ -33,6 +33,7 @@ fn effective_status(agent: &AgentEntry) -> String {
             AgentStatus::Done => "done".to_string(),
             AgentStatus::Failed => "failed".to_string(),
             AgentStatus::Dead => "dead".to_string(),
+            AgentStatus::Parked => "parked".to_string(),
         }
     }
 }

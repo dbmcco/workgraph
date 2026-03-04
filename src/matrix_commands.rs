@@ -346,6 +346,9 @@ pub fn execute_claim(workgraph_dir: &Path, task_id: &str, actor: Option<&str>) -
         Status::Abandoned => {
             return format!("Cannot claim task '{}': task is Abandoned", task_id);
         }
+        Status::Waiting => {
+            return format!("Cannot claim task '{}': task is Waiting", task_id);
+        }
     }
 
     task.status = Status::InProgress;

@@ -529,6 +529,9 @@ fn build_auto_assign_tasks(
             context_scope: None,
             cycle_config: None,
             token_usage: None,
+            session_id: None,
+        wait_condition: None,
+        checkpoint: None,
             // Assignment tasks only need wg CLI — no file access required
             exec_mode: Some("bare".to_string()),
         };
@@ -747,6 +750,9 @@ fn build_auto_evaluate_tasks(
             cycle_config: None,
             exec_mode: None,
             token_usage: None,
+            session_id: None,
+        wait_condition: None,
+        checkpoint: None,
         };
 
         graph.add_node(Node::Task(eval_task));

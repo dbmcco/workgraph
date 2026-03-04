@@ -296,7 +296,7 @@ fn main() -> Result<()> {
     workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
 
     match command {
-        Commands::Init => commands::init::run(&workgraph_dir),
+        Commands::Init { no_agency } => commands::init::run(&workgraph_dir, no_agency),
         Commands::Add {
             title,
             id,
@@ -454,6 +454,11 @@ fn main() -> Result<()> {
         Commands::Pause { id } => commands::pause::run(&workgraph_dir, &id),
         Commands::Resume { id, only } => commands::resume::run(&workgraph_dir, &id, only),
         Commands::Publish { id, only } => commands::resume::publish(&workgraph_dir, &id, only),
+        Commands::Wait {
+            id,
+            until,
+            checkpoint,
+        } => commands::wait::run(&workgraph_dir, &id, &until, checkpoint.as_deref()),
         Commands::AddDep { task, dependency } => {
             commands::link::run_link(&workgraph_dir, &task, &dependency)
         }
@@ -1157,6 +1162,50 @@ fn main() -> Result<()> {
                 commands::heartbeat::run_auto(&workgraph_dir, a)
             } else {
                 commands::heartbeat::run_check_agents(&workgraph_dir, threshold, cli.json)
+            }
+        }
+        Commands::Checkpoint {
+            task,
+            summary,
+            agent,
+            files,
+            stream_offset,
+            turn_count,
+            token_input,
+            token_output,
+            checkpoint_type,
+            list,
+        } => {
+            if list {
+                let agent_id = agent
+                    .or_else(|| std::env::var("WG_AGENT_ID").ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--agent or WG_AGENT_ID required for --list")
+                    })?;
+                commands::checkpoint::run_list(
+                    &workgraph_dir,
+                    &agent_id,
+                    Some(&task),
+                    cli.json,
+                )
+            } else {
+                let cp_type = match checkpoint_type.as_str() {
+                    "auto" => commands::checkpoint::CheckpointType::Auto,
+                    _ => commands::checkpoint::CheckpointType::Explicit,
+                };
+                commands::checkpoint::run(
+                    &workgraph_dir,
+                    &task,
+                    &summary,
+                    agent.as_deref(),
+                    &files,
+                    stream_offset,
+                    turn_count,
+                    token_input,
+                    token_output,
+                    cp_type,
+                    cli.json,
+                )
             }
         }
         Commands::Artifact { task, path, remove } => {

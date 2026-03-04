@@ -35,7 +35,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize a new workgraph in the current directory
-    Init,
+    Init {
+        /// Skip agency initialization (roles, agents, auto-assign config)
+        #[arg(long)]
+        no_agency: bool,
+    },
 
     /// Add a new task
     Add {
@@ -332,6 +336,21 @@ pub enum Commands {
         /// Only publish this single task (skip subgraph propagation)
         #[arg(long)]
         only: bool,
+    },
+
+    /// Park a task and exit — sets status to Waiting until condition is met
+    Wait {
+        /// Task ID to park
+        #[arg(value_name = "TASK")]
+        id: String,
+
+        /// Condition to wait for (e.g. "task:dep-a=done", "timer:5m", "message")
+        #[arg(long)]
+        until: String,
+
+        /// Checkpoint summary of progress so far
+        #[arg(long)]
+        checkpoint: Option<String>,
     },
 
     /// Add a dependency: task depends on (waits for) dependency
@@ -708,6 +727,49 @@ pub enum Commands {
     Msg {
         #[command(subcommand)]
         command: MsgCommands,
+    },
+
+    /// Save a checkpoint for context preservation during long-running tasks
+    Checkpoint {
+        /// Task ID
+        #[arg(value_name = "TASK")]
+        task: String,
+
+        /// Summary of progress (~500 tokens)
+        #[arg(long, short = 's')]
+        summary: String,
+
+        /// Agent ID (default: WG_AGENT_ID env var or task assignee)
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Files modified since last checkpoint
+        #[arg(long = "file", short = 'f')]
+        files: Vec<String>,
+
+        /// Stream byte offset
+        #[arg(long)]
+        stream_offset: Option<u64>,
+
+        /// Conversation turn count
+        #[arg(long)]
+        turn_count: Option<u64>,
+
+        /// Input tokens used
+        #[arg(long)]
+        token_input: Option<u64>,
+
+        /// Output tokens used
+        #[arg(long)]
+        token_output: Option<u64>,
+
+        /// Checkpoint type: explicit (default) or auto
+        #[arg(long, default_value = "explicit")]
+        checkpoint_type: String,
+
+        /// List checkpoints instead of creating one
+        #[arg(long)]
+        list: bool,
     },
 
     /// Chat with the coordinator agent
@@ -2341,7 +2403,7 @@ pub enum TelegramCommands {
 /// Get the command name from a Commands enum variant for usage tracking
 pub fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
-        Commands::Init => "init",
+        Commands::Init { .. } => "init",
         Commands::Add { .. } => "add",
         Commands::Edit { .. } => "edit",
         Commands::Done { .. } => "done",
@@ -2353,6 +2415,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Pause { .. } => "pause",
         Commands::Resume { .. } => "resume",
         Commands::Publish { .. } => "publish",
+        Commands::Wait { .. } => "wait",
         Commands::AddDep { .. } => "add-dep",
         Commands::RmDep { .. } => "rm-dep",
         Commands::Reclaim { .. } => "reclaim",
@@ -2397,6 +2460,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Assign { .. } => "assign",
         Commands::Match { .. } => "match",
         Commands::Heartbeat { .. } => "heartbeat",
+        Commands::Checkpoint { .. } => "checkpoint",
         Commands::Artifact { .. } => "artifact",
         Commands::Context { .. } => "context",
         Commands::Next { .. } => "next",
@@ -2464,6 +2528,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Tradeoff { .. }
             | Commands::Match { .. }
             | Commands::Heartbeat { .. }
+            | Commands::Checkpoint { .. }
             | Commands::Artifact { .. }
             | Commands::Context { .. }
             | Commands::Next { .. }

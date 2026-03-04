@@ -90,6 +90,32 @@ pub struct Estimate {
     pub cost: Option<f64>,
 }
 
+/// Wait condition for `wg wait` — specifies what a Waiting task is waiting for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum WaitCondition {
+    /// Wait for a task to reach a specific status
+    TaskStatus { task_id: String, status: Status },
+    /// Wait for a duration to elapse (resume_after is ISO 8601 timestamp computed at wait time)
+    Timer { resume_after: String },
+    /// Wait for a human to send a message on the task
+    HumanInput,
+    /// Wait for any message on the task (from any source)
+    Message,
+    /// Wait for a file to change (mtime check)
+    FileChanged { path: String, mtime_at_wait: u64 },
+}
+
+/// Composite wait specification: AND (All) or OR (Any) of conditions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "mode", content = "conditions")]
+pub enum WaitSpec {
+    /// All conditions must be true
+    All(Vec<WaitCondition>),
+    /// Any condition being true is sufficient
+    Any(Vec<WaitCondition>),
+}
+
 /// Task status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -97,6 +123,7 @@ pub enum Status {
     #[default]
     Open,
     InProgress,
+    Waiting,
     Done,
     Blocked,
     Failed,
@@ -108,6 +135,7 @@ impl std::fmt::Display for Status {
         match self {
             Status::Open => write!(f, "open"),
             Status::InProgress => write!(f, "in-progress"),
+            Status::Waiting => write!(f, "waiting"),
             Status::Done => write!(f, "done"),
             Status::Blocked => write!(f, "blocked"),
             Status::Failed => write!(f, "failed"),
@@ -126,6 +154,7 @@ impl<'de> serde::Deserialize<'de> for Status {
         match s.as_str() {
             "open" => Ok(Status::Open),
             "in-progress" => Ok(Status::InProgress),
+            "waiting" => Ok(Status::Waiting),
             "done" => Ok(Status::Done),
             "blocked" => Ok(Status::Blocked),
             "failed" => Ok(Status::Failed),
@@ -137,6 +166,7 @@ impl<'de> serde::Deserialize<'de> for Status {
                 &[
                     "open",
                     "in-progress",
+                    "waiting",
                     "done",
                     "blocked",
                     "failed",
@@ -268,6 +298,15 @@ pub struct Task {
     /// Token usage and cost data extracted from agent output.log
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+    /// Claude session ID for resume/resurrection (populated from stream.jsonl Init events)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Wait condition set by `wg wait` — coordinator checks and resumes when met
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_condition: Option<WaitSpec>,
+    /// Checkpoint summary written by agent before parking via `wg wait`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
 }
 
 /// Token usage and cost data from a Claude CLI agent run.
@@ -661,6 +700,12 @@ struct TaskHelper {
     exec_mode: Option<String>,
     #[serde(default)]
     token_usage: Option<TokenUsage>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    wait_condition: Option<WaitSpec>,
+    #[serde(default)]
+    checkpoint: Option<String>,
     /// Old format: inline identity object. Migrated to `agent` hash on read.
     #[serde(default)]
     identity: Option<LegacyIdentity>,
@@ -719,6 +764,9 @@ impl<'de> Deserialize<'de> for Task {
             context_scope: helper.context_scope,
             exec_mode: helper.exec_mode,
             token_usage: helper.token_usage,
+            session_id: helper.session_id,
+            wait_condition: helper.wait_condition,
+            checkpoint: helper.checkpoint,
         })
     }
 }

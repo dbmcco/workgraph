@@ -88,6 +88,10 @@ struct TaskDetails {
     token_usage: Option<TokenUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_condition: Option<workgraph::graph::WaitSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
 }
 
 fn is_default_visibility(val: &str) -> bool {
@@ -207,6 +211,8 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         exec_mode: task.exec_mode.clone(),
         token_usage,
         session_id: task.session_id.clone(),
+        wait_condition: task.wait_condition.clone(),
+        checkpoint: task.checkpoint.clone(),
     };
 
     if json {
@@ -520,6 +526,8 @@ mod tests {
             cycle_config: None,
             token_usage: None,
             session_id: None,
+            wait_condition: None,
+            checkpoint: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();

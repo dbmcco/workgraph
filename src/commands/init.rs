@@ -16,7 +16,7 @@ matrix.toml
 *.credentials
 "#;
 
-pub fn run(dir: &Path) -> Result<()> {
+pub fn run(dir: &Path, no_agency: bool) -> Result<()> {
     if dir.exists() {
         anyhow::bail!("Workgraph already initialized at {}", dir.display());
     }
@@ -58,16 +58,12 @@ pub fn run(dir: &Path) -> Result<()> {
     let gitignore_path = dir.join(".gitignore");
     fs::write(&gitignore_path, GITIGNORE_CONTENT).context("Failed to create .gitignore")?;
 
-    // Seed agency with starter roles and motivations
-    let agency_dir = dir.join("agency");
-    let (roles, motivations) =
-        workgraph::agency::seed_starters(&agency_dir).context("Failed to seed agency starters")?;
-
     println!("Initialized workgraph at {}", dir.display());
-    println!(
-        "Seeded agency with {} roles and {} motivations.",
-        roles, motivations
-    );
+
+    // Full agency initialization: roles, tradeoffs, default agents, config
+    if !no_agency {
+        super::agency_init::run(dir).context("Failed to initialize agency")?;
+    }
 
     // Hint about global config if it doesn't exist
     if let Ok(global_path) = workgraph::config::Config::global_config_path()
@@ -128,7 +124,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         assert!(wg_dir.exists());
         assert!(wg_dir.is_dir());
@@ -139,7 +135,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let graph_path = wg_dir.join("graph.jsonl");
         assert!(graph_path.exists());
@@ -152,7 +148,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let gitignore = wg_dir.join(".gitignore");
         assert!(gitignore.exists());
@@ -168,7 +164,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let repo_gitignore = tmp.path().join(".gitignore");
         assert!(repo_gitignore.exists());
@@ -183,7 +179,7 @@ mod tests {
         fs::write(&repo_gitignore, "node_modules/\n").unwrap();
 
         let wg_dir = tmp.path().join(".workgraph");
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert!(contents.contains("node_modules/"));
@@ -197,7 +193,7 @@ mod tests {
         fs::write(&repo_gitignore, ".workgraph\n").unwrap();
 
         let wg_dir = tmp.path().join(".workgraph");
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert_eq!(
@@ -208,27 +204,54 @@ mod tests {
     }
 
     #[test]
-    fn test_seeds_agency() {
+    fn test_full_agency_init() {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
+        run(&wg_dir, false).unwrap();
 
         let agency_dir = wg_dir.join("agency");
         assert!(agency_dir.exists());
         let roles_dir = agency_dir.join("cache/roles");
-        let motivations_dir = agency_dir.join("primitives/tradeoffs");
+        let tradeoffs_dir = agency_dir.join("primitives/tradeoffs");
         assert!(roles_dir.exists(), "agency/roles should be created");
         assert!(
-            motivations_dir.exists(),
-            "agency/motivations should be created"
+            tradeoffs_dir.exists(),
+            "agency/tradeoffs should be created"
         );
 
-        // At least one role and one motivation should be seeded
+        // Full agency init creates roles, tradeoffs, and agents
         let role_count = fs::read_dir(&roles_dir).unwrap().count();
-        let motivation_count = fs::read_dir(&motivations_dir).unwrap().count();
-        assert!(role_count > 0, "should seed at least one role");
-        assert!(motivation_count > 0, "should seed at least one motivation");
+        let tradeoff_count = fs::read_dir(&tradeoffs_dir).unwrap().count();
+        assert!(role_count >= 8, "should seed at least 8 roles (4 starter + 4 special)");
+        assert!(tradeoff_count >= 4, "should seed at least 4 tradeoffs");
+
+        // Agents should be created (1 default + 4 special)
+        let agents_dir = agency_dir.join("cache/agents");
+        assert!(agents_dir.exists(), "agents dir should be created");
+        let agent_count = fs::read_dir(&agents_dir).unwrap().count();
+        assert_eq!(agent_count, 5, "should create 5 agents (1 default + 4 special)");
+
+        // Config should have auto_assign and auto_evaluate enabled
+        let config = workgraph::config::Config::load(&wg_dir).unwrap();
+        assert!(config.agency.auto_assign, "auto_assign should be enabled");
+        assert!(config.agency.auto_evaluate, "auto_evaluate should be enabled");
+    }
+
+    #[test]
+    fn test_no_agency_flag() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+
+        run(&wg_dir, true).unwrap();
+
+        // Workgraph dir and graph.jsonl should exist
+        assert!(wg_dir.exists());
+        assert!(wg_dir.join("graph.jsonl").exists());
+
+        // Agency dir should NOT exist
+        let agency_dir = wg_dir.join("agency");
+        assert!(!agency_dir.exists(), "agency should not be created with --no-agency");
     }
 
     #[test]
@@ -236,8 +259,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir).unwrap();
-        let result = run(&wg_dir);
+        run(&wg_dir, false).unwrap();
+        let result = run(&wg_dir, false);
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

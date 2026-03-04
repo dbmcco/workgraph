@@ -898,6 +898,9 @@ mod tests {
             exec_mode: None,
             cycle_config: None,
             token_usage: None,
+            session_id: None,
+            wait_condition: None,
+            checkpoint: None,
         }
     }
 

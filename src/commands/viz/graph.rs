@@ -88,6 +88,7 @@ pub fn generate_graph_with_overrides(
             Status::Blocked => "\x1b[90m",
             Status::Failed => "\x1b[31m",
             Status::Abandoned => "\x1b[90m",
+            Status::Waiting => "\x1b[33m",
         }
     };
     let reset = if use_color { "\x1b[0m" } else { "" };
@@ -100,6 +101,7 @@ pub fn generate_graph_with_overrides(
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
+            Status::Waiting => "waiting",
         }
     };
 

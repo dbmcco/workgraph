@@ -57,6 +57,10 @@ pub struct Config {
     /// LLM endpoints
     #[serde(default)]
     pub llm_endpoints: EndpointsConfig,
+
+    /// Checkpoint configuration
+    #[serde(default)]
+    pub checkpoint: CheckpointConfig,
 }
 
 /// Help display configuration
@@ -211,6 +215,9 @@ pub struct TuiConfig {
     /// Inspector panel ratio: percentage of width given to the inspector in split mode (default: 67)
     #[serde(default = "default_panel_ratio")]
     pub panel_ratio: u16,
+    /// Default inspector size when first opened: "1/3", "1/2", "2/3" (default), "full"
+    #[serde(default = "default_inspector_size")]
+    pub default_inspector_size: String,
     /// Persist chat history across TUI restarts (default: true)
     #[serde(default = "default_true")]
     pub chat_history: bool,
@@ -240,6 +247,9 @@ fn default_message_indent() -> u16 {
 fn default_panel_ratio() -> u16 {
     67
 }
+fn default_inspector_size() -> String {
+    "2/3".to_string()
+}
 fn default_chat_history_max() -> usize {
     1000
 }
@@ -255,6 +265,7 @@ impl Default for TuiConfig {
             message_name_threshold: default_message_name_threshold(),
             message_indent: default_message_indent(),
             panel_ratio: default_panel_ratio(),
+            default_inspector_size: default_inspector_size(),
             chat_history: true,
             chat_history_max: default_chat_history_max(),
         }
@@ -319,6 +330,44 @@ pub struct EndpointsConfig {
     /// List of configured endpoints
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+}
+
+/// Checkpoint configuration for agent context preservation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// Auto-checkpoint every N turns
+    #[serde(default = "default_auto_interval_turns")]
+    pub auto_interval_turns: u32,
+
+    /// Auto-checkpoint every N minutes
+    #[serde(default = "default_auto_interval_mins")]
+    pub auto_interval_mins: u32,
+
+    /// Keep only last N checkpoints per task
+    #[serde(default = "default_max_checkpoints")]
+    pub max_checkpoints: u32,
+}
+
+fn default_auto_interval_turns() -> u32 {
+    15
+}
+
+fn default_auto_interval_mins() -> u32 {
+    20
+}
+
+fn default_max_checkpoints() -> u32 {
+    5
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            auto_interval_turns: default_auto_interval_turns(),
+            auto_interval_mins: default_auto_interval_mins(),
+            max_checkpoints: default_max_checkpoints(),
+        }
+    }
 }
 
 fn default_auto_create_threshold() -> u32 {

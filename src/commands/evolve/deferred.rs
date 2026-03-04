@@ -125,6 +125,9 @@ pub(crate) fn defer_self_mutation(
         context_scope: None,
         cycle_config: None,
         token_usage: None,
+        session_id: None,
+        wait_condition: None,
+        checkpoint: None,
         exec_mode: None,
     };
 

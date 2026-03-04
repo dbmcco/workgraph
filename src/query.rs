@@ -90,8 +90,8 @@ pub fn project_summary(graph: &WorkGraph) -> ProjectSummary {
                 // Explicit blocked status also counts
                 blocked_count += 1;
             }
-            Status::Failed | Status::Abandoned => {
-                // Failed and abandoned tasks are terminal states, not counted as open
+            Status::Failed | Status::Abandoned | Status::Waiting => {
+                // Failed, abandoned, and waiting tasks are not counted as open
             }
         }
     }

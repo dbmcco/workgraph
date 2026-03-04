@@ -228,7 +228,7 @@ pub(crate) fn build_graph_summary(
             Status::Done => done += 1,
             Status::Failed => failed += 1,
             Status::Blocked => blocked += 1,
-            Status::Abandoned => {}
+            Status::Abandoned | Status::Waiting => {}
         }
     }
     parts.push(format!(

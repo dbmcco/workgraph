@@ -273,6 +273,9 @@ pub fn run(
                 context_scope: None,
                 cycle_config: None,
                 token_usage: None,
+                session_id: None,
+        wait_condition: None,
+        checkpoint: None,
                 exec_mode: None,
             };
 
