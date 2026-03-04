@@ -16,6 +16,8 @@ default = ["matrix-lite"]
 matrix = ["dep:matrix-sdk"]
 matrix-lite = ["dep:urlencoding"]
 telegram = ["dep:teloxide"]
+email = ["dep:lettre"]
+slack = []
 llm-tests = []  # gates tests that call Claude CLI
 test-support = []  # exposes test helpers for cross-crate use
 
@@ -60,6 +62,9 @@ urlencoding = { version = "2.1", optional = true }
 
 # Optional Telegram integration
 teloxide = { version = "0.13", features = ["macros"], optional = true }
+# Optional Email integration (SMTP via lettre)
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder", "hostname"], optional = true }
+
 pulldown-cmark = "0.13.1"
 hmac = "0.12.1"
 hex = "0.4.3"

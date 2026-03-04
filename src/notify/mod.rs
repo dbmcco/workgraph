@@ -6,8 +6,11 @@
 
 pub mod config;
 pub mod dispatch;
+#[cfg(feature = "email")]
+pub mod email;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix;
+pub mod slack;
 pub mod telegram;
 pub mod webhook;
 
