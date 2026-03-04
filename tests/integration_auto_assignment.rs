@@ -261,6 +261,8 @@ fn build_assign_subgraph(dir: &Path) {
             session_id: None,
             wait_condition: None,
             checkpoint: None,
+            resurrection_count: 0,
+            last_resurrected_at: None,
         };
 
         mutable_graph.add_node(Node::Task(assign_task));

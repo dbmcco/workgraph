@@ -307,6 +307,12 @@ pub struct Task {
     /// Checkpoint summary written by agent before parking via `wg wait`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Number of times this task has been resurrected (Done → Open) due to messages
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resurrection_count: u32,
+    /// Timestamp of last resurrection (for cooldown enforcement)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resurrected_at: Option<String>,
 }
 
 /// Token usage and cost data from a Claude CLI agent run.
@@ -706,6 +712,10 @@ struct TaskHelper {
     wait_condition: Option<WaitSpec>,
     #[serde(default)]
     checkpoint: Option<String>,
+    #[serde(default)]
+    resurrection_count: u32,
+    #[serde(default)]
+    last_resurrected_at: Option<String>,
     /// Old format: inline identity object. Migrated to `agent` hash on read.
     #[serde(default)]
     identity: Option<LegacyIdentity>,
@@ -767,6 +777,8 @@ impl<'de> Deserialize<'de> for Task {
             session_id: helper.session_id,
             wait_condition: helper.wait_condition,
             checkpoint: helper.checkpoint,
+            resurrection_count: helper.resurrection_count,
+            last_resurrected_at: helper.last_resurrected_at,
         })
     }
 }

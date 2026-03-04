@@ -302,6 +302,8 @@ pub fn run(
         session_id: None,
         wait_condition: None,
         checkpoint: None,
+            resurrection_count: 0,
+            last_resurrected_at: None,
     };
 
     // Add task to graph
@@ -548,6 +550,8 @@ fn add_task_directly(
         session_id: None,
         wait_condition: None,
         checkpoint: None,
+            resurrection_count: 0,
+            last_resurrected_at: None,
     };
 
     graph.add_node(Node::Task(task));
