@@ -22,11 +22,11 @@ pub const REQUIRED_WORKFLOW_SECTION: &str = "\
 
 You MUST use these commands to track your work:
 
-0. **Check for messages** at the very start:
+0. **Check for messages** (BEFORE any other work):
    ```bash
    wg msg read {{task_id}} --agent $WG_AGENT_ID
    ```
-   ACKNOWLEDGE any messages by replying with `wg msg send {{task_id}} \"your response\"`.
+   Reply to EACH message: `wg msg send {{task_id}} \"your response\"`
 
 1. **Log progress** as you work (helps recovery if interrupted):
    ```bash
@@ -48,20 +48,25 @@ You MUST use these commands to track your work:
      wg log {{task_id}} \"Validated: re-read description, all requirements addressed\"
      ```
 
-4. **Complete the task** when done:
+4. **Check messages AGAIN** (BEFORE marking done — this is a gate, not optional):
+   ```bash
+   wg msg read {{task_id}} --agent $WG_AGENT_ID
+   ```
+   Reply to any new messages. Do NOT skip this step.
+
+5. **Complete the task** when done:
    ```bash
    wg done {{task_id}}
    wg done {{task_id}} --converged  # Use this if task has loop edges and work is complete
    ```
 
-5. **Mark as failed** if you cannot complete:
+6. **Mark as failed** if you cannot complete:
    ```bash
    wg fail {{task_id}} --reason \"Specific reason why\"
    ```
 
 ## Important
 - Run `wg log` commands BEFORE doing work to track progress
-- After each `wg log`, check the output for messages and reply to any you see
 - Validate BEFORE running `wg done`
 - Run `wg done` BEFORE you finish responding
 - If the task description is unclear, do your best interpretation\n";
@@ -177,34 +182,14 @@ The coordinator will dispatch them automatically.
 /// Message polling instructions for agents.
 /// Contains {{task_id}} placeholder for variable substitution.
 pub const MESSAGE_POLLING_SECTION: &str = "\
-## Messages\n\
-\n\
-**You MUST check for messages at the START of your task and at every natural breakpoint.**\n\
-**After EVERY `wg log` call, READ THE COMPLETE OUTPUT — it may contain pending messages.**\n\
-\n\
-Check for new messages periodically during long-running tasks:\n\
-```bash\n\
-wg msg read {{task_id}} --agent $WG_AGENT_ID\n\
-```\n\
-Messages may contain updated requirements, context from other agents,\n\
-or instructions from the user. Check at natural breakpoints in your work.\n\
-\n\
-**Your messaging identity:** When you send messages, you are identified as \
-'{{task_id}}'. Other agents and the coordinator will see your task name as the sender.\n\
-\n\
-**Cross-task messaging:** If you discover something relevant to a sibling or \
-related task, send them a message:\n\
-```bash\n\
-wg msg send <other-task-id> \"Found X while working on {{task_id}}\"\n\
-```\n\
-This helps the whole graph converge faster.\n\
-\n\
-**IMPORTANT: When you receive a message, you MUST acknowledge it.**\n\
-- Reply using: `wg msg send {{task_id}} \"your response\"`\n\
-- If the message contains new requirements, acknowledge and explain how you'll incorporate them\n\
-- If the message asks a question, answer it\n\
-- If the message is informational, briefly acknowledge (e.g., \"Noted, incorporating that\")\n\
-- Never ignore messages \u{2014} the coordinator or user is watching for your response\n";
+## Messages
+
+Check for new messages periodically during long-running tasks:
+```bash
+wg msg read {{task_id}} --agent $WG_AGENT_ID
+```
+Messages may contain updated requirements, context from other agents,
+or instructions from the user. Check at natural breakpoints in your work.\n";
 
 /// Hint for task+ scopes about using wg context/show to get more info (R2).
 const WG_CONTEXT_HINT: &str = "\

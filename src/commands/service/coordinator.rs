@@ -816,38 +816,58 @@ fn spawn_eval_inline(
     let graph_path = graph_path(dir);
     let mut graph = load_graph(&graph_path).context("Failed to load graph for eval spawn")?;
 
-    let task = graph.get_task_mut_or_err(eval_task_id)?;
-    if task.status != Status::Open {
+    // Extract needed fields from the eval task before releasing the mutable borrow.
+    let (eval_task_status, eval_task_exec, eval_task_agent) = {
+        let task = graph.get_task_or_err(eval_task_id)?;
+        (task.status, task.exec.clone(), task.agent.clone())
+    };
+
+    if eval_task_status != Status::Open {
         anyhow::bail!(
             "Eval task '{}' is not open (status: {:?})",
             eval_task_id,
-            task.status
+            eval_task_status
         );
     }
 
     // Use the task's exec command directly if it starts with "wg evaluate".
     // This handles both "wg evaluate run <task>" and "wg evaluate org <task>".
     // Fall back to reconstructing from task ID for backward compatibility.
-    let eval_cmd = if let Some(exec) = task.exec.as_deref()
+    let source_task_id = eval_task_id
+        .strip_prefix("evaluate-")
+        .unwrap_or(eval_task_id);
+    let eval_cmd = if let Some(ref exec) = eval_task_exec
         && exec.starts_with("wg evaluate")
     {
         exec.to_string()
     } else {
-        let source_task_id = eval_task_id
-            .strip_prefix("evaluate-")
-            .unwrap_or(eval_task_id);
         format!(
             "wg evaluate run '{}'",
             source_task_id.replace('\'', "'\\''")
         )
     };
 
+    // Determine if FLIP evaluation should also run after standard eval.
+    // FLIP runs when: flip_enabled is true globally, OR the source task has the 'flip-eval' tag.
+    let config = Config::load_or_default(dir);
+    let source_has_flip_tag = graph
+        .get_task(source_task_id)
+        .map(|t| t.tags.iter().any(|tag| tag == "flip-eval"))
+        .unwrap_or(false);
+    let run_flip = config.agency.flip_enabled || source_has_flip_tag;
+    let flip_cmd = if run_flip {
+        Some(format!(
+            "wg evaluate run '{}' --flip",
+            source_task_id.replace('\'', "'\\''")
+        ))
+    } else {
+        None
+    };
+
     // Resolve the special agent (evaluator) hash for performance recording.
     // After the inline eval completes, we record an Evaluation against this
     // agent so it accumulates performance history like any other agent.
-    let config = Config::load_or_default(dir);
-    let special_agent_hash = task
-        .agent
+    let special_agent_hash = eval_task_agent
         .clone()
         .or_else(|| config.agency.evaluator_agent.clone());
 
@@ -877,14 +897,22 @@ fn spawn_eval_inline(
             .map(|a| a.id)
     });
 
-    // Single script: run eval, record special agent perf, then mark done/failed
+    // Build the optional FLIP command fragment. FLIP runs after standard eval
+    // succeeds. FLIP failure is non-fatal (|| true) — it produces supplementary
+    // 'source: flip' evaluation records but should not block the eval task.
+    let flip_fragment = flip_cmd
+        .as_ref()
+        .map(|cmd| format!("\n    {cmd} >> '{escaped_output}' 2>&1 || true"))
+        .unwrap_or_default();
+
+    // Single script: run eval, optionally run FLIP, record special agent perf, then mark done/failed
     let script = if let Some(ref sa_id) = special_agent_verified {
         let escaped_sa_id = sa_id.replace('\'', "'\\''");
         format!(
             r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 {eval_cmd} >> '{escaped_output}' 2>&1
 EXIT_CODE=$?
-if [ $EXIT_CODE -eq 0 ]; then
+if [ $EXIT_CODE -eq 0 ]; then{flip_fragment}
     wg evaluate record '{escaped_eval_id}' 1.0 --source system --notes "Inline evaluation completed successfully (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
     wg done '{escaped_eval_id}' 2>> '{escaped_output}'
 else
@@ -898,7 +926,7 @@ exit $EXIT_CODE"#,
             r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 {eval_cmd} >> '{escaped_output}' 2>&1
 EXIT_CODE=$?
-if [ $EXIT_CODE -eq 0 ]; then
+if [ $EXIT_CODE -eq 0 ]; then{flip_fragment}
     wg done '{escaped_eval_id}' 2>> '{escaped_output}'
 else
     wg fail '{escaped_eval_id}' --reason "wg evaluate exited with code $EXIT_CODE" 2>> '{escaped_output}'
@@ -908,6 +936,7 @@ exit $EXIT_CODE"#,
     };
 
     // Claim the task before spawning
+    let task = graph.get_task_mut_or_err(eval_task_id)?;
     task.status = Status::InProgress;
     task.started_at = Some(Utc::now().to_rfc3339());
     task.assigned = Some(agent_id.clone());

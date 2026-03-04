@@ -604,6 +604,12 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
         wg fail "$TASK_ID" --reason "Agent exceeded hard timeout" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
     elif [ $EXIT_CODE -eq 0 ]; then
         echo "" >> "$OUTPUT_FILE"
+        # Safety net: check for unread messages the agent may have missed
+        UNREAD=$(wg msg read "$TASK_ID" --agent "$WG_AGENT_ID" 2>/dev/null)
+        if [ -n "$UNREAD" ] && ! echo "$UNREAD" | grep -q "No unread messages"; then
+            echo "[wrapper] WARNING: Agent finished with unread messages:" >> "$OUTPUT_FILE"
+            echo "$UNREAD" >> "$OUTPUT_FILE"
+        fi
         echo "{complete_msg}" >> "$OUTPUT_FILE"
         {complete_cmd}
     else

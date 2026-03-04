@@ -933,14 +933,14 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.toggle_right_panel();
         }
 
-        // Cycle layout mode: split → full panel → full graph
-        KeyCode::Char('=') | KeyCode::Char('i') => {
+        // Cycle layout mode: 1/3 → 2/3 → full → off
+        KeyCode::Char('=') | KeyCode::Char('i') | KeyCode::BackTab => {
             app.cycle_layout_mode();
         }
 
         // Navigate between matches
         KeyCode::Char('n') => app.next_match(),
-        KeyCode::Char('N') | KeyCode::BackTab => app.prev_match(),
+        KeyCode::Char('N') => app.prev_match(),
 
         // Alt+Up/Down: toggle focus between graph and right panel
         KeyCode::Up if modifiers.contains(KeyModifiers::ALT) => {
@@ -1123,7 +1123,7 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.inspector_sub_focus = InspectorSubFocus::TextEntry;
         }
 
-        // Digit keys 0-6: switch right panel tab
+        // Digit keys 0-7: switch right panel tab
         KeyCode::Char(d @ '0'..='7') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
@@ -1157,7 +1157,9 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                     app.kill_focused_agent();
                 }
                 KeyCode::Char('\\') => app.toggle_right_panel(),
-                KeyCode::Char('=') | KeyCode::Char('i') => app.cycle_layout_mode(),
+                KeyCode::Char('=') | KeyCode::Char('i') | KeyCode::BackTab => {
+                    app.cycle_layout_mode()
+                }
                 KeyCode::Esc => {
                     app.focused_panel = FocusedPanel::Graph;
                 }
@@ -1192,8 +1194,8 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.toggle_right_panel();
         }
 
-        // Cycle layout mode: split → full panel → full graph
-        KeyCode::Char('=') | KeyCode::Char('i') => {
+        // Cycle layout mode: 1/3 → 2/3 → full → off
+        KeyCode::Char('=') | KeyCode::Char('i') | KeyCode::BackTab => {
             app.cycle_layout_mode();
         }
 
@@ -2163,7 +2165,7 @@ fn handle_files_key(app: &mut VizApp, code: KeyCode) {
 /// Returns None if the click is on a divider or beyond the last tab.
 fn tab_at_column(col: u16) -> Option<RightPanelTab> {
     let labels = [
-        "0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency", "5:Config", "6:Files",
+        "0:Chat", "1:Detail", "2:Log", "3:Msg", "4:Agency", "5:Config", "6:Files", "7:Coord",
     ];
     let mut pos: u16 = 0;
     for (i, label) in labels.iter().enumerate() {

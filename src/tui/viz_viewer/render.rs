@@ -83,7 +83,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
     // Layout based on layout mode.
     match app.layout_mode {
-        LayoutMode::FullPanel => {
+        LayoutMode::FullInspector => {
             // Full-width panel: right panel takes entire main area, no graph.
             app.last_graph_area = Rect::default();
             app.scroll.viewport_height = 0;
@@ -92,7 +92,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
             draw_right_panel(frame, app, main_area);
             app.last_graph_hscrollbar_area = Rect::default();
         }
-        LayoutMode::FullGraph => {
+        LayoutMode::Off => {
             // Full-width graph: graph takes entire main area, no panel.
             app.last_graph_area = main_area;
             app.last_right_panel_area = Rect::default();
@@ -116,7 +116,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
             );
         }
-        LayoutMode::Split => {
+        LayoutMode::ThirdInspector | LayoutMode::TwoThirdsInspector => {
             if app.right_panel_visible {
                 if area.width >= SIDE_MIN_WIDTH {
                     // Side-by-side: viz left, right panel right.
@@ -906,7 +906,7 @@ fn draw_horizontal_scrollbar(
 fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.last_right_panel_area = area;
 
-    let is_full_panel = app.layout_mode == LayoutMode::FullPanel;
+    let is_full_panel = app.layout_mode == LayoutMode::FullInspector;
 
     // In full-panel mode: no borders (edge-to-edge content for clean copy-paste).
     // In split mode: minimal single-line border, dim when unfocused.
@@ -3510,23 +3510,30 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         ));
     }
 
-    // Layout mode indicator (show when not default split view)
+    // Layout mode indicator (show when not default 1/3 split view)
     match app.layout_mode {
-        LayoutMode::FullPanel => {
+        LayoutMode::TwoThirdsInspector => {
+            spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "2/3 PANEL ",
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        LayoutMode::FullInspector => {
             spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(
                 "FULL PANEL ",
                 Style::default().fg(Color::Magenta),
             ));
         }
-        LayoutMode::FullGraph => {
+        LayoutMode::Off => {
             spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(
                 "FULL GRAPH ",
                 Style::default().fg(Color::Magenta),
             ));
         }
-        LayoutMode::Split => {}
+        LayoutMode::ThirdInspector => {}
     }
 
     // Help hint

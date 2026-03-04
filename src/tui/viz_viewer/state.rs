@@ -333,25 +333,45 @@ impl HudSize {
     }
 }
 
-/// Layout mode for the three-state cycle (i/= key).
+/// Layout mode for the four-state cycle (=/i/Shift+Tab key).
+/// Cycle: ThirdInspector → TwoThirdsInspector → FullInspector → Off → ...
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum LayoutMode {
-    /// Split view: graph on left, right panel on right (default).
+    /// 1/3 inspector (2/3 graph + 1/3 inspector).
+    ThirdInspector,
+    /// 2/3 inspector (1/3 graph + 2/3 inspector).
     #[default]
-    Split,
-    /// Full-width panel: right panel takes entire screen width, graph hidden.
-    FullPanel,
-    /// Full-width graph: graph takes entire screen width, panels hidden.
-    FullGraph,
+    TwoThirdsInspector,
+    /// Full inspector: inspector takes entire screen, graph hidden.
+    FullInspector,
+    /// Off: graph takes entire screen, inspector hidden.
+    Off,
 }
 
 impl LayoutMode {
     pub fn cycle(&self) -> Self {
         match self {
-            Self::Split => Self::FullPanel,
-            Self::FullPanel => Self::FullGraph,
-            Self::FullGraph => Self::Split,
+            Self::ThirdInspector => Self::TwoThirdsInspector,
+            Self::TwoThirdsInspector => Self::FullInspector,
+            Self::FullInspector => Self::Off,
+            Self::Off => Self::ThirdInspector,
         }
+    }
+
+    /// Whether this mode shows the inspector panel.
+    pub fn has_inspector(&self) -> bool {
+        matches!(
+            self,
+            Self::ThirdInspector | Self::TwoThirdsInspector | Self::FullInspector
+        )
+    }
+
+    /// Whether this mode shows the graph.
+    pub fn has_graph(&self) -> bool {
+        matches!(
+            self,
+            Self::ThirdInspector | Self::TwoThirdsInspector | Self::Off
+        )
     }
 }
 
@@ -1268,10 +1288,10 @@ impl VizApp {
             detail_collapsed_sections: std::collections::HashSet::new(),
             right_panel_visible: true,
             focused_panel: FocusedPanel::Graph,
-            right_panel_tab: RightPanelTab::Detail,
+            right_panel_tab: RightPanelTab::Chat,
             right_panel_percent: config.tui.panel_ratio.clamp(10, 90),
             hud_size: HudSize::Normal,
-            layout_mode: LayoutMode::Split,
+            layout_mode: LayoutMode::TwoThirdsInspector,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
             inspector_sub_focus: InspectorSubFocus::ChatHistory,
@@ -3545,7 +3565,7 @@ impl VizApp {
             right_panel_tab: RightPanelTab::Detail,
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
-            layout_mode: LayoutMode::Split,
+            layout_mode: LayoutMode::ThirdInspector,
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
             inspector_sub_focus: InspectorSubFocus::ChatHistory,
@@ -3610,20 +3630,20 @@ impl VizApp {
     // ── Multi-panel methods ──
 
     /// Toggle focus between Graph and RightPanel.
-    /// In full-panel or full-graph mode, focus stays locked to the visible content.
+    /// In full-inspector or off mode, focus stays locked to the visible content.
     pub fn toggle_panel_focus(&mut self) {
         match self.layout_mode {
-            LayoutMode::FullPanel => {
+            LayoutMode::FullInspector => {
                 // Only the panel is visible; stay focused on it.
                 self.focused_panel = FocusedPanel::RightPanel;
                 return;
             }
-            LayoutMode::FullGraph => {
+            LayoutMode::Off => {
                 // Only the graph is visible; stay focused on it.
                 self.focused_panel = FocusedPanel::Graph;
                 return;
             }
-            LayoutMode::Split => {}
+            LayoutMode::ThirdInspector | LayoutMode::TwoThirdsInspector => {}
         }
         self.focused_panel = match self.focused_panel {
             FocusedPanel::Graph => {
@@ -3638,11 +3658,11 @@ impl VizApp {
     }
 
     /// Toggle right panel visibility.
-    /// If in a non-split layout mode, resets to split mode first.
+    /// If in a non-split layout mode, resets to ThirdInspector mode first.
     pub fn toggle_right_panel(&mut self) {
-        if self.layout_mode != LayoutMode::Split {
-            // Reset to split mode, then apply the toggle.
-            self.layout_mode = LayoutMode::Split;
+        if !self.layout_mode.has_graph() || !self.layout_mode.has_inspector() {
+            // Reset to default split mode, then apply the toggle.
+            self.layout_mode = LayoutMode::TwoThirdsInspector;
         }
         self.right_panel_visible = !self.right_panel_visible;
         if !self.right_panel_visible {
@@ -3657,19 +3677,24 @@ impl VizApp {
         self.right_panel_percent = self.hud_size.side_percent();
     }
 
-    /// Cycle layout mode: split → full panel → full graph → split.
+    /// Cycle layout mode: 1/3 inspector → 2/3 inspector → full inspector → off → 1/3.
     pub fn cycle_layout_mode(&mut self) {
         self.layout_mode = self.layout_mode.cycle();
         match self.layout_mode {
-            LayoutMode::Split => {
+            LayoutMode::ThirdInspector => {
                 self.right_panel_visible = true;
+                self.right_panel_percent = 33;
             }
-            LayoutMode::FullPanel => {
+            LayoutMode::TwoThirdsInspector => {
+                self.right_panel_visible = true;
+                self.right_panel_percent = 67;
+            }
+            LayoutMode::FullInspector => {
                 self.right_panel_visible = true;
                 // Focus the right panel since it's the only visible content.
                 self.focused_panel = FocusedPanel::RightPanel;
             }
-            LayoutMode::FullGraph => {
+            LayoutMode::Off => {
                 self.right_panel_visible = false;
                 self.focused_panel = FocusedPanel::Graph;
             }
