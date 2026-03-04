@@ -81,26 +81,77 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         app.file_browser = Some(super::file_browser::FileBrowser::new(&app.workgraph_dir));
     }
 
-    // Layout based on layout mode.
+    // Phase 1: Compute viewport dimensions from layout (needed for deferred centering).
     match app.layout_mode {
         LayoutMode::FullInspector => {
-            // Full-width panel: right panel takes entire main area, no graph.
             app.last_graph_area = Rect::default();
             app.scroll.viewport_height = 0;
             app.scroll.viewport_width = 0;
-
-            draw_right_panel(frame, app, main_area);
-            app.last_graph_hscrollbar_area = Rect::default();
         }
         LayoutMode::Off => {
-            // Full-width graph: graph takes entire main area, no panel.
             app.last_graph_area = main_area;
             app.last_right_panel_area = Rect::default();
             app.last_tab_bar_area = Rect::default();
             app.last_right_content_area = Rect::default();
             app.scroll.viewport_height = main_area.height as usize;
             app.scroll.viewport_width = main_area.width as usize;
+        }
+        LayoutMode::ThirdInspector | LayoutMode::TwoThirdsInspector => {
+            if app.right_panel_visible {
+                if area.width >= SIDE_MIN_WIDTH {
+                    let right_width =
+                        (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
+                    let left_width = main_area.width.saturating_sub(right_width);
+                    let split = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(left_width),
+                            Constraint::Length(right_width),
+                        ])
+                        .split(main_area);
+                    app.last_graph_area = split[0];
+                    app.scroll.viewport_height = split[0].height as usize;
+                    app.scroll.viewport_width = split[0].width as usize;
+                } else {
+                    let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
+                        / 100)
+                        .max(5) as u16;
+                    let top_height = main_area.height.saturating_sub(panel_height);
+                    let split = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(top_height),
+                            Constraint::Length(panel_height),
+                        ])
+                        .split(main_area);
+                    app.last_graph_area = split[0];
+                    app.scroll.viewport_height = split[0].height as usize;
+                    app.scroll.viewport_width = split[0].width as usize;
+                }
+            } else {
+                app.last_graph_area = main_area;
+                app.last_right_panel_area = Rect::default();
+                app.last_tab_bar_area = Rect::default();
+                app.last_right_content_area = Rect::default();
+                app.scroll.viewport_height = main_area.height as usize;
+                app.scroll.viewport_width = main_area.width as usize;
+            }
+        }
+    }
 
+    // Phase 2: Deferred centering — viewport_height is now set, apply before drawing.
+    if app.needs_center_on_selected {
+        app.needs_center_on_selected = false;
+        app.center_on_selected_task();
+    }
+
+    // Phase 3: Draw content using the (possibly updated) scroll offset.
+    match app.layout_mode {
+        LayoutMode::FullInspector => {
+            draw_right_panel(frame, app, main_area);
+            app.last_graph_hscrollbar_area = Rect::default();
+        }
+        LayoutMode::Off => {
             draw_viz_content(frame, app, main_area);
             if app.scroll.content_height > app.scroll.viewport_height
                 && app.graph_scrollbar_visible()
@@ -119,7 +170,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         LayoutMode::ThirdInspector | LayoutMode::TwoThirdsInspector => {
             if app.right_panel_visible {
                 if area.width >= SIDE_MIN_WIDTH {
-                    // Side-by-side: viz left, right panel right.
                     let right_width =
                         (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
                     let left_width = main_area.width.saturating_sub(right_width);
@@ -133,10 +183,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
                     let viz_area = split[0];
                     let right_area = split[1];
-
-                    app.last_graph_area = viz_area;
-                    app.scroll.viewport_height = viz_area.height as usize;
-                    app.scroll.viewport_width = viz_area.width as usize;
 
                     draw_viz_content(frame, app, viz_area);
                     if app.scroll.content_height > app.scroll.viewport_height
@@ -154,8 +200,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     );
                     draw_right_panel(frame, app, right_area);
                 } else {
-                    // Narrow: viz on top, right panel on bottom.
-                    // Use right_panel_percent so = cycling works in vertical mode too.
                     let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
                         / 100)
                         .max(5) as u16;
@@ -170,10 +214,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
                     let viz_area = split[0];
                     let right_area = split[1];
-
-                    app.last_graph_area = viz_area;
-                    app.scroll.viewport_height = viz_area.height as usize;
-                    app.scroll.viewport_width = viz_area.width as usize;
 
                     draw_viz_content(frame, app, viz_area);
                     if app.scroll.content_height > app.scroll.viewport_height
@@ -192,14 +232,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     draw_right_panel(frame, app, right_area);
                 }
             } else {
-                // No right panel — full width viz.
-                app.last_graph_area = main_area;
-                app.last_right_panel_area = Rect::default();
-                app.last_tab_bar_area = Rect::default();
-                app.last_right_content_area = Rect::default();
-                app.scroll.viewport_height = main_area.height as usize;
-                app.scroll.viewport_width = main_area.width as usize;
-
                 draw_viz_content(frame, app, main_area);
                 if app.scroll.content_height > app.scroll.viewport_height
                     && app.graph_scrollbar_visible()
@@ -216,12 +248,6 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 );
             }
         }
-    }
-
-    // Deferred centering: viewport_height is now set, so we can center properly.
-    if app.needs_center_on_selected {
-        app.needs_center_on_selected = false;
-        app.center_on_selected_task();
     }
 
     // Top status bar

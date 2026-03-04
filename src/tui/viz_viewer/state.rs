@@ -1102,6 +1102,11 @@ pub struct VizApp {
     /// The chat message history area from the last render frame (for click-to-focus).
     pub last_chat_message_area: Rect,
 
+    /// The file browser tree pane area from the last render frame (for mouse clicks).
+    pub last_file_tree_area: Rect,
+    /// The file browser preview pane area from the last render frame (for mouse clicks).
+    pub last_file_preview_area: Rect,
+
     /// Maps config entry index → screen Y position (set each frame by renderer).
     /// Used for mouse click → config entry selection.
     pub config_entry_y_positions: Vec<(usize, u16)>,
@@ -1358,6 +1363,8 @@ impl VizApp {
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_file_tree_area: Rect::default(),
+            last_file_preview_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
             jump_target: None,
             task_order: Vec::new(),
@@ -3558,6 +3565,8 @@ impl VizApp {
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
+            last_file_tree_area: Rect::default(),
+            last_file_preview_area: Rect::default(),
             config_entry_y_positions: Vec::new(),
             jump_target: None,
             task_order,

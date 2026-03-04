@@ -244,13 +244,11 @@ impl MdRenderer {
                 self.link_url = Some(dest_url.to_string());
                 self.push_style(|s| s.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED));
             }
-            Event::End(TagEnd::Heading(level)) => {
+            Event::End(TagEnd::Heading(_level)) => {
                 self.flush_line();
                 self.pop_style();
-                // h1 and h2 get a blank line after; h3+ stay tight to content
-                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-                    self.blank_line();
-                }
+                // Don't add blank line here — the following Start(Paragraph)
+                // already inserts one, so adding one here would double-space.
                 self.heading_level = None;
             }
             Event::End(TagEnd::Paragraph) => {
@@ -322,9 +320,10 @@ impl MdRenderer {
                 } else if self.in_table {
                     self.current_cell.push(' ');
                 } else {
-                    let style = self.current_style();
-                    self.current_spans
-                        .push(Span::styled(" ".to_string(), style));
+                    // In a TUI, soft breaks should produce actual line breaks
+                    // rather than spaces. This preserves newlines in tool output
+                    // and other pre-formatted content that isn't in code blocks.
+                    self.flush_line();
                 }
             }
             Event::HardBreak => {
@@ -615,5 +614,41 @@ mod tests {
         assert!(all_text.contains("Left"));
         assert!(all_text.contains("Center"));
         assert!(all_text.contains("Right"));
+    }
+
+    #[test]
+    fn test_soft_breaks_produce_newlines() {
+        // Simulates tool output format: consecutive lines should stay separate.
+        let md = "┌─ Bash ────\n│ $ ls\n│ file.txt\n└─";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        assert!(
+            texts.len() >= 4,
+            "each line should be separate, got {} lines: {:?}",
+            texts.len(),
+            texts
+        );
+        assert!(texts[0].contains("┌─ Bash"), "first line: tool header");
+        assert!(texts[1].contains("│ $ ls"), "second line: command");
+        assert!(texts[2].contains("│ file.txt"), "third line: output");
+        assert!(texts[3].contains("└─"), "fourth line: closing box");
+    }
+
+    #[test]
+    fn test_heading_no_double_blank_line() {
+        let md = "## Title\n\nContent here";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        // Should be: heading, blank, content (3 lines).
+        // NOT: heading, blank, blank, content (4 lines).
+        assert_eq!(
+            texts.len(),
+            3,
+            "heading + blank + content = 3 lines, got {:?}",
+            texts
+        );
+        assert!(texts[0].contains("Title"));
+        assert_eq!(texts[1], ""); // single blank line
+        assert!(texts[2].contains("Content"));
     }
 }

@@ -1499,6 +1499,19 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             if in_graph {
                 app.record_graph_scroll_activity();
                 app.scroll.scroll_up(3);
+            } else if (in_right_content || in_tab_bar)
+                && app.right_panel_tab == RightPanelTab::Files
+                && app.last_file_tree_area.height > 0
+            {
+                // Files tab: scroll tree or preview depending on mouse position.
+                app.record_panel_scroll_activity();
+                if app.last_file_preview_area.contains(pos) {
+                    if let Some(fb) = app.file_browser.as_mut() {
+                        fb.preview_scroll_up(3);
+                    }
+                } else if let Some(fb) = app.file_browser.as_mut() {
+                    fb.tree_state.scroll_up(3);
+                }
             } else if in_right_content || in_tab_bar {
                 right_panel_scroll_up(app, 3);
             } else {
@@ -1510,6 +1523,19 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             if in_graph {
                 app.record_graph_scroll_activity();
                 app.scroll.scroll_down(3);
+            } else if (in_right_content || in_tab_bar)
+                && app.right_panel_tab == RightPanelTab::Files
+                && app.last_file_tree_area.height > 0
+            {
+                // Files tab: scroll tree or preview depending on mouse position.
+                app.record_panel_scroll_activity();
+                if app.last_file_preview_area.contains(pos) {
+                    if let Some(fb) = app.file_browser.as_mut() {
+                        fb.preview_scroll_down(3);
+                    }
+                } else if let Some(fb) = app.file_browser.as_mut() {
+                    fb.tree_state.scroll_down(3);
+                }
             } else if in_right_content || in_tab_bar {
                 right_panel_scroll_down(app, 3);
             } else {
@@ -1577,6 +1603,25 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 if app.input_mode == InputMode::ChatInput {
                     app.input_mode = InputMode::Normal;
                     app.chat_input_dismissed = true;
+                }
+            } else if in_right_content
+                && app.right_panel_tab == RightPanelTab::Files
+                && app.last_file_tree_area.height > 0
+            {
+                // Click in Files tab.
+                app.focused_panel = FocusedPanel::RightPanel;
+                if app.last_file_tree_area.contains(pos) {
+                    // Click on the tree pane: select the clicked item.
+                    if let Some(fb) = app.file_browser.as_mut() {
+                        fb.focus = super::file_browser::FileBrowserFocus::Tree;
+                        fb.tree_state.click_at(pos);
+                        fb.load_preview();
+                    }
+                } else if app.last_file_preview_area.contains(pos) {
+                    // Click on the preview pane: switch focus to preview.
+                    if let Some(fb) = app.file_browser.as_mut() {
+                        fb.focus = super::file_browser::FileBrowserFocus::Preview;
+                    }
                 }
             } else if in_right_content {
                 // Click in right panel content: focus the right panel.

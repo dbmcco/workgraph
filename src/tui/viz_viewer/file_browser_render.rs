@@ -7,18 +7,12 @@ use super::state::VizApp;
 
 /// Draw the Files tab: two-pane file browser (tree + preview).
 pub fn draw_files_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    let fb = match app.file_browser.as_mut() {
-        Some(fb) => fb,
-        None => {
-            let msg = Paragraph::new("Initializing file browser...")
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(msg, area);
-            return;
-        }
-    };
-
-    // Load preview if needed
-    fb.load_preview();
+    if app.file_browser.is_none() {
+        let msg = Paragraph::new("Initializing file browser...")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
 
     if area.height < 3 || area.width < 10 {
         return;
@@ -41,6 +35,15 @@ pub fn draw_files_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let tree_area = panes[0];
     let preview_area = panes[1];
+
+    // Store areas for mouse hit-testing.
+    app.last_file_tree_area = tree_area;
+    app.last_file_preview_area = preview_area;
+
+    let fb = app.file_browser.as_mut().unwrap();
+
+    // Load preview if needed
+    fb.load_preview();
 
     draw_tree_pane(frame, fb, tree_area);
     draw_preview_pane(frame, fb, preview_area);
