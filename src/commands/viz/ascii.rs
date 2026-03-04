@@ -1834,6 +1834,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         src.loop_iteration = 3;
         let mut tgt = make_task("tgt", "Target");
@@ -1884,6 +1886,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         task.loop_iteration = 2;
         graph.add_node(Node::Task(task));
@@ -1929,6 +1933,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         let mut tgt = make_task("tgt", "Target");
         tgt.after = vec!["src".to_string()];
@@ -2008,6 +2014,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         a.created_at = Some("2024-01-01T00:00:00Z".to_string());
         let mut b = make_task("verify", "Verify");
@@ -2283,6 +2291,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         a.created_at = Some("2024-01-01T00:00:00Z".to_string());
         let mut b = make_task("child", "Child");
@@ -2335,6 +2345,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         target.created_at = Some("2024-01-01T00:00:00Z".to_string());
 
@@ -2406,6 +2418,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         a.created_at = Some("2024-01-01T00:00:00Z".to_string());
         let mut b = make_task("bb", "BB");
@@ -2692,6 +2706,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         // F also blocks A (non-tree) → part of Arc B
         a.after.push("fff".to_string());

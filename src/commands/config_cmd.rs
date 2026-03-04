@@ -104,6 +104,10 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         );
         println!("  max_task_depth = {}", config.guardrails.max_task_depth);
         println!();
+        println!("[tui]");
+        println!("  chat_history = {}", config.tui.chat_history);
+        println!("  chat_history_max = {}", config.tui.chat_history_max);
+        println!();
         println!("[viz]");
         println!("  edge_color = \"{}\"", config.viz.edge_color);
         println!();
@@ -174,6 +178,8 @@ pub fn update(
     flip_enabled: Option<bool>,
     flip_inference_model: Option<&str>,
     flip_comparison_model: Option<&str>,
+    chat_history: Option<bool>,
+    chat_history_max: Option<usize>,
 ) -> Result<()> {
     let mut config = match scope {
         ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
@@ -364,6 +370,19 @@ pub fn update(
     if let Some(m) = flip_comparison_model {
         config.agency.flip_comparison_model = Some(m.to_string());
         println!("Set agency.flip_comparison_model = \"{}\"", m);
+        changed = true;
+    }
+
+    // TUI chat history settings
+    if let Some(v) = chat_history {
+        config.tui.chat_history = v;
+        println!("Set tui.chat_history = {}", v);
+        changed = true;
+    }
+
+    if let Some(v) = chat_history_max {
+        config.tui.chat_history_max = v;
+        println!("Set tui.chat_history_max = {}", v);
         changed = true;
     }
 
@@ -709,6 +728,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -733,6 +754,8 @@ mod tests {
             Some(60),
             None,
             Some("shell"),
+            None,
+            None,
             None,
             None,
             None,
@@ -803,6 +826,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -836,6 +861,8 @@ mod tests {
             Some("creator-hash"),
             Some("haiku"),
             Some("Retire below 0.3 after 10 evals"),
+            None,
+            None,
             None,
             None,
             None,

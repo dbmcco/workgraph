@@ -14,7 +14,10 @@ use workgraph::agency::{
 };
 use workgraph::chat;
 use workgraph::config::Config;
-use workgraph::graph::{LogEntry, Node, Status, Task, evaluate_all_cycle_iterations};
+use workgraph::graph::{
+    LogEntry, Node, Status, Task, evaluate_all_cycle_failure_restarts,
+    evaluate_all_cycle_iterations,
+};
 use workgraph::parser::{load_graph, save_graph};
 use workgraph::query::ready_tasks_with_peers_cycle_aware;
 use workgraph::service::registry::AgentRegistry;
@@ -519,6 +522,7 @@ fn build_auto_assign_tasks(
             agent: config.agency.assigner_agent.clone(),
 
             loop_iteration: 0,
+            cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),
@@ -735,6 +739,7 @@ fn build_auto_evaluate_tasks(
             agent: config.agency.evaluator_agent.clone(),
 
             loop_iteration: 0,
+            cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),
@@ -1134,6 +1139,22 @@ pub fn coordinator_tick(
             );
             save_graph(&graph, &graph_path)
                 .context("Failed to save graph after cycle reactivation")?;
+        }
+    }
+
+    // Phase 2.6: Cycle failure restart — reactivate cycles where a member is Failed
+    // and restart_on_failure is true (default). Analogous to phase 2.5 for successes.
+    {
+        let cycle_analysis = graph.compute_cycle_analysis();
+        let reactivated = evaluate_all_cycle_failure_restarts(&mut graph, &cycle_analysis);
+        if !reactivated.is_empty() {
+            eprintln!(
+                "[coordinator] Cycle failure restart: re-activated {} task(s): {:?}",
+                reactivated.len(),
+                reactivated
+            );
+            save_graph(&graph, &graph_path)
+                .context("Failed to save graph after cycle failure restart")?;
         }
     }
 

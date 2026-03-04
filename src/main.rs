@@ -317,6 +317,8 @@ fn main() -> Result<()> {
             cycle_guard,
             cycle_delay,
             no_converge,
+            no_restart_on_failure,
+            max_failure_restarts,
             visibility,
             context_scope,
             exec_mode,
@@ -359,6 +361,8 @@ fn main() -> Result<()> {
                     cycle_guard.as_deref(),
                     cycle_delay.as_deref(),
                     no_converge,
+                    no_restart_on_failure,
+                    max_failure_restarts,
                     &visibility,
                     context_scope.as_deref(),
                     exec_mode.as_deref(),
@@ -383,6 +387,8 @@ fn main() -> Result<()> {
             cycle_guard,
             cycle_delay,
             no_converge,
+            no_restart_on_failure,
+            max_failure_restarts,
             visibility,
             context_scope,
             exec_mode,
@@ -404,6 +410,8 @@ fn main() -> Result<()> {
             cycle_guard.as_deref(),
             cycle_delay.as_deref(),
             no_converge,
+            no_restart_on_failure,
+            max_failure_restarts,
             visibility.as_deref(),
             context_scope.as_deref(),
             exec_mode.as_deref(),
@@ -1372,6 +1380,8 @@ fn main() -> Result<()> {
             flip_enabled,
             flip_inference_model,
             flip_comparison_model,
+            chat_history,
+            chat_history_max,
         } => {
             // Derive scope from --global/--local flags
             let scope = if global {
@@ -1441,7 +1451,9 @@ fn main() -> Result<()> {
                     && eval_gate_all.is_none()
                     && flip_enabled.is_none()
                     && flip_inference_model.is_none()
-                    && flip_comparison_model.is_none())
+                    && flip_comparison_model.is_none()
+                    && chat_history.is_none()
+                    && chat_history_max.is_none())
             {
                 commands::config_cmd::show(&workgraph_dir, scope, cli.json)
             } else {
@@ -1480,6 +1492,8 @@ fn main() -> Result<()> {
                     flip_enabled,
                     flip_inference_model.as_deref(),
                     flip_comparison_model.as_deref(),
+                    chat_history,
+                    chat_history_max,
                 )
             }
         }

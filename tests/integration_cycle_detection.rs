@@ -460,6 +460,8 @@ fn test_dispatch_header_ready_when_external_deps_done() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![x, worker, validator]);
@@ -491,6 +493,8 @@ fn test_dispatch_header_not_ready_when_external_deps_open() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "B");
     b.after = vec!["a".to_string()];
@@ -518,6 +522,8 @@ fn test_dispatch_non_header_waits_for_predecessor() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "B");
     b.after = vec!["a".to_string()];
@@ -550,6 +556,8 @@ fn test_dispatch_non_iterator_not_ready_when_pred_open() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![a, b, c]);
@@ -613,6 +621,8 @@ fn test_dispatch_back_edge_exemption_only_for_iterator_blocker() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![a, b, c]);
@@ -671,6 +681,8 @@ fn test_dispatch_reiteration_worker_ready_after_reopen() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     validator.loop_iteration = 1;
 
@@ -714,6 +726,8 @@ fn test_dispatch_cycle_header_not_exempt_from_forward_deps() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![design, integrate, verify]);
@@ -751,6 +765,8 @@ fn test_dispatch_cycle_header_ready_when_all_forward_deps_done() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![design, integrate, verify]);
@@ -781,6 +797,8 @@ fn test_completion_all_done_triggers_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -814,6 +832,8 @@ fn test_completion_partial_no_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -843,6 +863,8 @@ fn test_completion_converged_stops_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.tags = vec!["converged".to_string()];
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -873,6 +895,8 @@ fn test_completion_max_iterations_respected() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.loop_iteration = 2; // Already at max
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -901,6 +925,8 @@ fn test_completion_max_iterations_allows_under_limit() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.loop_iteration = 1;
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -935,6 +961,8 @@ fn test_completion_guard_prevents_iteration() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -964,6 +992,8 @@ fn test_completion_guard_allows_iteration() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -989,6 +1019,8 @@ fn test_completion_guard_always_allows() {
         guard: Some(LoopGuard::Always),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1014,6 +1046,8 @@ fn test_completion_delay_applied() {
         guard: None,
         delay: Some("30s".to_string()),
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1070,6 +1104,8 @@ fn test_completion_iteration_counter_increments() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1105,6 +1141,8 @@ fn test_completion_clears_assignment_and_timestamps() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.assigned = Some("agent-1".to_string());
     a.started_at = Some("2026-01-01T00:00:00Z".to_string());
@@ -1147,6 +1185,8 @@ fn test_completion_adds_log_entry() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1192,6 +1232,8 @@ fn test_completion_failed_member_prevents_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Failed);
     b.after = vec!["a".to_string()];
@@ -1216,6 +1258,8 @@ fn test_completion_three_node_cycle_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1247,6 +1291,8 @@ fn test_completion_multiple_independent_cycles() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1259,6 +1305,8 @@ fn test_completion_multiple_independent_cycles() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut d = make_task("d", "D"); // Open
     d.after = vec!["c".to_string()];
@@ -1301,6 +1349,8 @@ fn test_completion_iteration_less_than_guard() {
         guard: Some(LoopGuard::IterationLessThan(2)),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.loop_iteration = 0;
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -1633,6 +1683,8 @@ fn test_cli_done_triggers_cycle_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "B");
     b.status = Status::InProgress; // Was working on it
@@ -1677,6 +1729,8 @@ fn test_cli_done_converged_stops_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![a, b]);
@@ -1709,6 +1763,8 @@ fn test_cli_done_cycle_three_nodes() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -1744,6 +1800,8 @@ fn test_cli_done_max_iterations_stops_cli() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.loop_iteration = 1;
     let mut b = make_task("b", "B");
@@ -1803,6 +1861,8 @@ fn test_cycle_with_mixed_statuses_no_iteration() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::InProgress);
     b.after = vec!["a".to_string()];
@@ -1875,6 +1935,8 @@ fn test_normal_ready_tasks_no_cycle_exemption() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "B");
     b.after = vec!["a".to_string()];
@@ -1905,6 +1967,8 @@ fn test_implicit_cycle_fires_on_done() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut graph = build_graph(vec![a, b]);
@@ -1952,6 +2016,8 @@ fn test_implicit_cycle_respects_max_iterations() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut graph = build_graph(vec![a, b]);
@@ -1975,6 +2041,8 @@ fn test_implicit_cycle_respects_converged() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     b.tags = vec!["converged".to_string()];
 
@@ -1999,6 +2067,8 @@ fn test_implicit_cycle_partial_done_no_fire() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut graph = build_graph(vec![a, b]);
@@ -2023,6 +2093,8 @@ fn test_implicit_cycle_multiple_deps() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut graph = build_graph(vec![a, b, c]);
@@ -2117,6 +2189,8 @@ fn test_viz_cycle_back_reference_annotation() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "Task B");
     b.after = vec!["a".to_string()];
@@ -2178,6 +2252,8 @@ fn test_viz_implicit_cycle_annotation() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![a, b]);
@@ -2211,6 +2287,8 @@ fn test_self_convergence_blocked_by_guard() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![sentinel, a, b]);
@@ -2261,6 +2339,8 @@ fn test_self_convergence_works_without_guard() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![a, b]);
@@ -2295,6 +2375,8 @@ fn test_self_convergence_guard_always_treated_as_no_guard() {
         guard: Some(LoopGuard::Always),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![a, b]);
@@ -2330,6 +2412,8 @@ fn test_unit_guard_authority_ignores_converged_tag() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -2366,6 +2450,8 @@ fn test_guard_stops_cycle_when_condition_not_met() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![sentinel, a, b]);
@@ -2401,6 +2487,8 @@ fn test_guard_allows_cycle_when_condition_met() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![sentinel, a, b]);
@@ -2532,6 +2620,8 @@ fn test_mixed_deps_setup_not_reopened() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut graph = build_graph(vec![setup, impl_task, validate]);
@@ -2632,6 +2722,8 @@ fn test_first_iteration_exemption_header_ready() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![x, a, b]);
@@ -2661,6 +2753,8 @@ fn test_first_iteration_exemption_implicit_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![a, b]);
@@ -3054,6 +3148,8 @@ fn test_deep_guard_authority_blocks_self_convergence() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     // Add converged tag — guard should override it
     b.tags = vec!["converged".to_string()];
@@ -3148,6 +3244,8 @@ fn test_deep_first_iteration_ordering_unit_test() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![a, b]);
@@ -3184,6 +3282,8 @@ fn test_deep_reiteration_ordering() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     b.loop_iteration = 1;
 
@@ -3376,6 +3476,8 @@ fn test_deep_three_task_cycle_unit() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -3722,6 +3824,8 @@ fn test_deep_converged_first_iteration_unit() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     b.tags = vec!["converged".to_string()];
 
@@ -3849,6 +3953,8 @@ fn test_deep_parallel_cycles_dispatch_independence() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let mut c = make_task("c", "C");
@@ -3860,6 +3966,8 @@ fn test_deep_parallel_cycles_dispatch_independence() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let graph = build_graph(vec![a, b, c, d]);
@@ -3960,6 +4068,8 @@ fn test_deep_nested_structure_dependent_non_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut reporter = make_task("reporter", "Reporter");
     reporter.after = vec!["validator".to_string()];
@@ -4246,6 +4356,8 @@ fn test_viz_cycle_back_edge_no_duplicate_node_rendering() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     // Back-edge: a depends on c (creating cycle a→b→c→a)
     let mut a_with_back = a.clone();
@@ -4288,6 +4400,8 @@ fn test_viz_cycle_members_shown_without_all_flag() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     // Back-edge: a depends on b (creating cycle a→b→a)
     let mut a_with_back = a.clone();
@@ -4324,6 +4438,8 @@ fn test_reactivate_ignores_converged_tag_when_guard_is_set() {
         }),
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.tags = vec!["converged".to_string()]; // Injected converged tag
 
@@ -4354,6 +4470,8 @@ fn test_reactivate_respects_converged_tag_when_no_guard() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.tags = vec!["converged".to_string()];
 
@@ -4386,6 +4504,8 @@ fn test_evaluate_all_cycles_reactivates_completed_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -4411,6 +4531,8 @@ fn test_evaluate_all_cycles_skips_incomplete_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task("b", "B"); // Open
     b.after = vec!["a".to_string()];
@@ -4435,6 +4557,8 @@ fn test_evaluate_all_cycles_respects_max_iterations() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.loop_iteration = 2;
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -4461,6 +4585,8 @@ fn test_evaluate_all_cycles_three_node_cycle() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -4491,6 +4617,8 @@ fn test_evaluate_all_cycles_multi_iteration_sweep() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -4538,6 +4666,8 @@ fn test_evaluate_all_cycles_respects_convergence() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.tags = vec!["converged".to_string()];
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -4668,6 +4798,8 @@ fn test_no_converge_ignores_converged_tag_in_reactivate() {
         guard: None,
         delay: None,
         no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     a.tags = vec!["converged".to_string()]; // Would normally stop the cycle
     let mut b = make_task_with_status("b", "B", Status::Done);
@@ -4693,6 +4825,8 @@ fn test_no_converge_respects_max_iterations() {
         guard: None,
         delay: None,
         no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];
@@ -4721,6 +4855,8 @@ fn test_cli_done_converged_ignored_for_no_converge_cycle() {
         guard: None,
         delay: None,
         no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
 
     let wg_dir = setup_workgraph(&tmp, vec![a, b]);
@@ -4754,6 +4890,8 @@ fn test_no_converge_without_converged_tag_iterates_normally() {
         guard: None,
         delay: None,
         no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "B", Status::Done);
     b.after = vec!["a".to_string()];

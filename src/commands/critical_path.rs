@@ -417,6 +417,7 @@ mod tests {
             verify: None,
             agent: None,
             loop_iteration: 0,
+            cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),

@@ -516,6 +516,8 @@ mod tests {
             }),
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         setup_workgraph(dir_path, vec![header]);
@@ -561,6 +563,8 @@ mod tests {
             }),
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         let mut worker = make_task("worker", "Worker in cycle", Status::Open);
@@ -603,6 +607,8 @@ mod tests {
             guard: Some(LoopGuard::Always),
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         setup_workgraph(dir_path, vec![header]);
@@ -638,6 +644,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         setup_workgraph(dir_path, vec![header]);
@@ -723,6 +731,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: true,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         setup_workgraph(dir_path, vec![header]);
@@ -768,6 +778,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: true,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         let mut worker = make_task("worker", "Worker in forced cycle", Status::Open);

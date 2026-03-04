@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
-use workgraph::graph::{LogEntry, Status};
+use workgraph::graph::{LogEntry, Status, evaluate_cycle_on_failure};
 use workgraph::parser::save_graph;
 
 #[cfg(test)]
@@ -65,12 +65,27 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
         message: log_message,
     });
 
-    // Extract values we need for printing before saving
+    // Extract values we need before cycle restart may modify the task
     let retry_count = task.retry_count;
     let max_retries = task.max_retries;
+    let agent_id_for_archive = task.assigned.clone();
+
+    // Evaluate cycle failure restart — if this task is part of a cycle with
+    // restart_on_failure (default true), reset all cycle members to Open.
+    let id_owned = id.to_string();
+    let cycle_analysis = graph.compute_cycle_analysis();
+    let cycle_reactivated = evaluate_cycle_on_failure(&mut graph, &id_owned, &cycle_analysis);
 
     save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
+
+    if !cycle_reactivated.is_empty() {
+        println!(
+            "  Cycle failure restart: re-activated {} task(s): {:?}",
+            cycle_reactivated.len(),
+            cycle_reactivated
+        );
+    }
 
     // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
@@ -106,9 +121,8 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
     }
 
     // Archive agent conversation (prompt + output) for provenance
-    if let Some(task) = graph.get_task(id)
-        && let Some(ref agent_id) = task.assigned
-    {
+    // Use agent_id captured before cycle restart (which clears assigned)
+    if let Some(ref agent_id) = agent_id_for_archive {
         match super::log::archive_agent(dir, id, agent_id) {
             Ok(archive_dir) => {
                 eprintln!("Agent archived to {}", archive_dir.display());

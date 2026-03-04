@@ -859,6 +859,8 @@ mod tests {
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
         src.loop_iteration = 2;
         let mut tgt = make_task("tgt", "Target");

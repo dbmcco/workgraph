@@ -861,6 +861,7 @@ mod tests {
             verify: None,
             agent: None,
             loop_iteration: 0,
+            cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),
@@ -1588,6 +1589,8 @@ args = ["--custom-flag"]
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         let vars = TemplateVars::from_task(&task, None, None);
@@ -1660,6 +1663,8 @@ args = ["--custom-flag"]
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         let vars = TemplateVars::from_task(&task, None, None);
@@ -1791,6 +1796,8 @@ args = ["--custom-flag"]
             guard: None,
             delay: None,
             no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
         });
 
         let vars = TemplateVars::from_task(&task, None, None);

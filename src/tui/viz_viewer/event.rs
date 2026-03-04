@@ -1633,6 +1633,34 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                             app.right_panel_tab = RightPanelTab::Messages;
                             app.invalidate_messages_panel();
                             app.load_messages_panel();
+                        } else if let Some(line) = app.plain_lines.get(orig_line) {
+                            // Determine click region for tab switching.
+                            let chars: Vec<char> = line.chars().collect();
+                            let text_start = chars.iter().position(|c| c.is_alphanumeric());
+                            // Find the "  (" separator between task ID and status.
+                            let paren_start = text_start.and_then(|ts| {
+                                (ts..chars.len().saturating_sub(1))
+                                    .find(|&i| chars[i] == ' ' && chars[i + 1] == '(')
+                            });
+                            if let (Some(ts), Some(ps)) = (text_start, paren_start) {
+                                if content_col >= ts && content_col < ps {
+                                    // Clicked on task name → Detail tab.
+                                    app.right_panel_visible = true;
+                                    if app.layout_mode == super::state::LayoutMode::Off {
+                                        app.layout_mode = super::state::LayoutMode::ThirdInspector;
+                                    }
+                                    app.right_panel_tab = RightPanelTab::Detail;
+                                } else if content_col >= ps {
+                                    // Clicked on metadata (status/tokens/time) → Log tab.
+                                    app.right_panel_visible = true;
+                                    if app.layout_mode == super::state::LayoutMode::Off {
+                                        app.layout_mode = super::state::LayoutMode::ThirdInspector;
+                                    }
+                                    app.right_panel_tab = RightPanelTab::Log;
+                                    app.invalidate_log_pane();
+                                    app.load_log_pane();
+                                }
+                            }
                         }
                     }
                 }

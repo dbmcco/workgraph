@@ -340,6 +340,8 @@ fn cycle_delay_sets_ready_after_on_reactivation() {
         guard: None,
         delay: Some("60s".to_string()),
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "Cycle tail", Status::Done);
     b.after = vec!["a".to_string()];
@@ -400,6 +402,8 @@ fn cycle_no_delay_no_ready_after() {
         guard: None,
         delay: None,
         no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
     });
     let mut b = make_task_with_status("b", "No delay tail", Status::Done);
     b.after = vec!["a".to_string()];

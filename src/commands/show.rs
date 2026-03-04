@@ -70,6 +70,8 @@ struct TaskDetails {
     agent: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     loop_iteration: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    cycle_failure_restarts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     cycle_config: Option<CycleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,6 +196,7 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         verify: task.verify.clone(),
         agent: task.agent.clone(),
         loop_iteration: task.loop_iteration,
+        cycle_failure_restarts: task.cycle_failure_restarts,
         cycle_config: task.cycle_config.clone(),
         ready_after: task.ready_after.clone(),
         paused: task.paused,
@@ -505,6 +508,7 @@ mod tests {
             verify: None,
             agent: None,
             loop_iteration: 0,
+            cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
             visibility: "internal".to_string(),

@@ -578,6 +578,81 @@ pub enum ChatRole {
     System,
 }
 
+/// Serializable chat message for persistence to disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedChatMessage {
+    role: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<String>,
+    timestamp: String,
+}
+
+/// Path to the persisted chat history file.
+fn chat_history_path(workgraph_dir: &std::path::Path) -> std::path::PathBuf {
+    workgraph_dir.join("chat-history.json")
+}
+
+/// Save chat messages to disk. Respects config for max history size.
+fn save_chat_history(workgraph_dir: &std::path::Path, messages: &[ChatMessage]) {
+    let config = Config::load_or_default(workgraph_dir);
+    if !config.tui.chat_history {
+        return;
+    }
+    let max = config.tui.chat_history_max;
+    let skip = messages.len().saturating_sub(max);
+    let persisted: Vec<PersistedChatMessage> = messages[skip..]
+        .iter()
+        .map(|m| PersistedChatMessage {
+            role: match m.role {
+                ChatRole::User => "user".to_string(),
+                ChatRole::Coordinator => "coordinator".to_string(),
+                ChatRole::System => "system".to_string(),
+            },
+            text: m.text.clone(),
+            full_text: m.full_text.clone(),
+            attachments: m.attachments.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        })
+        .collect();
+    let path = chat_history_path(workgraph_dir);
+    if let Ok(json) = serde_json::to_string(&persisted) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Load persisted chat history from disk.
+fn load_persisted_chat_history(workgraph_dir: &std::path::Path) -> Vec<ChatMessage> {
+    let config = Config::load_or_default(workgraph_dir);
+    if !config.tui.chat_history {
+        return vec![];
+    }
+    let path = chat_history_path(workgraph_dir);
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return vec![],
+    };
+    let persisted: Vec<PersistedChatMessage> = match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(_) => return vec![],
+    };
+    persisted
+        .into_iter()
+        .map(|p| ChatMessage {
+            role: match p.role.as_str() {
+                "user" => ChatRole::User,
+                "coordinator" => ChatRole::Coordinator,
+                _ => ChatRole::System,
+            },
+            text: p.text,
+            full_text: p.full_text,
+            attachments: p.attachments,
+        })
+        .collect()
+}
+
 /// State for the agent monitor panel.
 #[derive(Default)]
 pub struct AgentMonitorState {
@@ -1782,90 +1857,6 @@ impl VizApp {
         }
     }
 
-    /// Center the viewport on a newly focused task with WCC awareness.
-    ///
-    /// Instead of just centering on the task itself, this tries to show the
-    /// top of the weakly connected component (WCC) the task belongs to, so the
-    /// user can see the full cluster. If the WCC is too tall to fit in the
-    /// viewport, centers on the task but biases upward.
-    fn center_on_new_task_wcc_aware(&mut self) {
-        let task_id = match self.selected_task_idx.and_then(|i| self.task_order.get(i)) {
-            Some(id) => id.clone(),
-            None => return,
-        };
-        let task_orig_line = match self.node_line_map.get(&task_id) {
-            Some(&line) => line,
-            None => return,
-        };
-        let task_visible = match self.original_to_visible(task_orig_line) {
-            Some(pos) => pos,
-            None => return,
-        };
-
-        let vh = self.scroll.viewport_height;
-        if vh == 0 {
-            return;
-        }
-
-        // Find all tasks in the same WCC via BFS on undirected edges.
-        let wcc = self.find_wcc_tasks(&task_id);
-
-        // Find the top (minimum) and bottom (maximum) visible lines of the WCC.
-        let mut wcc_top = task_visible;
-        let mut wcc_bottom = task_visible;
-        for wcc_id in &wcc {
-            if let Some(&orig) = self.node_line_map.get(wcc_id.as_str())
-                && let Some(vis) = self.original_to_visible(orig)
-            {
-                wcc_top = wcc_top.min(vis);
-                wcc_bottom = wcc_bottom.max(vis);
-            }
-        }
-
-        let wcc_height = wcc_bottom - wcc_top + 1;
-
-        if wcc_height <= vh {
-            // Entire WCC fits in viewport. Position so the WCC is vertically
-            // centered, which also keeps the new task in view.
-            let padding = (vh - wcc_height) / 2;
-            self.scroll.offset_y = wcc_top.saturating_sub(padding);
-        } else {
-            // WCC is taller than viewport. Center on the new task but bias
-            // upward: place the task at 2/3 from the top so more of the
-            // WCC above it is visible.
-            let bias = vh * 2 / 3;
-            self.scroll.offset_y = task_visible.saturating_sub(bias);
-        }
-        self.scroll.clamp();
-    }
-
-    /// Find all task IDs in the same weakly connected component as `task_id`.
-    fn find_wcc_tasks(&self, task_id: &str) -> HashSet<String> {
-        let mut visited = HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        visited.insert(task_id.to_string());
-        queue.push_back(task_id.to_string());
-        while let Some(current) = queue.pop_front() {
-            // Follow forward edges (dependents).
-            if let Some(fwd) = self.forward_edges.get(&current) {
-                for neighbor in fwd {
-                    if visited.insert(neighbor.clone()) {
-                        queue.push_back(neighbor.clone());
-                    }
-                }
-            }
-            // Follow reverse edges (dependencies).
-            if let Some(rev) = self.reverse_edges.get(&current) {
-                for neighbor in rev {
-                    if visited.insert(neighbor.clone()) {
-                        queue.push_back(neighbor.clone());
-                    }
-                }
-            }
-        }
-        visited
-    }
-
     /// Select the task at the given original line index, if any.
     /// Returns true if a task was found and selected.
     pub fn select_task_at_line(&mut self, orig_line: usize) -> bool {
@@ -2365,6 +2356,11 @@ impl VizApp {
         let needs_token_refresh = self.task_counts.in_progress > 0;
 
         if graph_changed || needs_token_refresh {
+            // Capture HUD scroll state BEFORE load_viz(), because load_viz() ->
+            // recompute_trace() -> invalidate_hud() clears hud_detail.
+            let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
+            let prev_hud_scroll = self.hud_scroll;
+
             if graph_changed {
                 self.last_graph_mtime = current_mtime;
                 // Update smart-follow state before reloading: track if user is at bottom.
@@ -2378,8 +2374,6 @@ impl VizApp {
             self.load_agent_monitor();
             self.update_agent_streams();
             // Preserve HUD scroll position when the selected task hasn't changed.
-            let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
-            let prev_hud_scroll = self.hud_scroll;
             self.invalidate_hud();
             // Eagerly reload so we can restore scroll before render.
             self.load_hud_detail();
@@ -3812,6 +3806,7 @@ impl VizApp {
                             full_text: None,
                             attachments: vec![],
                         });
+                        save_chat_history(&self.workgraph_dir, &self.chat.messages);
                     }
                     // Clear awaiting state — the response arrives via poll_chat_messages.
                     // Don't push the response here to avoid duplicates with poll.
@@ -4207,45 +4202,52 @@ impl VizApp {
             .is_some_and(|s| is_service_alive(s.pid));
     }
 
-    /// Load chat history from inbox/outbox files on startup.
+    /// Load chat history on startup.
+    /// Tries the persisted chat-history.json first, then falls back to inbox/outbox.
     pub fn load_chat_history(&mut self) {
-        let history = match workgraph::chat::read_history(&self.workgraph_dir) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
+        let persisted = load_persisted_chat_history(&self.workgraph_dir);
+        if !persisted.is_empty() {
+            self.chat.messages = persisted;
+        } else {
+            // Fall back to inbox/outbox (e.g. first run after upgrade).
+            let history = workgraph::chat::read_history(&self.workgraph_dir).unwrap_or_default();
 
-        self.chat.messages.clear();
-        for msg in &history {
-            let role = match msg.role.as_str() {
-                "user" => ChatRole::User,
-                "coordinator" => ChatRole::Coordinator,
-                _ => ChatRole::System,
-            };
-            let att_names: Vec<String> = msg
-                .attachments
-                .iter()
-                .map(|a| {
-                    std::path::Path::new(&a.path)
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .unwrap_or(&a.path)
-                        .to_string()
-                })
-                .collect();
-            self.chat.messages.push(ChatMessage {
-                role,
-                text: msg.content.clone(),
-                full_text: msg.full_response.clone(),
-                attachments: att_names,
-            });
+            self.chat.messages.clear();
+            for msg in &history {
+                let role = match msg.role.as_str() {
+                    "user" => ChatRole::User,
+                    "coordinator" => ChatRole::Coordinator,
+                    _ => ChatRole::System,
+                };
+                let att_names: Vec<String> = msg
+                    .attachments
+                    .iter()
+                    .map(|a| {
+                        std::path::Path::new(&a.path)
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or(&a.path)
+                            .to_string()
+                    })
+                    .collect();
+                self.chat.messages.push(ChatMessage {
+                    role,
+                    text: msg.content.clone(),
+                    full_text: msg.full_response.clone(),
+                    attachments: att_names,
+                });
+            }
+
+            // Persist the loaded history so next restart uses the file.
+            if !self.chat.messages.is_empty() {
+                save_chat_history(&self.workgraph_dir, &self.chat.messages);
+            }
         }
 
         // Set outbox cursor to latest outbox message ID so we don't re-display old messages.
         if let Ok(msgs) = workgraph::chat::read_outbox_since(&self.workgraph_dir, 0) {
             self.chat.outbox_cursor = msgs.last().map(|m| m.id).unwrap_or(0);
         }
-        // Also track inbox cursor to detect messages from other sources.
-        // (We just loaded history, so we're caught up.)
     }
 
     /// Poll for new coordinator responses in the outbox.
@@ -4282,6 +4284,9 @@ impl VizApp {
                 attachments: att_names,
             });
         }
+
+        // Persist updated chat history.
+        save_chat_history(&self.workgraph_dir, &self.chat.messages);
 
         // Update cursor to latest message.
         self.chat.outbox_cursor = new_msgs
@@ -4332,6 +4337,9 @@ impl VizApp {
             full_text: None,
             attachments: att_names,
         });
+
+        // Persist updated chat history.
+        save_chat_history(&self.workgraph_dir, &self.chat.messages);
 
         // Reset scroll to bottom.
         self.chat.scroll = 0;

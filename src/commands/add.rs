@@ -62,6 +62,8 @@ pub fn run(
     cycle_guard: Option<&str>,
     cycle_delay: Option<&str>,
     no_converge: bool,
+    no_restart_on_failure: bool,
+    max_failure_restarts: Option<u32>,
     visibility: &str,
     context_scope: Option<&str>,
     exec_mode: Option<&str>,
@@ -205,6 +207,8 @@ pub fn run(
             guard,
             delay,
             no_converge,
+            restart_on_failure: !no_restart_on_failure,
+            max_failure_restarts,
         })
     } else {
         if cycle_guard.is_some() || cycle_delay.is_some() {
@@ -212,6 +216,11 @@ pub fn run(
         }
         if no_converge {
             anyhow::bail!("--no-converge requires --max-iterations");
+        }
+        if no_restart_on_failure || max_failure_restarts.is_some() {
+            anyhow::bail!(
+                "--no-restart-on-failure and --max-failure-restarts require --max-iterations"
+            );
         }
         None
     };
@@ -275,6 +284,7 @@ pub fn run(
         verify: verify.map(String::from),
         agent: None,
         loop_iteration: 0,
+        cycle_failure_restarts: 0,
         cycle_config,
         ready_after: None,
         paused,
@@ -512,6 +522,7 @@ fn add_task_directly(
         verify: verify.map(String::from),
         agent: None,
         loop_iteration: 0,
+        cycle_failure_restarts: 0,
         ready_after: None,
         paused: false,
         visibility: "internal".to_string(),
@@ -944,6 +955,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -984,6 +997,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -1024,6 +1039,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -1071,6 +1088,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -1115,6 +1134,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,

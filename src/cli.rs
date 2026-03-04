@@ -114,6 +114,14 @@ pub enum Commands {
         #[arg(long = "no-converge")]
         no_converge: bool,
 
+        /// Disable automatic cycle restart on failure (restart is on by default)
+        #[arg(long = "no-restart-on-failure")]
+        no_restart_on_failure: bool,
+
+        /// Maximum failure-triggered cycle restarts (default: 3)
+        #[arg(long = "max-failure-restarts")]
+        max_failure_restarts: Option<u32>,
+
         /// Task visibility zone for trace exports (internal, public, peer)
         #[arg(long, default_value = "internal")]
         visibility: String,
@@ -200,6 +208,14 @@ pub enum Commands {
         /// Force all cycle iterations to run (agents cannot signal convergence)
         #[arg(long = "no-converge")]
         no_converge: bool,
+
+        /// Disable automatic cycle restart on failure
+        #[arg(long = "no-restart-on-failure")]
+        no_restart_on_failure: bool,
+
+        /// Maximum failure-triggered cycle restarts (default: 3)
+        #[arg(long = "max-failure-restarts")]
+        max_failure_restarts: Option<u32>,
 
         /// Set task visibility zone (internal, public, peer)
         #[arg(long)]
@@ -1042,6 +1058,14 @@ pub enum Commands {
         /// Model for FLIP comparison phase (scoring similarity)
         #[arg(long, name = "flip-comparison-model")]
         flip_comparison_model: Option<String>,
+
+        /// Enable/disable chat history persistence across TUI restarts
+        #[arg(long, name = "chat-history")]
+        chat_history: Option<bool>,
+
+        /// Maximum number of chat messages to persist (default: 1000)
+        #[arg(long, name = "chat-history-max")]
+        chat_history_max: Option<usize>,
     },
 
     /// Detect and clean up dead agents

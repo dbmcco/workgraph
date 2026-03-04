@@ -211,6 +211,12 @@ pub struct TuiConfig {
     /// Inspector panel ratio: percentage of width given to the inspector in split mode (default: 67)
     #[serde(default = "default_panel_ratio")]
     pub panel_ratio: u16,
+    /// Persist chat history across TUI restarts (default: true)
+    #[serde(default = "default_true")]
+    pub chat_history: bool,
+    /// Maximum number of chat messages to persist (default: 1000)
+    #[serde(default = "default_chat_history_max")]
+    pub chat_history_max: usize,
 }
 
 fn default_tui_layout() -> String {
@@ -234,6 +240,9 @@ fn default_message_indent() -> u16 {
 fn default_panel_ratio() -> u16 {
     67
 }
+fn default_chat_history_max() -> usize {
+    1000
+}
 
 impl Default for TuiConfig {
     fn default() -> Self {
@@ -246,6 +255,8 @@ impl Default for TuiConfig {
             message_name_threshold: default_message_name_threshold(),
             message_indent: default_message_indent(),
             panel_ratio: default_panel_ratio(),
+            chat_history: true,
+            chat_history_max: default_chat_history_max(),
         }
     }
 }

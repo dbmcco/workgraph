@@ -25,6 +25,8 @@ pub fn run(
     cycle_guard: Option<&str>,
     cycle_delay: Option<&str>,
     no_converge: bool,
+    no_restart_on_failure: bool,
+    max_failure_restarts: Option<u32>,
     visibility: Option<&str>,
     context_scope: Option<&str>,
     exec_mode: Option<&str>,
@@ -173,6 +175,8 @@ pub fn run(
                 guard,
                 delay,
                 no_converge,
+                restart_on_failure: !no_restart_on_failure,
+                max_failure_restarts,
             });
             println!(
                 "Set cycle_config: max_iterations={}{}",
@@ -218,6 +222,28 @@ pub fn run(
                 } else {
                     anyhow::bail!(
                         "Cannot set --no-converge without --max-iterations: task has no cycle_config"
+                    );
+                }
+            }
+            if no_restart_on_failure {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.restart_on_failure = false;
+                    println!("Disabled restart-on-failure for cycle");
+                    changed = true;
+                } else {
+                    anyhow::bail!(
+                        "Cannot set --no-restart-on-failure without --max-iterations: task has no cycle_config"
+                    );
+                }
+            }
+            if let Some(max) = max_failure_restarts {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.max_failure_restarts = Some(max);
+                    println!("Set max-failure-restarts: {}", max);
+                    changed = true;
+                } else {
+                    anyhow::bail!(
+                        "Cannot set --max-failure-restarts without --max-iterations: task has no cycle_config"
                     );
                 }
             }
@@ -403,6 +429,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -440,6 +468,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -468,6 +498,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             "internal",
             None,
             None,
@@ -500,6 +532,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -535,6 +569,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -570,6 +606,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -606,6 +644,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -641,6 +681,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -677,6 +719,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -712,6 +756,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -747,6 +793,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -783,6 +831,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -818,6 +868,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -849,6 +901,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -879,6 +933,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -916,6 +972,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -957,6 +1015,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -982,6 +1042,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -1032,6 +1094,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -1090,6 +1154,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -1129,6 +1195,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,
@@ -1163,6 +1231,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
             None,
             None,
             None,

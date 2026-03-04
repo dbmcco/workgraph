@@ -17,10 +17,26 @@ pub struct CycleConfig {
     /// When true, agents cannot signal convergence — all iterations MUST run
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_converge: bool,
+    /// When true (default), if any cycle member fails, restart the entire cycle
+    /// from the header instead of dead-ending. Set to false to preserve legacy behavior.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub restart_on_failure: bool,
+    /// Maximum number of failure-triggered restarts per cycle lifetime.
+    /// Prevents infinite failure loops. Defaults to 3 when restart_on_failure is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_failure_restarts: Option<u32>,
 }
 
 fn is_false(b: &bool) -> bool {
     !b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Guard condition for a loop edge
@@ -219,6 +235,9 @@ pub struct Task {
     /// Current cycle iteration (0 = first run, incremented on each re-activation)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub loop_iteration: u32,
+    /// Number of failure-triggered cycle restarts consumed (on cycle config owner only)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cycle_failure_restarts: u32,
     /// Configuration for structural cycle iteration (only on cycle header tasks)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cycle_config: Option<CycleConfig>,
@@ -627,6 +646,8 @@ struct TaskHelper {
     #[serde(default)]
     loop_iteration: u32,
     #[serde(default)]
+    cycle_failure_restarts: u32,
+    #[serde(default)]
     cycle_config: Option<CycleConfig>,
     #[serde(default)]
     ready_after: Option<String>,
@@ -690,6 +711,7 @@ impl<'de> Deserialize<'de> for Task {
             verify: helper.verify,
             agent,
             loop_iteration: helper.loop_iteration,
+            cycle_failure_restarts: helper.cycle_failure_restarts,
             cycle_config: helper.cycle_config,
             ready_after: helper.ready_after,
             paused: helper.paused,
@@ -1241,6 +1263,246 @@ pub fn evaluate_all_cycle_iterations(
 
         let reactivated = reactivate_cycle(graph, &cycle.members, &config_owner_id, &cycle_config);
         all_reactivated.extend(reactivated);
+    }
+
+    all_reactivated
+}
+
+/// Evaluate whether a failed task should trigger a cycle restart.
+///
+/// When a task in a cycle fails and `restart_on_failure` is true (the default),
+/// this resets all cycle members to Open so the cycle retries from the top.
+/// The `loop_iteration` is NOT incremented (the failed iteration is retried).
+/// The `cycle_failure_restarts` counter on the config owner IS incremented.
+///
+/// Returns the list of task IDs that were re-activated, or empty if no restart.
+pub fn evaluate_cycle_on_failure(
+    graph: &mut WorkGraph,
+    failed_task_id: &str,
+    cycle_analysis: &CycleAnalysis,
+) -> Vec<String> {
+    // Mode 1: SCC-detected cycle
+    if let Some(&cycle_idx) = cycle_analysis.task_to_cycle.get(failed_task_id) {
+        let cycle = &cycle_analysis.cycles[cycle_idx];
+
+        let (config_owner_id, cycle_config) = {
+            let mut found = None;
+            for member_id in &cycle.members {
+                if let Some(task) = graph.get_task(member_id)
+                    && let Some(ref config) = task.cycle_config
+                {
+                    found = Some((member_id.clone(), config.clone()));
+                    break;
+                }
+            }
+            match found {
+                Some(pair) => pair,
+                None => return vec![],
+            }
+        };
+
+        return reactivate_cycle_on_failure(
+            graph,
+            &cycle.members,
+            &config_owner_id,
+            &cycle_config,
+            failed_task_id,
+        );
+    }
+
+    // Mode 2: Implicit cycle — failed task has cycle_config
+    if let Some(task) = graph.get_task(failed_task_id)
+        && let Some(ref config) = task.cycle_config
+    {
+        let config = config.clone();
+        let mut members: Vec<String> = task.after.clone();
+        let config_owner_id = failed_task_id.to_string();
+        if !members.contains(&config_owner_id) {
+            members.push(config_owner_id.clone());
+        }
+
+        return reactivate_cycle_on_failure(
+            graph,
+            &members,
+            &config_owner_id,
+            &config,
+            failed_task_id,
+        );
+    }
+
+    // Mode 3: Failed task is a member of an implicit cycle (config owner is different)
+    for (id, node) in &graph.nodes {
+        if let Node::Task(task) = node
+            && task.cycle_config.is_some()
+            && task.after.contains(&failed_task_id.to_string())
+        {
+            let config = task.cycle_config.as_ref().unwrap().clone();
+            let config_owner_id = id.clone();
+            let mut members = task.after.clone();
+            if !members.contains(&config_owner_id) {
+                members.push(config_owner_id.clone());
+            }
+
+            return reactivate_cycle_on_failure(
+                graph,
+                &members,
+                &config_owner_id,
+                &config,
+                failed_task_id,
+            );
+        }
+    }
+
+    vec![]
+}
+
+/// Failure-triggered cycle restart: re-open all members when a cycle member fails.
+fn reactivate_cycle_on_failure(
+    graph: &mut WorkGraph,
+    members: &[String],
+    config_owner_id: &str,
+    cycle_config: &CycleConfig,
+    failed_task_id: &str,
+) -> Vec<String> {
+    if !cycle_config.restart_on_failure {
+        return vec![];
+    }
+
+    // Verify the failed task is actually Failed
+    if let Some(task) = graph.get_task(failed_task_id) {
+        if task.status != Status::Failed {
+            return vec![];
+        }
+    } else {
+        return vec![];
+    }
+
+    // Check max_failure_restarts
+    let failure_restarts = graph
+        .get_task(config_owner_id)
+        .map(|t| t.cycle_failure_restarts)
+        .unwrap_or(0);
+    let max_failure_restarts = cycle_config.max_failure_restarts.unwrap_or(3);
+    if failure_restarts >= max_failure_restarts {
+        if let Some(task) = graph.get_task_mut(config_owner_id) {
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: None,
+                message: format!(
+                    "Cycle failure restart budget exhausted ({}/{}). Task '{}' failed — cycle dead-ended.",
+                    failure_restarts, max_failure_restarts, failed_task_id
+                ),
+            });
+        }
+        return vec![];
+    }
+
+    // Collect failure info before mutating
+    let failure_reason = graph
+        .get_task(failed_task_id)
+        .and_then(|t| t.failure_reason.clone());
+
+    // Compute delay
+    let ready_after = cycle_config.delay.as_ref().and_then(|d| {
+        parse_delay(d).and_then(|secs| {
+            if secs <= i64::MAX as u64 {
+                Some((Utc::now() + Duration::seconds(secs as i64)).to_rfc3339())
+            } else {
+                None
+            }
+        })
+    });
+
+    let current_iter = graph
+        .get_task(config_owner_id)
+        .map(|t| t.loop_iteration)
+        .unwrap_or(0);
+    let new_failure_restarts = failure_restarts + 1;
+
+    let failure_info = match &failure_reason {
+        Some(r) => format!("{}: {}", failed_task_id, r),
+        None => failed_task_id.to_string(),
+    };
+
+    let mut reactivated = Vec::new();
+
+    for member_id in members {
+        if let Some(task) = graph.get_task_mut(member_id) {
+            task.status = Status::Open;
+            task.assigned = None;
+            task.started_at = None;
+            task.completed_at = None;
+            task.failure_reason = None;
+            // loop_iteration stays the same — this is a retry of the same iteration
+            if *member_id == config_owner_id {
+                task.ready_after = ready_after.clone();
+                task.cycle_failure_restarts = new_failure_restarts;
+                task.tags.retain(|t| t != "converged");
+            }
+
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: None,
+                message: format!(
+                    "Cycle failure restart {}/{} (iteration {}). Failed: [{}]",
+                    new_failure_restarts, max_failure_restarts, current_iter, failure_info
+                ),
+            });
+
+            reactivated.push(member_id.clone());
+        }
+    }
+
+    reactivated
+}
+
+/// Scan all cycles and reactivate any where a member is Failed and restart_on_failure is true.
+pub fn evaluate_all_cycle_failure_restarts(
+    graph: &mut WorkGraph,
+    cycle_analysis: &CycleAnalysis,
+) -> Vec<String> {
+    let mut all_reactivated = Vec::new();
+
+    for cycle in &cycle_analysis.cycles {
+        let found = {
+            let mut result = None;
+            for member_id in &cycle.members {
+                if let Some(task) = graph.get_task(member_id)
+                    && let Some(ref config) = task.cycle_config
+                {
+                    result = Some((member_id.clone(), config.clone()));
+                    break;
+                }
+            }
+            result
+        };
+
+        let Some((config_owner_id, cycle_config)) = found else {
+            continue;
+        };
+
+        if !cycle_config.restart_on_failure {
+            continue;
+        }
+
+        let failed_member = cycle.members.iter().find(|id| {
+            graph
+                .get_task(id.as_str())
+                .map(|t| t.status == Status::Failed)
+                .unwrap_or(false)
+        });
+
+        if let Some(failed_id) = failed_member {
+            let failed_id = failed_id.clone();
+            let reactivated = reactivate_cycle_on_failure(
+                graph,
+                &cycle.members,
+                &config_owner_id,
+                &cycle_config,
+                &failed_id,
+            );
+            all_reactivated.extend(reactivated);
+        }
     }
 
     all_reactivated

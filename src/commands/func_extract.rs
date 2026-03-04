@@ -2209,6 +2209,8 @@ mod tests {
                 guard: Some(LoopGuard::IterationLessThan(3)),
                 delay: Some("5s".to_string()),
                 no_converge: false,
+                restart_on_failure: true,
+                max_failure_restarts: None,
             }),
             after: vec!["root-step".to_string()],
             ..Task::default()

@@ -141,6 +141,9 @@ impl MdRenderer {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
+                if !self.lines.is_empty() {
+                    self.blank_line();
+                }
                 self.heading_level = Some(level);
                 let color = heading_color(level);
                 self.push_style(|s| s.fg(color).add_modifier(Modifier::BOLD));
@@ -241,9 +244,13 @@ impl MdRenderer {
                 self.link_url = Some(dest_url.to_string());
                 self.push_style(|s| s.fg(COLOR_LINK).add_modifier(Modifier::UNDERLINED));
             }
-            Event::End(TagEnd::Heading(_level)) => {
+            Event::End(TagEnd::Heading(level)) => {
                 self.flush_line();
                 self.pop_style();
+                // h1 and h2 get a blank line after; h3+ stay tight to content
+                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                    self.blank_line();
+                }
                 self.heading_level = None;
             }
             Event::End(TagEnd::Paragraph) => {
