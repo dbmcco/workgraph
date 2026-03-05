@@ -1235,7 +1235,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     match kind {
         MouseEventKind::ScrollUp => {
             if in_text_prompt {
-                // Mouse scroll in text prompt: handled by edtui
+                // Scroll up in text prompt: move cursor up to trigger viewport change.
+                scroll_editor_up(app, 3, EditorTarget::TextPrompt);
             } else if in_graph {
                 app.record_graph_scroll_activity();
                 app.scroll.scroll_up(3);
@@ -1261,7 +1262,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
         }
         MouseEventKind::ScrollDown => {
             if in_text_prompt {
-                // Mouse scroll in text prompt: handled by edtui
+                // Scroll down in text prompt: move cursor down to trigger viewport change.
+                scroll_editor_down(app, 3, EditorTarget::TextPrompt);
             } else if in_graph {
                 app.record_graph_scroll_activity();
                 app.scroll.scroll_down(3);
@@ -1315,6 +1317,9 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.scrollbar_drag = Some(ScrollbarDragTarget::GraphHorizontal);
                 app.record_graph_hscroll_activity();
                 hscrollbar_jump_to_column(app, column);
+            } else if in_text_prompt {
+                // Click inside text prompt overlay: position cursor via edtui.
+                route_mouse_to_editor(app, row, column, EditorTarget::TextPrompt);
             } else if in_tab_bar {
                 // Click on tab header: always focus right panel, switch tab if hit.
                 app.focused_panel = FocusedPanel::RightPanel;
@@ -1324,15 +1329,14 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 }
             } else if app.last_chat_input_area.height > 0
                 && app.last_chat_input_area.contains(pos)
-                && app.input_mode != InputMode::ChatInput
                 && (app.right_panel_tab == RightPanelTab::Chat)
             {
-                // Click on chat input area: resume editing.
+                // Click on chat input area: enter/resume editing and position cursor.
                 app.focused_panel = FocusedPanel::RightPanel;
                 app.chat_input_dismissed = false;
                 app.input_mode = InputMode::ChatInput;
                 app.inspector_sub_focus = InspectorSubFocus::TextEntry;
-                // Editor cursor is already at the right position.
+                route_mouse_to_editor(app, row, column, EditorTarget::Chat);
             } else if in_right_content
                 && app.right_panel_tab == RightPanelTab::Chat
                 && app.last_chat_message_area.height > 0
@@ -1383,6 +1387,12 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             } else if in_graph {
                 // Click in graph: focus graph + select task at clicked line.
                 app.focused_panel = FocusedPanel::Graph;
+                // Exit text entry mode if active (text persists, goes gray).
+                if app.input_mode == InputMode::ChatInput {
+                    app.input_mode = InputMode::Normal;
+                    app.chat_input_dismissed = true;
+                    app.inspector_sub_focus = InspectorSubFocus::ChatHistory;
+                }
                 let content_row = row.saturating_sub(app.last_graph_area.y);
                 let visible_idx = app.scroll.offset_y + content_row as usize;
                 let line_count = app.visible_line_count();
@@ -1472,6 +1482,66 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             }
         }
         _ => {}
+    }
+}
+
+/// Which editor should receive a mouse event.
+enum EditorTarget {
+    Chat,
+    TextPrompt,
+}
+
+/// Route a mouse-down event to the appropriate edtui editor for click-to-position.
+fn route_mouse_to_editor(app: &mut VizApp, row: u16, column: u16, target: EditorTarget) {
+    let mouse_event = crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+    match target {
+        EditorTarget::Chat => {
+            app.editor_handler
+                .on_mouse_event(mouse_event, &mut app.chat.editor);
+        }
+        EditorTarget::TextPrompt => {
+            app.editor_handler
+                .on_mouse_event(mouse_event, &mut app.text_prompt.editor);
+        }
+    }
+}
+
+/// Scroll an editor up by moving the cursor up `n` lines.
+fn scroll_editor_up(app: &mut VizApp, n: usize, target: EditorTarget) {
+    use crossterm::event::KeyEvent;
+    for _ in 0..n {
+        let key = KeyEvent::new(KeyCode::Up, crossterm::event::KeyModifiers::NONE);
+        match target {
+            EditorTarget::Chat => {
+                app.editor_handler.on_key_event(key, &mut app.chat.editor);
+            }
+            EditorTarget::TextPrompt => {
+                app.editor_handler
+                    .on_key_event(key, &mut app.text_prompt.editor);
+            }
+        }
+    }
+}
+
+/// Scroll an editor down by moving the cursor down `n` lines.
+fn scroll_editor_down(app: &mut VizApp, n: usize, target: EditorTarget) {
+    use crossterm::event::KeyEvent;
+    for _ in 0..n {
+        let key = KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+        match target {
+            EditorTarget::Chat => {
+                app.editor_handler.on_key_event(key, &mut app.chat.editor);
+            }
+            EditorTarget::TextPrompt => {
+                app.editor_handler
+                    .on_key_event(key, &mut app.text_prompt.editor);
+            }
+        }
     }
 }
 
