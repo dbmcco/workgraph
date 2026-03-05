@@ -947,9 +947,66 @@ impl WorkGraph {
     }
 
     /// Insert a node (task or resource) into the graph.
+    ///
+    /// If the node is a task with `before` entries (meaning "I come before X"),
+    /// this also adds the task's ID to each target's `after` list, so that the
+    /// edge is visible to readiness checks and the reverse index.
     pub fn add_node(&mut self, node: Node) {
         self.cycle_analysis = None;
-        self.nodes.insert(node.id().to_string(), node);
+        let node_id = node.id().to_string();
+
+        // Collect before targets before inserting (to avoid borrow issues).
+        let before_targets: Vec<String> = match &node {
+            Node::Task(t) => t.before.clone(),
+            _ => vec![],
+        };
+
+        self.nodes.insert(node_id.clone(), node);
+
+        // For each "before" target, add this task to the target's `after` list.
+        for target_id in before_targets {
+            if target_id == node_id {
+                continue; // skip self-references
+            }
+            if let Some(Node::Task(target)) = self.nodes.get_mut(&target_id) {
+                if !target.after.contains(&node_id) {
+                    target.after.push(node_id.clone());
+                }
+            }
+        }
+    }
+
+    /// Normalize all `before` edges in the graph into `after` edges.
+    ///
+    /// After a bulk load (e.g. from JSONL), tasks may reference targets in their
+    /// `before` list that were loaded after them, so `add_node()` couldn't resolve
+    /// the edge at insertion time. This method does a full pass to ensure every
+    /// `before` relationship is reflected in the target's `after` list.
+    pub fn normalize_before_edges(&mut self) {
+        // Collect all (source_id, target_id) pairs from before fields.
+        let edges: Vec<(String, String)> = self
+            .nodes
+            .values()
+            .filter_map(|n| match n {
+                Node::Task(t) => Some(
+                    t.before
+                        .iter()
+                        .filter(|target_id| target_id.as_str() != t.id)
+                        .map(|target_id| (t.id.clone(), target_id.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        for (source_id, target_id) in edges {
+            if let Some(Node::Task(target)) = self.nodes.get_mut(&target_id) {
+                if !target.after.contains(&source_id) {
+                    target.after.push(source_id);
+                }
+            }
+        }
     }
 
     /// Look up a node by ID.
@@ -1712,6 +1769,65 @@ mod tests {
 
         let impl_task = graph.get_task("api-impl").unwrap();
         assert_eq!(impl_task.after, vec!["api-design"]);
+    }
+
+
+    #[test]
+    fn test_add_node_normalizes_before_into_after() {
+        let mut graph = WorkGraph::new();
+        let target = make_task("target", "Target task");
+        graph.add_node(Node::Task(target));
+
+        let mut source = make_task("source", "Source task");
+        source.before = vec!["target".to_string()];
+        graph.add_node(Node::Task(source));
+
+        let target = graph.get_task("target").unwrap();
+        assert!(
+            target.after.contains(&"source".to_string()),
+            "target.after should contain 'source', got: {:?}",
+            target.after
+        );
+    }
+
+    #[test]
+    fn test_normalize_before_edges_handles_late_targets() {
+        let mut graph = WorkGraph::new();
+
+        let mut source = make_task("source", "Source task");
+        source.before = vec!["target".to_string()];
+        graph.add_node(Node::Task(source));
+
+        let target = make_task("target", "Target task");
+        graph.add_node(Node::Task(target));
+
+        graph.normalize_before_edges();
+
+        let target = graph.get_task("target").unwrap();
+        assert!(
+            target.after.contains(&"source".to_string()),
+            "after normalize, target.after should contain 'source', got: {:?}",
+            target.after
+        );
+    }
+
+    #[test]
+    fn test_normalize_before_edges_no_duplicates() {
+        let mut graph = WorkGraph::new();
+
+        let mut target = make_task("target", "Target task");
+        target.after = vec!["source".to_string()];
+        graph.add_node(Node::Task(target));
+
+        let mut source = make_task("source", "Source task");
+        source.before = vec!["target".to_string()];
+        graph.add_node(Node::Task(source));
+
+        graph.normalize_before_edges();
+
+        let target = graph.get_task("target").unwrap();
+        let count = target.after.iter().filter(|id| *id == "source").count();
+        assert_eq!(count, 1, "should not have duplicate 'source' in after");
     }
 
     #[test]
