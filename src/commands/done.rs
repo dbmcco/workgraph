@@ -83,6 +83,11 @@ fn run_verify_command(verify_cmd: &str, project_root: &Path) -> Result<()> {
 }
 
 pub fn run(dir: &Path, id: &str, converged: bool, skip_verify: bool) -> Result<()> {
+    let is_agent = std::env::var("WG_AGENT_ID").is_ok();
+    run_inner(dir, id, converged, skip_verify, is_agent)
+}
+
+fn run_inner(dir: &Path, id: &str, converged: bool, skip_verify: bool, is_agent: bool) -> Result<()> {
     let (mut graph, path) = super::load_workgraph_mut(dir)?;
 
     let task = graph.get_task_mut_or_err(id)?;
@@ -133,7 +138,7 @@ pub fn run(dir: &Path, id: &str, converged: bool, skip_verify: bool) -> Result<(
     if let Some(verify_cmd) = graph.get_task(id).and_then(|t| t.verify.clone()) {
         if skip_verify {
             // Block agents from using --skip-verify
-            if std::env::var("WG_AGENT_ID").is_ok() {
+            if is_agent {
                 anyhow::bail!(
                     "Agents cannot use --skip-verify. The verify command must pass:\n  {}",
                     verify_cmd,
@@ -968,10 +973,8 @@ mod tests {
         task.verify = Some("exit 1".to_string());
         setup_workgraph(dir_path, vec![task]);
 
-        // Remove WG_AGENT_ID to simulate human usage
-        unsafe { std::env::remove_var("WG_AGENT_ID") };
-
-        let result = run(dir_path, "t1", false, true);
+        // Use run_inner with is_agent=false to simulate human usage
+        let result = super::run_inner(dir_path, "t1", false, true, false);
         assert!(result.is_ok());
 
         let path = graph_path(dir_path);
@@ -989,13 +992,8 @@ mod tests {
         task.verify = Some("exit 1".to_string());
         setup_workgraph(dir_path, vec![task]);
 
-        // Set WG_AGENT_ID to simulate agent context
-        unsafe { std::env::set_var("WG_AGENT_ID", "agent-test-123") };
-
-        let result = run(dir_path, "t1", false, true);
-
-        // Clean up env var
-        unsafe { std::env::remove_var("WG_AGENT_ID") };
+        // Use run_inner with is_agent=true to simulate agent context
+        let result = super::run_inner(dir_path, "t1", false, true, true);
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
