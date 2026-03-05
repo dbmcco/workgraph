@@ -1130,26 +1130,25 @@ pub struct HudDetail {
 }
 
 /// Extract section name from a detail header line like "── Description ──" → "Description".
+/// Also handles lines with trailing annotations: "── Output ── [R: raw JSON]" → "Output".
 /// Returns None for non-header lines or the task-id header (first line).
 pub fn extract_section_name(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    if trimmed.starts_with("──") && trimmed.ends_with("──") {
-        let inner = trimmed
-            .trim_start_matches('─')
-            .trim_end_matches('─')
-            .trim()
-            // Strip any trailing annotations like "[R: raw JSON]"
-            .split(" [")
-            .next()
-            .unwrap_or("")
-            .trim();
-        // Skip the task-id header line (it doesn't contain spaces or known section keywords)
-        // Section names are things like "Description", "Prompt", "Output", "Output (raw)", etc.
-        if !inner.is_empty() {
-            Some(inner.to_string())
-        } else {
-            None
-        }
+    if !trimmed.starts_with("──") {
+        return None;
+    }
+    // Strip trailing annotations like " [R: raw JSON]" before checking the closing ──.
+    let base = trimmed.split(" [").next().unwrap_or(trimmed).trim_end();
+    if !base.ends_with("──") {
+        return None;
+    }
+    let inner = base
+        .trim_start_matches('─')
+        .trim_end_matches('─')
+        .trim();
+    // Section names are things like "Description", "Prompt", "Output", "Output (raw)", etc.
+    if !inner.is_empty() {
+        Some(inner.to_string())
     } else {
         None
     }
@@ -1544,7 +1543,10 @@ impl VizApp {
             hud_wrapped_line_count: 0,
             hud_detail_viewport_height: 0,
             detail_raw_json: false,
-            detail_collapsed_sections: std::collections::HashSet::new(),
+            detail_collapsed_sections: ["Output", "Output (raw)", "Prompt"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             detail_section_header_lines: Vec::new(),
             right_panel_visible: true,
             focused_panel: FocusedPanel::Graph,

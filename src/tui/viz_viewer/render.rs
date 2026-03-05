@@ -1225,8 +1225,14 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         if let Some(name) = extract_section_name(line) {
             let collapsed = app.detail_collapsed_sections.contains(&name);
             let indicator = if collapsed { "▸" } else { "▾" };
+            // Preserve any trailing annotation like " [R: raw JSON]" from the original header.
+            let annotation = line
+                .trim()
+                .find(" [")
+                .map(|i| &line.trim()[i..])
+                .unwrap_or("");
             // Replace the original header with an indicator-prefixed version.
-            visible_lines.push(format!("{} ── {} ──", indicator, name));
+            visible_lines.push(format!("{} ── {} ──{}", indicator, name, annotation));
             if collapsed {
                 // Add a summary line showing content stats.
                 let content_lines = section_content.get(&name);
@@ -1309,7 +1315,9 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             flush_md(&mut md_buffer, &mut all_lines, wrap_width);
             in_md_section = is_md_header(line);
             // Extract section name from the indicator-prefixed header.
-            let section_name = line
+            // Strip trailing annotations like " [R: raw JSON]" before extracting name.
+            let base = line.split(" [").next().unwrap_or(line);
+            let section_name = base
                 .trim_start_matches("▸ ")
                 .trim_start_matches("▾ ")
                 .trim_start_matches("── ")
