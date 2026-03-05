@@ -663,6 +663,9 @@ pub struct ChatState {
     pub scroll_from_top: usize,
     /// Live token counts from coordinator's current turn (input, output).
     pub thinking_tokens: Option<(u64, u64)>,
+    /// Streaming text from the coordinator's in-progress response.
+    /// Populated by polling `.workgraph/chat/.streaming`.
+    pub streaming_text: Option<String>,
 }
 
 impl Default for ChatState {
@@ -680,6 +683,7 @@ impl Default for ChatState {
             viewport_height: 0,
             scroll_from_top: 0,
             thinking_tokens: None,
+            streaming_text: None,
         }
     }
 }
@@ -2617,6 +2621,7 @@ impl VizApp {
             self.poll_chat_messages();
             if self.chat.awaiting_response {
                 self.poll_thinking_tokens();
+                self.poll_streaming_text();
             }
         }
 
@@ -4560,11 +4565,24 @@ impl VizApp {
         if self.chat.awaiting_response {
             self.chat.awaiting_response = false;
             self.chat.last_request_id = None;
+            self.chat.streaming_text = None;
         }
 
         // Auto-scroll to bottom when new messages arrive (if user hasn't scrolled up).
         if self.chat.scroll == 0 {
             // Already at bottom; new messages will be visible.
+        }
+    }
+
+    /// Poll for streaming response text from the coordinator.
+    pub fn poll_streaming_text(&mut self) {
+        let new_text = workgraph::chat::read_streaming(&self.workgraph_dir);
+        let changed = new_text != self.chat.streaming_text;
+        self.chat.streaming_text = new_text;
+
+        // Auto-scroll to bottom when new streaming text arrives and user is at bottom.
+        if changed && self.chat.scroll == 0 {
+            // Already at bottom; new text will be visible.
         }
     }
 

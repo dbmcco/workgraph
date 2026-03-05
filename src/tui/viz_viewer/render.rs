@@ -1716,32 +1716,85 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         rendered_lines.push(Line::from(""));
     }
 
-    // Streaming indicator when awaiting response.
+    // Streaming response or thinking indicator when awaiting response.
     if app.chat.awaiting_response {
-        // Braille spinner (more portable than SLOW_BLINK which doesn't work on Termux)
+        // Braille spinner
         const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame_idx = (app.tick_count / 3) as usize % SPINNER_FRAMES.len();
         let spinner = SPINNER_FRAMES[frame_idx];
 
-        let mut spans = vec![Span::styled(
-            format!("↯ {} ", spinner),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )];
+        if let Some(ref streaming) = app.chat.streaming_text {
+            // Render streaming text as an in-progress coordinator message
+            let prefix = "↯ ";
+            let prefix_len = prefix.width();
+            let indent_str = " ".repeat(prefix_len);
+            let text_w = content_width.saturating_sub(prefix_len);
 
-        if let Some((input_tokens, output_tokens)) = app.chat.thinking_tokens {
-            spans.push(Span::styled(
-                format!(
-                    "→{}/←{}",
-                    format_tokens(input_tokens),
-                    format_tokens(output_tokens)
+            let md_lines = markdown_to_lines(streaming, text_w);
+            let wrapped = wrap_line_spans(&md_lines, text_w);
+
+            let mut first = true;
+            for wline in &wrapped {
+                if first {
+                    let mut spans = vec![Span::styled(
+                        prefix.to_string(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )];
+                    spans.extend(wline.spans.iter().cloned());
+                    rendered_lines.push(Line::from(spans));
+                    first = false;
+                } else {
+                    let mut spans = vec![Span::raw(indent_str.clone())];
+                    spans.extend(wline.spans.iter().cloned());
+                    rendered_lines.push(Line::from(spans));
+                }
+            }
+
+            // Add spinner + token count on a new line after the streaming text
+            let mut indicator_spans = vec![
+                Span::raw(indent_str.clone()),
+                Span::styled(
+                    format!("{} ", spinner),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
+            ];
+            if let Some((input_tokens, output_tokens)) = app.chat.thinking_tokens {
+                indicator_spans.push(Span::styled(
+                    format!(
+                        "→{}/←{}",
+                        format_tokens(input_tokens),
+                        format_tokens(output_tokens)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            rendered_lines.push(Line::from(indicator_spans));
+        } else {
+            // No streaming text yet — show the spinner with optional token counts
+            let mut spans = vec![Span::styled(
+                format!("↯ {} ", spinner),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
 
-        rendered_lines.push(Line::from(spans));
+            if let Some((input_tokens, output_tokens)) = app.chat.thinking_tokens {
+                spans.push(Span::styled(
+                    format!(
+                        "→{}/←{}",
+                        format_tokens(input_tokens),
+                        format_tokens(output_tokens)
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            rendered_lines.push(Line::from(spans));
+        }
         rendered_lines.push(Line::from(""));
     }
 
