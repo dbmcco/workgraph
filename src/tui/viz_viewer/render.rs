@@ -1261,8 +1261,11 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let usable = (area.width as usize).saturating_sub(prompt_prefix).max(1);
         let visual_lines = count_visual_lines(&chat_text, usable);
         let wrapped_lines = (visual_lines as u16).max(1);
-        // Cap so input never eats more than half the area.
-        let max_input = (area.height / 2).max(2);
+        // Cap so input never eats more than 3/4 of the area (leave room for
+        // at least a few chat history lines). The generous cap avoids edtui's
+        // wrap-mode scrolling limitation where a single long wrapped line can
+        // push the cursor off-screen.
+        let max_input = (area.height * 3 / 4).max(3);
         let lines = wrapped_lines.min(max_input);
         let att_line = if has_pending_att { 1 } else { 0 };
         lines + 1 + att_line // +1 for separator line, +1 for attachment indicator
@@ -1341,14 +1344,12 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Scrollbar overlays the rightmost column when visible.
     let content_width = width.saturating_sub(1);
     let mut rendered_lines: Vec<Line> = Vec::new();
-    // Map each rendered line to its source message index (for click-to-toggle).
-    let mut line_to_message: Vec<Option<usize>> = Vec::new();
 
     // Subtle warm-tinted dark background for user messages (like iMessage blue/gray,
     // but extremely subtle). Echoes the yellow ">" prefix and loop arrows.
     let user_msg_bg = Color::Rgb(30, 28, 20);
 
-    for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
+    for msg in app.chat.messages.iter() {
         let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
         let is_user = msg.role == super::state::ChatRole::User;
 
@@ -1479,7 +1480,6 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 }
                 rendered_lines.push(built);
             }
-            line_to_message.push(Some(msg_idx));
         }
         // Show attachment indicators.
         for att_name in &msg.attachments {
@@ -1494,11 +1494,9 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 att_line = apply_line_bg(att_line, user_msg_bg);
             }
             rendered_lines.push(att_line);
-            line_to_message.push(Some(msg_idx));
         }
         // Blank line between messages.
         rendered_lines.push(Line::from(""));
-        line_to_message.push(None);
     }
 
     // Streaming indicator when awaiting response.
@@ -1509,13 +1507,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
-        line_to_message.push(None);
         rendered_lines.push(Line::from(""));
-        line_to_message.push(None);
     }
-
-    // Store line-to-message mapping for click handling.
-    app.chat.line_to_message = line_to_message;
 
     // Scrolling: `scroll` is lines from bottom (0 = fully scrolled down).
     let total_lines = rendered_lines.len();
@@ -1958,8 +1951,8 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let usable = (area.width as usize).saturating_sub(prompt_prefix).max(1);
         let visual_lines = count_visual_lines(&msg_text, usable);
         let wrapped_lines = (visual_lines as u16).max(1);
-        // Cap so input never eats more than half the area.
-        let max_input = (area.height / 2).max(2);
+        // Cap so input never eats more than 3/4 of the area.
+        let max_input = (area.height * 3 / 4).max(3);
         let lines = wrapped_lines.min(max_input);
         lines + 1 // +1 for separator line
     } else {

@@ -47,7 +47,33 @@ pub fn editor_clear(state: &mut EditorState) {
 }
 
 pub fn create_editor_handler() -> EditorEventHandler {
-    EditorEventHandler::default()
+    use edtui::actions::delete::DeleteToEndOfLine;
+    use edtui::actions::{MoveBackward, MoveForward, MoveToEndOfLine, MoveToStartOfLine};
+    use edtui::events::{KeyEvent as EdKeyEvent, KeyEventRegister};
+    let mut handler = EditorEventHandler::default();
+    // Emacs keybindings for insert mode
+    handler.key_handler.insert(
+        KeyEventRegister::i(vec![EdKeyEvent::Ctrl('a')]),
+        MoveToStartOfLine(),
+    );
+    handler.key_handler.insert(
+        KeyEventRegister::i(vec![EdKeyEvent::Ctrl('e')]),
+        MoveToEndOfLine(),
+    );
+    handler.key_handler.insert(
+        KeyEventRegister::i(vec![EdKeyEvent::Ctrl('f')]),
+        MoveForward(1),
+    );
+    handler.key_handler.insert(
+        KeyEventRegister::i(vec![EdKeyEvent::Ctrl('b')]),
+        MoveBackward(1),
+    );
+    handler.key_handler.insert(
+        KeyEventRegister::i(vec![EdKeyEvent::Ctrl('k')]),
+        DeleteToEndOfLine,
+    );
+    // Ctrl-U (kill to beginning of line) is already mapped by edtui default
+    handler
 }
 
 /// Maximum simultaneous animations before oldest are dropped.
@@ -620,9 +646,7 @@ pub struct ChatState {
     pub total_rendered_lines: usize,
     /// Viewport height for the message area (set each frame by renderer).
     pub viewport_height: usize,
-    /// Map from rendered line index → message index, populated each frame by the renderer.
-    pub line_to_message: Vec<Option<usize>>,
-    /// Scroll offset from top (set each frame by renderer for click hit-testing).
+    /// Scroll offset from top (set each frame by renderer for scrollbar dragging).
     pub scroll_from_top: usize,
 }
 
@@ -639,7 +663,6 @@ impl Default for ChatState {
             pending_attachments: Vec::new(),
             total_rendered_lines: 0,
             viewport_height: 0,
-            line_to_message: Vec::new(),
             scroll_from_top: 0,
         }
     }
