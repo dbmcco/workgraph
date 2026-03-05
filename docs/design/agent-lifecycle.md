@@ -19,12 +19,25 @@ Three triggers, one resume path:
   Coordinator-initiated ──→ stuck detection (kill)   ├──→ checkpoint→resume pipeline
   External-triggered ──→ message on Done task        ─┘
 
-Resume pipeline:
-  1. Try claude --resume <session_id>  (zero cost, full context)
+Resume pipeline (executor-agnostic):
+  1. Try executor-native session resume (zero/low cost, best context)
   2. Fall back to checkpoint summary injection (cheap, lossy)
 ```
 
 This means every mechanism that stops an agent produces a **checkpoint**, and every mechanism that starts an agent consumes one. The checkpoint is the universal context bridge.
+
+### Executor-Agnostic Design Principle
+
+**Every mechanism in this design MUST work across all executor types.** The resume pipeline defines an abstract interface; each executor provides its own implementation. No feature may depend solely on Claude CLI capabilities.
+
+| Executor | Session Resume | Checkpoint | Context Injection |
+|----------|---------------|------------|-------------------|
+| **Claude CLI** | `claude --resume <session_id>` (server-side context) | Stream event monitoring + auto-checkpoint | Prompt append via `--resume` follow-up |
+| **Native (OpenAI-compatible)** | Conversation history replay from stored messages | Turn-count/timer triggers on stored conversation | Prepend checkpoint to system prompt on fresh spawn |
+| **Amplifier** | Bundle-level session continuity | Delegated to sub-executor checkpoints | Bundle context injection |
+| **Shell / Custom** | No session resume (always fresh) | No auto-checkpoint (explicit `wg checkpoint` only) | Checkpoint injected into task context template |
+
+**The native executor is the primary target.** It manages its own conversation history in `.workgraph/agents/<id>/conversation.json`, making session resume a first-class capability without depending on any external service. The resume pipeline's fallback path (checkpoint injection) works for ALL executors, including shell and custom ones that have no session concept.
 
 ## Lifecycle States
 
@@ -81,7 +94,7 @@ This means every mechanism that stops an agent produces a **checkpoint**, and ev
 
 2. **Child task (when downstream is running):** If any downstream task is already InProgress/Done, create a lightweight child task `respond-to-<parent-id>` that inherits the parent's `session_id`. The parent stays Done — no downstream confusion. The child prompt says: "You previously completed `<parent>`. Read and respond to pending messages."
 
-**Session resume:** The child/reopened task passes `--resume <session_id>` to claude. If the session is expired, fall back to checkpoint summary injection (belt-and-suspenders from Round 1).
+**Session resume:** The child/reopened task resumes via the executor's native session mechanism (Claude CLI: `--resume <session_id>`, native executor: conversation history replay, etc.). If session resume fails or is unavailable for the executor type, fall back to checkpoint summary injection (belt-and-suspenders from Round 1).
 
 **Batching:** Multiple messages on a Done task trigger ONE resurrection. The resurrected agent reads all pending messages via `wg msg read`.
 
@@ -93,11 +106,18 @@ This means every mechanism that stops an agent produces a **checkpoint**, and ev
 
 **Implementation detail — `completed_at`:** When reopening a Done task, keep `completed_at` (for timing analysis). Add `resurrected_at` timestamp to the log entry.
 
-### Critical prerequisite: session persistence
+### Critical prerequisite: session persistence (executor-specific)
 
-Currently `--no-session-persistence` is set at `execution.rs:401, 437, 466` for ALL Claude executor modes (A1 finding). This **blocks** resume for all lifecycle features. **Action: remove `--no-session-persistence`, make session persistence the default.** Add opt-out via per-executor config for users with disk space concerns.
+Session resume requires each executor to persist enough state to reconstruct conversation context:
 
-Store `session_id` on the Task struct (not just AgentEntry) so it survives agent death and can be inherited by child tasks or successor agents.
+| Executor | Persistence Mechanism | Action Required |
+|----------|----------------------|-----------------|
+| **Claude CLI** | Server-side sessions via `session_id` | Already implemented: `--resume` support exists in `execution.rs:385-390`. Ensure session IDs are stored on Task struct. |
+| **Native** | Conversation history in `.workgraph/agents/<id>/conversation.json` | Already persisted by the native executor. Resume = replay stored messages to the API. |
+| **Amplifier** | Delegated to sub-executor | Passes session context through bundle protocol. |
+| **Shell / Custom** | None (stateless) | Checkpoint injection is the only resume path. |
+
+Store `session_id` on the Task struct (not just AgentEntry) so it survives agent death and can be inherited by child tasks or successor agents. For the native executor, `session_id` maps to the conversation history file path. For Claude CLI, it maps to the server-side session. The field is executor-agnostic; interpretation is executor-specific.
 
 ## 2. Checkpointing for Long-Running Tasks
 
@@ -107,17 +127,22 @@ Disk state (files, git commits, artifacts) survives agent death. The critical ga
 
 ### Tiered approach (B2)
 
-| Tier | Mechanism | Cost | Context quality |
-|------|-----------|------|----------------|
-| Free | Triage summary (existing) | $0 (already runs on death) | Lossy — post-mortem only |
-| Cheap | Periodic checkpoint | ~$0.01/checkpoint (haiku) | Good — captures in-flight reasoning |
-| Best | `claude --resume` | $0 incremental | Perfect — full server-side context |
+| Tier | Mechanism | Cost | Context quality | Executor support |
+|------|-----------|------|----------------|-----------------|
+| Free | Triage summary (existing) | $0 (already runs on death) | Lossy — post-mortem only | All |
+| Cheap | Periodic checkpoint | ~$0.01/checkpoint (haiku) | Good — captures in-flight reasoning | All (auto or explicit) |
+| Best | Executor-native session resume | $0 incremental (Claude), low (native replay) | Perfect — full context | Claude CLI, Native |
 
 ### Hybrid checkpointing (B1 + B2 consensus)
 
 **Agent-driven (explicit):** Agents call `wg checkpoint <task-id> --summary "..."` at semantic boundaries (e.g., "finished research, starting implementation"). Higher quality summaries because the agent knows what matters.
 
-**Coordinator-driven (auto-fallback):** The coordinator monitors stream events and auto-generates checkpoints via haiku when: `turn_count % N == 0` (default: N=15) OR `time_since_last_checkpoint > M min` (default: M=20). Works with any executor, even non-compliant agents.
+**Coordinator-driven (auto-fallback):** The coordinator auto-generates checkpoints based on executor-reported progress:
+- **Claude CLI:** Monitor stream events; trigger when `turn_count % N == 0` (default: N=15) or `time_since_last_checkpoint > M min` (default: M=20).
+- **Native executor:** Tracks its own turn count and conversation length; emits checkpoint events directly or the coordinator queries its state via the agent process.
+- **Shell / Custom:** Timer-based only (`time_since_last_checkpoint > M min`). No turn-count tracking. Explicit `wg checkpoint` is the primary path.
+
+Works with any executor — timer fallback is always available.
 
 **Both produce the same data structure:**
 
@@ -145,7 +170,7 @@ When triage produces a "continue" verdict for a task **with** checkpoints:
 2. Inject latest checkpoint summary into `## Previous Attempt Recovery`
 3. Include file list so successor agent knows what to check
 
-Checkpoints are **complementary** to `claude --resume`. `--resume` is primary (zero cost, full context). Checkpoint summary is the fallback when `--resume` fails (session expired). This is the belt-and-suspenders pattern from Round 1.
+Checkpoints are **complementary** to executor-native session resume. Session resume is primary (zero/low cost, full context). Checkpoint summary is the fallback when session resume fails (session expired, executor doesn't support resume, or executor changed between attempts). This is the belt-and-suspenders pattern from Round 1.
 
 ### Configuration
 
@@ -183,7 +208,7 @@ Composable: comma for AND (`task:a=done,task:b=done`), pipe for OR (`timer:5m|me
 New fields on Task:
 ```rust
 wait_condition: Option<WaitSpec>,   // what we're waiting for
-session_id: Option<String>,         // for claude --resume
+session_id: Option<String>,         // executor-specific session reference
 checkpoint: Option<String>,         // agent's summary at park time
 ```
 
@@ -194,7 +219,7 @@ New status: `Waiting`. New agent status: `Parked` (does NOT count against `max_a
 On each tick, for each Waiting task:
 1. Evaluate condition (all checks are O(1) — task status lookup, timer comparison, message scan)
 2. If satisfied: clear `wait_condition` → set status to Open → normal dispatch picks it up
-3. Spawn new agent with resume context: try `--resume <session_id>`, fall back to checkpoint injection
+3. Spawn new agent with resume context: try executor-native session resume, fall back to checkpoint injection
 4. Inject brief graph state delta (~100 tokens) showing what changed while waiting (NOT full `wg context` dump — token accumulation concern)
 
 ### Edge cases
@@ -226,10 +251,13 @@ All stopped→running transitions flow through the same pipeline:
 └──────────┬──────────┘
            ▼
 ┌─────────────────────┐     ┌─────────────────────┐
-│ Try --resume         │────→│ Success: agent has   │
-│ <session_id>         │     │ full context         │
-└──────────┬──────────┘     └─────────────────────┘
-           │ (fails — expired/unavailable)
+│ Try executor-native  │────→│ Success: agent has   │
+│ session resume       │     │ full context         │
+│ (Claude: --resume,   │     └─────────────────────┘
+│  Native: history     │
+│  replay, etc.)       │
+└──────────┬──────────┘
+           │ (fails — expired/unavailable/unsupported)
            ▼
 ┌─────────────────────┐     ┌─────────────────────┐
 │ Fresh spawn with     │────→│ Agent gets:          │
@@ -249,6 +277,30 @@ All stopped→running transitions flow through the same pipeline:
 | Stuck kill-restart | InProgress → Open | Increment | Checkpoint or triage summary |
 | Agent death + continue | InProgress → Open | Increment | Checkpoint or triage summary |
 
+### Executor-specific resume implementations
+
+The `SessionResume` trait abstracts session resume across executors:
+
+```rust
+trait SessionResume {
+    /// Attempt to resume a previous session. Returns modified spawn args
+    /// if resume is possible, None if fallback to checkpoint is needed.
+    fn try_resume(&self, session_id: &str, task: &Task) -> Option<SpawnArgs>;
+
+    /// Inject checkpoint context into a fresh spawn (fallback path).
+    fn inject_checkpoint(&self, checkpoint: &Checkpoint, spawn_args: &mut SpawnArgs);
+}
+```
+
+| Executor | `try_resume` | `inject_checkpoint` |
+|----------|-------------|---------------------|
+| **Claude CLI** | Add `--resume <session_id>` to args; append checkpoint as follow-up message | Prepend checkpoint summary to prompt.txt |
+| **Native** | Load `conversation.json`, replay messages to API, then inject new context | Prepend checkpoint to system prompt for new conversation |
+| **Amplifier** | Forward resume request to sub-executor via bundle protocol | Inject into bundle context |
+| **Shell/Custom** | Returns `None` (no session support) | Inject checkpoint into task context template via `{{checkpoint}}` variable |
+
+**Key insight for the native executor:** Because it manages its own conversation history locally, session resume is always available (no server-side expiry risk). This makes it the most reliable executor for long-running lifecycle features. The conversation history file serves as both the session state AND the checkpoint source — the coordinator can extract the last N turns for checkpoint generation without an LLM call.
+
 ## Integration with Liveness Detection (Round 1)
 
 This design **builds on** liveness-detection.md, not replaces it. The Round 1 design covers:
@@ -258,7 +310,7 @@ This design **builds on** liveness-detection.md, not replaces it. The Round 1 de
 - Phase 1-3 implementation plan for detection and intervention
 
 This document adds:
-- **Phase 4 expansion:** Parking (`wg wait`) and resume via `--resume`
+- **Phase 4 expansion:** Parking (`wg wait`) and executor-native session resume
 - **Phase 5:** Checkpointing system (auto + explicit)
 - **Phase 6:** Message-triggered resurrection
 
@@ -270,21 +322,28 @@ The liveness detection system (Phases 1-3) feeds INTO this lifecycle:
 ## Implementation Phases
 
 ### Phase 4: Session Persistence + `wg wait` (foundation)
-- Remove `--no-session-persistence` from executor spawn (execution.rs:401, 437, 466)
-- Store `session_id` on Task struct and populate from stream.jsonl Init events
+- Define executor-agnostic `SessionResume` trait with per-executor implementations:
+  - Claude CLI: `--resume <session_id>` (server-side context)
+  - Native executor: conversation history replay from `.workgraph/agents/<id>/conversation.json`
+  - Amplifier: delegate to sub-executor session mechanism
+  - Shell/Custom: no-op (always falls back to checkpoint injection)
+- Store `session_id` on Task struct and populate from executor-specific sources (Claude: stream.jsonl Init events, Native: conversation file path)
 - Implement `wg wait` command (park-and-exit with condition)
 - Add `Waiting` task status and `Parked` agent status
 - Coordinator condition evaluation on tick
-- Resume with `--resume <session_id>` + checkpoint fallback
-- ~300 lines of new code
+- Resume via executor's session mechanism + checkpoint fallback
+- ~350 lines of new code (including executor trait + implementations)
 
 ### Phase 5: Checkpointing
-- `wg checkpoint` CLI command for agents
-- Coordinator auto-checkpoint trigger (stream event monitoring)
+- `wg checkpoint` CLI command for agents (works with all executor types)
+- Coordinator auto-checkpoint trigger:
+  - Claude CLI: stream event monitoring (turn count / time interval)
+  - Native executor: query conversation length directly or receive checkpoint events
+  - All executors: timer-based fallback
 - Checkpoint storage and pruning
 - Integration with triage "continue" (use checkpoint instead of LLM summary)
 - `[checkpoint]` config section
-- ~200 lines of new code
+- ~250 lines of new code
 
 ### Phase 6: Message Resurrection
 - Coordinator scan for unread messages on Done tasks
