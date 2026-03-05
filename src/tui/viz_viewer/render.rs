@@ -482,6 +482,72 @@ fn apply_bg_to_title_range<'a>(line: Line<'a>, plain_line: &str, bg: Color) -> L
     Line::from(new_spans)
 }
 
+/// Convert any ratatui `Color` to an approximate `(u8, u8, u8)` RGB tuple.
+///
+/// Used for smooth color interpolation during fade animations, so that ANSI named
+/// colors fade toward their true hue instead of a gray fallback.
+fn color_to_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 49, 49),
+        Color::Green => (13, 188, 121),
+        Color::Yellow => (229, 229, 16),
+        Color::Blue => (36, 114, 200),
+        Color::Magenta => (188, 63, 188),
+        Color::Cyan => (17, 168, 205),
+        Color::Gray => (170, 170, 170),
+        Color::DarkGray => (118, 118, 118),
+        Color::LightRed => (241, 76, 76),
+        Color::LightGreen => (35, 209, 139),
+        Color::LightYellow => (245, 245, 67),
+        Color::LightBlue => (59, 142, 234),
+        Color::LightMagenta => (214, 112, 214),
+        Color::LightCyan => (41, 184, 219),
+        Color::White => (229, 229, 229),
+        Color::Indexed(idx) => indexed_color_to_rgb(idx),
+        _ => (200, 200, 200),
+    }
+}
+
+/// Map a 256-color palette index to approximate RGB.
+fn indexed_color_to_rgb(idx: u8) -> (u8, u8, u8) {
+    match idx {
+        // 0-7: standard colors (same as named ANSI)
+        0 => (0, 0, 0),
+        1 => (205, 49, 49),
+        2 => (13, 188, 121),
+        3 => (229, 229, 16),
+        4 => (36, 114, 200),
+        5 => (188, 63, 188),
+        6 => (17, 168, 205),
+        7 => (170, 170, 170),
+        // 8-15: bright colors
+        8 => (118, 118, 118),
+        9 => (241, 76, 76),
+        10 => (35, 209, 139),
+        11 => (245, 245, 67),
+        12 => (59, 142, 234),
+        13 => (214, 112, 214),
+        14 => (41, 184, 219),
+        15 => (229, 229, 229),
+        // 16-231: 6x6x6 color cube
+        16..=231 => {
+            let n = idx - 16;
+            let b_idx = n % 6;
+            let g_idx = (n / 6) % 6;
+            let r_idx = n / 36;
+            let to_val = |i: u8| if i == 0 { 0u8 } else { 55 + 40 * i };
+            (to_val(r_idx), to_val(g_idx), to_val(b_idx))
+        }
+        // 232-255: grayscale ramp
+        232..=255 => {
+            let v = 8 + 10 * (idx - 232);
+            (v, v, v)
+        }
+    }
+}
+
 /// Apply a foreground color fade to the task title range.
 /// Interpolates each span's foreground from `start_fg` toward its original fg color
 /// based on `t` (0.0 = fully `start_fg`, 1.0 = original foreground).
@@ -513,9 +579,9 @@ fn apply_fg_fade_to_title_range<'a>(
     for (char_idx, (c, base_style)) in chars_with_styles.iter().enumerate() {
         let style = if char_idx >= text_start && char_idx < text_end {
             let orig_fg = match base_style.fg {
-                Some(Color::Rgb(r, g, b)) => (r, g, b),
-                // Default terminal foreground — assume light gray for dark terminals.
-                _ => (200, 200, 200),
+                Some(c) => color_to_rgb(c),
+                // No foreground set — assume light gray for dark terminals.
+                None => (200, 200, 200),
             };
             let r = (start_fg.0 as f64 + (orig_fg.0 as f64 - start_fg.0 as f64) * t) as u8;
             let g = (start_fg.1 as f64 + (orig_fg.1 as f64 - start_fg.1 as f64) * t) as u8;
