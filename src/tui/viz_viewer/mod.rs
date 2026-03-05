@@ -5,6 +5,8 @@ pub mod render;
 pub mod state;
 
 #[cfg(test)]
+mod config_tests;
+#[cfg(test)]
 mod editor_tests;
 
 use std::io;

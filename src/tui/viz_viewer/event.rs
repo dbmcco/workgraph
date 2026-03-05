@@ -116,7 +116,7 @@ fn dispatch_event(app: &mut VizApp, ev: Event) {
     }
 }
 
-fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     // Help overlay intercepts all keys when shown
     if app.show_help {
         match code {
