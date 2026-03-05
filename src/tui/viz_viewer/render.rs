@@ -309,11 +309,11 @@ fn splash_info_for_line(app: &VizApp, orig_idx: usize) -> Option<(f64, (u8, u8, 
     None
 }
 
-/// Apply a splash-and-fade background color to the task text portion of a line.
+/// Apply a splash-and-fade background color to the task title portion of a line.
 /// `progress` ranges from 0.0 (bright splash) to 1.0 (fully faded/transparent).
 /// `flash_color` is the (r, g, b) color at full brightness.
-/// Only the task text (ID, title, status) gets the splash — tree connectors,
-/// metadata, and trailing content are left unchanged.
+/// Only the task title (ID) gets the splash — tree connectors, status/token
+/// metadata, timestamps, and trailing content are left unchanged.
 fn apply_splash_style<'a>(
     line: Line<'a>,
     progress: f64,
@@ -333,7 +333,7 @@ fn apply_splash_style<'a>(
             (flash_color.1 as f64 * 0.6) as u8,
             (flash_color.2 as f64 * 0.6) as u8,
         );
-        return apply_bg_to_text_range(line, plain_line, splash_bg);
+        return apply_bg_to_title_range(line, plain_line, splash_bg);
     }
 
     // Ease-out curve for a smoother fade (fast initial dim, slow tail-off).
@@ -345,19 +345,65 @@ fn apply_splash_style<'a>(
     let g = (flash_color.1 as f64 * (1.0 - t)) as u8;
     let b = (flash_color.2 as f64 * (1.0 - t)) as u8;
 
-    // At very low intensity, skip to avoid barely-visible artifacts.
-    if r < 15 && g < 15 && b < 5 {
+    // At low intensity, skip to avoid a visible snap when the animation
+    // ends.  Use generous thresholds so the fade reaches near-invisible
+    // well before the animation timer expires.
+    if r < 25 && g < 25 && b < 15 {
         return line;
     }
 
     let splash_bg = Color::Rgb(r, g, b);
-    apply_bg_to_text_range(line, plain_line, splash_bg)
+    apply_bg_to_title_range(line, plain_line, splash_bg)
 }
 
-/// Apply a background color to the task text range of a line.
-fn apply_bg_to_text_range<'a>(line: Line<'a>, plain_line: &str, bg: Color) -> Line<'a> {
-    // Only apply splash to the task text range (not tree chars, metadata, etc.).
-    let (text_start, text_end) = match find_text_range(plain_line) {
+/// Find the task title/ID range in a viz line — just the title, not metadata.
+///
+/// A typical viz line looks like:
+///   `└→ fix-remove-yellow  (in-progress · →1.1M) 4m`
+///
+/// This returns the range covering only `fix-remove-yellow`, stopping before
+/// the `  (` that introduces status/token metadata.
+fn find_title_range(plain_line: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = plain_line.chars().collect();
+
+    // Start at first alphanumeric character (skip tree connectors like └→).
+    let text_start = chars.iter().position(|c| c.is_alphanumeric())?;
+
+    // End before the metadata parenthetical — look for `  (` (two spaces + open paren)
+    // which separates the task ID from its status/token info.
+    let mut text_end = chars.len();
+    for i in text_start..chars.len().saturating_sub(2) {
+        if chars[i] == ' ' && chars[i + 1] == ' ' && chars[i + 2] == '(' {
+            text_end = i;
+            break;
+        }
+    }
+
+    // If we didn't find `  (`, try single ` (` as fallback.
+    if text_end == chars.len() {
+        for i in text_start..chars.len().saturating_sub(1) {
+            if chars[i] == ' ' && chars[i + 1] == '(' {
+                text_end = i;
+                break;
+            }
+        }
+    }
+
+    // Trim trailing whitespace from the title range.
+    while text_end > text_start && chars[text_end - 1] == ' ' {
+        text_end -= 1;
+    }
+
+    if text_end <= text_start {
+        return None;
+    }
+
+    Some((text_start, text_end))
+}
+
+/// Apply a background color to the task title range (narrow — just the ID/title).
+fn apply_bg_to_title_range<'a>(line: Line<'a>, plain_line: &str, bg: Color) -> Line<'a> {
+    let (text_start, text_end) = match find_title_range(plain_line) {
         Some(range) => range,
         None => return line,
     };
@@ -370,7 +416,7 @@ fn apply_bg_to_text_range<'a>(line: Line<'a>, plain_line: &str, bg: Color) -> Li
         }
     }
 
-    // Rebuild spans, applying splash bg only within the text range.
+    // Rebuild spans, applying bg only within the title range.
     let mut new_spans: Vec<Span<'a>> = Vec::new();
     let mut current_buf = String::new();
     let mut current_style = Style::default();
