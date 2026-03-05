@@ -128,6 +128,11 @@ pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
         graph.add_node(node);
     }
 
+    // After bulk loading, normalize all `before` edges into `after` edges.
+    // During loading, tasks may reference `before` targets that weren't yet
+    // loaded when `add_node()` was called, so we do a full reconciliation pass.
+    graph.normalize_before_edges();
+
     Ok(graph)
     // Lock is automatically released when _lock goes out of scope
 }

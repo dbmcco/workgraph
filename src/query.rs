@@ -229,15 +229,29 @@ where
 }
 
 /// Build a reverse dependency index: maps each task ID to the list of tasks that depend on it.
+///
+/// Scans both `after` edges (X.after contains Y → Y blocks X) and `before` edges
+/// (Y.before contains X → Y blocks X) for defense in depth. Normally `before` edges
+/// are normalized into `after` at load/insert time, but this ensures correctness even
+/// if normalization was missed.
 pub fn build_reverse_index(graph: &WorkGraph) -> HashMap<String, Vec<String>> {
     let mut index: HashMap<String, Vec<String>> = HashMap::new();
 
     for task in graph.tasks() {
+        // after: "I depend on blocker_id" → blocker_id blocks me
         for blocker_id in &task.after {
             index
                 .entry(blocker_id.clone())
                 .or_default()
                 .push(task.id.clone());
+        }
+
+        // before: "I come before target_id" → I block target_id
+        for target_id in &task.before {
+            let dependents = index.entry(task.id.clone()).or_default();
+            if !dependents.contains(target_id) {
+                dependents.push(target_id.clone());
+            }
         }
     }
 
@@ -1721,5 +1735,64 @@ mod tests {
         let graph = WorkGraph::new();
         // Remote ref without workgraph_dir → treated as blocked
         assert!(!is_blocker_satisfied("peer:task-id", &graph, None));
+    }
+
+    #[test]
+    fn test_build_reverse_index_includes_before_edges() {
+        let mut graph = WorkGraph::new();
+
+        let mut assign_task = make_task("assign-task", "Assign task");
+        assign_task.before = vec!["target".to_string()];
+        graph.add_node(Node::Task(assign_task));
+
+        let target = make_task("target", "Target task");
+        graph.add_node(Node::Task(target));
+
+        let index = build_reverse_index(&graph);
+
+        let dependents = index.get("assign-task").expect("assign-task should be in index");
+        assert!(
+            dependents.contains(&"target".to_string()),
+            "reverse index should show assign-task blocks target, got: {:?}",
+            dependents
+        );
+    }
+
+    #[test]
+    fn test_ready_tasks_respects_before_edges() {
+        let mut graph = WorkGraph::new();
+
+        let mut source = make_task("source", "Source task");
+        source.before = vec!["target".to_string()];
+
+        let target = make_task("target", "Target task");
+
+        graph.add_node(Node::Task(target));
+        graph.add_node(Node::Task(source));
+
+        let ready = ready_tasks(&graph);
+        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+
+        assert!(ready_ids.contains(&"source"), "source should be ready");
+        assert!(!ready_ids.contains(&"target"), "target should be blocked by source");
+    }
+
+    #[test]
+    fn test_ready_tasks_before_edge_unblocked_when_done() {
+        let mut graph = WorkGraph::new();
+
+        let mut source = make_task("source", "Source task");
+        source.before = vec!["target".to_string()];
+        source.status = Status::Done;
+
+        let target = make_task("target", "Target task");
+
+        graph.add_node(Node::Task(target));
+        graph.add_node(Node::Task(source));
+
+        let ready = ready_tasks(&graph);
+        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+
+        assert!(ready_ids.contains(&"target"), "target should be ready now that source is done");
     }
 }
