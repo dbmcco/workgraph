@@ -118,6 +118,19 @@ pub fn load_workgraph_mut(dir: &Path) -> Result<(workgraph::graph::WorkGraph, Pa
     load_workgraph(dir)
 }
 
+/// Atomically load, modify, and save the workgraph while holding flock
+/// across the entire read-modify-write cycle. Prevents TOCTOU races.
+pub fn mutate_workgraph<F, T>(dir: &Path, f: F) -> Result<T>
+where
+    F: FnOnce(&mut workgraph::graph::WorkGraph) -> Result<T>,
+{
+    let path = graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+    workgraph::parser::mutate_graph(&path, f)
+}
+
 pub use workgraph::service::{is_process_alive, kill_process_force, kill_process_graceful};
 
 pub fn graph_path(dir: &Path) -> std::path::PathBuf {

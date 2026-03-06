@@ -5,7 +5,7 @@ use std::path::Path;
 
 use workgraph::agency;
 use workgraph::graph::{Node, Status, Task};
-use workgraph::{load_graph, save_graph};
+use workgraph::{lock_graph_file, load_graph_locked, save_graph_locked};
 
 use super::operations::apply_operation;
 use super::strategy::EvolverOperation;
@@ -59,8 +59,9 @@ pub(crate) fn defer_self_mutation(
     run_id: &str,
 ) -> Result<String> {
     let graph_path = super::super::graph_path(dir);
+    let _lock = lock_graph_file(&graph_path).context("Failed to lock graph")?;
     let mut graph =
-        load_graph(&graph_path).context("Failed to load graph for self-mutation deferral")?;
+        load_graph_locked(&graph_path, &_lock).context("Failed to load graph for self-mutation deferral")?;
 
     let task_id = format!(
         "evolve-review-{}-{}",
@@ -135,7 +136,7 @@ pub(crate) fn defer_self_mutation(
     };
 
     graph.add_node(Node::Task(task));
-    save_graph(&graph, &graph_path)
+    save_graph_locked(&graph, &graph_path, &_lock)
         .context("Failed to save graph with self-mutation review task")?;
     super::super::notify_graph_changed(dir);
 

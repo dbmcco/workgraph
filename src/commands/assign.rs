@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use workgraph::agency;
 use workgraph::config::Config;
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 
 use super::graph_path;
 
@@ -106,12 +106,13 @@ fn run_explicit_assign(dir: &Path, path: &Path, task_id: &str, agent_hash: &str)
         format!("No agent matching '{}'. {}", agent_hash, hint)
     })?;
 
-    let mut graph = load_graph(path).context("Failed to load graph")?;
+    let _lock = lock_graph_file(path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(path, &_lock).context("Failed to load graph")?;
 
     let task = graph.get_task_mut_or_err(task_id)?;
 
     task.agent = Some(agent.id.clone());
-    save_graph(&graph, path).context("Failed to save graph")?;
+    save_graph_locked(&graph, path, &_lock).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     // Record operation
@@ -189,13 +190,14 @@ fn run_explicit_assign(dir: &Path, path: &Path, task_id: &str, agent_hash: &str)
 
 /// Clear the agent assignment from a task.
 fn run_clear(dir: &Path, path: &Path, task_id: &str) -> Result<()> {
-    let mut graph = load_graph(path).context("Failed to load graph")?;
+    let _lock = lock_graph_file(path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(path, &_lock).context("Failed to load graph")?;
 
     let task = graph.get_task_mut_or_err(task_id)?;
 
     let prev_agent = task.agent.clone();
     task.agent = None;
-    save_graph(&graph, path).context("Failed to save graph")?;
+    save_graph_locked(&graph, path, &_lock).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     // Record operation

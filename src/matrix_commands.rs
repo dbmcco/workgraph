@@ -20,7 +20,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use crate::graph::{LogEntry, Status};
-use crate::parser::{load_graph, save_graph};
+use crate::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 
 /// A parsed command from a Matrix message
 #[derive(Debug, Clone, PartialEq)]
@@ -314,7 +314,8 @@ pub fn execute_claim(workgraph_dir: &Path, task_id: &str, actor: Option<&str>) -
         return "Error: Workgraph not initialized".to_string();
     }
 
-    let mut graph = match load_graph(&graph_path) {
+    let _lock = match lock_graph_file(&graph_path) { Ok(l) => l, Err(e) => return format!("Error locking graph: {}", e) };
+    let mut graph = match load_graph_locked(&graph_path, &_lock) {
         Ok(g) => g,
         Err(e) => return format!("Error loading graph: {}", e),
     };
@@ -357,7 +358,7 @@ pub fn execute_claim(workgraph_dir: &Path, task_id: &str, actor: Option<&str>) -
         task.assigned = Some(actor_id.to_string());
     }
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
         return format!("Error saving graph: {}", e);
     }
 
@@ -375,7 +376,8 @@ pub fn execute_done(workgraph_dir: &Path, task_id: &str) -> String {
         return "Error: Workgraph not initialized".to_string();
     }
 
-    let mut graph = match load_graph(&graph_path) {
+    let _lock = match lock_graph_file(&graph_path) { Ok(l) => l, Err(e) => return format!("Error locking graph: {}", e) };
+    let mut graph = match load_graph_locked(&graph_path, &_lock) {
         Ok(g) => g,
         Err(e) => return format!("Error loading graph: {}", e),
     };
@@ -392,7 +394,7 @@ pub fn execute_done(workgraph_dir: &Path, task_id: &str) -> String {
     task.status = Status::Done;
     task.completed_at = Some(Utc::now().to_rfc3339());
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
         return format!("Error saving graph: {}", e);
     }
 
@@ -407,7 +409,8 @@ pub fn execute_fail(workgraph_dir: &Path, task_id: &str, reason: Option<&str>) -
         return "Error: Workgraph not initialized".to_string();
     }
 
-    let mut graph = match load_graph(&graph_path) {
+    let _lock = match lock_graph_file(&graph_path) { Ok(l) => l, Err(e) => return format!("Error locking graph: {}", e) };
+    let mut graph = match load_graph_locked(&graph_path, &_lock) {
         Ok(g) => g,
         Err(e) => return format!("Error loading graph: {}", e),
     };
@@ -434,7 +437,7 @@ pub fn execute_fail(workgraph_dir: &Path, task_id: &str, reason: Option<&str>) -
 
     let retry_count = task.retry_count;
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
         return format!("Error saving graph: {}", e);
     }
 
@@ -453,7 +456,8 @@ pub fn execute_input(workgraph_dir: &Path, task_id: &str, text: &str, actor: &st
         return "Error: Workgraph not initialized".to_string();
     }
 
-    let mut graph = match load_graph(&graph_path) {
+    let _lock = match lock_graph_file(&graph_path) { Ok(l) => l, Err(e) => return format!("Error locking graph: {}", e) };
+    let mut graph = match load_graph_locked(&graph_path, &_lock) {
         Ok(g) => g,
         Err(e) => return format!("Error loading graph: {}", e),
     };
@@ -471,7 +475,7 @@ pub fn execute_input(workgraph_dir: &Path, task_id: &str, text: &str, actor: &st
 
     task.log.push(entry);
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
         return format!("Error saving graph: {}", e);
     }
 
@@ -486,7 +490,8 @@ pub fn execute_unclaim(workgraph_dir: &Path, task_id: &str) -> String {
         return "Error: Workgraph not initialized".to_string();
     }
 
-    let mut graph = match load_graph(&graph_path) {
+    let _lock = match lock_graph_file(&graph_path) { Ok(l) => l, Err(e) => return format!("Error locking graph: {}", e) };
+    let mut graph = match load_graph_locked(&graph_path, &_lock) {
         Ok(g) => g,
         Err(e) => return format!("Error loading graph: {}", e),
     };
@@ -499,7 +504,7 @@ pub fn execute_unclaim(workgraph_dir: &Path, task_id: &str) -> String {
     task.status = Status::Open;
     task.assigned = None;
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
         return format!("Error saving graph: {}", e);
     }
 

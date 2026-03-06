@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 
 use super::graph_path;
 
@@ -215,7 +215,8 @@ pub fn restore(dir: &Path, task_id: &str, reopen: bool) -> Result<()> {
     }
 
     // Add back to graph
-    let mut graph = load_graph(&path).context("Failed to load graph")?;
+    let _lock = lock_graph_file(&path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(&path, &_lock).context("Failed to load graph")?;
     if graph.get_task(&restored_task.id).is_some() {
         anyhow::bail!(
             "Task '{}' already exists in the active graph",
@@ -223,7 +224,7 @@ pub fn restore(dir: &Path, task_id: &str, reopen: bool) -> Result<()> {
         );
     }
     graph.add_node(Node::Task(restored_task.clone()));
-    save_graph(&graph, &path).context("Failed to save graph")?;
+    save_graph_locked(&graph, &path, &_lock).context("Failed to save graph")?;
 
     // Remove from archive
     remove_from_archive(&arch_path, task_id)?;
@@ -281,7 +282,8 @@ pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: boo
         None
     };
 
-    let graph = load_graph(&path).context("Failed to load graph")?;
+    let _lock = lock_graph_file(&path).context("Failed to lock graph")?;
+    let graph = load_graph_locked(&path, &_lock).context("Failed to load graph")?;
 
     // Find tasks to archive
     let tasks_to_archive: Vec<Task> = graph
@@ -315,7 +317,7 @@ pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: boo
     }
 
     // 3. Save the modified graph
-    save_graph(&modified_graph, &path).context("Failed to save graph")?;
+    save_graph_locked(&modified_graph, &path, &_lock).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     // Record operation

@@ -20,7 +20,7 @@ use workgraph::graph::{
     evaluate_all_cycle_iterations,
 };
 use workgraph::messages;
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, save_graph_locked};
 use workgraph::query::ready_tasks_with_peers_cycle_aware;
 use workgraph::service::registry::AgentRegistry;
 
@@ -1234,19 +1234,11 @@ fn build_auto_evaluate_tasks(
             max_retries: None,
             failure_reason: None,
             model: Some({
-                let eval_role = if workgraph::graph::is_system_task(task_id) {
-                    workgraph::config::DispatchRole::SystemEvaluator
-                } else {
-                    workgraph::config::DispatchRole::Evaluator
-                };
+                let eval_role = workgraph::config::DispatchRole::Evaluator;
                 config.resolve_model_for_role(eval_role).model
             }),
             provider: {
-                let eval_role = if workgraph::graph::is_system_task(task_id) {
-                    workgraph::config::DispatchRole::SystemEvaluator
-                } else {
-                    workgraph::config::DispatchRole::Evaluator
-                };
+                let eval_role = workgraph::config::DispatchRole::Evaluator;
                 config.resolve_model_for_role(eval_role).provider
             },
             verify: None,
@@ -1516,7 +1508,8 @@ fn spawn_eval_inline(
     use std::process::{Command, Stdio};
 
     let graph_path = graph_path(dir);
-    let mut graph = load_graph(&graph_path).context("Failed to load graph for eval spawn")?;
+    let _graph_lock = lock_graph_file(&graph_path).context("Failed to lock graph for eval spawn")?;
+    let mut graph = load_graph_locked(&graph_path, &_graph_lock).context("Failed to load graph for eval spawn")?;
 
     // Extract needed fields from the eval task before releasing the mutable borrow.
     let (eval_task_status, eval_task_exec, eval_task_agent) = {
@@ -1653,7 +1646,7 @@ exit $EXIT_CODE"#,
                 .unwrap_or_default()
         ),
     });
-    save_graph(&graph, &graph_path).context("Failed to save graph after claiming eval task")?;
+    save_graph_locked(&graph, &graph_path, &_graph_lock).context("Failed to save graph after claiming eval task")?;
 
     // Fork the process
     let mut cmd = Command::new("bash");
@@ -1677,8 +1670,8 @@ exit $EXIT_CODE"#,
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Rollback the claim
-            if let Ok(mut rollback_graph) = load_graph(&graph_path)
+            // Rollback the claim (reuse existing lock)
+            if let Ok(mut rollback_graph) = load_graph_locked(&graph_path, &_graph_lock)
                 && let Some(t) = rollback_graph.get_task_mut(eval_task_id)
             {
                 t.status = Status::Open;
@@ -1689,7 +1682,7 @@ exit $EXIT_CODE"#,
                     actor: Some(agent_id.clone()),
                     message: format!("Eval spawn failed, reverting claim: {}", e),
                 });
-                let _ = save_graph(&rollback_graph, &graph_path);
+                let _ = save_graph_locked(&rollback_graph, &graph_path, &_graph_lock);
             }
             return Err(anyhow::anyhow!("Failed to spawn eval process: {}", e));
         }
@@ -2018,8 +2011,9 @@ pub fn coordinator_tick(
     // Phase 1.5: Auto-checkpoint alive agents if thresholds are met
     auto_checkpoint_agents(dir, &config);
 
-    // Phase 2: Load graph
-    let mut graph = load_graph(&graph_path).context("Failed to load graph")?;
+    // Phase 2: Load graph (hold lock across entire read-modify-write cycle)
+    let _tick_lock = lock_graph_file(&graph_path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(&graph_path, &_tick_lock).context("Failed to load graph")?;
 
     let slots_available = max_agents.saturating_sub(alive_count);
 
@@ -2037,7 +2031,7 @@ pub fn coordinator_tick(
                 reactivated.len(),
                 reactivated
             );
-            save_graph(&graph, &graph_path)
+            save_graph_locked(&graph, &graph_path, &_tick_lock)
                 .context("Failed to save graph after cycle reactivation")?;
         }
     }
@@ -2053,7 +2047,7 @@ pub fn coordinator_tick(
                 reactivated.len(),
                 reactivated
             );
-            save_graph(&graph, &graph_path)
+            save_graph_locked(&graph, &graph_path, &_tick_lock)
                 .context("Failed to save graph after cycle failure restart")?;
         }
     }
@@ -2063,7 +2057,7 @@ pub fn coordinator_tick(
     {
         let wait_modified = evaluate_waiting_tasks(&mut graph, dir);
         if wait_modified {
-            save_graph(&graph, &graph_path)
+            save_graph_locked(&graph, &graph_path, &_tick_lock)
                 .context("Failed to save graph after wait condition evaluation")?;
         }
     }
@@ -2073,7 +2067,7 @@ pub fn coordinator_tick(
     {
         let resurrect_modified = resurrect_done_tasks(&mut graph, dir);
         if resurrect_modified {
-            save_graph(&graph, &graph_path).context("Failed to save graph after resurrection")?;
+            save_graph_locked(&graph, &graph_path, &_tick_lock).context("Failed to save graph after resurrection")?;
         }
     }
 
@@ -2098,7 +2092,7 @@ pub fn coordinator_tick(
     // Abort tick if save fails — continuing with unsaved state would spawn agents
     // on tasks that haven't been persisted.
     if graph_modified {
-        save_graph(&graph, &graph_path)
+        save_graph_locked(&graph, &graph_path, &_tick_lock)
             .context("Failed to save graph after auto-assign/auto-evaluate; aborting tick")?;
     }
 

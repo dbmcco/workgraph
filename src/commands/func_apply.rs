@@ -6,7 +6,7 @@ use workgraph::function::{
     self, FunctionInput, InputType, PlanningConfig, TaskTemplate, TraceFunction,
 };
 use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 
 use super::graph_path;
 
@@ -136,8 +136,9 @@ pub fn run(
 
     // 6. Load graph (needed for creating tasks)
     let graph_file = graph_path(dir);
+    let _lock = lock_graph_file(&graph_file).context("Failed to lock graph")?;
     let mut graph = if graph_file.exists() {
-        load_graph(&graph_file).context("Failed to load graph")?
+        load_graph_locked(&graph_file, &_lock).context("Failed to load graph")?
     } else {
         anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
     };
@@ -318,7 +319,7 @@ pub fn run(
     }
 
     // Save graph
-    save_graph(&graph, &graph_file).context("Failed to save graph")?;
+    save_graph_locked(&graph, &graph_file, &_lock).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     // Record provenance

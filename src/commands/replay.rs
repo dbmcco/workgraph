@@ -9,7 +9,6 @@ use std::path::Path;
 use workgraph::agency::{Evaluation, load_all_evaluations_or_warn};
 use workgraph::config::Config;
 use workgraph::graph::{Status, Task};
-use workgraph::parser::save_graph;
 use workgraph::runs::{self, RunMeta};
 
 /// Options controlling which tasks to reset.
@@ -34,148 +33,145 @@ struct ReplayOutput {
 }
 
 pub fn run(dir: &Path, opts: &ReplayOptions, json: bool) -> Result<()> {
-    let (mut graph, graph_path) = super::load_workgraph_mut(dir)?;
     let config = Config::load_or_default(dir);
 
-    // Determine keep_done threshold
-    let keep_done_threshold = opts.keep_done.unwrap_or(config.replay.keep_done_threshold);
+    // Phase 1-3: Read-only analysis (no lock held — just determining what to reset)
+    let (reset_ids, preserved_ids, score_map) = {
+        let (graph, _) = super::load_workgraph(dir)?;
 
-    // Load evaluations for --below-score and --keep-done filtering
-    let agency_dir = dir.join("agency");
-    let evaluations = if opts.below_score.is_some() || keep_done_threshold < 1.0 {
-        load_all_evaluations_or_warn(&agency_dir)
-    } else {
-        Vec::new()
-    };
+        let keep_done_threshold = opts.keep_done.unwrap_or(config.replay.keep_done_threshold);
 
-    // Build a map of task_id -> best evaluation score
-    let score_map = build_score_map(&evaluations);
+        let agency_dir = dir.join("agency");
+        let evaluations = if opts.below_score.is_some() || keep_done_threshold < 1.0 {
+            load_all_evaluations_or_warn(&agency_dir)
+        } else {
+            Vec::new()
+        };
 
-    // Collect tasks in subgraph if --subgraph is specified
-    let subgraph_ids: Option<HashSet<String>> = if let Some(root) = &opts.subgraph {
-        Some(collect_subgraph(&graph, root)?)
-    } else {
-        None
-    };
+        let score_map = build_score_map(&evaluations);
 
-    // Phase 1: Determine which tasks to reset (seed set)
-    let mut seeds: HashSet<String> = HashSet::new();
+        let subgraph_ids: Option<HashSet<String>> = if let Some(root) = &opts.subgraph {
+            Some(collect_subgraph(&graph, root)?)
+        } else {
+            None
+        };
 
-    for task in graph.tasks() {
-        // If subgraph filter is active, skip tasks outside the subgraph
-        if let Some(ref sg) = subgraph_ids
-            && !sg.contains(&task.id)
-        {
-            continue;
-        }
+        let mut seeds: HashSet<String> = HashSet::new();
 
-        if !opts.tasks.is_empty() {
-            // Explicit task list: only seed listed tasks
-            if opts.tasks.contains(&task.id) {
-                seeds.insert(task.id.clone());
+        for task in graph.tasks() {
+            if let Some(ref sg) = subgraph_ids
+                && !sg.contains(&task.id)
+            {
+                continue;
             }
-            continue;
-        }
 
-        if opts.failed_only {
-            if matches!(task.status, Status::Failed | Status::Abandoned) {
-                seeds.insert(task.id.clone());
-            }
-            continue;
-        }
-
-        if let Some(threshold) = opts.below_score {
-            let score = score_map.get(&task.id).copied();
-            if let Some(s) = score {
-                if s < threshold {
+            if !opts.tasks.is_empty() {
+                if opts.tasks.contains(&task.id) {
                     seeds.insert(task.id.clone());
                 }
-            } else if task.status.is_terminal() {
-                // No eval score — reset if terminal (no evidence of quality)
+                continue;
+            }
+
+            if opts.failed_only {
+                if matches!(task.status, Status::Failed | Status::Abandoned) {
+                    seeds.insert(task.id.clone());
+                }
+                continue;
+            }
+
+            if let Some(threshold) = opts.below_score {
+                let score = score_map.get(&task.id).copied();
+                if let Some(s) = score {
+                    if s < threshold {
+                        seeds.insert(task.id.clone());
+                    }
+                } else if task.status.is_terminal() {
+                    seeds.insert(task.id.clone());
+                }
+                continue;
+            }
+
+            if task.status.is_terminal() {
                 seeds.insert(task.id.clone());
             }
-            continue;
         }
 
-        // Default: reset all terminal tasks (unless kept by --keep-done)
-        if task.status.is_terminal() {
-            seeds.insert(task.id.clone());
+        let reverse_index = build_reverse_index(&graph);
+        let mut all_to_reset = seeds.clone();
+        for seed in &seeds {
+            super::collect_transitive_dependents(&reverse_index, seed, &mut all_to_reset);
         }
-    }
 
-    // Phase 2: Collect transitive dependents of seed tasks
-    let reverse_index = build_reverse_index(&graph);
-    let mut all_to_reset = seeds.clone();
-    for seed in &seeds {
-        super::collect_transitive_dependents(&reverse_index, seed, &mut all_to_reset);
-    }
-
-    // Phase 3: Apply --keep-done — remove Done tasks with score above threshold
-    if keep_done_threshold < 1.0 {
-        let mut to_keep = Vec::new();
-        for task_id in &all_to_reset {
-            if let Some(task) = graph.get_task(task_id)
-                && task.status == Status::Done
-                && let Some(&score) = score_map.get(task_id)
-                && score >= keep_done_threshold
-            {
-                to_keep.push(task_id.clone());
+        if keep_done_threshold < 1.0 {
+            let mut to_keep = Vec::new();
+            for task_id in &all_to_reset {
+                if let Some(task) = graph.get_task(task_id)
+                    && task.status == Status::Done
+                    && let Some(&score) = score_map.get(task_id)
+                    && score >= keep_done_threshold
+                {
+                    to_keep.push(task_id.clone());
+                }
+            }
+            for id in to_keep {
+                all_to_reset.remove(&id);
             }
         }
-        for id in to_keep {
-            all_to_reset.remove(&id);
+
+        let mut reset_ids: Vec<String> = all_to_reset.into_iter().collect();
+        reset_ids.sort();
+
+        let mut preserved_ids: Vec<String> = graph
+            .tasks()
+            .filter(|t| !reset_ids.contains(&t.id))
+            .map(|t| t.id.clone())
+            .collect();
+        preserved_ids.sort();
+
+        // Handle plan_only display (needs graph for status display)
+        if opts.plan_only {
+            let output = ReplayOutput {
+                run_id: "(dry run)".to_string(),
+                model: opts.model.clone(),
+                reset_tasks: reset_ids.clone(),
+                preserved_tasks: preserved_ids.clone(),
+                plan_only: true,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Replay plan (dry run — no changes will be made):\n");
+                if let Some(ref m) = opts.model {
+                    println!("  Model override: {}", m);
+                }
+                println!("  Tasks to reset ({}):", reset_ids.len());
+                for id in &reset_ids {
+                    let status = graph
+                        .get_task(id)
+                        .map(|t| t.status.to_string())
+                        .unwrap_or_default();
+                    let score = score_map
+                        .get(id)
+                        .map(|s| format!(" (score: {:.2})", s))
+                        .unwrap_or_default();
+                    println!("    {} [{}]{}", id, status, score);
+                }
+                println!("  Tasks preserved ({}):", preserved_ids.len());
+                for id in &preserved_ids {
+                    let status = graph
+                        .get_task(id)
+                        .map(|t| t.status.to_string())
+                        .unwrap_or_default();
+                    println!("    {} [{}]", id, status);
+                }
+            }
+            return Ok(());
         }
-    }
 
-    // Sort for deterministic output
-    let mut reset_ids: Vec<String> = all_to_reset.into_iter().collect();
-    reset_ids.sort();
+        (reset_ids, preserved_ids, score_map)
+    };
 
-    let mut preserved_ids: Vec<String> = graph
-        .tasks()
-        .filter(|t| !reset_ids.contains(&t.id))
-        .map(|t| t.id.clone())
-        .collect();
-    preserved_ids.sort();
-
-    if opts.plan_only {
-        let output = ReplayOutput {
-            run_id: "(dry run)".to_string(),
-            model: opts.model.clone(),
-            reset_tasks: reset_ids.clone(),
-            preserved_tasks: preserved_ids.clone(),
-            plan_only: true,
-        };
-        if json {
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("Replay plan (dry run — no changes will be made):\n");
-            if let Some(ref m) = opts.model {
-                println!("  Model override: {}", m);
-            }
-            println!("  Tasks to reset ({}):", reset_ids.len());
-            for id in &reset_ids {
-                let status = graph
-                    .get_task(id)
-                    .map(|t| t.status.to_string())
-                    .unwrap_or_default();
-                let score = score_map
-                    .get(id)
-                    .map(|s| format!(" (score: {:.2})", s))
-                    .unwrap_or_default();
-                println!("    {} [{}]{}", id, status, score);
-            }
-            println!("  Tasks preserved ({}):", preserved_ids.len());
-            for id in &preserved_ids {
-                let status = graph
-                    .get_task(id)
-                    .map(|t| t.status.to_string())
-                    .unwrap_or_default();
-                println!("    {} [{}]", id, status);
-            }
-        }
-        return Ok(());
-    }
+    let _ = &score_map; // suppress unused warning in non-plan path
 
     if reset_ids.is_empty() {
         if json {
@@ -192,7 +188,7 @@ pub fn run(dir: &Path, opts: &ReplayOptions, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Phase 4: Snapshot current state
+    // Phase 4: Snapshot current state (writes to runs dir, not graph.jsonl)
     let run_id = runs::next_run_id(dir);
     let filter_desc = build_filter_desc(opts);
     let meta = RunMeta {
@@ -205,22 +201,21 @@ pub fn run(dir: &Path, opts: &ReplayOptions, json: bool) -> Result<()> {
     };
     runs::snapshot(dir, &run_id, &meta)?;
 
-    // Phase 5: Reset selected tasks
-    for task_id in &reset_ids {
-        if let Some(task) = graph.get_task_mut(task_id) {
-            reset_task(task);
-            // Apply model override
-            if let Some(ref model) = opts.model {
-                task.model = Some(model.clone());
+    // Phase 5: Atomic reset (flock held across read-modify-write)
+    super::mutate_workgraph(dir, |graph| {
+        for task_id in &reset_ids {
+            if let Some(task) = graph.get_task_mut(task_id) {
+                reset_task(task);
+                if let Some(ref model) = opts.model {
+                    task.model = Some(model.clone());
+                }
             }
         }
-    }
-
-    // Phase 6: Save graph
-    save_graph(&graph, &graph_path).context("Failed to save graph after replay")?;
+        Ok(())
+    })?;
     super::notify_graph_changed(dir);
 
-    // Phase 7: Record provenance
+    // Phase 6: Record provenance
     let _ = workgraph::provenance::record(
         dir,
         "replay",

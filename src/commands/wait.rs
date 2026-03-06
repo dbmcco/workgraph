@@ -1,8 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status, WaitCondition, WaitSpec, parse_delay};
-use workgraph::parser::save_graph;
 use workgraph::service::registry::{AgentRegistry, AgentStatus};
 
 /// Parse a condition string into a WaitCondition.
@@ -127,49 +126,37 @@ fn parse_wait_spec(s: &str, graph: &workgraph::graph::WorkGraph) -> Result<WaitS
 }
 
 pub fn run(dir: &Path, id: &str, until: &str, checkpoint: Option<&str>) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
+    let assigned_agent = super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_or_err(id)?;
+        if task.status != Status::InProgress {
+            anyhow::bail!(
+                "Cannot wait on task '{}': status is '{}', expected 'in-progress'",
+                id, task.status
+            );
+        }
+        let wait_spec = parse_wait_spec(until, graph)?;
+        let task = graph.get_task_mut(id).ok_or_else(|| anyhow::anyhow!("Task '{}' not found", id))?;
+        task.status = Status::Waiting;
+        task.wait_condition = Some(wait_spec);
+        if let Some(cp) = checkpoint {
+            task.checkpoint = Some(cp.to_string());
+        }
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: task.assigned.clone(),
+            message: format!("Agent parked. Waiting for: {}", until),
+        });
+        Ok(task.assigned.clone())
+    })?;
 
-    let task = graph.get_task_or_err(id)?;
-
-    // Validate task is InProgress
-    if task.status != Status::InProgress {
-        anyhow::bail!(
-            "Cannot wait on task '{}': status is '{}', expected 'in-progress'",
-            id,
-            task.status
-        );
-    }
-
-    // Parse and validate the condition
-    let wait_spec = parse_wait_spec(until, &graph)?;
-
-    // Now mutate
-    let task = graph
-        .get_task_mut(id)
-        .ok_or_else(|| anyhow::anyhow!("Task '{}' not found", id))?;
-
-    task.status = Status::Waiting;
-    task.wait_condition = Some(wait_spec);
-
-    if let Some(cp) = checkpoint {
-        task.checkpoint = Some(cp.to_string());
-    }
-
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: task.assigned.clone(),
-        message: format!("Agent parked. Waiting for: {}", until),
-    });
-
-    // Update agent status to Parked if there's an assigned agent
-    if let Some(ref assigned) = task.assigned.clone()
+    // Update agent registry outside the graph lock
+    if let Some(ref assigned) = assigned_agent
         && let Ok(mut registry) = AgentRegistry::load_locked(dir)
     {
         if let Some(agent) = registry.registry.get_agent_mut(assigned) {
             agent.status = AgentStatus::Parked;
             agent.completed_at = Some(Utc::now().to_rfc3339());
         }
-        // Also try to find by task_id if assigned is not an agent registry key
         for agent in registry.registry.agents.values_mut() {
             if agent.task_id == id && agent.is_alive() {
                 agent.status = AgentStatus::Parked;
@@ -181,12 +168,9 @@ pub fn run(dir: &Path, id: &str, until: &str, checkpoint: Option<&str>) -> Resul
         let _ = registry.save();
     }
 
-    save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
-
     println!("Parked task '{}'. Condition: {}", id, until);
     println!("Checkpoint saved. You should now exit cleanly.");
-
     Ok(())
 }
 

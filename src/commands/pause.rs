@@ -1,31 +1,27 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::LogEntry;
-use workgraph::parser::save_graph;
 
 #[cfg(test)]
 use super::graph_path;
 #[cfg(test)]
-use workgraph::parser::load_graph;
+use workgraph::parser::{load_graph, save_graph};
 
 pub fn run(dir: &Path, id: &str) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    if task.paused {
-        anyhow::bail!("Task '{}' is already paused", id);
-    }
-
-    task.paused = true;
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: None,
-        message: "Task paused".to_string(),
-    });
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
+    super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        if task.paused {
+            anyhow::bail!("Task '{}' is already paused", id);
+        }
+        task.paused = true;
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: None,
+            message: "Task paused".to_string(),
+        });
+        Ok(())
+    })?;
     super::notify_graph_changed(dir);
 
     // Record operation

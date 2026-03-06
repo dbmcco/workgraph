@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Node, Status, Task, is_system_task};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 use workgraph::service::executor::{ExecutorRegistry, PromptTemplate, TemplateVars, build_prompt};
 use workgraph::service::registry::AgentRegistry;
 
@@ -37,8 +37,9 @@ pub(crate) fn spawn_agent_inner(
         anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
     }
 
-    // Load the graph and get task info
-    let mut graph = load_graph(&graph_path).context("Failed to load graph")?;
+    // Load the graph and get task info (lock held across full read-modify-write)
+    let _spawn_lock = lock_graph_file(&graph_path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(&graph_path, &_spawn_lock).context("Failed to load graph")?;
 
     let task = graph.get_task_or_err(task_id)?;
 
@@ -321,14 +322,14 @@ pub(crate) fn spawn_agent_inner(
         }));
     }
 
-    save_graph(&graph, &graph_path).context("Failed to save graph")?;
+    save_graph_locked(&graph, &graph_path, &_spawn_lock).context("Failed to save graph")?;
 
     // Spawn the process (don't wait). If spawn fails, unclaim the task.
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Spawn failed — revert the task claim so it's not stuck
-            match load_graph(&graph_path) {
+            // Spawn failed — revert the task claim (reuse existing lock)
+            match load_graph_locked(&graph_path, &_spawn_lock) {
                 Ok(mut rollback_graph) => {
                     if let Some(t) = rollback_graph.get_task_mut(task_id) {
                         t.status = Status::Open;
@@ -339,7 +340,7 @@ pub(crate) fn spawn_agent_inner(
                             actor: Some(temp_agent_id.clone()),
                             message: format!("Spawn failed, reverting claim: {}", e),
                         });
-                        if let Err(save_err) = save_graph(&rollback_graph, &graph_path) {
+                        if let Err(save_err) = save_graph_locked(&rollback_graph, &graph_path, &_spawn_lock) {
                             eprintln!(
                                 "Warning: failed to save rollback graph for task '{}': {}",
                                 task_id, save_err

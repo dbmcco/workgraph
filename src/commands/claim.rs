@@ -1,150 +1,95 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::save_graph;
 
 #[cfg(test)]
 use super::graph_path;
 #[cfg(test)]
-use workgraph::parser::load_graph;
+use workgraph::parser::{load_graph, save_graph};
 
 /// Claim a task for work: sets status to InProgress, optionally assigns an actor
 pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    // Only allow claiming tasks that are Open or Blocked
-    match task.status {
-        Status::Open | Status::Blocked => {}
-        Status::Waiting => anyhow::bail!(
-            "Cannot claim task '{}': task is Waiting. Use 'wg resume' first.",
-            id
-        ),
-        Status::InProgress => {
-            let since = task
-                .started_at
-                .as_ref()
-                .map(|t| format!(" (since {})", t))
-                .unwrap_or_default();
-            match &task.assigned {
-                Some(assigned) => {
-                    anyhow::bail!(
-                        "Task '{}' is already claimed by @{}{}. Use 'wg unclaim {}' to release it first.",
-                        id,
-                        assigned,
-                        since,
-                        id
-                    );
-                }
-                None => {
-                    anyhow::bail!("Task '{}' is already in progress{}", id, since);
+    let (prev_status, prev_assigned) = super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        match task.status {
+            Status::Open | Status::Blocked => {}
+            Status::Waiting => anyhow::bail!("Cannot claim task '{}': task is Waiting. Use 'wg resume' first.", id),
+            Status::InProgress => {
+                let since = task.started_at.as_ref().map(|t| format!(" (since {})", t)).unwrap_or_default();
+                match &task.assigned {
+                    Some(assigned) => anyhow::bail!("Task '{}' is already claimed by @{}{}. Use 'wg unclaim {}' to release it first.", id, assigned, since, id),
+                    None => anyhow::bail!("Task '{}' is already in progress{}", id, since),
                 }
             }
+            Status::Done => anyhow::bail!("Task '{}' is already done", id),
+            Status::Failed => anyhow::bail!("Cannot claim task '{}': task is Failed. Use 'wg retry' to retry it.", id),
+            Status::Abandoned => anyhow::bail!("Cannot claim task '{}': task is Abandoned", id),
         }
-        Status::Done => {
-            anyhow::bail!("Task '{}' is already done", id);
+        let prev_status = format!("{:?}", task.status);
+        let prev_assigned = task.assigned.clone();
+        task.status = Status::InProgress;
+        task.started_at = Some(Utc::now().to_rfc3339());
+        if let Some(actor_id) = actor {
+            task.assigned = Some(actor_id.to_string());
         }
-        Status::Failed => {
-            anyhow::bail!(
-                "Cannot claim task '{}': task is Failed. Use 'wg retry' to retry it.",
-                id
-            );
-        }
-        Status::Abandoned => {
-            anyhow::bail!("Cannot claim task '{}': task is Abandoned", id);
-        }
-    }
-
-    let prev_status = format!("{:?}", task.status);
-    let prev_assigned = task.assigned.clone();
-
-    task.status = Status::InProgress;
-    task.started_at = Some(Utc::now().to_rfc3339());
-    if let Some(actor_id) = actor {
-        task.assigned = Some(actor_id.to_string());
-    }
-
-    let log_message = match actor {
-        Some(actor_id) => format!("Task claimed by @{}", actor_id),
-        None => "Task claimed".to_string(),
-    };
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: actor.map(std::string::ToString::to_string),
-        message: log_message,
-    });
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: actor.map(std::string::ToString::to_string),
+            message: match actor {
+                Some(actor_id) => format!("Task claimed by @{}", actor_id),
+                None => "Task claimed".to_string(),
+            },
+        });
+        Ok((prev_status, prev_assigned))
+    })?;
     super::notify_graph_changed(dir);
 
-    // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
-        dir,
-        "claim",
-        Some(id),
-        actor,
+        dir, "claim", Some(id), actor,
         serde_json::json!({ "prev_status": prev_status, "prev_assigned": prev_assigned }),
         config.log.rotation_threshold,
     );
-
     match actor {
         Some(actor_id) => println!("Claimed '{}' for '{}'", id, actor_id),
         None => println!("Claimed '{}'", id),
     }
-
     Ok(())
 }
 
 /// Unclaim a task: sets status back to Open and clears assigned
 pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    // Only allow unclaiming tasks that are InProgress (or Open, as a no-op).
-    // Terminal states should not be reverted via unclaim.
-    match task.status {
-        Status::InProgress | Status::Open | Status::Blocked => {}
-        Status::Waiting => anyhow::bail!(
-            "Cannot claim task '{}': task is Waiting. Use 'wg resume' first.",
-            id
-        ),
-        Status::Done => anyhow::bail!("Cannot unclaim task '{}': task is Done", id),
-        Status::Failed => anyhow::bail!("Cannot unclaim task '{}': task is Failed", id),
-        Status::Abandoned => anyhow::bail!("Cannot unclaim task '{}': task is Abandoned", id),
-    }
-
-    let prev_assigned = task.assigned.clone();
-    task.status = Status::Open;
-    task.assigned = None;
-
-    let log_message = match &prev_assigned {
-        Some(actor_id) => format!("Task unclaimed (was assigned to @{})", actor_id),
-        None => "Task unclaimed".to_string(),
-    };
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: prev_assigned.clone(),
-        message: log_message,
-    });
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
+    let prev_assigned = super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        match task.status {
+            Status::InProgress | Status::Open | Status::Blocked => {}
+            Status::Waiting => anyhow::bail!("Cannot claim task '{}': task is Waiting. Use 'wg resume' first.", id),
+            Status::Done => anyhow::bail!("Cannot unclaim task '{}': task is Done", id),
+            Status::Failed => anyhow::bail!("Cannot unclaim task '{}': task is Failed", id),
+            Status::Abandoned => anyhow::bail!("Cannot unclaim task '{}': task is Abandoned", id),
+        }
+        let prev_assigned = task.assigned.clone();
+        task.status = Status::Open;
+        task.assigned = None;
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: prev_assigned.clone(),
+            message: match &prev_assigned {
+                Some(actor_id) => format!("Task unclaimed (was assigned to @{})", actor_id),
+                None => "Task unclaimed".to_string(),
+            },
+        });
+        Ok(prev_assigned)
+    })?;
     super::notify_graph_changed(dir);
 
-    // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
-        dir,
-        "unclaim",
-        Some(id),
-        prev_assigned.as_deref(),
+        dir, "unclaim", Some(id), prev_assigned.as_deref(),
         serde_json::json!({ "prev_assigned": prev_assigned }),
         config.log.rotation_threshold,
     );
-
     println!("Unclaimed '{}'", id);
     Ok(())
 }

@@ -12,7 +12,7 @@ use workgraph::agency::{
 };
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Status, TokenUsage};
-use workgraph::parser::load_graph;
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 use workgraph::provenance;
 
 /// Extract the model from a task's spawn log entry.
@@ -433,10 +433,12 @@ pub fn run(
     if let Some(usage) = eval_result.token_usage {
         let eval_task_id = format!(".evaluate-{}", task_id);
         let graph_path = super::graph_path(dir);
-        if let Ok(mut graph) = load_graph(&graph_path) {
-            if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
-                eval_task.token_usage = Some(usage);
-                let _ = workgraph::parser::save_graph(&graph, &graph_path);
+        if let Ok(lock) = lock_graph_file(&graph_path) {
+            if let Ok(mut graph) = load_graph_locked(&graph_path, &lock) {
+                if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
+                    eval_task.token_usage = Some(usage);
+                    let _ = save_graph_locked(&graph, &graph_path, &lock);
+                }
             }
         }
     }
@@ -812,10 +814,12 @@ pub fn run_flip(
     if let Some(usage) = combined_usage {
         let eval_task_id = format!(".evaluate-{}", task_id);
         let graph_path = super::graph_path(dir);
-        if let Ok(mut graph) = load_graph(&graph_path) {
-            if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
-                eval_task.token_usage = Some(usage);
-                let _ = workgraph::parser::save_graph(&graph, &graph_path);
+        if let Ok(lock) = lock_graph_file(&graph_path) {
+            if let Ok(mut graph) = load_graph_locked(&graph_path, &lock) {
+                if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
+                    eval_task.token_usage = Some(usage);
+                    let _ = save_graph_locked(&graph, &graph_path, &lock);
+                }
             }
         }
     }

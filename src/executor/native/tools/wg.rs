@@ -11,7 +11,7 @@ use serde_json::json;
 use super::{Tool, ToolOutput, ToolRegistry, truncate_output};
 use crate::executor::native::client::ToolDefinition;
 use crate::graph::{LogEntry, Node, Status, Task};
-use crate::parser::{load_graph, save_graph};
+use crate::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked, GraphLock};
 use crate::query::build_reverse_index;
 
 /// Register all workgraph tools.
@@ -48,6 +48,16 @@ fn load_workgraph(dir: &Path) -> Result<(crate::graph::WorkGraph, PathBuf), Stri
     }
     let graph = load_graph(&path).map_err(|e| format!("Failed to load graph: {}", e))?;
     Ok((graph, path))
+}
+
+fn load_workgraph_mut(dir: &Path) -> Result<(crate::graph::WorkGraph, PathBuf, GraphLock), String> {
+    let path = graph_path(dir);
+    if !path.exists() {
+        return Err("Workgraph not initialized".to_string());
+    }
+    let lock = lock_graph_file(&path).map_err(|e| format!("Failed to lock graph: {}", e))?;
+    let graph = load_graph_locked(&path, &lock).map_err(|e| format!("Failed to load graph: {}", e))?;
+    Ok((graph, path, lock))
 }
 
 fn generate_id(title: &str) -> String {
@@ -295,7 +305,7 @@ impl Tool for WgAddTool {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let (mut graph, path) = match load_workgraph(&self.dir) {
+        let (mut graph, path, _lock) = match load_workgraph_mut(&self.dir) {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
@@ -343,7 +353,7 @@ impl Tool for WgAddTool {
         graph.add_node(Node::Task(task));
 
         // Save the graph
-        if let Err(e) = save_graph(&graph, &path) {
+        if let Err(e) = save_graph_locked(&graph, &path, &_lock) {
             return ToolOutput::error(format!("Failed to save graph: {}", e));
         }
 
@@ -395,7 +405,7 @@ impl Tool for WgDoneTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let (mut graph, path) = match load_workgraph(&self.dir) {
+        let (mut graph, path, _lock) = match load_workgraph_mut(&self.dir) {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
@@ -412,7 +422,7 @@ impl Tool for WgDoneTool {
             task.tags.push("converged".to_string());
         }
 
-        if let Err(e) = save_graph(&graph, &path) {
+        if let Err(e) = save_graph_locked(&graph, &path, &_lock) {
             return ToolOutput::error(format!("Failed to save graph: {}", e));
         }
 
@@ -464,7 +474,7 @@ impl Tool for WgFailTool {
             .and_then(|v| v.as_str())
             .unwrap_or("No reason provided");
 
-        let (mut graph, path) = match load_workgraph(&self.dir) {
+        let (mut graph, path, _lock) = match load_workgraph_mut(&self.dir) {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
@@ -484,7 +494,7 @@ impl Tool for WgFailTool {
             message: format!("Failed: {}", reason),
         });
 
-        if let Err(e) = save_graph(&graph, &path) {
+        if let Err(e) = save_graph_locked(&graph, &path, &_lock) {
             return ToolOutput::error(format!("Failed to save graph: {}", e));
         }
 
@@ -535,7 +545,7 @@ impl Tool for WgLogTool {
             None => return ToolOutput::error("Missing required parameter: message".to_string()),
         };
 
-        let (mut graph, path) = match load_workgraph(&self.dir) {
+        let (mut graph, path, _lock) = match load_workgraph_mut(&self.dir) {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
@@ -551,7 +561,7 @@ impl Tool for WgLogTool {
             message: message.to_string(),
         });
 
-        if let Err(e) = save_graph(&graph, &path) {
+        if let Err(e) = save_graph_locked(&graph, &path, &_lock) {
             return ToolOutput::error(format!("Failed to save graph: {}", e));
         }
 
@@ -602,7 +612,7 @@ impl Tool for WgArtifactTool {
             None => return ToolOutput::error("Missing required parameter: path".to_string()),
         };
 
-        let (mut graph, graph_path) = match load_workgraph(&self.dir) {
+        let (mut graph, graph_path, _lock) = match load_workgraph_mut(&self.dir) {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
@@ -616,7 +626,7 @@ impl Tool for WgArtifactTool {
             task.artifacts.push(path.to_string());
         }
 
-        if let Err(e) = save_graph(&graph, &graph_path) {
+        if let Err(e) = save_graph_locked(&graph, &graph_path, &_lock) {
             return ToolOutput::error(format!("Failed to save graph: {}", e));
         }
 

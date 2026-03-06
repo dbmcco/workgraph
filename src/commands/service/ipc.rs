@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 
 use workgraph::config::Config;
 use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 use workgraph::service::registry::AgentRegistry;
 
 use super::{CoordinatorState, DaemonConfig, DaemonLogger, ServiceState};
@@ -623,7 +623,11 @@ fn handle_add_task(
     origin: Option<&str>,
 ) -> IpcResponse {
     let graph_path = graph_path(dir);
-    let mut graph = match load_graph(&graph_path) {
+    let _ipc_lock = match lock_graph_file(&graph_path) {
+        Ok(l) => l,
+        Err(e) => return IpcResponse::error(&format!("Failed to lock graph: {}", e)),
+    };
+    let mut graph = match load_graph_locked(&graph_path, &_ipc_lock) {
         Ok(g) => g,
         Err(e) => return IpcResponse::error(&format!("Failed to load graph: {}", e)),
     };
@@ -732,7 +736,7 @@ fn handle_add_task(
         }
     }
 
-    if let Err(e) = save_graph(&graph, &graph_path) {
+    if let Err(e) = save_graph_locked(&graph, &graph_path, &_ipc_lock) {
         return IpcResponse::error(&format!("Failed to save graph: {}", e));
     }
 

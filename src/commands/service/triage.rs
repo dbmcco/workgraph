@@ -9,7 +9,7 @@ use std::path::Path;
 use workgraph::agency;
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, save_graph_locked};
 use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 use workgraph::stream_event::{self, StreamEvent};
 
@@ -168,7 +168,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
     let config = Config::load_or_default(dir);
 
     // Unclaim their tasks (if still in progress - agent may have completed or failed them already)
-    let mut graph = load_graph(graph_path).context("Failed to load graph")?;
+    let _triage_lock = lock_graph_file(graph_path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(graph_path, &_triage_lock).context("Failed to load graph")?;
     let mut tasks_modified = false;
     let mut tasks_completed_by_triage: Vec<String> = Vec::new();
 
@@ -294,7 +295,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
     }
 
     if tasks_modified {
-        save_graph(&graph, graph_path).context("Failed to save graph")?;
+        save_graph_locked(&graph, graph_path, &_triage_lock).context("Failed to save graph")?;
     }
 
     // Capture output for completed/failed tasks whose agents just died.
@@ -302,7 +303,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
     // and the agent may have completed without triggering capture (e.g. wrapper
     // script marked it done but output capture wasn't invoked). This is a
     // best-effort safety net.
-    let graph = load_graph(graph_path).context("Failed to reload graph for output capture")?;
+    let graph = load_graph_locked(graph_path, &_triage_lock).context("Failed to reload graph for output capture")?;
     for (_agent_id, task_id, _pid, _output_file, _reason) in &dead {
         if let Some(task) = graph.get_task(task_id)
             && matches!(task.status, Status::Done | Status::Failed)

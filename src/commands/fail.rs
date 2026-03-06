@@ -1,9 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
-use workgraph::graph::{LogEntry, Status, evaluate_cycle_on_failure};
-use workgraph::parser::save_graph;
+use workgraph::graph::{LogEntry, Status, Task, evaluate_cycle_on_failure};
 
 #[cfg(test)]
 use super::graph_path;
@@ -14,137 +13,98 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
     run_inner(dir, id, reason, false)
 }
 
-/// Reject a done task via evaluation gate. This allows failing a task that is
-/// already Done — the evaluator determined the work is unacceptable.
 pub fn run_eval_reject(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
     run_inner(dir, id, reason, true)
 }
 
+struct FailResult {
+    retry_count: u32,
+    max_retries: Option<u32>,
+    agent_id: Option<String>,
+    cycle_reactivated: Vec<String>,
+    task_snapshot: Task,
+}
+
 fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    if task.status == Status::Done && !eval_reject {
-        anyhow::bail!(
-            "Task '{}' is already done and cannot be marked as failed",
-            id
-        );
-    }
-
-    if task.status == Status::Abandoned {
-        anyhow::bail!("Task '{}' is already abandoned", id);
-    }
-
-    if task.status == Status::Failed {
-        println!(
-            "Task '{}' is already failed (retry_count: {})",
-            id, task.retry_count
-        );
-        return Ok(());
-    }
-
-    task.status = Status::Failed;
-    task.retry_count += 1;
-    task.failure_reason = reason.map(String::from);
-
-    let log_message = if eval_reject {
-        match reason {
-            Some(r) => format!("Evaluation rejected task: {}", r),
-            None => "Evaluation rejected task".to_string(),
+    let result = super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        if task.status == Status::Done && !eval_reject {
+            anyhow::bail!("Task '{}' is already done and cannot be marked as failed", id);
         }
-    } else {
-        match reason {
-            Some(r) => format!("Task marked as failed: {}", r),
-            None => "Task marked as failed".to_string(),
+        if task.status == Status::Abandoned {
+            anyhow::bail!("Task '{}' is already abandoned", id);
+        }
+        if task.status == Status::Failed {
+            return Ok(None); // already failed — no-op
+        }
+
+        task.status = Status::Failed;
+        task.retry_count += 1;
+        task.failure_reason = reason.map(String::from);
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: task.assigned.clone(),
+            message: if eval_reject {
+                match reason { Some(r) => format!("Evaluation rejected task: {}", r), None => "Evaluation rejected task".to_string() }
+            } else {
+                match reason { Some(r) => format!("Task marked as failed: {}", r), None => "Task marked as failed".to_string() }
+            },
+        });
+
+        let retry_count = task.retry_count;
+        let max_retries = task.max_retries;
+        let agent_id = task.assigned.clone();
+
+        let id_owned = id.to_string();
+        let cycle_analysis = graph.compute_cycle_analysis();
+        let cycle_reactivated = evaluate_cycle_on_failure(graph, &id_owned, &cycle_analysis);
+
+        let task_snapshot = graph.get_task(id).unwrap().clone();
+        Ok(Some(FailResult { retry_count, max_retries, agent_id, cycle_reactivated, task_snapshot }))
+    })?;
+
+    let result = match result {
+        Some(r) => r,
+        None => {
+            // Already failed — printed inside closure would need graph access,
+            // so we use a read to get retry_count
+            let (graph, _) = super::load_workgraph(dir)?;
+            let task = graph.get_task_or_err(id)?;
+            println!("Task '{}' is already failed (retry_count: {})", id, task.retry_count);
+            return Ok(());
         }
     };
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: task.assigned.clone(),
-        message: log_message,
-    });
-
-    // Extract values we need before cycle restart may modify the task
-    let retry_count = task.retry_count;
-    let max_retries = task.max_retries;
-    let agent_id_for_archive = task.assigned.clone();
-
-    // Evaluate cycle failure restart — if this task is part of a cycle with
-    // restart_on_failure (default true), reset all cycle members to Open.
-    let id_owned = id.to_string();
-    let cycle_analysis = graph.compute_cycle_analysis();
-    let cycle_reactivated = evaluate_cycle_on_failure(&mut graph, &id_owned, &cycle_analysis);
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
-    if !cycle_reactivated.is_empty() {
-        println!(
-            "  Cycle failure restart: re-activated {} task(s): {:?}",
-            cycle_reactivated.len(),
-            cycle_reactivated
-        );
+    if !result.cycle_reactivated.is_empty() {
+        println!("  Cycle failure restart: re-activated {} task(s): {:?}", result.cycle_reactivated.len(), result.cycle_reactivated);
     }
 
-    // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
-    let detail = match reason {
-        Some(r) => serde_json::json!({ "reason": r }),
-        None => serde_json::Value::Null,
-    };
-    let _ = workgraph::provenance::record(
-        dir,
-        "fail",
-        Some(id),
-        None,
-        detail,
-        config.log.rotation_threshold,
-    );
+    let detail = match reason { Some(r) => serde_json::json!({ "reason": r }), None => serde_json::Value::Null };
+    let _ = workgraph::provenance::record(dir, "fail", Some(id), None, detail, config.log.rotation_threshold);
 
     let reason_msg = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
-    println!(
-        "Marked '{}' as failed{} (retry #{})",
-        id, reason_msg, retry_count
-    );
+    println!("Marked '{}' as failed{} (retry #{})", id, reason_msg, result.retry_count);
 
-    // Show retry info if max_retries is set
-    if let Some(max) = max_retries {
-        if retry_count >= max {
-            println!(
-                "  Warning: Max retries ({}) reached. Consider abandoning or increasing limit.",
-                max
-            );
+    if let Some(max) = result.max_retries {
+        if result.retry_count >= max {
+            println!("  Warning: Max retries ({}) reached. Consider abandoning or increasing limit.", max);
         } else {
-            println!("  Retries remaining: {}", max - retry_count);
+            println!("  Retries remaining: {}", max - result.retry_count);
         }
     }
 
-    // Archive agent conversation (prompt + output) for provenance
-    // Use agent_id captured before cycle restart (which clears assigned)
-    if let Some(ref agent_id) = agent_id_for_archive {
+    if let Some(ref agent_id) = result.agent_id {
         match super::log::archive_agent(dir, id, agent_id) {
-            Ok(archive_dir) => {
-                eprintln!("Agent archived to {}", archive_dir.display());
-            }
-            Err(e) => {
-                eprintln!("Warning: agent archive failed: {}", e);
-            }
+            Ok(archive_dir) => eprintln!("Agent archived to {}", archive_dir.display()),
+            Err(e) => eprintln!("Warning: agent archive failed: {}", e),
         }
     }
 
-    // Capture task output (git diff, artifacts, log) for evaluation.
-    // Failed tasks are also evaluated when auto_evaluate is enabled — there is
-    // useful signal in what kinds of tasks cause which agents to fail.
-    if let Some(task) = graph.get_task(id) {
-        match capture_task_output(dir, task) {
-            Ok(output_dir) => {
-                eprintln!("Output captured to {}", output_dir.display());
-            }
-            Err(e) => {
-                eprintln!("Warning: output capture failed: {}", e);
-            }
-        }
+    match capture_task_output(dir, &result.task_snapshot) {
+        Ok(output_dir) => eprintln!("Output captured to {}", output_dir.display()),
+        Err(e) => eprintln!("Warning: output capture failed: {}", e),
     }
 
     Ok(())

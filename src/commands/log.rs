@@ -4,7 +4,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use workgraph::graph::LogEntry;
 use workgraph::messages;
-use workgraph::parser::save_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -17,19 +16,15 @@ pub fn run_add(
     actor: Option<&str>,
     agent_id: Option<&str>,
 ) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    let entry = LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: actor.map(String::from),
-        message: message.to_string(),
-    };
-
-    task.log.push(entry);
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
+    super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: actor.map(String::from),
+            message: message.to_string(),
+        });
+        Ok(())
+    })?;
     super::notify_graph_changed(dir);
 
     let actor_str = actor.map(|a| format!(" ({})", a)).unwrap_or_default();

@@ -1,8 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::save_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -10,50 +9,43 @@ use super::graph_path;
 use workgraph::parser::load_graph;
 
 pub fn run(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    if task.status == Status::Done {
-        anyhow::bail!("Task '{}' is already done and cannot be abandoned", id);
-    }
-
-    if task.status == Status::Abandoned {
-        println!("Task '{}' is already abandoned", id);
-        return Ok(());
-    }
-
-    let prev_assigned = task.assigned.clone();
-    task.status = Status::Abandoned;
-    task.failure_reason = reason.map(String::from);
-
-    let log_message = match reason {
-        Some(r) => format!("Task abandoned: {}", r),
-        None => "Task abandoned".to_string(),
+    let prev_assigned = match super::mutate_workgraph(dir, |graph| {
+        let task = graph.get_task_mut_or_err(id)?;
+        if task.status == Status::Done {
+            anyhow::bail!("Task '{}' is already done and cannot be abandoned", id);
+        }
+        if task.status == Status::Abandoned {
+            return Ok(None); // already abandoned — no-op
+        }
+        let prev_assigned = task.assigned.clone();
+        task.status = Status::Abandoned;
+        task.failure_reason = reason.map(String::from);
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: task.assigned.clone(),
+            message: match reason {
+                Some(r) => format!("Task abandoned: {}", r),
+                None => "Task abandoned".to_string(),
+            },
+        });
+        Ok(Some(prev_assigned))
+    })? {
+        Some(prev) => prev,
+        None => {
+            println!("Task '{}' is already abandoned", id);
+            return Ok(());
+        }
     };
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: task.assigned.clone(),
-        message: log_message,
-    });
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
-    // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
-        dir,
-        "abandon",
-        Some(id),
-        prev_assigned.as_deref(),
+        dir, "abandon", Some(id), prev_assigned.as_deref(),
         serde_json::json!({ "reason": reason, "prev_assigned": prev_assigned }),
         config.log.rotation_threshold,
     );
-
     let reason_msg = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
     println!("Marked '{}' as abandoned{}", id, reason_msg);
-
     Ok(())
 }
 

@@ -50,7 +50,10 @@ pub use matrix_lite::{
     IncomingMessage as IncomingMessageLite, MatrixClient as MatrixClientLite, send_notification,
     send_notification_to_room,
 };
-pub use parser::{load_graph, save_graph};
+pub use parser::{
+    load_graph, load_graph_locked, lock_graph_file, mutate_graph, save_graph, save_graph_locked,
+    GraphLock,
+};
 pub use service::{AgentEntry, AgentRegistry, AgentStatus};
 
 #[cfg(any(test, feature = "test-support"))]

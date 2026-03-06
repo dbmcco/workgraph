@@ -91,12 +91,8 @@ fn get_lock_path<P: AsRef<Path>>(graph_path: P) -> PathBuf {
     }
 }
 
-/// Load a work graph from a JSONL file
-/// Uses advisory file locking to prevent concurrent access corruption
-pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
-    let lock_path = get_lock_path(&path);
-    let _lock = FileLock::acquire(&lock_path)?;
-
+/// Load a graph from disk without acquiring any lock.
+fn load_graph_inner<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut graph = WorkGraph::new();
@@ -107,7 +103,6 @@ pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Skip legacy Actor nodes (removed in actor-system cleanup)
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
             && v.get("kind").and_then(|k| k.as_str()) == Some("actor")
         {
@@ -128,25 +123,20 @@ pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
         graph.add_node(node);
     }
 
-    // After bulk loading, normalize all `before` edges into `after` edges.
-    // During loading, tasks may reference `before` targets that weren't yet
-    // loaded when `add_node()` was called, so we do a full reconciliation pass.
     graph.normalize_before_edges();
-
     Ok(graph)
-    // Lock is automatically released when _lock goes out of scope
 }
 
-/// Save a work graph to a JSONL file
-/// Uses advisory file locking and atomic write (temp file + rename) to
-/// prevent data loss on crash.
-pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
-    let path = path.as_ref();
-    let lock_path = get_lock_path(path);
+/// Load a work graph from a JSONL file.
+/// Uses advisory file locking to prevent concurrent access corruption.
+pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
+    let lock_path = get_lock_path(&path);
     let _lock = FileLock::acquire(&lock_path)?;
+    load_graph_inner(path)
+}
 
-    // Write to a temporary file in the same directory, then atomically rename.
-    // This ensures a crash mid-write leaves the original file intact.
+/// Save a graph to disk without acquiring any lock.
+fn save_graph_inner(graph: &WorkGraph, path: &Path) -> Result<(), ParseError> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let tmp_path = parent.join(format!(".graph.tmp.{}", std::process::id()));
 
@@ -167,7 +157,6 @@ pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), Pars
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            // fsync to ensure data is on disk before rename
             let rc = unsafe { libc::fsync(file.as_raw_fd()) };
             if rc != 0 {
                 return Err(ParseError::Io(std::io::Error::last_os_error()));
@@ -180,12 +169,57 @@ pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), Pars
     if result.is_ok() {
         std::fs::rename(&tmp_path, path)?;
     } else {
-        // Clean up temp file on failure
         let _ = std::fs::remove_file(&tmp_path);
     }
 
     result
-    // Lock is automatically released when _lock goes out of scope
+}
+
+/// Save a work graph to a JSONL file.
+/// Uses advisory file locking and atomic write (temp file + rename).
+pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
+    let path = path.as_ref();
+    let lock_path = get_lock_path(path);
+    let _lock = FileLock::acquire(&lock_path)?;
+    save_graph_inner(graph, path)
+}
+
+/// Opaque guard that holds the graph file lock.
+/// The lock is released when this guard is dropped.
+#[allow(dead_code)]
+pub struct GraphLock(FileLock);
+
+/// Acquire an exclusive lock on the graph file.
+/// While held, other processes will block on load_graph/save_graph/mutate_graph.
+pub fn lock_graph_file(path: impl AsRef<Path>) -> Result<GraphLock, ParseError> {
+    let lock_path = get_lock_path(&path);
+    Ok(GraphLock(FileLock::acquire(&lock_path)?))
+}
+
+/// Load a work graph while already holding the lock.
+pub fn load_graph_locked(path: impl AsRef<Path>, _lock: &GraphLock) -> Result<WorkGraph, ParseError> {
+    load_graph_inner(path)
+}
+
+/// Save a work graph while already holding the lock.
+pub fn save_graph_locked(graph: &WorkGraph, path: impl AsRef<Path>, _lock: &GraphLock) -> Result<(), ParseError> {
+    save_graph_inner(graph, path.as_ref())
+}
+
+/// Atomically load, modify, and save a graph while holding flock across
+/// the entire read-modify-write cycle. Prevents TOCTOU races where
+/// concurrent writers silently overwrite each other's changes.
+pub fn mutate_graph<F, T, E>(path: impl AsRef<Path>, f: F) -> Result<T, E>
+where
+    F: FnOnce(&mut WorkGraph) -> Result<T, E>,
+    E: From<ParseError>,
+{
+    let path = path.as_ref();
+    let lock = lock_graph_file(path)?;
+    let mut graph = load_graph_locked(path, &lock)?;
+    let result = f(&mut graph)?;
+    save_graph_locked(&graph, path, &lock)?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -841,6 +875,62 @@ mod tests {
 
         // The graph should be parseable (no EOF errors or corruption)
         assert!(!final_graph.is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_mutate_graph_no_lost_updates() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Create a temporary file with an initial empty graph
+        let file = NamedTempFile::new().unwrap();
+        let path = Arc::new(file.path().to_path_buf());
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t0", "Seed")));
+        save_graph(&graph, path.as_ref()).unwrap();
+
+        let num_threads = 10;
+        let mut handles = vec![];
+
+        // Each thread adds a uniquely-named task via mutate_graph,
+        // which holds flock across the full read-modify-write cycle.
+        for i in 0..num_threads {
+            let path = Arc::clone(&path);
+            let handle = thread::spawn(move || {
+                mutate_graph(path.as_ref(), |g: &mut WorkGraph| {
+                    g.add_node(Node::Task(make_task(
+                        &format!("concurrent-{}", i),
+                        &format!("Task from thread {}", i),
+                    )));
+                    Ok::<(), ParseError>(())
+                })
+                .unwrap();
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Every single task must be present — no lost updates.
+        let final_graph = load_graph(path.as_ref()).unwrap();
+        // 1 seed + num_threads tasks
+        assert_eq!(
+            final_graph.tasks().count(),
+            num_threads + 1,
+            "Expected {} tasks but found {}. Some updates were lost!",
+            num_threads + 1,
+            final_graph.tasks().count()
+        );
+        for i in 0..num_threads {
+            assert!(
+                final_graph.get_task(&format!("concurrent-{}", i)).is_some(),
+                "Task concurrent-{} is missing — lost update!",
+                i
+            );
+        }
     }
 
     #[test]

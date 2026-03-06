@@ -17,7 +17,7 @@ use chrono::Utc;
 use std::path::Path;
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::{load_graph, save_graph};
+use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
 use workgraph::service::{AgentRegistry, AgentStatus};
 
 use super::graph_path;
@@ -130,7 +130,8 @@ pub fn run_cleanup(
     locked_registry.save_ref()?;
 
     // Now unclaim tasks from dead agents
-    let mut graph = load_graph(&path).context("Failed to load graph")?;
+    let _lock = lock_graph_file(&path).context("Failed to lock graph")?;
+    let mut graph = load_graph_locked(&path, &_lock).context("Failed to load graph")?;
     let mut tasks_unclaimed = Vec::new();
     let mut errors = Vec::new();
 
@@ -166,7 +167,7 @@ pub fn run_cleanup(
 
     // Save graph
     if !tasks_unclaimed.is_empty() {
-        save_graph(&graph, &path).context("Failed to save graph")?;
+        save_graph_locked(&graph, &path, &_lock).context("Failed to save graph")?;
     }
 
     let result = DetectionResult {
