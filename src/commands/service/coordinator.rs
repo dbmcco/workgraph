@@ -1233,12 +1233,22 @@ fn build_auto_evaluate_tasks(
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
-            model: Some(
-                config
-                    .resolve_model_for_role(workgraph::config::DispatchRole::Evaluator)
-                    .model,
-            ),
-            provider: None,
+            model: Some({
+                let eval_role = if workgraph::graph::is_system_task(task_id) {
+                    workgraph::config::DispatchRole::SystemEvaluator
+                } else {
+                    workgraph::config::DispatchRole::Evaluator
+                };
+                config.resolve_model_for_role(eval_role).model
+            }),
+            provider: {
+                let eval_role = if workgraph::graph::is_system_task(task_id) {
+                    workgraph::config::DispatchRole::SystemEvaluator
+                } else {
+                    workgraph::config::DispatchRole::Evaluator
+                };
+                config.resolve_model_for_role(eval_role).provider
+            },
             verify: None,
             agent: config.agency.evaluator_agent.clone(),
 
@@ -1801,7 +1811,7 @@ fn spawn_agents_for_ready_tasks(
 // ---------------------------------------------------------------------------
 
 /// Check alive agents and trigger auto-checkpoints when turn count or time
-/// thresholds are met. Calls haiku to summarize the agent's recent output.
+/// thresholds are met. Calls the triage-role model to summarize the agent's recent output.
 fn auto_checkpoint_agents(dir: &Path, config: &Config) {
     let interval_turns = config.checkpoint.auto_interval_turns;
     let interval_mins = config.checkpoint.auto_interval_mins;
@@ -1917,7 +1927,7 @@ fn try_auto_checkpoint(
         return Ok(());
     }
 
-    // Generate summary via haiku
+    // Generate summary via triage-role model
     let summary = generate_checkpoint_summary(config, &agent.output_file, &agent.task_id)?;
 
     eprintln!(
@@ -1946,7 +1956,7 @@ fn try_auto_checkpoint(
     Ok(())
 }
 
-/// Call haiku (or configured triage model) to summarize an agent's recent output log.
+/// Call the triage-role model to summarize an agent's recent output log.
 fn generate_checkpoint_summary(
     config: &Config,
     output_file: &str,
