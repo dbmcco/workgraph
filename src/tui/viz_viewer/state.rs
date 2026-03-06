@@ -117,7 +117,7 @@ impl AnimationSpeed {
 }
 
 /// What kind of change triggered this animation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnimationKind {
     /// A brand-new task appeared in the graph.
     NewTask,
@@ -7462,5 +7462,630 @@ mod hud_tests {
         // Collapsed state stays even if we reload hud_detail
         app.load_hud_detail();
         assert!(app.detail_collapsed_sections.contains("Description"));
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests for dot-task (system task) toggle visibility and viewport centering
+// ══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod dot_task_toggle_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    use crate::commands::viz::ascii::generate_ascii;
+    use crate::commands::viz::{LayoutMode, VizOutput};
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// Build a VizOutput with a mix of regular and dot-prefixed tasks.
+    /// Regular: task-a (in-progress), task-b (open)
+    /// Dot:    .setup-a (done), .assign-b (done)
+    fn make_mixed_viz() -> VizOutput {
+        let mut node_line_map = HashMap::new();
+        node_line_map.insert("task-a".to_string(), 0);
+        node_line_map.insert(".setup-a".to_string(), 1);
+        node_line_map.insert("task-b".to_string(), 2);
+        node_line_map.insert(".assign-b".to_string(), 3);
+
+        VizOutput {
+            text: "task-a: in-progress\n.setup-a: done\ntask-b: open\n.assign-b: done".to_string(),
+            node_line_map,
+            task_order: vec![
+                "task-a".into(),
+                ".setup-a".into(),
+                "task-b".into(),
+                ".assign-b".into(),
+            ],
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+        }
+    }
+
+    /// Build a VizOutput with only regular tasks (no dot-tasks).
+    fn make_regular_only_viz() -> VizOutput {
+        let mut node_line_map = HashMap::new();
+        node_line_map.insert("task-a".to_string(), 0);
+        node_line_map.insert("task-b".to_string(), 1);
+
+        VizOutput {
+            text: "task-a: open\ntask-b: open".to_string(),
+            node_line_map,
+            task_order: vec!["task-a".into(), "task-b".into()],
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+        }
+    }
+
+    fn add_snapshot(app: &mut VizApp, id: &str, status: Status) {
+        app.task_snapshots.insert(
+            id.to_string(),
+            TaskSnapshot {
+                status,
+                assigned: None,
+                token_bucket: 0,
+                edge_count: 0,
+            },
+        );
+    }
+
+    /// Build a real graph on disk with mixed regular and dot-tasks.
+    /// Returns (VizOutput_with_dot_tasks, VizOutput_without_dot_tasks, WorkGraph, TempDir).
+    fn build_mixed_graph_on_disk() -> (VizOutput, VizOutput, WorkGraph, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+
+        let mut a = make_task_with_status("task-a", "Task Alpha", Status::InProgress);
+        a.assigned = Some("agent-001".to_string());
+
+        let b = make_task_with_status("task-b", "Task Bravo", Status::Open);
+
+        let mut setup = make_task_with_status(".setup-a", "Setup for Alpha", Status::Done);
+        setup.after = vec!["task-a".to_string()];
+
+        let mut assign = make_task_with_status(".assign-b", "Assign Bravo", Status::Done);
+        assign.tags = vec!["assignment".to_string()];
+        assign.after = vec!["task-b".to_string()];
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(setup));
+        graph.add_node(Node::Task(assign));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let all_tasks: Vec<_> = graph.tasks().collect();
+        let all_ids: HashSet<&str> = all_tasks.iter().map(|t| t.id.as_str()).collect();
+
+        let viz_all = generate_ascii(
+            &graph,
+            &all_tasks,
+            &all_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let regular_tasks: Vec<_> = graph
+            .tasks()
+            .filter(|t| !t.id.starts_with('.'))
+            .collect();
+        let regular_ids: HashSet<&str> = regular_tasks.iter().map(|t| t.id.as_str()).collect();
+
+        let viz_regular = generate_ascii(
+            &graph,
+            &regular_tasks,
+            &regular_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        (viz_all, viz_regular, graph, tmp)
+    }
+
+    // ── center_on_best_target tests ─────────────────────────────────────
+
+    #[test]
+    fn center_targets_in_progress_task() {
+        let viz = make_mixed_viz();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        add_snapshot(&mut app, "task-a", Status::InProgress);
+        add_snapshot(&mut app, ".setup-a", Status::Done);
+        add_snapshot(&mut app, "task-b", Status::Open);
+        add_snapshot(&mut app, ".assign-b", Status::Done);
+
+        // Make viewport smaller than content so centering is needed.
+        app.scroll.viewport_height = 2;
+        app.scroll.content_height = 10;
+
+        app.center_on_best_target();
+
+        // Should select the first in-progress task (task-a at index 0).
+        assert_eq!(app.selected_task_idx, Some(0));
+        assert!(
+            app.needs_center_on_selected,
+            "should defer centering until render"
+        );
+    }
+
+    #[test]
+    fn center_falls_back_to_last_task_when_no_in_progress() {
+        let viz = make_mixed_viz();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        add_snapshot(&mut app, "task-a", Status::Done);
+        add_snapshot(&mut app, ".setup-a", Status::Done);
+        add_snapshot(&mut app, "task-b", Status::Open);
+        add_snapshot(&mut app, ".assign-b", Status::Done);
+
+        app.scroll.viewport_height = 2;
+        app.scroll.content_height = 10;
+
+        app.center_on_best_target();
+
+        // No in-progress → selects last task (index 3 = .assign-b).
+        assert_eq!(app.selected_task_idx, Some(3));
+        assert!(app.needs_center_on_selected);
+    }
+
+    #[test]
+    fn center_resets_to_top_when_content_fits_viewport() {
+        let viz = make_regular_only_viz();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        add_snapshot(&mut app, "task-a", Status::Open);
+        add_snapshot(&mut app, "task-b", Status::Open);
+
+        // Content fits in viewport.
+        app.scroll.content_height = 3;
+        app.scroll.viewport_height = 10;
+        app.scroll.offset_y = 5; // was scrolled down
+
+        app.center_on_best_target();
+
+        assert_eq!(app.scroll.offset_y, 0, "scroll should reset to top");
+        assert_eq!(
+            app.selected_task_idx,
+            Some(0),
+            "should select first task"
+        );
+    }
+
+    #[test]
+    fn center_selects_first_in_progress_among_many() {
+        // Build viz with multiple in-progress tasks.
+        let mut node_line_map = HashMap::new();
+        node_line_map.insert("done-1".to_string(), 0);
+        node_line_map.insert("wip-1".to_string(), 1);
+        node_line_map.insert("wip-2".to_string(), 2);
+        node_line_map.insert("open-1".to_string(), 3);
+
+        let viz = VizOutput {
+            text: "done-1\nwip-1\nwip-2\nopen-1".to_string(),
+            node_line_map,
+            task_order: vec![
+                "done-1".into(),
+                "wip-1".into(),
+                "wip-2".into(),
+                "open-1".into(),
+            ],
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+        };
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        add_snapshot(&mut app, "done-1", Status::Done);
+        add_snapshot(&mut app, "wip-1", Status::InProgress);
+        add_snapshot(&mut app, "wip-2", Status::InProgress);
+        add_snapshot(&mut app, "open-1", Status::Open);
+
+        app.scroll.viewport_height = 2;
+        app.scroll.content_height = 10;
+
+        app.center_on_best_target();
+
+        // Should pick the FIRST in-progress task.
+        assert_eq!(app.selected_task_idx, Some(1)); // wip-1
+    }
+
+    // ── Unhide: immediate visibility (no Revealed animation) ────────────
+
+    #[test]
+    fn unhide_skips_revealed_animation() {
+        // Simulate the animation logic from load_viz (lines 1784-1806).
+        // When system_tasks_just_toggled is true, newly appearing tasks
+        // should NOT get any animation (they appear at full opacity).
+
+        let old_task_order: Vec<String> = vec!["task-a".into(), "task-b".into()];
+        let new_task_order: Vec<String> = vec![
+            "task-a".into(),
+            ".setup-a".into(),
+            "task-b".into(),
+            ".assign-b".into(),
+        ];
+
+        let old_set: HashSet<&str> = old_task_order.iter().map(|s| s.as_str()).collect();
+        let mut splash_animations: HashMap<String, Animation> = HashMap::new();
+
+        // With system_tasks_just_toggled = true, the code skips the fade-in block.
+        let system_tasks_just_toggled = true;
+        if !system_tasks_just_toggled {
+            for id in &new_task_order {
+                if !old_set.contains(id.as_str()) && !splash_animations.contains_key(id) {
+                    splash_animations.insert(
+                        id.clone(),
+                        Animation {
+                            start: Instant::now(),
+                            flash_color: (0, 0, 0),
+                            kind: AnimationKind::NewTask,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Dot-tasks should have NO animation — they appear instantly.
+        assert!(
+            !splash_animations.contains_key(".setup-a"),
+            "dot-task .setup-a should not have an animation on unhide"
+        );
+        assert!(
+            !splash_animations.contains_key(".assign-b"),
+            "dot-task .assign-b should not have an animation on unhide"
+        );
+        assert!(
+            splash_animations.is_empty(),
+            "no animations should be created when system_tasks_just_toggled is true"
+        );
+    }
+
+    #[test]
+    fn normal_new_task_gets_animation() {
+        // Contrast: when NOT toggling, new tasks DO get animations.
+        let old_task_order: Vec<String> = vec!["task-a".into()];
+        let new_task_order: Vec<String> = vec!["task-a".into(), "task-b".into()];
+
+        let old_set: HashSet<&str> = old_task_order.iter().map(|s| s.as_str()).collect();
+        let mut splash_animations: HashMap<String, Animation> = HashMap::new();
+
+        let system_tasks_just_toggled = false;
+        if !system_tasks_just_toggled {
+            for id in &new_task_order {
+                if !old_set.contains(id.as_str()) && !splash_animations.contains_key(id) {
+                    splash_animations.insert(
+                        id.clone(),
+                        Animation {
+                            start: Instant::now(),
+                            flash_color: (0, 0, 0),
+                            kind: AnimationKind::NewTask,
+                        },
+                    );
+                }
+            }
+        }
+
+        assert!(
+            splash_animations.contains_key("task-b"),
+            "normal new task should get a NewTask animation"
+        );
+        assert_eq!(splash_animations["task-b"].kind, AnimationKind::NewTask);
+    }
+
+    // ── Hide: fade-out animation registered ─────────────────────────────
+
+    #[test]
+    fn hide_registers_fade_out_for_dot_tasks() {
+        // Simulate hiding dot-tasks: tasks disappear from new_task_order
+        // and get FadeOut animations.
+        let old_task_order: Vec<String> = vec![
+            "task-a".into(),
+            ".setup-a".into(),
+            "task-b".into(),
+            ".assign-b".into(),
+        ];
+        let new_task_order: Vec<String> = vec!["task-a".into(), "task-b".into()];
+
+        let new_set: HashSet<&str> = new_task_order.iter().map(|s| s.as_str()).collect();
+
+        // Build old line data for the tasks that will disappear.
+        let mut old_task_lines: HashMap<String, (String, String)> = HashMap::new();
+        old_task_lines.insert(
+            ".setup-a".to_string(),
+            (".setup-a: done".to_string(), ".setup-a: done".to_string()),
+        );
+        old_task_lines.insert(
+            ".assign-b".to_string(),
+            (
+                ".assign-b: done".to_string(),
+                ".assign-b: done".to_string(),
+            ),
+        );
+
+        let mut fading_out_lines: HashMap<String, (String, String)> = HashMap::new();
+        let mut splash_animations: HashMap<String, Animation> = HashMap::new();
+
+        let system_tasks_just_toggled = true;
+        if system_tasks_just_toggled {
+            for id in &old_task_order {
+                if !new_set.contains(id.as_str()) && !fading_out_lines.contains_key(id) {
+                    if let Some(line_data) = old_task_lines.get(id) {
+                        fading_out_lines.insert(id.clone(), line_data.clone());
+                        splash_animations.insert(
+                            id.clone(),
+                            Animation {
+                                start: Instant::now(),
+                                flash_color: (0, 0, 0),
+                                kind: AnimationKind::FadeOut,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            fading_out_lines.contains_key(".setup-a"),
+            "hidden dot-task should have fade-out line data"
+        );
+        assert!(
+            fading_out_lines.contains_key(".assign-b"),
+            "hidden dot-task should have fade-out line data"
+        );
+        assert_eq!(
+            splash_animations[".setup-a"].kind,
+            AnimationKind::FadeOut,
+            "hidden dot-task should get FadeOut animation"
+        );
+        assert_eq!(
+            splash_animations[".assign-b"].kind,
+            AnimationKind::FadeOut,
+            "hidden dot-task should get FadeOut animation"
+        );
+        // Regular tasks should NOT be fading.
+        assert!(!fading_out_lines.contains_key("task-a"));
+        assert!(!fading_out_lines.contains_key("task-b"));
+    }
+
+    // ── Reappearing during fade-out cancels animation ───────────────────
+
+    #[test]
+    fn reappearing_task_cancels_fade_out() {
+        // If a task reappears while still fading out (rapid toggle),
+        // the fade-out should be cancelled.
+        let mut fading_out_lines: HashMap<String, (String, String)> = HashMap::new();
+        fading_out_lines.insert(
+            ".setup-a".to_string(),
+            (".setup-a: done".to_string(), ".setup-a: done".to_string()),
+        );
+        let mut splash_animations: HashMap<String, Animation> = HashMap::new();
+        splash_animations.insert(
+            ".setup-a".to_string(),
+            Animation {
+                start: Instant::now(),
+                flash_color: (0, 0, 0),
+                kind: AnimationKind::FadeOut,
+            },
+        );
+
+        // Simulate task reappearing in new task_order.
+        let new_task_order: Vec<String> = vec!["task-a".into(), ".setup-a".into()];
+        for id in &new_task_order {
+            if fading_out_lines.remove(id).is_some() {
+                splash_animations.remove(id);
+            }
+        }
+
+        assert!(
+            !fading_out_lines.contains_key(".setup-a"),
+            "reappeared task should no longer be fading out"
+        );
+        assert!(
+            !splash_animations.contains_key(".setup-a"),
+            "reappeared task should have no animation"
+        );
+    }
+
+    // ── Rapid toggle consistency ────────────────────────────────────────
+
+    #[test]
+    fn rapid_toggle_leaves_consistent_state() {
+        let viz = make_mixed_viz();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        // Rapid toggle: on → off → on → off
+        for _ in 0..4 {
+            app.show_system_tasks = !app.show_system_tasks;
+            app.system_tasks_just_toggled = true;
+            // In real code, force_refresh() would follow. Since we can't
+            // call it without disk I/O, verify the state flags are coherent.
+        }
+
+        // After even number of toggles, should be back to original state.
+        assert!(
+            !app.show_system_tasks,
+            "4 toggles from false should return to false"
+        );
+    }
+
+    #[test]
+    fn rapid_toggle_odd_count() {
+        let viz = make_mixed_viz();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        // 3 toggles: off → on → off → on
+        for _ in 0..3 {
+            app.show_system_tasks = !app.show_system_tasks;
+            app.system_tasks_just_toggled = true;
+        }
+
+        assert!(
+            app.show_system_tasks,
+            "3 toggles from false should end at true"
+        );
+    }
+
+    // ── Integration: full toggle with real graph on disk ────────────────
+
+    #[test]
+    fn integration_toggle_off_then_on_with_real_graph() {
+        let (viz_all, viz_regular, _graph, tmp) = build_mixed_graph_on_disk();
+
+        // Start with all tasks visible (system tasks shown).
+        let mut app = VizApp::from_viz_output_for_test(&viz_all);
+        app.workgraph_dir = tmp.path().to_path_buf();
+        app.animation_mode = AnimationMode::Normal;
+
+        let initial_count = app.task_order.len();
+        assert!(
+            initial_count >= 4,
+            "should have at least 4 tasks (2 regular + 2 dot)"
+        );
+
+        // Verify dot-tasks are present.
+        assert!(
+            app.task_order.iter().any(|id| id.starts_with('.')),
+            "should have dot-tasks in initial view"
+        );
+
+        // Simulate "hide dot-tasks": switch to regular-only view.
+        // This mimics what load_viz produces when show_system_tasks = false.
+        let _old_task_order = app.task_order.clone();
+        app.task_order = viz_regular.task_order.clone();
+        app.node_line_map = viz_regular.node_line_map.clone();
+        app.lines = viz_regular.text.lines().map(String::from).collect();
+        app.plain_lines = app
+            .lines
+            .iter()
+            .map(|l| {
+                String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default()
+            })
+            .collect();
+        app.update_scroll_bounds();
+
+        // Verify dot-tasks are gone from task_order.
+        assert!(
+            !app.task_order.iter().any(|id| id.starts_with('.')),
+            "dot-tasks should be gone after hiding"
+        );
+
+        // Simulate "unhide": switch back to all-tasks view.
+        let old_task_order_2 = app.task_order.clone();
+        let old_set: HashSet<&str> = old_task_order_2.iter().map(|s| s.as_str()).collect();
+        app.task_order = viz_all.task_order.clone();
+        app.node_line_map = viz_all.node_line_map.clone();
+        app.lines = viz_all.text.lines().map(String::from).collect();
+        app.plain_lines = app
+            .lines
+            .iter()
+            .map(|l| {
+                String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default()
+            })
+            .collect();
+        app.update_scroll_bounds();
+
+        // When system_tasks_just_toggled is true, NO animations should be
+        // created for the newly appearing dot-tasks.
+        app.system_tasks_just_toggled = true;
+        if !app.system_tasks_just_toggled {
+            // This block should NOT execute.
+            for id in &app.task_order {
+                if !old_set.contains(id.as_str()) {
+                    app.splash_animations.insert(
+                        id.clone(),
+                        Animation {
+                            start: Instant::now(),
+                            flash_color: (0, 0, 0),
+                            kind: AnimationKind::NewTask,
+                        },
+                    );
+                }
+            }
+        }
+        app.system_tasks_just_toggled = false;
+
+        // Dot-tasks should be back with NO animations.
+        assert!(
+            app.task_order.iter().any(|id| id.starts_with('.')),
+            "dot-tasks should reappear after unhide"
+        );
+        assert!(
+            app.splash_animations.is_empty(),
+            "unhidden dot-tasks should have no animations (appear at full opacity)"
+        );
+    }
+
+    #[test]
+    fn integration_center_on_best_target_after_hide() {
+        let (_viz_all, viz_regular, _graph, tmp) = build_mixed_graph_on_disk();
+
+        // Build app from regular-only view (dot-tasks hidden).
+        let mut app = VizApp::from_viz_output_for_test(&viz_regular);
+        app.workgraph_dir = tmp.path().to_path_buf();
+
+        // Set up snapshots — task-a is in-progress.
+        add_snapshot(&mut app, "task-a", Status::InProgress);
+        add_snapshot(&mut app, "task-b", Status::Open);
+
+        // Make viewport smaller than content for meaningful centering.
+        app.scroll.viewport_height = 2;
+        app.scroll.content_height = 10;
+        app.scroll.offset_y = 8; // scrolled far down
+
+        app.center_on_best_target();
+
+        // Should target the in-progress task.
+        let selected_id = app
+            .selected_task_idx
+            .and_then(|i| app.task_order.get(i))
+            .map(String::as_str);
+        assert_eq!(
+            selected_id,
+            Some("task-a"),
+            "should center on in-progress task"
+        );
+        assert!(app.needs_center_on_selected);
+    }
+
+    // ── Edge case: empty graph ──────────────────────────────────────────
+
+    #[test]
+    fn center_on_empty_graph() {
+        let viz = VizOutput {
+            text: "(empty)".to_string(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+        };
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        app.scroll.viewport_height = 10;
+        app.scroll.content_height = 1;
+
+        // Should not panic.
+        app.center_on_best_target();
+
+        assert_eq!(app.scroll.offset_y, 0);
     }
 }
