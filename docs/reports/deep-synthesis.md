@@ -93,7 +93,56 @@ Core graph features are mature: cycle detection via Tarjan's SCC (53 tests, ~103
 - File locking fix is prerequisite for reliable multi-agent operation
 - TUI node-specific chat depends on coordinator chat infrastructure
 
-### F. Recovered Archive Ideas (Maturity: VARIES)
+### F. Graph Safety (Maturity: HIGH)
+
+Two new designs landed after the initial synthesis that form a complete safety architecture around the task graph. Combined with mandatory validation and liveness detection, they create a three-layer defense system: **prevention**, **detection**, and **recovery**.
+
+#### Task Retraction & Cascade Control (`task-retraction-cascade.md`)
+
+Motivated by the spark-v2 incident where a prematurely dispatched task created 17 child tasks before it could be stopped, requiring 26 manual cleanup steps. Introduces four new commands:
+
+- **`wg retract <id>`** -- Undoes what a task *produced*: finds all tasks it created (via provenance lineage), kills their agents, abandons them, resets the originating task to open. Uses transitive provenance-based traversal.
+- **`wg cascade-stop <id>`** -- Stops everything *downstream* of a task (via `--after` edges). Supports `--hold` (pause instead of abandon) for recoverable freezes.
+- **`wg reset <id>`** -- Full clean-slate reset to open, regardless of current status. `--downstream` resets all dependents. `--retract` abandons created tasks first. `wg reset X --retract --downstream` replaces the entire 26-step spark-v2 incident with one command.
+- **`wg hold/unhold <id>`** -- Atomic subtree pause/resume. Pauses a task plus all transitive dependents, kills in-progress agents.
+
+Also adds **live dependency enforcement**: when `wg edit --add-after` adds a dep to an already-dispatched task, the system pauses the task and the coordinator's `recall_stale_agents()` kills and resets tasks with unmet deps. This prevents the exact race condition that caused the spark-v2 incident.
+
+**Scope:** ~900 lines Rust + tests across ~9 files. No new task fields -- retraction computed from provenance. Key design decisions: no automatic git revert (append-only history), provenance records all retraction operations.
+
+#### Self-Healing Task Graph (`self-healing-task-graph.md`)
+
+When a task fails, instead of waiting for human intervention, the coordinator automatically diagnoses and remediates:
+
+1. **Lightweight LLM diagnosis** (sonnet-class, ~2s) classifies the failure into 6 categories: transient, context overflow, build failure, missing dependency, agent confusion, unfixable
+2. **Category-specific remediation**: auto-retry with backoff (transient), task decomposition via `.remediate-*` task (context overflow), prerequisite injection (build/missing dep), description rewrite (confusion), escalation to human (unfixable)
+3. **Graph wiring**: `.remediate-*` tasks are wired `--before` the failed task, blocking retry until the fix completes. Multiple attempts accumulate context (`.remediate-T`, `.remediate-T-2`, etc.)
+
+**Safety guardrails:** Max 3 remediation attempts per task, token budget cap (2x original cost), system tasks (dot-prefixed) never remediated, abandoned tasks never remediated, circuit breaker respected. Confidence threshold of 0.6 -- below this, escalate to human.
+
+**Integration points:**
+- FLIP can retroactively fail a task -> triggers remediation
+- Validation rejection -> max rejections -> task Failed -> remediation kicks in
+- `wg retract .remediate-X` cleans up bad remediation subtasks
+- Remediation patterns feed evolution signal (repeated failures indicate role improvement needed)
+
+#### Unified Safety Architecture
+
+| Layer | Mechanism | Source Design |
+|-------|-----------|---------------|
+| **Prevention** | Live dep enforcement, dangling dep detection, auto-reopen on new dep, mandatory validation gates | task-retraction-cascade, dangling-dependency-resolution, reopen-on-new-dep, mandatory-validation |
+| **Detection** | Liveness detection (clock drift + stream staleness), failure classification (LLM diagnosis), coordinator dep escalation | liveness-detection, self-healing-task-graph, dangling-dependency-resolution |
+| **Recovery** | `wg retract`, `wg cascade-stop`, `wg reset`, `wg hold/unhold`, auto-remediation (`.remediate-*`), validation rejection + re-dispatch, stuck triage verdicts | task-retraction-cascade, self-healing-task-graph, mandatory-validation, liveness-detection |
+
+The dot-prefix convention (`.remediate-*`, `.evaluate-*`, `.validate-*`, `.assign-*`, `.evolve-*`) serves as a universal safety boundary preventing infinite regress across all systems.
+
+**Cross-cluster dependencies:**
+- Liveness detection feeds stuck agent failures into remediation pipeline
+- File locking fix is prerequisite for all graph mutation safety
+- Retraction provides the "undo" that remediation lacks when it goes wrong
+- Validation gates remediation retries (PendingValidation ensures quality before downstream unblock)
+
+### G. Recovered Archive Ideas (Maturity: VARIES)
 
 Mining 1758 archived tasks reveals:
 - **Worktree isolation** (3 research docs): Per-agent git worktree isolation, critical for scaling parallel agents beyond the "same files = sequential edges" workaround
@@ -109,22 +158,26 @@ Mining 1758 archived tasks reveals:
 
 | Feature | Cluster | Effort | Impact |
 |---------|---------|--------|--------|
-| Unify hardcoded model fallbacks | Providers | ~50 LOC | Enables all provider routing |
+| File locking fix (mutate_graph wrapper) | Infra | ~50 LOC | **CRITICAL** data loss prevention |
+| Unify hardcoded model fallbacks | Infra | ~50 LOC | Enables all provider routing |
+| Validation prompt improvements + surface task.verify | Infra | ~50 LOC | Highest-impact zero-risk change |
+| Live dependency enforcement (wg edit detection) | Safety | ~30 LOC | Prevents spark-v2 race condition |
+| Dangling dep detection (layers 1-3) | Safety | ~200 LOC | Prevents silent stalls from typos |
+| Reopen-on-new-dep + wg reopen | Safety | ~120 LOC | Stale completion prevention |
+| wg reset command | Safety | ~80 LOC | Clean-slate task reset foundation |
 | SystemEvaluator dispatch role | Agency | ~30 LOC | Better meta-task evaluation |
-| Surface task.verify in agent prompts | Agency | ~20 LOC | Activates dormant validation |
-| Validation prompt improvements (R1-R3) | Agency | ~30 LOC | Highest-impact zero-risk change |
-| Dynamic TUI model choices | TUI | ~80 LOC | Multi-provider UX |
-| File locking fix (mutate_graph wrapper) | TUI/Graph | ~50 LOC | **CRITICAL** data loss prevention |
-| Outbound edge viz fix | TUI | ~40 LOC | Rendering correctness |
-| Cycle edge coloring | TUI | ~40 LOC | Visual clarity for cycles |
 | Liveness detection (sleep-aware) | Coordinator | ~180 LOC | Operational reliability |
 | Agent activity protocol | Coordinator | ~300 LOC | Observability + token bug fix |
+| Outbound edge viz fix | TUI | ~40 LOC | Rendering correctness |
+| Cycle edge coloring | TUI | ~40 LOC | Visual clarity for cycles |
 
 ### Ready as foundational work (no prereqs, but are themselves prereqs)
 
 | Feature | Cluster | Effort | Enables |
 |---------|---------|--------|---------|
-| Provider trait abstraction | Providers | ~800 LOC | Multi-model native executor |
+| wg cascade-stop + hold/unhold | Safety | ~180 LOC | Subtree control for incident recovery |
+| wg retract (provenance lineage) | Safety | ~150 LOC | Undo task's side effects |
+| Self-healing diagnosis + remediation | Safety | ~500 LOC | Automatic failure recovery |
 | Compactor MVP | Coordinator | ~350 LOC | Context management, epoch navigation |
 | NotificationChannel trait | Human | ~200 LOC | All external notification channels |
 | Cost tracking data layer | Agency | ~200 LOC | Cost-aware assignment |
@@ -170,6 +223,12 @@ Mining 1758 archived tasks reveals:
 5. **Tool strategy for coordinator**: Bash-only (v1, immediate) vs. typed native tools (v2, requires native executor).
    **Resolution:** Not a true conflict -- phased. v1 ships now with claude executor; v2 ships when native executor is ready.
 
+6. **Retraction vs. remediation scope**: `wg retract` undoes what a task *produced* (created tasks), while remediation fixes why a task *failed*. Both modify task state and coordinator tick.
+   **Resolution:** They're complementary. Retraction provides the "undo" if remediation goes wrong. Build retraction (simpler graph operations) before remediation (LLM diagnosis calls).
+
+7. **Live dep enforcement vs. auto-reopen**: Both handle graph topology changes invalidating task state, at different lifecycle stages. Live dep enforcement handles in-progress tasks; auto-reopen handles done tasks.
+   **Resolution:** Build live dep enforcement first (handles the active race condition), then auto-reopen (handles the passive staleness case). Both modify `edit.rs` so must be serialized.
+
 ### Overlaps (complementary, not conflicting)
 
 1. **Cost infrastructure**: model-cost-tracking (empirical data) and executor-weight-tiers (cost reduction) share cost data layer. Build tracking first, right-sizing on top.
@@ -184,47 +243,44 @@ Mining 1758 archived tasks reveals:
 
 6. **Logging/observability**: logging-gaps, provenance-system, and agent-activity-protocol form complementary observability stack. Provenance addresses mutation audit; activity addresses token tracking.
 
+7. **Liveness -> Remediation pipeline**: Liveness detection kills stuck agents (task -> Failed) -> self-healing diagnoses failure -> creates `.remediate-*` task. The full stuck-agent recovery pipeline spans two designs that share the coordinator tick loop.
+
+8. **Safety dot-prefix convention**: `.remediate-*`, `.evaluate-*`, `.validate-*`, `.assign-*`, `.evolve-*` all use the dot-prefix to prevent infinite regress. This is shared infrastructure across remediation, evaluation, validation, and evolution systems.
+
 ---
 
 ## 4. Critical Path
 
-### Three independent tracks after shared foundations:
+### Five tracks after shared foundations:
 
 ```
 SHARED FOUNDATIONS (must be first):
   File locking fix ────────────> Reliable multi-agent operation
   Validation prompt fixes ─────> Meaningful evaluation signal
-  Unify model fallbacks ───────> All provider features
+  Unify model fallbacks ───────> All provider + agency features
 
-Track 1: MULTI-PROVIDER (enables model diversity)
-  Provider trait abstraction
-       |
-  Wire endpoint API keys + Per-role routing
-       |
-  Multi-provider smoke tests
-       |
-  Cost-aware assignment
+Track 1: GRAPH SAFETY (prevent/detect/recover from failures)
+  Live dep enforcement ──> Reopen-on-dep ──> (prevention complete)
+  wg reset ──> wg cascade-stop ──> wg retract ──> smoke-safety-ops
+  Self-healing diagnosis ──> Mandatory validation ──> smoke-self-healing
+  Dangling dep detection (parallel)
 
 Track 2: COORDINATOR EVOLUTION (self-improving coordinator)
-  Liveness detection (parallel, independent)
-  Agent activity protocol (parallel, independent)
-  Compactor MVP
+  Liveness detection ──> Activity protocol ──> Compactor MVP
        |
-  Coordinator as regular agent
-       |
-  Coordinator as graph citizen
+  Coordinator as regular agent ──> Coordinator as graph citizen
 
 Track 3: AGENCY LOOP (close the self-improvement cycle)
-  SystemEvaluator dispatch role
-  Surface task.verify in prompts
-       |
-  Auto-evolver loop
-       |
-  Cost tracking + cost-efficient assignment
+  SystemEvaluator dispatch role ──> Cost tracking ──> Auto-evolver
+  Executor weight tiers (parallel after SystemEvaluator)
 
-INDEPENDENT TRACKS (can proceed anytime):
-  Human connection: NotificationChannel trait -> Telegram -> wg ask
-  TUI improvements: edge viz fixes, cycle coloring, temporal nav Phase 1
+Track 4: HUMAN CONNECTION
+  NotificationChannel trait ──> Telegram channel
+                            ──> Webhook channel
+
+Track 5: TUI
+  TUI fade fix (instant dot-task toggle)
+  Edge viz fix ──> Cycle coloring ──> Dangling dep viz
 ```
 
 ### What must be built first (foundational ordering):
@@ -235,13 +291,22 @@ INDEPENDENT TRACKS (can proceed anytime):
 
 3. **Unify hardcoded model fallbacks** -- Every provider feature builds on `resolve_model_for_role()`. ~50 LOC with highest downstream enablement.
 
-4. **Provider trait abstraction** -- Without this, native executor can't route to different providers per-role. Blocks OpenRouter integration, local model support, coordinator model-agnosticism. ~800 LOC.
+4. **Live dependency enforcement** -- Prevents the spark-v2 race condition. Highest safety value, lowest risk. ~30 LOC in edit.rs.
 
-5. **Compactor MVP** -- Coordinator context grows unbounded. Compactor enables the coordinator-as-regular-agent transformation and epoch-based temporal navigation. ~350 LOC.
+5. **wg reset** -- Foundation for cascade-stop, retract, and self-healing. ~80 LOC. The building block that makes the entire safety track possible.
+
+6. **Liveness detection** -- Operational reliability. Feeds stuck agent failures into the self-healing pipeline. ~180 LOC.
+
+7. **Compactor MVP** -- Coordinator context grows unbounded. Compactor enables the coordinator-as-regular-agent transformation and epoch-based temporal navigation. ~350 LOC.
 
 ### Parallel tracks after foundations:
 
-- **Human connection** (NotificationChannel -> Telegram -> wg ask) fully independent
-- **TUI improvements** (edge viz, temporal nav Phase 1, tui-textarea) fully independent
-- **Agency improvements** (SystemEvaluator, auto-evolver) depend only on validation fixes
-- **Coordinator evolution** depends on compactor and provider abstraction
+- **Graph safety** (live dep enforcement -> reopen -> retract pipeline) depends on file locking fix
+- **Human connection** (NotificationChannel -> Telegram -> wg ask) depends on file locking fix
+- **TUI improvements** (edge viz, cycle coloring, fade fix) mostly independent
+- **Agency improvements** (SystemEvaluator, auto-evolver) depend on validation fixes + unified fallbacks
+- **Coordinator evolution** depends on liveness detection + compactor
+
+### Final integration depends on ALL tracks:
+
+The `integrate-spark-v3` task validates end-to-end that safety, agency, TUI, human connection, and coordinator improvements work together. It depends on all smoke tests and all track completions.
