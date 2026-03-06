@@ -130,6 +130,9 @@ pub enum AnimationKind {
     /// A new dependency edge appeared on the task.
     EdgeChange,
     /// A previously hidden task was revealed (e.g. toggling system task visibility).
+    /// Currently unused (revealed tasks appear immediately without animation),
+    /// but kept for the render fade-in path that references it.
+    #[allow(dead_code)]
     Revealed,
     /// A task is fading out because it was hidden by a filter change.
     FadeOut,
@@ -1758,17 +1761,11 @@ impl VizApp {
                     }
 
                     // Detect tasks that reappeared while fading out — cancel
-                    // fade-out and start a gentle reveal animation instead.
+                    // the fade-out so they render at full visibility immediately
+                    // (no Revealed fade-in, which starts from invisible).
                     for id in &self.task_order {
                         if self.fading_out_lines.remove(id).is_some() {
-                            self.splash_animations.insert(
-                                id.clone(),
-                                Animation {
-                                    start: now,
-                                    flash_color: flash_color_for_kind(AnimationKind::Revealed),
-                                    kind: AnimationKind::Revealed,
-                                },
-                            );
+                            self.splash_animations.remove(id);
                         }
                     }
 
@@ -1785,26 +1782,26 @@ impl VizApp {
                     self.splice_fading_lines(&old_task_order);
 
                     // ── Fade-in: detect tasks entering the view ──
-                    // If system task visibility was just toggled, newly visible
-                    // tasks get a gentle "revealed" animation instead of the
-                    // bright "new task" flash.
-                    let anim_kind = if self.system_tasks_just_toggled {
-                        AnimationKind::Revealed
-                    } else {
-                        AnimationKind::NewTask
-                    };
-                    for id in &self.task_order {
-                        if !old_set.contains(id.as_str())
-                            && !self.splash_animations.contains_key(id)
-                        {
-                            self.splash_animations.insert(
-                                id.clone(),
-                                Animation {
-                                    start: now,
-                                    flash_color: flash_color_for_kind(anim_kind),
-                                    kind: anim_kind,
-                                },
-                            );
+                    // When system task visibility was just toggled, skip
+                    // animation for newly appearing tasks so they render at
+                    // full opacity immediately (the old Revealed fade-in
+                    // started from invisible, making tasks appear dark/broken).
+                    if !self.system_tasks_just_toggled {
+                        for id in &self.task_order {
+                            if !old_set.contains(id.as_str())
+                                && !self.splash_animations.contains_key(id)
+                            {
+                                self.splash_animations.insert(
+                                    id.clone(),
+                                    Animation {
+                                        start: now,
+                                        flash_color: flash_color_for_kind(
+                                            AnimationKind::NewTask,
+                                        ),
+                                        kind: AnimationKind::NewTask,
+                                    },
+                                );
+                            }
                         }
                     }
                     self.system_tasks_just_toggled = false;
