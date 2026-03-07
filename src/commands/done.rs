@@ -98,6 +98,40 @@ fn run_verify_command(verify_cmd: &str, project_root: &Path) -> Result<()> {
     }
 }
 
+/// Check git hygiene when an agent marks a task as done.
+/// Emits warnings for uncommitted changes and stash growth.
+fn check_agent_git_hygiene(dir: &Path, task_id: &str) {
+    use std::process::Command;
+    let project_root = dir.parent().unwrap_or(dir);
+    if let Ok(output) = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+    {
+        let status = String::from_utf8_lossy(&output.stdout);
+        if !status.is_empty() {
+            let changed: Vec<&str> = status.lines().take(10).collect();
+            eprintln!(
+                "Warning: git hygiene for '{}': uncommitted changes:\n{}",
+                task_id, changed.join("\n")
+            );
+        }
+    }
+    if let Ok(output) = Command::new("git")
+        .args(["stash", "list"])
+        .current_dir(project_root)
+        .output()
+    {
+        let count = String::from_utf8_lossy(&output.stdout).lines().count();
+        if count > 0 {
+            eprintln!(
+                "Warning: git hygiene for '{}': {} stash(es) exist. Agents should never stash.",
+                task_id, count
+            );
+        }
+    }
+}
+
 pub fn run(dir: &Path, id: &str, converged: bool, skip_verify: bool) -> Result<()> {
     let is_agent = std::env::var("WG_AGENT_ID").is_ok();
     run_inner(dir, id, converged, skip_verify, is_agent)
@@ -154,6 +188,11 @@ fn run_inner(
                 blocker_list.join("\n")
             );
         }
+    }
+
+    // Git hygiene check for agents: warn about uncommitted changes
+    if is_agent {
+        check_agent_git_hygiene(dir, id);
     }
 
     // Run verify command gate (if task has a verify field)

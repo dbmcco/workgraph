@@ -56,9 +56,9 @@ You MUST use these commands to track your work:
 
 4. **Commit and push** if you modified files:
    - Run `cargo build` and `cargo test` BEFORE committing — never commit broken code
-   - Stage and commit with a descriptive message referencing the task ID:
+   - Stage ONLY your files (never `git add -A`) and commit with a descriptive message:
      ```bash
-     git add -A && git commit -m \"feat: <description> ({{task_id}})\"
+     git add <your-files> && git commit -m \"feat: <description> ({{task_id}})\"
      git push
      ```
    - Log the commit hash:
@@ -216,6 +216,20 @@ Add POST /auth/token endpoint.
 - The task is small and well-scoped (just do it)
 - Decomposition overhead exceeds the work itself
 - The subtasks would all modify the same files (serialize instead)\n";
+
+/// Git hygiene rules for agents working in a shared repository.
+pub const GIT_HYGIENE_SECTION: &str = "\
+## Git Hygiene (Shared Repo Rules)
+
+You share a working tree with other agents. Follow these rules strictly:
+
+- **Surgical staging only.** NEVER use `git add -A` or `git add .`. Always list specific files: `git add src/foo.rs src/bar.rs`
+- **Verify before committing.** Run `git diff --cached --name-only` — every file must be one YOU modified for YOUR task. Unstage others' files with `git restore --staged <file>`.
+- **Commit early, commit often.** Don't accumulate large uncommitted deltas. Commit after each logical unit of work.
+- **NEVER stash.** Do not run `git stash`. If you see uncommitted changes from another agent, leave them alone.
+- **NEVER force push.** No `git push --force`.
+- **Don't touch others' changes.** If `git status` shows files you didn't modify, do not stage, commit, stash, or reset them.
+- **Handle locks gracefully.** `.git/index.lock` or cargo target locks mean another agent is working. Wait 2-3 seconds and retry. Don't delete lock files.\n";
 
 /// Message polling instructions for agents.
 /// Contains {{task_id}} placeholder for variable substitution.
@@ -387,6 +401,7 @@ pub fn build_prompt(vars: &TemplateVars, scope: ContextScope, ctx: &ScopeContext
     // Task+ scope: workflow sections (with {{task_id}} substitution)
     if scope >= ContextScope::Task {
         parts.push(vars.apply(REQUIRED_WORKFLOW_SECTION));
+        parts.push(GIT_HYGIENE_SECTION.to_string());
         parts.push(vars.apply(MESSAGE_POLLING_SECTION));
         parts.push(vars.apply(ETHOS_SECTION));
         parts.push(vars.apply(AUTOPOIETIC_GUIDANCE));
