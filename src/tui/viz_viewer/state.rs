@@ -4779,6 +4779,8 @@ impl VizApp {
     pub fn load_config_panel(&mut self) {
         let config = Config::load_or_default(&self.workgraph_dir);
         let model_choices = load_model_choices(&self.workgraph_dir);
+        let mut model_choices_with_default = vec!["(default)".to_string()];
+        model_choices_with_default.extend(model_choices.iter().cloned());
         let mut entries = Vec::new();
 
         // ── 1. LLM Endpoints ──
@@ -5116,12 +5118,7 @@ impl VizApp {
                 .assigner_model
                 .clone()
                 .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(vec![
-                "(default)".into(),
-                "opus".into(),
-                "sonnet".into(),
-                "haiku".into(),
-            ]),
+            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
@@ -5132,12 +5129,7 @@ impl VizApp {
                 .evaluator_model
                 .clone()
                 .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(vec![
-                "(default)".into(),
-                "opus".into(),
-                "sonnet".into(),
-                "haiku".into(),
-            ]),
+            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
@@ -5148,12 +5140,7 @@ impl VizApp {
                 .evolver_model
                 .clone()
                 .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(vec![
-                "(default)".into(),
-                "opus".into(),
-                "sonnet".into(),
-                "haiku".into(),
-            ]),
+            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
@@ -5164,12 +5151,7 @@ impl VizApp {
                 .creator_model
                 .clone()
                 .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(vec![
-                "(default)".into(),
-                "opus".into(),
-                "sonnet".into(),
-                "haiku".into(),
-            ]),
+            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
@@ -5180,12 +5162,7 @@ impl VizApp {
                 .triage_model
                 .clone()
                 .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(vec![
-                "(default)".into(),
-                "opus".into(),
-                "sonnet".into(),
-                "haiku".into(),
-            ]),
+            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
