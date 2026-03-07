@@ -1232,6 +1232,19 @@ pub fn run_daemon(
     // Ensure the .coordinator cycle task exists in the graph (Phase 2).
     ensure_coordinator_task(&dir);
 
+    // Auto-bootstrap agency when auto_evolve is enabled and agency isn't initialized.
+    if config.agency.auto_evolve {
+        let agency_dir = dir.join("agency");
+        let roles_dir = agency_dir.join("cache/roles");
+        if !roles_dir.exists() || agency::load_all_roles(&roles_dir).map(|r| r.is_empty()).unwrap_or(true) {
+            logger.info("auto_evolve enabled but agency not initialized — bootstrapping agency");
+            match super::agency_init::run(&dir) {
+                Ok(()) => logger.info("Agency auto-bootstrap complete"),
+                Err(e) => logger.warn(&format!("Agency auto-bootstrap failed: {}", e)),
+            }
+        }
+    }
+
     // Create the shared event log for coordinator context refresh.
     // The daemon records events (task completions, agent spawns, etc.) and the
     // coordinator agent reads them when building context for each interaction.
@@ -1575,6 +1588,50 @@ pub fn run_stop(dir: &Path, force: bool, kill_agents: bool, json: bool) -> Resul
 
 #[cfg(not(unix))]
 pub fn run_stop(_dir: &Path, _force: bool, _kill_agents: bool, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Restart the service daemon: graceful stop (agents kept alive) then start.
+///
+/// Reads the running daemon's effective config (max_agents, executor, model,
+/// poll_interval) before stopping, and passes it to the new daemon so the
+/// restart is transparent.
+#[cfg(unix)]
+pub fn run_restart(dir: &Path, json: bool) -> Result<()> {
+    // Capture the current daemon's effective config before stopping.
+    let prior_config = CoordinatorState::load(dir);
+
+    // Stop gracefully — agents continue running independently.
+    run_stop(dir, false, false, json)?;
+
+    // Derive start parameters from the previous daemon's state.
+    let (max_agents, executor, interval, model) = match &prior_config {
+        Some(cs) => (
+            Some(cs.max_agents),
+            Some(cs.executor.as_str()),
+            Some(cs.poll_interval),
+            cs.model.as_deref(),
+        ),
+        None => (None, None, None, None),
+    };
+
+    // Start a new daemon with the same config.
+    run_start(
+        dir,
+        None,  // socket — use default
+        None,  // port
+        max_agents,
+        executor,
+        interval,
+        model,
+        json,
+        true,  // force — clean up any leftover state
+        false, // no_coordinator_agent — use default
+    )
+}
+
+#[cfg(not(unix))]
+pub fn run_restart(_dir: &Path, _json: bool) -> Result<()> {
     anyhow::bail!("Service daemon is only supported on Unix systems")
 }
 

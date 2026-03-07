@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use workgraph::agency;
+use workgraph::agency::evolver::{self, EvolverState, EvolutionTrigger};
 use workgraph::agency::run_mode::{self, AssignmentPath};
 use workgraph::agency::{
     AssignerModeContext, AssignmentMode, Evaluation, TaskAssignmentRecord,
@@ -1508,6 +1509,170 @@ fn build_flip_verification_tasks(
     modified
 }
 
+/// Auto-evolve: create a `.evolve-*` meta-task when evaluation data warrants evolution.
+///
+/// Checks the evolver state to determine whether enough evaluations have
+/// accumulated (threshold trigger) or performance has dropped (reactive trigger).
+/// Creates at most one evolution meta-task per trigger.
+///
+/// Returns `true` if the graph was modified.
+fn build_auto_evolve_task(
+    dir: &Path,
+    graph: &mut workgraph::graph::WorkGraph,
+    config: &Config,
+) -> bool {
+    let agency_dir = dir.join("agency");
+
+    // Don't create if agency isn't initialized
+    if !agency_dir.join("cache/roles").exists() {
+        return false;
+    }
+
+    let state = EvolverState::load(&agency_dir);
+
+    let trigger = match evolver::should_trigger_evolution(&agency_dir, &config.agency, &state) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Check that no .evolve-* task is already in-progress or open
+    let has_active_evolve = graph
+        .tasks()
+        .any(|t| t.id.starts_with(".evolve-") && matches!(t.status, Status::Open | Status::InProgress));
+    if has_active_evolve {
+        return false;
+    }
+
+    // Generate evolve task ID and run ID
+    let ts = Utc::now().format("%Y%m%d-%H%M%S");
+    let evolve_task_id = format!(".evolve-auto-{}", ts);
+    let budget = evolver::evolution_budget(&config.agency);
+
+    // Build description based on trigger type
+    let trigger_reason = match &trigger {
+        EvolutionTrigger::Threshold { new_evals } => {
+            format!(
+                "Threshold trigger: {} new evaluations since last evolution (threshold: {})",
+                new_evals, config.agency.evolution_threshold
+            )
+        }
+        EvolutionTrigger::Reactive { avg_score } => {
+            format!(
+                "Reactive trigger: average score {:.2} dropped below threshold {:.2}",
+                avg_score, config.agency.evolution_reactive_threshold
+            )
+        }
+    };
+
+    // Build the evolve command with safe strategies
+    let safe_strategies = evolver::SAFE_STRATEGIES.join(",");
+    let desc = format!(
+        "## Auto-Evolution Cycle\n\n\
+         **Trigger:** {}\n\n\
+         Run `wg evolve --budget {} --strategy mutation` to evolve agency roles and tradeoffs.\n\n\
+         ### Constraints\n\
+         - Safe strategies only: {}\n\
+         - Budget cap: {} operations\n\
+         - Do NOT use crossover or bizarre-ideation strategies\n\n\
+         ### Instructions\n\
+         1. Run `wg evolve --budget {}` (the evolver will use safe strategies)\n\
+         2. Log the results\n\
+         3. Mark this task done\n",
+        trigger_reason, budget, safe_strategies, budget, budget,
+    );
+
+    let evolver_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evolver);
+
+    let evolve_task = Task {
+        id: evolve_task_id.clone(),
+        title: format!("Auto-evolve: {}", trigger_reason),
+        description: Some(desc),
+        status: Status::Open,
+        assigned: None,
+        estimate: None,
+        before: vec![],
+        after: vec![],
+        requires: vec![],
+        tags: vec!["evolution".to_string(), "agency".to_string()],
+        skills: vec![],
+        inputs: vec![],
+        deliverables: vec![],
+        artifacts: vec![],
+        exec: Some(format!("wg evolve --budget {}", budget)),
+        not_before: None,
+        created_at: Some(Utc::now().to_rfc3339()),
+        started_at: None,
+        completed_at: None,
+        log: vec![],
+        retry_count: 0,
+        max_retries: Some(1),
+        failure_reason: None,
+        model: Some(evolver_resolved.model),
+        provider: evolver_resolved.provider,
+        verify: None,
+        agent: config.agency.evolver_agent.clone(),
+        loop_iteration: 0,
+        cycle_failure_restarts: 0,
+        ready_after: None,
+        paused: false,
+        visibility: "internal".to_string(),
+        context_scope: None,
+        cycle_config: None,
+        exec_mode: Some("bare".to_string()),
+        token_usage: None,
+        session_id: None,
+        wait_condition: None,
+        checkpoint: None,
+        resurrection_count: 0,
+        last_resurrected_at: None,
+        validation: None,
+        validation_commands: vec![],
+        test_required: false,
+        rejection_count: 0,
+        max_rejections: None,
+        superseded_by: vec![],
+        supersedes: None,
+    };
+
+    graph.add_node(Node::Task(evolve_task));
+
+    // Update evolver state to record we've created this task
+    // (actual record_evolution happens when the task completes)
+    let mut updated_state = state;
+    let current_eval_count = evolver::count_evaluation_files(&agency_dir.join("evaluations"));
+    let new_evals = current_eval_count.saturating_sub(updated_state.last_eval_count);
+    let pre_avg = evolver::compute_current_avg_score(&agency_dir);
+
+    // Record baselines before evolution
+    if let Ok(roles) = agency::load_all_roles(&agency_dir.join("cache/roles")) {
+        for role in &roles {
+            if let Some(avg) = role.performance.avg_score {
+                updated_state.baselines.insert(role.id.clone(), avg);
+            }
+        }
+    }
+
+    updated_state.record_evolution(
+        &format!("auto-{}", ts),
+        new_evals,
+        0, // Operations counted when task completes
+        vec!["auto-triggered".to_string()],
+        pre_avg,
+        Some(&evolve_task_id),
+    );
+
+    if let Err(e) = updated_state.save(&agency_dir) {
+        eprintln!("[coordinator] Warning: failed to save evolver state: {}", e);
+    }
+
+    eprintln!(
+        "[coordinator] Created auto-evolve task '{}' — {}",
+        evolve_task_id, trigger_reason,
+    );
+
+    true
+}
+
 /// Spawn an evaluation task directly without the full agent spawn machinery.
 ///
 /// Instead of coordinator -> run.sh -> bash -> `wg evaluate` -> claude, this
@@ -2125,6 +2290,11 @@ pub fn coordinator_tick(
     // Phase 4.5: FLIP verification — create verification tasks for tasks with
     // low FLIP scores. Only runs when flip_verification_threshold is set.
     graph_modified |= build_flip_verification_tasks(dir, &mut graph, &config);
+
+    // Phase 4.6: Auto-evolve — trigger evolution when evaluation data warrants it.
+    if config.agency.auto_evolve {
+        graph_modified |= build_auto_evolve_task(dir, &mut graph, &config);
+    }
 
     // Save graph once if it was modified during auto-assign or auto-evaluate.
     // Abort tick if save fails — continuing with unsaved state would spawn agents

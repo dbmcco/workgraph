@@ -2356,6 +2356,12 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
+    /// Restart the service daemon (graceful stop then start)
+    ///
+    /// Stops the running daemon without killing agents, then starts a new one
+    /// with the same configuration. Running agents continue independently.
+    Restart,
+
     /// Pause the coordinator (running agents continue, no new spawns)
     Pause,
 

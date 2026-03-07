@@ -103,6 +103,22 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
             "  flip_verification_model = \"{}\"",
             config.agency.flip_verification_model
         );
+        if config.agency.auto_evolve {
+            println!("  auto_evolve = {}", config.agency.auto_evolve);
+            println!(
+                "  evolution_interval = {}",
+                config.agency.evolution_interval
+            );
+            println!(
+                "  evolution_threshold = {}",
+                config.agency.evolution_threshold
+            );
+            println!("  evolution_budget = {}", config.agency.evolution_budget);
+            println!(
+                "  evolution_reactive_threshold = {}",
+                config.agency.evolution_reactive_threshold
+            );
+        }
         println!();
         println!("[guardrails]");
         println!(

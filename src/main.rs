@@ -1689,6 +1689,9 @@ fn main() -> Result<()> {
             ServiceCommands::Stop { force, kill_agents } => {
                 commands::service::run_stop(&workgraph_dir, force, kill_agents, cli.json)
             }
+            ServiceCommands::Restart => {
+                commands::service::run_restart(&workgraph_dir, cli.json)
+            }
             ServiceCommands::Status => commands::service::run_status(&workgraph_dir, cli.json),
             ServiceCommands::Reload {
                 max_agents,

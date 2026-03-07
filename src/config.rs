@@ -873,6 +873,18 @@ fn default_flip_verification_threshold() -> Option<f64> {
 fn default_flip_verification_model() -> String {
     "opus".to_string()
 }
+fn default_evolution_interval() -> u64 {
+    7200
+}
+fn default_evolution_threshold() -> u32 {
+    10
+}
+fn default_evolution_budget() -> u32 {
+    5
+}
+fn default_evolution_reactive_threshold() -> f64 {
+    0.4
+}
 fn default_auto_assign_grace_seconds() -> u64 {
     10
 }
@@ -1044,6 +1056,32 @@ pub struct AgencyConfig {
     /// Default: "opus" (highest capability for independent verification).
     #[serde(default = "default_flip_verification_model")]
     pub flip_verification_model: String,
+
+    /// Automatically trigger evolution cycles based on evaluation data.
+    /// When enabled, the coordinator creates `.evolve-*` meta-tasks
+    /// after sufficient evaluations accumulate. Default: false (opt-in).
+    #[serde(default)]
+    pub auto_evolve: bool,
+
+    /// Minimum seconds between automatic evolution cycles. Default: 7200 (2 hours).
+    #[serde(default = "default_evolution_interval")]
+    pub evolution_interval: u64,
+
+    /// Minimum number of new evaluations required before triggering evolution.
+    /// Default: 10.
+    #[serde(default = "default_evolution_threshold")]
+    pub evolution_threshold: u32,
+
+    /// Maximum number of evolver operations per automatic evolution cycle.
+    /// Default: 5.
+    #[serde(default = "default_evolution_budget")]
+    pub evolution_budget: u32,
+
+    /// Average score threshold for reactive evolution trigger. When the
+    /// average evaluation score drops below this value, evolution is
+    /// triggered regardless of the normal interval/threshold. Default: 0.4.
+    #[serde(default = "default_evolution_reactive_threshold")]
+    pub evolution_reactive_threshold: f64,
 }
 
 impl Default for AgencyConfig {
@@ -1082,6 +1120,11 @@ impl Default for AgencyConfig {
             flip_comparison_model: None,
             flip_verification_threshold: default_flip_verification_threshold(),
             flip_verification_model: default_flip_verification_model(),
+            auto_evolve: false,
+            evolution_interval: default_evolution_interval(),
+            evolution_threshold: default_evolution_threshold(),
+            evolution_budget: default_evolution_budget(),
+            evolution_reactive_threshold: default_evolution_reactive_threshold(),
         }
     }
 }
