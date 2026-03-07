@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
-use workgraph::executor::native::provider::create_provider;
+use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250514";
@@ -29,6 +29,7 @@ pub fn run(
     exec_mode: &str,
     task_id: &str,
     model: Option<&str>,
+    provider: Option<&str>,
     max_turns: usize,
 ) -> Result<()> {
     let prompt = std::fs::read_to_string(prompt_file)
@@ -81,7 +82,7 @@ pub fn run(
     );
 
     // Create the LLM provider (auto-selects by model name)
-    let client = create_provider(workgraph_dir, &effective_model)?;
+    let client = create_provider_ext(workgraph_dir, &effective_model, provider)?;
 
     // Create and run the agent loop
     let agent = AgentLoop::new(client, registry, system_prompt, max_turns, output_log);

@@ -42,12 +42,12 @@ pub fn run_lightweight_llm_call(
     if let Some(prov) = provider {
         match prov {
             "anthropic" => {
-                if let Ok(result) = call_anthropic_native(model, prompt, timeout_secs) {
+                if let Ok(result) = call_anthropic_native(config, prov, model, prompt, timeout_secs) {
                     return Ok(result);
                 }
             }
             "openai" | "openrouter" => {
-                if let Ok(result) = call_openai_native(model, prompt, timeout_secs) {
+                if let Ok(result) = call_openai_native(config, prov, model, prompt, timeout_secs) {
                     return Ok(result);
                 }
             }
@@ -90,14 +90,24 @@ fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCa
     })
 }
 
-fn call_anthropic_native(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
+fn call_anthropic_native(config: &Config, provider_name: &str, model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
     use crate::executor::native::client::{
         AnthropicClient, ContentBlock, Message, MessagesRequest, Role,
         };
     use crate::executor::native::provider::Provider;
 
-    let client = AnthropicClient::from_env(model)
-        .context("Failed to create Anthropic client for lightweight call")?;
+    let endpoint = config.llm_endpoints.find_for_provider(provider_name);
+    let client = if let Some(key) = endpoint.and_then(|ep| ep.api_key.clone()) {
+        let mut c = AnthropicClient::new(key, model)
+            .context("Failed to create Anthropic client for lightweight call")?;
+        if let Some(url) = endpoint.and_then(|ep| ep.url.clone()) {
+            c = c.with_base_url(&url);
+        }
+        c
+    } else {
+        AnthropicClient::from_env(model)
+            .context("Failed to create Anthropic client for lightweight call")?
+    };
 
     let request = MessagesRequest {
         model: model.to_string(),
@@ -152,15 +162,25 @@ fn call_anthropic_native(model: &str, prompt: &str, timeout_secs: u64) -> Result
     })
 }
 
-fn call_openai_native(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
+fn call_openai_native(config: &Config, provider_name: &str, model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
     use crate::executor::native::client::{
         ContentBlock, Message, MessagesRequest, Role,
     };
     use crate::executor::native::openai_client::OpenAiClient;
     use crate::executor::native::provider::Provider;
 
-    let client = OpenAiClient::from_env(model)
-        .context("Failed to create OpenAI client for lightweight call")?;
+    let endpoint = config.llm_endpoints.find_for_provider(provider_name);
+    let client = if let Some(key) = endpoint.and_then(|ep| ep.api_key.clone()) {
+        let mut c = OpenAiClient::new(key, model, None)
+            .context("Failed to create OpenAI client for lightweight call")?;
+        if let Some(url) = endpoint.and_then(|ep| ep.url.clone()) {
+            c = c.with_base_url(&url);
+        }
+        c
+    } else {
+        OpenAiClient::from_env(model)
+            .context("Failed to create OpenAI client for lightweight call")?
+    };
 
     let request = MessagesRequest {
         model: model.to_string(),

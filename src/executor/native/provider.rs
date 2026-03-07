@@ -38,15 +38,24 @@ pub trait Provider: Send + Sync {
     async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse>;
 }
 
-/// Create a provider by routing on the model string.
-///
-/// - Bare model name (no `/`) → Anthropic native API
-/// - Model with `/` prefix (e.g., `openai/gpt-4o`) → OpenAI-compatible API
-/// - Explicit provider override via config or `WG_LLM_PROVIDER` env var
-///
-/// Reads `[native_executor]` section from `config.toml` for `provider`,
-/// `api_base`, and `max_tokens` settings.
+/// Backward-compatible wrapper: routes by model string only.
 pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Provider>> {
+    create_provider_ext(workgraph_dir, model, None)
+}
+
+/// Create a provider, optionally overriding the provider name.
+///
+/// Resolution order for API key and base URL:
+/// 1. Matching `[[llm_endpoints]]` entry in config (by provider name)
+/// 2. `[native_executor]` section in config (`api_base`)
+/// 3. Environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
+pub fn create_provider_ext(
+    workgraph_dir: &Path,
+    model: &str,
+    provider_override: Option<&str>,
+) -> Result<Box<dyn Provider>> {
+    let config = crate::config::Config::load(workgraph_dir).unwrap_or_default();
+
     let config_path = workgraph_dir.join("config.toml");
     let config_val: Option<toml::Value> = std::fs::read_to_string(&config_path)
         .ok()
@@ -54,11 +63,15 @@ pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Prov
 
     let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
 
-    // Resolve provider: config > env var > model heuristic
-    let provider_name = native_cfg
-        .and_then(|c| c.get("provider"))
-        .and_then(|v| v.as_str())
+    // Resolve provider name: override > config > env var > model heuristic
+    let provider_name = provider_override
         .map(String::from)
+        .or_else(|| {
+            native_cfg
+                .and_then(|c| c.get("provider"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .or_else(|| std::env::var("WG_LLM_PROVIDER").ok())
         .unwrap_or_else(|| {
             if model.contains('/') {
@@ -68,10 +81,17 @@ pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Prov
             }
         });
 
-    let api_base = native_cfg
-        .and_then(|c| c.get("api_base"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    // Look up endpoint config for this provider
+    let endpoint = config.llm_endpoints.find_for_provider(&provider_name);
+    let endpoint_key = endpoint.and_then(|ep| ep.api_key.clone());
+    let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
+
+    let api_base: Option<String> = endpoint_url.or_else(|| {
+        native_cfg
+            .and_then(|c| c.get("api_base"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
 
     let max_tokens = native_cfg
         .and_then(|c| c.get("max_tokens"))
@@ -80,12 +100,16 @@ pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Prov
 
     match provider_name.as_str() {
         "openai" | "openrouter" => {
-            let mut client = OpenAiClient::from_env(model)
-                .or_else(|_| {
-                    let key = super::client::resolve_api_key_from_dir(workgraph_dir)?;
-                    OpenAiClient::new(key, model, None)
-                })
-                .context("Failed to initialize OpenAI-compatible client")?;
+            let mut client = if let Some(key) = endpoint_key {
+                OpenAiClient::new(key, model, None)
+            } else {
+                OpenAiClient::from_env(model)
+                    .or_else(|_| {
+                        let key = super::client::resolve_api_key_from_dir(workgraph_dir)?;
+                        OpenAiClient::new(key, model, None)
+                    })
+            }
+            .context("Failed to initialize OpenAI-compatible client")?;
             if let Some(base) = api_base {
                 client = client.with_base_url(&base);
             }
@@ -99,8 +123,12 @@ pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Prov
             Ok(Box::new(client))
         }
         _ => {
-            let mut client = AnthropicClient::from_env(model)
-                .context("Failed to initialize Anthropic client")?;
+            let mut client = if let Some(key) = endpoint_key {
+                AnthropicClient::new(key, model)
+            } else {
+                AnthropicClient::from_env(model)
+            }
+            .context("Failed to initialize Anthropic client")?;
             if let Some(base) = api_base {
                 client = client.with_base_url(&base);
             }

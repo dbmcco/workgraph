@@ -204,7 +204,7 @@ impl AnthropicClient {
         Self::new(api_key.to_string(), model)
     }
 
-    fn new(api_key: String, model: &str) -> Result<Self> {
+    pub fn new(api_key: String, model: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
