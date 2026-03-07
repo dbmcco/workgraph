@@ -903,6 +903,51 @@ pub struct StuckTask {
     pub agent_id: String,
 }
 
+/// Which item is focused in the service control panel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlPanelFocus {
+    StartStop,
+    PauseResume,
+    Restart,
+    PanicKill,
+    StuckAgent(usize),
+    KillAllDead,
+    RetryFailedEvals,
+}
+
+impl ControlPanelFocus {
+    pub fn next(&self, stuck_count: usize) -> Self {
+        match self {
+            Self::StartStop => Self::PauseResume,
+            Self::PauseResume => Self::Restart,
+            Self::Restart => Self::PanicKill,
+            Self::PanicKill => {
+                if stuck_count > 0 { Self::StuckAgent(0) } else { Self::KillAllDead }
+            }
+            Self::StuckAgent(i) => {
+                if *i + 1 < stuck_count { Self::StuckAgent(i + 1) } else { Self::KillAllDead }
+            }
+            Self::KillAllDead => Self::RetryFailedEvals,
+            Self::RetryFailedEvals => Self::StartStop,
+        }
+    }
+    pub fn prev(&self, stuck_count: usize) -> Self {
+        match self {
+            Self::StartStop => Self::RetryFailedEvals,
+            Self::PauseResume => Self::StartStop,
+            Self::Restart => Self::PauseResume,
+            Self::PanicKill => Self::Restart,
+            Self::StuckAgent(i) => {
+                if *i > 0 { Self::StuckAgent(i - 1) } else { Self::PanicKill }
+            }
+            Self::KillAllDead => {
+                if stuck_count > 0 { Self::StuckAgent(stuck_count - 1) } else { Self::PanicKill }
+            }
+            Self::RetryFailedEvals => Self::KillAllDead,
+        }
+    }
+}
+
 /// State for the service health badge in the status bar.
 pub struct ServiceHealthState {
     /// Current health level (drives badge color).
@@ -934,6 +979,10 @@ pub struct ServiceHealthState {
     pub detail_scroll: usize,
     /// Uptime in seconds (for <30s starting detection).
     pub uptime_secs: Option<u64>,
+    pub panel_open: bool,
+    pub panel_focus: ControlPanelFocus,
+    pub panic_confirm: bool,
+    pub feedback: Option<(String, Instant)>,
 }
 
 impl Default for ServiceHealthState {
@@ -954,6 +1003,10 @@ impl Default for ServiceHealthState {
             detail_open: false,
             detail_scroll: 0,
             uptime_secs: None,
+            panel_open: false,
+            panel_focus: ControlPanelFocus::StartStop,
+            panic_confirm: false,
+            feedback: None,
         }
     }
 }
@@ -5051,22 +5104,19 @@ impl VizApp {
 
         // Determine health level
         let stuck_count = self.service_health.stuck_tasks.len();
+        let count_label = format!("{}/{}", alive, coord.max_agents);
         if coord.paused {
             self.service_health.level = ServiceHealthLevel::Yellow;
-            self.service_health.label = "PAUSED".to_string();
         } else if uptime_secs.is_some_and(|s| s < 30) {
             self.service_health.level = ServiceHealthLevel::Yellow;
-            self.service_health.label = "STARTING".to_string();
         } else if stuck_count > 0 {
             self.service_health.level = ServiceHealthLevel::Yellow;
-            self.service_health.label = format!("OK ({} stuck)", stuck_count);
         } else if !self.service_health.recent_errors.is_empty() {
             self.service_health.level = ServiceHealthLevel::Yellow;
-            self.service_health.label = "DEGRADED".to_string();
         } else {
             self.service_health.level = ServiceHealthLevel::Green;
-            self.service_health.label = format!("{}/{}", alive, coord.max_agents);
         }
+        self.service_health.label = count_label;
 
         self.service_health.last_poll = Instant::now();
     }
@@ -5096,10 +5146,77 @@ impl VizApp {
         self.time_counters.last_refresh = Instant::now();
     }
 
-    /// Toggle the service health detail popup.
-    pub fn toggle_service_health_detail(&mut self) {
-        self.service_health.detail_open = !self.service_health.detail_open;
-        self.service_health.detail_scroll = 0;
+    /// Open or close the service control panel.
+    pub fn toggle_service_control_panel(&mut self) {
+        if self.service_health.panel_open {
+            self.close_service_control_panel();
+        } else {
+            self.service_health.detail_open = false;
+            self.service_health.panel_open = true;
+            self.service_health.panel_focus = ControlPanelFocus::StartStop;
+            self.service_health.panic_confirm = false;
+        }
+    }
+
+    pub fn close_service_control_panel(&mut self) {
+        self.service_health.panel_open = false;
+        self.service_health.panic_confirm = false;
+    }
+
+    pub fn set_service_feedback(&mut self, msg: String) {
+        self.service_health.feedback = Some((msg, Instant::now()));
+    }
+
+    pub fn execute_service_action(&mut self) {
+        let health = &self.service_health;
+        let is_running = health.pid.is_some() && health.level != ServiceHealthLevel::Red;
+        match health.panel_focus.clone() {
+            ControlPanelFocus::StartStop => {
+                if is_running {
+                    self.exec_command(vec!["service".into(), "stop".into()], CommandEffect::RefreshAndNotify("Service stopped".into()));
+                    self.set_service_feedback("Service stopped".into());
+                } else {
+                    self.exec_command(vec!["service".into(), "start".into()], CommandEffect::RefreshAndNotify("Service started".into()));
+                    self.set_service_feedback("Service starting...".into());
+                }
+            }
+            ControlPanelFocus::PauseResume => {
+                if health.paused {
+                    self.exec_command(vec!["service".into(), "resume".into()], CommandEffect::RefreshAndNotify("Launches resumed".into()));
+                    self.set_service_feedback("Resumed".into());
+                } else {
+                    self.exec_command(vec!["service".into(), "pause".into()], CommandEffect::RefreshAndNotify("Launches paused".into()));
+                    self.set_service_feedback("Paused".into());
+                }
+            }
+            ControlPanelFocus::Restart => {
+                self.exec_command(vec!["service".into(), "restart".into()], CommandEffect::RefreshAndNotify("Service restarted".into()));
+                self.set_service_feedback("Restarting...".into());
+            }
+            ControlPanelFocus::PanicKill => {}
+            ControlPanelFocus::StuckAgent(idx) => {
+                if let Some(st) = health.stuck_tasks.get(idx) {
+                    let aid = st.agent_id.clone();
+                    self.exec_command(vec!["kill".into(), aid.clone(), "--force".into()], CommandEffect::RefreshAndNotify(format!("Killed {}", aid)));
+                    self.set_service_feedback(format!("Killed {}", aid));
+                }
+            }
+            ControlPanelFocus::KillAllDead => {
+                self.exec_command(vec!["kill".into(), "--all".into(), "--force".into()], CommandEffect::RefreshAndNotify("Killed all dead agents".into()));
+                self.set_service_feedback("Killed all dead agents".into());
+            }
+            ControlPanelFocus::RetryFailedEvals => {
+                self.exec_command(vec!["retry".into(), "--failed-evals".into()], CommandEffect::RefreshAndNotify("Retrying failed evals".into()));
+                self.set_service_feedback("Retrying failed evals...".into());
+            }
+        }
+    }
+
+    pub fn execute_panic_kill(&mut self) {
+        let n = self.service_health.agents_alive;
+        self.exec_command(vec!["service".into(), "stop".into(), "--force".into(), "--kill-agents".into()], CommandEffect::RefreshAndNotify(format!("PANIC: killed {} agents", n)));
+        self.service_health.panic_confirm = false;
+        self.set_service_feedback(format!("PANIC KILL: {} agents killed, service stopped", n));
     }
 
     /// Load chat history on startup.
@@ -8347,5 +8464,40 @@ mod service_health_tests {
         std::fs::create_dir_all(temp.path().join("service")).unwrap();
         use crate::commands::service::ServiceState;
         assert!(ServiceState::load(temp.path()).ok().flatten().is_none());
+    }
+
+    #[test]
+    fn control_panel_defaults() {
+        let h = ServiceHealthState::default();
+        assert!(!h.panel_open);
+        assert_eq!(h.panel_focus, ControlPanelFocus::StartStop);
+        assert!(!h.panic_confirm);
+        assert!(h.feedback.is_none());
+    }
+
+    #[test]
+    fn control_panel_focus_navigation() {
+        let f = ControlPanelFocus::StartStop;
+        assert_eq!(f.next(0), ControlPanelFocus::PauseResume);
+        assert_eq!(f.next(0).next(0), ControlPanelFocus::Restart);
+    }
+
+    #[test]
+    fn control_panel_focus_with_stuck() {
+        let f = ControlPanelFocus::PanicKill;
+        assert_eq!(f.next(2), ControlPanelFocus::StuckAgent(0));
+        assert_eq!(f.next(0), ControlPanelFocus::KillAllDead);
+    }
+
+    #[test]
+    fn control_panel_focus_prev_wraps() {
+        let f = ControlPanelFocus::StartStop;
+        assert_eq!(f.prev(0), ControlPanelFocus::RetryFailedEvals);
+    }
+
+    #[test]
+    fn no_degraded_label() {
+        let h = ServiceHealthState::default();
+        assert!(!h.label.contains("DEGRADED"));
     }
 }

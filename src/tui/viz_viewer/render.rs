@@ -7,9 +7,9 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    ConfigEditKind, ConfigSection, ConfirmAction, FocusedPanel, InputMode, LayoutMode,
-    RightPanelTab, ServiceHealthLevel, SortMode, TaskFormField, TaskFormState, TextPromptAction,
-    VizApp, extract_section_name, format_duration_compact,
+    ConfigEditKind, ConfigSection, ConfirmAction, ControlPanelFocus, FocusedPanel, InputMode,
+    LayoutMode, RightPanelTab, ServiceHealthLevel, SortMode, TaskFormField, TaskFormState,
+    TextPromptAction, VizApp, extract_section_name, format_duration_compact,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -292,8 +292,13 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         draw_task_form(frame, form);
     }
 
-    // Service health detail popup
-    if app.service_health.detail_open {
+    // Service control panel (modal overlay)
+    if app.service_health.panel_open {
+        draw_service_control_panel(frame, app);
+    }
+
+    // Legacy service health detail popup
+    if app.service_health.detail_open && !app.service_health.panel_open {
         draw_service_health_detail(frame, app);
     }
 }
@@ -4626,6 +4631,144 @@ fn draw_service_health_detail(frame: &mut Frame, app: &VizApp) {
         .collect();
 
     frame.render_widget(Paragraph::new(visible_lines), inner);
+}
+
+/// Draw the service control panel - a modal overlay with service actions.
+fn draw_service_control_panel(frame: &mut Frame, app: &VizApp) {
+    let size = frame.area();
+    let health = &app.service_health;
+    let is_running = health.pid.is_some() && health.level != ServiceHealthLevel::Red;
+    let width = 56.min(size.width.saturating_sub(4));
+    let height = 32.min(size.height.saturating_sub(2));
+    let x = size.width.saturating_sub(width + 1);
+    let y = 1.min(size.height.saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let (border_color, title_dot) = match health.level {
+        ServiceHealthLevel::Green => (Color::Green, "\u{25CF}"),
+        ServiceHealthLevel::Yellow => (Color::Yellow, "\u{25CF}"),
+        ServiceHealthLevel::Red => (Color::Red, "\u{25CF}"),
+    };
+    let block = Block::default()
+        .title(format!(" {} Service Control ", title_dot))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines: Vec<Line> = Vec::new();
+    let label_style = Style::default().fg(Color::Cyan);
+    let value_style = Style::default().fg(Color::White);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let focus = &health.panel_focus;
+    lines.push(Line::from(vec![
+        Span::styled("  PID: ", label_style),
+        Span::styled(health.pid.map(|p| p.to_string()).unwrap_or_else(|| "N/A".to_string()), value_style),
+        Span::styled("    Uptime: ", label_style),
+        Span::styled(health.uptime.as_deref().unwrap_or("N/A"), value_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Agents: ", label_style),
+        Span::styled(format!("{} alive / {} max", health.agents_alive, health.agents_max), value_style),
+        Span::styled(format!("  ({} total)", health.agents_total), dim_style),
+    ]));
+    if !health.recent_errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  Recent errors:", label_style)]));
+        for err in health.recent_errors.iter().take(3) {
+            let max_w = width as usize - 6;
+            let truncated = if err.len() > max_w {
+                format!("{}...", &err[..err.floor_char_boundary(max_w.saturating_sub(3))])
+            } else { err.clone() };
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim_style),
+                Span::styled(truncated, Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  Controls", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]));
+    let ssl = if is_running { "Stop Service" } else { "Start Service" };
+    let ssk = if is_running { "[S] Stop" } else { "[S] Start" };
+    lines.push(control_panel_line(ssl, ssk, *focus == ControlPanelFocus::StartStop, if is_running { Color::Red } else { Color::Green }));
+    let pl = if health.paused { "Resume Launches" } else { "Pause Launches" };
+    let pk = if health.paused { "[P] Resume" } else { "[P] Pause" };
+    lines.push(control_panel_line(pl, pk, *focus == ControlPanelFocus::PauseResume, Color::Yellow));
+    lines.push(control_panel_line("Restart Service", "[Enter]", *focus == ControlPanelFocus::Restart, Color::Cyan));
+    let pf = *focus == ControlPanelFocus::PanicKill;
+    let ps = if pf { Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Red).add_modifier(Modifier::BOLD) };
+    lines.push(Line::from(vec![
+        Span::styled(if pf { " > " } else { "   " }, ps),
+        Span::styled("PANIC KILL", ps),
+        Span::styled("  [K]  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("kills {} agents + stops service", health.agents_alive), Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::from(""));
+    if health.stuck_tasks.is_empty() {
+        lines.push(Line::from(vec![Span::styled("  Stuck agents: ", label_style), Span::styled("none", Style::default().fg(Color::Green))]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Stuck agents: ", label_style),
+            Span::styled(format!("{}", health.stuck_tasks.len()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  (Enter=kill, U=unclaim)", dim_style),
+        ]));
+        for (i, st) in health.stuck_tasks.iter().enumerate() {
+            let sf = *focus == ControlPanelFocus::StuckAgent(i);
+            let td = if st.task_title.len() > 25 { format!("{}...", &st.task_title[..st.task_title.floor_char_boundary(22)]) } else { st.task_title.clone() };
+            let pfx = if sf { " > " } else { "   " };
+            let fg = if sf { Color::Yellow } else { Color::DarkGray };
+            lines.push(Line::from(vec![
+                Span::styled(pfx, Style::default().fg(fg)),
+                Span::styled(&st.agent_id, Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" ({}) ", td), Style::default().fg(fg)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(control_panel_line("Kill All Dead Agents", "[Enter]", *focus == ControlPanelFocus::KillAllDead, Color::Yellow));
+    lines.push(control_panel_line("Retry Failed Evals", "[Enter]", *focus == ControlPanelFocus::RetryFailedEvals, Color::Cyan));
+    if let Some((ref msg, ref at)) = health.feedback {
+        if at.elapsed() < std::time::Duration::from_secs(5) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  ", dim_style), Span::styled(msg.as_str(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]));
+        }
+    }
+    if health.panic_confirm {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  WARNING: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("This will kill {} running agents and stop the service.", health.agents_alive), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Are you sure? ", Style::default().fg(Color::White)),
+            Span::styled("[y]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(" Yes  ", dim_style),
+            Span::styled("[n/Esc]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" No", dim_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim_style),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" close  ", dim_style),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Yellow)),
+        Span::styled(" navigate  ", dim_style),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled(" activate", dim_style),
+    ]));
+    let visible_lines: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible_lines), inner);
+}
+
+fn control_panel_line<'a>(label: &'a str, key_hint: &'a str, focused: bool, color: Color) -> Line<'a> {
+    let prefix = if focused { " > " } else { "   " };
+    let style = if focused { Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD) } else { Style::default().fg(color) };
+    Line::from(vec![
+        Span::styled(prefix, style),
+        Span::styled(label, style),
+        Span::styled("  ", Style::default()),
+        Span::styled(key_hint, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn draw_help_overlay(frame: &mut Frame) {

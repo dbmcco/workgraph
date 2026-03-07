@@ -11,8 +11,8 @@ use ratatui::layout::Position;
 
 use super::render;
 use super::state::{
-    CommandEffect, ConfigEditKind, ConfirmAction, FocusedPanel, InputMode, InspectorSubFocus,
-    RightPanelTab, TaskFormField, TextPromptAction, VizApp,
+    CommandEffect, ConfigEditKind, ConfirmAction, ControlPanelFocus, FocusedPanel, InputMode,
+    InspectorSubFocus, RightPanelTab, TaskFormField, TextPromptAction, VizApp,
 };
 
 /// Input poll timeout — short for responsive scrolling.
@@ -122,6 +122,12 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => app.show_help = false,
             _ => {} // swallow all other keys while help is shown
         }
+        return;
+    }
+
+    // Service control panel intercepts keys when open
+    if app.service_health.panel_open {
+        handle_service_control_panel_key(app, code);
         return;
     }
 
@@ -293,6 +299,41 @@ fn handle_confirm_input(app: &mut VizApp, code: KeyCode) {
         }
         KeyCode::Char('n') | KeyCode::Esc => {
             app.input_mode = InputMode::Normal;
+        }
+        _ => {}
+    }
+}
+
+/// Handle keyboard input when the service control panel is open.
+fn handle_service_control_panel_key(app: &mut VizApp, code: KeyCode) {
+    let stuck_count = app.service_health.stuck_tasks.len();
+    if app.service_health.panic_confirm {
+        match code {
+            KeyCode::Char('y') => { app.execute_panic_kill(); }
+            KeyCode::Char('n') | KeyCode::Esc => { app.service_health.panic_confirm = false; }
+            _ => {}
+        }
+        return;
+    }
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => { app.close_service_control_panel(); }
+        KeyCode::Down | KeyCode::Char('j') => { app.service_health.panel_focus = app.service_health.panel_focus.next(stuck_count); }
+        KeyCode::Up | KeyCode::Char('k') => { app.service_health.panel_focus = app.service_health.panel_focus.prev(stuck_count); }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if app.service_health.panel_focus == ControlPanelFocus::PanicKill { app.service_health.panic_confirm = true; }
+            else { app.execute_service_action(); }
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => { app.service_health.panel_focus = ControlPanelFocus::StartStop; app.execute_service_action(); }
+        KeyCode::Char('p') | KeyCode::Char('P') => { app.service_health.panel_focus = ControlPanelFocus::PauseResume; app.execute_service_action(); }
+        KeyCode::Char('K') => { app.service_health.panel_focus = ControlPanelFocus::PanicKill; app.service_health.panic_confirm = true; }
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            if let ControlPanelFocus::StuckAgent(idx) = app.service_health.panel_focus {
+                if let Some(st) = app.service_health.stuck_tasks.get(idx) {
+                    let tid = st.task_id.clone();
+                    app.exec_command(vec!["unclaim".to_string(), tid.clone()], CommandEffect::RefreshAndNotify(format!("Unclaimed {}", tid)));
+                    app.set_service_feedback(format!("Unclaimed {}", tid));
+                }
+            }
         }
         _ => {}
     }
@@ -1349,7 +1390,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             let in_service_badge = app.last_service_badge_area.width > 0
                 && app.last_service_badge_area.contains(pos);
             if in_service_badge {
-                app.toggle_service_health_detail();
+                app.toggle_service_control_panel();
                 return;
             }
             if in_graph_vscrollbar {
