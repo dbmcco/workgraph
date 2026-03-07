@@ -327,6 +327,7 @@ pub enum RightPanelTab {
     Config,   // 5
     Files,    // 6
     CoordLog, // 7
+    Firehose, // 8
 }
 
 impl RightPanelTab {
@@ -340,6 +341,7 @@ impl RightPanelTab {
             Self::Config => "Config",
             Self::Files => "Files",
             Self::CoordLog => "Coord",
+            Self::Firehose => "Fire",
         }
     }
 
@@ -353,6 +355,7 @@ impl RightPanelTab {
             Self::Config => 5,
             Self::Files => 6,
             Self::CoordLog => 7,
+            Self::Firehose => 8,
         }
     }
 
@@ -366,19 +369,20 @@ impl RightPanelTab {
             5 => Some(Self::Config),
             6 => Some(Self::Files),
             7 => Some(Self::CoordLog),
+            8 => Some(Self::Firehose),
             _ => None,
         }
     }
 
     pub fn next(&self) -> Self {
-        Self::from_index((self.index() + 1) % 8).unwrap()
+        Self::from_index((self.index() + 1) % Self::ALL.len()).unwrap()
     }
 
     pub fn prev(&self) -> Self {
-        Self::from_index((self.index() + 7) % 8).unwrap()
+        Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len()).unwrap()
     }
 
-    pub const ALL: [RightPanelTab; 8] = [
+    pub const ALL: [RightPanelTab; 9] = [
         Self::Chat,
         Self::Detail,
         Self::Log,
@@ -387,6 +391,7 @@ impl RightPanelTab {
         Self::Config,
         Self::Files,
         Self::CoordLog,
+        Self::Firehose,
     ];
 }
 
@@ -975,6 +980,57 @@ impl Default for CoordLogState {
     }
 }
 
+/// A single line in the firehose view — one output line from one agent.
+#[derive(Clone)]
+pub struct FirehoseLine {
+    /// Agent ID (e.g. "agent-7220").
+    pub agent_id: String,
+    /// Task ID the agent is working on.
+    pub task_id: String,
+    /// The output text (single line).
+    pub text: String,
+    /// Color index for this agent (cycles through a palette).
+    pub color_idx: usize,
+}
+
+/// Maximum number of lines kept in the firehose buffer.
+const FIREHOSE_MAX_LINES: usize = 1000;
+
+/// State for the Firehose panel (panel 8) — merged stream of all agent output.
+pub struct FirehoseState {
+    /// Scroll offset from the top.
+    pub scroll: usize,
+    /// Whether auto-scroll (tail mode) is active.
+    pub auto_tail: bool,
+    /// Merged, chronologically-ordered output lines from all agents.
+    pub lines: Vec<FirehoseLine>,
+    /// Per-agent file offset for incremental reads (agent_id → byte offset).
+    pub agent_offsets: HashMap<String, u64>,
+    /// Mapping from agent_id to a stable color index.
+    pub agent_colors: HashMap<String, usize>,
+    /// Next color index to assign.
+    pub next_color: usize,
+    /// Viewport height (set each frame by renderer).
+    pub viewport_height: usize,
+    /// Total rendered lines (set each frame by renderer, for scrollbar).
+    pub total_rendered_lines: usize,
+}
+
+impl Default for FirehoseState {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            auto_tail: true,
+            lines: Vec::new(),
+            agent_offsets: HashMap::new(),
+            agent_colors: HashMap::new(),
+            next_color: 0,
+            viewport_height: 0,
+            total_rendered_lines: 0,
+        }
+    }
+}
+
 /// Direction of a message relative to the task's assigned agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageDirection {
@@ -1419,6 +1475,9 @@ pub struct VizApp {
     /// Per-agent JSONL stream state for live activity feed.
     pub agent_streams: HashMap<String, AgentStreamInfo>,
 
+    // ── Firehose state (panel 8) ──
+    pub firehose: FirehoseState,
+
     // ── Agency lifecycle for selected task ──
     pub agency_lifecycle: Option<AgencyLifecycle>,
 
@@ -1634,6 +1693,7 @@ impl VizApp {
             chat: ChatState::default(),
             agent_monitor: AgentMonitorState::default(),
             agent_streams: HashMap::new(),
+            firehose: FirehoseState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -2634,6 +2694,10 @@ impl VizApp {
             self.load_stats();
             self.load_agent_monitor();
             self.update_agent_streams();
+            // Update firehose with new agent output if Firehose tab is active.
+            if self.right_panel_tab == RightPanelTab::Firehose {
+                self.update_firehose();
+            }
             // Preserve HUD scroll position when the selected task hasn't changed.
             self.invalidate_hud();
             // Eagerly reload so we can restore scroll before render.
@@ -2933,17 +2997,13 @@ impl VizApp {
         if let Some(output_path) = output_path {
             if self.detail_raw_json {
                 lines.push("── Output (raw) ── [R: human-readable]".to_string());
-            } else {
-                lines.push("── Output ── [R: raw JSON]".to_string());
-            }
-            if let Ok(content) = std::fs::read_to_string(&output_path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-                    {
-                        if self.detail_raw_json {
-                            // Raw mode: pretty-printed JSON
+                // Raw mode: pretty-printed JSON
+                if let Ok(content) = std::fs::read_to_string(&output_path) {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                            && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+                        {
                             if let Ok(pretty) = serde_json::to_string_pretty(&val) {
                                 for pline in pretty.lines() {
                                     lines.push(format!("  {}", pline));
@@ -2952,11 +3012,21 @@ impl VizApp {
                                 lines.push(format!("  {}", line));
                             }
                         } else {
-                            // Human-readable mode: extract key/value pairs
-                            flatten_json_to_lines(&val, "  ", &mut lines);
+                            lines.push(format!("  {}", line));
                         }
+                    }
+                }
+            } else {
+                lines.push("── Output ── [R: raw JSON]".to_string());
+                // Human-readable mode: extract assistant text as markdown
+                if let Ok(content) = std::fs::read_to_string(&output_path) {
+                    let extracted = extract_assistant_text_from_log(&content);
+                    if extracted.is_empty() {
+                        lines.push("  (no assistant output)".to_string());
                     } else {
-                        lines.push(format!("  {}", line));
+                        for line in extracted.lines() {
+                            lines.push(format!("  {}", line));
+                        }
                     }
                 }
             }
@@ -3229,19 +3299,11 @@ impl VizApp {
         if let Some(output_path) = output_path {
             lines.push("── Output ──".to_string());
             if let Ok(content) = std::fs::read_to_string(&output_path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if (trimmed.starts_with('{') || trimmed.starts_with('['))
-                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-                    {
-                        if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                            for pline in pretty.lines() {
-                                lines.push(format!("  {}", pline));
-                            }
-                        } else {
-                            lines.push(format!("  {}", line));
-                        }
-                    } else {
+                let extracted = extract_assistant_text_from_log(&content);
+                if extracted.is_empty() {
+                    lines.push("  (no assistant output)".to_string());
+                } else {
+                    for line in extracted.lines() {
                         lines.push(format!("  {}", line));
                     }
                 }
@@ -3894,6 +3956,7 @@ impl VizApp {
             chat: ChatState::default(),
             agent_monitor: AgentMonitorState::default(),
             agent_streams: HashMap::new(),
+            firehose: FirehoseState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -4464,6 +4527,104 @@ impl VizApp {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// Update the firehose view by reading new lines from all active agents' output.log files.
+    /// Each non-empty line is appended to the firehose buffer. The buffer is capped at
+    /// FIREHOSE_MAX_LINES to prevent memory growth.
+    pub fn update_firehose(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let agents_dir = self.workgraph_dir.join("agents");
+
+        // Collect active agent IDs and their task IDs from the monitor.
+        let active_agents: Vec<(String, String)> = self
+            .agent_monitor
+            .agents
+            .iter()
+            .filter(|a| matches!(a.status, AgentStatus::Working))
+            .map(|a| {
+                (
+                    a.agent_id.clone(),
+                    a.task_id.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+
+        let mut new_lines: Vec<FirehoseLine> = Vec::new();
+
+        for (agent_id, task_id) in &active_agents {
+            let log_path = agents_dir.join(agent_id).join("output.log");
+            if !log_path.exists() {
+                continue;
+            }
+
+            let offset = self
+                .firehose
+                .agent_offsets
+                .entry(agent_id.clone())
+                .or_insert(0);
+
+            let mut file = match std::fs::File::open(&log_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len <= *offset {
+                continue;
+            }
+
+            if file.seek(SeekFrom::Start(*offset)).is_err() {
+                continue;
+            }
+
+            let mut new_data = String::new();
+            if file.read_to_string(&mut new_data).is_err() {
+                continue;
+            }
+
+            *offset = file_len;
+
+            // Assign a stable color index for this agent.
+            let color_idx = *self
+                .firehose
+                .agent_colors
+                .entry(agent_id.clone())
+                .or_insert_with(|| {
+                    let idx = self.firehose.next_color;
+                    self.firehose.next_color += 1;
+                    idx
+                });
+
+            for line in new_data.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                new_lines.push(FirehoseLine {
+                    agent_id: agent_id.clone(),
+                    task_id: task_id.clone(),
+                    text: line.to_string(),
+                    color_idx,
+                });
+            }
+        }
+
+        if !new_lines.is_empty() {
+            self.firehose.lines.extend(new_lines);
+            // Cap buffer.
+            if self.firehose.lines.len() > FIREHOSE_MAX_LINES {
+                let drain = self.firehose.lines.len() - FIREHOSE_MAX_LINES;
+                self.firehose.lines.drain(..drain);
+                // Adjust scroll offset to account for removed lines.
+                self.firehose.scroll = self.firehose.scroll.saturating_sub(drain);
+            }
+            // Auto-scroll to bottom if tail mode is active.
+            if self.firehose.auto_tail {
+                self.firehose.scroll = usize::MAX;
             }
         }
     }
@@ -6271,100 +6432,94 @@ fn find_latest_archive(
     None
 }
 
-/// Format an ISO 8601 timestamp for HUD display (shorter, local time).
-/// Flatten a JSON value into human-readable key/value lines.
-/// Strings are displayed directly, objects show "Key: Value", arrays are listed.
-/// Nested objects recurse with increased indent.
-fn flatten_json_to_lines(val: &serde_json::Value, indent: &str, lines: &mut Vec<String>) {
-    match val {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                match value {
-                    serde_json::Value::String(s) => {
-                        // Capitalize the key nicely
-                        let label = humanize_key(key);
-                        for (i, line) in s.lines().enumerate() {
-                            if i == 0 {
-                                lines.push(format!("{}{}: {}", indent, label, line));
-                            } else {
-                                let continuation = " ".repeat(indent.len() + label.len() + 2);
-                                lines.push(format!("{}{}", continuation, line));
-                            }
+/// Extract assistant text content from a JSON stream log (output.log / raw_stream.jsonl).
+///
+/// Parses each JSON line, finds `"type": "assistant"` events, and extracts text
+/// from `message.content[].text` blocks. Returns the concatenated markdown text
+/// with tool-use blocks rendered as compact summaries.
+fn extract_assistant_text_from_log(content: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type != "assistant" {
+            continue;
+        }
+
+        let content_arr = match val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        for block in content_arr {
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                        let trimmed_text = text.trim();
+                        if !trimmed_text.is_empty() {
+                            parts.push(trimmed_text.to_string());
                         }
-                    }
-                    serde_json::Value::Number(n) => {
-                        lines.push(format!("{}{}: {}", indent, humanize_key(key), n));
-                    }
-                    serde_json::Value::Bool(b) => {
-                        lines.push(format!("{}{}: {}", indent, humanize_key(key), b));
-                    }
-                    serde_json::Value::Null => {
-                        lines.push(format!("{}{}: null", indent, humanize_key(key)));
-                    }
-                    serde_json::Value::Array(arr) => {
-                        lines.push(format!("{}{}:", indent, humanize_key(key)));
-                        let child_indent = format!("{}  ", indent);
-                        for item in arr {
-                            match item {
-                                serde_json::Value::String(s) => {
-                                    lines.push(format!("{}- {}", child_indent, s));
-                                }
-                                serde_json::Value::Object(_) => {
-                                    flatten_json_to_lines(item, &child_indent, lines);
-                                    lines.push(String::new());
-                                }
-                                other => {
-                                    lines.push(format!("{}- {}", child_indent, other));
-                                }
-                            }
-                        }
-                    }
-                    serde_json::Value::Object(_) => {
-                        lines.push(format!("{}{}:", indent, humanize_key(key)));
-                        let child_indent = format!("{}  ", indent);
-                        flatten_json_to_lines(value, &child_indent, lines);
                     }
                 }
+                "tool_use" => {
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
+                    let detail = match name {
+                        "Bash" => block
+                            .get("input")
+                            .and_then(|i| i.get("command"))
+                            .and_then(|v| v.as_str())
+                            .map(|c| {
+                                let c = c.trim();
+                                if c.len() > 80 {
+                                    format!(
+                                        "{}…",
+                                        &c[..c.floor_char_boundary(80)]
+                                    )
+                                } else {
+                                    c.to_string()
+                                }
+                            }),
+                        "Read" | "Write" | "Edit" => block
+                            .get("input")
+                            .and_then(|i| i.get("file_path"))
+                            .and_then(|v| v.as_str())
+                            .map(|p| p.to_string()),
+                        "Grep" | "Glob" => block
+                            .get("input")
+                            .and_then(|i| i.get("pattern"))
+                            .and_then(|v| v.as_str())
+                            .map(|p| p.to_string()),
+                        _ => None,
+                    };
+                    let summary = match detail {
+                        Some(d) => format!("┌─ {} ────\n│ {}\n└─", name, d),
+                        None => format!("┌─ {} ────\n└─", name),
+                    };
+                    parts.push(summary);
+                }
+                _ => {}
             }
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                flatten_json_to_lines(item, indent, lines);
-                lines.push(String::new());
-            }
-        }
-        serde_json::Value::String(s) => {
-            lines.push(format!("{}{}", indent, s));
-        }
-        other => {
-            lines.push(format!("{}{}", indent, other));
         }
     }
-}
 
-/// Convert a snake_case or camelCase JSON key to a human-readable label.
-fn humanize_key(key: &str) -> String {
-    // Replace underscores and split camelCase, then capitalize first letter.
-    let mut result = String::new();
-    let mut prev_lower = false;
-    for (i, c) in key.chars().enumerate() {
-        if c == '_' || c == '-' {
-            result.push(' ');
-            prev_lower = false;
-        } else if c.is_uppercase() && prev_lower {
-            result.push(' ');
-            result.push(c.to_lowercase().next().unwrap_or(c));
-            prev_lower = false;
-        } else {
-            if i == 0 {
-                result.push(c.to_uppercase().next().unwrap_or(c));
-            } else {
-                result.push(c);
-            }
-            prev_lower = c.is_lowercase();
-        }
-    }
-    result
+    parts.join("\n\n")
 }
 
 fn format_timestamp(ts: &str) -> String {
@@ -7264,6 +7419,106 @@ mod hud_tests {
 }
 
 #[cfg(test)]
+mod extract_assistant_text_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_text_from_assistant_messages() {
+        let log = concat!(
+            r#"{"type":"system","subtype":"init","cwd":"/tmp"}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Heading here\n\nThis is **bold** text."}]}}"#, "\n",
+            r#"{"type":"user","message":{"role":"user","content":[]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Second message."}]}}"#,
+        );
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("Heading here"));
+        assert!(result.contains("**bold**"));
+        assert!(result.contains("Second message."));
+    }
+
+    #[test]
+    fn extracts_tool_use_summaries() {
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("┌─ Bash"));
+        assert!(result.contains("cargo test"));
+        assert!(result.contains("└─"));
+    }
+
+    #[test]
+    fn handles_read_tool_summary() {
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/src/main.rs"}}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("┌─ Read"));
+        assert!(result.contains("/src/main.rs"));
+    }
+
+    #[test]
+    fn handles_grep_tool_summary() {
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"fn main"}}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("┌─ Grep"));
+        assert!(result.contains("fn main"));
+    }
+
+    #[test]
+    fn ignores_non_assistant_messages() {
+        let log = r#"{"type":"system","subtype":"init"}
+{"type":"user","message":{"content":[{"type":"text","text":"user text"}]}}
+{"type":"rate_limit_event","rate_limit_info":{}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn skips_empty_text_blocks() {
+        let log =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"  \n  "}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn handles_mixed_text_and_tool_use() {
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check."},{"type":"tool_use","name":"Bash","input":{"command":"ls -la"}}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("Let me check."));
+        assert!(result.contains("┌─ Bash"));
+        assert!(result.contains("ls -la"));
+    }
+
+    #[test]
+    fn unknown_tool_shows_name_only() {
+        let log = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"CustomTool","input":{"foo":"bar"}}]}}"#;
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.contains("┌─ CustomTool"));
+        assert!(result.contains("└─"));
+        // No detail line for unknown tools
+        assert!(!result.contains("│ "));
+    }
+
+    #[test]
+    fn handles_malformed_json_gracefully() {
+        let log = "not json at all\n{broken json\n";
+        let result = extract_assistant_text_from_log(log);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn truncates_long_bash_commands() {
+        let long_cmd = "x".repeat(200);
+        let log = format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{}"}}}}]}}}}"#,
+            long_cmd
+        );
+        let result = extract_assistant_text_from_log(&log);
+        assert!(result.contains("┌─ Bash"));
+        // Should be truncated with …
+        assert!(result.contains('…'));
+    }
+}
+
+#[cfg(test)]
 mod remap_panel_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
@@ -7338,7 +7593,7 @@ mod remap_panel_tests {
         let mut app = build_test_app();
         app.right_panel_visible = true;
         app.layout_mode = LayoutMode::TwoThirdsInspector;
-        app.right_panel_tab = RightPanelTab::CoordLog; // last tab
+        app.right_panel_tab = RightPanelTab::Firehose; // last tab
 
         app.cycle_inspector_view_forward();
 
@@ -7357,7 +7612,7 @@ mod remap_panel_tests {
         app.cycle_inspector_view_backward();
 
         assert!(app.right_panel_visible);
-        assert_eq!(app.right_panel_tab, RightPanelTab::CoordLog);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Firehose);
         assert!(app.slide_animation.is_some());
     }
 
@@ -7374,7 +7629,7 @@ mod remap_panel_tests {
         assert_eq!(app.layout_mode, LayoutMode::Off);
     }
 
-    // ── Full forward cycle: 9 presses returns to closed ──
+    // ── Full forward cycle: 10 presses returns to closed ──
 
     #[test]
     fn cycle_inspector_view_forward_full_cycle() {
@@ -7382,7 +7637,7 @@ mod remap_panel_tests {
         app.right_panel_visible = false;
         app.layout_mode = LayoutMode::Off;
 
-        // 8 tabs + 1 close = 9 presses
+        // 9 tabs + 1 close = 10 presses
         let expected_tabs = [
             Some(RightPanelTab::Chat),
             Some(RightPanelTab::Detail),
@@ -7392,6 +7647,7 @@ mod remap_panel_tests {
             Some(RightPanelTab::Config),
             Some(RightPanelTab::Files),
             Some(RightPanelTab::CoordLog),
+            Some(RightPanelTab::Firehose),
             None, // closed
         ];
 
