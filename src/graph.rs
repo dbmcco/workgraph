@@ -558,7 +558,7 @@ pub fn format_token_display(
         let cache_total = u.cache_read_input_tokens + u.cache_creation_input_tokens;
         s.push_str(&format!(
             "→{} ←{}",
-            format_tokens(u.total_input()),
+            format_tokens(u.input_tokens),
             format_tokens(u.output_tokens)
         ));
         if cache_total > 0 {
@@ -2151,14 +2151,14 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
-        // →in ←out ◎cached ⊳assign ∴eval format
+        // →novel_in ←out ◎cached ⊳assign ∴eval format
         assert_eq!(
             format_token_display(Some(&usage), Some(&assign), Some(&eval)),
-            Some("→110k ←3.9k ◎105k ⊳700 ∴1.2k".to_string())
+            Some("→4.6k ←3.9k ◎105k ⊳700 ∴1.2k".to_string())
         );
         assert_eq!(
             format_token_display(Some(&usage), None, None),
-            Some("→110k ←3.9k ◎105k".to_string())
+            Some("→4.6k ←3.9k ◎105k".to_string())
         );
         // Only eval, no assign
         assert_eq!(
@@ -2182,7 +2182,7 @@ mod tests {
         };
         assert_eq!(
             format_token_display(Some(&usage), Some(&zero_val), Some(&zero_val)),
-            Some("→110k ←3.9k ◎105k".to_string())
+            Some("→4.6k ←3.9k ◎105k".to_string())
         );
         assert_eq!(format_token_display(None, Some(&zero_val), None), None);
     }

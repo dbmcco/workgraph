@@ -409,12 +409,21 @@ fn print_human_readable(details: &TaskDetails) {
     // Token usage
     if let Some(ref usage) = details.token_usage {
         println!();
-        let compact = format!(
-            "{}/{}",
-            format_tokens(usage.total_input()),
-            format_tokens(usage.output_tokens)
-        );
-        println!("Tokens: {} (in/out)", compact);
+        let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+        if cache_total > 0 {
+            println!(
+                "Tokens: {}/{} (novel-in/out) +{} cached",
+                format_tokens(usage.input_tokens),
+                format_tokens(usage.output_tokens),
+                format_tokens(cache_total)
+            );
+        } else {
+            println!(
+                "Tokens: {}/{} (in/out)",
+                format_tokens(usage.input_tokens),
+                format_tokens(usage.output_tokens)
+            );
+        }
         if usage.cost_usd > 0.0 {
             println!("Cost: ${:.2}", usage.cost_usd);
         }

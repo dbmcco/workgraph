@@ -4526,7 +4526,7 @@ fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, lab
     let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
     let token_str = if cache_total > 0 {
         let cache = format_tokens(cache_total);
-        format!("→{} +{} cached ←{}", new_input, cache, output)
+        format!("→{} ◎{} ←{}", new_input, cache, output)
     } else {
         format!("→{} ←{}", new_input, output)
     };
