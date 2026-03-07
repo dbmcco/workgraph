@@ -228,6 +228,9 @@ pub struct TuiConfig {
     /// Maximum number of chat messages to persist (default: 1000)
     #[serde(default = "default_chat_history_max")]
     pub chat_history_max: usize,
+    /// Comma-separated time counters to display: "uptime", "cumulative", "active"
+    #[serde(default = "default_counters")]
+    pub counters: String,
 }
 
 fn default_tui_layout() -> String {
@@ -257,6 +260,9 @@ fn default_inspector_size() -> String {
 fn default_chat_history_max() -> usize {
     1000
 }
+fn default_counters() -> String {
+    "uptime,cumulative,active".to_string()
+}
 
 impl Default for TuiConfig {
     fn default() -> Self {
@@ -272,6 +278,7 @@ impl Default for TuiConfig {
             default_inspector_size: default_inspector_size(),
             chat_history: true,
             chat_history_max: default_chat_history_max(),
+            counters: default_counters(),
         }
     }
 }

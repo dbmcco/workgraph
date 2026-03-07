@@ -1669,6 +1669,8 @@ pub struct VizApp {
     // ── Scrollbar drag state ──
     /// Which scrollbar (if any) is currently being dragged.
     pub scrollbar_drag: Option<ScrollbarDragTarget>,
+    /// Last mouse position during a graph-body drag-to-pan gesture (col, row).
+    pub graph_pan_last: Option<(u16, u16)>,
 
     /// Vertical scrollbar area for the graph pane (set each frame by renderer).
     pub last_graph_scrollbar_area: Rect,
@@ -1843,6 +1845,7 @@ impl VizApp {
             graph_scroll_activity: None,
             panel_scroll_activity: None,
             scrollbar_drag: None,
+            graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
             graph_hscroll_activity: None,
@@ -4117,6 +4120,7 @@ impl VizApp {
             graph_scroll_activity: None,
             panel_scroll_activity: None,
             scrollbar_drag: None,
+            graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
             graph_hscroll_activity: None,

@@ -130,6 +130,7 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         println!("[tui]");
         println!("  chat_history = {}", config.tui.chat_history);
         println!("  chat_history_max = {}", config.tui.chat_history_max);
+    println!("  counters = \"{}\"", config.tui.counters);
         println!();
         println!("[viz]");
         println!("  edge_color = \"{}\"", config.viz.edge_color);
@@ -236,6 +237,7 @@ pub fn update(
     flip_verification_model: Option<&str>,
     chat_history: Option<bool>,
     chat_history_max: Option<usize>,
+    tui_counters: Option<&str>,
 ) -> Result<()> {
     let mut config = match scope {
         ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
@@ -483,6 +485,22 @@ pub fn update(
     if let Some(v) = chat_history_max {
         config.tui.chat_history_max = v;
         println!("Set tui.chat_history_max = {}", v);
+        changed = true;
+    }
+
+    if let Some(counters) = tui_counters {
+        let valid = ["uptime", "cumulative", "active", "session"];
+        for part in counters.split(',') {
+            let p = part.trim();
+            if !p.is_empty() && !valid.contains(&p) {
+                anyhow::bail!(
+                    "Invalid counter '{}'. Valid: uptime, cumulative, active, session",
+                    p
+                );
+            }
+        }
+        config.tui.counters = counters.to_string();
+        println!("Set tui.counters = \"{}\"", counters);
         changed = true;
     }
 
@@ -953,6 +971,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -977,6 +996,7 @@ mod tests {
             Some(60),
             None,
             Some("shell"),
+            None,
             None,
             None,
             None,
@@ -1055,6 +1075,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -1088,6 +1109,7 @@ mod tests {
             Some("creator-hash"),
             Some("haiku"),
             Some("Retire below 0.3 after 10 evals"),
+            None,
             None,
             None,
             None,

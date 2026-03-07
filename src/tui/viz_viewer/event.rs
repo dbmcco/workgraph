@@ -1439,6 +1439,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             } else if in_graph {
                 // Click in graph: focus graph + select task at clicked line.
                 app.focused_panel = FocusedPanel::Graph;
+                // Start drag-to-pan tracking for touch/mouse pan gestures.
+                app.graph_pan_last = Some((column, row));
                 // Exit text entry mode if active (text persists, goes gray).
                 if app.input_mode == InputMode::ChatInput {
                     app.input_mode = InputMode::Normal;
@@ -1526,12 +1528,33 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             } else if app.scrollbar_drag == Some(ScrollbarDragTarget::GraphHorizontal) {
                 app.record_graph_hscroll_activity();
                 hscrollbar_jump_to_column(app, column);
+            } else if let Some((prev_col, prev_row)) = app.graph_pan_last {
+                // Drag-to-pan: move the graph viewport following the finger/mouse.
+                // Natural scrolling: dragging down (row increases) scrolls content up.
+                let dx = prev_col as i32 - column as i32;
+                let dy = prev_row as i32 - row as i32;
+                if dx > 0 {
+                    app.record_graph_hscroll_activity();
+                    app.scroll.scroll_right(dx as usize);
+                } else if dx < 0 {
+                    app.record_graph_hscroll_activity();
+                    app.scroll.scroll_left((-dx) as usize);
+                }
+                if dy > 0 {
+                    app.record_graph_scroll_activity();
+                    app.scroll.scroll_down(dy as usize);
+                } else if dy < 0 {
+                    app.record_graph_scroll_activity();
+                    app.scroll.scroll_up((-dy) as usize);
+                }
+                app.graph_pan_last = Some((column, row));
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if app.scrollbar_drag.is_some() {
                 app.scrollbar_drag = None;
             }
+            app.graph_pan_last = None;
         }
         _ => {}
     }
@@ -2879,5 +2902,127 @@ mod scrollbar_tests {
             app.graph_scrollbar_visible(),
             "Scrollbar should be visible immediately after scroll activity"
         );
+    }
+
+    // ── 6. Touch drag-to-pan ──
+
+    #[test]
+    fn drag_in_graph_body_pans_vertically() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.scroll.content_width = 200;
+        app.scroll.viewport_width = 80;
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect { x: 79, y: 0, width: 1, height: 20 };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Mouse down inside graph body.
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 40);
+        assert!(app.graph_pan_last.is_some(), "Pan should start on mouse down in graph");
+        assert_eq!(app.scroll.offset_y, 0);
+
+        // Drag upward (row decreases from 10 to 5) → content follows finger up → scroll_down.
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, 40);
+        assert_eq!(app.scroll.offset_y, 5, "Dragging up should scroll down by 5 rows");
+
+        // Drag back down (row increases from 5 to 8) → content follows finger down → scroll_up.
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 8, 40);
+        assert_eq!(app.scroll.offset_y, 2, "Dragging down should scroll up by 3 rows");
+    }
+
+    #[test]
+    fn drag_in_graph_body_pans_horizontally() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.scroll.content_width = 200;
+        app.scroll.viewport_width = 80;
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect { x: 79, y: 0, width: 1, height: 20 };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Mouse down inside graph body.
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 40);
+        assert_eq!(app.scroll.offset_x, 0);
+
+        // Drag left (column decreases from 40 to 30) → content follows finger left → scroll_right.
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 10, 30);
+        assert_eq!(app.scroll.offset_x, 10, "Dragging left should scroll right by 10 cols");
+
+        // Drag right (column increases from 30 to 35) → content follows finger right → scroll_left.
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 10, 35);
+        assert_eq!(app.scroll.offset_x, 5, "Dragging right should scroll left by 5 cols");
+    }
+
+    #[test]
+    fn drag_pan_cleared_on_mouse_up() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect { x: 79, y: 0, width: 1, height: 20 };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 40);
+        assert!(app.graph_pan_last.is_some());
+
+        handle_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5, 40);
+        assert!(app.graph_pan_last.is_none(), "Pan state should be cleared on mouse up");
+    }
+
+    #[test]
+    fn drag_pan_does_not_conflict_with_scrollbar_drag() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.scroll.content_width = 200;
+        app.scroll.viewport_width = 80;
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect { x: 79, y: 0, width: 1, height: 20 };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Click on scrollbar, not graph body.
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 79);
+        assert_eq!(app.scrollbar_drag, Some(ScrollbarDragTarget::Graph));
+        // graph_pan_last should NOT be set since this was a scrollbar click.
+        assert!(app.graph_pan_last.is_none(), "Scrollbar click should not start graph pan");
+    }
+
+    #[test]
+    fn drag_pan_diagonal_movement() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.scroll.content_width = 200;
+        app.scroll.viewport_width = 80;
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect { x: 79, y: 0, width: 1, height: 20 };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Mouse down at (row=10, col=40).
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 40);
+
+        // Drag diagonally: row 10→5 (up 5), col 40→30 (left 10).
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, 30);
+        assert_eq!(app.scroll.offset_y, 5, "Vertical pan from diagonal drag");
+        assert_eq!(app.scroll.offset_x, 10, "Horizontal pan from diagonal drag");
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_still_works_with_pan_state() {
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        app.last_graph_area = Rect { x: 0, y: 0, width: 79, height: 20 };
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Scroll wheel should work normally.
+        handle_mouse(&mut app, MouseEventKind::ScrollDown, 10, 40);
+        assert_eq!(app.scroll.offset_y, 3, "Mouse wheel ScrollDown should scroll by 3");
+
+        handle_mouse(&mut app, MouseEventKind::ScrollUp, 10, 40);
+        assert_eq!(app.scroll.offset_y, 0, "Mouse wheel ScrollUp should scroll back");
     }
 }
