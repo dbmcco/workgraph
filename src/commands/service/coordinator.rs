@@ -944,12 +944,10 @@ fn build_auto_assign_tasks(
         if let Some(task) = graph.get_task_mut(&task_id) {
             task.agent = Some(resolved_agent.id.clone());
             if let Some(ref mode) = verdict.exec_mode {
-                match mode.as_str() {
-                    "shell" | "bare" | "light" | "full" => {
-                        task.exec_mode = Some(mode.clone());
-                    }
-                    _ => {} // invalid, keep default
+                if mode.parse::<workgraph::config::ExecMode>().is_ok() {
+                    task.exec_mode = Some(mode.clone());
                 }
+                // else: invalid value, keep default
             }
             if let Some(ref scope) = verdict.context_scope {
                 match scope.as_str() {

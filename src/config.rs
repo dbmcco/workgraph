@@ -423,6 +423,8 @@ pub enum DispatchRole {
     Creator,
     /// Compactor: distills graph state into context.md
     Compactor,
+    /// Coordinator evaluation (inline per-turn scoring)
+    CoordinatorEval,
 }
 
 impl std::fmt::Display for DispatchRole {
@@ -439,6 +441,7 @@ impl std::fmt::Display for DispatchRole {
             Self::Triage => write!(f, "triage"),
             Self::Creator => write!(f, "creator"),
             Self::Compactor => write!(f, "compactor"),
+            Self::CoordinatorEval => write!(f, "coordinator_eval"),
         }
     }
 }
@@ -459,6 +462,7 @@ impl std::str::FromStr for DispatchRole {
             "triage" => Ok(Self::Triage),
             "creator" => Ok(Self::Creator),
             "compactor" => Ok(Self::Compactor),
+            "coordinator_eval" => Ok(Self::CoordinatorEval),
             _ => Err(anyhow::anyhow!(
                 "Unknown dispatch role '{}'. Valid roles: default, task_agent, evaluator, \
                  flip_inference, flip_comparison, assigner, evolver, verification, triage, creator, compactor",
@@ -482,6 +486,77 @@ impl DispatchRole {
         Self::Creator,
         Self::Compactor,
     ];
+}
+
+// ---------------------------------------------------------------------------
+// Execution weight tiers
+// ---------------------------------------------------------------------------
+
+/// Execution weight tier for agent spawning.
+///
+/// Controls what tools and context an agent gets, from lightest to heaviest:
+/// - Shell: no LLM, just run a shell command
+/// - Bare: LLM with wg CLI only (no file access)
+/// - Light: LLM with read-only file access (research/review)
+/// - Full: all tools (implementation/debugging)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    /// No LLM — run `task.exec` command directly via bash
+    Shell,
+    /// LLM with `Bash(wg:*)` only, `--system-prompt` path
+    Bare,
+    /// LLM with read-only file tools: `Bash(wg:*),Read,Glob,Grep,WebFetch,WebSearch`
+    Light,
+    /// Full Claude Code session with all tools
+    Full,
+}
+
+impl Default for ExecMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+impl std::fmt::Display for ExecMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shell => write!(f, "shell"),
+            Self::Bare => write!(f, "bare"),
+            Self::Light => write!(f, "light"),
+            Self::Full => write!(f, "full"),
+        }
+    }
+}
+
+impl std::str::FromStr for ExecMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "shell" => Ok(Self::Shell),
+            "bare" => Ok(Self::Bare),
+            "light" => Ok(Self::Light),
+            "full" => Ok(Self::Full),
+            _ => Err(anyhow::anyhow!(
+                "Invalid exec_mode '{}'. Valid values: shell, bare, light, full",
+                s
+            )),
+        }
+    }
+}
+
+impl ExecMode {
+    /// All variants in order from lightest to heaviest.
+    pub const ALL: &'static [ExecMode] = &[Self::Shell, Self::Bare, Self::Light, Self::Full];
+
+    /// Parse from an optional string, defaulting to Full.
+    pub fn from_opt(s: Option<&str>) -> Result<Self, anyhow::Error> {
+        match s {
+            Some(v) => v.parse(),
+            None => Ok(Self::Full),
+        }
+    }
 }
 
 /// Per-role model+provider assignment.
@@ -550,6 +625,7 @@ impl ModelRoutingConfig {
             DispatchRole::Triage => self.triage.as_ref(),
             DispatchRole::Creator => self.creator.as_ref(),
             DispatchRole::Compactor => self.compactor.as_ref(),
+            DispatchRole::CoordinatorEval => self.evaluator.as_ref(),
         }
     }
 
@@ -567,6 +643,7 @@ impl ModelRoutingConfig {
             DispatchRole::Triage => &mut self.triage,
             DispatchRole::Creator => &mut self.creator,
             DispatchRole::Compactor => &mut self.compactor,
+            DispatchRole::CoordinatorEval => &mut self.evaluator,
         }
     }
 
@@ -660,6 +737,7 @@ impl Config {
         let tier_default = match role {
             DispatchRole::Triage => Some("haiku"),
             DispatchRole::Compactor => Some("haiku"),
+            DispatchRole::CoordinatorEval => Some("haiku"),
             DispatchRole::FlipComparison => Some("haiku"),
             DispatchRole::FlipInference => Some("sonnet"),
             DispatchRole::Verification => Some("opus"),
@@ -1097,6 +1175,11 @@ pub struct CoordinatorConfig {
     /// Provenance ops growth threshold that triggers compaction (default: 100)
     #[serde(default = "default_compactor_ops_threshold")]
     pub compactor_ops_threshold: usize,
+
+    /// How often to evaluate coordinator turns.
+    /// Options: "every", "every_5" (default), "every_10", "sample_20pct", "none"
+    #[serde(default = "default_eval_frequency")]
+    pub eval_frequency: String,
 }
 
 fn default_max_agents() -> usize {
@@ -1127,6 +1210,10 @@ fn default_compactor_ops_threshold() -> usize {
     100
 }
 
+fn default_eval_frequency() -> String {
+    "every_5".to_string()
+}
+
 fn default_agent_timeout() -> String {
     "30m".to_string()
 }
@@ -1145,6 +1232,7 @@ impl Default for CoordinatorConfig {
             coordinator_agent: default_coordinator_agent(),
             compactor_interval: default_compactor_interval(),
             compactor_ops_threshold: default_compactor_ops_threshold(),
+            eval_frequency: default_eval_frequency(),
         }
     }
 }

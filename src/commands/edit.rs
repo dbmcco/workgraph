@@ -291,20 +291,14 @@ pub fn run(
 
         // Update exec mode
         if let Some(mode) = exec_mode {
-            match mode {
-                "full" | "light" | "bare" | "shell" => {
-                    let old = task.exec_mode.clone();
-                    task.exec_mode = Some(mode.to_string());
-                    field_changes
-                        .push(serde_json::json!({"field": "exec_mode", "old": old, "new": mode}));
-                    println!("Updated exec_mode: {}", mode);
-                    changed = true;
-                }
-                _ => anyhow::bail!(
-                    "Invalid exec_mode '{}'. Valid values: full, light, bare, shell",
-                    mode
-                ),
-            }
+            mode.parse::<workgraph::config::ExecMode>()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let old = task.exec_mode.clone();
+            task.exec_mode = Some(mode.to_string());
+            field_changes
+                .push(serde_json::json!({"field": "exec_mode", "old": old, "new": mode}));
+            println!("Updated exec_mode: {}", mode);
+            changed = true;
         }
 
         // Update not_before (from --delay or --not-before)

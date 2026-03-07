@@ -1069,6 +1069,56 @@ fn try_dispatch_notifications(dir: &Path, logger: &DaemonLogger) {
     }
 }
 
+/// Ensure the `.coordinator` cycle task exists in the graph.
+///
+/// Creates it if missing (Phase 2 of coordinator-as-graph-citizen).
+/// The task has unlimited iterations and is tagged `coordinator-loop`.
+fn ensure_coordinator_task(dir: &Path) {
+    use workgraph::graph::{CycleConfig, LogEntry, Node, Task};
+    use workgraph::parser::save_graph;
+
+    let gp = graph_path(dir);
+    let mut graph = match load_graph(&gp) {
+        Ok(g) => g,
+        Err(_) => return, // No graph yet — nothing to do
+    };
+
+    if graph.get_task(".coordinator").is_some() {
+        return; // Already exists
+    }
+
+    let task = Task {
+        id: ".coordinator".to_string(),
+        title: "Coordinator".to_string(),
+        description: Some(
+            "Persistent coordinator agent — each turn is a cycle iteration.".to_string(),
+        ),
+        status: workgraph::graph::Status::InProgress,
+        tags: vec!["coordinator-loop".to_string()],
+        cycle_config: Some(CycleConfig {
+            max_iterations: 0, // unlimited
+            guard: None,
+            delay: None,
+            no_converge: true,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        }),
+        created_at: Some(Utc::now().to_rfc3339()),
+        started_at: Some(Utc::now().to_rfc3339()),
+        log: vec![LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some("daemon".to_string()),
+            message: "Coordinator task created by daemon".to_string(),
+        }],
+        ..Default::default()
+    };
+
+    graph.add_node(Node::Task(task));
+    if let Err(e) = save_graph(&graph, &gp) {
+        eprintln!("[daemon] Failed to save graph after creating .coordinator task: {}", e);
+    }
+}
+
 /// Run the actual daemon loop (called by forked process)
 #[cfg(unix)]
 pub fn run_daemon(
@@ -1178,6 +1228,9 @@ pub fn run_daemon(
         paused: false,
     };
     coord_state.save(&dir);
+
+    // Ensure the .coordinator cycle task exists in the graph (Phase 2).
+    ensure_coordinator_task(&dir);
 
     // Create the shared event log for coordinator context refresh.
     // The daemon records events (task completions, agent spawns, etc.) and the

@@ -472,6 +472,9 @@ fn agent_thread_main(
         // Track the last interaction time for context injection
         let mut last_interaction = chrono::Utc::now().to_rfc3339();
 
+        // Track turn count for evaluation frequency
+        let mut turn_count: u32 = 0;
+
         // Process messages from the main daemon thread
         loop {
             // Wait for a chat message (with timeout to check process health)
@@ -510,6 +513,7 @@ fn agent_thread_main(
             }
 
             if let Some(req) = request {
+                let turn_start = std::time::Instant::now();
                 logger.info(&format!(
                     "Coordinator agent: processing request_id={}",
                     req.request_id
@@ -559,11 +563,13 @@ fn agent_thread_main(
                 let collected =
                     collect_response(&response_rx, logger, std::time::Duration::from_secs(300));
 
-                match collected {
+                let response_info = match collected {
                     Some(resp) if !resp.summary.is_empty() => {
+                        let len = resp.summary.len();
+                        let summary_clone = resp.summary.clone();
                         logger.info(&format!(
                             "Coordinator agent: got response ({} chars{}) for request_id={}",
-                            resp.summary.len(),
+                            len,
                             if resp.full_text.is_some() {
                                 ", with tool calls"
                             } else {
@@ -582,6 +588,7 @@ fn agent_thread_main(
                                 e
                             ));
                         }
+                        Some((len, summary_clone))
                     }
                     Some(_) => {
                         logger.warn("Coordinator agent: empty response from Claude CLI");
@@ -590,6 +597,7 @@ fn agent_thread_main(
                             "The coordinator processed your message but produced no response text.",
                             &req.request_id,
                         );
+                        None
                     }
                     None => {
                         logger.warn("Coordinator agent: response timeout");
@@ -598,6 +606,30 @@ fn agent_thread_main(
                             "The coordinator agent timed out processing your message. It may be performing a long-running operation.",
                             &req.request_id,
                         );
+                        None
+                    }
+                };
+
+                // Record this turn as a cycle iteration on the .coordinator task
+                if let Some((resp_len, ref resp_summary)) = response_info {
+                    turn_count += 1;
+                    record_coordinator_turn(dir, &req.message, resp_len, turn_start);
+
+                    // Inline evaluation (runs in background thread, non-blocking)
+                    let eval_config = workgraph::config::Config::load_or_default(dir);
+                    if should_evaluate_turn(turn_count, &eval_config.coordinator.eval_frequency) {
+                        let eval_dir = dir.to_path_buf();
+                        let eval_msg = req.message.clone();
+                        let eval_resp = resp_summary.clone();
+                        let eval_turn = turn_count;
+                        std::thread::Builder::new()
+                            .name("coordinator-eval".to_string())
+                            .spawn(move || {
+                                evaluate_coordinator_turn(
+                                    &eval_dir, eval_turn, &eval_msg, &eval_resp,
+                                );
+                            })
+                            .ok();
                     }
                 }
 
@@ -1182,6 +1214,278 @@ fn build_system_prompt(dir: &Path) -> String {
 /// Hardcoded fallback prompt used when coordinator-prompt files don't exist.
 fn build_system_prompt_fallback() -> String {
     include_str!("coordinator_prompt_fallback.txt").to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Turn recording (Phase 2: coordinator-as-graph-citizen)
+// ---------------------------------------------------------------------------
+
+/// Record a coordinator turn as a cycle iteration on the `.coordinator` task.
+///
+/// Logs turn metadata (response length, latency) and increments `loop_iteration`.
+fn record_coordinator_turn(
+    dir: &Path,
+    user_message: &str,
+    response_len: usize,
+    turn_start: std::time::Instant,
+) {
+    use workgraph::graph::LogEntry;
+    use workgraph::parser::save_graph;
+
+    let gp = graph_path(dir);
+    let mut graph = match load_graph(&gp) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    let task = match graph.get_task_mut(".coordinator") {
+        Some(t) => t,
+        None => return,
+    };
+
+    let latency = turn_start.elapsed();
+    let iteration = task.loop_iteration;
+    task.loop_iteration = iteration.saturating_add(1);
+
+    // Truncate user message for the log entry
+    let msg_preview: String = user_message.chars().take(80).collect();
+    let msg_suffix = if user_message.len() > 80 { "..." } else { "" };
+
+    let log_msg = format!(
+        "Turn {}: processed \"{}{}\" ({} chars response, {:.1}s)",
+        iteration + 1,
+        msg_preview,
+        msg_suffix,
+        response_len,
+        latency.as_secs_f64(),
+    );
+
+    task.log.push(LogEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        actor: Some("daemon".to_string()),
+        message: log_msg,
+    });
+
+    // Keep log bounded (last 100 entries)
+    if task.log.len() > 100 {
+        let drain_count = task.log.len() - 100;
+        task.log.drain(..drain_count);
+    }
+
+    if let Err(e) = save_graph(&graph, &gp) {
+        eprintln!(
+            "[coordinator-agent] Failed to save graph after turn recording: {}",
+            e
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline evaluation (Phase 3: coordinator-as-graph-citizen)
+// ---------------------------------------------------------------------------
+
+/// Coordinator evaluation rubric dimensions with weights.
+const COORDINATOR_EVAL_DIMENSIONS: &[(&str, f64)] = &[
+    ("decomposition", 0.30),
+    ("dependency_accuracy", 0.25),
+    ("description_quality", 0.20),
+    ("user_responsiveness", 0.15),
+    ("efficiency", 0.10),
+];
+
+/// Check whether a coordinator turn should be evaluated based on eval_frequency config.
+fn should_evaluate_turn(turn_number: u32, eval_frequency: &str) -> bool {
+    match eval_frequency {
+        "every" => true,
+        "every_5" => turn_number % 5 == 0,
+        "every_10" => turn_number % 10 == 0,
+        "sample_20pct" => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            turn_number.hash(&mut hasher);
+            chrono::Utc::now().timestamp_nanos_opt().hash(&mut hasher);
+            hasher.finish() % 5 == 0
+        }
+        "none" => false,
+        _ => turn_number % 5 == 0, // default to every_5
+    }
+}
+
+/// Build the evaluation prompt for a coordinator turn.
+fn build_coordinator_eval_prompt(
+    user_message: &str,
+    response_summary: &str,
+    graph_summary: &str,
+) -> String {
+    format!(
+        r#"You are evaluating a coordinator turn. The coordinator received input and produced output.
+
+## Input
+- User message: {user_message}
+- Graph state at turn start: {graph_summary}
+
+## Output
+- Response to user: {response_summary}
+
+## Evaluation Criteria
+Score each dimension 0.0-1.0:
+
+1. **Decomposition (30%)**: Were the tasks well-scoped? Right number? Right boundaries?
+2. **Dependency accuracy (25%)**: Correct edges? No cycles that shouldn't be there? Same-file work serialized?
+3. **Description quality (20%)**: Clear? Actionable? Validation criteria included?
+4. **User responsiveness (15%)**: Helpful? Accurate? Right level of detail?
+5. **Efficiency (10%)**: Minimal unnecessary work? No redundant tasks?
+
+Output JSON:
+{{
+  "score": <float 0.0-1.0>,
+  "dimensions": {{
+    "decomposition": <float>,
+    "dependency_accuracy": <float>,
+    "description_quality": <float>,
+    "user_responsiveness": <float>,
+    "efficiency": <float>
+  }},
+  "notes": "<brief explanation of strengths and weaknesses>"
+}}"#
+    )
+}
+
+/// Run inline evaluation of a coordinator turn via lightweight LLM call.
+///
+/// Called asynchronously after eligible turns. Records the evaluation in
+/// `.workgraph/agency/evaluations/`.
+fn evaluate_coordinator_turn(
+    dir: &Path,
+    turn_number: u32,
+    user_message: &str,
+    response_summary: &str,
+) {
+    use std::collections::HashMap;
+    use workgraph::agency::{self, Evaluation};
+    use workgraph::config::{Config, DispatchRole};
+    use workgraph::service::llm::run_lightweight_llm_call;
+
+    let config = Config::load_or_default(dir);
+
+    // Build a brief graph summary for context
+    let gp = graph_path(dir);
+    let graph_summary = if let Ok(graph) = load_graph(&gp) {
+        let total = graph.tasks().count();
+        let done = graph.tasks().filter(|t| t.status == Status::Done).count();
+        let in_prog = graph.tasks().filter(|t| t.status == Status::InProgress).count();
+        let failed = graph.tasks().filter(|t| t.status == Status::Failed).count();
+        format!("{} tasks ({} done, {} in-progress, {} failed)", total, done, in_prog, failed)
+    } else {
+        "unknown".to_string()
+    };
+
+    // Truncate inputs for the eval prompt (keep it cheap)
+    let msg_trunc: String = user_message.chars().take(500).collect();
+    let resp_trunc: String = response_summary.chars().take(1000).collect();
+
+    let prompt = build_coordinator_eval_prompt(&msg_trunc, &resp_trunc, &graph_summary);
+
+    let result = match run_lightweight_llm_call(&config, DispatchRole::CoordinatorEval, &prompt, 30)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[coordinator-eval] Failed to run evaluation LLM call: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    // Parse the JSON response
+    let text = result.text.trim();
+    // Extract JSON from possible markdown code blocks
+    let json_str = if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            &text[start..=end]
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[coordinator-eval] Failed to parse evaluation response: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let score = parsed
+        .get("score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+    let notes = parsed
+        .get("notes")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut dimensions = HashMap::new();
+    if let Some(dims) = parsed.get("dimensions").and_then(|v| v.as_object()) {
+        for (key, val) in dims {
+            if let Some(f) = val.as_f64() {
+                dimensions.insert(key.clone(), f);
+            }
+        }
+    }
+
+    // Compute weighted score if we got dimensions
+    let weighted_score = if !dimensions.is_empty() {
+        let mut total = 0.0;
+        for (dim_name, weight) in COORDINATOR_EVAL_DIMENSIONS {
+            if let Some(dim_score) = dimensions.get(*dim_name) {
+                total += dim_score * weight;
+            }
+        }
+        total
+    } else {
+        score
+    };
+
+    let evaluation = Evaluation {
+        id: format!("eval-coordinator-turn-{}", turn_number),
+        task_id: ".coordinator".to_string(),
+        agent_id: String::new(),
+        role_id: "coordinator".to_string(),
+        tradeoff_id: String::new(),
+        score: weighted_score,
+        dimensions,
+        notes,
+        evaluator: "inline-coordinator-eval".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        model: None,
+        source: "coordinator-inline".to_string(),
+    };
+
+    let agency_dir = dir.join("agency");
+    match agency::record_evaluation(&evaluation, &agency_dir) {
+        Ok(path) => {
+            eprintln!(
+                "[coordinator-eval] Turn {} evaluated: {:.2} (saved to {})",
+                turn_number,
+                weighted_score,
+                path.display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[coordinator-eval] Failed to record evaluation: {}",
+                e
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

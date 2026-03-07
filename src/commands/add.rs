@@ -94,13 +94,8 @@ pub fn run(
 
     // Validate exec_mode if provided
     if let Some(mode) = exec_mode {
-        match mode {
-            "full" | "light" | "bare" | "shell" => {}
-            _ => anyhow::bail!(
-                "Invalid exec_mode '{}'. Valid values: full, light, bare, shell",
-                mode
-            ),
-        }
+        mode.parse::<workgraph::config::ExecMode>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
     let path = graph_path(dir);

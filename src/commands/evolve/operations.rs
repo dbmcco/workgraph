@@ -56,6 +56,8 @@ pub(crate) fn apply_operation(
         "meta_swap_role" => apply_meta_swap_role(op, run_id, agency_dir, dir),
         "meta_swap_tradeoff" => apply_meta_swap_tradeoff(op, run_id, agency_dir, dir),
         "meta_compose_agent" => apply_meta_compose_agent(op, run_id, agency_dir, dir),
+        // Coordinator prompt evolution
+        "modify_coordinator_prompt" => apply_modify_coordinator_prompt(op, agency_dir),
         other => bail!("Unknown operation type: '{}'", other),
     }
 }

@@ -297,9 +297,11 @@ pub struct Task {
     /// Context scope for prompt assembly: clean, task, graph, full
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_scope: Option<String>,
-    /// Execution mode: "full" (default, full Claude Code session with all tools)
-    /// or "bare" (lightweight --system-prompt path, no file I/O tools).
-    /// Use "bare" for pure-reasoning tasks: synthesis, triage, summarization, abstract reasoning.
+    /// Execution weight tier controlling agent tool access:
+    /// - "shell": no LLM, run task.exec command directly
+    /// - "bare": LLM with wg CLI only, --system-prompt path
+    /// - "light": LLM with read-only file access (Read, Glob, Grep, WebFetch)
+    /// - "full" (default): full Claude Code session with all tools
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_mode: Option<String>,
     /// Token usage and cost data extracted from agent output.log
