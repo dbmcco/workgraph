@@ -112,7 +112,7 @@ wg agent create "Erik" \
 # AI agent
 wg agent create "Claude Coder" \
   --role <role-hash> \
-  --motivation <motivation-hash> \
+  --tradeoff <tradeoff-hash> \
   --capabilities coding,testing,docs
 ```
 
@@ -590,9 +590,9 @@ When the coordinator ticks, it automatically creates `assign-{task}` and `evalua
 ### Evolution
 
 ```bash
-wg evolve                              # full evolution cycle
-wg evolve --strategy mutation --budget 3  # targeted changes
-wg evolve --dry-run                    # preview without applying
+wg evolve run                              # full evolution cycle
+wg evolve run --strategy mutation --budget 3  # targeted changes
+wg evolve run --dry-run                    # preview without applying
 ```
 
 ### Federation
@@ -813,7 +813,7 @@ wg trace show <task-id> --animate    # animated replay of execution over time
 
 ## Key concepts
 
-**Tasks** have a status (`open`, `in-progress`, `done`, `failed`, `abandoned`, `blocked`, `pending-validation`) and can block other tasks. Tasks can carry a per-task `model` override, an `agent` identity assignment, a `visibility` field (`internal`, `public`, `peer`) controlling what information is shared during trace exports, and a `context_scope` (`clean`, `task`, `graph`, `full`) controlling how much context the agent receives at dispatch.
+**Tasks** have a status (`open`, `in-progress`, `done`, `failed`, `abandoned`, `blocked`, `pending-validation`, `waiting`) and can block other tasks. Tasks can carry a per-task `model` override, an `agent` identity assignment, a `visibility` field (`internal`, `public`, `peer`) controlling what information is shared during trace exports, and a `context_scope` (`clean`, `task`, `graph`, `full`) controlling how much context the agent receives at dispatch.
 
 **Agents** are humans or AIs that do work. They can be AI agents (with a role and motivation that shape their behavior) or human agents (with contact info and a human executor like Matrix or email). All agents share the same identity model: capabilities, trust levels, rate, and capacity.
 
@@ -923,11 +923,17 @@ Agency data lives in `.workgraph/agency/`, with federation config and functions 
   functions/               # Trace functions (workflow templates)
     <name>.yaml
   agency/
-    roles/                 # Role YAML files (keyed by content-hash)
-    motivations/           # Motivation YAML files
-    agents/                # Agent YAML files (role+motivation pairings)
-    evaluations/           # Evaluation records (JSON)
-    evolver-skills/        # Strategy-specific skill documents for evolution
+    primitives/
+      components/              # Skill components (atomic capabilities)
+      outcomes/                # Desired outcomes
+      tradeoffs/               # Tradeoff definitions
+    cache/
+      roles/                   # Composed roles (component_ids + outcome_id)
+      agents/                  # Agent definitions (role + tradeoff pairs)
+    evaluations/               # Evaluation records (JSON)
+    evolver-skills/            # Strategy-specific guidance documents
+    coordinator-prompt/        # Coordinator prompt files
+    deferred-ops/              # Deferred evolution operations
 ```
 
 ## More docs

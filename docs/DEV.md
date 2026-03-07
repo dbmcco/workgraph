@@ -125,7 +125,7 @@ wg add "Implement feature X" --skill rust
 
 ### FLIP pipeline
 
-FLIP (Forward-Lookup Inference Protocol) validates task output by reconstructing the prompt from the output and comparing it to the original. It runs as part of the evaluation pipeline.
+FLIP (Fidelity via Latent Intent Probing) validates task output by reconstructing the prompt from the output and comparing it to the original. It runs as part of the evaluation pipeline.
 
 FLIP uses two model roles:
 - **FlipInference** (standard tier, default: sonnet) — reconstructs the prompt
@@ -138,9 +138,9 @@ Low FLIP scores can trigger **Verification** tasks (premium tier, default: opus)
 After accumulating evaluations, evolve the agency:
 
 ```bash
-wg evolve                                  # full cycle, all strategies
-wg evolve --strategy mutation --budget 3   # targeted changes
-wg evolve --dry-run                        # preview without applying
+wg evolve run                                  # full cycle, all strategies
+wg evolve run --strategy mutation --budget 3   # targeted changes
+wg evolve run --dry-run                        # preview without applying
 ```
 
 Strategies: `mutation`, `crossover`, `gap-analysis`, `retirement`, `tradeoff-tuning`, `all` (default).
