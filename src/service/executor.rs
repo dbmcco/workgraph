@@ -957,6 +957,13 @@ mod tests {
             checkpoint: None,
             resurrection_count: 0,
             last_resurrected_at: None,
+            validation: None,
+            validation_commands: vec![],
+            test_required: false,
+            rejection_count: 0,
+            max_rejections: None,
+            superseded_by: vec![],
+            supersedes: None,
         }
     }
 

@@ -16,92 +16,11 @@ use anyhow::{Context, Result};
 
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
-use workgraph::executor::native::client::{AnthropicClient, LlmClient};
-use workgraph::executor::native::openai_client::OpenAiClient;
+use workgraph::executor::native::provider::create_provider;
 use workgraph::executor::native::tools::ToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250514";
 
-/// Resolve which LLM provider to use and create the appropriate client.
-///
-/// Resolution order:
-/// 1. `[native_executor] provider` in config.toml ("anthropic" or "openai")
-/// 2. `WG_LLM_PROVIDER` environment variable
-/// 3. Heuristic: if model contains "/" (e.g., "openai/gpt-4o"), use OpenAI
-/// 4. Default to "anthropic"
-fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>> {
-    // Read config for provider and endpoint settings
-    let config_path = workgraph_dir.join("config.toml");
-    let config_val: Option<toml::Value> = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|c| toml::from_str(&c).ok());
-
-    let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
-
-    // Resolve provider
-    let provider = native_cfg
-        .and_then(|c| c.get("provider"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| std::env::var("WG_LLM_PROVIDER").ok())
-        .unwrap_or_else(|| {
-            // Heuristic: models with "/" are likely OpenRouter format
-            if model.contains('/') {
-                "openai".to_string()
-            } else {
-                "anthropic".to_string()
-            }
-        });
-
-    // Resolve optional base URL and max_tokens from config
-    let api_base = native_cfg
-        .and_then(|c| c.get("api_base"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let max_tokens = native_cfg
-        .and_then(|c| c.get("max_tokens"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32);
-
-    match provider.as_str() {
-        "openai" | "openrouter" => {
-            let mut client = OpenAiClient::from_env(model)
-                .or_else(|_| {
-                    // Fall back to Anthropic key for OpenRouter (it accepts both)
-                    let key = workgraph::executor::native::client::resolve_api_key_from_dir(
-                        workgraph_dir,
-                    )?;
-                    OpenAiClient::new(key, model, None)
-                })
-                .context("Failed to initialize OpenAI-compatible client")?;
-            if let Some(base) = api_base {
-                client = client.with_base_url(&base);
-            }
-            if let Some(mt) = max_tokens {
-                client = client.with_max_tokens(mt);
-            }
-            eprintln!(
-                "[native-exec] Using OpenAI-compatible provider ({})",
-                client.model
-            );
-            Ok(Box::new(client))
-        }
-        _ => {
-            // Default: Anthropic
-            let mut client = AnthropicClient::from_env(model)
-                .context("Failed to initialize Anthropic client")?;
-            if let Some(base) = api_base {
-                client = client.with_base_url(&base);
-            }
-            if let Some(mt) = max_tokens {
-                client = client.with_max_tokens(mt);
-            }
-            eprintln!("[native-exec] Using Anthropic provider ({})", client.model);
-            Ok(Box::new(client))
-        }
-    }
-}
 
 /// Run the native executor agent loop.
 pub fn run(
@@ -161,8 +80,8 @@ pub fn run(
         task_id, effective_model, exec_mode, max_turns
     );
 
-    // Create the API client (auto-selects provider)
-    let client = create_client(workgraph_dir, &effective_model)?;
+    // Create the LLM provider (auto-selects by model name)
+    let client = create_provider(workgraph_dir, &effective_model)?;
 
     // Create and run the agent loop
     let agent = AgentLoop::new(client, registry, system_prompt, max_turns, output_log);

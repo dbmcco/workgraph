@@ -92,8 +92,9 @@ fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCa
 
 fn call_anthropic_native(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
     use crate::executor::native::client::{
-        AnthropicClient, ContentBlock, LlmClient, Message, MessagesRequest, Role,
-    };
+        AnthropicClient, ContentBlock, Message, MessagesRequest, Role,
+        };
+    use crate::executor::native::provider::Provider;
 
     let client = AnthropicClient::from_env(model)
         .context("Failed to create Anthropic client for lightweight call")?;
@@ -153,9 +154,10 @@ fn call_anthropic_native(model: &str, prompt: &str, timeout_secs: u64) -> Result
 
 fn call_openai_native(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
     use crate::executor::native::client::{
-        ContentBlock, LlmClient, Message, MessagesRequest, Role,
+        ContentBlock, Message, MessagesRequest, Role,
     };
     use crate::executor::native::openai_client::OpenAiClient;
+    use crate::executor::native::provider::Provider;
 
     let client = OpenAiClient::from_env(model)
         .context("Failed to create OpenAI client for lightweight call")?;

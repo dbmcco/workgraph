@@ -128,6 +128,7 @@ pub enum Status {
     Blocked,
     Failed,
     Abandoned,
+    PendingValidation,
 }
 
 impl std::fmt::Display for Status {
@@ -140,6 +141,7 @@ impl std::fmt::Display for Status {
             Status::Blocked => write!(f, "blocked"),
             Status::Failed => write!(f, "failed"),
             Status::Abandoned => write!(f, "abandoned"),
+            Status::PendingValidation => write!(f, "pending-validation"),
         }
     }
 }
@@ -159,6 +161,7 @@ impl<'de> serde::Deserialize<'de> for Status {
             "blocked" => Ok(Status::Blocked),
             "failed" => Ok(Status::Failed),
             "abandoned" => Ok(Status::Abandoned),
+            "pending-validation" => Ok(Status::PendingValidation),
             // Migration: pending-review is treated as done
             "pending-review" => Ok(Status::Done),
             other => Err(serde::de::Error::unknown_variant(
@@ -171,6 +174,7 @@ impl<'de> serde::Deserialize<'de> for Status {
                     "blocked",
                     "failed",
                     "abandoned",
+                    "pending-validation",
                 ],
             )),
         }
@@ -316,6 +320,27 @@ pub struct Task {
     /// Timestamp of last resurrection (for cooldown enforcement)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resurrected_at: Option<String>,
+    /// Validation mode: "none" (default/backward-compat), "integrated", or "external"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<String>,
+    /// Commands to run during validation
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_commands: Vec<String>,
+    /// If true, validator rejects when no test files were modified
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub test_required: bool,
+    /// Number of times this task has been rejected by validation
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rejection_count: u32,
+    /// Maximum rejections before task fails (default 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rejections: Option<u32>,
+    /// Tasks that this task was replaced by (set on abandon with --superseded-by)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_by: Vec<String>,
+    /// Task that this task replaces (set on new tasks created as replacements)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 /// Returns `true` if the task ID represents a system-generated task.
@@ -728,6 +753,20 @@ struct TaskHelper {
     resurrection_count: u32,
     #[serde(default)]
     last_resurrected_at: Option<String>,
+    #[serde(default)]
+    validation: Option<String>,
+    #[serde(default)]
+    validation_commands: Vec<String>,
+    #[serde(default)]
+    test_required: bool,
+    #[serde(default)]
+    rejection_count: u32,
+    #[serde(default)]
+    max_rejections: Option<u32>,
+    #[serde(default)]
+    superseded_by: Vec<String>,
+    #[serde(default)]
+    supersedes: Option<String>,
     /// Old format: inline identity object. Migrated to `agent` hash on read.
     #[serde(default)]
     identity: Option<LegacyIdentity>,
@@ -792,6 +831,13 @@ impl<'de> Deserialize<'de> for Task {
             checkpoint: helper.checkpoint,
             resurrection_count: helper.resurrection_count,
             last_resurrected_at: helper.last_resurrected_at,
+            validation: helper.validation,
+            validation_commands: helper.validation_commands,
+            test_required: helper.test_required,
+            rejection_count: helper.rejection_count,
+            max_rejections: helper.max_rejections,
+            superseded_by: helper.superseded_by,
+            supersedes: helper.supersedes,
         })
     }
 }
@@ -1628,6 +1674,7 @@ mod tests {
         assert!(Status::Done.is_terminal());
         assert!(Status::Failed.is_terminal());
         assert!(Status::Abandoned.is_terminal());
+        assert!(!Status::PendingValidation.is_terminal());
     }
 
     #[test]

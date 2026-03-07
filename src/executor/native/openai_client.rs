@@ -13,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::client::{
-    ContentBlock, LlmClient, Message, MessagesRequest, MessagesResponse, Role, StopReason,
+    ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason,
     ToolDefinition, Usage,
 };
 
@@ -468,9 +468,9 @@ impl OpenAiClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for OpenAiClient {
-    async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
-        self.chat_completion(request).await
+impl super::provider::Provider for OpenAiClient {
+    fn name(&self) -> &str {
+        "openai"
     }
 
     fn model(&self) -> &str {
@@ -479,6 +479,10 @@ impl LlmClient for OpenAiClient {
 
     fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+        self.chat_completion(request).await
     }
 }
 

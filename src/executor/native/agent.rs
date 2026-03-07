@@ -11,8 +11,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::client::{
-    ContentBlock, LlmClient, Message, MessagesRequest, MessagesResponse, Role, StopReason, Usage,
+    ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason, Usage,
 };
+use super::provider::Provider;
 use super::tools::ToolRegistry;
 use crate::stream_event::{self, StreamWriter, TotalUsage, TurnUsage};
 
@@ -36,7 +37,7 @@ pub struct AgentResult {
 
 /// The main agent loop.
 pub struct AgentLoop {
-    client: Box<dyn LlmClient>,
+    client: Box<dyn Provider>,
     tools: ToolRegistry,
     system_prompt: String,
     max_turns: usize,
@@ -99,7 +100,7 @@ impl From<&ContentBlock> for ContentBlockLog {
 impl AgentLoop {
     /// Create a new agent loop.
     pub fn new(
-        client: Box<dyn LlmClient>,
+        client: Box<dyn Provider>,
         tools: ToolRegistry,
         system_prompt: String,
         max_turns: usize,
