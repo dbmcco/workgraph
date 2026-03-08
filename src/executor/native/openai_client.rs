@@ -554,9 +554,9 @@ impl OpenAiClient {
                     // Accumulate tool calls
                     if let Some(ref tcs) = choice.delta.tool_calls {
                         for tc in tcs {
-                            let entry = tool_calls.entry(tc.index).or_insert_with(|| {
-                                (String::new(), String::new(), String::new())
-                            });
+                            let entry = tool_calls
+                                .entry(tc.index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
                             if let Some(ref id) = tc.id {
                                 entry.0 = id.clone();
                             }
@@ -580,13 +580,7 @@ impl OpenAiClient {
         }
 
         // Assemble the response
-        assemble_oai_stream_response(
-            response_id,
-            text_content,
-            tool_calls,
-            finish_reason,
-            usage,
-        )
+        assemble_oai_stream_response(response_id, text_content, tool_calls, finish_reason, usage)
     }
 
     /// Send a request with retry logic.
@@ -1106,8 +1100,7 @@ mod tests {
 
     #[test]
     fn test_openrouter_url_construction() {
-        let client =
-            OpenAiClient::new("test-key".into(), "minimax/minimax-m2.5", None).unwrap();
+        let client = OpenAiClient::new("test-key".into(), "minimax/minimax-m2.5", None).unwrap();
         assert!(client.base_url.ends_with("/v1"));
         let expected = format!("{}/chat/completions", client.base_url);
         assert_eq!(expected, "https://openrouter.ai/api/v1/chat/completions");
@@ -1183,9 +1176,7 @@ mod tests {
 
         assert_eq!(resp.id, "gen-abc");
         assert_eq!(resp.content.len(), 1);
-        assert!(
-            matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world")
-        );
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 5);
@@ -1254,15 +1245,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.content.len(), 3);
-        assert!(
-            matches!(&resp.content[0], ContentBlock::Text { text } if text == "Let me check.")
-        );
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Let me check."));
         assert!(
             matches!(&resp.content[1], ContentBlock::ToolUse { name, .. } if name == "read_file")
         );
-        assert!(
-            matches!(&resp.content[2], ContentBlock::ToolUse { name, .. } if name == "bash")
-        );
+        assert!(matches!(&resp.content[2], ContentBlock::ToolUse { name, .. } if name == "bash"));
     }
 
     #[test]
@@ -1300,10 +1287,7 @@ mod tests {
         let tc = &chunk.choices[0].delta.tool_calls.as_ref().unwrap()[0];
         assert_eq!(tc.index, 0);
         assert_eq!(tc.id.as_deref(), Some("call_xyz"));
-        assert_eq!(
-            tc.function.as_ref().unwrap().name.as_deref(),
-            Some("bash")
-        );
+        assert_eq!(tc.function.as_ref().unwrap().name.as_deref(), Some("bash"));
     }
 
     #[test]
