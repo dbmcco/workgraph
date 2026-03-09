@@ -704,13 +704,30 @@ impl Config {
     ///
     /// Provider resolution follows the same cascade but only from [models].
     pub fn resolve_model_for_role(&self, role: DispatchRole) -> ResolvedModel {
+        // Default provider cascades to all roles that don't set their own.
+        let default_provider = self
+            .models
+            .get_role(DispatchRole::Default)
+            .and_then(|c| c.provider.clone());
+
+        // Helper: resolve provider for a role, cascading to default if unset.
+        let resolve_provider = |role: DispatchRole| -> Option<String> {
+            self.models
+                .get_role(role)
+                .and_then(|c| c.provider.clone())
+                .or_else(|| default_provider.clone())
+        };
+
         // 1. Check role-specific [models] config
         if let Some(role_cfg) = self.models.get_role(role)
             && let Some(ref model) = role_cfg.model
         {
             return ResolvedModel {
                 model: model.clone(),
-                provider: role_cfg.provider.clone(),
+                provider: role_cfg
+                    .provider
+                    .clone()
+                    .or_else(|| default_provider.clone()),
             };
         }
 
@@ -735,11 +752,9 @@ impl Config {
             _ => None,
         };
         if let Some(model) = legacy_model {
-            // Legacy config has no provider — check if [models] role has provider set
-            let provider = self.models.get_role(role).and_then(|c| c.provider.clone());
             return ResolvedModel {
                 model: model.clone(),
-                provider,
+                provider: resolve_provider(role),
             };
         }
 
@@ -756,10 +771,9 @@ impl Config {
             _ => None,
         };
         if let Some(default_model) = tier_default {
-            let provider = self.models.get_role(role).and_then(|c| c.provider.clone());
             return ResolvedModel {
                 model: default_model.to_string(),
-                provider,
+                provider: resolve_provider(role),
             };
         }
 
@@ -769,17 +783,14 @@ impl Config {
         {
             return ResolvedModel {
                 model: model.clone(),
-                provider: default_cfg.provider.clone(),
+                provider: default_provider,
             };
         }
 
         // 4. Global fallback
         ResolvedModel {
             model: self.agent.model.clone(),
-            provider: self
-                .models
-                .get_role(DispatchRole::Default)
-                .and_then(|c| c.provider.clone()),
+            provider: default_provider,
         }
     }
 
@@ -1240,6 +1251,11 @@ pub struct CoordinatorConfig {
     /// When true, each agent gets its own worktree at .wg-worktrees/<agent-id>/.
     #[serde(default)]
     pub worktree_isolation: bool,
+
+    /// Maximum number of concurrent coordinator agents (LLM sessions).
+    /// Each coordinator is a separate Claude CLI process. Default: 4.
+    #[serde(default = "default_max_coordinators")]
+    pub max_coordinators: usize,
 }
 
 fn default_max_agents() -> usize {
@@ -1274,6 +1290,10 @@ fn default_eval_frequency() -> String {
     "every_5".to_string()
 }
 
+fn default_max_coordinators() -> usize {
+    4
+}
+
 fn default_agent_timeout() -> String {
     "30m".to_string()
 }
@@ -1294,6 +1314,7 @@ impl Default for CoordinatorConfig {
             compactor_ops_threshold: default_compactor_ops_threshold(),
             eval_frequency: default_eval_frequency(),
             worktree_isolation: false,
+            max_coordinators: default_max_coordinators(),
         }
     }
 }
@@ -2238,5 +2259,117 @@ model = "haiku"
         config.agency.evaluator_model = Some("haiku".to_string());
         let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
         assert_eq!(resolved.model, "haiku");
+    }
+
+    #[test]
+    fn test_default_provider_cascades_to_tier_defaults() {
+        // Setting [models.default].provider = "openrouter" should cascade
+        // to roles that use tier defaults (triage, flip_comparison, etc.)
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: Some("openrouter".to_string()),
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Triage);
+        assert_eq!(resolved.model, "haiku");
+        assert_eq!(
+            resolved.provider,
+            Some("openrouter".to_string()),
+            "Default provider should cascade to tier default roles"
+        );
+
+        let resolved = config.resolve_model_for_role(DispatchRole::FlipInference);
+        assert_eq!(resolved.model, "sonnet");
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+
+        let resolved = config.resolve_model_for_role(DispatchRole::FlipComparison);
+        assert_eq!(resolved.model, "haiku");
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Verification);
+        assert_eq!(resolved.model, "opus");
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_default_provider_cascades_to_role_with_model_only() {
+        // If a role has model set but no provider, default provider should cascade
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: Some("openrouter".to_string()),
+        });
+        config.models.triage = Some(RoleModelConfig {
+            model: Some("anthropic/claude-3.5-haiku".to_string()),
+            provider: None,
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Triage);
+        assert_eq!(resolved.model, "anthropic/claude-3.5-haiku");
+        assert_eq!(
+            resolved.provider,
+            Some("openrouter".to_string()),
+            "Default provider should cascade when role only sets model"
+        );
+    }
+
+    #[test]
+    fn test_role_provider_overrides_default_provider() {
+        // Role-specific provider should override default provider
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: Some("openrouter".to_string()),
+        });
+        config.models.triage = Some(RoleModelConfig {
+            model: Some("gpt-4o-mini".to_string()),
+            provider: Some("openai".to_string()),
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Triage);
+        assert_eq!(resolved.model, "gpt-4o-mini");
+        assert_eq!(
+            resolved.provider,
+            Some("openai".to_string()),
+            "Role-specific provider should take priority"
+        );
+    }
+
+    #[test]
+    fn test_default_provider_cascades_to_global_fallback() {
+        // Roles without tier defaults should also get the default provider
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: Some("openrouter".to_string()),
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, config.agent.model);
+        assert_eq!(
+            resolved.provider,
+            Some("openrouter".to_string()),
+            "Default provider should cascade to global fallback roles"
+        );
+    }
+
+    #[test]
+    fn test_default_provider_cascades_to_legacy_model() {
+        // Legacy model config should also get the default provider
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: Some("openrouter".to_string()),
+        });
+        config.agency.evaluator_model = Some("haiku".to_string());
+
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "haiku");
+        assert_eq!(
+            resolved.provider,
+            Some("openrouter".to_string()),
+            "Default provider should cascade to legacy model roles"
+        );
     }
 }
