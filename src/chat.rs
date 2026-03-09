@@ -668,6 +668,61 @@ pub fn store_attachment(workgraph_dir: &Path, source: &Path) -> Result<Attachmen
     })
 }
 
+/// Rewrite a JSONL file atomically, applying a transformation to each message.
+/// The closure receives each message mutably and returns `true` to keep it.
+fn rewrite_jsonl(path: &Path, mut f: impl FnMut(&mut ChatMessage) -> bool) -> Result<()> {
+    let mut messages = if path.exists() {
+        read_messages(path)?
+    } else {
+        return Ok(());
+    };
+
+    messages.retain_mut(|msg| f(msg));
+
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let mut out = String::new();
+    for msg in &messages {
+        out.push_str(
+            &serde_json::to_string(msg).context("Failed to serialize chat message during rewrite")?,
+        );
+        out.push('\n');
+    }
+    fs::write(&tmp_path, &out)
+        .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("Failed to rename temp file to: {}", path.display()))?;
+    Ok(())
+}
+
+/// Edit an inbox message's content by ID for a specific coordinator.
+/// Only works if the message hasn't been consumed by the coordinator yet.
+pub fn edit_inbox_message_for(
+    workgraph_dir: &Path,
+    coordinator_id: u32,
+    message_id: u64,
+    new_content: &str,
+) -> Result<()> {
+    let path = inbox_path_for(workgraph_dir, coordinator_id);
+    let content = new_content.to_string();
+    rewrite_jsonl(&path, |msg| {
+        if msg.id == message_id {
+            msg.content = content.clone();
+        }
+        true
+    })
+}
+
+/// Delete an inbox message by ID for a specific coordinator.
+/// Only works if the message hasn't been consumed by the coordinator yet.
+pub fn delete_inbox_message_for(
+    workgraph_dir: &Path,
+    coordinator_id: u32,
+    message_id: u64,
+) -> Result<()> {
+    let path = inbox_path_for(workgraph_dir, coordinator_id);
+    rewrite_jsonl(&path, |msg| msg.id != message_id)
+}
+
 /// Clear chat data for a specific coordinator.
 pub fn clear_for(workgraph_dir: &Path, coordinator_id: u32) -> Result<()> {
     let dir = chat_dir_for(workgraph_dir, coordinator_id);

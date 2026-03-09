@@ -1711,14 +1711,24 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Scrollbar overlays the rightmost column when visible.
     let content_width = width.saturating_sub(1);
     let mut rendered_lines: Vec<Line> = Vec::new();
+    // Track which message index each rendered line belongs to (for click-to-edit).
+    let mut line_to_message: Vec<Option<usize>> = Vec::new();
 
     // Subtle warm-tinted dark background for user messages (like iMessage blue/gray,
     // but extremely subtle). Echoes the yellow ">" prefix and loop arrows.
     let user_msg_bg = Color::Rgb(30, 28, 20);
+    // Brighter background for editable (pending) user messages.
+    let pending_user_msg_bg = Color::Rgb(35, 32, 20);
+    // Highlight background for the message currently being edited.
+    let editing_msg_bg = Color::Rgb(40, 35, 15);
 
-    for msg in app.chat.messages.iter() {
+    let editing_index = app.chat.editing_index;
+
+    for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
         let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
         let is_user = msg.role == super::state::ChatRole::User;
+        let is_editable = is_user && !app.is_chat_message_consumed(msg_idx);
+        let is_being_edited = editing_index == Some(msg_idx);
 
         let (prefix, role_style) = match msg.role {
             super::state::ChatRole::User => (
@@ -1826,16 +1836,33 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             out
         };
 
+        // Choose background for user messages based on state.
+        let msg_bg = if is_being_edited {
+            editing_msg_bg
+        } else if is_editable {
+            pending_user_msg_bg
+        } else {
+            user_msg_bg
+        };
+
         let mut first_line = true;
         for line in &wrapped {
             if first_line {
                 let mut spans = vec![Span::styled(prefix.clone(), role_style)];
                 spans.extend(line.spans.iter().cloned());
+                // Append "(edited)" indicator on the first line of edited messages.
+                if msg.edited {
+                    spans.push(Span::styled(
+                        " (edited)",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ));
+                }
                 let mut built = Line::from(spans);
                 if is_user {
-                    built = apply_line_bg(built, user_msg_bg);
+                    built = apply_line_bg(built, msg_bg);
                 }
                 rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
                 first_line = false;
             } else {
                 // Continuation/tool lines: indent to align with text after prefix
@@ -1843,9 +1870,10 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 spans.extend(line.spans.iter().cloned());
                 let mut built = Line::from(spans);
                 if is_user {
-                    built = apply_line_bg(built, user_msg_bg);
+                    built = apply_line_bg(built, msg_bg);
                 }
                 rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
             }
         }
         // Show attachment indicators.
@@ -1858,12 +1886,14 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     .add_modifier(Modifier::ITALIC),
             ));
             if is_user {
-                att_line = apply_line_bg(att_line, user_msg_bg);
+                att_line = apply_line_bg(att_line, msg_bg);
             }
             rendered_lines.push(att_line);
+            line_to_message.push(Some(msg_idx));
         }
         // Blank line between messages.
         rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
     }
 
     // Streaming indicator when awaiting response.
@@ -1874,8 +1904,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
+        line_to_message.push(None);
         rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
     }
+
+    // Store line-to-message mapping for click-to-edit.
+    app.chat.line_to_message = line_to_message;
 
     // Scrolling: `scroll` is lines from bottom (0 = fully scrolled down).
     let total_lines = rendered_lines.len();
@@ -1942,21 +1977,41 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 /// Draw the chat input line at the bottom of the chat panel.
 fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let is_editing = app.input_mode == InputMode::ChatInput;
+    let in_edit_mode = app.chat.editing_index.is_some();
     let has_text = !super::state::editor_is_empty(&app.chat.editor);
     app.last_chat_input_area = area;
-    let border_color = if is_editing {
+    // Use yellow/gold border when in edit mode, magenta for normal input.
+    let border_color = if is_editing && in_edit_mode {
+        Color::Yellow
+    } else if is_editing {
         Color::Magenta
     } else {
         Color::DarkGray
     };
-    let prompt_color = if is_editing {
+    let prompt_color = if is_editing && in_edit_mode {
+        Color::Yellow
+    } else if is_editing {
         Color::LightMagenta
     } else {
         Color::DarkGray
     };
     if is_editing || has_text {
+        // Separator line — show edit mode hint.
+        let sep_text = if is_editing && in_edit_mode {
+            let w = area.width as usize;
+            let hint = " Editing (Enter=save, Esc=cancel, Ctrl+D=delete) ";
+            if w > hint.len() + 2 {
+                let left = (w - hint.len()) / 2;
+                let right = w - hint.len() - left;
+                format!("{}{}{}", "─".repeat(left), hint, "─".repeat(right))
+            } else {
+                "─".repeat(w)
+            }
+        } else {
+            "─".repeat(area.width as usize)
+        };
         let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
+            sep_text,
             Style::default()
                 .fg(border_color)
                 .add_modifier(if is_editing {
@@ -5115,6 +5170,8 @@ fn draw_help_overlay(frame: &mut Frame) {
         binding("s", "Cycle sort: Chrono↓/↑/Status"),
         binding("m", "Toggle mouse capture"),
         binding("r", "Force refresh"),
+        binding(".", "Toggle all system tasks"),
+        binding("<", "Toggle running system tasks only"),
         binding("L", "Toggle coordinator log"),
         binding("?", "Toggle this help"),
         binding("q", "Quit"),
