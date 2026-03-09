@@ -1514,41 +1514,31 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 return;
             }
             if in_coordinator_bar {
-                // Click on coordinator bead bar: switch coordinator, create, or close.
+                // Click on coordinator tab bar: switch coordinator, create, or close.
                 app.focused_panel = FocusedPanel::RightPanel;
                 app.right_panel_tab = RightPanelTab::Chat;
-                // Layout mirrors render: each coordinator is dot(1) + optional "x"(1) + space(1)
-                let coordinator_ids = app.list_coordinator_ids();
-                let bar_x = app.last_coordinator_bar_area.x;
-                let col = column.saturating_sub(bar_x) as usize;
-                let mut offset = 0usize;
-                let mut clicked_coord: Option<u32> = None;
-                let mut clicked_close = false;
-                for &cid in &coordinator_ids {
-                    let dot_len = 1; // ◉ or ● (1 column wide)
-                    let close_len: usize = if cid != 0 { 1 } else { 0 }; // "×"
-                    let sep_len = 1; // trailing space
-                    let entry_len = dot_len + close_len + sep_len;
-                    if col >= offset && col < offset + entry_len {
-                        if close_len > 0 && col == offset + dot_len {
-                            clicked_close = true;
-                            clicked_coord = Some(cid);
-                        } else {
-                            clicked_coord = Some(cid);
-                        }
-                        break;
-                    }
-                    offset += entry_len;
-                }
-                if clicked_close {
-                    if let Some(cid) = clicked_coord {
-                        app.delete_coordinator(cid);
-                    }
-                } else if let Some(cid) = clicked_coord {
-                    app.switch_coordinator(cid);
-                } else if col >= offset && col < offset + 3 {
-                    // Clicked [+]
+
+                // Check [+] button first
+                let plus = &app.coordinator_plus_hit;
+                if column >= plus.start && column < plus.end {
                     app.create_coordinator(None);
+                    return;
+                }
+
+                // Check each tab's hit area
+                for hit in &app.coordinator_tab_hits {
+                    if column >= hit.tab_start && column < hit.tab_end {
+                        // Check if click is on the close button
+                        if hit.close_start != hit.close_end
+                            && column >= hit.close_start
+                            && column < hit.close_end
+                        {
+                            app.delete_coordinator(hit.cid);
+                        } else {
+                            app.switch_coordinator(hit.cid);
+                        }
+                        return;
+                    }
                 }
                 return;
             }

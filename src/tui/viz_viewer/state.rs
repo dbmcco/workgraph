@@ -607,6 +607,26 @@ pub enum TextPromptAction {
     AttachFile,         // attach a file to the next chat message
 }
 
+/// Hit area for a single coordinator tab in the tab bar.
+#[derive(Clone, Debug)]
+pub struct CoordinatorTabHit {
+    pub cid: u32,
+    /// Column range for the entire tab (clicking switches coordinator).
+    pub tab_start: u16,
+    pub tab_end: u16,
+    /// Column range for the close button (clicking deletes coordinator).
+    /// If close_start == close_end, there is no close button.
+    pub close_start: u16,
+    pub close_end: u16,
+}
+
+/// Column range for the [+] button in the coordinator tab bar.
+#[derive(Clone, Debug, Default)]
+pub struct CoordinatorPlusHit {
+    pub start: u16,
+    pub end: u16,
+}
+
 /// State for the task creation form overlay.
 pub struct TaskFormState {
     /// Which field is currently focused.
@@ -1607,6 +1627,12 @@ pub struct VizApp {
     pub last_chat_message_area: Rect,
     /// The coordinator tab bar area from the last render frame (for click support).
     pub last_coordinator_bar_area: Rect,
+    /// Per-tab hit areas for coordinator tab bar click testing.
+    /// Each entry: (coordinator_id, tab_start_col, tab_end_col, close_start_col, close_end_col).
+    /// close_start == close_end means no close button.
+    pub coordinator_tab_hits: Vec<CoordinatorTabHit>,
+    /// Hit area for the [+] button in the coordinator tab bar.
+    pub coordinator_plus_hit: CoordinatorPlusHit,
     /// The message input area from the last render frame (for click-to-type).
     pub last_message_input_area: Rect,
 
@@ -1905,6 +1931,8 @@ impl VizApp {
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
             last_coordinator_bar_area: Rect::default(),
+            coordinator_tab_hits: Vec::new(),
+            coordinator_plus_hit: CoordinatorPlusHit::default(),
             last_message_input_area: Rect::default(),
             last_text_prompt_area: Rect::default(),
             last_file_tree_area: Rect::default(),
@@ -4247,6 +4275,8 @@ impl VizApp {
             last_chat_input_area: Rect::default(),
             last_chat_message_area: Rect::default(),
             last_coordinator_bar_area: Rect::default(),
+            coordinator_tab_hits: Vec::new(),
+            coordinator_plus_hit: CoordinatorPlusHit::default(),
             last_message_input_area: Rect::default(),
             last_text_prompt_area: Rect::default(),
             last_file_tree_area: Rect::default(),
@@ -5953,26 +5983,48 @@ impl VizApp {
 
     /// Get a list of known coordinator IDs from the graph.
     pub fn list_coordinator_ids(&self) -> Vec<u32> {
+        self.list_coordinator_ids_and_labels()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Get coordinator IDs with display labels from the graph.
+    /// Returns Vec of (id, label) where label is the task title if available,
+    /// otherwise "C{id}".
+    pub fn list_coordinator_ids_and_labels(&self) -> Vec<(u32, String)> {
         let graph_path = self.workgraph_dir.join("graph.jsonl");
         let graph = match workgraph::parser::load_graph(&graph_path) {
             Ok(g) => g,
-            Err(_) => return vec![0],
+            Err(_) => return vec![(0, "C0".to_string())],
         };
-        let mut ids: Vec<u32> = graph
+        let mut entries: Vec<(u32, String)> = graph
             .tasks()
             .filter(|t| t.tags.iter().any(|tag| tag == "coordinator-loop"))
             .filter_map(|t| {
-                t.id.strip_prefix(".coordinator-")
+                let cid = t
+                    .id
+                    .strip_prefix(".coordinator-")
                     .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| if t.id == ".coordinator" { Some(0) } else { None })
+                    .or_else(|| if t.id == ".coordinator" { Some(0) } else { None })?;
+                // Use task title as label if it's not a generic "Coordinator" title
+                let label = if !t.title.is_empty()
+                    && t.title != "Coordinator"
+                    && !t.title.starts_with("coordinator")
+                {
+                    t.title.clone()
+                } else {
+                    format!("C{}", cid)
+                };
+                Some((cid, label))
             })
             .collect();
-        ids.sort();
-        ids.dedup();
-        if ids.is_empty() {
-            ids.push(0);
+        entries.sort_by_key(|(id, _)| *id);
+        entries.dedup_by_key(|(id, _)| *id);
+        if entries.is_empty() {
+            entries.push((0, "C0".to_string()));
         }
-        ids
+        entries
     }
 
     /// Try to paste an image from the system clipboard.

@@ -7,9 +7,10 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    ConfigEditKind, ConfigSection, ConfirmAction, ControlPanelFocus, FocusedPanel, InputMode,
-    LayoutMode, RightPanelTab, ServiceHealthLevel, SortMode, TaskFormField, TaskFormState,
-    TextPromptAction, VizApp, extract_section_name, format_duration_compact,
+    ConfigEditKind, ConfigSection, ConfirmAction, ControlPanelFocus, CoordinatorPlusHit,
+    CoordinatorTabHit, FocusedPanel, InputMode, LayoutMode, RightPanelTab, ServiceHealthLevel,
+    SortMode, TaskFormField, TaskFormState, TextPromptAction, VizApp, extract_section_name,
+    format_duration_compact,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -1580,7 +1581,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let msg_area_height = area.height.saturating_sub(input_height);
 
     // Coordinator tab bar — always visible so the user can discover [+] even with 1 coordinator
-    let coordinator_ids = app.list_coordinator_ids();
+    let coordinator_entries = app.list_coordinator_ids_and_labels();
     let tab_bar_height: u16 = 1;
 
     {
@@ -1609,30 +1610,110 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             DOT_COLORS[hash as usize % DOT_COLORS.len()]
         }
 
+        let bar_x = tab_area.x;
+        let max_width = tab_area.width as usize;
         let mut spans = Vec::new();
-        for &cid in &coordinator_ids {
+        let mut tab_hits = Vec::new();
+        let mut col: usize = 1; // start after leading space
+        let mut overflow = false;
+
+        // Leading space
+        spans.push(Span::raw(" "));
+
+        for (i, (cid, label)) in coordinator_entries.iter().enumerate() {
+            let cid = *cid;
             let is_active = cid == app.active_coordinator_id;
             let color = dot_color(cid);
+            let has_close = cid != 0;
+
+            // Tab content: " ◉ Label " or " ◉ Label ✕ "
+            // dot(1) + space(1) + label + space(1) + optional close(1+space(1))
+            let label_width = label.len();
+            let close_width: usize = if has_close { 2 } else { 0 }; // " ✕"
+            // Content: dot(1) + " "(1) + label + " "(1) + close
+            let tab_content_width = 1 + 1 + label_width + 1 + close_width;
+            // Separator: "│" between tabs (1 column wide)
+            let sep_w: usize = if i > 0 { 1 } else { 0 };
+
+            let total_tab_width = sep_w + tab_content_width;
+
+            // Check if this tab fits (also need room for "… [+]" = 5 if there are more tabs)
+            let remaining_tabs = coordinator_entries.len() - i - 1;
+            let suffix_width = if remaining_tabs > 0 { 6 } else { 4 }; // "… [+]" or " [+]"
+            if col + total_tab_width + suffix_width > max_width && remaining_tabs > 0 {
+                overflow = true;
+                break;
+            }
+
+            // Separator
+            if i > 0 {
+                spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                col += sep_w;
+            }
+
+            let tab_start = (bar_x as usize + col) as u16;
+
+            // Dot
             if is_active {
-                // Active: brighter large dot ◉ with bold
                 spans.push(Span::styled(
-                    "◉",
+                    " ◉",
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ));
             } else {
-                // Inactive: regular dot ●
-                spans.push(Span::styled("●", Style::default().fg(color)));
+                spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
             }
-            // Show close indicator for all non-zero coordinators
-            if cid != 0 {
-                spans.push(Span::styled(
-                    "×",
-                    Style::default().fg(Color::Red),
-                ));
+            col += 2; // " ◉" = space + dot
+
+            // Label
+            let label_style = if is_active {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(format!(" {}", label), label_style));
+            col += 1 + label_width; // " " + label
+
+            // Close button (padded for wider touch target)
+            let mut close_start: u16 = 0;
+            let mut close_end: u16 = 0;
+            if has_close {
+                close_start = (bar_x as usize + col) as u16;
+                spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
+                col += 2; // " ✕"
+                close_end = (bar_x as usize + col) as u16;
             }
+
+            // Trailing space
             spans.push(Span::raw(" "));
+            col += 1;
+
+            let tab_end = (bar_x as usize + col) as u16;
+
+            tab_hits.push(CoordinatorTabHit {
+                cid,
+                tab_start,
+                tab_end,
+                close_start,
+                close_end,
+            });
         }
+
+        if overflow {
+            spans.push(Span::styled("… ", Style::default().fg(Color::DarkGray)));
+            col += 2;
+        }
+
+        let plus_start = (bar_x as usize + col) as u16;
         spans.push(Span::styled("[+]", Style::default().fg(Color::DarkGray)));
+        col += 3;
+        let plus_end = (bar_x as usize + col) as u16;
+
+        app.coordinator_tab_hits = tab_hits;
+        app.coordinator_plus_hit = CoordinatorPlusHit {
+            start: plus_start,
+            end: plus_end,
+        };
+
         let tab_line = Line::from(spans);
         frame.render_widget(Paragraph::new(vec![tab_line]), tab_area);
     }
