@@ -275,6 +275,7 @@ pub(crate) fn generate_ascii(
     let format_node = |id: &str| -> String {
         let task = task_map.get(id);
         let is_context = context_ids.contains(id);
+        let is_coordinator = task.is_some_and(|t| super::is_coordinator_task(t));
         let status = task.map(|t| status_label(&t.status)).unwrap_or("unknown");
 
         // Context nodes: dimmed, reduced detail (just ID and status, no tokens/phase/loop)
@@ -282,23 +283,32 @@ pub(crate) fn generate_ascii(
             return format!("{}{}  ({}){}", dim, id, status, reset);
         }
 
-        let color = task.map(|t| status_color(&t.status)).unwrap_or("");
-        let loop_info = task
-            .filter(|t| t.cycle_config.is_some() || t.loop_iteration > 0)
-            .map(|t| {
-                let (iter, max, forced) = if let Some(ref cfg) = t.cycle_config {
-                    (t.loop_iteration, cfg.max_iterations, cfg.no_converge)
-                } else {
-                    (t.loop_iteration, 0, false)
-                };
-                if max > 0 {
-                    let label = if forced { "forced" } else { "iter" };
-                    format!(" ↺ ({} {}/{})", label, iter, max)
-                } else {
-                    format!(" ↺ (iter {})", iter)
-                }
-            })
-            .unwrap_or_default();
+        // Coordinator tasks: cyan color, "turn N" instead of loop info
+        let color = if is_coordinator && use_color {
+            "\x1b[36m" // cyan
+        } else {
+            task.map(|t| status_color(&t.status)).unwrap_or("")
+        };
+        let loop_info = if is_coordinator {
+            task.map(|t| format!(" [turn {}]", t.loop_iteration))
+                .unwrap_or_default()
+        } else {
+            task.filter(|t| t.cycle_config.is_some() || t.loop_iteration > 0)
+                .map(|t| {
+                    let (iter, max, forced) = if let Some(ref cfg) = t.cycle_config {
+                        (t.loop_iteration, cfg.max_iterations, cfg.no_converge)
+                    } else {
+                        (t.loop_iteration, 0, false)
+                    };
+                    if max > 0 {
+                        let label = if forced { "forced" } else { "iter" };
+                        format!(" ↺ ({} {}/{})", label, iter, max)
+                    } else {
+                        format!(" ↺ (iter {})", iter)
+                    }
+                })
+                .unwrap_or_default()
+        };
         let phase_info = annotations
             .get(id)
             .map(|a| format!(" {}", a))

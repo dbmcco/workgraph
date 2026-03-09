@@ -202,6 +202,8 @@ pub fn generate_graph_with_overrides(
         let effective_status = status_overrides.get(id).copied().unwrap_or(task.status);
         let status = status_label(&effective_status);
 
+        let is_coordinator = super::is_coordinator_task(task);
+
         // Context nodes: dimmed, reduced detail (just ID and status)
         let (line1, line2) = if is_context {
             (display_id, status.to_string())
@@ -211,7 +213,9 @@ pub fn generate_graph_with_overrides(
                 .map(|a| format!(" {}", a))
                 .unwrap_or_default();
 
-            let loop_info = if let Some(ref cfg) = task.cycle_config {
+            let loop_info = if is_coordinator {
+                format!(" [turn {}]", task.loop_iteration)
+            } else if let Some(ref cfg) = task.cycle_config {
                 if cfg.max_iterations > 0 {
                     if cfg.no_converge {
                         format!(" ↺ forced {}/{}", task.loop_iteration, cfg.max_iterations)
@@ -244,7 +248,9 @@ pub fn generate_graph_with_overrides(
         };
         let width = line1.len().max(line2.len());
 
-        let color = if is_context {
+        let color = if is_coordinator && use_color {
+            "\x1b[36m" // cyan for coordinator
+        } else if is_context {
             dim
         } else {
             status_color(&effective_status)

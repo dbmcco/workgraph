@@ -135,12 +135,21 @@ impl Default for VizOptions {
 }
 
 /// Returns true if the task is an auto-generated internal task (assignment or evaluation).
+/// Coordinator tasks (tagged `coordinator-loop`) are exempt — always visible.
 fn is_internal_task(task: &Task) -> bool {
+    if task.tags.iter().any(|t| t == "coordinator-loop") {
+        return false;
+    }
     workgraph::graph::is_system_task(&task.id)
         || task
             .tags
             .iter()
             .any(|t| t == "assignment" || t == "evaluation")
+}
+
+/// Returns true if the task is a coordinator task.
+pub(crate) fn is_coordinator_task(task: &Task) -> bool {
+    task.tags.iter().any(|t| t == "coordinator-loop")
 }
 
 /// Determine the phase annotation for a parent task based on its related internal tasks.
@@ -1056,5 +1065,80 @@ mod tests {
         assert!(!ids.contains(&"done-a"), "Fully done tree: hidden");
         assert!(!ids.contains(&"done-b"), "Fully done tree: hidden");
         assert!(!ids.contains(&"task-abandoned"), "Abandoned: hidden");
+    }
+
+    #[test]
+    fn test_coordinator_task_not_internal() {
+        // Coordinator tasks (tagged coordinator-loop) should NOT be filtered as internal,
+        // even though they have system task IDs (starting with '.').
+        use workgraph::graph::CycleConfig;
+        let coordinator = Task {
+            id: ".coordinator".to_string(),
+            title: "Coordinator".to_string(),
+            status: Status::InProgress,
+            tags: vec!["coordinator-loop".to_string()],
+            cycle_config: Some(CycleConfig {
+                max_iterations: 0,
+                guard: None,
+                delay: None,
+                no_converge: true,
+                restart_on_failure: true,
+                max_failure_restarts: None,
+            }),
+            ..Task::default()
+        };
+
+        // Should not be treated as internal
+        assert!(
+            !is_internal_task(&coordinator),
+            "Coordinator tasks should not be filtered as internal"
+        );
+        // Should be detected as coordinator
+        assert!(
+            is_coordinator_task(&coordinator),
+            "Coordinator tasks should be detected by is_coordinator_task"
+        );
+
+        // Regular system tasks should still be internal
+        let assign = make_internal_task("assign-foo", "Assign", "assignment", vec![]);
+        assert!(is_internal_task(&assign));
+    }
+
+    #[test]
+    fn test_coordinator_visible_in_filter() {
+        // Coordinator tasks should pass through filter_internal_tasks
+        use workgraph::graph::CycleConfig;
+        let mut graph = WorkGraph::new();
+
+        let coordinator = Task {
+            id: ".coordinator".to_string(),
+            title: "Coordinator".to_string(),
+            status: Status::InProgress,
+            tags: vec!["coordinator-loop".to_string()],
+            cycle_config: Some(CycleConfig {
+                max_iterations: 0,
+                guard: None,
+                delay: None,
+                no_converge: true,
+                restart_on_failure: true,
+                max_failure_restarts: None,
+            }),
+            ..Task::default()
+        };
+        let normal = make_task("foo", "Normal task");
+        let assign = make_internal_task(".assign-foo", "Assign foo", "assignment", vec![]);
+
+        graph.add_node(Node::Task(coordinator));
+        graph.add_node(Node::Task(normal));
+        graph.add_node(Node::Task(assign));
+
+        let annotations = HashMap::new();
+        let (filtered, _) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
+        let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+
+        assert!(ids.contains(".coordinator"), "Coordinator should be visible");
+        assert!(ids.contains("foo"), "Normal tasks should be visible");
+        assert!(!ids.contains(".assign-foo"), "Internal tasks should be hidden");
     }
 }
