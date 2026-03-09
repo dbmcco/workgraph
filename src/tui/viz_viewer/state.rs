@@ -3378,23 +3378,16 @@ impl VizApp {
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
             let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            lines.push(format!(
+                "  Input:  →{}",
+                format_tokens(usage.input_tokens)
+            ));
+            lines.push(format!("  Output: ←{}", format_tokens(usage.output_tokens)));
             if cache_total > 0 {
                 lines.push(format!(
-                    "  Input:  {} new + {} cached",
-                    format_tokens(usage.input_tokens),
-                    format_tokens(cache_total)
-                ));
-            } else {
-                lines.push(format!("  Input:  {}", format_tokens(usage.input_tokens)));
-            }
-            lines.push(format!("  Output: {}", format_tokens(usage.output_tokens)));
-            if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
-                lines.push(format!(
-                    "  Cache read:  {}",
-                    format_tokens(usage.cache_read_input_tokens)
-                ));
-                lines.push(format!(
-                    "  Cache write: {}",
+                    "  Cached: {} (read: {}, write: {})",
+                    format_tokens(cache_total),
+                    format_tokens(usage.cache_read_input_tokens),
                     format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
@@ -3404,34 +3397,46 @@ impl VizApp {
             lines.push(String::new());
         }
 
-        // ── Assignment + Evaluation costs ──
+        // ── Assignment + Evaluation costs (via graph queries) ──
         {
             let agents_dir = self.workgraph_dir.join("agents");
             let assign_task_id = format!(".assign-{}", task.id);
             let legacy_assign_id = format!("assign-{}", task.id);
             let eval_task_id = format!(".evaluate-{}", task.id);
             let legacy_eval_id = format!("evaluate-{}", task.id);
+            let flip_task_id = format!(".flip-{}", task.id);
+
+            let get_usage = |t: &workgraph::graph::Task| -> Option<TokenUsage> {
+                t.token_usage.clone().or_else(|| {
+                    let agent_id = t.assigned.as_deref()?;
+                    let log_path = agents_dir.join(agent_id).join("output.log");
+                    parse_token_usage_live(&log_path)
+                })
+            };
 
             let assign_usage = graph
                 .tasks()
                 .find(|t| t.id == assign_task_id || t.id == legacy_assign_id)
-                .and_then(|t| {
-                    t.token_usage.clone().or_else(|| {
-                        let agent_id = t.assigned.as_deref()?;
-                        let log_path = agents_dir.join(agent_id).join("output.log");
-                        parse_token_usage_live(&log_path)
-                    })
-                });
-            let eval_usage = graph
+                .and_then(&get_usage);
+
+            // Combine .evaluate-* and .flip-* token usage
+            let eval_base = graph
                 .tasks()
                 .find(|t| t.id == eval_task_id || t.id == legacy_eval_id)
-                .and_then(|t| {
-                    t.token_usage.clone().or_else(|| {
-                        let agent_id = t.assigned.as_deref()?;
-                        let log_path = agents_dir.join(agent_id).join("output.log");
-                        parse_token_usage_live(&log_path)
-                    })
-                });
+                .and_then(&get_usage);
+            let flip_usage = graph
+                .tasks()
+                .find(|t| t.id == flip_task_id)
+                .and_then(get_usage);
+            let eval_usage = match (eval_base, flip_usage) {
+                (Some(mut eu), Some(fu)) => {
+                    eu.accumulate(&fu);
+                    Some(eu)
+                }
+                (Some(eu), None) => Some(eu),
+                (None, Some(fu)) => Some(fu),
+                (None, None) => None,
+            };
 
             if assign_usage.is_some() || eval_usage.is_some() {
                 lines.push("── Phase Costs ──".to_string());
@@ -3443,7 +3448,7 @@ impl VizApp {
                         format_tokens(u.output_tokens)
                     );
                     if cache > 0 {
-                        detail.push_str(&format!(" +{} cached", format_tokens(cache)));
+                        detail.push_str(&format!("  (cached: {})", format_tokens(cache)));
                     }
                     if u.cost_usd > 0.0 {
                         detail.push_str(&format!(" ${:.4}", u.cost_usd));
@@ -3458,7 +3463,7 @@ impl VizApp {
                         format_tokens(u.output_tokens)
                     );
                     if cache > 0 {
-                        detail.push_str(&format!(" +{} cached", format_tokens(cache)));
+                        detail.push_str(&format!("  (cached: {})", format_tokens(cache)));
                     }
                     if u.cost_usd > 0.0 {
                         detail.push_str(&format!(" ${:.4}", u.cost_usd));
@@ -3612,23 +3617,16 @@ impl VizApp {
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
             let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+            lines.push(format!(
+                "  Input:  →{}",
+                format_tokens(usage.input_tokens)
+            ));
+            lines.push(format!("  Output: ←{}", format_tokens(usage.output_tokens)));
             if cache_total > 0 {
                 lines.push(format!(
-                    "  Input:  {} new + {} cached",
-                    format_tokens(usage.input_tokens),
-                    format_tokens(cache_total)
-                ));
-            } else {
-                lines.push(format!("  Input:  {}", format_tokens(usage.input_tokens)));
-            }
-            lines.push(format!("  Output: {}", format_tokens(usage.output_tokens)));
-            if usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0 {
-                lines.push(format!(
-                    "  Cache read:  {}",
-                    format_tokens(usage.cache_read_input_tokens)
-                ));
-                lines.push(format!(
-                    "  Cache write: {}",
+                    "  Cached: {} (read: {}, write: {})",
+                    format_tokens(cache_total),
+                    format_tokens(usage.cache_read_input_tokens),
                     format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
@@ -5118,14 +5116,29 @@ impl VizApp {
         // Execution phase (the task itself)
         let execution = Some(build_phase(&task, "Execution"));
 
-        // Evaluation phase
+        // Evaluation phase: combine .evaluate-* and .flip-* token usage
         let eval_task_id = format!(".evaluate-{}", task_id);
         let legacy_eval_id = format!("evaluate-{}", task_id);
-        let evaluation = graph
+        let flip_task_id = format!(".flip-{}", task_id);
+        let eval_task = graph
             .tasks()
-            .find(|t| t.id == eval_task_id || t.id == legacy_eval_id)
+            .find(|t| t.id == eval_task_id || t.id == legacy_eval_id);
+        let flip_task = graph.tasks().find(|t| t.id == flip_task_id);
+        let evaluation = eval_task
             .map(|t| {
                 let mut phase = build_phase(t, "Evaluation");
+
+                // Accumulate FLIP task token usage into evaluation phase
+                if let Some(ft) = flip_task {
+                    let flip_phase = build_phase(ft, "FLIP");
+                    if let Some(flip_usage) = flip_phase.token_usage {
+                        if let Some(ref mut eval_usage) = phase.token_usage {
+                            eval_usage.accumulate(&flip_usage);
+                        } else {
+                            phase.token_usage = Some(flip_usage);
+                        }
+                    }
+                }
 
                 // Load evaluation results from agency/evaluations/
                 let evals_dir = self.workgraph_dir.join("agency").join("evaluations");
@@ -5151,6 +5164,10 @@ impl VizApp {
                 }
 
                 phase
+            })
+            .or_else(|| {
+                // If no evaluate task but flip task exists, show flip as evaluation phase
+                flip_task.map(|ft| build_phase(ft, "Evaluation"))
             });
 
         self.agency_lifecycle = Some(AgencyLifecycle {
@@ -8139,7 +8156,7 @@ mod hud_tests {
             detail
                 .rendered_lines
                 .iter()
-                .any(|l| l.contains("Cache read:"))
+                .any(|l| l.contains("Cached:"))
         );
     }
 

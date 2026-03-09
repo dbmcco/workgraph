@@ -3448,18 +3448,27 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     if let Some(ref usage) = phase.token_usage {
                         let cache_total =
                             usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-                        let mut tok_parts = vec![format!("→{}", format_tokens(usage.input_tokens))];
-                        if cache_total > 0 {
-                            tok_parts.push(format!("+{} cached", format_tokens(cache_total)));
-                        }
-                        tok_parts.push(format!("←{}", format_tokens(usage.output_tokens)));
-                        if usage.cost_usd > 0.0 {
-                            tok_parts.push(format!("${:.4}", usage.cost_usd));
-                        }
-                        lines.push(Line::from(Span::styled(
-                            format!("  Tokens: {}", tok_parts.join(" ")),
+                        let mut spans: Vec<Span> = vec![Span::styled(
+                            format!(
+                                "  Tokens: →{} ←{}",
+                                format_tokens(usage.input_tokens),
+                                format_tokens(usage.output_tokens)
+                            ),
                             Style::default().fg(Color::DarkGray),
-                        )));
+                        )];
+                        if cache_total > 0 {
+                            spans.push(Span::styled(
+                                format!("  (cached: {})", format_tokens(cache_total)),
+                                Style::default().fg(Color::Rgb(80, 80, 80)),
+                            ));
+                        }
+                        if usage.cost_usd > 0.0 {
+                            spans.push(Span::styled(
+                                format!(" ${:.4}", usage.cost_usd),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        lines.push(Line::from(spans));
                     }
 
                     // Runtime
@@ -3547,29 +3556,31 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let total_tokens = total_new_input + total_output + total_cached;
         if total_tokens > 0 {
             lines.push(Line::from(""));
-            let mut summary = if total_cached > 0 {
-                format!(
-                    "  Total: →{} +{} cached ←{}",
-                    format_tokens(total_new_input),
-                    format_tokens(total_cached),
-                    format_tokens(total_output)
-                )
-            } else {
+            let mut spans: Vec<Span> = vec![Span::styled(
                 format!(
                     "  Total: →{} ←{}",
                     format_tokens(total_new_input),
                     format_tokens(total_output)
-                )
-            };
-            if total_cost > 0.0 {
-                summary.push_str(&format!(" (${:.4})", total_cost));
-            }
-            lines.push(Line::from(Span::styled(
-                summary,
+                ),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
-            )));
+            )];
+            if total_cached > 0 {
+                spans.push(Span::styled(
+                    format!("  (cached: {})", format_tokens(total_cached)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if total_cost > 0.0 {
+                spans.push(Span::styled(
+                    format!(" ${:.4}", total_cost),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         lines.push(Line::from(""));
