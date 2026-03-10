@@ -534,6 +534,35 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
     }
 }
 
+/// Parse token usage from `__WG_TOKENS__:` lines in an output log.
+///
+/// Eval agents (`.evaluate-*`, `.flip-*`) emit `__WG_TOKENS__:{json}` to stderr
+/// during `wg evaluate run`. This function extracts and sums those lines.
+/// Returns `None` if the file doesn't exist or has no `__WG_TOKENS__` lines.
+pub fn parse_wg_tokens(output_log_path: &std::path::Path) -> Option<TokenUsage> {
+    let content = std::fs::read_to_string(output_log_path).ok()?;
+
+    let mut total = TokenUsage {
+        cost_usd: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    let mut found_any = false;
+
+    for line in content.lines() {
+        if let Some(json) = line.strip_prefix("__WG_TOKENS__:") {
+            if let Ok(usage) = serde_json::from_str::<TokenUsage>(json.trim()) {
+                found_any = true;
+                total.accumulate(&usage);
+            }
+        }
+    }
+
+    if found_any { Some(total) } else { None }
+}
+
 /// Format token usage in compact slash notation: in/out or in/out/val
 /// Input = total input (uncached + cache_read + cache_creation).
 /// Validation shown only when > 0.
@@ -569,9 +598,9 @@ pub fn format_token_display(
         let novel_in = a.input_tokens;
         let novel_out = a.output_tokens;
         if novel_in + novel_out > 0 {
-            // ∎ tombstone/QED for aggregated agency token usage (novel only)
+            // § agency marker for aggregated agency token usage (novel only)
             s.push_str(&format!(
-                " ∎→{} ←{}",
+                " §→{} ←{}",
                 format_tokens(novel_in),
                 format_tokens(novel_out)
             ));
@@ -2140,10 +2169,10 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
-        // →novel_in ←out ◎cached ∎→agency_in ←agency_out
+        // →novel_in ←out ◎cached §→agency_in ←agency_out
         assert_eq!(
             format_token_display(Some(&usage), Some(&agency)),
-            Some("→4.6k ←3.9k ◎105k ∎→1.3k ←600".to_string())
+            Some("→4.6k ←3.9k ◎105k §→1.3k ←600".to_string())
         );
         assert_eq!(
             format_token_display(Some(&usage), None),
@@ -2152,11 +2181,11 @@ mod tests {
         // Only agency, no task usage
         assert_eq!(
             format_token_display(None, Some(&agency)),
-            Some(" ∎→1.3k ←600".to_string())
+            Some(" §→1.3k ←600".to_string())
         );
         assert_eq!(format_token_display(None, None), None);
 
-        // Zero agency tokens should not show ∎ section
+        // Zero agency tokens should not show § section
         let zero_val = TokenUsage {
             cost_usd: 0.0,
             input_tokens: 0,
@@ -2280,6 +2309,52 @@ mod tests {
     fn test_parse_token_usage_live_missing_file() {
         let result = parse_token_usage_live(std::path::Path::new("/nonexistent/output.log"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            "FLIP Phase 1: Inferring prompt from output...\nFLIP Phase 2: Comparing prompts...\n__WG_TOKENS__:{\"cost_usd\":0.12,\"input_tokens\":500,\"output_tokens\":200,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":50}\n",
+        ).unwrap();
+
+        let usage = parse_wg_tokens(&log_path).unwrap();
+        assert!((usage.cost_usd - 0.12).abs() < f64::EPSILON);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.cache_creation_input_tokens, 50);
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_multiple_lines_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            "__WG_TOKENS__:{\"cost_usd\":0.1,\"input_tokens\":100,\"output_tokens\":50}\n__WG_TOKENS__:{\"cost_usd\":0.2,\"input_tokens\":200,\"output_tokens\":80}\n",
+        ).unwrap();
+
+        let usage = parse_wg_tokens(&log_path).unwrap();
+        assert!((usage.cost_usd - 0.3).abs() < f64::EPSILON);
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 130);
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_missing_file() {
+        let result = parse_wg_tokens(std::path::Path::new("/nonexistent/output.log"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_no_tokens_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(&log_path, "Some eval output\nAnother line\n").unwrap();
+        assert!(parse_wg_tokens(&log_path).is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
-use workgraph::graph::{LogEntry, Status, evaluate_cycle_iteration, parse_token_usage};
+use workgraph::graph::{LogEntry, Status, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens};
 use workgraph::parser::save_graph;
 use workgraph::query;
 use workgraph::service::registry::AgentRegistry;
@@ -423,6 +423,10 @@ fn run_inner(
             dir.parent().unwrap_or(dir).join(output_path)
         };
         if let Some(usage) = parse_token_usage(&abs_path) {
+            task.token_usage = Some(usage);
+        } else if let Some(usage) = parse_wg_tokens(&abs_path) {
+            // Eval agents (.evaluate-*, .flip-*) emit __WG_TOKENS__ lines
+            // instead of Claude CLI type=result JSON.
             task.token_usage = Some(usage);
         }
     }
