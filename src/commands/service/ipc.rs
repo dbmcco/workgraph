@@ -778,6 +778,8 @@ fn handle_add_task(
         superseded_by: vec![],
         supersedes: None,
         unplaced: false,
+        place_near: vec![],
+        place_before: vec![],
     };
 
     graph.add_node(Node::Task(task));

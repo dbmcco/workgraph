@@ -242,6 +242,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -284,6 +286,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -356,6 +360,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -405,6 +411,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -448,6 +456,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -491,6 +501,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -534,6 +546,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -580,6 +594,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -628,6 +644,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -676,6 +694,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -721,6 +741,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -769,6 +791,8 @@ mod provenance_coverage_tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )

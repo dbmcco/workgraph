@@ -70,6 +70,8 @@ pub fn run(
     exec_mode: Option<&str>,
     paused: bool,
     no_place: bool,
+    place_near: &[String],
+    place_before: &[String],
     delay: Option<&str>,
     not_before: Option<&str>,
 ) -> Result<()> {
@@ -310,6 +312,8 @@ pub fn run(
         superseded_by: vec![],
         supersedes: None,
         unplaced: no_place,
+        place_near: place_near.to_vec(),
+        place_before: place_before.to_vec(),
     };
 
     // Add task to graph
@@ -573,6 +577,8 @@ fn add_task_directly(
         superseded_by: vec![],
         supersedes: None,
         unplaced: false,
+        place_near: vec![],
+        place_before: vec![],
     };
 
     graph.add_node(Node::Task(task));
@@ -1006,6 +1012,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         );
@@ -1050,6 +1058,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         );
@@ -1094,6 +1104,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         );
@@ -1145,6 +1157,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         );
@@ -1193,6 +1207,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         );

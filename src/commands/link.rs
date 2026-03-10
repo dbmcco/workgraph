@@ -180,6 +180,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -213,6 +215,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )
@@ -246,6 +250,8 @@ mod tests {
             None,
             false,
             false,
+            &[],
+            &[],
             None,
             None,
         )

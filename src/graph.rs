@@ -347,6 +347,12 @@ pub struct Task {
     /// The placement system will not create a .place-* task for this task.
     #[serde(default, skip_serializing_if = "is_bool_false")]
     pub unplaced: bool,
+    /// Placement hint: place near these tasks (IDs). Used by .place-* agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub place_near: Vec<String>,
+    /// Placement hint: place before these tasks (IDs). Used by .place-* agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub place_before: Vec<String>,
 }
 
 /// Returns `true` if the task ID represents a system-generated task.
@@ -799,6 +805,10 @@ struct TaskHelper {
     supersedes: Option<String>,
     #[serde(default)]
     unplaced: bool,
+    #[serde(default)]
+    place_near: Vec<String>,
+    #[serde(default)]
+    place_before: Vec<String>,
     /// Old format: inline identity object. Migrated to `agent` hash on read.
     #[serde(default)]
     identity: Option<LegacyIdentity>,
@@ -871,6 +881,8 @@ impl<'de> Deserialize<'de> for Task {
             superseded_by: helper.superseded_by,
             supersedes: helper.supersedes,
             unplaced: helper.unplaced,
+            place_near: helper.place_near,
+            place_before: helper.place_before,
         })
     }
 }

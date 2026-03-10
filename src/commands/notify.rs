@@ -367,6 +367,8 @@ mod tests {
             superseded_by: vec![],
             supersedes: None,
             unplaced: false,
+            place_near: vec![],
+            place_before: vec![],
         }
     }
 

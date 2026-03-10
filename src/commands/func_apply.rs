@@ -288,6 +288,8 @@ pub fn run(
                 superseded_by: vec![],
                 supersedes: None,
                 unplaced: false,
+                place_near: vec![],
+                place_before: vec![],
             };
 
             graph.add_node(Node::Task(task));
