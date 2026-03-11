@@ -95,6 +95,11 @@ fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCa
         .arg("json")
         .arg("--dangerously-skip-permissions")
         .arg(prompt)
+        // Strip CLAUDECODE env var so the CLI doesn't refuse to run
+        // when invoked from within a Claude Code session (e.g. daemon
+        // spawned by a coordinator agent). This is a headless --print
+        // call, not an interactive nested session.
+        .env_remove("CLAUDECODE")
         .output()
         .context("Failed to run claude CLI for lightweight LLM call")?;
 
