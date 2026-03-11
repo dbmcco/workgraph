@@ -159,23 +159,21 @@ fn run_inner(
     // Check for unresolved blockers (cycle-aware: only exempt back-edge blockers,
     // not all same-cycle blockers).
     //
-    // A "back-edge blocker" is a blocker that has cycle_config (the cycle's
-    // iterator/validator task) and is in the same cycle as the task being
-    // completed.  The auto-created dependency from the worker back to the
-    // iterator is a loop-back edge; the iterator should not block the worker.
+    // Any blocker that is in the same cycle (SCC) as the task being completed
+    // is exempted — both header and non-header members.  The mutual dependency
+    // between cycle members is a structural back-edge; blocking on it would
+    // deadlock the cycle.
     let blockers = query::after(&graph, id);
     if !blockers.is_empty() {
         let cycle_analysis = graph.compute_cycle_analysis();
         let effective_blockers: Vec<_> = blockers
             .into_iter()
             .filter(|b| {
-                // Exempt if the blocker is the cycle iterator in the same cycle
-                let blocker_is_cycle_iterator = b.cycle_config.is_some();
-                let in_same_cycle = blocker_is_cycle_iterator
-                    && cycle_analysis
-                        .task_to_cycle
-                        .get(&b.id)
-                        .is_some_and(|bc| cycle_analysis.task_to_cycle.get(id) == Some(bc));
+                // Exempt any blocker in the same cycle (SCC) as this task
+                let in_same_cycle = cycle_analysis
+                    .task_to_cycle
+                    .get(&b.id)
+                    .is_some_and(|bc| cycle_analysis.task_to_cycle.get(id) == Some(bc));
                 !in_same_cycle
             })
             .collect();
