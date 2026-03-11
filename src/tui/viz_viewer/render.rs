@@ -4006,6 +4006,7 @@ fn draw_text_prompt(
         TextPromptAction::SendMessage(id) => format!("Message to '{}':", id),
         TextPromptAction::EditDescription(id) => format!("Edit description for '{}':", id),
         TextPromptAction::AttachFile => "Attach file \u{2014} enter path:".to_string(),
+        TextPromptAction::CreateCoordinator => "New Coordinator".to_string(),
     };
     let size = frame.area();
     if is_multiline {

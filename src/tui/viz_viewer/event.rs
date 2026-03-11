@@ -409,6 +409,17 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
     if submit {
         let text = editor_text(&app.text_prompt.editor);
         editor_clear(&mut app.text_prompt.editor);
+        // CreateCoordinator accepts empty text (creates unnamed coordinator)
+        if action == TextPromptAction::CreateCoordinator {
+            let name = if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.trim().to_string())
+            };
+            app.create_coordinator(name);
+            app.input_mode = InputMode::Normal;
+            return;
+        }
         if text.trim().is_empty() {
             if action == TextPromptAction::AttachFile {
                 app.input_mode = InputMode::ChatInput;
@@ -450,6 +461,7 @@ fn handle_text_prompt_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                 app.inspector_sub_focus = InspectorSubFocus::TextEntry;
                 return;
             }
+            TextPromptAction::CreateCoordinator => unreachable!("handled above"),
         }
         app.input_mode = InputMode::Normal;
         return;
@@ -1385,7 +1397,8 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         }
         // Chat tab: '+' creates a new coordinator session
         KeyCode::Char('+') if app.right_panel_tab == RightPanelTab::Chat => {
-            app.create_coordinator(None);
+            app.text_prompt.editor = edtui::EditorState::default();
+            app.input_mode = InputMode::TextPrompt(TextPromptAction::CreateCoordinator);
         }
         // Chat tab: '-' closes the current coordinator (except coordinator 0)
         KeyCode::Char('-') if app.right_panel_tab == RightPanelTab::Chat => {
@@ -1675,7 +1688,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 // Check [+] button first
                 let plus = &app.coordinator_plus_hit;
                 if column >= plus.start && column < plus.end {
-                    app.create_coordinator(None);
+                    app.text_prompt.editor = edtui::EditorState::default();
+                    app.input_mode = InputMode::TextPrompt(TextPromptAction::CreateCoordinator);
                     return;
                 }
 

@@ -604,7 +604,8 @@ pub enum TextPromptAction {
     #[allow(dead_code)]
     SendMessage(String), // task_id
     EditDescription(String), // task_id
-    AttachFile,         // attach a file to the next chat message
+    AttachFile,          // attach a file to the next chat message
+    CreateCoordinator,   // prompt for optional coordinator name
 }
 
 /// Hit area for a single coordinator tab in the tab bar.
