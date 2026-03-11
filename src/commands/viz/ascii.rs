@@ -480,6 +480,20 @@ pub(crate) fn generate_ascii(
                 let Some(t) = task_map.get(id) else {
                     return false;
                 };
+                // Coordinator tasks are hot when they have a recent log entry
+                // (within 60s), indicating the coordinator is actively processing.
+                if t.tags.iter().any(|tag| tag == "coordinator-loop") {
+                    if let Some(last_log) = t.log.last() {
+                        if let Ok(dt) =
+                            chrono::DateTime::parse_from_rfc3339(&last_log.timestamp)
+                        {
+                            let age = now_utc.signed_duration_since(dt);
+                            if age.num_seconds() < 60 {
+                                return true;
+                            }
+                        }
+                    }
+                }
                 if t.status == Status::InProgress {
                     return true;
                 }
@@ -4837,6 +4851,111 @@ mod tests {
         assert!(
             !result.reverse_edges.is_empty(),
             "reverse_edges should be populated"
+        );
+    }
+
+    use workgraph::graph::LogEntry;
+
+    #[test]
+    fn test_coordinator_with_recent_log_sorts_above_in_progress() {
+        let mut graph = WorkGraph::new();
+
+        // WCC 1: a regular in-progress task (hot by status)
+        let mut worker = make_task("worker-task", "Worker");
+        worker.status = Status::InProgress;
+        graph.add_node(Node::Task(worker));
+
+        // WCC 2: coordinator-loop task in Open status with a recent log entry
+        let mut coordinator = make_task("coordinator-0", "Coordinator");
+        coordinator.status = Status::Open;
+        coordinator.tags = vec!["coordinator-loop".to_string()];
+        coordinator.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: None,
+            message: "Processing turn".to_string(),
+        });
+        graph.add_node(Node::Task(coordinator));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let coord_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "coordinator-0")
+            .expect("coordinator-0 should appear in task_order");
+        let worker_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "worker-task")
+            .expect("worker-task should appear in task_order");
+        assert!(
+            coord_pos < worker_pos,
+            "Coordinator with recent log (pos {}) should sort before in-progress WCC (pos {})\nOutput:\n{}",
+            coord_pos,
+            worker_pos,
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_coordinator_without_recent_log_does_not_override_in_progress() {
+        let mut graph = WorkGraph::new();
+
+        // WCC 1: a regular in-progress task (hot by status)
+        let mut worker = make_task("worker-task", "Worker");
+        worker.status = Status::InProgress;
+        graph.add_node(Node::Task(worker));
+
+        // WCC 2: coordinator-loop task with no log entries (stale)
+        let mut coordinator = make_task("coordinator-0", "Coordinator");
+        coordinator.status = Status::Open;
+        coordinator.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(coordinator));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let coord_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "coordinator-0")
+            .expect("coordinator-0 should appear in task_order");
+        let worker_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "worker-task")
+            .expect("worker-task should appear in task_order");
+        assert!(
+            coord_pos > worker_pos,
+            "Stale coordinator (pos {}) should NOT sort before in-progress WCC (pos {})\nOutput:\n{}",
+            coord_pos,
+            worker_pos,
+            result.text
         );
     }
 }
