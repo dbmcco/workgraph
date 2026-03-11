@@ -6,10 +6,7 @@ use std::path::Path;
 use workgraph::service::compactor;
 
 pub fn run(dir: &Path, json: bool) -> Result<()> {
-    let state = compactor::CompactorState::load(dir);
-    let tick = state.last_tick;
-
-    let output_path = compactor::run_compaction(dir, tick)?;
+    let output_path = compactor::run_compaction(dir)?;
 
     if json {
         let result = serde_json::json!({

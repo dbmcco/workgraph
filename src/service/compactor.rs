@@ -5,8 +5,8 @@
 //! - Persistent Facts (~500 tokens)
 //! - Evaluation Digest (~500 tokens)
 //!
-//! Triggered by: coordinator tick interval, ops growth threshold, restart,
-//! or manual `wg compact`.
+//! Triggered by: graph lifecycle (`.compact-0` becomes ready when coordinator
+//! marks done and cycle edge reactivates it), or manual `wg compact`.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -65,6 +65,11 @@ impl CompactorState {
 }
 
 /// Check whether compaction should run based on coordinator tick count and ops growth.
+///
+/// **Deprecated:** Compaction is now cycle-driven — it fires when `.compact-0` is
+/// graph-ready (Open + all deps terminal). The daemon no longer calls this function.
+/// Kept for backward compatibility; `compactor_interval` and `compactor_ops_threshold`
+/// config values are no-ops in the new model.
 pub fn should_compact(workgraph_dir: &Path, current_tick: u64, config: &Config) -> bool {
     let interval = config.coordinator.compactor_interval;
     if interval == 0 {
@@ -105,7 +110,9 @@ fn count_ops(workgraph_dir: &Path) -> usize {
 /// Run compaction: gather graph state, call LLM, write context.md.
 ///
 /// This is the main entry point for both `wg compact` and coordinator-triggered compaction.
-pub fn run_compaction(workgraph_dir: &Path, current_tick: u64) -> Result<PathBuf> {
+/// Compaction is now cycle-driven — the daemon calls this only when `.compact-0` is
+/// graph-ready. The old timer/ops gating has been removed from the call path.
+pub fn run_compaction(workgraph_dir: &Path) -> Result<PathBuf> {
     let config = Config::load_or_default(workgraph_dir);
     let graph_path = workgraph_dir.join("graph.jsonl");
 
@@ -140,7 +147,6 @@ pub fn run_compaction(workgraph_dir: &Path, current_tick: u64) -> Result<PathBuf
     let mut state = CompactorState::load(workgraph_dir);
     state.last_compaction = Some(Utc::now().to_rfc3339());
     state.last_ops_count = count_ops(workgraph_dir);
-    state.last_tick = current_tick;
     state.compaction_count += 1;
     state.save(workgraph_dir)?;
 

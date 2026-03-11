@@ -1199,21 +1199,39 @@ fn ensure_coordinator_task(dir: &Path) {
 
 /// Run compaction as a visible graph task (`.compact-N`).
 ///
-/// Instead of running compaction inline, this function manages the `.compact-0`
-/// task lifecycle: checks should_compact, marks the task InProgress, runs
-/// compaction, and marks it Done with updated iteration count.
+/// Compaction is purely cycle-driven: it fires only when `.compact-0` is
+/// graph-ready (status=Open and all after-deps are terminal). This replaces
+/// the old timer/ops-threshold gating via `should_compact()`.
 fn run_graph_compaction(
     dir: &Path,
-    current_tick: u64,
     compaction_error_count: &mut u64,
     logger: &DaemonLogger,
 ) {
-    let config = workgraph::config::Config::load_or_default(dir);
-    if !workgraph::service::compactor::should_compact(dir, current_tick, &config) {
-        return;
-    }
-
     let gp = graph_path(dir);
+
+    // Check if .compact-0 is graph-ready (Open + all deps terminal)
+    {
+        let graph = match load_graph(&gp) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let compact = match graph.get_task(".compact-0") {
+            Some(t) => t,
+            None => return, // No compact task in graph
+        };
+        if compact.status != workgraph::graph::Status::Open {
+            return; // Not ready — already in-progress, done, etc.
+        }
+        let all_deps_met = compact.after.iter().all(|dep_id| {
+            graph
+                .get_task(dep_id)
+                .map(|t| t.status.is_terminal())
+                .unwrap_or(false)
+        });
+        if !all_deps_met {
+            return; // Dependencies not yet satisfied
+        }
+    }
 
     // Mark .compact-0 as InProgress
     {
@@ -1227,7 +1245,7 @@ fn run_graph_compaction(
             task.log.push(workgraph::graph::LogEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 actor: Some("daemon".to_string()),
-                message: format!("Compaction started (tick #{})", current_tick),
+                message: "Compaction started (cycle-driven)".to_string(),
             });
             if let Err(e) = workgraph::parser::save_graph(&graph, &gp) {
                 eprintln!(
@@ -1240,7 +1258,7 @@ fn run_graph_compaction(
     }
 
     // Run compaction
-    match workgraph::service::compactor::run_compaction(dir, current_tick) {
+    match workgraph::service::compactor::run_compaction(dir) {
         Ok(path) => {
             if *compaction_error_count > 0 {
                 logger.info(&format!(
@@ -1736,10 +1754,9 @@ pub fn run_daemon(
                     // Dispatch notifications for task state changes (failures, blocks)
                     try_dispatch_notifications(&dir, &logger);
 
-                    // Compaction: run as a visible graph task (.compact-N) instead of inline
+                    // Compaction: run when .compact-0 is graph-ready (cycle-driven)
                     run_graph_compaction(
                         &dir,
-                        coord_state.ticks,
                         &mut compaction_error_count,
                         &logger,
                     );
@@ -2848,7 +2865,7 @@ mod tests {
         let dir = temp_dir.path();
         let gp = dir.join("graph.jsonl");
 
-        // Create a graph with .compact-0
+        // Create a graph with .compact-0 (no deps → immediately ready)
         let mut graph = workgraph::graph::WorkGraph::new();
         graph.add_node(Node::Task(Task {
             id: ".compact-0".to_string(),
@@ -2859,30 +2876,107 @@ mod tests {
         }));
         workgraph::parser::save_graph(&graph, &gp).unwrap();
 
-        // Set up config with compactor_interval = 1 (always compact)
-        let config_dir = dir.join("config.toml");
-        fs::write(
-            &config_dir,
-            "[coordinator]\ncompactor_interval = 1\n",
-        )
-        .unwrap();
-
         // Create a logger for the test
         let logger = DaemonLogger::open(dir).unwrap();
 
         let mut error_count = 0u64;
-        // This will try to compact but fail (no graph data / LLM) — that's fine,
-        // we're testing that the task status gets updated to InProgress
-        run_graph_compaction(dir, 1, &mut error_count, &logger);
+        // .compact-0 is Open with no deps → graph-ready → compaction fires
+        // It will fail (no LLM) but we verify the task status gets updated
+        run_graph_compaction(dir, &mut error_count, &logger);
 
         // After the call, .compact-0 should be Open (failed, reverted to Open)
-        // or Done (if compaction somehow succeeded). Either way, the status changed.
         let graph = load_graph(&gp).unwrap();
         let compact = graph.get_task(".compact-0").unwrap();
         // The task should have log entries from the compaction attempt
         assert!(
             compact.log.len() > 0,
             "compact task should have log entries after compaction attempt"
+        );
+    }
+
+    #[test]
+    fn test_compaction_fires_when_compact_ready() {
+        use workgraph::graph::{Node, Status, Task};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        // Create a graph: .coordinator-0 (Done) → .compact-0 (Open, after .coordinator-0)
+        let mut graph = workgraph::graph::WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: ".coordinator-0".to_string(),
+            title: "Coordinator 0".to_string(),
+            status: Status::Done,
+            ..Default::default()
+        }));
+        graph.add_node(Node::Task(Task {
+            id: ".compact-0".to_string(),
+            title: "Compact 0".to_string(),
+            status: Status::Open,
+            after: vec![".coordinator-0".to_string()],
+            tags: vec!["compact-loop".to_string()],
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        let mut error_count = 0u64;
+
+        // .compact-0 is Open and dep (.coordinator-0) is Done → should fire
+        run_graph_compaction(dir, &mut error_count, &logger);
+
+        let graph = load_graph(&gp).unwrap();
+        let compact = graph.get_task(".compact-0").unwrap();
+        // Compaction attempted (will fail due to no LLM, but log entries prove it fired)
+        assert!(
+            !compact.log.is_empty(),
+            "compaction should fire when .compact-0 is graph-ready"
+        );
+    }
+
+    #[test]
+    fn test_compaction_blocked_when_dep_not_done() {
+        use workgraph::graph::{Node, Status, Task};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        // Create a graph: .coordinator-0 (InProgress) → .compact-0 (Open, after .coordinator-0)
+        let mut graph = workgraph::graph::WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: ".coordinator-0".to_string(),
+            title: "Coordinator 0".to_string(),
+            status: Status::InProgress,
+            ..Default::default()
+        }));
+        graph.add_node(Node::Task(Task {
+            id: ".compact-0".to_string(),
+            title: "Compact 0".to_string(),
+            status: Status::Open,
+            after: vec![".coordinator-0".to_string()],
+            tags: vec!["compact-loop".to_string()],
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        let mut error_count = 0u64;
+
+        // .compact-0 is Open but dep (.coordinator-0) is InProgress → should NOT fire
+        run_graph_compaction(dir, &mut error_count, &logger);
+
+        let graph = load_graph(&gp).unwrap();
+        let compact = graph.get_task(".compact-0").unwrap();
+        assert!(
+            compact.log.is_empty(),
+            "compaction should NOT fire when .compact-0 deps are not terminal"
+        );
+        assert_eq!(
+            compact.status,
+            Status::Open,
+            ".compact-0 should remain Open when blocked"
         );
     }
 }
