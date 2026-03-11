@@ -54,6 +54,21 @@ fn cleanup_and_count_alive(
         );
     }
 
+    // Reconciliation safety net: catch orphaned InProgress tasks whose agents
+    // are Dead in registry but weren't unclaimed (split-save race condition).
+    match crate::commands::sweep::reconcile_orphaned_tasks(dir, graph_path) {
+        Ok(0) => {}
+        Ok(n) => {
+            eprintln!(
+                "[coordinator] Reconciliation: recovered {} orphaned task(s)",
+                n
+            );
+        }
+        Err(e) => {
+            eprintln!("[coordinator] Reconciliation warning: {}", e);
+        }
+    }
+
     // Now count truly alive agents (process still running)
     let registry = AgentRegistry::load(dir)?;
     let alive_count = registry

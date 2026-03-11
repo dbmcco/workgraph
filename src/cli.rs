@@ -1370,6 +1370,16 @@ pub enum Commands {
         threshold: Option<u64>,
     },
 
+    /// Detect and recover orphaned in-progress tasks with dead agents
+    #[command(
+        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the coordinator can re-dispatch.\n\nThis is safe to run anytime — it is idempotent."
+    )]
+    Sweep {
+        /// Only report orphaned tasks, don't fix them
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// List running agent processes (service workers)
     #[command(
         after_help = "This command shows agent processes spawned by the service coordinator.\nThese are runtime workers, not agent identity definitions.\n\nSee also: 'wg agent' to manage agent definitions (role + tradeoff pairings)."
@@ -2799,6 +2809,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Evolve { .. } => "evolve",
         Commands::Config { .. } => "config",
         Commands::DeadAgents { .. } => "dead-agents",
+        Commands::Sweep { .. } => "sweep",
         Commands::Agents { .. } => "agents",
         Commands::Kill { .. } => "kill",
         Commands::Service { .. } => "service",
@@ -2869,6 +2880,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Evolve { .. }
             | Commands::Config { .. }
             | Commands::DeadAgents { .. }
+            | Commands::Sweep { .. }
             | Commands::Agents { .. }
             | Commands::Kill { .. }
             | Commands::Service { .. }

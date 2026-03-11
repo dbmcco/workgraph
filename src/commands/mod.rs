@@ -87,6 +87,7 @@ pub mod spawn;
 pub mod stats;
 pub mod status;
 pub mod structure;
+pub mod sweep;
 pub mod telegram;
 pub mod tokens;
 pub mod trace;
