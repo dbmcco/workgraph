@@ -3321,23 +3321,30 @@ mod tests {
         // Config with 15 turn threshold
         let config = Config::default(); // default has auto_interval_turns=15
 
-        // Should not panic and should attempt checkpoint (will fail on LLM call,
-        // but the logic should trigger)
-        let result = try_auto_checkpoint(dir, &agent_entry, &config, 15, 20);
-        // LLM call will fail in test env — that's expected.
+        // Should not panic and should attempt checkpoint.
         // The important thing is the logic correctly identifies the trigger.
-        // The function will return Err because claude CLI isn't available.
-        assert!(result.is_err());
-        // Error should be about the LLM call, not about threshold logic
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.to_lowercase().contains("checkpoint summary")
-                || err_msg.contains("claude")
-                || err_msg.contains("Claude")
-                || err_msg.contains("No such file"),
-            "Expected LLM-related error, got: {}",
-            err_msg
-        );
+        let result = try_auto_checkpoint(dir, &agent_entry, &config, 15, 20);
+        // Checkpoint was triggered — either succeeds (LLM available) or fails (LLM unavailable).
+        // Both outcomes confirm the threshold logic worked correctly.
+        match &result {
+            Ok(()) => {
+                // LLM was available — checkpoint was saved
+                let cp_dir = agent_dir.join("checkpoints");
+                assert!(cp_dir.exists(), "Checkpoint directory should exist on success");
+            }
+            Err(e) => {
+                // LLM not available — expected in CI environments
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.to_lowercase().contains("checkpoint summary")
+                        || err_msg.contains("claude")
+                        || err_msg.contains("Claude")
+                        || err_msg.contains("No such file"),
+                    "Expected LLM-related error, got: {}",
+                    err_msg
+                );
+            }
+        }
     }
 
     #[test]
@@ -3404,10 +3411,27 @@ mod tests {
 
         let config = Config::default();
 
-        // Should trigger due to time (25 min > 20 min threshold)
-        // but fail on LLM call
+        // Should trigger due to time (25 min > 20 min threshold).
+        // Either succeeds (LLM available) or fails (LLM unavailable) —
+        // both confirm the time-based threshold logic worked correctly.
         let result = try_auto_checkpoint(dir, &agent_entry, &config, 15, 20);
-        assert!(result.is_err()); // Expected: LLM not available in test
+        match &result {
+            Ok(()) => {
+                let cp_dir = agent_dir.join("checkpoints");
+                assert!(cp_dir.exists(), "Checkpoint directory should exist on success");
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.to_lowercase().contains("checkpoint summary")
+                        || err_msg.contains("claude")
+                        || err_msg.contains("Claude")
+                        || err_msg.contains("No such file"),
+                    "Expected LLM-related error, got: {}",
+                    err_msg
+                );
+            }
+        }
     }
 
     #[test]
