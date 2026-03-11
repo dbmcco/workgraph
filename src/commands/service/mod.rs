@@ -1366,6 +1366,8 @@ pub fn run_daemon(
     // Load max_coordinators limit from config
     let max_coordinators = config.coordinator.max_coordinators;
 
+    let mut compaction_error_count: u64 = 0;
+
     while running {
         // Reap zombie child processes (agents that have exited).
         // Even though agents call setsid() to create a new session, they are
@@ -1595,11 +1597,24 @@ pub fn run_daemon(
                                 coord_state.ticks,
                             ) {
                                 Ok(path) => {
+                                    if compaction_error_count > 0 {
+                                        logger.info(&format!(
+                                            "Compaction recovered after {} consecutive error(s)",
+                                            compaction_error_count
+                                        ));
+                                    }
+                                    compaction_error_count = 0;
                                     logger
                                         .info(&format!("Compaction complete → {}", path.display()));
                                 }
                                 Err(e) => {
-                                    logger.error(&format!("Compaction error: {}", e));
+                                    compaction_error_count += 1;
+                                    if compaction_error_count == 1 || compaction_error_count % 5 == 0 {
+                                        logger.error(&format!(
+                                            "Compaction error (#{} consecutive): {:#}",
+                                            compaction_error_count, e
+                                        ));
+                                    }
                                 }
                             }
                         }
