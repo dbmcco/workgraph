@@ -1176,6 +1176,10 @@ pub enum Commands {
         #[arg(long)]
         auto_place: Option<bool>,
 
+        /// Enable/disable automatic creator agent invocation
+        #[arg(long)]
+        auto_create: Option<bool>,
+
         /// Set model for triage (default: haiku)
         #[arg(long)]
         triage_model: Option<String>,

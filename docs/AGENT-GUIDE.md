@@ -80,6 +80,24 @@ wg abandon old-task --superseded-by new-task-a,new-task-b --reason "Replaced wit
 
 The `superseded_by` field creates a traceable link from the old task to its replacements.
 
+### Placement flow
+
+When `auto_place` is enabled (`wg config --auto-place true`), newly added tasks go through placement analysis before becoming available for assignment:
+
+```
+wg add "New task" → Draft state → coordinator creates .place-<task-id>
+                                → placement agent analyzes graph context
+                                → determines optimal dependencies and wiring
+                                → task transitions to Open (ready for assignment)
+```
+
+The placement agent (dispatched at the `fast` tier, typically haiku) examines the current graph structure and the new task's description to decide:
+- Which existing tasks should be `--after` dependencies
+- Whether the task needs specific context scope
+- Optimal position in the task graph
+
+If `auto_place` is disabled, tasks are added directly in Open state and the user must wire dependencies manually with `--after`.
+
 ---
 
 ## 2. Structure Rules

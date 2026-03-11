@@ -1471,6 +1471,7 @@ fn main() -> Result<()> {
             retention_heuristics,
             auto_triage,
             auto_place,
+            auto_create,
             triage_model,
             triage_timeout,
             triage_max_log_bytes,
@@ -1682,6 +1683,7 @@ fn main() -> Result<()> {
                     && retention_heuristics.is_none()
                     && auto_triage.is_none()
                     && auto_place.is_none()
+                    && auto_create.is_none()
                     && triage_model.is_none()
                     && triage_timeout.is_none()
                     && triage_max_log_bytes.is_none()
@@ -1728,6 +1730,7 @@ fn main() -> Result<()> {
                     retention_heuristics.as_deref(),
                     auto_triage,
                     auto_place,
+                    auto_create,
                     triage_model.as_deref(),
                     triage_timeout,
                     triage_max_log_bytes,

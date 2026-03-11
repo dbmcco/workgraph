@@ -45,6 +45,7 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);
         println!("  auto_assign = {}", config.agency.auto_assign);
+        println!("  auto_create = {}", config.agency.auto_create);
         if let Some(ref agent) = config.agency.assigner_agent {
             println!("  assigner_agent = \"{}\"", agent);
         }
@@ -279,6 +280,7 @@ pub fn update(
     retention_heuristics: Option<&str>,
     auto_triage: Option<bool>,
     auto_place: Option<bool>,
+    auto_create: Option<bool>,
     triage_model: Option<&str>,
     triage_timeout: Option<u64>,
     triage_max_log_bytes: Option<usize>,
@@ -445,6 +447,12 @@ pub fn update(
     if let Some(v) = auto_place {
         config.agency.auto_place = v;
         println!("Set agency.auto_place = {}", v);
+        changed = true;
+    }
+
+    if let Some(v) = auto_create {
+        config.agency.auto_create = v;
+        println!("Set agency.auto_create = {}", v);
         changed = true;
     }
 
@@ -1610,6 +1618,7 @@ mod tests {
             None,
             None, // auto_triage
             None, // auto_place
+            None, // auto_create
             None,
             None,
             None,
@@ -1666,6 +1675,7 @@ mod tests {
             None,
             None, // auto_triage
             None, // auto_place
+            None, // auto_create
             None,
             None,
             None,
@@ -1721,6 +1731,7 @@ mod tests {
             None,
             None, // auto_triage
             None, // auto_place
+            None, // auto_create
             None,
             None,
             None,
@@ -1773,6 +1784,7 @@ mod tests {
             Some("Retire below 0.3 after 10 evals"),
             None, // auto_triage
             None, // auto_place
+            None, // auto_create
             None,
             None,
             None,
