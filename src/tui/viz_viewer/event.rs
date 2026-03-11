@@ -1475,7 +1475,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         }
         // Chat tab: '+' creates a new coordinator session
         KeyCode::Char('+') if app.right_panel_tab == RightPanelTab::Chat => {
-            app.text_prompt.editor = edtui::EditorState::default();
+            super::state::editor_clear(&mut app.text_prompt.editor);
             app.input_mode = InputMode::TextPrompt(TextPromptAction::CreateCoordinator);
         }
         // Chat tab: '-' opens choice dialog for coordinator removal (except coordinator 0)
@@ -1775,7 +1775,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 // Check [+] button first
                 let plus = &app.coordinator_plus_hit;
                 if column >= plus.start && column < plus.end {
-                    app.text_prompt.editor = edtui::EditorState::default();
+                    super::state::editor_clear(&mut app.text_prompt.editor);
                     app.input_mode = InputMode::TextPrompt(TextPromptAction::CreateCoordinator);
                     return;
                 }
