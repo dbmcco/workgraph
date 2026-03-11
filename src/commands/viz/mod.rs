@@ -138,9 +138,13 @@ impl Default for VizOptions {
 }
 
 /// Returns true if the task is an auto-generated internal task (assignment or evaluation).
-/// Coordinator tasks (tagged `coordinator-loop`) are exempt — always visible.
+/// Coordinator and compact tasks are exempt — always visible.
 fn is_internal_task(task: &Task) -> bool {
-    if task.tags.iter().any(|t| t == "coordinator-loop") {
+    if task
+        .tags
+        .iter()
+        .any(|t| t == "coordinator-loop" || t == "compact-loop")
+    {
         return false;
     }
     workgraph::graph::is_system_task(&task.id)

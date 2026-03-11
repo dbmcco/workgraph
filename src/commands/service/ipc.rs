@@ -965,6 +965,39 @@ fn handle_create_coordinator(dir: &Path, name: Option<&str>) -> IpcResponse {
     };
 
     graph.add_node(workgraph::graph::Node::Task(task));
+
+    // Create companion .compact-N task forming a visible cycle
+    let compact_id = format!(".compact-{}", next_id);
+    if graph.get_task(&compact_id).is_none() {
+        let compact_task = workgraph::graph::Task {
+            id: compact_id.clone(),
+            title: format!("Compact {}", next_id),
+            description: Some(format!(
+                "Compaction task — distills graph state into context.md. \
+                 Forms a cycle with coordinator {}.",
+                next_id
+            )),
+            status: workgraph::graph::Status::Open,
+            tags: vec!["compact-loop".to_string()],
+            after: vec![format!(".coordinator-{}", next_id)],
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            log: vec![workgraph::graph::LogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                actor: Some("daemon".to_string()),
+                message: format!("Compact {} task created via IPC", next_id),
+            }],
+            ..Default::default()
+        };
+        graph.add_node(workgraph::graph::Node::Task(compact_task));
+
+        // Add back-edge from coordinator to compact (cycle)
+        if let Some(coord) = graph.get_task_mut(&format!(".coordinator-{}", next_id)) {
+            if !coord.after.contains(&compact_id) {
+                coord.after.push(compact_id);
+            }
+        }
+    }
+
     if let Err(e) = workgraph::parser::save_graph(&graph, &graph_path) {
         return IpcResponse::error(&format!("Failed to save graph: {}", e));
     }

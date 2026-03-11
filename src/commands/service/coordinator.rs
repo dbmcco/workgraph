@@ -2517,6 +2517,11 @@ fn spawn_agents_for_ready_tasks(
             continue;
         }
 
+        // Skip compact tasks — handled directly by the daemon, not spawned as agents
+        if task.tags.iter().any(|t| t == "compact-loop") {
+            continue;
+        }
+
         // Respawn throttle: detect rapid respawn loops and back off
         if let Err(reason) = check_respawn_throttle(task, &gp) {
             eprintln!("[coordinator] Skipping '{}': {}", task.id, reason);

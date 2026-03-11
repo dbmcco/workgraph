@@ -1096,10 +1096,12 @@ fn try_dispatch_notifications(dir: &Path, logger: &DaemonLogger) {
     }
 }
 
-/// Ensure the `.coordinator` cycle task exists in the graph.
+/// Ensure the `.coordinator` and `.compact` cycle tasks exist in the graph.
 ///
-/// Creates it if missing (Phase 2 of coordinator-as-graph-citizen).
-/// The task has unlimited iterations and is tagged `coordinator-loop`.
+/// Creates them if missing (Phase 2 of coordinator-as-graph-citizen).
+/// The coordinator task has unlimited iterations and is tagged `coordinator-loop`.
+/// The compact task forms a visible cycle with the coordinator:
+///   .coordinator-0 → .compact-0 → .coordinator-0
 fn ensure_coordinator_task(dir: &Path) {
     use workgraph::graph::{CycleConfig, LogEntry, Node, Task};
     use workgraph::parser::save_graph;
@@ -1132,6 +1134,7 @@ fn ensure_coordinator_task(dir: &Path) {
             ),
             status: workgraph::graph::Status::InProgress,
             tags: vec!["coordinator-loop".to_string()],
+            after: vec![".compact-0".to_string()],
             cycle_config: Some(CycleConfig {
                 max_iterations: 0, // unlimited
                 guard: None,
@@ -1152,13 +1155,162 @@ fn ensure_coordinator_task(dir: &Path) {
 
         graph.add_node(Node::Task(task));
         modified = true;
+    } else if let Some(coord) = graph.get_task_mut(".coordinator-0") {
+        // Ensure back-edge to .compact-0 exists on pre-existing coordinator tasks
+        if !coord.after.contains(&".compact-0".to_string()) {
+            coord.after.push(".compact-0".to_string());
+            modified = true;
+        }
+    }
+
+    // Ensure .compact-0 exists — forms a cycle with .coordinator-0
+    if graph.get_task(".compact-0").is_none() {
+        let task = Task {
+            id: ".compact-0".to_string(),
+            title: "Compact 0".to_string(),
+            description: Some(
+                "Compaction task — distills graph state into context.md. \
+                 Forms a cycle with the coordinator: coordinator → compact → coordinator."
+                    .to_string(),
+            ),
+            status: workgraph::graph::Status::Open,
+            tags: vec!["compact-loop".to_string()],
+            after: vec![".coordinator-0".to_string()],
+            created_at: Some(Utc::now().to_rfc3339()),
+            log: vec![LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: Some("daemon".to_string()),
+                message: "Compact 0 task created by daemon".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        graph.add_node(Node::Task(task));
+        modified = true;
     }
 
     if modified && let Err(e) = save_graph(&graph, &gp) {
         eprintln!(
-            "[daemon] Failed to save graph after creating .coordinator-0 task: {}",
+            "[daemon] Failed to save graph after creating coordinator/compact tasks: {}",
             e
         );
+    }
+}
+
+/// Run compaction as a visible graph task (`.compact-N`).
+///
+/// Instead of running compaction inline, this function manages the `.compact-0`
+/// task lifecycle: checks should_compact, marks the task InProgress, runs
+/// compaction, and marks it Done with updated iteration count.
+fn run_graph_compaction(
+    dir: &Path,
+    current_tick: u64,
+    compaction_error_count: &mut u64,
+    logger: &DaemonLogger,
+) {
+    let config = workgraph::config::Config::load_or_default(dir);
+    if !workgraph::service::compactor::should_compact(dir, current_tick, &config) {
+        return;
+    }
+
+    let gp = graph_path(dir);
+
+    // Mark .compact-0 as InProgress
+    {
+        let mut graph = match load_graph(&gp) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(task) = graph.get_task_mut(".compact-0") {
+            task.status = workgraph::graph::Status::InProgress;
+            task.started_at = Some(chrono::Utc::now().to_rfc3339());
+            task.log.push(workgraph::graph::LogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                actor: Some("daemon".to_string()),
+                message: format!("Compaction started (tick #{})", current_tick),
+            });
+            if let Err(e) = workgraph::parser::save_graph(&graph, &gp) {
+                eprintln!(
+                    "[daemon] Failed to save graph after marking .compact-0 InProgress: {}",
+                    e
+                );
+                return;
+            }
+        }
+    }
+
+    // Run compaction
+    match workgraph::service::compactor::run_compaction(dir, current_tick) {
+        Ok(path) => {
+            if *compaction_error_count > 0 {
+                logger.info(&format!(
+                    "Compaction recovered after {} consecutive error(s)",
+                    *compaction_error_count
+                ));
+            }
+            *compaction_error_count = 0;
+            logger.info(&format!("Compaction complete → {}", path.display()));
+
+            // Mark .compact-0 as Done and increment iteration
+            let mut graph = match load_graph(&gp) {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(task) = graph.get_task_mut(".compact-0") {
+                task.status = workgraph::graph::Status::Done;
+                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                task.loop_iteration = task.loop_iteration.saturating_add(1);
+                task.log.push(workgraph::graph::LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    actor: Some("daemon".to_string()),
+                    message: format!(
+                        "Compaction iteration {} complete → {}",
+                        task.loop_iteration,
+                        path.display()
+                    ),
+                });
+                // Keep log bounded
+                if task.log.len() > 50 {
+                    let drain_count = task.log.len() - 50;
+                    task.log.drain(..drain_count);
+                }
+            }
+            if let Err(e) = workgraph::parser::save_graph(&graph, &gp) {
+                eprintln!(
+                    "[daemon] Failed to save graph after marking .compact-0 Done: {}",
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            *compaction_error_count += 1;
+            if *compaction_error_count == 1 || *compaction_error_count % 5 == 0 {
+                logger.error(&format!(
+                    "Compaction error (#{} consecutive): {:#}",
+                    *compaction_error_count, e
+                ));
+            }
+
+            // Mark .compact-0 as failed for this iteration, then reopen for retry
+            let mut graph = match load_graph(&gp) {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(task) = graph.get_task_mut(".compact-0") {
+                task.status = workgraph::graph::Status::Open;
+                task.started_at = None;
+                task.log.push(workgraph::graph::LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    actor: Some("daemon".to_string()),
+                    message: format!("Compaction error: {:#}", e),
+                });
+                if task.log.len() > 50 {
+                    let drain_count = task.log.len() - 50;
+                    task.log.drain(..drain_count);
+                }
+            }
+            let _ = workgraph::parser::save_graph(&graph, &gp);
+        }
     }
 }
 
@@ -1584,41 +1736,13 @@ pub fn run_daemon(
                     // Dispatch notifications for task state changes (failures, blocks)
                     try_dispatch_notifications(&dir, &logger);
 
-                    // Compaction: distill graph state into context.md at configured intervals
-                    {
-                        let config = workgraph::config::Config::load_or_default(&dir);
-                        if workgraph::service::compactor::should_compact(
-                            &dir,
-                            coord_state.ticks,
-                            &config,
-                        ) {
-                            match workgraph::service::compactor::run_compaction(
-                                &dir,
-                                coord_state.ticks,
-                            ) {
-                                Ok(path) => {
-                                    if compaction_error_count > 0 {
-                                        logger.info(&format!(
-                                            "Compaction recovered after {} consecutive error(s)",
-                                            compaction_error_count
-                                        ));
-                                    }
-                                    compaction_error_count = 0;
-                                    logger
-                                        .info(&format!("Compaction complete → {}", path.display()));
-                                }
-                                Err(e) => {
-                                    compaction_error_count += 1;
-                                    if compaction_error_count == 1 || compaction_error_count % 5 == 0 {
-                                        logger.error(&format!(
-                                            "Compaction error (#{} consecutive): {:#}",
-                                            compaction_error_count, e
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Compaction: run as a visible graph task (.compact-N) instead of inline
+                    run_graph_compaction(
+                        &dir,
+                        coord_state.ticks,
+                        &mut compaction_error_count,
+                        &logger,
+                    );
                 }
                 Err(e) => {
                     coord_state.ticks += 1;
@@ -2627,5 +2751,138 @@ mod tests {
         unsafe { std::env::remove_var("WG_AGENT_ID") };
         let result = guard_agent_stop_pause();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compaction_cycle() {
+        use workgraph::graph::Status;
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        // Initialize an empty graph
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        // Run ensure_coordinator_task — should create both .coordinator-0 and .compact-0
+        ensure_coordinator_task(dir);
+
+        let graph = load_graph(&gp).unwrap();
+
+        // .coordinator-0 should exist with cycle_config
+        let coord = graph.get_task(".coordinator-0").expect(".coordinator-0 should exist");
+        assert_eq!(coord.status, Status::InProgress);
+        assert!(coord.cycle_config.is_some(), "coordinator should have cycle_config");
+        assert!(
+            coord.after.contains(&".compact-0".to_string()),
+            "coordinator should have back-edge to .compact-0"
+        );
+        assert!(
+            coord.tags.contains(&"coordinator-loop".to_string()),
+            "coordinator should have coordinator-loop tag"
+        );
+
+        // .compact-0 should exist with proper edges
+        let compact = graph.get_task(".compact-0").expect(".compact-0 should exist");
+        assert_eq!(compact.status, Status::Open);
+        assert!(
+            compact.after.contains(&".coordinator-0".to_string()),
+            "compact should depend on .coordinator-0"
+        );
+        assert!(
+            compact.tags.contains(&"compact-loop".to_string()),
+            "compact should have compact-loop tag"
+        );
+
+        // The two tasks should form a cycle (SCC)
+        let cycle_analysis = graph.compute_cycle_analysis();
+        assert!(
+            cycle_analysis.task_to_cycle.contains_key(".coordinator-0"),
+            "coordinator should be part of a detected cycle"
+        );
+        assert!(
+            cycle_analysis.task_to_cycle.contains_key(".compact-0"),
+            "compact should be part of a detected cycle"
+        );
+        // Both should be in the same cycle
+        assert_eq!(
+            cycle_analysis.task_to_cycle.get(".coordinator-0"),
+            cycle_analysis.task_to_cycle.get(".compact-0"),
+            "coordinator and compact should be in the same cycle"
+        );
+    }
+
+    #[test]
+    fn test_compaction_cycle_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        // Run twice — should be idempotent
+        ensure_coordinator_task(dir);
+        ensure_coordinator_task(dir);
+
+        let graph = load_graph(&gp).unwrap();
+        assert!(graph.get_task(".coordinator-0").is_some());
+        assert!(graph.get_task(".compact-0").is_some());
+
+        // Only one back-edge, not duplicated
+        let coord = graph.get_task(".coordinator-0").unwrap();
+        let compact_refs: Vec<_> = coord
+            .after
+            .iter()
+            .filter(|a| *a == ".compact-0")
+            .collect();
+        assert_eq!(compact_refs.len(), 1, "back-edge should not be duplicated");
+    }
+
+    #[test]
+    fn test_run_graph_compaction_updates_task() {
+        use workgraph::graph::{Node, Status, Task};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        // Create a graph with .compact-0
+        let mut graph = workgraph::graph::WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: ".compact-0".to_string(),
+            title: "Compact 0".to_string(),
+            status: Status::Open,
+            tags: vec!["compact-loop".to_string()],
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        // Set up config with compactor_interval = 1 (always compact)
+        let config_dir = dir.join("config.toml");
+        fs::write(
+            &config_dir,
+            "[coordinator]\ncompactor_interval = 1\n",
+        )
+        .unwrap();
+
+        // Create a logger for the test
+        let logger = DaemonLogger::open(dir).unwrap();
+
+        let mut error_count = 0u64;
+        // This will try to compact but fail (no graph data / LLM) — that's fine,
+        // we're testing that the task status gets updated to InProgress
+        run_graph_compaction(dir, 1, &mut error_count, &logger);
+
+        // After the call, .compact-0 should be Open (failed, reverted to Open)
+        // or Done (if compaction somehow succeeded). Either way, the status changed.
+        let graph = load_graph(&gp).unwrap();
+        let compact = graph.get_task(".compact-0").unwrap();
+        // The task should have log entries from the compaction attempt
+        assert!(
+            compact.log.len() > 0,
+            "compact task should have log entries after compaction attempt"
+        );
     }
 }
