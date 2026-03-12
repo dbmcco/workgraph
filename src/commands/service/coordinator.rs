@@ -1370,10 +1370,22 @@ fn build_auto_assign_tasks(
                 let creator_resolved =
                     config.resolve_model_for_role(workgraph::config::DispatchRole::Creator);
 
+                // Find most recently completed non-system task for graph connectivity
+                let causal_edge: Vec<String> = graph
+                    .tasks()
+                    .filter(|t| {
+                        t.status == Status::Done
+                            && !workgraph::graph::is_system_task(&t.id)
+                    })
+                    .max_by(|a, b| a.completed_at.cmp(&b.completed_at))
+                    .map(|t| vec![t.id.clone()])
+                    .unwrap_or_default();
+
                 let desc = format!(
                     "## Creator Triggered by Assigner\n\n\
                      The assigner could not find a good agent match for task '{}' ({}).\n\
                      Reason: {}\n\n\
+                     **Triggering task:** `{}`\n\n\
                      Run `wg agency create` to expand the primitive store.\n",
                     source_id,
                     graph
@@ -1381,6 +1393,7 @@ fn build_auto_assign_tasks(
                         .map(|t| t.title.as_str())
                         .unwrap_or("?"),
                     verdict.reason,
+                    source_id,
                 );
 
                 let create_task = Task {
@@ -1391,7 +1404,7 @@ fn build_auto_assign_tasks(
                     assigned: None,
                     estimate: None,
                     before: vec![],
-                    after: vec![],
+                    after: causal_edge,
                     requires: vec![],
                     tags: vec!["creation".to_string(), "agency".to_string()],
                     skills: vec![],
@@ -1851,11 +1864,30 @@ fn build_auto_evolve_task(
         }
     };
 
+    // Causal edges: recently completed non-system tasks for graph connectivity
+    let mut recent_completed: Vec<_> = graph
+        .tasks()
+        .filter(|t| t.status == Status::Done && !workgraph::graph::is_system_task(&t.id))
+        .map(|t| (t.id.clone(), t.completed_at.clone()))
+        .collect();
+    recent_completed.sort_by(|a, b| b.1.cmp(&a.1));
+    let causal_ids: Vec<String> = recent_completed
+        .iter()
+        .take(5)
+        .map(|(id, _)| id.clone())
+        .collect();
+
     // Build the evolve command with safe strategies
     let safe_strategies = evolver::SAFE_STRATEGIES.join(",");
+    let causal_list = causal_ids
+        .iter()
+        .map(|id| format!("- `{}`", id))
+        .collect::<Vec<_>>()
+        .join("\n");
     let desc = format!(
         "## Auto-Evolution Cycle\n\n\
          **Trigger:** {}\n\n\
+         **Recently completed tasks:**\n{}\n\n\
          Run `wg evolve --budget {} --strategy mutation` to evolve agency roles and tradeoffs.\n\n\
          ### Constraints\n\
          - Safe strategies only: {}\n\
@@ -1865,7 +1897,7 @@ fn build_auto_evolve_task(
          1. Run `wg evolve --budget {}` (the evolver will use safe strategies)\n\
          2. Log the results\n\
          3. Mark this task done\n",
-        trigger_reason, budget, safe_strategies, budget, budget,
+        trigger_reason, causal_list, budget, safe_strategies, budget, budget,
     );
 
     let evolver_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evolver);
@@ -1878,7 +1910,7 @@ fn build_auto_evolve_task(
         assigned: None,
         estimate: None,
         before: vec![],
-        after: vec![],
+        after: causal_ids,
         requires: vec![],
         tags: vec!["evolution".to_string(), "agency".to_string()],
         skills: vec![],
@@ -1992,11 +2024,14 @@ fn build_auto_create_task(
         return false;
     }
 
-    // Count completed (Done) non-system tasks
-    let completed_count = graph
+    // Collect completed (Done) non-system tasks, sorted by completed_at desc
+    let mut completed_tasks: Vec<_> = graph
         .tasks()
         .filter(|t| t.status == Status::Done && !workgraph::graph::is_system_task(&t.id))
-        .count() as u32;
+        .map(|t| (t.id.clone(), t.completed_at.clone()))
+        .collect();
+    let completed_count = completed_tasks.len() as u32;
+    completed_tasks.sort_by(|a, b| b.1.cmp(&a.1));
 
     // Load last creator invocation count from state file
     let state_path = agency_dir.join("creator_state.json");
@@ -2012,22 +2047,35 @@ fn build_auto_create_task(
         return false;
     }
 
+    // Causal edges: recently completed tasks that triggered the threshold (all Done, won't block)
+    let trigger_ids: Vec<String> = completed_tasks
+        .iter()
+        .take(since_last.min(5) as usize)
+        .map(|(id, _)| id.clone())
+        .collect();
+
     // Generate create task ID
     let ts = Utc::now().format("%Y%m%d-%H%M%S");
     let create_task_id = format!(".create-{}", ts);
 
     let creator_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Creator);
 
+    let trigger_list = trigger_ids
+        .iter()
+        .map(|id| format!("- `{}`", id))
+        .collect::<Vec<_>>()
+        .join("\n");
     let desc = format!(
         "## Auto-Creator Cycle\n\n\
          **Trigger:** {} completed tasks since last creation (threshold: {})\n\n\
+         **Triggering tasks:**\n{}\n\n\
          Run `wg agency create` to expand the primitive store with new role components,\n\
          desired outcomes, and tradeoff configurations.\n\n\
          ### Instructions\n\
          1. Run `wg agency create`\n\
          2. Log the results\n\
          3. Mark this task done\n",
-        since_last, config.agency.auto_create_threshold,
+        since_last, config.agency.auto_create_threshold, trigger_list,
     );
 
     let create_task = Task {
@@ -2038,7 +2086,7 @@ fn build_auto_create_task(
         assigned: None,
         estimate: None,
         before: vec![],
-        after: vec![],
+        after: trigger_ids,
         requires: vec![],
         tags: vec!["creation".to_string(), "agency".to_string()],
         skills: vec![],
