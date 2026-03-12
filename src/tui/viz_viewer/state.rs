@@ -1953,6 +1953,9 @@ pub struct VizApp {
     pub messages_panel: MessagesPanelState,
     /// Per-task message drafts: persists unsent text across task/panel switches.
     pub message_drafts: HashMap<String, String>,
+    /// Cached coordinator message status per task ID (TUI-perspective read state).
+    /// Refreshed each graph reload. Used to color the Messages tab header.
+    pub task_message_statuses: HashMap<String, workgraph::messages::CoordinatorMessageStatus>,
 
     // ── Config panel state (panel 5) ──
     pub config_panel: ConfigPanelState,
@@ -2182,6 +2185,7 @@ impl VizApp {
             coord_log: CoordLogState::default(),
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
+            task_message_statuses: HashMap::new(),
             config_panel: ConfigPanelState::default(),
             archive_browser: ArchiveBrowserState::default(),
             file_browser: None,
@@ -3234,6 +3238,15 @@ impl VizApp {
         self.task_counts = counts;
         self.total_usage = total_usage;
         self.task_token_map = task_token_map;
+
+        // Refresh coordinator message statuses for all tasks.
+        self.task_message_statuses = graph
+            .tasks()
+            .filter_map(|t| {
+                workgraph::messages::coordinator_message_status(&self.workgraph_dir, &t.id)
+                    .map(|s| (t.id.clone(), s))
+            })
+            .collect();
 
         // Enforce animation cap: drop oldest if we exceed MAX_ANIMATIONS.
         self.enforce_animation_cap();
@@ -4727,6 +4740,7 @@ impl VizApp {
             coord_log: CoordLogState::default(),
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
+            task_message_statuses: HashMap::new(),
             cmd_rx: mpsc::channel().1,
             cmd_tx: mpsc::channel().0,
             notification: None,
@@ -8564,6 +8578,7 @@ mod hud_tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         (result, graph, tmp)
     }
@@ -9122,6 +9137,7 @@ mod hud_tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let mut app = build_app(&viz, "long-desc", tmp.path());
@@ -9176,6 +9192,7 @@ mod hud_tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let mut app = build_app(&viz, "collapse-test", tmp.path());
@@ -9225,6 +9242,7 @@ mod hud_tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -9381,6 +9399,7 @@ mod remap_panel_tests {
             VizLayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -9689,6 +9708,7 @@ mod firehose_tests {
             VizLayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         let mut app = VizApp::from_viz_output_for_test(&viz);
@@ -10044,6 +10064,7 @@ mod tui_config_panel_tests {
             VizLayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         let mut app = VizApp::from_viz_output_for_test(&viz);

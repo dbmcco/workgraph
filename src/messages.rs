@@ -628,8 +628,8 @@ impl CoordinatorMessageStatus {
     /// ANSI color for this status (ratatui Color).
     pub fn color(&self) -> ratatui::style::Color {
         match self {
-            CoordinatorMessageStatus::Unseen => ratatui::style::Color::Yellow,
-            CoordinatorMessageStatus::Seen => ratatui::style::Color::Gray,
+            CoordinatorMessageStatus::Unseen => ratatui::style::Color::DarkGray,
+            CoordinatorMessageStatus::Seen => ratatui::style::Color::Yellow,
             CoordinatorMessageStatus::Replied => ratatui::style::Color::Green,
         }
     }
@@ -637,9 +637,18 @@ impl CoordinatorMessageStatus {
     /// Single-character icon for this status.
     pub fn icon(&self) -> char {
         match self {
-            CoordinatorMessageStatus::Unseen => '!',
-            CoordinatorMessageStatus::Seen => '·',
-            CoordinatorMessageStatus::Replied => '✓',
+            CoordinatorMessageStatus::Unseen => '✉',
+            CoordinatorMessageStatus::Seen => '✓',
+            CoordinatorMessageStatus::Replied => '↩',
+        }
+    }
+
+    /// ANSI escape code prefix for terminal coloring.
+    pub fn ansi_prefix(&self) -> &'static str {
+        match self {
+            CoordinatorMessageStatus::Unseen => "\x1b[90m",  // DarkGray
+            CoordinatorMessageStatus::Seen => "\x1b[33m",    // Yellow
+            CoordinatorMessageStatus::Replied => "\x1b[32m", // Green
         }
     }
 }

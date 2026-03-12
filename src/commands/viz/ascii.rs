@@ -2,7 +2,7 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, format_token_display};
-use workgraph::messages::MessageStats;
+use workgraph::messages::{CoordinatorMessageStatus, MessageStats};
 
 use super::{LayoutMode, VizOutput};
 
@@ -35,6 +35,7 @@ pub(crate) fn generate_ascii(
     context_ids: &HashSet<String>,
     edge_color: &str,
     message_stats: &HashMap<String, MessageStats>,
+    coordinator_status: &HashMap<String, CoordinatorMessageStatus>,
 ) -> VizOutput {
     if tasks.is_empty() {
         return VizOutput {
@@ -354,19 +355,30 @@ pub(crate) fn generate_ascii(
                     format!("{}", stats.incoming)
                 };
                 if use_color {
-                    // Green: all messages responded to
-                    // Blue: all messages read (but not responded)
-                    // Yellow: has unread messages
-                    let color = if stats.responded {
-                        "\x1b[32m" // green
-                    } else if !stats.has_unread {
-                        "\x1b[34m" // blue
+                    if let Some(status) = coordinator_status.get(id) {
+                        format!(
+                            " {}{}{}\x1b[0m",
+                            status.ansi_prefix(),
+                            status.icon(),
+                            count_str
+                        )
                     } else {
-                        "\x1b[33m" // yellow
-                    };
-                    format!(" {}✉{}\x1b[0m", color, count_str)
+                        // No TUI cursor data: fall back to MessageStats-based coloring.
+                        let color = if stats.responded {
+                            "\x1b[32m" // green
+                        } else if !stats.has_unread {
+                            "\x1b[34m" // blue
+                        } else {
+                            "\x1b[33m" // yellow
+                        };
+                        format!(" {}✉{}\x1b[0m", color, count_str)
+                    }
                 } else {
-                    format!(" ✉{}", count_str)
+                    let icon = coordinator_status
+                        .get(id)
+                        .map(|s| s.icon())
+                        .unwrap_or('✉');
+                    format!(" {}{}", icon, count_str)
                 }
             })
             .unwrap_or_default();
@@ -1517,6 +1529,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(result.text, "(no tasks to display)");
     }
@@ -1543,6 +1556,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1579,6 +1593,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // a is root with two children
@@ -1614,6 +1629,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // c should appear, and the fan-in edge should be shown as a right-side arc
@@ -1646,6 +1662,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(result.text.contains("solo"));
@@ -1676,6 +1693,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1708,6 +1726,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1759,6 +1778,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Internal task should NOT appear
@@ -1797,6 +1817,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1841,6 +1862,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(!result.text.contains("evaluate-my-task"));
@@ -1878,6 +1900,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1922,6 +1945,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1969,6 +1993,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2018,6 +2043,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Task with cycle_config should show the ↺ symbol
@@ -2047,6 +2073,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2098,6 +2125,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2159,6 +2187,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Fan-in should produce a right-side arc (not a text annotation)
@@ -2216,6 +2245,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         eprintln!("DIAMOND:\n{}", result.text);
 
@@ -2263,6 +2293,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("TREE:\n{}", result_tree.text);
@@ -2316,6 +2347,7 @@ mod tests {
             LayoutMode::Diamond,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("WIDE DIAMOND:\n{}", result.text);
@@ -2371,6 +2403,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2440,6 +2473,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Should have exactly one ← (same-target collapse)
@@ -2496,6 +2530,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Lines with arcs should have space before the dash fill
@@ -2541,6 +2576,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Find the lines
@@ -2578,6 +2614,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         let tree_lines: Vec<&str> = result_tree.text.lines().collect();
@@ -2630,6 +2667,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2688,6 +2726,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2779,6 +2818,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         eprintln!("CROSSING OUTPUT:\n{}", result.text);
         // Should contain crossing character ┼ where verticals cross horizontals
@@ -2820,6 +2860,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2885,6 +2926,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Output should look like:
@@ -2936,6 +2978,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -3051,6 +3094,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         )
     }
@@ -3450,6 +3494,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4347,6 +4392,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let a_line = viz.node_line_map["a"];
@@ -4440,6 +4486,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // All 110 tasks should appear in the output
@@ -4511,6 +4558,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Should not be empty
@@ -4552,6 +4600,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4614,6 +4663,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // cycle_members should contain both a and b
@@ -4673,6 +4723,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert!(
             !result_hidden.text.contains(".assign-my-task"),
@@ -4691,6 +4742,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert!(
@@ -4745,6 +4797,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4824,6 +4877,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(!result.text.is_empty());
@@ -4872,6 +4926,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4928,6 +4983,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let coord_pos = result
@@ -4976,6 +5032,7 @@ mod tests {
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 

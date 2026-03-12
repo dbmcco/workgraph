@@ -1439,8 +1439,12 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.last_tab_bar_area = tab_area;
     app.last_right_content_area = content_area;
 
-    // Tab bar
-    draw_tab_bar(frame, app.right_panel_tab, tab_area);
+    // Tab bar — pass selected task's message status for the Msg tab indicator.
+    let msg_status = app
+        .selected_task_id()
+        .and_then(|id| app.task_message_statuses.get(id))
+        .cloned();
+    draw_tab_bar(frame, app.right_panel_tab, tab_area, msg_status);
 
     // Apply slide animation offset to the content area.
     let content_area = if let Some(ref anim) = app.slide_animation {
@@ -1508,10 +1512,29 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 }
 
 /// Draw the tab bar for the right panel.
-fn draw_tab_bar(frame: &mut Frame, active: RightPanelTab, area: Rect) {
-    let tab_labels: Vec<String> = RightPanelTab::ALL
+/// `msg_status` colors the Messages tab icon to reflect TUI read state.
+fn draw_tab_bar(
+    frame: &mut Frame,
+    active: RightPanelTab,
+    area: Rect,
+    msg_status: Option<workgraph::messages::CoordinatorMessageStatus>,
+) {
+    let tab_labels: Vec<Line> = RightPanelTab::ALL
         .iter()
-        .map(|t| format!("{}:{}", t.index(), t.label()))
+        .map(|t| {
+            if *t == RightPanelTab::Messages {
+                if let Some(ref status) = msg_status {
+                    return Line::from(vec![
+                        Span::raw(format!("{}:", t.index())),
+                        Span::styled(
+                            format!("{} {}", t.label(), status.icon()),
+                            Style::default().fg(status.color()),
+                        ),
+                    ]);
+                }
+            }
+            Line::from(format!("{}:{}", t.index(), t.label()))
+        })
         .collect();
     let active_idx = active.index();
 
@@ -5992,6 +6015,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         (result, graph)
     }
@@ -6294,6 +6318,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6767,6 +6792,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
         (result, graph)
     }
@@ -6965,6 +6991,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Test with b-prog selected (so a-root is upstream, c-open is downstream,
@@ -7065,6 +7092,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -7408,6 +7436,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Build app with NO selection
@@ -7511,6 +7540,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // The annotation [assigning] must appear in the output
@@ -7560,6 +7590,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let task_line_idx2 = viz2.node_line_map["eval-task"];
@@ -7603,6 +7634,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let task_line_idx3 = viz3.node_line_map["val-task"];
@@ -7641,6 +7673,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -7691,6 +7724,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -7788,6 +7822,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -7931,6 +7966,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let app = build_app_from_viz_output(&viz, "gc3");
@@ -8037,6 +8073,7 @@ mod tests {
                 LayoutMode::default(),
                 &HashSet::new(),
                 "gray",
+                &HashMap::new(),
                 &HashMap::new(),
             )
         };
@@ -8483,6 +8520,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         (result, graph)
@@ -8986,6 +9024,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let mut app = VizApp::from_viz_output_for_test(&viz);
@@ -9059,6 +9098,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -9165,6 +9205,7 @@ mod tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let mut app = VizApp::from_viz_output_for_test(&viz);
@@ -9229,6 +9270,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -9391,6 +9433,7 @@ mod tests {
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 

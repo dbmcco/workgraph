@@ -2964,6 +2964,7 @@ mod scrollbar_tests {
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         let mut app = VizApp::from_viz_output_for_test(&viz);
@@ -3925,6 +3926,7 @@ mod scrollbar_tests {
             VizLayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 

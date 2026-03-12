@@ -641,6 +641,16 @@ pub fn generate_viz_output_from_graph(
         })
         .collect();
 
+    // Compute per-task coordinator message status (TUI-perspective read state).
+    let coordinator_status: HashMap<String, workgraph::messages::CoordinatorMessageStatus> =
+        tasks_to_show
+            .iter()
+            .filter_map(|t| {
+                workgraph::messages::coordinator_message_status(dir, &t.id)
+                    .map(|s| (t.id.clone(), s))
+            })
+            .collect();
+
     // Generate output
     let output = match options.format {
         OutputFormat::Ascii => ascii::generate_ascii(
@@ -654,6 +664,7 @@ pub fn generate_viz_output_from_graph(
             &context_ids,
             &options.edge_color,
             &message_stats,
+            &coordinator_status,
         ),
         _ => {
             let text = match options.format {
