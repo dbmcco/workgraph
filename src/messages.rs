@@ -613,6 +613,96 @@ impl MessageAdapter for ShellMessageAdapter {
     }
 }
 
+/// Status of coordinator-side (TUI) message read state for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorMessageStatus {
+    /// Task has messages and the TUI has not viewed them yet.
+    Unseen,
+    /// TUI has viewed all messages but not replied after the last incoming message.
+    Seen,
+    /// The TUI (or user/coordinator) has sent a reply after the last incoming message.
+    Replied,
+}
+
+impl CoordinatorMessageStatus {
+    /// ANSI color for this status (ratatui Color).
+    pub fn color(&self) -> ratatui::style::Color {
+        match self {
+            CoordinatorMessageStatus::Unseen => ratatui::style::Color::Yellow,
+            CoordinatorMessageStatus::Seen => ratatui::style::Color::Gray,
+            CoordinatorMessageStatus::Replied => ratatui::style::Color::Green,
+        }
+    }
+
+    /// Single-character icon for this status.
+    pub fn icon(&self) -> char {
+        match self {
+            CoordinatorMessageStatus::Unseen => '!',
+            CoordinatorMessageStatus::Seen => '·',
+            CoordinatorMessageStatus::Replied => '✓',
+        }
+    }
+}
+
+/// Compute the coordinator (TUI) message status for a given task.
+///
+/// Uses the "tui" cursor to determine what the coordinator has seen.
+/// - `Replied`: an outgoing message from "tui", "user", or "coordinator" exists
+///   after the last incoming message.
+/// - `Seen`: tui cursor >= max incoming message ID (all seen, no reply yet).
+/// - `Unseen`: tui cursor < max incoming message ID or no cursor exists.
+///
+/// Returns `None` if the task has no messages.
+pub fn coordinator_message_status(
+    workgraph_dir: &Path,
+    task_id: &str,
+) -> Option<CoordinatorMessageStatus> {
+    let messages = list_messages(workgraph_dir, task_id).ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Senders considered "coordinator-side" (outgoing from the TUI perspective).
+    let is_coordinator_sender = |sender: &str| {
+        matches!(sender, "tui" | "user" | "coordinator")
+    };
+
+    let mut last_incoming_id: u64 = 0;
+    let mut last_outgoing_after_incoming_id: u64 = 0;
+
+    // Walk messages in order to find last incoming and whether there's an outgoing reply after it.
+    for msg in &messages {
+        if is_coordinator_sender(&msg.sender) {
+            // This is an outgoing message from the coordinator side.
+            if last_incoming_id > 0 && msg.id > last_incoming_id {
+                last_outgoing_after_incoming_id = msg.id;
+            }
+        } else {
+            // Incoming message — reset the outgoing-after-incoming tracker.
+            last_incoming_id = msg.id;
+            last_outgoing_after_incoming_id = 0;
+        }
+    }
+
+    if last_incoming_id == 0 {
+        // All messages are outgoing — no incoming messages to respond to.
+        return None;
+    }
+
+    // Check if there's a reply after the last incoming message.
+    if last_outgoing_after_incoming_id > last_incoming_id {
+        return Some(CoordinatorMessageStatus::Replied);
+    }
+
+    // Check the TUI cursor: if it's >= last_incoming_id, the user has seen everything.
+    let tui_cursor = read_cursor(workgraph_dir, "tui", task_id).unwrap_or(0);
+    if tui_cursor >= last_incoming_id {
+        Some(CoordinatorMessageStatus::Seen)
+    } else {
+        Some(CoordinatorMessageStatus::Unseen)
+    }
+}
+
 /// Create the appropriate message adapter for a given executor type.
 ///
 /// Returns a boxed trait object that handles message delivery for that executor.
@@ -1148,5 +1238,94 @@ mod tests {
 
         let notif_path = notification_file(&wg_dir, "agent-new");
         assert!(notif_path.exists());
+    }
+
+    // --- CoordinatorMessageStatus tests ---
+
+    #[test]
+    fn test_coordinator_message_status_no_messages() {
+        let (_tmp, wg_dir) = setup();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn test_coordinator_message_status_unseen() {
+        let (_tmp, wg_dir) = setup();
+        // Send an incoming message (from agent, not tui/user/coordinator)
+        send_message(&wg_dir, "task-1", "Hello", "agent-1", "normal").unwrap();
+        // No cursor set — should be Unseen
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_unseen_cursor_behind() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Msg 1", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Msg 2", "agent-1", "normal").unwrap();
+        // Cursor at 1 but last incoming is 2
+        write_cursor(&wg_dir, "tui", "task-1", 1).unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_seen() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Hello", "agent-1", "normal").unwrap();
+        // TUI cursor advanced to cover the incoming message
+        write_cursor(&wg_dir, "tui", "task-1", 1).unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Seen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_tui() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "tui", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_user() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "user", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_coordinator() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "coordinator", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_resets_on_new_incoming() {
+        let (_tmp, wg_dir) = setup();
+        // Agent asks, user replies, then agent asks again
+        send_message(&wg_dir, "task-1", "Q1", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "A1", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Q2", "agent-1", "normal").unwrap();
+        // Now Q2 is unanswered — should be Unseen (no cursor advance)
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_all_outgoing_returns_none() {
+        let (_tmp, wg_dir) = setup();
+        // Only outgoing messages from the coordinator side
+        send_message(&wg_dir, "task-1", "Hello", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Follow-up", "tui", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, None);
     }
 }

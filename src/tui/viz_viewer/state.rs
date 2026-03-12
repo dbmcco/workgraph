@@ -4552,6 +4552,18 @@ impl VizApp {
                     responded,
                     unanswered: unanswered_incoming.len(),
                 };
+
+                // Auto-advance the TUI read cursor so the coordinator knows
+                // which messages have been seen.
+                let max_id = msgs.last().map(|m| m.id).unwrap_or(0);
+                if max_id > 0 {
+                    let _ = workgraph::messages::write_cursor(
+                        &self.workgraph_dir,
+                        "tui",
+                        &task_id,
+                        max_id,
+                    );
+                }
             }
             Err(_) => {
                 self.messages_panel
