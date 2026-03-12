@@ -28,7 +28,7 @@ pub(crate) fn generate_ascii(
     graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     live_token_usage: &HashMap<String, TokenUsage>,
     agency_token_usage: &HashMap<String, TokenUsage>,
     layout: LayoutMode,
@@ -45,6 +45,7 @@ pub(crate) fn generate_ascii(
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: annotations.clone(),
         };
     }
 
@@ -310,7 +311,7 @@ pub(crate) fn generate_ascii(
         };
         let phase_info = annotations
             .get(id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         // Override phase annotation to true pink for agency phases (assigning/evaluating).
@@ -318,16 +319,16 @@ pub(crate) fn generate_ascii(
         // which is used for upstream edge tracing.
         let is_agency_phase = use_color
             && annotations.get(id).is_some_and(|a| {
-                a.contains("placing")
-                    || a.contains("assigning")
-                    || a.contains("evaluating")
-                    || a.contains("validating")
-                    || a.contains("verifying")
+                a.text.contains("placing")
+                    || a.text.contains("assigning")
+                    || a.text.contains("evaluating")
+                    || a.text.contains("validating")
+                    || a.text.contains("verifying")
             });
         let phase_info = if is_agency_phase {
             annotations
                 .get(id)
-                .map(|a| format!(" \x1b[38;5;219m{}\x1b[0m", a))
+                .map(|a| format!(" \x1b[38;5;219m{}\x1b[0m", a.text))
                 .unwrap_or_default()
         } else {
             phase_info
@@ -814,6 +815,7 @@ pub(crate) fn generate_ascii(
         reverse_edges,
         char_edge_map,
         cycle_members: cycle_members_map,
+        annotation_map: annotations.clone(),
     }
 }
 
@@ -1738,7 +1740,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -1782,7 +1784,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(place));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -1825,7 +1827,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(eval));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -3440,8 +3442,9 @@ mod tests {
         graph.add_node(Node::Task(assign));
 
         let tasks: Vec<_> = graph.tasks().collect();
+        let empty: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annotations) =
-            super::super::filter_internal_tasks(&graph, tasks, &HashMap::new());
+            super::super::filter_internal_tasks(&graph, tasks, &empty);
         let filtered_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
         let result = generate_ascii(
             &graph,

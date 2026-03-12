@@ -10,6 +10,16 @@ use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, parse_token_usage_li
 // Re-export public API
 pub use graph::{generate_graph, generate_graph_with_overrides};
 
+/// Rich annotation info for a parent task, carrying both the display text
+/// and the dot-task IDs that produced it (for click resolution in the TUI).
+#[derive(Debug, Clone)]
+pub struct AnnotationInfo {
+    /// The rendered annotation text (e.g. "[⊞ assigning]").
+    pub text: String,
+    /// The system task IDs that contributed to this annotation (e.g. [".assign-my-task"]).
+    pub dot_task_ids: Vec<String>,
+}
+
 /// Structured output from viz generation, containing both the rendered string
 /// and metadata needed for interactive features (e.g., TUI task selection).
 pub struct VizOutput {
@@ -33,6 +43,9 @@ pub struct VizOutput {
     /// Cycle membership: task_id → set of all task IDs in the same SCC.
     /// Only populated for tasks that are in non-trivial SCCs (>1 member).
     pub cycle_members: HashMap<String, HashSet<String>>,
+    /// Phase annotation info per parent task ID, carrying display text and
+    /// the dot-task IDs that produced the annotation (for TUI click resolution).
+    pub annotation_map: HashMap<String, AnnotationInfo>,
 }
 
 /// Output format for visualization
@@ -203,13 +216,13 @@ fn system_task_parent_id(id: &str) -> Option<String> {
 ///
 /// Returns:
 /// - The filtered list of tasks (internal tasks removed)
-/// - A map of parent_task_id → phase annotation string
+/// - A map of parent_task_id → AnnotationInfo (display text + source dot-task IDs)
 pub(crate) fn filter_internal_tasks<'a>(
     _graph: &'a WorkGraph,
     tasks: Vec<&'a Task>,
-    _existing_annotations: &HashMap<String, String>,
-) -> (Vec<&'a Task>, HashMap<String, String>) {
-    let mut annotations: HashMap<String, String> = HashMap::new();
+    _existing_annotations: &HashMap<String, AnnotationInfo>,
+) -> (Vec<&'a Task>, HashMap<String, AnnotationInfo>) {
+    let mut annotations: HashMap<String, AnnotationInfo> = HashMap::new();
     let mut internal_ids: HashSet<&str> = HashSet::new();
 
     for task in &tasks {
@@ -225,10 +238,14 @@ pub(crate) fn filter_internal_tasks<'a>(
             annotations
                 .entry(pid)
                 .and_modify(|existing| {
-                    existing.push(' ');
-                    existing.push_str(annotation);
+                    existing.text.push(' ');
+                    existing.text.push_str(annotation);
+                    existing.dot_task_ids.push(task.id.clone());
                 })
-                .or_insert_with(|| annotation.to_string());
+                .or_insert_with(|| AnnotationInfo {
+                    text: annotation.to_string(),
+                    dot_task_ids: vec![task.id.clone()],
+                });
         }
     }
 
@@ -247,9 +264,9 @@ pub(crate) fn filter_internal_tasks<'a>(
 pub(crate) fn filter_internal_tasks_running_only<'a>(
     _graph: &'a WorkGraph,
     tasks: Vec<&'a Task>,
-    _existing_annotations: &HashMap<String, String>,
-) -> (Vec<&'a Task>, HashMap<String, String>) {
-    let annotations: HashMap<String, String> = HashMap::new();
+    _existing_annotations: &HashMap<String, AnnotationInfo>,
+) -> (Vec<&'a Task>, HashMap<String, AnnotationInfo>) {
+    let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
 
     let filtered: Vec<&'a Task> = tasks
         .into_iter()
@@ -467,7 +484,7 @@ pub fn generate_viz_output_from_graph(
     };
 
     // Filter out internal tasks (assign-*, evaluate-*) unless --show-internal
-    let empty_annotations = HashMap::new();
+    let empty_annotations: HashMap<String, AnnotationInfo> = HashMap::new();
     let (tasks_to_show, annotations) = if options.show_internal {
         (tasks_to_show, empty_annotations)
     } else if options.show_internal_running_only {
@@ -673,6 +690,7 @@ pub fn generate_viz_output_from_graph(
                 reverse_edges: HashMap::new(),
                 char_edge_map: HashMap::new(),
                 cycle_members: HashMap::new(),
+                annotation_map: annotations,
             }
         }
     };
@@ -960,7 +978,7 @@ mod tests {
         graph.add_node(Node::Task(assign_b));
         graph.add_node(Node::Task(task_b));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
         let (filtered, annots) =
             filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
         let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
@@ -970,8 +988,11 @@ mod tests {
         assert!(task_ids.contains("b"));
         assert!(!task_ids.contains("assign-b"));
 
-        // b should show [assigning] annotation
+        // b should show [assigning] annotation with the source dot-task ID
         assert!(annots.contains_key("b"));
+        let b_annot = &annots["b"];
+        assert!(b_annot.text.contains("assigning"));
+        assert!(b_annot.dot_task_ids.contains(&"assign-b".to_string()));
     }
 
     /// Verify the default viz filter includes in-progress tasks alongside open tasks,
@@ -1157,7 +1178,7 @@ mod tests {
         graph.add_node(Node::Task(normal));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
         let (filtered, _) = filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
         let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
 

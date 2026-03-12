@@ -1822,6 +1822,9 @@ pub struct VizApp {
     pub char_edge_map: std::collections::HashMap<(usize, usize), Vec<(String, String)>>,
     /// Cycle membership from VizOutput: task_id → set of SCC members.
     cycle_members: HashMap<String, HashSet<String>>,
+    /// Phase annotation info per parent task: task_id → AnnotationInfo.
+    /// Carries display text and source dot-task IDs for click resolution.
+    pub annotation_map: HashMap<String, crate::commands::viz::AnnotationInfo>,
     /// Set of task IDs in the same SCC as the currently selected task.
     /// Empty if the selected task is not in any cycle.
     pub cycle_set: HashSet<String>,
@@ -2098,6 +2101,7 @@ impl VizApp {
             downstream_set: HashSet::new(),
             char_edge_map: std::collections::HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
@@ -2235,6 +2239,7 @@ impl VizApp {
                 self.reverse_edges = viz_output.reverse_edges;
                 self.char_edge_map = viz_output.char_edge_map;
                 self.cycle_members = viz_output.cycle_members;
+                self.annotation_map = viz_output.annotation_map;
 
                 // Detect newly appeared tasks and register splash animations.
                 // Skip on initial load (old_task_order is empty).
@@ -4600,6 +4605,7 @@ impl VizApp {
             downstream_set: HashSet::new(),
             char_edge_map: viz.char_edge_map.clone(),
             cycle_members: viz.cycle_members.clone(),
+            annotation_map: viz.annotation_map.clone(),
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
@@ -8962,6 +8968,7 @@ mod hud_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         };
 
         let mut app = VizApp::from_viz_output_for_test(&empty_viz);

@@ -17,7 +17,7 @@ pub fn generate_graph(
     graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     live_token_usage: &HashMap<String, TokenUsage>,
     agency_token_usage: &HashMap<String, TokenUsage>,
     context_ids: &HashSet<String>,
@@ -41,7 +41,7 @@ pub fn generate_graph_with_overrides(
     _graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     status_overrides: &HashMap<&str, Status>,
     live_token_usage: &HashMap<String, TokenUsage>,
     agency_token_usage: &HashMap<String, TokenUsage>,
@@ -207,7 +207,7 @@ pub fn generate_graph_with_overrides(
         } else {
             let phase = annotations
                 .get(id)
-                .map(|a| format!(" {}", a))
+                .map(|a| format!(" {}", a.text))
                 .unwrap_or_default();
 
             let loop_info = if is_coordinator {

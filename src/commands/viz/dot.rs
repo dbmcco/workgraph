@@ -9,7 +9,7 @@ pub(crate) fn generate_dot(
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
     critical_path: &HashSet<String>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
 ) -> String {
     let mut lines = vec![
         "digraph workgraph {".to_string(),
@@ -41,7 +41,7 @@ pub(crate) fn generate_dot(
         // Add phase annotation if present
         let phase_str = annotations
             .get(&task.id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         let label = format!("{}\\n{}{}{}", task.id, task.title, hours_str, phase_str);
@@ -162,7 +162,7 @@ pub(crate) fn generate_mermaid(
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
     critical_path: &HashSet<String>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
 ) -> String {
     let mut lines = Vec::new();
 
@@ -183,7 +183,7 @@ pub(crate) fn generate_mermaid(
         // Add phase annotation if present
         let phase_str = annotations
             .get(&task.id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         let label = format!("{}: {}{}{}", task.id, title, hours_str, phase_str);
@@ -458,7 +458,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -490,7 +490,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),

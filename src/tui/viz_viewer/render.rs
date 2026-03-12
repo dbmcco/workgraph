@@ -7410,7 +7410,10 @@ mod tests {
         graph.add_node(Node::Task(task));
 
         let mut annotations = HashMap::new();
-        annotations.insert("my-task".to_string(), "[assigning]".to_string());
+        annotations.insert("my-task".to_string(), crate::commands::viz::AnnotationInfo {
+            text: "[assigning]".to_string(),
+            dot_task_ids: vec![".assign-my-task".to_string()],
+        });
 
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
@@ -7453,7 +7456,10 @@ mod tests {
         let task2 = make_task_with_status("eval-task", "Eval Task", Status::Done);
         graph2.add_node(Node::Task(task2));
         let mut annotations2 = HashMap::new();
-        annotations2.insert("eval-task".to_string(), "[∴ evaluating]".to_string());
+        annotations2.insert("eval-task".to_string(), crate::commands::viz::AnnotationInfo {
+            text: "[∴ evaluating]".to_string(),
+            dot_task_ids: vec![".evaluate-eval-task".to_string()],
+        });
 
         let tasks2: Vec<_> = graph2.tasks().collect();
         let task_ids2: HashSet<&str> = tasks2.iter().map(|t| t.id.as_str()).collect();
@@ -7490,7 +7496,10 @@ mod tests {
         let task3 = make_task_with_status("val-task", "Val Task", Status::InProgress);
         graph3.add_node(Node::Task(task3));
         let mut annotations3 = HashMap::new();
-        annotations3.insert("val-task".to_string(), "[✓ validating]".to_string());
+        annotations3.insert("val-task".to_string(), crate::commands::viz::AnnotationInfo {
+            text: "[✓ validating]".to_string(),
+            dot_task_ids: vec![".verify-val-task".to_string()],
+        });
 
         let tasks3: Vec<_> = graph3.tasks().collect();
         let task_ids3: HashSet<&str> = tasks3.iter().map(|t| t.id.as_str()).collect();
@@ -7522,7 +7531,13 @@ mod tests {
         let mut annotations4 = HashMap::new();
         annotations4.insert(
             "both-task".to_string(),
-            "[∴ evaluating] [✓ validating]".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[∴ evaluating] [✓ validating]".to_string(),
+                dot_task_ids: vec![
+                    ".evaluate-both-task".to_string(),
+                    ".verify-both-task".to_string(),
+                ],
+            },
         );
 
         let tasks4: Vec<_> = graph4.tasks().collect();
@@ -7567,7 +7582,10 @@ mod tests {
         graph.add_node(Node::Task(child));
 
         let mut annotations = HashMap::new();
-        annotations.insert("child".to_string(), "[assigning]".to_string());
+        annotations.insert("child".to_string(), crate::commands::viz::AnnotationInfo {
+            text: "[assigning]".to_string(),
+            dot_task_ids: vec![".assign-child".to_string()],
+        });
 
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
