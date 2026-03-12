@@ -72,7 +72,7 @@ fn run_animation_loop(
     initial_speed: f64,
 ) -> Result<()> {
     let task_ids: HashSet<&str> = subgraph_ids.iter().copied().collect();
-    let annotations = HashMap::new();
+    let annotations: HashMap<String, super::viz::AnnotationInfo> = HashMap::new();
     let mut current_idx: usize = 0;
     let mut paused = false;
     let mut speed = initial_speed;
@@ -230,7 +230,7 @@ fn render_frame(
     graph: &workgraph::graph::WorkGraph,
     descendants: &[&workgraph::graph::Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::viz::AnnotationInfo>,
     snapshot: &GraphSnapshot,
     current_idx: usize,
     total_snapshots: usize,
