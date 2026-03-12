@@ -1228,7 +1228,7 @@ fn run_graph_compaction(dir: &Path, compaction_error_count: &mut u64, logger: &D
 
         // Gate on token threshold: defer compaction until enough tokens have accumulated
         let config = workgraph::config::Config::load_or_default(dir);
-        let threshold = config.coordinator.compaction_token_threshold;
+        let threshold = config.effective_compaction_threshold();
         if threshold > 0 {
             let state = CoordinatorState::load_or_default(dir);
             if state.accumulated_tokens < threshold {

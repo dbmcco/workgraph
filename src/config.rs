@@ -1659,8 +1659,16 @@ pub struct CoordinatorConfig {
     /// Accumulated coordinator conversation token threshold for triggering compaction.
     /// Compaction is deferred until at least this many tokens have been accumulated
     /// since the last compaction. Default: 100_000. Set to 0 to disable token gating.
+    /// Used as the fallback when context window size cannot be determined.
     #[serde(default = "default_compaction_token_threshold")]
     pub compaction_token_threshold: u64,
+
+    /// Fraction of the coordinator model's context window to use as compaction threshold.
+    /// Threshold = context_window * compaction_threshold_ratio.
+    /// Default: 0.8 (trigger compaction at 80% of context window).
+    /// Set to 0.0 to disable dynamic threshold (use compaction_token_threshold always).
+    #[serde(default = "default_compaction_threshold_ratio")]
+    pub compaction_threshold_ratio: f64,
 
     /// How often to evaluate coordinator turns.
     /// Options: "every", "every_5" (default), "every_10", "sample_20pct", "none"
@@ -1710,6 +1718,10 @@ fn default_compaction_token_threshold() -> u64 {
     100_000
 }
 
+fn default_compaction_threshold_ratio() -> f64 {
+    0.8
+}
+
 fn default_eval_frequency() -> String {
     "every_5".to_string()
 }
@@ -1737,6 +1749,7 @@ impl Default for CoordinatorConfig {
             compactor_interval: default_compactor_interval(),
             compactor_ops_threshold: default_compactor_ops_threshold(),
             compaction_token_threshold: default_compaction_token_threshold(),
+            compaction_threshold_ratio: default_compaction_threshold_ratio(),
             eval_frequency: default_eval_frequency(),
             worktree_isolation: false,
             max_coordinators: default_max_coordinators(),
@@ -2146,6 +2159,39 @@ impl Config {
         }
 
         Ok((config, sources))
+    }
+
+    /// Compute the effective compaction token threshold for the coordinator.
+    ///
+    /// If the coordinator model is found in the registry with a known context window,
+    /// returns `context_window * compaction_threshold_ratio` (dynamic threshold).
+    /// Falls back to `compaction_token_threshold` when:
+    /// - No coordinator model is configured
+    /// - Model not found in registry
+    /// - Model's context_window is 0
+    /// - compaction_threshold_ratio is 0.0
+    pub fn effective_compaction_threshold(&self) -> u64 {
+        let ratio = self.coordinator.compaction_threshold_ratio;
+        if ratio > 0.0 {
+            // Resolve coordinator model ID: coordinator.model first, then agent.model
+            let model_id = self
+                .coordinator
+                .model
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let m = self.agent.model.as_str();
+                    if m.is_empty() { None } else { Some(m) }
+                });
+            if let Some(id) = model_id {
+                if let Some(entry) = self.registry_lookup(id) {
+                    if entry.context_window > 0 {
+                        return (entry.context_window as f64 * ratio).round() as u64;
+                    }
+                }
+            }
+        }
+        self.coordinator.compaction_token_threshold
     }
 
     /// Build the executor command from template
@@ -3372,5 +3418,76 @@ model = "haiku"
         assert_eq!(role_cfg.endpoint.as_deref(), Some("openrouter"));
         assert!(role_cfg.model.is_none()); // Didn't touch model
         assert!(role_cfg.provider.is_none()); // Didn't touch provider
+    }
+
+    // --- effective_compaction_threshold tests ---
+
+    #[test]
+    fn test_effective_compaction_threshold_dynamic_from_registry() {
+        // Built-in "haiku" has context_window=200_000; 80% = 160_000
+        let mut config = Config::default();
+        config.coordinator.model = Some("haiku".to_string());
+        config.coordinator.compaction_threshold_ratio = 0.8;
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 160_000);
+    }
+
+    #[test]
+    fn test_effective_compaction_threshold_mock_200k_context_window() {
+        // Mock API returning 200k context window → threshold set to 160k
+        let mut config = Config::default();
+        config.model_registry = vec![ModelRegistryEntry {
+            id: "mock-model".into(),
+            provider: "anthropic".into(),
+            model: "claude-mock".into(),
+            tier: Tier::Standard,
+            context_window: 200_000,
+            ..Default::default()
+        }];
+        config.coordinator.model = Some("mock-model".to_string());
+        config.coordinator.compaction_threshold_ratio = 0.8;
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 160_000);
+    }
+
+    #[test]
+    fn test_effective_compaction_threshold_fallback_unknown_model() {
+        // Model not in registry → fallback to compaction_token_threshold
+        let mut config = Config::default();
+        config.coordinator.model = Some("unknown-model".to_string());
+        config.coordinator.compaction_token_threshold = 50_000;
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 50_000);
+    }
+
+    #[test]
+    fn test_effective_compaction_threshold_fallback_no_model() {
+        // No coordinator model → falls back to agent.model
+        let config = Config::default();
+        // agent.model defaults to "opus" (200_000 context window)
+        // 200_000 * 0.8 = 160_000
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 160_000); // uses agent.model "opus" fallback
+    }
+
+    #[test]
+    fn test_effective_compaction_threshold_ratio_zero_uses_hardcoded() {
+        // Ratio = 0.0 → always use compaction_token_threshold
+        let mut config = Config::default();
+        config.coordinator.model = Some("haiku".to_string());
+        config.coordinator.compaction_threshold_ratio = 0.0;
+        config.coordinator.compaction_token_threshold = 75_000;
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 75_000);
+    }
+
+    #[test]
+    fn test_effective_compaction_threshold_custom_ratio() {
+        // sonnet has context_window=200_000; 60% = 120_000
+        let mut config = Config::default();
+        config.coordinator.model = Some("sonnet".to_string());
+        config.coordinator.compaction_threshold_ratio = 0.6;
+        let threshold = config.effective_compaction_threshold();
+        assert_eq!(threshold, 120_000);
     }
 }
