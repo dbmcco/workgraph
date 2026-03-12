@@ -148,6 +148,37 @@ pub enum AnimationKind {
     EdgeChange,
     /// A previously hidden task was revealed (e.g. toggling system task visibility).
     Revealed,
+    /// A phase annotation was clicked (brief flash on the annotation text).
+    AnnotationClick,
+}
+
+/// Hit region for a clickable phase annotation in the graph view.
+/// Computed from `plain_lines`, `annotation_map`, and `node_line_map` after each refresh.
+#[derive(Clone, Debug)]
+pub struct AnnotationHitRegion {
+    /// Original line index in `plain_lines`.
+    pub orig_line: usize,
+    /// Start column (inclusive) of the annotation text in the plain line.
+    pub col_start: usize,
+    /// End column (exclusive) of the annotation text in the plain line.
+    pub col_end: usize,
+    /// The parent task ID whose line contains this annotation.
+    pub parent_task_id: String,
+    /// The dot-task IDs that produced this annotation.
+    pub dot_task_ids: Vec<String>,
+}
+
+/// Transient flash state for a clicked annotation.
+#[derive(Clone, Debug)]
+pub struct AnnotationClickFlash {
+    /// Original line index of the flashed annotation.
+    pub orig_line: usize,
+    /// Start column (inclusive).
+    pub col_start: usize,
+    /// End column (exclusive).
+    pub col_end: usize,
+    /// When the flash started.
+    pub start: Instant,
 }
 
 /// A single active flash-and-fade animation on a task.
@@ -235,6 +266,7 @@ fn flash_color_for_kind(kind: AnimationKind) -> (u8, u8, u8) {
         AnimationKind::Assignment => (200, 120, 220), // magenta
         AnimationKind::EdgeChange => (100, 180, 200), // teal
         AnimationKind::Revealed => (120, 120, 140), // soft gray-blue
+        AnimationKind::AnnotationClick => (255, 180, 220), // bright pink
     }
 }
 
@@ -1825,6 +1857,10 @@ pub struct VizApp {
     /// Phase annotation info per parent task: task_id → AnnotationInfo.
     /// Carries display text and source dot-task IDs for click resolution.
     pub annotation_map: HashMap<String, crate::commands::viz::AnnotationInfo>,
+    /// Clickable hit regions for phase annotations, computed from plain_lines + annotation_map.
+    pub annotation_hit_regions: Vec<AnnotationHitRegion>,
+    /// Active annotation click flash (for visual feedback). Clears after 500ms.
+    pub annotation_click_flash: Option<AnnotationClickFlash>,
     /// Set of task IDs in the same SCC as the currently selected task.
     /// Empty if the selected task is not in any cycle.
     pub cycle_set: HashSet<String>,
@@ -2102,6 +2138,8 @@ impl VizApp {
             char_edge_map: std::collections::HashMap::new(),
             cycle_members: HashMap::new(),
             annotation_map: HashMap::new(),
+            annotation_hit_regions: Vec::new(),
+            annotation_click_flash: None,
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
@@ -2240,6 +2278,7 @@ impl VizApp {
                 self.char_edge_map = viz_output.char_edge_map;
                 self.cycle_members = viz_output.cycle_members;
                 self.annotation_map = viz_output.annotation_map;
+                self.compute_annotation_hit_regions();
 
                 // Detect newly appeared tasks and register splash animations.
                 // Skip on initial load (old_task_order is empty).
@@ -2590,6 +2629,34 @@ impl VizApp {
         self.invalidate_messages_panel();
     }
 
+    /// Compute annotation hit regions from `plain_lines`, `annotation_map`, and `node_line_map`.
+    /// Called after each refresh to populate `annotation_hit_regions`.
+    pub fn compute_annotation_hit_regions(&mut self) {
+        self.annotation_hit_regions.clear();
+        for (parent_id, info) in &self.annotation_map {
+            let orig_line = match self.node_line_map.get(parent_id) {
+                Some(&line) => line,
+                None => continue,
+            };
+            let plain = match self.plain_lines.get(orig_line) {
+                Some(line) => line,
+                None => continue,
+            };
+            // The annotation text (e.g. "[⊞ assigning]") is appended to the line.
+            // Find it by searching for the text substring in the plain line.
+            if let Some(col_start) = plain.find(&info.text) {
+                let col_end = col_start + info.text.len();
+                self.annotation_hit_regions.push(AnnotationHitRegion {
+                    orig_line,
+                    col_start,
+                    col_end,
+                    parent_task_id: parent_id.clone(),
+                    dot_task_ids: info.dot_task_ids.clone(),
+                });
+            }
+        }
+    }
+
     /// If the currently selected task is a coordinator task, switch to that
     /// coordinator and show the Chat tab. Call this only from user-initiated
     /// selection changes (keyboard / mouse), NOT from automatic graph refreshes.
@@ -2767,6 +2834,12 @@ impl VizApp {
         let cutoff = std::time::Duration::from_secs_f64(duration);
         self.splash_animations
             .retain(|_, anim| anim.start.elapsed() < cutoff);
+        // Expire annotation click flash after 500ms.
+        if let Some(ref flash) = self.annotation_click_flash {
+            if flash.start.elapsed() > std::time::Duration::from_millis(500) {
+                self.annotation_click_flash = None;
+            }
+        }
     }
 
     /// Enforce the maximum animation count by dropping oldest animations.
@@ -4606,6 +4679,8 @@ impl VizApp {
             char_edge_map: viz.char_edge_map.clone(),
             cycle_members: viz.cycle_members.clone(),
             annotation_map: viz.annotation_map.clone(),
+            annotation_hit_regions: Vec::new(),
+            annotation_click_flash: None,
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,

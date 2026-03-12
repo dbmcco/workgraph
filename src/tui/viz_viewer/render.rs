@@ -410,6 +410,70 @@ fn apply_splash_style<'a>(
     apply_bg_to_title_range(line, plain_line, splash_bg)
 }
 
+/// Apply a brief inverse/highlight flash to the annotation text region of a line.
+/// The flash fades from bright pink background to transparent over 500ms.
+fn apply_annotation_flash<'a>(
+    line: Line<'a>,
+    col_start: usize,
+    col_end: usize,
+    elapsed_ms: u64,
+) -> Line<'a> {
+    // Fade from bright pink to nothing over 500ms.
+    let progress = (elapsed_ms as f64 / 500.0).min(1.0);
+    let t = progress * progress; // ease-out
+    let intensity = 1.0 - t;
+
+    // True pink (ANSI 219) base: (255, 175, 215) — fade toward black.
+    let r = (255.0 * intensity) as u8;
+    let g = (175.0 * intensity) as u8;
+    let b = (215.0 * intensity) as u8;
+
+    if r < 20 && g < 20 && b < 20 {
+        return line;
+    }
+
+    let flash_bg = Color::Rgb(r, g, b);
+    let flash_fg = Color::Rgb(0, 0, 0); // black text on pink bg
+
+    let mut new_spans: Vec<Span<'a>> = Vec::new();
+    let mut char_idx = 0;
+    for span in line.spans {
+        let span_len = span.content.chars().count();
+        let span_start = char_idx;
+        let span_end = char_idx + span_len;
+
+        if span_end <= col_start || span_start >= col_end {
+            // Entirely outside flash region.
+            new_spans.push(span);
+        } else if span_start >= col_start && span_end <= col_end {
+            // Entirely inside flash region.
+            let mut style = span.style;
+            style = style.bg(flash_bg).fg(flash_fg);
+            new_spans.push(Span::styled(span.content, style));
+        } else {
+            // Partially overlapping — split the span.
+            let chars: Vec<char> = span.content.chars().collect();
+            let overlap_start = col_start.saturating_sub(span_start);
+            let overlap_end = col_end.saturating_sub(span_start).min(span_len);
+
+            if overlap_start > 0 {
+                let before: String = chars[..overlap_start].iter().collect();
+                new_spans.push(Span::styled(before, span.style));
+            }
+            let mid: String = chars[overlap_start..overlap_end].iter().collect();
+            let mut mid_style = span.style;
+            mid_style = mid_style.bg(flash_bg).fg(flash_fg);
+            new_spans.push(Span::styled(mid, mid_style));
+            if overlap_end < span_len {
+                let after: String = chars[overlap_end..].iter().collect();
+                new_spans.push(Span::styled(after, span.style));
+            }
+        }
+        char_idx = span_end;
+    }
+    Line::from(new_spans)
+}
+
 /// Find the task title/ID range in a viz line — just the title, not metadata.
 ///
 /// A typical viz line looks like:
@@ -803,6 +867,22 @@ fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 reduced,
                 anim_kind,
             );
+        }
+
+        // Annotation click flash: briefly invert the annotation text colors.
+        if let Some(ref flash) = app.annotation_click_flash {
+            if flash.orig_line == orig_idx {
+                let elapsed_ms = flash.start.elapsed().as_millis() as u64;
+                if elapsed_ms < 500 {
+                    let last = text_lines.last_mut().unwrap();
+                    *last = apply_annotation_flash(
+                        std::mem::take(last),
+                        flash.col_start,
+                        flash.col_end,
+                        elapsed_ms,
+                    );
+                }
+            }
         }
 
         // Chat-to-coordinator visual link: apply a subtle cyan tint to coordinator
@@ -8859,5 +8939,228 @@ mod tests {
         assert_eq!(cursor_in_segments(&segs, 10), (1, 4));
         // Cursor at end (col 11): past end of last segment.
         assert_eq!(cursor_in_segments(&segs, 11), (1, 5));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ANNOTATION CLICK: hit regions, flash animation, and detail loading
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_annotation_click_hit_regions_computed() {
+        // Build a graph with a task that has an annotation.
+        let mut graph = WorkGraph::new();
+        let task = make_task_with_status("my-task", "My Task", Status::Open);
+        graph.add_node(Node::Task(task));
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "my-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[⊞ assigning]".to_string(),
+                dot_task_ids: vec![".assign-my-task".to_string()],
+            },
+        );
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &annotations,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+
+        // Should have exactly one hit region for "my-task".
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 annotation hit region, got {}",
+            app.annotation_hit_regions.len()
+        );
+
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "my-task");
+        assert_eq!(region.dot_task_ids, vec![".assign-my-task"]);
+
+        // The annotation text should be found in the plain line.
+        let plain = &app.plain_lines[region.orig_line];
+        let expected_text = "[⊞ assigning]";
+        assert!(
+            plain.contains(expected_text),
+            "Plain line should contain annotation text.\nLine: {:?}",
+            plain
+        );
+
+        // col_start/col_end should span the annotation text.
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("assigning"),
+            "Hit region should cover annotation text, got: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_multiple_annotations_same_graph() {
+        // Two tasks with different annotations — both should get hit regions.
+        let mut graph = WorkGraph::new();
+        let task_a = make_task_with_status("task-a", "Task A", Status::Open);
+        let task_b = make_task_with_status("task-b", "Task B", Status::Done);
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "task-a".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[⊞ assigning]".to_string(),
+                dot_task_ids: vec![".assign-task-a".to_string()],
+            },
+        );
+        annotations.insert(
+            "task-b".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[∴ evaluating]".to_string(),
+                dot_task_ids: vec![".evaluate-task-b".to_string()],
+            },
+        );
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &annotations,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+
+        // Should have two hit regions — one per annotated task.
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            2,
+            "Expected 2 annotation hit regions for 2 annotated tasks"
+        );
+
+        // Each region maps to its respective task.
+        let ids: HashSet<&str> = app
+            .annotation_hit_regions
+            .iter()
+            .map(|r| r.parent_task_id.as_str())
+            .collect();
+        assert!(ids.contains("task-a"));
+        assert!(ids.contains("task-b"));
+
+        // Regions should be on different lines.
+        let lines: HashSet<usize> = app
+            .annotation_hit_regions
+            .iter()
+            .map(|r| r.orig_line)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Each annotated task should be on a different line"
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_flash_rendering() {
+        // Verify that apply_annotation_flash modifies the affected column range.
+        let line = Line::from(vec![
+            Span::styled("prefix ", Style::default()),
+            Span::styled("[⊞ assigning]", Style::default().fg(Color::Magenta)),
+            Span::styled(" suffix", Style::default()),
+        ]);
+
+        // Flash at elapsed=0 should apply background color.
+        let flashed = apply_annotation_flash(line.clone(), 7, 20, 0);
+        // The flash should produce spans where the annotation region has a bg color.
+        let mut has_bg_in_region = false;
+        let mut char_idx = 0;
+        for span in &flashed.spans {
+            for _ in span.content.chars() {
+                if char_idx >= 7 && char_idx < 20 {
+                    if span.style.bg.is_some() {
+                        has_bg_in_region = true;
+                    }
+                }
+                char_idx += 1;
+            }
+        }
+        assert!(
+            has_bg_in_region,
+            "Flash at t=0 should apply background to annotation region"
+        );
+
+        // Flash at elapsed=500 should return to normal (progress=1.0).
+        let faded = apply_annotation_flash(line.clone(), 7, 20, 500);
+        // At 500ms the flash should be fully faded — no bg in the region.
+        let mut has_bg = false;
+        char_idx = 0;
+        for span in &faded.spans {
+            for _ in span.content.chars() {
+                if char_idx >= 7 && char_idx < 20 {
+                    if span.style.bg.is_some() {
+                        has_bg = true;
+                    }
+                }
+                char_idx += 1;
+            }
+        }
+        assert!(
+            !has_bg,
+            "Flash at t=500 should be fully faded (no bg color)"
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_no_regions_without_annotations() {
+        // Graph with no annotations should produce no hit regions.
+        let mut graph = WorkGraph::new();
+        let task = make_task_with_status("plain-task", "Plain Task", Status::Open);
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.compute_annotation_hit_regions();
+
+        assert!(
+            app.annotation_hit_regions.is_empty(),
+            "No annotations should produce no hit regions"
+        );
     }
 }

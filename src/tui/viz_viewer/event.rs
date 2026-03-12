@@ -1959,6 +1959,35 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         let content_col = (column.saturating_sub(app.last_graph_area.x) as usize)
                             + app.scroll.offset_x;
 
+                        // Check annotation hit regions first (pink phase labels).
+                        let clicked_annotation = app
+                            .annotation_hit_regions
+                            .iter()
+                            .find(|r| {
+                                r.orig_line == orig_line
+                                    && content_col >= r.col_start
+                                    && content_col < r.col_end
+                            })
+                            .cloned();
+
+                        if let Some(region) = clicked_annotation {
+                            // Select the parent task (keeps graph node highlighted).
+                            app.select_task_at_line(orig_line);
+                            // Show the dot-task detail in the inspector.
+                            if let Some(dot_id) = region.dot_task_ids.first() {
+                                app.load_hud_detail_for_task(dot_id);
+                            }
+                            app.right_panel_visible = true;
+                            app.right_panel_tab = RightPanelTab::Detail;
+                            // Trigger annotation flash.
+                            app.annotation_click_flash =
+                                Some(super::state::AnnotationClickFlash {
+                                    orig_line: region.orig_line,
+                                    col_start: region.col_start,
+                                    col_end: region.col_end,
+                                    start: std::time::Instant::now(),
+                                });
+                        } else {
                         // Only select a task when clicking on actual text content
                         // (task name, status, log snippet, mail indicator), not on
                         // tree-drawing chars, indentation, or empty space past the
@@ -2033,6 +2062,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                                 // If inspector is closed, just select — don't auto-open.
                             }
                         }
+                        } // end else (not annotation click)
                     }
                 }
             } else if app.last_right_panel_area.contains(pos) {
