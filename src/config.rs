@@ -336,11 +336,22 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 impl EndpointConfig {
+    /// Return the environment variable names to check for API keys, based on provider.
+    pub fn env_var_names_for_provider(provider: &str) -> &'static [&'static str] {
+        match provider {
+            "openrouter" => &["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+            "openai" => &["OPENAI_API_KEY"],
+            "anthropic" => &["ANTHROPIC_API_KEY"],
+            _ => &[],
+        }
+    }
+
     /// Resolve the API key for this endpoint.
     ///
     /// Priority:
     /// 1. `api_key` — use directly if set
     /// 2. `api_key_file` — read file contents, trim whitespace
+    /// 3. Environment variable fallback based on provider
     ///
     /// For `api_key_file`, supports:
     /// - `~` expansion to home directory
@@ -366,6 +377,15 @@ impl EndpointConfig {
                 anyhow::bail!("API key file {} is empty", path.display());
             }
             return Ok(Some(key));
+        }
+        // Environment variable fallback based on provider
+        for var_name in Self::env_var_names_for_provider(&self.provider) {
+            if let Ok(key) = std::env::var(var_name) {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    return Ok(Some(key));
+                }
+            }
         }
         Ok(None)
     }
@@ -3294,6 +3314,25 @@ model = "haiku"
 
     #[test]
     fn test_resolve_api_key_none() {
+        // Use "local" provider which has no env var fallback
+        let ep = EndpointConfig {
+            name: "test".to_string(),
+            provider: "local".to_string(),
+            url: None,
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            is_default: false,
+        };
+        let key = ep.resolve_api_key(None).unwrap();
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_var_fallback() {
+        // Save/clear env
+        let saved = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-test") };
         let ep = EndpointConfig {
             name: "test".to_string(),
             provider: "openai".to_string(),
@@ -3304,7 +3343,104 @@ model = "haiku"
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
-        assert!(key.is_none());
+        assert_eq!(key.as_deref(), Some("sk-env-test"));
+        // Restore env
+        match saved {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn test_resolve_api_key_inline_beats_env_var() {
+        let saved = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-should-lose") };
+        let ep = EndpointConfig {
+            name: "test".to_string(),
+            provider: "openai".to_string(),
+            url: None,
+            model: None,
+            api_key: Some("sk-inline-wins".to_string()),
+            api_key_file: None,
+            is_default: false,
+        };
+        let key = ep.resolve_api_key(None).unwrap();
+        assert_eq!(key.as_deref(), Some("sk-inline-wins"));
+        match saved {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn test_resolve_api_key_file_beats_env_var() {
+        let saved = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-should-lose") };
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, "sk-file-wins").unwrap();
+        let ep = EndpointConfig {
+            name: "test".to_string(),
+            provider: "openai".to_string(),
+            url: None,
+            model: None,
+            api_key: None,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            is_default: false,
+        };
+        let key = ep.resolve_api_key(None).unwrap();
+        assert_eq!(key.as_deref(), Some("sk-file-wins"));
+        match saved {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn test_resolve_api_key_openrouter_env_var_cascade() {
+        let saved_or = std::env::var("OPENROUTER_API_KEY").ok();
+        let saved_oai = std::env::var("OPENAI_API_KEY").ok();
+        // Clear both, set only OPENAI_API_KEY
+        unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-oai-fallback") };
+        let ep = EndpointConfig {
+            name: "test".to_string(),
+            provider: "openrouter".to_string(),
+            url: None,
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            is_default: false,
+        };
+        let key = ep.resolve_api_key(None).unwrap();
+        assert_eq!(key.as_deref(), Some("sk-oai-fallback"));
+        // Restore
+        match saved_or {
+            Some(v) => unsafe { std::env::set_var("OPENROUTER_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENROUTER_API_KEY") },
+        }
+        match saved_oai {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn test_env_var_names_for_provider() {
+        assert_eq!(
+            EndpointConfig::env_var_names_for_provider("openrouter"),
+            &["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            EndpointConfig::env_var_names_for_provider("openai"),
+            &["OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            EndpointConfig::env_var_names_for_provider("anthropic"),
+            &["ANTHROPIC_API_KEY"]
+        );
+        assert!(EndpointConfig::env_var_names_for_provider("local").is_empty());
+        assert!(EndpointConfig::env_var_names_for_provider("unknown").is_empty());
     }
 
     #[test]

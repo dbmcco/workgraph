@@ -57,10 +57,20 @@ struct OaiRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OaiToolDef>,
     stream: bool,
+    /// When streaming, request that the API include usage data in the final chunk.
+    /// OpenAI requires `{"include_usage": true}` to report token counts in streaming mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OaiStreamOptions>,
     /// OpenRouter cache_control — triggers auto-caching for Anthropic/Gemini models.
     /// When set, OpenRouter applies cache_control to the last cacheable content block.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<serde_json::Value>,
+}
+
+/// Options for streaming mode.
+#[derive(Debug, Clone, Serialize)]
+struct OaiStreamOptions {
+    include_usage: bool,
 }
 
 /// OpenAI-format response body.
@@ -201,6 +211,7 @@ const DEFAULT_MAX_TOKENS: u32 = 16384;
 /// OpenAI-compatible chat completions client.
 ///
 /// Works with OpenRouter, direct OpenAI API, and any compatible endpoint.
+#[derive(Debug)]
 pub struct OpenAiClient {
     http: reqwest::Client,
     api_key: String,
@@ -245,6 +256,46 @@ impl OpenAiClient {
             .or_else(|_| std::env::var("OPENROUTER_BASE_URL"))
             .ok();
         Self::new(api_key, model, base_url.as_deref())
+    }
+
+    /// Create from an [`EndpointConfig`](crate::config::EndpointConfig) with full key resolution.
+    ///
+    /// Uses `EndpointConfig::resolve_api_key()` which checks inline key, key file,
+    /// then environment variable fallback based on provider.
+    pub fn from_endpoint(
+        endpoint: &crate::config::EndpointConfig,
+        model: &str,
+        workgraph_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let api_key = endpoint
+            .resolve_api_key(workgraph_dir)?
+            .ok_or_else(|| {
+                let env_vars = crate::config::EndpointConfig::env_var_names_for_provider(
+                    &endpoint.provider,
+                );
+                let env_hint = if env_vars.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Set {} environment variable,", env_vars[0])
+                };
+                anyhow!(
+                    "No API key found for endpoint '{}'.{} or configure api_key / api_key_file.",
+                    endpoint.name,
+                    env_hint,
+                )
+            })?;
+        let base_url = endpoint
+            .url
+            .as_deref()
+            .unwrap_or_else(|| crate::config::EndpointConfig::default_url_for_provider(&endpoint.provider));
+        let base_url = if base_url.is_empty() {
+            None
+        } else {
+            Some(base_url)
+        };
+        let mut client = Self::new(api_key, model, base_url)?;
+        client = client.with_provider_hint(&endpoint.provider);
+        Ok(client)
     }
 
     /// Override the base URL.
@@ -493,6 +544,7 @@ impl OpenAiClient {
             max_tokens: Some(request.max_tokens),
             tools: Self::translate_tools(&request.tools),
             stream: false,
+            stream_options: None,
             cache_control: self.cache_control_value(),
         };
 
@@ -505,6 +557,9 @@ impl OpenAiClient {
     /// Uses SSE (Server-Sent Events) to receive incremental chunks,
     /// accumulating text content and tool call arguments across chunks.
     /// Returns a complete `MessagesResponse` once the stream ends.
+    ///
+    /// Includes retry logic for transient failures (connection drops, 5xx errors).
+    /// Malformed SSE chunks are skipped with a warning rather than causing a crash.
     async fn chat_completion_streaming(
         &self,
         request: &MessagesRequest,
@@ -515,24 +570,68 @@ impl OpenAiClient {
             max_tokens: Some(request.max_tokens),
             tools: Self::translate_tools(&request.tools),
             stream: true,
+            stream_options: Some(OaiStreamOptions {
+                include_usage: true,
+            }),
             cache_control: self.cache_control_value(),
         };
 
         let url = format!("{}/chat/completions", self.base_url);
+        let max_retries = 3;
+        let mut retry_count = 0;
+        let mut backoff_ms = 1000u64;
+
+        loop {
+            match self
+                .streaming_attempt(&url, &oai_request)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    if retry_count < max_retries {
+                        retry_count += 1;
+                        eprintln!(
+                            "[openai-client] Streaming error (attempt {}/{}): {}. Retrying in {}ms",
+                            retry_count, max_retries, e, backoff_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(30_000);
+                        continue;
+                    }
+                    return Err(e).context("Streaming request failed after retries");
+                }
+            }
+        }
+    }
+
+    /// Execute a single streaming attempt: send request, parse SSE, accumulate response.
+    async fn streaming_attempt(
+        &self,
+        url: &str,
+        oai_request: &OaiRequest,
+    ) -> Result<MessagesResponse> {
         let headers = self.build_headers();
         let resp = self
             .http
-            .post(&url)
+            .post(url)
             .headers(headers)
-            .json(&oai_request)
+            .json(oai_request)
             .send()
             .await
             .context("Failed to send streaming request")?;
 
         let status = resp.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(oai_api_error(status.as_u16(), &body));
+            // Surface retryable errors so the caller can retry
+            if is_retryable(status_code) {
+                let wait_hint = parse_retry_after_oai(&body).unwrap_or(0);
+                if wait_hint > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_hint)).await;
+                }
+            }
+            return Err(oai_api_error(status_code, &body));
         }
 
         // Parse SSE stream and accumulate into a response
@@ -546,9 +645,27 @@ impl OpenAiClient {
             std::collections::BTreeMap::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<OaiUsage> = None;
+        let mut chunk_count: u32 = 0;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Error reading SSE chunk")?;
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    // Connection dropped mid-stream
+                    if chunk_count == 0 {
+                        return Err(anyhow!("Stream connection failed before receiving data: {}", e));
+                    }
+                    eprintln!(
+                        "[openai-client] Stream interrupted after {} chunks: {}",
+                        chunk_count, e
+                    );
+                    // If we have a finish_reason, the response is likely complete
+                    if finish_reason.is_some() {
+                        break;
+                    }
+                    return Err(anyhow!("Stream interrupted after {} chunks: {}", chunk_count, e));
+                }
+            };
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             // Process complete SSE data lines from the buffer
@@ -557,21 +674,30 @@ impl OpenAiClient {
                     break;
                 }
 
-                let chunk: OaiStreamChunk = match serde_json::from_str(&data) {
+                let parsed_chunk: OaiStreamChunk = match serde_json::from_str(&data) {
                     Ok(c) => c,
-                    Err(_) => continue, // Skip unparseable chunks
+                    Err(e) => {
+                        eprintln!(
+                            "[openai-client] Skipping malformed SSE chunk: {} (data: {})",
+                            e,
+                            truncate(&data, 200)
+                        );
+                        continue;
+                    }
                 };
 
-                if response_id.is_empty() && !chunk.id.is_empty() {
-                    response_id = chunk.id;
+                chunk_count += 1;
+
+                if response_id.is_empty() && !parsed_chunk.id.is_empty() {
+                    response_id = parsed_chunk.id;
                 }
 
                 // Capture usage from the final chunk (if present)
-                if let Some(u) = chunk.usage {
+                if let Some(u) = parsed_chunk.usage {
                     usage = Some(u);
                 }
 
-                for choice in &chunk.choices {
+                for choice in &parsed_chunk.choices {
                     // Accumulate text content
                     if let Some(ref text) = choice.delta.content {
                         text_content.push_str(text);
@@ -604,6 +730,14 @@ impl OpenAiClient {
                 }
             }
         }
+
+        // Log streaming completion summary
+        eprintln!(
+            "[openai-client] Stream complete: {} chunks, {} text chars, {} tool calls",
+            chunk_count,
+            text_content.len(),
+            tool_calls.len()
+        );
 
         // Assemble the response
         assemble_oai_stream_response(response_id, text_content, tool_calls, finish_reason, usage)
@@ -1617,6 +1751,7 @@ mod tests {
             max_tokens: Some(1024),
             tools: vec![],
             stream: false,
+            stream_options: None,
             cache_control: Some(serde_json::json!({"type": "ephemeral"})),
         };
         let json = serde_json::to_string(&request).unwrap();
@@ -1632,9 +1767,372 @@ mod tests {
             max_tokens: Some(1024),
             tools: vec![],
             stream: false,
+            stream_options: None,
             cache_control: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("cache_control"));
+    }
+
+    // ── from_endpoint tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_from_endpoint_inline_key() {
+        let ep = crate::config::EndpointConfig {
+            name: "test-openai".to_string(),
+            provider: "openai".to_string(),
+            url: Some("https://api.openai.com/v1".to_string()),
+            model: None,
+            api_key: Some("sk-test-inline".to_string()),
+            api_key_file: None,
+            is_default: false,
+        };
+        let client = OpenAiClient::from_endpoint(&ep, "gpt-4o", None).unwrap();
+        assert_eq!(client.model, "gpt-4o");
+        assert_eq!(client.base_url, "https://api.openai.com/v1");
+        assert_eq!(client.provider_hint.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn test_from_endpoint_key_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("api.key");
+        std::fs::write(&key_path, "sk-from-file\n").unwrap();
+        let ep = crate::config::EndpointConfig {
+            name: "test-or".to_string(),
+            provider: "openrouter".to_string(),
+            url: None,
+            model: None,
+            api_key: None,
+            api_key_file: Some(key_path.to_string_lossy().to_string()),
+            is_default: false,
+        };
+        let client = OpenAiClient::from_endpoint(&ep, "anthropic/claude-sonnet-4-6", None).unwrap();
+        assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(client.provider_hint.as_deref(), Some("openrouter"));
+        assert!(client.use_streaming); // OpenRouter enables streaming
+    }
+
+    #[test]
+    fn test_from_endpoint_no_key_errors() {
+        // Use "local" provider — no env var fallback, so this should fail gracefully
+        // unless "local" has a special case. Actually local doesn't error on from_endpoint
+        // since env_var_names_for_provider returns empty. Let's use a custom unknown provider.
+        let ep = crate::config::EndpointConfig {
+            name: "test-nokey".to_string(),
+            provider: "custom".to_string(),
+            url: Some("https://example.com/v1".to_string()),
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            is_default: false,
+        };
+        let result = OpenAiClient::from_endpoint(&ep, "some-model", None);
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("No API key found"));
+        assert!(msg.contains("test-nokey"));
+    }
+
+    #[test]
+    fn test_from_endpoint_default_url_for_provider() {
+        let ep = crate::config::EndpointConfig {
+            name: "test-or".to_string(),
+            provider: "openrouter".to_string(),
+            url: None, // Should use default
+            model: None,
+            api_key: Some("sk-test".to_string()),
+            api_key_file: None,
+            is_default: false,
+        };
+        let client = OpenAiClient::from_endpoint(&ep, "model", None).unwrap();
+        assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
+    }
+
+    // ── Streaming integration tests ──────────────────────────────────────
+
+    #[test]
+    fn test_streaming_request_includes_stream_options() {
+        let request = OaiRequest {
+            model: "anthropic/claude-sonnet-4-6".to_string(),
+            messages: vec![],
+            max_tokens: Some(1024),
+            tools: vec![],
+            stream: true,
+            stream_options: Some(OaiStreamOptions {
+                include_usage: true,
+            }),
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"stream\":true"));
+        assert!(json.contains("stream_options"));
+        assert!(json.contains("include_usage"));
+    }
+
+    #[test]
+    fn test_streaming_stream_options_omitted_when_not_streaming() {
+        let request = OaiRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            max_tokens: Some(1024),
+            tools: vec![],
+            stream: false,
+            stream_options: None,
+            cache_control: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"stream\":false"));
+        assert!(!json.contains("stream_options"));
+    }
+
+    #[test]
+    fn test_streaming_full_sse_text_flow() {
+        // Simulate a complete SSE text response flow
+        let mut buffer = concat!(
+            "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+
+        let mut response_id = String::new();
+        let mut text = String::new();
+        let tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        let mut finish = None;
+        let mut usage = None;
+
+        while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            if data == "[DONE]" {
+                break;
+            }
+            let chunk: OaiStreamChunk = serde_json::from_str(&data).unwrap();
+            if response_id.is_empty() && !chunk.id.is_empty() {
+                response_id = chunk.id;
+            }
+            if let Some(u) = chunk.usage {
+                usage = Some(u);
+            }
+            for choice in &chunk.choices {
+                if let Some(ref t) = choice.delta.content {
+                    text.push_str(t);
+                }
+                if let Some(ref fr) = choice.finish_reason {
+                    finish = Some(fr.clone());
+                }
+            }
+        }
+
+        let resp =
+            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+        assert_eq!(resp.id, "gen-1");
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
+        assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn test_streaming_full_sse_tool_call_flow() {
+        // Simulate tool call arriving across multiple SSE chunks
+        let mut buffer = concat!(
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"com\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"mand\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ls\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+
+        let mut response_id = String::new();
+        let text = String::new();
+        let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        let mut finish = None;
+        let mut usage = None;
+
+        while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            if data == "[DONE]" {
+                break;
+            }
+            let chunk: OaiStreamChunk = serde_json::from_str(&data).unwrap();
+            if response_id.is_empty() && !chunk.id.is_empty() {
+                response_id = chunk.id;
+            }
+            if let Some(u) = chunk.usage {
+                usage = Some(u);
+            }
+            for choice in &chunk.choices {
+                if let Some(ref tcs) = choice.delta.tool_calls {
+                    for tc in tcs {
+                        let entry = tool_calls
+                            .entry(tc.index)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                        if let Some(ref id) = tc.id {
+                            entry.0 = id.clone();
+                        }
+                        if let Some(ref func) = tc.function {
+                            if let Some(ref name) = func.name {
+                                entry.1 = name.clone();
+                            }
+                            if let Some(ref args) = func.arguments {
+                                entry.2.push_str(args);
+                            }
+                        }
+                    }
+                }
+                if let Some(ref fr) = choice.finish_reason {
+                    finish = Some(fr.clone());
+                }
+            }
+        }
+
+        let resp =
+            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+        assert_eq!(resp.id, "gen-2");
+        assert_eq!(resp.content.len(), 1);
+        assert!(matches!(
+            &resp.content[0],
+            ContentBlock::ToolUse { id, name, input }
+            if id == "call_abc" && name == "bash" && input["command"] == "ls"
+        ));
+        assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(resp.usage.input_tokens, 20);
+        assert_eq!(resp.usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn test_streaming_multiple_tool_calls_accumulation() {
+        // Two tool calls arriving interleaved in the stream
+        let mut buffer = concat!(
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Running checks.\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+
+        let mut response_id = String::new();
+        let mut text = String::new();
+        let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        let mut finish = None;
+        let mut usage = None;
+
+        while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            if data == "[DONE]" {
+                break;
+            }
+            let chunk: OaiStreamChunk = serde_json::from_str(&data).unwrap();
+            if response_id.is_empty() && !chunk.id.is_empty() {
+                response_id = chunk.id;
+            }
+            if let Some(u) = chunk.usage {
+                usage = Some(u);
+            }
+            for choice in &chunk.choices {
+                if let Some(ref t) = choice.delta.content {
+                    text.push_str(t);
+                }
+                if let Some(ref tcs) = choice.delta.tool_calls {
+                    for tc in tcs {
+                        let entry = tool_calls
+                            .entry(tc.index)
+                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                        if let Some(ref id) = tc.id {
+                            entry.0 = id.clone();
+                        }
+                        if let Some(ref func) = tc.function {
+                            if let Some(ref name) = func.name {
+                                entry.1 = name.clone();
+                            }
+                            if let Some(ref args) = func.arguments {
+                                entry.2.push_str(args);
+                            }
+                        }
+                    }
+                }
+                if let Some(ref fr) = choice.finish_reason {
+                    finish = Some(fr.clone());
+                }
+            }
+        }
+
+        let resp =
+            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+        assert_eq!(resp.content.len(), 3); // text + 2 tool calls
+        assert!(
+            matches!(&resp.content[0], ContentBlock::Text { text } if text == "Running checks.")
+        );
+        assert!(
+            matches!(&resp.content[1], ContentBlock::ToolUse { id, name, .. } if id == "call_1" && name == "bash")
+        );
+        assert!(
+            matches!(&resp.content[2], ContentBlock::ToolUse { id, name, input } if id == "call_2" && name == "read_file" && input["path"] == "/tmp/x")
+        );
+    }
+
+    #[test]
+    fn test_streaming_malformed_chunk_skipped() {
+        // One good chunk, one malformed, one good — malformed should be skipped
+        let mut buffer = concat!(
+            "data: {\"id\":\"gen-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"},\"finish_reason\":null}]}\n\n",
+            "data: {not valid json}\n\n",
+            "data: {\"id\":\"gen-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"B\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"gen-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+
+        let mut text = String::new();
+        let mut chunks_parsed = 0u32;
+        let mut malformed = 0u32;
+
+        while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            if data == "[DONE]" {
+                break;
+            }
+            match serde_json::from_str::<OaiStreamChunk>(&data) {
+                Ok(chunk) => {
+                    chunks_parsed += 1;
+                    for choice in &chunk.choices {
+                        if let Some(ref t) = choice.delta.content {
+                            text.push_str(t);
+                        }
+                    }
+                }
+                Err(_) => {
+                    malformed += 1;
+                }
+            }
+        }
+
+        assert_eq!(text, "AB");
+        assert_eq!(chunks_parsed, 3); // A, B, finish
+        assert_eq!(malformed, 1);
+    }
+
+    #[test]
+    fn test_streaming_no_usage_without_stream_options() {
+        // When the API doesn't return usage (stream_options not set), usage should default
+        let resp = assemble_oai_stream_response(
+            "gen-nousage".to_string(),
+            "Hello".to_string(),
+            std::collections::BTreeMap::new(),
+            Some("stop".to_string()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(resp.usage.input_tokens, 0);
+        assert_eq!(resp.usage.output_tokens, 0);
     }
 }
