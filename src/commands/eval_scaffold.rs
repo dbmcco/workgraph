@@ -1,8 +1,8 @@
 //! Eager lifecycle-task scaffolding.
 //!
-//! Creates `.assign-<task>`, `.evaluate-<task>`, and `.flip-<task>` tasks at
-//! publish time so every published task has a full lifecycle chain as real
-//! graph edges:
+//! Creates `.place-<task>`, `.assign-<task>`, `.flip-<task>`, and
+//! `.evaluate-<task>` tasks at publish time so every published task has a full
+//! lifecycle chain as real graph edges, wired atomically in one graph write:
 //!
 //! ```text
 //! .place-foo → .assign-foo → foo → .flip-foo → .evaluate-foo
@@ -69,6 +69,339 @@ pub fn scaffold_flip_task(graph: &mut WorkGraph, task_id: &str, config: &Config)
     );
 
     true
+}
+
+/// Extract file paths from a task description using heuristics.
+fn extract_file_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for word in text.split_whitespace() {
+        let word = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+        });
+        if word.contains('/')
+            && (word.ends_with(".rs")
+                || word.ends_with(".ts")
+                || word.ends_with(".js")
+                || word.ends_with(".py")
+                || word.ends_with(".go")
+                || word.ends_with(".toml")
+                || word.ends_with(".md")
+                || word.ends_with(".yaml")
+                || word.ends_with(".yml")
+                || word.ends_with(".json"))
+        {
+            paths.push(word.to_string());
+        }
+    }
+    paths
+}
+
+/// Build placement context string for a `.place-*` task description.
+///
+/// Includes:
+/// - Task summary and placement hints
+/// - Active tasks with their artifacts and titles
+/// - Explicit restriction: only add edges to the MAIN task, not dot-tasks
+fn build_placement_context(graph: &WorkGraph, task_id: &str) -> String {
+    use workgraph::graph::is_system_task;
+
+    let mut ctx = String::new();
+
+    if let Some(task) = graph.get_task(task_id) {
+        let mentioned_files = extract_file_paths(task.description.as_deref().unwrap_or(""));
+        ctx.push_str("## Task to place\n");
+        ctx.push_str(&format!("ID: {}\n", task.id));
+        ctx.push_str(&format!("Title: {}\n", task.title));
+        if let Some(ref desc) = task.description {
+            let summary = desc
+                .split("\n\n")
+                .next()
+                .unwrap_or(desc)
+                .lines()
+                .next()
+                .unwrap_or(desc);
+            let summary = if summary.len() > 150 {
+                format!("{}…", &summary[..summary.floor_char_boundary(150)])
+            } else {
+                summary.to_string()
+            };
+            ctx.push_str(&format!("Summary: {}\n", summary));
+        }
+        if !mentioned_files.is_empty() {
+            ctx.push_str(&format!(
+                "Files mentioned: {}\n",
+                mentioned_files.join(", ")
+            ));
+        }
+        if !task.after.is_empty() {
+            ctx.push_str(&format!("Existing deps: {}\n", task.after.join(", ")));
+        }
+        ctx.push('\n');
+
+        if !task.place_near.is_empty() || !task.place_before.is_empty() {
+            ctx.push_str("## Placement hints\n");
+            if !task.place_near.is_empty() {
+                ctx.push_str(&format!("near: {}\n", task.place_near.join(", ")));
+            }
+            if !task.place_before.is_empty() {
+                ctx.push_str(&format!("before: {}\n", task.place_before.join(", ")));
+            }
+            ctx.push('\n');
+        }
+    }
+
+    ctx.push_str("## Active tasks (non-terminal)\n");
+    let active_tasks: Vec<_> = graph
+        .tasks()
+        .filter(|t| {
+            !t.status.is_terminal() && !t.paused && !is_system_task(&t.id) && t.id != task_id
+        })
+        .collect();
+    if active_tasks.is_empty() {
+        ctx.push_str("(none)\n");
+    } else {
+        for t in &active_tasks {
+            ctx.push_str(&format!("- {} ({})", t.id, t.status));
+            if !t.artifacts.is_empty() {
+                ctx.push_str(&format!(" [files: {}]", t.artifacts.join(", ")));
+            }
+            ctx.push('\n');
+        }
+    }
+
+    ctx.push_str("\n## Your job\n");
+    ctx.push_str(&format!(
+        "Add `--after` or `--before` edges to the MAIN task '{}' only.\n",
+        task_id
+    ));
+    ctx.push_str("Do NOT modify .assign-*, .flip-*, .evaluate-*, or any other dot-task.\n");
+    ctx.push_str("Use: wg edit ");
+    ctx.push_str(task_id);
+    ctx.push_str(" --after <dep-id>  (or --before <dep-id>)\n");
+    ctx.push_str("If no placement changes are needed, do nothing (no-op is valid).\n");
+
+    ctx
+}
+
+/// Scaffold the FULL agency pipeline for a task in one pass:
+///
+/// ```text
+/// .place-{id} → .assign-{id} → {id} → .flip-{id} → .evaluate-{id}
+/// ```
+///
+/// All five tasks are created and all dependency edges are wired atomically
+/// (caller is responsible for the single `save_graph` / `modify_graph` call).
+///
+/// - `.place-*` is created if `config.agency.auto_place` is enabled.
+/// - `.assign-*` is created if `config.agency.auto_assign` is enabled.
+/// - `.flip-*` is created if FLIP is enabled (globally or per-task tag).
+/// - `.evaluate-*` is created if `config.agency.auto_evaluate` is enabled.
+///
+/// Returns `true` if the graph was modified.
+/// Idempotent: skips tasks that already exist.
+pub fn scaffold_full_pipeline(
+    dir: &Path,
+    graph: &mut WorkGraph,
+    task_id: &str,
+    task_title: &str,
+    config: &Config,
+) -> bool {
+    // Skip system tasks and dominated-tag tasks
+    if workgraph::graph::is_system_task(task_id) {
+        return false;
+    }
+    if let Some(task) = graph.get_task(task_id) {
+        if task
+            .tags
+            .iter()
+            .any(|tag| DOMINATED_TAGS.contains(&tag.as_str()))
+        {
+            return false;
+        }
+        // NOTE: We intentionally do NOT early-return on "eval-scheduled" here.
+        // The tag may have been set by `scaffold_eval_task` (which only creates
+        // .flip/.evaluate), so .place/.assign might still be missing.  Each
+        // individual task creation below has its own idempotency guard.
+    }
+
+    let place_task_id = format!(".place-{}", task_id);
+    let assign_task_id = format!(".assign-{}", task_id);
+    let flip_task_id = format!(".flip-{}", task_id);
+    let eval_task_id = format!(".evaluate-{}", task_id);
+
+    let mut any_created = false;
+
+    // 1. Create .place-* task (no deps — runs first; agent adds edges to main task)
+    if config.agency.auto_place && graph.get_task(&place_task_id).is_none() {
+        let placement_context = build_placement_context(graph, task_id);
+        let placer_model =
+            config.resolve_model_for_role(workgraph::config::DispatchRole::Placer);
+        let place_task = Task {
+            id: place_task_id.clone(),
+            title: format!("Place: {}", task_id),
+            description: Some(placement_context),
+            status: Status::Open,
+            after: vec![],
+            tags: vec!["placement".to_string(), "agency".to_string()],
+            exec_mode: Some("bare".to_string()),
+            visibility: "internal".to_string(),
+            created_at: Some(Utc::now().to_rfc3339()),
+            model: Some(placer_model.model),
+            provider: placer_model.provider,
+            agent: config.agency.placer_agent.clone(),
+            ..Task::default()
+        };
+        graph.add_node(Node::Task(place_task));
+        any_created = true;
+        eprintln!(
+            "[eval-scaffold] Created placement task '{}' for '{}'",
+            place_task_id, task_id,
+        );
+    }
+
+    // 2. Create .assign-* task (depends on .place-* if it was created, else no deps)
+    if config.agency.auto_assign && graph.get_task(&assign_task_id).is_none() {
+        let assign_after = if graph.get_task(&place_task_id).is_some() {
+            vec![place_task_id.clone()]
+        } else {
+            vec![]
+        };
+        let assign_task = Task {
+            id: assign_task_id.clone(),
+            title: format!("Assign agent for: {}", task_title),
+            status: Status::Open,
+            after: assign_after,
+            before: vec![task_id.to_string()],
+            tags: vec!["assignment".to_string(), "agency".to_string()],
+            exec: Some(format!("wg assign {} --auto", task_id)),
+            exec_mode: Some("bare".to_string()),
+            visibility: "internal".to_string(),
+            created_at: Some(Utc::now().to_rfc3339()),
+            ..Task::default()
+        };
+        graph.add_node(Node::Task(assign_task));
+        any_created = true;
+        eprintln!(
+            "[eval-scaffold] Created assignment task '{}' blocking '{}'",
+            assign_task_id, task_id,
+        );
+    }
+
+    // 3. Wire main task to depend on .assign-* (so it waits for assignment)
+    if graph.get_task(&assign_task_id).is_some() {
+        if let Some(source) = graph.get_task_mut(task_id) {
+            if !source.after.iter().any(|a| a == &assign_task_id) {
+                source.after.push(assign_task_id.clone());
+            }
+        }
+    }
+
+    // 4. Create .flip-* task (depends on main task)
+    let run_flip = should_run_flip(graph, task_id, config);
+    if run_flip && graph.get_task(&flip_task_id).is_none() {
+        let flip_resolved =
+            config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+        let flip_task = Task {
+            id: flip_task_id.clone(),
+            title: format!("FLIP: {}", task_id),
+            description: Some(format!(
+                "Run FLIP (Fidelity via Latent Intent Probing) evaluation for task '{}'.",
+                task_id,
+            )),
+            status: Status::Open,
+            after: vec![task_id.to_string()],
+            tags: vec!["flip".to_string(), "agency".to_string()],
+            exec: Some(format!("wg evaluate run {} --flip", task_id)),
+            model: Some(flip_resolved.model),
+            provider: flip_resolved.provider,
+            exec_mode: Some("bare".to_string()),
+            visibility: "internal".to_string(),
+            created_at: Some(Utc::now().to_rfc3339()),
+            ..Task::default()
+        };
+        graph.add_node(Node::Task(flip_task));
+        any_created = true;
+        eprintln!(
+            "[eval-scaffold] Created FLIP task '{}' blocked by '{}'",
+            flip_task_id, task_id,
+        );
+    }
+
+    // 5. Create .evaluate-* task (depends on .flip-* if FLIP enabled, else main task)
+    if config.agency.auto_evaluate && graph.get_task(&eval_task_id).is_none() {
+        let eval_after = if run_flip {
+            vec![flip_task_id.clone()]
+        } else {
+            vec![task_id.to_string()]
+        };
+
+        let evaluator_identity = resolve_evaluator_identity(dir, config);
+        let mut desc = String::new();
+        if let Some(ref identity) = evaluator_identity {
+            desc.push_str(identity);
+            desc.push_str("\n\n");
+        }
+        desc.push_str(&format!(
+            "Evaluate the completed task '{}'.\n\n\
+             Run `wg evaluate run {}` to produce a structured evaluation.\n\
+             This reads the task output from `.workgraph/output/{}/` and \
+             the task definition via `wg show {}`.",
+            task_id, task_id, task_id, task_id,
+        ));
+
+        let eval_resolved =
+            config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+        let eval_task = Task {
+            id: eval_task_id.clone(),
+            title: format!("Evaluate: {}", task_title),
+            description: Some(desc),
+            status: Status::Open,
+            after: eval_after,
+            tags: vec!["evaluation".to_string(), "agency".to_string()],
+            exec: Some(format!("wg evaluate run {}", task_id)),
+            model: Some(eval_resolved.model),
+            provider: eval_resolved.provider,
+            agent: config.agency.evaluator_agent.clone(),
+            exec_mode: Some("bare".to_string()),
+            visibility: "internal".to_string(),
+            created_at: Some(Utc::now().to_rfc3339()),
+            ..Task::default()
+        };
+        graph.add_node(Node::Task(eval_task));
+        any_created = true;
+        eprintln!(
+            "[eval-scaffold] Created evaluation task '{}' blocked by '{}'",
+            eval_task_id, task_id,
+        );
+    }
+
+    // Tag source task as eval-scheduled (prevents duplicate scaffolding after gc)
+    if any_created {
+        if let Some(source) = graph.get_task_mut(task_id) {
+            if !source.tags.iter().any(|t| t == "eval-scheduled") {
+                source.tags.push("eval-scheduled".to_string());
+            }
+        }
+    }
+
+    any_created
+}
+
+/// Scaffold the full pipeline for multiple tasks at once (batch mode for publish).
+/// Returns the number of tasks for which the pipeline was created.
+pub fn scaffold_full_pipeline_batch(
+    dir: &Path,
+    graph: &mut WorkGraph,
+    task_ids: &[(String, String)], // (id, title) pairs
+    config: &Config,
+) -> usize {
+    let mut count = 0;
+    for (task_id, task_title) in task_ids {
+        if scaffold_full_pipeline(dir, graph, task_id, task_title, config) {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Create a `.assign-<task_id>` task in `graph` that blocks `task_id`.
@@ -694,79 +1027,221 @@ mod tests {
         assert!(graph.get_task(".assign-b").is_some());
     }
 
-    // --- Full lifecycle chain test ---
+    // --- scaffold_full_pipeline tests ---
 
     #[test]
-    fn test_publish_creates_full_lifecycle_chain() {
+    fn test_scaffold_full_pipeline_creates_all_five_tasks() {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
+        config.agency.auto_place = true;
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
         config.agency.flip_enabled = true;
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("foo", "Foo Task")));
 
-        // Scaffold the full lifecycle chain (no .place-* — direct publish)
-        scaffold_assign_task(&mut graph, "foo", "Foo Task");
-        scaffold_eval_task(dir.path(), &mut graph, "foo", "Foo Task", &config);
+        let modified = scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
+        assert!(modified);
 
-        // Verify .assign-foo exists and blocks foo
-        let assign = graph.get_task(".assign-foo").unwrap();
-        assert_eq!(assign.status, Status::Open);
-        assert_eq!(assign.before, vec!["foo".to_string()]);
-        assert!(assign.after.is_empty()); // No .place-* → no deps
-
-        // Verify foo has .assign-foo in its after list
-        let foo = graph.get_task("foo").unwrap();
-        assert!(foo.after.contains(&".assign-foo".to_string()));
-
-        // Verify .flip-foo exists and depends on foo
-        let flip = graph.get_task(".flip-foo").unwrap();
-        assert_eq!(flip.after, vec!["foo".to_string()]);
-
-        // Verify .evaluate-foo exists and depends on .flip-foo
-        let eval = graph.get_task(".evaluate-foo").unwrap();
-        assert_eq!(eval.after, vec![".flip-foo".to_string()]);
-
-        // Full chain: .assign-foo → foo → .flip-foo → .evaluate-foo
+        // All five tasks exist
+        assert!(graph.get_task(".place-foo").is_some());
+        assert!(graph.get_task(".assign-foo").is_some());
+        assert!(graph.get_task(".flip-foo").is_some());
+        assert!(graph.get_task(".evaluate-foo").is_some());
     }
 
     #[test]
-    fn test_full_lifecycle_chain_with_placement() {
+    fn test_scaffold_full_pipeline_wires_all_edges() {
         let dir = tempdir().unwrap();
         let mut config = Config::default();
+        config.agency.auto_place = true;
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
         config.agency.flip_enabled = true;
         let mut graph = WorkGraph::new();
-        graph.add_node(Node::Task(make_task("bar", "Bar Task")));
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
 
-        // Simulate coordinator Phase 2.9: create .place-* first
-        let place_task = Task {
-            id: ".place-bar".to_string(),
-            title: "Place: bar".to_string(),
-            status: Status::Open,
-            tags: vec!["placement".to_string()],
-            ..Task::default()
-        };
-        graph.add_node(Node::Task(place_task));
+        scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
 
-        // Simulate publish (after placement agent calls wg publish):
-        // scaffold assign + eval
-        scaffold_assign_task(&mut graph, "bar", "Bar Task");
-        scaffold_eval_task(dir.path(), &mut graph, "bar", "Bar Task", &config);
+        // .place-foo has no deps (runs first)
+        let place = graph.get_task(".place-foo").unwrap();
+        assert!(place.after.is_empty());
 
-        // Full chain: .place-bar → .assign-bar → bar → .flip-bar → .evaluate-bar
-        let place = graph.get_task(".place-bar").unwrap();
-        assert_eq!(place.status, Status::Open);
+        // .assign-foo depends on .place-foo
+        let assign = graph.get_task(".assign-foo").unwrap();
+        assert_eq!(assign.after, vec![".place-foo".to_string()]);
+        assert_eq!(assign.before, vec!["foo".to_string()]);
 
-        let assign = graph.get_task(".assign-bar").unwrap();
-        assert_eq!(assign.after, vec![".place-bar".to_string()]);
-        assert_eq!(assign.before, vec!["bar".to_string()]);
+        // foo depends on .assign-foo
+        let foo = graph.get_task("foo").unwrap();
+        assert!(foo.after.contains(&".assign-foo".to_string()));
 
-        let bar = graph.get_task("bar").unwrap();
-        assert!(bar.after.contains(&".assign-bar".to_string()));
+        // .flip-foo depends on foo
+        let flip = graph.get_task(".flip-foo").unwrap();
+        assert_eq!(flip.after, vec!["foo".to_string()]);
 
-        let flip = graph.get_task(".flip-bar").unwrap();
-        assert_eq!(flip.after, vec!["bar".to_string()]);
+        // .evaluate-foo depends on .flip-foo (when FLIP enabled)
+        let eval = graph.get_task(".evaluate-foo").unwrap();
+        assert_eq!(eval.after, vec![".flip-foo".to_string()]);
+    }
 
-        let eval = graph.get_task(".evaluate-bar").unwrap();
-        assert_eq!(eval.after, vec![".flip-bar".to_string()]);
+    #[test]
+    fn test_scaffold_full_pipeline_no_place_when_auto_place_disabled() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_place = false;
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
+
+        scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
+
+        // No .place-* when auto_place=false
+        assert!(graph.get_task(".place-foo").is_none());
+        // .assign-* still created (no .place-* dep)
+        let assign = graph.get_task(".assign-foo").unwrap();
+        assert!(assign.after.is_empty()); // no .place-* dep
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_idempotent() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_place = true;
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
+
+        assert!(scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            "foo",
+            "Foo Task",
+            &config
+        ));
+        // Second call is a no-op (eval-scheduled tag prevents re-scaffolding)
+        assert!(!scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            "foo",
+            "Foo Task",
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_tags_source_as_eval_scheduled() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
+
+        scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
+
+        let foo = graph.get_task("foo").unwrap();
+        assert!(foo.tags.contains(&"eval-scheduled".to_string()));
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_skips_system_tasks() {
+        let dir = tempdir().unwrap();
+        let config = Config::default();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(".evaluate-foo", "Eval Foo")));
+
+        let modified = scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            ".evaluate-foo",
+            "Eval Foo",
+            &config,
+        );
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_skips_dominated_tags() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("eval-infra", "Eval Infra");
+        task.tags = vec!["evaluation".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let modified =
+            scaffold_full_pipeline(dir.path(), &mut graph, "eval-infra", "Eval Infra", &config);
+        assert!(!modified);
+        assert!(graph.get_task(".assign-eval-infra").is_none());
+        assert!(graph.get_task(".evaluate-eval-infra").is_none());
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_place_description_restricts_to_main_task() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_place = true;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
+
+        scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
+
+        let place = graph.get_task(".place-foo").unwrap();
+        let desc = place.description.as_deref().unwrap_or("");
+        // Description must explicitly restrict edge additions to the main task
+        assert!(
+            desc.contains("MAIN task") || desc.contains("main task"),
+            "Placement task description should restrict edges to main task, got: {}",
+            desc
+        );
+        assert!(
+            desc.contains("Do NOT") || desc.contains("do not"),
+            "Placement task description should prohibit modifying dot-tasks, got: {}",
+            desc
+        );
+    }
+
+    #[test]
+    fn test_scaffold_full_pipeline_creates_place_even_if_eval_scheduled() {
+        // Regression: if scaffold_eval_task ran first (coordinator path) and set
+        // the eval-scheduled tag, scaffold_full_pipeline must still create
+        // .place-* and .assign-* tasks.
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_place = true;
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("foo", "Foo Task")));
+
+        // Simulate coordinator's scaffold_eval_task running first:
+        // creates .flip-* and .evaluate-*, tags source as eval-scheduled
+        scaffold_eval_task(dir.path(), &mut graph, "foo", "Foo Task", &config);
+        assert!(graph.get_task(".flip-foo").is_some());
+        assert!(graph.get_task(".evaluate-foo").is_some());
+        let source = graph.get_task("foo").unwrap();
+        assert!(source.tags.contains(&"eval-scheduled".to_string()));
+
+        // Now scaffold_full_pipeline runs (publish path) — must still create
+        // .place-* and .assign-* despite the eval-scheduled tag
+        let modified = scaffold_full_pipeline(dir.path(), &mut graph, "foo", "Foo Task", &config);
+        assert!(modified, "scaffold_full_pipeline should have created .place and .assign");
+
+        assert!(
+            graph.get_task(".place-foo").is_some(),
+            ".place-foo must exist even when eval-scheduled tag is set"
+        );
+        assert!(
+            graph.get_task(".assign-foo").is_some(),
+            ".assign-foo must exist even when eval-scheduled tag is set"
+        );
     }
 }

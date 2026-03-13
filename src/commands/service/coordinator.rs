@@ -741,30 +741,23 @@ fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> 
     modified
 }
 
-/// Build placement tasks for draft tasks needing automatic placement.
+/// Handle failed `.place-*` tasks by fallback-publishing the original task.
 ///
-/// Detects tasks in draft state (paused=true, not unplaced, not system task)
-/// and either auto-places them (fast path) or creates `.place-*` system tasks
-/// for agent-based placement.
-///
-/// **Auto-place fast path:** If a draft task has `--after` deps AND no file
-/// overlap with active tasks' artifacts, publish it immediately (no agent needed).
-///
-/// **Agent placement:** Creates a `.place-<task-id>` system task with placement
-/// context (active tasks, artifacts, integration gates, file mentions).
+/// `.place-*` tasks are created atomically at `wg publish` time (see
+/// `eval_scaffold::scaffold_full_pipeline`). The coordinator no longer creates
+/// them — it only handles the failure case: if a `.place-*` task fails, the
+/// original task is unpaused so dispatch can proceed without placement.
 ///
 /// Returns `true` if the graph was modified.
 fn build_placement_tasks(
     graph: &mut workgraph::graph::WorkGraph,
-    config: &Config,
-    dir: &Path,
+    _config: &Config,
+    _dir: &Path,
 ) -> bool {
-    use workgraph::graph::is_system_task;
-
     let mut modified = false;
 
     // Handle failed .place-* tasks: fallback-publish the original task.
-    // Never let placement failure block dispatch.
+    // Never let placement failure permanently block dispatch.
     let failed_placers: Vec<(String, String)> = graph
         .tasks()
         .filter(|t| {
@@ -804,264 +797,7 @@ fn build_placement_tasks(
         }
     }
 
-    // Collect draft tasks needing placement
-    let tasks_needing_placement: Vec<(String, Vec<String>, Option<String>)> = graph
-        .tasks()
-        .filter(|t| {
-            t.paused
-                && !t.unplaced
-                && !is_system_task(&t.id)
-                && !t.tags.iter().any(|tag| tag == "placed")
-        })
-        .map(|t| (t.id.clone(), t.after.clone(), t.description.clone()))
-        .collect();
-
-    for (task_id, after_deps, description) in tasks_needing_placement {
-        let place_task_id = format!(".place-{}", task_id);
-
-        // Idempotent: skip if placement task already exists
-        if graph.get_task(&place_task_id).is_some() {
-            continue;
-        }
-
-        // Auto-place fast path: task has --after deps AND no file overlap with active tasks
-        if !after_deps.is_empty() {
-            let mentioned_files = extract_file_paths(description.as_deref().unwrap_or(""));
-            let has_overlap = if mentioned_files.is_empty() {
-                false
-            } else {
-                graph
-                    .tasks()
-                    .filter(|t| {
-                        t.id != task_id
-                            && !t.status.is_terminal()
-                            && !t.paused
-                            && !is_system_task(&t.id)
-                    })
-                    .any(|t| {
-                        t.artifacts
-                            .iter()
-                            .any(|a| mentioned_files.iter().any(|f| a.contains(f)))
-                    })
-            };
-
-            if !has_overlap {
-                if let Some(task) = graph.get_task_mut(&task_id) {
-                    task.paused = false;
-                    if !task.tags.contains(&"placed".to_string()) {
-                        task.tags.push("placed".to_string());
-                    }
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: Utc::now().to_rfc3339(),
-                        actor: Some("coordinator".to_string()),
-                        message: "Auto-placed: user deps sufficient, no file conflicts detected"
-                            .to_string(),
-                    });
-                }
-                eprintln!(
-                    "[coordinator] Auto-placed draft task '{}' (deps provided, no file conflicts)",
-                    task_id
-                );
-                super::super::notify_graph_changed(dir);
-                modified = true;
-                continue;
-            }
-        }
-
-        // Agent placement: create .place-<task-id> system task
-        let placement_context = build_placement_context(graph, &task_id);
-        let placer_model = config.resolve_model_for_role(workgraph::config::DispatchRole::Placer);
-        let place_task = Task {
-            id: place_task_id.clone(),
-            title: format!("Place: {}", task_id),
-            description: Some(placement_context),
-            status: Status::Open,
-            after: vec![],
-            tags: vec!["placement".to_string(), "agency".to_string()],
-            exec_mode: Some("bare".to_string()),
-            visibility: "internal".to_string(),
-            created_at: Some(Utc::now().to_rfc3339()),
-            model: Some(placer_model.model),
-            provider: placer_model.provider,
-            agent: config.agency.placer_agent.clone(),
-            ..Task::default()
-        };
-
-        graph.add_node(Node::Task(place_task));
-
-        // Wire .place-* → .assign-* dependency if .assign-* already exists.
-        // This enforces pipeline ordering: .place-* → .assign-* → task
-        let assign_task_id = format!(".assign-{}", task_id);
-        if let Some(assign_task) = graph.get_task_mut(&assign_task_id)
-            && !assign_task.after.iter().any(|a| a == &place_task_id)
-        {
-            assign_task.after.push(place_task_id.clone());
-            eprintln!(
-                "[coordinator] Wired placement dependency: '{}' → '{}'",
-                place_task_id, assign_task_id
-            );
-        }
-
-        eprintln!(
-            "[coordinator] Created placement task '{}' for draft task '{}'",
-            place_task_id, task_id
-        );
-        modified = true;
-    }
-
     modified
-}
-
-/// Extract file paths from a task description using heuristics.
-fn extract_file_paths(text: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for word in text.split_whitespace() {
-        let word = word.trim_matches(|c: char| {
-            !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
-        });
-        if word.contains('/')
-            && (word.ends_with(".rs")
-                || word.ends_with(".ts")
-                || word.ends_with(".js")
-                || word.ends_with(".py")
-                || word.ends_with(".go")
-                || word.ends_with(".toml")
-                || word.ends_with(".md")
-                || word.ends_with(".yaml")
-                || word.ends_with(".yml")
-                || word.ends_with(".json"))
-        {
-            paths.push(word.to_string());
-        }
-    }
-    paths
-}
-
-/// Build placement context string for a `.place-*` task description.
-fn build_placement_context(graph: &workgraph::graph::WorkGraph, task_id: &str) -> String {
-    use workgraph::graph::is_system_task;
-
-    let mut ctx = String::new();
-
-    if let Some(task) = graph.get_task(task_id) {
-        let mentioned_files = extract_file_paths(task.description.as_deref().unwrap_or(""));
-        ctx.push_str("## Task to place\n");
-        ctx.push_str(&format!("ID: {}\n", task.id));
-        ctx.push_str(&format!("Title: {}\n", task.title));
-        if let Some(ref desc) = task.description {
-            // Only include a brief summary — the placement agent needs topology
-            // context, not implementation details or code snippets.
-            let summary = desc
-                .split("\n\n")
-                .next()
-                .unwrap_or(desc)
-                .lines()
-                .next()
-                .unwrap_or(desc);
-            let summary = if summary.len() > 150 {
-                format!("{}…", &summary[..summary.floor_char_boundary(150)])
-            } else {
-                summary.to_string()
-            };
-            ctx.push_str(&format!("Summary: {}\n", summary));
-        }
-        if !mentioned_files.is_empty() {
-            ctx.push_str(&format!(
-                "Files mentioned: {}\n",
-                mentioned_files.join(", ")
-            ));
-        }
-        if !task.after.is_empty() {
-            ctx.push_str(&format!("Existing deps: {}\n", task.after.join(", ")));
-        }
-        ctx.push('\n');
-
-        // Placement hints section (per design doc section 5)
-        if !task.place_near.is_empty() || !task.place_before.is_empty() {
-            ctx.push_str("## Placement hints\n");
-            if !task.place_near.is_empty() {
-                ctx.push_str(&format!("near: {}\n", task.place_near.join(", ")));
-            }
-            if !task.place_before.is_empty() {
-                ctx.push_str(&format!("before: {}\n", task.place_before.join(", ")));
-            }
-            ctx.push('\n');
-        }
-    }
-
-    ctx.push_str("## Active tasks (non-terminal)\n");
-    let active_tasks: Vec<_> = graph
-        .tasks()
-        .filter(|t| {
-            !t.status.is_terminal() && !t.paused && !is_system_task(&t.id) && t.id != task_id
-        })
-        .collect();
-    if active_tasks.is_empty() {
-        ctx.push_str("(none)\n");
-    } else {
-        for t in &active_tasks {
-            let arts = if t.artifacts.is_empty() {
-                "[]".to_string()
-            } else {
-                format!("[{}]", t.artifacts.join(", "))
-            };
-            ctx.push_str(&format!("- {} ({}): artifacts={}\n", t.id, t.status, arts));
-        }
-    }
-    ctx.push('\n');
-
-    ctx.push_str("## Recently completed tasks (last 10)\n");
-    let mut completed: Vec<_> = graph
-        .tasks()
-        .filter(|t| t.status == Status::Done && !is_system_task(&t.id))
-        .collect();
-    completed.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
-    completed.truncate(10);
-    if completed.is_empty() {
-        ctx.push_str("(none)\n");
-    } else {
-        for t in &completed {
-            let arts = if t.artifacts.is_empty() {
-                "[]".to_string()
-            } else {
-                format!("[{}]", t.artifacts.join(", "))
-            };
-            ctx.push_str(&format!("- {} (done): artifacts={}\n", t.id, arts));
-        }
-    }
-    ctx.push('\n');
-
-    ctx.push_str("## Integration gates\n");
-    let gates: Vec<_> = graph
-        .tasks()
-        .filter(|t| t.after.len() >= 5 && !t.status.is_terminal())
-        .collect();
-    if gates.is_empty() {
-        ctx.push_str("(none)\n");
-    } else {
-        for t in &gates {
-            ctx.push_str(&format!("- {}: {} deps\n", t.id, t.after.len()));
-        }
-    }
-    ctx.push('\n');
-
-    ctx.push_str("## Instructions\n");
-    ctx.push_str("1. Analyze file overlap between the new task and active tasks\n");
-    ctx.push_str(&format!(
-        "2. Add dependency edges using: wg edit {} --add-after <dep-id>\n",
-        task_id
-    ));
-    ctx.push_str("3. If the task belongs before an integration gate, add it:\n");
-    ctx.push_str(&format!("   wg edit <gate-id> --add-after {}\n", task_id));
-    ctx.push_str(&format!(
-        "4. When done, publish the task: wg publish {}\n",
-        task_id
-    ));
-    ctx.push_str(
-        "5. If placement is ambiguous, publish anyway — some placement is better than none\n",
-    );
-
-    ctx
 }
 
 /// Auto-assign: scaffold `.assign-*` tasks and run lightweight LLM assignment.
@@ -1435,6 +1171,7 @@ fn build_auto_assign_tasks(
                     failure_reason: None,
                     model: Some(creator_resolved.model),
                     provider: creator_resolved.provider,
+                    endpoint: None,
                     verify: None,
                     agent: config.agency.creator_agent.clone(),
                     loop_iteration: 0,
@@ -1514,6 +1251,14 @@ fn build_auto_evaluate_tasks(
     let tasks_needing_eval: Vec<_> = graph
         .tasks()
         .filter(|t| {
+            // Skip paused/draft tasks — their pipeline is scaffolded at
+            // `wg publish` time via scaffold_full_pipeline.  Creating
+            // .flip/.evaluate here prematurely would tag the source task
+            // as eval-scheduled, causing scaffold_full_pipeline to skip
+            // .place/.assign creation later.
+            if t.paused {
+                return false;
+            }
             let eval_id = format!(".evaluate-{}", t.id);
             if graph.get_task(&eval_id).is_some() {
                 return false;
@@ -1749,6 +1494,7 @@ fn build_flip_verification_tasks(
             failure_reason: None,
             model: Some(verification_model.clone()),
             provider: verification_resolved.provider.clone(),
+            endpoint: None,
             verify: source_verify_cmd,
             agent: None,
             loop_iteration: 0,
@@ -1941,6 +1687,7 @@ fn build_auto_evolve_task(
         failure_reason: None,
         model: Some(evolver_resolved.model),
         provider: evolver_resolved.provider,
+        endpoint: None,
         verify: None,
         agent: config.agency.evolver_agent.clone(),
         loop_iteration: 0,
@@ -2117,6 +1864,7 @@ fn build_auto_create_task(
         failure_reason: None,
         model: Some(creator_resolved.model),
         provider: creator_resolved.provider,
+        endpoint: None,
         verify: None,
         agent: config.agency.creator_agent.clone(),
         loop_iteration: 0,
@@ -3038,7 +2786,10 @@ pub fn coordinator_tick(
         // Phase 2.8: Message-triggered resurrection.
         modified |= resurrect_done_tasks(graph, dir);
 
-        // Phase 2.9: Build placement tasks for draft tasks needing automatic placement.
+        // Phase 2.9: Handle failed .place-* tasks (fallback-publish).
+        // Note: .place-* tasks are now created atomically at `wg publish` time
+        // (see eval_scaffold::scaffold_full_pipeline). The coordinator no longer
+        // creates them — it only handles the failure fallback here.
         modified |= build_placement_tasks(graph, &config, dir);
 
         modified
@@ -3046,9 +2797,6 @@ pub fn coordinator_tick(
     .context("Failed to load/save graph during maintenance phases")?;
 
     // Phases 3–4.7: Agency scaffolding (atomic load-modify-save).
-    //
-    // A separate `modify_graph` call so that tasks created by Phase 2.9
-    // (placement) are visible on disk when we reload here.
     let graph = modify_graph(&graph_path, |graph| {
         let mut modified = false;
 

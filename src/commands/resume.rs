@@ -250,8 +250,11 @@ fn unpause_task(graph: &mut WorkGraph, task_id: &str, action: &str) {
     });
 }
 
-/// Create lifecycle tasks (`.assign-*`, `.evaluate-*`, `.flip-*`) for each
-/// published task. Skips system tasks (dot-prefixed) and dominated tags.
+/// Create the full agency pipeline (`.place-*`, `.assign-*`, `.flip-*`,
+/// `.evaluate-*`) for each published task in one atomic pass.
+///
+/// All five tasks and their edges are written together into the same graph
+/// object before the caller saves — guaranteeing a single, atomic write.
 fn scaffold_eval_for_published(dir: &Path, graph: &mut WorkGraph, task_ids: &[String]) {
     let config = workgraph::config::Config::load_or_default(dir);
 
@@ -262,26 +265,13 @@ fn scaffold_eval_for_published(dir: &Path, graph: &mut WorkGraph, task_ids: &[St
         .filter_map(|id| graph.get_task(id).map(|t| (id.clone(), t.title.clone())))
         .collect();
 
-    // Scaffold .assign-* tasks (blocking edges) when auto_assign is enabled
-    if config.agency.auto_assign {
-        let assign_count = eval_scaffold::scaffold_assign_tasks_batch(graph, &candidates);
-        if assign_count > 0 {
-            eprintln!(
-                "[publish] Eagerly scaffolded {} assignment task(s)",
-                assign_count
-            );
-        }
-    }
-
-    // Scaffold .evaluate-* and .flip-* tasks
-    if config.agency.auto_evaluate {
-        let eval_count = eval_scaffold::scaffold_eval_tasks_batch(dir, graph, &candidates, &config);
-        if eval_count > 0 {
-            eprintln!(
-                "[publish] Eagerly scaffolded {} evaluation task(s)",
-                eval_count
-            );
-        }
+    // Scaffold the full pipeline (.place → .assign → task → .flip → .evaluate)
+    let count = eval_scaffold::scaffold_full_pipeline_batch(dir, graph, &candidates, &config);
+    if count > 0 {
+        eprintln!(
+            "[publish] Eagerly scaffolded full agency pipeline for {} task(s)",
+            count
+        );
     }
 }
 
@@ -669,5 +659,39 @@ mod tests {
         let graph = load_graph(graph_path(dir.path())).unwrap();
         assert!(!graph.get_task("a").unwrap().paused);
         assert!(!graph.get_task("b").unwrap().paused);
+    }
+
+    #[test]
+    fn test_publish_creates_place_task_with_auto_place() {
+        // Regression test: wg publish must create .place-* tasks when
+        // auto_place is enabled.
+        let dir = tempdir().unwrap();
+        let mut task = make_task("my-task", "My Task", Status::Open);
+        task.paused = true;
+        setup_workgraph(dir.path(), vec![task]);
+
+        // Enable auto_place in config (dir.path() IS the .workgraph dir)
+        fs::write(
+            dir.path().join("config.toml"),
+            "[agency]\nauto_place = true\nauto_assign = true\nauto_evaluate = true\n",
+        )
+        .unwrap();
+
+        let result = publish(dir.path(), "my-task", false);
+        assert!(result.is_ok());
+
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        assert!(
+            graph.get_task(".place-my-task").is_some(),
+            ".place-my-task must be created at publish time"
+        );
+        assert!(
+            graph.get_task(".assign-my-task").is_some(),
+            ".assign-my-task must be created at publish time"
+        );
+        assert!(
+            graph.get_task(".evaluate-my-task").is_some(),
+            ".evaluate-my-task must be created at publish time"
+        );
     }
 }
