@@ -96,6 +96,7 @@ pub fn create_provider_ext(
     let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
 
     let api_base: Option<String> = endpoint_url
+        .or_else(|| std::env::var("WG_ENDPOINT_URL").ok())
         .or_else(|| {
             // OpenAI-family env var base URLs
             if matches!(provider_name.as_str(), "openai" | "openrouter" | "local") {

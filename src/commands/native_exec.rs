@@ -81,12 +81,17 @@ pub fn run(
         task_id, effective_model, exec_mode, max_turns
     );
 
-    // Create the LLM provider (auto-selects by model name)
+    // Create the LLM provider (auto-selects by model name).
+    // Provider resolution: CLI --provider > WG_LLM_PROVIDER env var > create_provider_ext fallback.
+    let effective_provider = provider
+        .map(String::from)
+        .or_else(|| std::env::var("WG_LLM_PROVIDER").ok());
     let endpoint_name = std::env::var("WG_ENDPOINT").ok();
+    // WG_ENDPOINT_URL is read inside create_provider_ext as a base URL override.
     let client = create_provider_ext(
         workgraph_dir,
         &effective_model,
-        provider,
+        effective_provider.as_deref(),
         endpoint_name.as_deref(),
     )?;
 

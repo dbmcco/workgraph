@@ -196,17 +196,20 @@ pub(crate) fn spawn_agent_inner(
     // Use resolved exec_mode (already accounts for role defaults)
     let exec_mode = resolved_exec_mode.as_str();
 
-    // Resolve per-role provider and endpoint for native executor.
+    // Resolve per-role provider and endpoint for all executor types.
     // Priority: task.provider (set on Task struct) > role-based config resolution.
     let task_provider = graph.get_task(task_id).and_then(|t| t.provider.clone());
     let resolved_task_agent =
         config.resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent);
-    let effective_provider: Option<String> = if settings.executor_type == "native" {
-        task_provider.or_else(|| resolved_task_agent.provider.clone())
-    } else {
-        None
-    };
+    let effective_provider: Option<String> =
+        task_provider.or_else(|| resolved_task_agent.provider.clone());
     let effective_endpoint: Option<String> = resolved_task_agent.endpoint.clone();
+
+    // Resolve endpoint URL from named endpoint config.
+    let effective_endpoint_url: Option<String> = effective_endpoint
+        .as_ref()
+        .and_then(|name| config.llm_endpoints.find_by_name(name))
+        .and_then(|ep| ep.url.clone());
 
     // Build the inner command string first
     let inner_command = build_inner_command(
@@ -280,6 +283,13 @@ pub(crate) fn spawn_agent_inner(
     }
     if let Some(ref ep) = effective_endpoint {
         cmd.env("WG_ENDPOINT", ep);
+        cmd.env("WG_ENDPOINT_NAME", ep);
+    }
+    if let Some(ref provider) = effective_provider {
+        cmd.env("WG_LLM_PROVIDER", provider);
+    }
+    if let Some(ref url) = effective_endpoint_url {
+        cmd.env("WG_ENDPOINT_URL", url);
     }
 
     // Set working directory: worktree overrides settings.working_dir
