@@ -2229,6 +2229,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -3329,6 +3330,7 @@ model = "haiku"
     }
 
     #[test]
+    #[serial]
     fn test_resolve_api_key_env_var_fallback() {
         // Save/clear env
         let saved = std::env::var("OPENAI_API_KEY").ok();
@@ -3352,6 +3354,7 @@ model = "haiku"
     }
 
     #[test]
+    #[serial]
     fn test_resolve_api_key_inline_beats_env_var() {
         let saved = std::env::var("OPENAI_API_KEY").ok();
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-should-lose") };
@@ -3373,6 +3376,7 @@ model = "haiku"
     }
 
     #[test]
+    #[serial]
     fn test_resolve_api_key_file_beats_env_var() {
         let saved = std::env::var("OPENAI_API_KEY").ok();
         unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-should-lose") };
@@ -3397,6 +3401,7 @@ model = "haiku"
     }
 
     #[test]
+    #[serial]
     fn test_resolve_api_key_openrouter_env_var_cascade() {
         let saved_or = std::env::var("OPENROUTER_API_KEY").ok();
         let saved_oai = std::env::var("OPENAI_API_KEY").ok();
