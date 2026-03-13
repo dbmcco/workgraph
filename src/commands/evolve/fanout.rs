@@ -678,10 +678,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tempfile::TempDir;
-    use workgraph::agency::{
-        AccessControl, Lineage, PerformanceRecord, init, build_role, build_tradeoff, save_role,
-        save_tradeoff, record_evaluation,
-    };
+    use workgraph::agency::{AccessControl, Lineage, PerformanceRecord};
     use workgraph::graph::WorkGraph;
 
     fn setup_test_env() -> (TempDir, std::path::PathBuf) {
@@ -750,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_fanout_dry_run_creates_no_tasks() {
-        let (tmp, wg_dir) = setup_test_env();
+        let (_tmp, wg_dir) = setup_test_env();
         let agency_dir = wg_dir.join("agency");
         fs::create_dir_all(agency_dir.join("cache/roles")).unwrap();
         fs::create_dir_all(agency_dir.join("primitives/tradeoffs")).unwrap();
@@ -789,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_fanout_creates_task_graph() {
-        let (tmp, wg_dir) = setup_test_env();
+        let (_tmp, wg_dir) = setup_test_env();
         let agency_dir = wg_dir.join("agency");
         fs::create_dir_all(agency_dir.join("cache/roles")).unwrap();
         fs::create_dir_all(agency_dir.join("primitives/tradeoffs")).unwrap();
