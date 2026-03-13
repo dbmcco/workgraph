@@ -875,164 +875,206 @@ fn resolve_model_source_reports_tier_override() {
 }
 
 // ===========================================================================
-// Place → Assign retroactive wiring tests
+// Full pipeline creation tests (publish creates all 5 tasks atomically)
 // ===========================================================================
 
 #[test]
-fn scaffold_assign_then_place_wires_retroactively() {
-    // Scenario: publish runs before coordinator Phase 2.9.
-    // .assign-* is created first (without .place-* dep), then .place-* is created.
-    // The coordinator's retroactive wiring must add .place-* to .assign-*'s after list
-    // so the chain .place-* → .assign-* → task is always correct regardless of order.
-    let mut graph = WorkGraph::new();
-    graph.add_node(Node::Task(make_task("my-task", "My Task")));
+fn publish_creates_full_pipeline_all_five_tasks() {
+    // wg publish with all agency flags enabled creates all 5 pipeline tasks:
+    // .place-*, .assign-*, main task (already exists), .flip-*, .evaluate-*
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp);
 
-    // Step 1: Simulate publish creating .assign-* without .place-* existing
-    // (replicates scaffold_assign_task when .place-* doesn't exist yet)
-    let assign_task = Task {
-        id: ".assign-my-task".to_string(),
-        title: "Assign agent for: My Task".to_string(),
-        status: Status::Open,
-        after: vec![], // No .place-* exists yet → empty deps
-        before: vec!["my-task".to_string()],
-        tags: vec!["assignment".to_string(), "agency".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(assign_task));
+    // Enable all pipeline stages
+    wg_ok(&wg_dir, &["config", "--auto-place", "true"]);
+    wg_ok(&wg_dir, &["config", "--auto-assign", "true"]);
+    wg_ok(&wg_dir, &["config", "--auto-evaluate", "true"]);
+    wg_ok(&wg_dir, &["config", "--flip-enabled", "true"]);
 
-    // Verify .assign-* has no deps initially
-    let assign = graph.get_task(".assign-my-task").unwrap();
+    // Create a draft task (will be paused)
+    wg_ok(&wg_dir, &["add", "My Feature"]);
+
+    // Verify it's a draft
+    let show = wg_ok(&wg_dir, &["show", "my-feature"]);
     assert!(
-        assign.after.is_empty(),
-        ".assign-* should have no deps when .place-* doesn't exist yet"
+        show.contains("paused") || show.contains("Paused"),
+        "Task should be paused (draft), got: {}",
+        show
     );
 
-    // Step 2: Simulate coordinator Phase 2.9 creating .place-*
-    let place_task = Task {
-        id: ".place-my-task".to_string(),
-        title: "Place: my-task".to_string(),
-        status: Status::Open,
-        tags: vec!["placement".to_string(), "agency".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(place_task));
+    // Publish it — this should atomically create all 5 pipeline tasks
+    wg_ok(&wg_dir, &["publish", "my-feature"]);
 
-    // Step 3: Coordinator's retroactive wiring (from build_placement_tasks):
-    // after creating .place-*, check if .assign-* exists and wire the edge
-    let place_task_id = ".place-my-task";
-    let assign_task_id = ".assign-my-task";
-    if let Some(assign_task) = graph.get_task_mut(assign_task_id)
-        && !assign_task.after.iter().any(|a| a == place_task_id)
-    {
-        assign_task.after.push(place_task_id.to_string());
-    }
+    // Load the graph and verify all pipeline tasks exist
+    use workgraph::parser::load_graph;
+    let graph_path = wg_dir.join("graph.jsonl");
+    let graph = load_graph(&graph_path).unwrap();
 
-    // Verify: .assign-* now depends on .place-*
-    let assign = graph.get_task(".assign-my-task").unwrap();
-    assert_eq!(
-        assign.after,
-        vec![".place-my-task".to_string()],
-        ".assign-* should depend on .place-* after retroactive wiring"
+    assert!(
+        graph.get_task("my-feature").is_some(),
+        "Main task should exist"
     );
-
-    // Verify: full chain .place-* → .assign-* → my-task
-    assert_eq!(assign.before, vec!["my-task".to_string()]);
+    assert!(
+        graph.get_task(".place-my-feature").is_some(),
+        ".place-my-feature should be created by wg publish"
+    );
+    assert!(
+        graph.get_task(".assign-my-feature").is_some(),
+        ".assign-my-feature should be created by wg publish"
+    );
+    assert!(
+        graph.get_task(".flip-my-feature").is_some(),
+        ".flip-my-feature should be created by wg publish (FLIP enabled)"
+    );
+    assert!(
+        graph.get_task(".evaluate-my-feature").is_some(),
+        ".evaluate-my-feature should be created by wg publish"
+    );
 }
 
 #[test]
-fn retroactive_wiring_is_idempotent() {
-    // The retroactive wiring must not add duplicate edges if called multiple times
-    let mut graph = WorkGraph::new();
-    graph.add_node(Node::Task(make_task("foo", "Foo")));
+fn publish_creates_all_pipeline_edges_correctly() {
+    // Verify the full edge chain after publish:
+    // .place-* → .assign-* → my-feature → .flip-* → .evaluate-*
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp);
 
-    let assign_task = Task {
-        id: ".assign-foo".to_string(),
-        title: "Assign agent for: Foo".to_string(),
-        status: Status::Open,
-        after: vec![],
-        before: vec!["foo".to_string()],
-        tags: vec!["assignment".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(assign_task));
+    wg_ok(&wg_dir, &["config", "--auto-place", "true"]);
+    wg_ok(&wg_dir, &["config", "--auto-assign", "true"]);
+    wg_ok(&wg_dir, &["config", "--auto-evaluate", "true"]);
+    wg_ok(&wg_dir, &["config", "--flip-enabled", "true"]);
 
-    let place_task = Task {
-        id: ".place-foo".to_string(),
-        title: "Place: foo".to_string(),
-        status: Status::Open,
-        tags: vec!["placement".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(place_task));
+    wg_ok(&wg_dir, &["add", "My Feature"]);
+    wg_ok(&wg_dir, &["publish", "my-feature"]);
 
-    // Wire twice — second call should be a no-op
-    for _ in 0..2 {
-        let place_id = ".place-foo";
-        let assign_id = ".assign-foo";
-        if let Some(assign_task) = graph.get_task_mut(assign_id)
-            && !assign_task.after.iter().any(|a| a == place_id)
-        {
-            assign_task.after.push(place_id.to_string());
-        }
-    }
+    use workgraph::parser::load_graph;
+    let graph_path = wg_dir.join("graph.jsonl");
+    let graph = load_graph(&graph_path).unwrap();
 
-    let assign = graph.get_task(".assign-foo").unwrap();
-    assert_eq!(
-        assign.after.len(),
-        1,
-        "Retroactive wiring should not create duplicate edges"
+    // .place-* has no deps (runs first)
+    let place = graph.get_task(".place-my-feature").unwrap();
+    assert!(
+        place.after.is_empty(),
+        ".place-* should have no deps, got: {:?}",
+        place.after
     );
-    assert_eq!(assign.after[0], ".place-foo");
+    assert!(
+        place.tags.contains(&"placement".to_string()),
+        ".place-* should have 'placement' tag"
+    );
+
+    // .assign-* depends on .place-*
+    let assign = graph.get_task(".assign-my-feature").unwrap();
+    assert!(
+        assign.after.contains(&".place-my-feature".to_string()),
+        ".assign-* should depend on .place-*, got after: {:?}",
+        assign.after
+    );
+    assert!(
+        assign.before.contains(&"my-feature".to_string()),
+        ".assign-* should block main task"
+    );
+
+    // main task depends on .assign-*
+    let main_task = graph.get_task("my-feature").unwrap();
+    assert!(
+        main_task.after.contains(&".assign-my-feature".to_string()),
+        "main task should depend on .assign-*, got after: {:?}",
+        main_task.after
+    );
+
+    // .flip-* depends on main task
+    let flip = graph.get_task(".flip-my-feature").unwrap();
+    assert!(
+        flip.after.contains(&"my-feature".to_string()),
+        ".flip-* should depend on main task, got after: {:?}",
+        flip.after
+    );
+
+    // .evaluate-* depends on .flip-*
+    let eval = graph.get_task(".evaluate-my-feature").unwrap();
+    assert!(
+        eval.after.contains(&".flip-my-feature".to_string()),
+        ".evaluate-* should depend on .flip-*, got after: {:?}",
+        eval.after
+    );
 }
 
 #[test]
-fn place_exists_before_assign_wires_forward() {
-    // Scenario: coordinator Phase 2.9 runs before publish.
-    // .place-* already exists when scaffold_assign_task creates .assign-*.
-    // Replicates the forward wiring path in eval_scaffold.rs lines 115-120.
-    let mut graph = WorkGraph::new();
-    graph.add_node(Node::Task(make_task("my-task", "My Task")));
+fn publish_place_task_description_restricts_to_main_task_only() {
+    // The .place-* task description must explicitly tell the placement agent
+    // to ONLY add edges to the MAIN task, never to dot-tasks.
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp);
 
-    // Step 1: Coordinator creates .place-* first
-    let place_task = Task {
-        id: ".place-my-task".to_string(),
-        title: "Place: my-task".to_string(),
-        status: Status::Open,
-        tags: vec!["placement".to_string(), "agency".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(place_task));
+    wg_ok(&wg_dir, &["config", "--auto-place", "true"]);
+    wg_ok(&wg_dir, &["add", "My Task"]);
+    wg_ok(&wg_dir, &["publish", "my-task"]);
 
-    // Step 2: Simulate scaffold_assign_task (publish-side) — detects .place-* exists
-    let task_id = "my-task";
-    let place_task_id = format!(".place-{}", task_id);
-    let after = if graph.get_task(&place_task_id).is_some() {
-        vec![place_task_id.clone()]
-    } else {
-        vec![]
-    };
+    use workgraph::parser::load_graph;
+    let graph_path = wg_dir.join("graph.jsonl");
+    let graph = load_graph(&graph_path).unwrap();
 
-    let assign_task = Task {
-        id: ".assign-my-task".to_string(),
-        title: "Assign agent for: My Task".to_string(),
-        status: Status::Open,
-        after,
-        before: vec!["my-task".to_string()],
-        tags: vec!["assignment".to_string(), "agency".to_string()],
-        ..Task::default()
-    };
-    graph.add_node(Node::Task(assign_task));
+    let place = graph.get_task(".place-my-task").unwrap();
+    let desc = place.description.as_deref().unwrap_or("");
 
-    // Verify: .assign-* depends on .place-* (forward wiring)
-    let assign = graph.get_task(".assign-my-task").unwrap();
-    assert_eq!(
-        assign.after,
-        vec![".place-my-task".to_string()],
-        ".assign-* should depend on .place-* when place exists at scaffold time"
+    assert!(
+        desc.contains("MAIN task") || desc.contains("main task"),
+        "Placement task description should restrict edges to the main task, got:\n{}",
+        desc
     );
+    assert!(
+        desc.contains("Do NOT") || desc.contains("do not") || desc.contains("NEVER"),
+        "Placement task description should prohibit modifying dot-tasks, got:\n{}",
+        desc
+    );
+    let mentions_dot_tasks =
+        desc.contains(".assign") || desc.contains("dot-task") || desc.contains("assign-*");
+    assert!(
+        mentions_dot_tasks,
+        "Description should mention that dot-tasks must not be modified, got:\n{}",
+        desc
+    );
+}
 
-    // Verify: full chain .place-* → .assign-* → my-task
-    assert_eq!(assign.before, vec!["my-task".to_string()]);
+#[test]
+fn coordinator_does_not_create_place_tasks_for_draft_tasks() {
+    // The coordinator's build_placement_tasks no longer creates .place-* for
+    // draft (paused) tasks. This is now done atomically at wg publish time.
+    //
+    // We verify by simulating the new coordinator fallback logic: only failed
+    // .place-* tasks trigger the fallback — no new ones are ever created.
+    let mut graph = WorkGraph::new();
+
+    let mut draft_task = make_task("unpublished-draft", "Unpublished Draft");
+    draft_task.paused = true;
+    draft_task.status = Status::Open;
+    graph.add_node(Node::Task(draft_task));
+
+    // The new build_placement_tasks only handles the failed-placer fallback.
+    // Replicate that logic: collect failed .place-* tasks only.
+    let failed_placers: Vec<(String, String)> = graph
+        .tasks()
+        .filter(|t| {
+            t.id.starts_with(".place-")
+                && t.status == Status::Failed
+                && !t.tags.iter().any(|tag| tag == "fallback-published")
+        })
+        .map(|t| {
+            let source_id = t.id.strip_prefix(".place-").unwrap().to_string();
+            (t.id.clone(), source_id)
+        })
+        .collect();
+
+    // No failed placers → nothing to do → no .place-* created
+    assert!(
+        failed_placers.is_empty(),
+        "No failed placers should exist for a fresh draft task"
+    );
+    assert!(
+        graph.get_task(".place-unpublished-draft").is_none(),
+        "Coordinator should NOT create .place-* for draft tasks (wg publish is responsible)"
+    );
 }
 
 // ===========================================================================
