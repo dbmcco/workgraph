@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use workgraph::agency;
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Node, Status, Task, is_system_task};
 use workgraph::parser::{load_graph, save_graph};
@@ -47,6 +48,19 @@ pub(crate) fn spawn_agent_inner(
     // Capture audit info before mutable borrows
     let task_title_for_audit = task.title.clone();
     let task_agent_for_audit = task.agent.clone();
+
+    // Look up agency agent preferences if task has an assigned agent identity.
+    // These are used later in model/provider resolution.
+    let (agent_preferred_model, agent_preferred_provider) =
+        if let Some(ref agent_hash) = task_agent_for_audit {
+            let agents_dir = dir.join("agency/cache/agents");
+            match agency::find_agent_by_prefix(&agents_dir, agent_hash) {
+                Ok(agent) => (agent.preferred_model.clone(), agent.preferred_provider.clone()),
+                Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
     // Only allow spawning on tasks that are Open or Blocked
     match task.status {
@@ -131,10 +145,13 @@ pub(crate) fn spawn_agent_inner(
     }
 
     // Model resolution hierarchy:
-    //   task.model > executor.model > model param (CLI --model or coordinator.model)
-    let effective_model = task_model
-        .or_else(|| executor_config.executor.model.clone())
-        .or_else(|| model.map(std::string::ToString::to_string));
+    //   task.model > agent.preferred_model > executor.model > model param (CLI --model or coordinator.model)
+    let effective_model = resolve_model(
+        task_model,
+        agent_preferred_model,
+        executor_config.executor.model.clone(),
+        model,
+    );
 
     // Override model in template vars with effective model
     if let Some(ref m) = effective_model {
@@ -197,19 +214,45 @@ pub(crate) fn spawn_agent_inner(
     let exec_mode = resolved_exec_mode.as_str();
 
     // Resolve per-role provider and endpoint for all executor types.
-    // Priority: task.provider (set on Task struct) > role-based config resolution.
+    // Priority: task.provider > agent.preferred_provider > role-based config resolution.
     let task_provider = graph.get_task(task_id).and_then(|t| t.provider.clone());
+    let task_endpoint = graph.get_task(task_id).and_then(|t| t.endpoint.clone());
     let resolved_task_agent =
         config.resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent);
-    let effective_provider: Option<String> =
-        task_provider.or_else(|| resolved_task_agent.provider.clone());
-    let effective_endpoint: Option<String> = resolved_task_agent.endpoint.clone();
+    let effective_provider: Option<String> = resolve_provider(
+        task_provider.clone(),
+        agent_preferred_provider.clone(),
+        resolved_task_agent.provider.clone(),
+    );
 
-    // Resolve endpoint URL from named endpoint config.
-    let effective_endpoint_url: Option<String> = effective_endpoint
+    // Endpoint resolution cascade:
+    //   1. task.endpoint — explicit endpoint name on the task
+    //   2. task.provider — find matching endpoint by provider
+    //   3. agent.preferred_provider — find matching endpoint by agent's provider
+    //   4. role config endpoint — from [models.task_agent].endpoint
+    let effective_endpoint: Option<String> = task_endpoint
+        .or_else(|| {
+            task_provider
+                .as_ref()
+                .and_then(|prov| config.llm_endpoints.find_for_provider(prov))
+                .map(|ep| ep.name.clone())
+        })
+        .or_else(|| {
+            agent_preferred_provider
+                .as_ref()
+                .and_then(|prov| config.llm_endpoints.find_for_provider(prov))
+                .map(|ep| ep.name.clone())
+        })
+        .or_else(|| resolved_task_agent.endpoint.clone());
+
+    // Resolve endpoint config, URL, and API key from the named endpoint.
+    let endpoint_config = effective_endpoint
         .as_ref()
-        .and_then(|name| config.llm_endpoints.find_by_name(name))
-        .and_then(|ep| ep.url.clone());
+        .and_then(|name| config.llm_endpoints.find_by_name(name));
+    let effective_endpoint_url: Option<String> =
+        endpoint_config.and_then(|ep| ep.url.clone());
+    let effective_api_key: Option<String> = endpoint_config
+        .and_then(|ep| ep.resolve_api_key(Some(dir)).ok().flatten());
 
     // Build the inner command string first
     let inner_command = build_inner_command(
@@ -218,6 +261,9 @@ pub(crate) fn spawn_agent_inner(
         &output_dir,
         &effective_model,
         &effective_provider,
+        &effective_endpoint,
+        &effective_endpoint_url,
+        &effective_api_key,
         &vars,
         &task_exec,
         resume_session_id.as_deref(),
@@ -290,6 +336,9 @@ pub(crate) fn spawn_agent_inner(
     }
     if let Some(ref url) = effective_endpoint_url {
         cmd.env("WG_ENDPOINT_URL", url);
+    }
+    if let Some(ref key) = effective_api_key {
+        cmd.env("WG_API_KEY", key);
     }
 
     // Set working directory: worktree overrides settings.working_dir
@@ -495,6 +544,9 @@ fn build_inner_command(
     output_dir: &Path,
     effective_model: &Option<String>,
     effective_provider: &Option<String>,
+    effective_endpoint: &Option<String>,
+    effective_endpoint_url: &Option<String>,
+    effective_api_key: &Option<String>,
     vars: &TemplateVars,
     task_exec: &Option<String>,
     resume_session_id: Option<&str>,
@@ -693,6 +745,18 @@ fn build_inner_command(
             if let Some(p) = effective_provider {
                 cmd_parts.push("--provider".to_string());
                 cmd_parts.push(shell_escape(p));
+            }
+            if let Some(ep) = effective_endpoint {
+                cmd_parts.push("--endpoint-name".to_string());
+                cmd_parts.push(shell_escape(ep));
+            }
+            if let Some(url) = effective_endpoint_url {
+                cmd_parts.push("--endpoint-url".to_string());
+                cmd_parts.push(shell_escape(url));
+            }
+            if let Some(key) = effective_api_key {
+                cmd_parts.push("--api-key".to_string());
+                cmd_parts.push(shell_escape(key));
             }
             cmd_parts.join(" ")
         }
@@ -910,4 +974,124 @@ exit $EXIT_CODE
     }
 
     Ok(wrapper_path)
+}
+
+/// Resolve model from the precedence hierarchy.
+/// Priority: task.model > agent.preferred_model > executor.model > coordinator.model
+pub(crate) fn resolve_model(
+    task_model: Option<String>,
+    agent_preferred_model: Option<String>,
+    executor_model: Option<String>,
+    coordinator_model: Option<&str>,
+) -> Option<String> {
+    task_model
+        .or(agent_preferred_model)
+        .or(executor_model)
+        .or_else(|| coordinator_model.map(std::string::ToString::to_string))
+}
+
+/// Resolve provider from the precedence hierarchy.
+/// Priority: task.provider > agent.preferred_provider > role_config.provider
+pub(crate) fn resolve_provider(
+    task_provider: Option<String>,
+    agent_preferred_provider: Option<String>,
+    role_config_provider: Option<String>,
+) -> Option<String> {
+    task_provider
+        .or(agent_preferred_provider)
+        .or(role_config_provider)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_model_task_overrides_agent() {
+        let result = resolve_model(
+            Some("task-model".to_string()),
+            Some("agent-model".to_string()),
+            Some("executor-model".to_string()),
+            Some("coordinator-model"),
+        );
+        assert_eq!(result, Some("task-model".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_agent_preferred_when_no_task_model() {
+        let result = resolve_model(
+            None,
+            Some("agent-model".to_string()),
+            Some("executor-model".to_string()),
+            Some("coordinator-model"),
+        );
+        assert_eq!(result, Some("agent-model".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_executor_when_no_agent() {
+        let result = resolve_model(
+            None,
+            None,
+            Some("executor-model".to_string()),
+            Some("coordinator-model"),
+        );
+        assert_eq!(result, Some("executor-model".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_coordinator_fallback() {
+        let result = resolve_model(None, None, None, Some("coordinator-model"));
+        assert_eq!(result, Some("coordinator-model".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_none_when_all_empty() {
+        let result = resolve_model(None, None, None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_provider_task_overrides_agent() {
+        let result = resolve_provider(
+            Some("task-provider".to_string()),
+            Some("agent-provider".to_string()),
+            Some("config-provider".to_string()),
+        );
+        assert_eq!(result, Some("task-provider".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_provider_agent_preferred_when_no_task() {
+        let result = resolve_provider(
+            None,
+            Some("agent-provider".to_string()),
+            Some("config-provider".to_string()),
+        );
+        assert_eq!(result, Some("agent-provider".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_provider_config_fallback() {
+        let result = resolve_provider(None, None, Some("config-provider".to_string()));
+        assert_eq!(result, Some("config-provider".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_provider_none_when_all_empty() {
+        let result = resolve_provider(None, None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_unassigned_task_uses_executor_model() {
+        // Simulates an unassigned task: no agent prefs
+        let result = resolve_model(
+            None,
+            None, // no agent
+            Some("executor-default".to_string()),
+            Some("coordinator-fallback"),
+        );
+        assert_eq!(result, Some("executor-default".to_string()));
+    }
 }
