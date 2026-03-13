@@ -2239,7 +2239,7 @@ impl VizApp {
             last_graph_mtime: graph_mtime,
             last_refresh: Instant::now(),
             last_refresh_display: chrono::Local::now().format("%H:%M:%S").to_string(),
-            refresh_interval: std::time::Duration::from_millis(1500),
+            refresh_interval: std::time::Duration::from_secs(1),
         };
         app.load_viz();
         app.load_stats();
