@@ -1300,6 +1300,8 @@ fn main() -> Result<()> {
                 trust_level,
                 contact,
                 executor,
+                model,
+                provider,
             } => commands::agent_crud::run_create(
                 &workgraph_dir,
                 &name,
@@ -1311,6 +1313,8 @@ fn main() -> Result<()> {
                 trust_level.as_deref(),
                 contact.as_deref(),
                 &executor,
+                model.as_deref(),
+                provider.as_deref(),
             ),
             AgentCommands::List => commands::agent_crud::run_list(&workgraph_dir, cli.json),
             AgentCommands::Show { id } => {

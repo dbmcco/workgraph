@@ -189,6 +189,8 @@ mod tests {
             trust_level: TrustLevel::Provisional,
             contact: None,
             executor: "claude".to_string(),
+            preferred_model: None,
+            preferred_provider: None,
             deployment_history: vec![],
             attractor_weight: 0.5,
             staleness_flags: vec![],

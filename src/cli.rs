@@ -2545,6 +2545,14 @@ pub enum AgentCommands {
         /// Executor backend (claude, matrix, email, shell)
         #[arg(long, default_value = "claude")]
         executor: String,
+
+        /// Preferred model (e.g., opus, sonnet, haiku, or full model ID)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Preferred provider (e.g., anthropic, openrouter)
+        #[arg(long)]
+        provider: Option<String>,
     },
 
     /// List all agent definitions

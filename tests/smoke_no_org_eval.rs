@@ -70,6 +70,8 @@ fn setup_agency(wg_dir: &std::path::Path) -> (String, String, String) {
         trust_level: Default::default(),
         contact: None,
         executor: "claude".to_string(),
+        preferred_model: None,
+        preferred_provider: None,
         attractor_weight: 0.5,
         deployment_history: vec![],
         staleness_flags: vec![],

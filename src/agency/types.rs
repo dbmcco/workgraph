@@ -310,6 +310,13 @@ pub struct Agent {
         skip_serializing_if = "is_default_executor"
     )]
     pub executor: String,
+    /// Preferred model for this agent (e.g., "opus", "sonnet", "haiku",
+    /// or a full model ID like "claude-opus-4-6").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    /// Preferred provider for this agent (e.g., "anthropic", "openrouter").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployment_history: Vec<DeploymentRef>,
     #[serde(default = "default_attractor_weight")]

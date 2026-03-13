@@ -30,7 +30,7 @@ fn parse_trust_level(s: &str) -> Result<TrustLevel> {
     }
 }
 
-/// `wg agent create <name> [--role <hash>] [--tradeoff <hash>] [--capabilities ...] [--rate N] [--capacity N] [--trust-level L] [--contact C] [--executor E]`
+/// `wg agent create <name> [--role <hash>] [--tradeoff <hash>] [--capabilities ...] [--rate N] [--capacity N] [--trust-level L] [--contact C] [--executor E] [--model M] [--provider P]`
 #[allow(clippy::too_many_arguments)]
 pub fn run_create(
     workgraph_dir: &Path,
@@ -43,6 +43,8 @@ pub fn run_create(
     trust_level: Option<&str>,
     contact: Option<&str>,
     executor: &str,
+    preferred_model: Option<&str>,
+    preferred_provider: Option<&str>,
 ) -> Result<()> {
     let agency_dir = workgraph_dir.join("agency");
     agency::init(&agency_dir).context("Failed to initialise agency directory")?;
@@ -133,6 +135,8 @@ pub fn run_create(
         trust_level: trust,
         contact: contact.map(std::string::ToString::to_string),
         executor: executor.to_string(),
+        preferred_model: preferred_model.map(std::string::ToString::to_string),
+        preferred_provider: preferred_provider.map(std::string::ToString::to_string),
         deployment_history: vec![],
         attractor_weight: 0.5,
         staleness_flags: vec![],
@@ -158,6 +162,12 @@ pub fn run_create(
         println!("  tradeoff:   {} ({})", t.name, agency::short_hash(&t.id));
     }
     println!("  executor:   {}", executor);
+    if let Some(m) = preferred_model {
+        println!("  model:      {} (preferred)", m);
+    }
+    if let Some(p) = preferred_provider {
+        println!("  provider:   {} (preferred)", p);
+    }
     if !capabilities.is_empty() {
         println!("  capabilities: {}", capabilities.join(", "));
     }
@@ -189,6 +199,8 @@ pub fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {
                     "role_id": a.role_id,
                     "tradeoff_id": a.tradeoff_id,
                     "executor": a.executor,
+                    "preferred_model": a.preferred_model,
+                    "preferred_provider": a.preferred_provider,
                     "capabilities": a.capabilities,
                     "avg_score": a.performance.avg_score,
                     "task_count": a.performance.task_count,
@@ -216,13 +228,19 @@ pub fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {
             } else {
                 agency::short_hash(&a.tradeoff_id).to_string()
             };
+            let model_str = a
+                .preferred_model
+                .as_deref()
+                .map(|m| format!(" model:{}", m))
+                .unwrap_or_default();
             println!(
-                "  {}  {:20} role:{} mot:{} exec:{} score:{} tasks:{}",
+                "  {}  {:20} role:{} mot:{} exec:{}{} score:{} tasks:{}",
                 agency::short_hash(&a.id),
                 a.name,
                 role_str,
                 mot_str,
                 a.executor,
+                model_str,
                 score_str,
                 a.performance.task_count,
             );
@@ -259,6 +277,8 @@ pub fn run_show(workgraph_dir: &Path, id: &str, json: bool) -> Result<()> {
             "tradeoff_id": agent.tradeoff_id,
             "tradeoff_name": tradeoff_name,
             "executor": agent.executor,
+            "preferred_model": agent.preferred_model,
+            "preferred_provider": agent.preferred_provider,
             "capabilities": agent.capabilities,
             "rate": agent.rate,
             "capacity": agent.capacity,
@@ -305,6 +325,12 @@ pub fn run_show(workgraph_dir: &Path, id: &str, json: bool) -> Result<()> {
 
         println!();
         println!("Executor: {}", agent.executor);
+        if let Some(model) = &agent.preferred_model {
+            println!("Model: {} (preferred)", model);
+        }
+        if let Some(provider) = &agent.preferred_provider {
+            println!("Provider: {} (preferred)", provider);
+        }
         if !agent.capabilities.is_empty() {
             println!("Capabilities: {}", agent.capabilities.join(", "));
         }
@@ -689,6 +715,8 @@ mod tests {
             None,
             None,
             "claude",
+            None,
+            None,
         )
     }
 
@@ -725,6 +753,8 @@ mod tests {
             Some("verified"),
             Some("ops@example.com"),
             "claude",
+            None,
+            None,
         )
         .unwrap();
 
@@ -757,6 +787,8 @@ mod tests {
             None,
             Some("@human:matrix.org"),
             "matrix",
+            None,
+            None,
         )
         .unwrap();
 
@@ -786,6 +818,8 @@ mod tests {
             None,
             None,
             "claude",
+            None,
+            None,
         );
         assert!(result.is_err());
         assert!(
@@ -823,6 +857,8 @@ mod tests {
             None,
             None,
             "claude",
+            None,
+            None,
         );
         assert!(result.is_err());
     }
