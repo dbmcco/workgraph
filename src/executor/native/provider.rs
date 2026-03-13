@@ -40,15 +40,16 @@ pub trait Provider: Send + Sync {
 
 /// Backward-compatible wrapper: routes by model string only.
 pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Provider>> {
-    create_provider_ext(workgraph_dir, model, None, None)
+    create_provider_ext(workgraph_dir, model, None, None, None)
 }
 
-/// Create a provider, optionally overriding the provider name and/or endpoint.
+/// Create a provider, optionally overriding the provider name, endpoint, and/or API key.
 ///
 /// Resolution order for API key:
-/// 1. Environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
-/// 2. Matching endpoint entry in config (by name if `endpoint_name` is set, otherwise by provider)
-/// 3. `[native_executor]` section in config (legacy fallback)
+/// 1. `api_key_override` parameter (pre-resolved by spawn path)
+/// 2. Environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
+/// 3. Matching endpoint entry in config (by name if `endpoint_name` is set, otherwise by provider)
+/// 4. `[native_executor]` section in config (legacy fallback)
 ///
 /// Resolution order for base URL:
 /// 1. Matching endpoint entry's `url` field
@@ -59,6 +60,7 @@ pub fn create_provider_ext(
     model: &str,
     provider_override: Option<&str>,
     endpoint_name: Option<&str>,
+    api_key_override: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
     let config = crate::config::Config::load(workgraph_dir).unwrap_or_default();
 
@@ -121,11 +123,14 @@ pub fn create_provider_ext(
 
     match provider_name.as_str() {
         "openai" | "openrouter" | "local" => {
-            // Resolve API key. Priority: env var > endpoint config > native_executor (legacy)
+            // Resolve API key. Priority: override > env var > endpoint config > native_executor (legacy)
             let env_key = ["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
                 .iter()
                 .find_map(|v| std::env::var(v).ok().filter(|k| !k.is_empty()));
-            let resolved_key = env_key.or(endpoint_key);
+            let resolved_key = api_key_override
+                .map(String::from)
+                .or(env_key)
+                .or(endpoint_key);
 
             let mut client = if let Some(key) = resolved_key {
                 OpenAiClient::new(key, model, None)
@@ -154,11 +159,13 @@ pub fn create_provider_ext(
             Ok(Box::new(client))
         }
         _ => {
-            // Resolve API key. Priority: env var > endpoint config > from_env fallbacks
+            // Resolve API key. Priority: override > env var > endpoint config > from_env fallbacks
             let env_key = std::env::var("ANTHROPIC_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty());
-            let mut client = if let Some(key) = env_key {
+            let mut client = if let Some(key) = api_key_override {
+                AnthropicClient::new(key.to_string(), model)
+            } else if let Some(key) = env_key {
                 AnthropicClient::new(key, model)
             } else if let Some(key) = endpoint_key {
                 AnthropicClient::new(key, model)

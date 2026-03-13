@@ -1530,6 +1530,18 @@ pub enum Commands {
         #[arg(long)]
         provider: Option<String>,
 
+        /// Named endpoint from config (e.g., openrouter, anthropic-prod)
+        #[arg(long)]
+        endpoint_name: Option<String>,
+
+        /// Endpoint URL override
+        #[arg(long)]
+        endpoint_url: Option<String>,
+
+        /// Pre-resolved API key (avoids re-resolution from config/files)
+        #[arg(long)]
+        api_key: Option<String>,
+
         /// Maximum agent turns before stopping
         #[arg(long, default_value = "100")]
         max_turns: usize,

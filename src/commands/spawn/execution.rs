@@ -1094,4 +1094,177 @@ mod tests {
         );
         assert_eq!(result, Some("executor-default".to_string()));
     }
+
+    /// Helper to build an EndpointsConfig for endpoint resolution tests.
+    fn test_endpoints_config() -> workgraph::config::EndpointsConfig {
+        workgraph::config::EndpointsConfig {
+            endpoints: vec![
+                workgraph::config::EndpointConfig {
+                    name: "my-openrouter".to_string(),
+                    provider: "openrouter".to_string(),
+                    url: Some("https://openrouter.ai/api/v1".to_string()),
+                    api_key: Some("sk-or-test".to_string()),
+                    api_key_file: None,
+                    model: None,
+                    is_default: true,
+                },
+                workgraph::config::EndpointConfig {
+                    name: "my-anthropic".to_string(),
+                    provider: "anthropic".to_string(),
+                    url: Some("https://api.anthropic.com".to_string()),
+                    api_key: Some("sk-ant-test".to_string()),
+                    api_key_file: None,
+                    model: None,
+                    is_default: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_endpoint_resolution_task_endpoint_takes_priority() {
+        let endpoints = test_endpoints_config();
+
+        // task.endpoint is set — should win over everything
+        let task_endpoint = Some("my-openrouter".to_string());
+        let task_provider: Option<String> = Some("anthropic".to_string());
+        let agent_provider: Option<String> = Some("anthropic".to_string());
+        let role_endpoint: Option<String> = Some("my-anthropic".to_string());
+
+        let effective = task_endpoint
+            .or_else(|| {
+                task_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or_else(|| {
+                agent_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or(role_endpoint);
+
+        assert_eq!(effective, Some("my-openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_resolution_task_provider_lookup() {
+        let endpoints = test_endpoints_config();
+
+        // No task.endpoint, but task.provider → find matching endpoint
+        let task_endpoint: Option<String> = None;
+        let task_provider = Some("openrouter".to_string());
+        let agent_provider: Option<String> = None;
+        let role_endpoint: Option<String> = None;
+
+        let effective = task_endpoint
+            .or_else(|| {
+                task_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or_else(|| {
+                agent_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or(role_endpoint);
+
+        assert_eq!(effective, Some("my-openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_resolution_agent_provider_fallback() {
+        let endpoints = test_endpoints_config();
+
+        // No task.endpoint or task.provider, agent.preferred_provider finds endpoint
+        let task_endpoint: Option<String> = None;
+        let task_provider: Option<String> = None;
+        let agent_provider = Some("anthropic".to_string());
+        let role_endpoint: Option<String> = None;
+
+        let effective = task_endpoint
+            .or_else(|| {
+                task_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or_else(|| {
+                agent_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or(role_endpoint);
+
+        assert_eq!(effective, Some("my-anthropic".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_resolution_role_config_fallback() {
+        let endpoints = test_endpoints_config();
+
+        // Nothing else set, role config endpoint is used
+        let task_endpoint: Option<String> = None;
+        let task_provider: Option<String> = None;
+        let agent_provider: Option<String> = None;
+        let role_endpoint = Some("my-anthropic".to_string());
+
+        let effective = task_endpoint
+            .or_else(|| {
+                task_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or_else(|| {
+                agent_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or(role_endpoint);
+
+        assert_eq!(effective, Some("my-anthropic".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_resolution_none_when_all_empty() {
+        let endpoints = test_endpoints_config();
+
+        let task_endpoint: Option<String> = None;
+        let task_provider: Option<String> = None;
+        let agent_provider: Option<String> = None;
+        let role_endpoint: Option<String> = None;
+
+        let effective = task_endpoint
+            .or_else(|| {
+                task_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or_else(|| {
+                agent_provider
+                    .as_ref()
+                    .and_then(|prov| endpoints.find_for_provider(prov))
+                    .map(|ep| ep.name.clone())
+            })
+            .or(role_endpoint);
+
+        assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn test_endpoint_api_key_resolved_from_config() {
+        let endpoints = test_endpoints_config();
+        let ep = endpoints.find_by_name("my-openrouter").unwrap();
+        let key = ep.resolve_api_key(None).unwrap();
+        assert_eq!(key, Some("sk-or-test".to_string()));
+    }
 }

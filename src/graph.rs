@@ -263,6 +263,9 @@ pub struct Task {
     /// Provider override for this task (anthropic, openai, openrouter, local)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Named endpoint for this task (matches a name in [llm_endpoints])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Verification criteria - if set, task requires review before done
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
@@ -749,6 +752,8 @@ struct TaskHelper {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
     verify: Option<String>,
     #[serde(default)]
     agent: Option<String>,
@@ -853,6 +858,7 @@ impl<'de> Deserialize<'de> for Task {
             failure_reason: helper.failure_reason,
             model: helper.model,
             provider: helper.provider,
+            endpoint: helper.endpoint,
             verify: helper.verify,
             agent,
             loop_iteration: helper.loop_iteration,

@@ -30,6 +30,9 @@ pub fn run(
     task_id: &str,
     model: Option<&str>,
     provider: Option<&str>,
+    endpoint_name: Option<&str>,
+    endpoint_url: Option<&str>,
+    api_key: Option<&str>,
     max_turns: usize,
 ) -> Result<()> {
     let prompt = std::fs::read_to_string(prompt_file)
@@ -86,13 +89,20 @@ pub fn run(
     let effective_provider = provider
         .map(String::from)
         .or_else(|| std::env::var("WG_LLM_PROVIDER").ok());
-    let endpoint_name = std::env::var("WG_ENDPOINT").ok();
-    // WG_ENDPOINT_URL is read inside create_provider_ext as a base URL override.
+    let effective_endpoint = endpoint_name
+        .map(String::from)
+        .or_else(|| std::env::var("WG_ENDPOINT").ok());
+    // If endpoint_url was passed explicitly, set WG_ENDPOINT_URL so create_provider_ext picks it up.
+    if let Some(url) = endpoint_url {
+        // SAFETY: native-exec is single-threaded at this point (before tokio runtime creation).
+        unsafe { std::env::set_var("WG_ENDPOINT_URL", url) };
+    }
     let client = create_provider_ext(
         workgraph_dir,
         &effective_model,
         effective_provider.as_deref(),
-        endpoint_name.as_deref(),
+        effective_endpoint.as_deref(),
+        api_key,
     )?;
 
     // Check if the model supports tool use

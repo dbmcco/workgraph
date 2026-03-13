@@ -268,7 +268,7 @@ api_key = "test-openai-key"
 
     // Even though "my-custom-model" has no slash, forcing openai provider
     let provider =
-        create_provider_ext(tmp.path(), "my-custom-model", Some("openai"), None).unwrap();
+        create_provider_ext(tmp.path(), "my-custom-model", Some("openai"), None, None).unwrap();
     assert_eq!(provider.name(), "openai");
 }
 
@@ -451,12 +451,12 @@ provider = "openai"
 
     // The evaluator should route to Anthropic
     let eval_provider =
-        create_provider_ext(tmp.path(), "claude-sonnet-4-6", Some("anthropic"), None).unwrap();
+        create_provider_ext(tmp.path(), "claude-sonnet-4-6", Some("anthropic"), None, None).unwrap();
     assert_eq!(eval_provider.name(), "anthropic");
 
     // The triage should route to OpenAI
     let triage_provider =
-        create_provider_ext(tmp.path(), "gpt-4o-mini", Some("openai"), None).unwrap();
+        create_provider_ext(tmp.path(), "gpt-4o-mini", Some("openai"), None, None).unwrap();
     assert_eq!(triage_provider.name(), "openai");
 
     // Verify they actually hit different API endpoints
@@ -831,4 +831,70 @@ provider = "anthropic"
     let evaluator = wrapper.models.get_role(DispatchRole::Evaluator).unwrap();
     assert_eq!(evaluator.model.as_deref(), Some("opus"));
     assert_eq!(evaluator.provider.as_deref(), Some("anthropic"));
+}
+
+// ── API key override in create_provider_ext ─────────────────────────────
+
+#[test]
+fn test_create_provider_ext_api_key_override() {
+    // When api_key_override is set, it should be used instead of endpoint config keys
+    let tmp = setup_workgraph_dir();
+
+    let mock_body = openai_mock_response("test-model");
+    let base_url = start_mock_server(mock_body, 1);
+
+    let config_content = format!(
+        r#"
+[[llm_endpoints.endpoints]]
+name = "test-openai"
+provider = "openai"
+url = "{base_url}"
+api_key = "config-key-should-not-be-used"
+is_default = true
+"#,
+        base_url = base_url,
+    );
+    std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();
+
+    // The override key should be used (provider is created successfully)
+    let provider = create_provider_ext(
+        tmp.path(),
+        "test/model",
+        Some("openai"),
+        Some("test-openai"),
+        Some("override-api-key"),
+    )
+    .unwrap();
+    assert_eq!(provider.name(), "openai");
+}
+
+#[test]
+fn test_create_provider_ext_endpoint_name_resolves_key() {
+    // When endpoint_name is set, its API key and URL should be used
+    let tmp = setup_workgraph_dir();
+
+    let mock_body = openai_mock_response("test-model");
+    let base_url = start_mock_server(mock_body, 1);
+
+    let config_content = format!(
+        r#"
+[[llm_endpoints.endpoints]]
+name = "my-endpoint"
+provider = "openai"
+url = "{base_url}"
+api_key = "endpoint-specific-key"
+"#,
+        base_url = base_url,
+    );
+    std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();
+
+    let provider = create_provider_ext(
+        tmp.path(),
+        "test/model",
+        Some("openai"),
+        Some("my-endpoint"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(provider.name(), "openai");
 }

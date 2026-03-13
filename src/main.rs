@@ -2045,6 +2045,9 @@ fn main() -> Result<()> {
             task_id,
             model,
             provider,
+            endpoint_name,
+            endpoint_url,
+            api_key,
             max_turns,
         } => commands::native_exec::run(
             &workgraph_dir,
@@ -2053,6 +2056,9 @@ fn main() -> Result<()> {
             &task_id,
             model.as_deref(),
             provider.as_deref(),
+            endpoint_name.as_deref(),
+            endpoint_url.as_deref(),
+            api_key.as_deref(),
             max_turns,
         ),
     }
