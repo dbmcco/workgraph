@@ -10,7 +10,7 @@ use super::state::{
     ChoiceDialogState, ConfigEditKind, ConfigSection, ConfirmAction, ControlPanelFocus,
     CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus, FocusedPanel, InputMode, LayoutMode,
     RightPanelTab, ServiceHealthLevel, SortMode, TaskFormField, TaskFormState, TextPromptAction,
-    VizApp, extract_section_name, format_duration_compact,
+    VizApp, extract_section_name, format_duration_compact, spinner_frame,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -2190,13 +2190,21 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Streaming indicator / progressive text when awaiting response.
     if app.chat.awaiting_response {
         if app.chat.streaming_text.is_empty() {
-            // No streaming text yet — show throbber.
-            rendered_lines.push(Line::from(Span::styled(
-                "↯ ...",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            )));
+            // No streaming text yet — show animated spinner with elapsed time.
+            let elapsed = app
+                .chat
+                .awaiting_since
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let frame = spinner_frame(elapsed);
+            let elapsed_str = format_duration_compact(elapsed.as_secs());
+            rendered_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{frame} "),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)),
+            ]));
             line_to_message.push(None);
         } else {
             // Show progressive streaming text from the coordinator with markdown
@@ -2289,13 +2297,22 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     line_to_message.push(None);
                 }
             }
-            // Append a blinking cursor to indicate still generating.
-            rendered_lines.push(Line::from(Span::styled(
-                "  ▍",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            )));
+            // Append animated spinner with elapsed time to indicate still generating.
+            let elapsed = app
+                .chat
+                .awaiting_since
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            let frame = spinner_frame(elapsed);
+            let elapsed_str = format_duration_compact(elapsed.as_secs());
+            rendered_lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!("{frame} "),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(elapsed_str, Style::default().fg(Color::DarkGray)),
+            ]));
             line_to_message.push(None);
         }
         rendered_lines.push(Line::from(""));

@@ -828,6 +828,8 @@ pub struct ChatState {
     pub chat_input_dismissed: bool,
     /// Partial streaming text from the coordinator (displayed progressively).
     pub streaming_text: String,
+    /// When `awaiting_response` was set to true (for spinner elapsed time).
+    pub awaiting_since: Option<std::time::Instant>,
 }
 
 impl Default for ChatState {
@@ -851,6 +853,7 @@ impl Default for ChatState {
             input_mode: InputMode::Normal,
             chat_input_dismissed: false,
             streaming_text: String::new(),
+            awaiting_since: None,
         }
     }
 }
@@ -1189,6 +1192,21 @@ pub fn format_duration_compact(secs: u64) -> String {
             format!("{}h", h)
         }
     }
+}
+
+/// Spinner frames for the lightning-bolt animated indicator.
+/// Uses braille dots swirling around a lightning bolt to convey active processing.
+const SPINNER_FRAMES: &[&str] = &[
+    "⚡⠋", "⚡⠙", "⚡⠹", "⚡⠸", "⚡⠼", "⚡⠴", "⚡⠦", "⚡⠧", "⚡⠇", "⚡⠏",
+];
+
+/// Interval between spinner frames in milliseconds.
+const SPINNER_FRAME_MS: u128 = 80;
+
+/// Returns the spinner frame string for the given elapsed duration.
+pub fn spinner_frame(elapsed: std::time::Duration) -> &'static str {
+    let idx = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3676,6 +3694,11 @@ impl VizApp {
             return std::time::Duration::from_millis(50);
         }
 
+        // Spinner animation while awaiting coordinator response
+        if self.chat.awaiting_response {
+            return std::time::Duration::from_millis(100);
+        }
+
         // When time-based UI elements are active (notifications, scrollbar fades),
         // use a moderate rate — they don't need 20fps but should update reasonably
         if self.has_timed_ui_elements() {
@@ -5418,6 +5441,7 @@ impl VizApp {
                         // Clear awaiting on error — no response will come.
                         if self.chat.last_request_id.as_deref() == Some(&request_id) {
                             self.chat.awaiting_response = false;
+                            self.chat.awaiting_since = None;
                             self.chat.last_request_id = None;
                         }
                     } else {
@@ -6463,6 +6487,7 @@ impl VizApp {
         // so we clear on any new outbox message rather than matching by ID.
         if self.chat.awaiting_response {
             self.chat.awaiting_response = false;
+            self.chat.awaiting_since = None;
             self.chat.last_request_id = None;
             self.chat.streaming_text.clear();
         }
@@ -6513,6 +6538,7 @@ impl VizApp {
 
         // Mark as awaiting response.
         self.chat.awaiting_response = true;
+        self.chat.awaiting_since = Some(std::time::Instant::now());
         self.chat.last_request_id = Some(request_id.clone());
 
         // Build `wg chat` command args, including --attachment and --coordinator flags.
