@@ -1843,6 +1843,16 @@ pub enum EvolveCommands {
         single_shot: bool,
     },
 
+    /// Apply a synthesis-result.json from a fan-out evolution run
+    Apply {
+        /// Path to synthesis-result.json
+        synthesis_file: std::path::PathBuf,
+
+        /// Output path for apply-results.json (default: auto-derived from synthesis file path)
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Review deferred evolver operations (list, approve, reject)
     Review {
         #[command(subcommand)]

@@ -1441,6 +1441,23 @@ fn main() -> Result<()> {
                 force_fanout,
                 single_shot,
             ),
+            EvolveCommands::Apply {
+                synthesis_file,
+                output,
+            } => {
+                let output_path = output.unwrap_or_else(|| {
+                    // Default: place apply-results.json next to synthesis-result.json
+                    synthesis_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join("apply-results.json")
+                });
+                commands::evolve::run_apply_synthesis(
+                    &workgraph_dir,
+                    &synthesis_file,
+                    &output_path,
+                )
+            }
             EvolveCommands::Review {
                 command: review_cmd,
             } => match review_cmd {

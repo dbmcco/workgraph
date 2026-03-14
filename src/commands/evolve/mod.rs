@@ -1,3 +1,4 @@
+mod apply_synthesis;
 mod deferred;
 mod fanout;
 mod meta;
@@ -8,6 +9,8 @@ mod prompt;
 mod strategy;
 #[allow(dead_code)]
 pub(crate) mod synthesize;
+
+pub use apply_synthesis::run_apply_synthesis;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
