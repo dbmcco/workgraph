@@ -52,6 +52,7 @@ pub mod graph;
 pub mod heartbeat;
 pub mod impact;
 pub mod init;
+pub mod key;
 pub mod kill;
 pub mod link;
 pub mod list;
@@ -59,6 +60,7 @@ pub mod log;
 pub mod match_cmd;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod matrix;
+pub mod model_cmd;
 pub mod models;
 pub mod msg;
 pub mod native_exec;

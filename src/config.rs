@@ -315,6 +315,9 @@ pub struct EndpointConfig {
     /// Path to a file containing the API key (~ and relative paths supported)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_file: Option<String>,
+    /// Environment variable name containing the API key (explicit reference)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     /// Whether this is the default endpoint for new agents
     #[serde(default)]
     pub is_default: bool,
@@ -351,7 +354,8 @@ impl EndpointConfig {
     /// Priority:
     /// 1. `api_key` — use directly if set
     /// 2. `api_key_file` — read file contents, trim whitespace
-    /// 3. Environment variable fallback based on provider
+    /// 3. `api_key_env` — read from explicitly named env var
+    /// 4. Environment variable fallback based on provider
     ///
     /// For `api_key_file`, supports:
     /// - `~` expansion to home directory
@@ -378,6 +382,15 @@ impl EndpointConfig {
             }
             return Ok(Some(key));
         }
+        // Explicit env var reference
+        if let Some(ref env_name) = self.api_key_env {
+            if let Ok(key) = std::env::var(env_name) {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    return Ok(Some(key));
+                }
+            }
+        }
         // Environment variable fallback based on provider
         for var_name in Self::env_var_names_for_provider(&self.provider) {
             if let Ok(key) = std::env::var(var_name) {
@@ -402,10 +415,31 @@ impl EndpointConfig {
             _ => {
                 if self.api_key_file.is_some() {
                     "(from file)".to_string()
+                } else if let Some(ref env_name) = self.api_key_env {
+                    format!("(from env: {})", env_name)
                 } else {
                     "(not set)".to_string()
                 }
             }
+        }
+    }
+
+    /// Describe the source of the API key for display purposes.
+    pub fn key_source(&self) -> String {
+        if self.api_key.is_some() {
+            "inline".to_string()
+        } else if let Some(ref file_path) = self.api_key_file {
+            format!("file: {}", file_path)
+        } else if let Some(ref env_name) = self.api_key_env {
+            format!("env: {}", env_name)
+        } else {
+            // Check provider-based env var fallback
+            for var_name in Self::env_var_names_for_provider(&self.provider) {
+                if std::env::var(var_name).is_ok() {
+                    return format!("env: {} (auto-detected)", var_name);
+                }
+            }
+            "(not configured)".to_string()
         }
     }
 
@@ -3082,6 +3116,7 @@ model = "haiku"
                 model: None,
                 api_key: Some("sk-test-key".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: false,
             }],
         };
@@ -3100,6 +3135,7 @@ model = "haiku"
                 model: None,
                 api_key: Some("sk-test".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: false,
             }],
         };
@@ -3117,6 +3153,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-first".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
                 EndpointConfig {
@@ -3126,6 +3163,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-default".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: true,
                 },
                 EndpointConfig {
@@ -3135,6 +3173,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-third".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
             ],
@@ -3155,6 +3194,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("ant-key".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
                 EndpointConfig {
@@ -3164,6 +3204,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-first".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
                 EndpointConfig {
@@ -3173,6 +3214,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-second".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
             ],
@@ -3192,6 +3234,7 @@ model = "haiku"
                 model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
                 api_key: Some("sk-or-test".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: true,
             }],
         };
@@ -3215,6 +3258,7 @@ model = "haiku"
             model: None,
             api_key: Some("sk-inline".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3230,6 +3274,7 @@ model = "haiku"
             model: None,
             api_key: Some("sk-inline".to_string()),
             api_key_file: Some("/nonexistent/file".to_string()),
+            api_key_env: None,
             is_default: false,
         };
         // Inline key should win even if api_key_file is also set
@@ -3249,6 +3294,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3267,6 +3313,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3282,6 +3329,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some("/nonexistent/path/key.txt".to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let err = ep.resolve_api_key(None).unwrap_err();
@@ -3302,6 +3350,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let err = ep.resolve_api_key(None).unwrap_err();
@@ -3321,6 +3370,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some("keys/test.key".to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(Some(dir.path())).unwrap();
@@ -3337,6 +3387,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3356,6 +3407,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3379,6 +3431,7 @@ model = "haiku"
             model: None,
             api_key: Some("sk-inline-wins".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3404,6 +3457,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3429,6 +3483,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let key = ep.resolve_api_key(None).unwrap();
@@ -3471,6 +3526,7 @@ model = "haiku"
             model: None,
             api_key: None,
             api_key_file: Some("~/.config/workgraph/openai.key".to_string()),
+            api_key_env: None,
             is_default: false,
         };
         assert_eq!(ep.masked_key(), "(from file)");
@@ -3489,6 +3545,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-or-test".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
                 EndpointConfig {
@@ -3498,6 +3555,7 @@ model = "haiku"
                     model: None,
                     api_key: Some("sk-ant-test".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: true,
                 },
             ],

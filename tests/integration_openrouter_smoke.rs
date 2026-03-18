@@ -84,6 +84,7 @@ fn openrouter_endpoint_config_roundtrip() {
             model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
             api_key: Some("sk-or-test-key-1234567890".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         }],
     };
@@ -118,6 +119,7 @@ fn openrouter_endpoint_bound_to_evaluator_resolves_correctly() {
             model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
             api_key: Some("sk-or-test-key".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         }],
     };
@@ -168,6 +170,7 @@ fn openrouter_client_creation_from_resolved_config() {
             model: None,
             api_key: Some("sk-or-v1-realkey".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         }],
     };
@@ -231,6 +234,7 @@ fn mixed_endpoints_different_roles_different_providers() {
                 model: None,
                 api_key: Some("sk-ant-key-direct".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: true,
             },
             EndpointConfig {
@@ -240,6 +244,7 @@ fn mixed_endpoints_different_roles_different_providers() {
                 model: None,
                 api_key: Some("sk-or-eval-key".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: false,
             },
         ],
@@ -313,6 +318,7 @@ fn endpoint_cascades_from_default_role() {
             model: None,
             api_key: Some("sk-or-global".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         }],
     };
@@ -356,6 +362,7 @@ fn api_key_file_loading_end_to_end() {
         model: None,
         api_key: None,
         api_key_file: Some(key_file.to_string_lossy().to_string()),
+        api_key_env: None,
         is_default: true,
     };
 
@@ -383,6 +390,7 @@ fn api_key_file_relative_to_workgraph_dir() {
         model: None,
         api_key: None,
         api_key_file: Some("secrets/or.key".to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -400,6 +408,7 @@ fn api_key_file_missing_returns_error() {
         model: None,
         api_key: None,
         api_key_file: Some("/nonexistent/path/key.txt".to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -420,6 +429,7 @@ fn api_key_file_empty_returns_error() {
         model: None,
         api_key: None,
         api_key_file: Some(key_file.to_string_lossy().to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -440,6 +450,7 @@ fn api_key_takes_priority_over_key_file() {
         model: None,
         api_key: Some("inline-key".to_string()),
         api_key_file: Some(key_file.to_string_lossy().to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -710,6 +721,7 @@ fn config_toml_roundtrip_with_endpoints() {
                 model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
                 api_key: Some("sk-or-roundtrip-key".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: true,
             },
             EndpointConfig {
@@ -719,6 +731,7 @@ fn config_toml_roundtrip_with_endpoints() {
                 model: None,
                 api_key: Some("sk-ant-roundtrip".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: false,
             },
         ],

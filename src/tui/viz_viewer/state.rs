@@ -8577,6 +8577,7 @@ impl VizApp {
                     Some(fields.api_key.clone())
                 },
                 api_key_file: None,
+                api_key_env: None,
                 is_default: is_first,
             });
         if config.save(&self.workgraph_dir).is_ok() {

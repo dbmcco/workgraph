@@ -1987,7 +1987,7 @@ fn main() -> Result<()> {
             }
             TelegramCommands::Status => commands::telegram::run_status(cli.json),
         },
-        Commands::Endpoints { command } => match command {
+        Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
             EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),
             EndpointsCommands::Add {
                 name,
@@ -1996,6 +1996,7 @@ fn main() -> Result<()> {
                 model,
                 api_key,
                 api_key_file,
+                key_env,
                 default: set_default,
                 global,
             } => commands::endpoints::run_add(
@@ -2006,6 +2007,7 @@ fn main() -> Result<()> {
                 model.as_deref(),
                 api_key.as_deref(),
                 api_key_file.as_deref(),
+                key_env.as_deref(),
                 set_default,
                 global,
             ),
@@ -2066,6 +2068,59 @@ fn main() -> Result<()> {
             }
             ModelsCommands::Init => commands::models::run_init(&workgraph_dir),
         },
+        Commands::Model { command } => match command {
+            ModelCommands::List { tier } => {
+                commands::model_cmd::run_list(&workgraph_dir, tier.as_deref(), cli.json)
+            }
+            ModelCommands::Add {
+                alias,
+                provider,
+                model_id,
+                tier,
+                endpoint,
+                context_window,
+                cost_in,
+                cost_out,
+                global,
+            } => commands::model_cmd::run_add(
+                &workgraph_dir,
+                &alias,
+                &provider,
+                model_id.as_deref(),
+                &tier,
+                endpoint.as_deref(),
+                context_window,
+                cost_in,
+                cost_out,
+                global,
+            ),
+            ModelCommands::Remove {
+                alias,
+                force,
+                global,
+            } => commands::model_cmd::run_remove(&workgraph_dir, &alias, force, global, cli.json),
+            ModelCommands::SetDefault { alias, global } => {
+                commands::model_cmd::run_set_default(&workgraph_dir, &alias, global)
+            }
+            ModelCommands::Routing => {
+                commands::model_cmd::run_routing(&workgraph_dir, cli.json)
+            }
+            ModelCommands::Set {
+                role,
+                model,
+                provider,
+                endpoint,
+                tier: _tier,
+                global,
+            } => commands::model_cmd::run_set(
+                &workgraph_dir,
+                &role,
+                &model,
+                provider.as_deref(),
+                endpoint.as_deref(),
+                global,
+            ),
+        },
         Commands::NativeExec {
             prompt_file,
             exec_mode,
@@ -2088,5 +2143,25 @@ fn main() -> Result<()> {
             api_key.as_deref(),
             max_turns,
         ),
+        Commands::Key { command } => match command {
+            KeyCommands::Set {
+                provider,
+                env,
+                file,
+                value,
+                global,
+            } => commands::key::run_set(
+                &workgraph_dir,
+                &provider,
+                env.as_deref(),
+                file.as_deref(),
+                value.as_deref(),
+                global,
+            ),
+            KeyCommands::Check { provider } => {
+                commands::key::run_check(&workgraph_dir, provider.as_deref(), cli.json)
+            }
+            KeyCommands::List => commands::key::run_list(&workgraph_dir, cli.json),
+        },
     }
 }

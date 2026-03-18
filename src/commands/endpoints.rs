@@ -26,12 +26,16 @@ pub fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {
         let items: Vec<serde_json::Value> = endpoints
             .iter()
             .map(|ep| {
+                let has_key = ep.resolve_api_key(Some(workgraph_dir)).ok().flatten().is_some();
                 serde_json::json!({
                     "name": ep.name,
                     "provider": ep.provider,
                     "url": ep.url.as_deref().unwrap_or(EndpointConfig::default_url_for_provider(&ep.provider)),
                     "model": ep.model,
                     "api_key": ep.masked_key(),
+                    "key_env": ep.api_key_env,
+                    "key_source": ep.key_source(),
+                    "key_present": has_key,
                     "is_default": ep.is_default,
                 })
             })
@@ -48,15 +52,23 @@ pub fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {
             .url
             .as_deref()
             .unwrap_or(EndpointConfig::default_url_for_provider(&ep.provider));
+        let key_status = match ep.resolve_api_key(Some(workgraph_dir)) {
+            Ok(Some(_)) => "\u{2713}",
+            _ => "\u{2717}",
+        };
         println!(
-            "  {}{}\n    provider: {}\n    url:      {}\n    model:    {}\n    api_key:  {}",
+            "  {}{}\n    provider: {}\n    url:      {}\n    model:    {}\n    api_key:  {} {}",
             ep.name,
             default_marker,
             ep.provider,
             url,
             ep.model.as_deref().unwrap_or("(not set)"),
             ep.masked_key(),
+            key_status,
         );
+        if let Some(ref env_name) = ep.api_key_env {
+            println!("    key_env:  {}", env_name);
+        }
         println!();
     }
     Ok(())
@@ -72,6 +84,7 @@ pub fn run_add(
     model: Option<&str>,
     api_key: Option<&str>,
     api_key_file: Option<&str>,
+    key_env: Option<&str>,
     set_default: bool,
     global: bool,
 ) -> Result<()> {
@@ -113,6 +126,7 @@ pub fn run_add(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         api_key_file: api_key_file.map(|s| s.to_string()),
+        api_key_env: key_env.map(|s| s.to_string()),
         is_default,
     });
 
@@ -333,6 +347,7 @@ mod tests {
             Some("gpt-4o"),
             Some("sk-test"),
             None,
+            None,
             false,
             false,
         )
@@ -363,6 +378,7 @@ mod tests {
             None,
             None,
             Some(kf.to_str().unwrap()),
+            None,
             false,
             false,
         )
@@ -387,6 +403,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         )
@@ -406,6 +423,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         )
@@ -414,6 +432,7 @@ mod tests {
             tmp.path(),
             "dup",
             Some("openai"),
+            None,
             None,
             None,
             None,
@@ -432,6 +451,7 @@ mod tests {
             tmp.path(),
             "first",
             Some("openai"),
+            None,
             None,
             None,
             None,
@@ -455,6 +475,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         )
@@ -463,6 +484,7 @@ mod tests {
             tmp.path(),
             "b",
             Some("anthropic"),
+            None,
             None,
             None,
             None,
@@ -487,6 +509,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         )
@@ -495,6 +518,7 @@ mod tests {
             tmp.path(),
             "b",
             Some("anthropic"),
+            None,
             None,
             None,
             None,
@@ -528,6 +552,7 @@ mod tests {
             Some("gpt-4o"),
             Some("sk-1"),
             None,
+            None,
             true,
             false,
         )
@@ -536,6 +561,7 @@ mod tests {
             tmp.path(),
             "ep2",
             Some("anthropic"),
+            None,
             None,
             None,
             None,
@@ -557,6 +583,7 @@ mod tests {
             tmp.path(),
             "x",
             Some("openai"),
+            None,
             None,
             None,
             None,
@@ -602,6 +629,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
             false,
         )
@@ -610,6 +638,7 @@ mod tests {
             tmp.path(),
             "b",
             Some("anthropic"),
+            None,
             None,
             None,
             None,
@@ -639,6 +668,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             true,
             false,
         )
@@ -647,6 +677,7 @@ mod tests {
             tmp.path(),
             "b",
             Some("anthropic"),
+            None,
             None,
             None,
             None,
@@ -722,6 +753,7 @@ mod tests {
             model: None,
             api_key: Some("sk-test".into()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         });
         config.save(tmp.path()).unwrap();
@@ -741,6 +773,7 @@ mod tests {
             model: None,
             api_key: Some("sk-bad".into()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         });
         config.save(tmp.path()).unwrap();
@@ -760,6 +793,7 @@ mod tests {
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         });
         config.save(tmp.path()).unwrap();
@@ -785,6 +819,7 @@ mod tests {
             model: None,
             api_key: Some("sk-x".into()),
             api_key_file: None,
+            api_key_env: None,
             is_default: true,
         });
         config.save(tmp.path()).unwrap();
@@ -807,6 +842,7 @@ mod tests {
             Some("gpt-4o"),
             Some("sk-a"),
             None,
+            None,
             true,
             false,
         )
@@ -818,6 +854,7 @@ mod tests {
             None,
             Some("sonnet"),
             Some("sk-b"),
+            None,
             None,
             false,
             false,

@@ -1785,6 +1785,7 @@ mod tests {
             model: None,
             api_key: Some("sk-test-inline".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let client = OpenAiClient::from_endpoint(&ep, "gpt-4o", None).unwrap();
@@ -1805,6 +1806,7 @@ mod tests {
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
         let client = OpenAiClient::from_endpoint(&ep, "anthropic/claude-sonnet-4-6", None).unwrap();
@@ -1825,6 +1827,7 @@ mod tests {
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let result = OpenAiClient::from_endpoint(&ep, "some-model", None);
@@ -1843,6 +1846,7 @@ mod tests {
             model: None,
             api_key: Some("sk-test".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let client = OpenAiClient::from_endpoint(&ep, "model", None).unwrap();

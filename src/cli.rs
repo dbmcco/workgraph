@@ -1501,10 +1501,29 @@ pub enum Commands {
         command: EndpointsCommands,
     },
 
+    /// Manage LLM endpoints (singular alias for 'endpoints')
+    #[command(hide = true)]
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointsCommands,
+    },
+
     /// Browse and search available models from OpenRouter
     Models {
         #[command(subcommand)]
         command: ModelsCommands,
+    },
+
+    /// Model registry and routing management
+    Model {
+        #[command(subcommand)]
+        command: ModelCommands,
+    },
+
+    /// Manage API keys for LLM providers
+    Key {
+        #[command(subcommand)]
+        command: KeyCommands,
     },
 
     /// Run the native executor agent loop (internal, called by spawn)
@@ -1577,6 +1596,10 @@ pub enum EndpointsCommands {
         /// Path to a file containing the API key
         #[arg(long)]
         api_key_file: Option<String>,
+
+        /// Environment variable name to read the API key from
+        #[arg(long)]
+        key_env: Option<String>,
 
         /// Set as the default endpoint
         #[arg(long)]
@@ -1694,6 +1717,140 @@ pub enum ModelsCommands {
 
     /// Initialize the models.yaml with defaults
     Init,
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommands {
+    /// Show all models in the registry (built-in + user-defined)
+    List {
+        /// Filter by tier (fast, standard, premium)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+
+    /// Add or update a model in the config registry
+    Add {
+        /// Short alias for the model (e.g., "gpt-4o", "claude-via-openrouter")
+        alias: String,
+
+        /// Provider: anthropic, openai, openrouter, local
+        #[arg(long)]
+        provider: String,
+
+        /// Full API model identifier (defaults to alias if omitted)
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// Quality tier: fast, standard, premium
+        #[arg(long, default_value = "standard")]
+        tier: String,
+
+        /// Named endpoint to use for this model
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Context window in tokens
+        #[arg(long)]
+        context_window: Option<u64>,
+
+        /// Cost per million input tokens (USD)
+        #[arg(long)]
+        cost_in: Option<f64>,
+
+        /// Cost per million output tokens (USD)
+        #[arg(long)]
+        cost_out: Option<f64>,
+
+        /// Write to global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Remove a model from the config registry
+    Remove {
+        /// Model alias to remove
+        alias: String,
+
+        /// Skip confirmation for entries referenced by roles
+        #[arg(long)]
+        force: bool,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Set the default model for agent dispatch
+    SetDefault {
+        /// Model alias (must exist in registry)
+        alias: String,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Show per-role model routing configuration
+    Routing,
+
+    /// Set the model for a specific dispatch role
+    Set {
+        /// Role name (e.g., default, evaluator, triage, compactor)
+        role: String,
+
+        /// Model alias or ID
+        model: String,
+
+        /// Also set provider for this role
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Also set endpoint for this role
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Set tier override instead of direct model
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeyCommands {
+    /// Configure an API key for a provider
+    Set {
+        /// Provider name (e.g., openrouter, anthropic, openai)
+        provider: String,
+
+        /// Reference an environment variable by name
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Path to a file containing the key
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Store key value directly (written to ~/.workgraph/keys/<provider>.key, NOT to config)
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Apply to global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Validate API key availability and status
+    Check {
+        /// Provider name (omit to check all)
+        provider: Option<String>,
+    },
+
+    /// Show key configuration status for all providers
+    List,
 }
 
 #[derive(Subcommand)]
@@ -2959,8 +3116,10 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Matrix { .. } => "matrix",
         Commands::Telegram { .. } => "telegram",
         Commands::Chat { .. } => "chat",
-        Commands::Endpoints { .. } => "endpoints",
+        Commands::Endpoints { .. } | Commands::Endpoint { .. } => "endpoints",
         Commands::Models { .. } => "models",
+        Commands::Model { .. } => "model",
+        Commands::Key { .. } => "key",
         Commands::NativeExec { .. } => "native-exec",
     }
 }
@@ -3029,7 +3188,10 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Chat { .. }
             | Commands::Telegram { .. }
             | Commands::Endpoints { .. }
+            | Commands::Endpoint { .. }
             | Commands::Models { .. }
+            | Commands::Model { .. }
+            | Commands::Key { .. }
     ) || {
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         {

@@ -39,6 +39,7 @@ fn integration_openrouter_resolve_inline_key() {
         model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
         api_key: Some("sk-or-inline-key-123".to_string()),
         api_key_file: None,
+        api_key_env: None,
         is_default: true,
     };
 
@@ -59,6 +60,7 @@ fn integration_openrouter_resolve_key_file() {
         model: None,
         api_key: None,
         api_key_file: Some(key_path.to_string_lossy().to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -82,6 +84,7 @@ fn integration_openrouter_resolve_key_file_relative() {
         model: None,
         api_key: None,
         api_key_file: Some("secrets/or.key".to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -102,6 +105,7 @@ fn integration_openrouter_inline_key_beats_key_file() {
         model: None,
         api_key: Some("inline-wins".to_string()),
         api_key_file: Some(key_path.to_string_lossy().to_string()),
+        api_key_env: None,
         is_default: false,
     };
 
@@ -118,6 +122,7 @@ fn integration_openrouter_no_key_returns_none() {
         model: None,
         api_key: None,
         api_key_file: None,
+        api_key_env: None,
         is_default: false,
     };
 
@@ -140,6 +145,7 @@ fn integration_openrouter_find_for_provider() {
                 url: Some("https://api.anthropic.com".to_string()),
                 api_key: Some("sk-ant-prod".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: true,
             },
@@ -149,6 +155,7 @@ fn integration_openrouter_find_for_provider() {
                 url: Some("https://openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-or-prod".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: false,
             },
@@ -175,6 +182,7 @@ fn integration_openrouter_find_for_provider_prefers_default() {
                 url: Some("https://staging.openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-staging".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: false,
             },
@@ -184,6 +192,7 @@ fn integration_openrouter_find_for_provider_prefers_default() {
                 url: Some("https://openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-prod".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: true,
             },
@@ -250,6 +259,7 @@ mod provider_env_var_tests {
                 url: Some("https://openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-test".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: true,
             }],
@@ -273,6 +283,7 @@ mod provider_env_var_tests {
                 url: Some("https://openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-or-test".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: true,
             }],
@@ -439,6 +450,7 @@ mod agent_model_preference_tests {
                     url: Some("https://openrouter.ai/api/v1".to_string()),
                     api_key: Some("sk-or-test".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     model: None,
                     is_default: true,
                 },
@@ -448,6 +460,7 @@ mod agent_model_preference_tests {
                     url: Some("https://api.anthropic.com".to_string()),
                     api_key: Some("sk-ant-test".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     model: None,
                     is_default: false,
                 },
@@ -495,6 +508,7 @@ mod agent_model_preference_tests {
                     url: Some("https://openrouter.ai/api/v1".to_string()),
                     api_key: Some("sk-or".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     model: None,
                     is_default: true,
                 },
@@ -504,6 +518,7 @@ mod agent_model_preference_tests {
                     url: Some("https://api.anthropic.com".to_string()),
                     api_key: Some("sk-ant".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     model: None,
                     is_default: false,
                 },
@@ -550,6 +565,7 @@ mod agent_model_preference_tests {
                 url: Some("https://openrouter.ai/api/v1".to_string()),
                 api_key: Some("sk-or-eval".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 model: None,
                 is_default: true,
             }],
@@ -605,6 +621,7 @@ mod config_roundtrip_tests {
                     model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
                     api_key: Some("sk-or-roundtrip-1".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: true,
                 },
                 EndpointConfig {
@@ -614,6 +631,7 @@ mod config_roundtrip_tests {
                     model: None,
                     api_key: Some("sk-ant-roundtrip".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
             ],
@@ -673,6 +691,7 @@ mod config_roundtrip_tests {
                 model: None,
                 api_key: Some("sk-or-prod-key".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: true,
             }],
         };
@@ -732,6 +751,7 @@ mod config_roundtrip_tests {
                 model: None,
                 api_key: None,
                 api_key_file: Some("secrets/or.key".to_string()),
+                api_key_env: None,
                 is_default: true,
             }],
         };
@@ -763,6 +783,7 @@ mod config_roundtrip_tests {
                     model: None,
                     api_key: Some("key-a".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: true,
                 },
                 EndpointConfig {
@@ -772,6 +793,7 @@ mod config_roundtrip_tests {
                     model: None,
                     api_key: Some("key-b".to_string()),
                     api_key_file: None,
+                    api_key_env: None,
                     is_default: false,
                 },
             ],
@@ -824,6 +846,7 @@ mod error_case_tests {
             model: None,
             api_key: None,
             api_key_file: Some("/nonexistent/path/or.key".to_string()),
+            api_key_env: None,
             is_default: false,
         };
 
@@ -850,6 +873,7 @@ mod error_case_tests {
             model: None,
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
+            api_key_env: None,
             is_default: false,
         };
 
@@ -879,6 +903,7 @@ mod error_case_tests {
                 model: None,
                 api_key: Some("key".to_string()),
                 api_key_file: None,
+                api_key_env: None,
                 is_default: true,
             }],
         };
@@ -909,6 +934,7 @@ mod error_case_tests {
             model: None,
             api_key: Some("sk-or-v1-abcdef123456".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         let masked = ep1.masked_key();
@@ -924,6 +950,7 @@ mod error_case_tests {
             model: None,
             api_key: Some("short".to_string()),
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         assert_eq!(ep2.masked_key(), "****");
@@ -936,6 +963,7 @@ mod error_case_tests {
             model: None,
             api_key: None,
             api_key_file: Some("/some/path".to_string()),
+            api_key_env: None,
             is_default: false,
         };
         assert_eq!(ep3.masked_key(), "(from file)");
@@ -948,6 +976,7 @@ mod error_case_tests {
             model: None,
             api_key: None,
             api_key_file: None,
+            api_key_env: None,
             is_default: false,
         };
         assert_eq!(ep4.masked_key(), "(not set)");

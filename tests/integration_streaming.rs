@@ -556,6 +556,7 @@ fn from_endpoint_sets_streaming_for_openrouter() {
         model: None,
         api_key: Some("sk-or-key".to_string()),
         api_key_file: None,
+        api_key_env: None,
         is_default: true,
     };
 

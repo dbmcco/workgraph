@@ -1655,6 +1655,7 @@ pub fn set_key(
             model: None,
             api_key: None,
             api_key_file: Some(file_path.to_string()),
+            api_key_env: None,
             is_default: is_first,
         });
     }
