@@ -149,12 +149,20 @@ pub(crate) fn spawn_agent_inner(
 
     // Model resolution hierarchy:
     //   task.model > agent.preferred_model > executor.model > model param (CLI --model or coordinator.model)
-    let effective_model = resolve_model(
-        task_model,
+    let effective_model_raw = resolve_model(
+        task_model.clone(),
         agent_preferred_model,
         executor_config.executor.model.clone(),
         model,
     );
+
+    // --- Model registry alias resolution ---
+    // If the effective model string matches a registry entry, resolve it to the
+    // actual API model ID, provider, and endpoint. Built-in tier aliases
+    // (haiku/sonnet/opus) are kept as-is for backward compatibility with the
+    // Claude CLI, which understands them natively.
+    let (effective_model, registry_provider, registry_endpoint) =
+        resolve_model_via_registry(effective_model_raw, task_model.as_ref(), &config, dir)?;
 
     // Override model in template vars with effective model
     if let Some(ref m) = effective_model {
@@ -217,25 +225,38 @@ pub(crate) fn spawn_agent_inner(
     let exec_mode = resolved_exec_mode.as_str();
 
     // Resolve per-role provider and endpoint for all executor types.
-    // Priority: task.provider > agent.preferred_provider > role-based config resolution.
+    // Priority: task.provider > registry entry > agent.preferred_provider > role-based config.
     let task_provider = graph.get_task(task_id).and_then(|t| t.provider.clone());
     let task_endpoint = graph.get_task(task_id).and_then(|t| t.endpoint.clone());
     let resolved_task_agent =
         config.resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent);
     let effective_provider: Option<String> = resolve_provider(
         task_provider.clone(),
-        agent_preferred_provider.clone(),
-        resolved_task_agent.provider.clone(),
+        registry_provider.clone(),
+        resolve_provider(
+            agent_preferred_provider.clone(),
+            resolved_task_agent.provider.clone(),
+            None,
+        ),
     );
 
     // Endpoint resolution cascade:
     //   1. task.endpoint — explicit endpoint name on the task
-    //   2. task.provider — find matching endpoint by provider
-    //   3. agent.preferred_provider — find matching endpoint by agent's provider
-    //   4. role config endpoint — from [models.task_agent].endpoint
+    //   2. registry entry endpoint — from model registry alias
+    //   3. task.provider — find matching endpoint by provider
+    //   4. registry provider — find matching endpoint by registry provider
+    //   5. agent.preferred_provider — find matching endpoint by agent's provider
+    //   6. role config endpoint — from [models.task_agent].endpoint
     let effective_endpoint: Option<String> = task_endpoint
+        .or(registry_endpoint.clone())
         .or_else(|| {
             task_provider
+                .as_ref()
+                .and_then(|prov| config.llm_endpoints.find_for_provider(prov))
+                .map(|ep| ep.name.clone())
+        })
+        .or_else(|| {
+            registry_provider
                 .as_ref()
                 .and_then(|prov| config.llm_endpoints.find_for_provider(prov))
                 .map(|ep| ep.name.clone())
@@ -255,6 +276,30 @@ pub(crate) fn spawn_agent_inner(
     let effective_endpoint_url: Option<String> = endpoint_config.and_then(|ep| ep.url.clone());
     let effective_api_key: Option<String> =
         endpoint_config.and_then(|ep| ep.resolve_api_key(Some(dir)).ok().flatten());
+
+    // Validate endpoint resolution for registry-resolved models.
+    // If the model came from the registry with an explicit endpoint that doesn't exist
+    // in config, or the endpoint has no valid key, fail early with a clear message.
+    if let Some(ref reg_ep) = registry_endpoint {
+        if endpoint_config.is_none() {
+            anyhow::bail!(
+                "Model references endpoint '{}' which is not configured.\n\
+                 Add it with: wg endpoint add {} --provider <provider> --url <url>",
+                reg_ep,
+                reg_ep,
+            );
+        }
+        if effective_api_key.is_none() {
+            let ep = endpoint_config.unwrap(); // safe: checked above
+            anyhow::bail!(
+                "Endpoint '{}' (provider: {}) has no valid API key.\n\
+                 Set one with: wg key set {} --value <key>",
+                reg_ep,
+                ep.provider,
+                ep.provider,
+            );
+        }
+    }
 
     // Build the inner command string first
     let inner_command = build_inner_command(
@@ -1004,6 +1049,66 @@ pub(crate) fn resolve_provider(
         .or(role_config_provider)
 }
 
+/// Built-in tier alias IDs that the Claude CLI understands natively.
+const BUILTIN_TIER_ALIASES: &[&str] = &["haiku", "sonnet", "opus"];
+
+/// Resolve a model string through the model registry.
+///
+/// If the model matches a registry entry:
+/// - Built-in tier aliases (haiku/sonnet/opus) are kept as-is (Claude CLI understands them)
+/// - Custom aliases are resolved to their full API model ID
+/// - The entry's provider and endpoint are returned for downstream resolution
+///
+/// If the model is not in the registry:
+/// - If the task explicitly specified it → error (user should register it first)
+/// - Otherwise (from executor/coordinator defaults) → pass through unchanged
+///
+/// Returns `(effective_model, registry_provider, registry_endpoint)`.
+fn resolve_model_via_registry(
+    effective_model: Option<String>,
+    task_model: Option<&String>,
+    config: &Config,
+    dir: &Path,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let model_str = match effective_model {
+        Some(ref s) => s.clone(),
+        None => return Ok((None, None, None)),
+    };
+
+    // Load merged config for registry lookup (includes global + local + builtins)
+    let merged = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
+
+    if let Some(entry) = merged.registry_lookup(&model_str) {
+        // Found in registry
+        let is_builtin = BUILTIN_TIER_ALIASES.contains(&model_str.as_str());
+        let resolved_model = if is_builtin {
+            // Keep tier alias as-is for backward compat with Claude CLI
+            model_str
+        } else {
+            // Custom alias → use actual API model ID
+            entry.model.clone()
+        };
+        Ok((
+            Some(resolved_model),
+            Some(entry.provider.clone()),
+            entry.endpoint.clone(),
+        ))
+    } else if task_model.is_some() && task_model.map(|s| s.as_str()) == effective_model.as_deref()
+    {
+        // Task explicitly specified a model that's not in the registry.
+        // Error so the user knows they need to register it first.
+        anyhow::bail!(
+            "Model '{}' not found in config. Register it first with:\n  wg model add {} --provider <provider> --model-id <model-id>",
+            model_str,
+            model_str,
+        );
+    } else {
+        // Model came from executor/coordinator defaults — pass through unchanged.
+        // It may be a direct model ID the executor understands.
+        Ok((effective_model, None, None))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,5 +1375,176 @@ mod tests {
         let ep = endpoints.find_by_name("my-openrouter").unwrap();
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key, Some("sk-or-test".to_string()));
+    }
+
+    // --- resolve_model_via_registry tests ---
+
+    fn setup_registry_dir() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir).unwrap();
+
+        // Create a config with a custom model registry entry
+        let mut config = Config::default();
+        config.model_registry = vec![workgraph::config::ModelRegistryEntry {
+            id: "my-custom".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-3.5-sonnet".to_string(),
+            tier: workgraph::config::Tier::Standard,
+            endpoint: Some("my-openrouter".to_string()),
+            ..Default::default()
+        }];
+        config.save(dir).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn test_registry_resolves_custom_alias_to_model_id() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        let (model, provider, endpoint) = resolve_model_via_registry(
+            Some("my-custom".to_string()),
+            Some(&"my-custom".to_string()),
+            &config,
+            dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model,
+            Some("anthropic/claude-3.5-sonnet".to_string()),
+            "Custom alias should resolve to actual model ID"
+        );
+        assert_eq!(
+            provider,
+            Some("openrouter".to_string()),
+            "Provider should come from registry entry"
+        );
+        assert_eq!(
+            endpoint,
+            Some("my-openrouter".to_string()),
+            "Endpoint should come from registry entry"
+        );
+    }
+
+    #[test]
+    fn test_registry_keeps_builtin_alias_unchanged() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        for alias in &["haiku", "sonnet", "opus"] {
+            let (model, provider, _endpoint) = resolve_model_via_registry(
+                Some(alias.to_string()),
+                Some(&alias.to_string()),
+                &config,
+                dir,
+            )
+            .unwrap();
+
+            assert_eq!(
+                model.as_deref(),
+                Some(*alias),
+                "Built-in alias '{}' should be kept as-is",
+                alias
+            );
+            assert_eq!(
+                provider,
+                Some("anthropic".to_string()),
+                "Built-in alias '{}' should resolve to anthropic provider",
+                alias
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_errors_on_unknown_task_model() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        let result = resolve_model_via_registry(
+            Some("nonexistent-model".to_string()),
+            Some(&"nonexistent-model".to_string()),
+            &config,
+            dir,
+        );
+
+        assert!(result.is_err(), "Should error when task model is not in registry");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found in config"),
+            "Error should mention 'not found in config': {}",
+            err
+        );
+        assert!(
+            err.contains("wg model add"),
+            "Error should suggest how to register: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_registry_passes_through_non_task_model() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        // Model came from executor/coordinator, not from task — should pass through
+        let (model, provider, endpoint) = resolve_model_via_registry(
+            Some("claude-opus-4-6".to_string()),
+            None, // no task model
+            &config,
+            dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model,
+            Some("claude-opus-4-6".to_string()),
+            "Non-task model should pass through unchanged"
+        );
+        assert_eq!(provider, None, "No registry provider for pass-through");
+        assert_eq!(endpoint, None, "No registry endpoint for pass-through");
+    }
+
+    #[test]
+    fn test_registry_none_model_returns_none() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        let (model, provider, endpoint) =
+            resolve_model_via_registry(None, None, &config, dir).unwrap();
+
+        assert_eq!(model, None);
+        assert_eq!(provider, None);
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn test_registry_non_task_model_matching_alias_still_resolves() {
+        let tmp = setup_registry_dir();
+        let dir = tmp.path();
+        let config = Config::load_or_default(dir);
+
+        // Model came from executor config but happens to match a registry entry
+        let (model, provider, endpoint) = resolve_model_via_registry(
+            Some("my-custom".to_string()),
+            None, // not from task
+            &config,
+            dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            model,
+            Some("anthropic/claude-3.5-sonnet".to_string()),
+            "Should still resolve even if not from task"
+        );
+        assert_eq!(provider, Some("openrouter".to_string()));
+        assert_eq!(endpoint, Some("my-openrouter".to_string()));
     }
 }
