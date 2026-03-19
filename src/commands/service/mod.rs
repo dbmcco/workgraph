@@ -198,15 +198,43 @@ pub fn tail_log(dir: &Path, n: usize, level_filter: Option<&str>) -> Vec<String>
 /// Uses streaming reads to avoid loading the entire binary into memory at once.
 /// Returns the 32-byte digest on success.
 fn compute_exe_hash(path: &Path) -> std::io::Result<[u8; 32]> {
+    compute_exe_hash_inner(path, false)
+}
+
+/// Low-priority variant that throttles I/O so the background hash thread
+/// stays below ~5 % of a CPU core.  Used for the initial baseline hash.
+fn compute_exe_hash_background(path: &Path) -> std::io::Result<[u8; 32]> {
+    compute_exe_hash_inner(path, true)
+}
+
+/// Compute SHA-256 of the file at `path`.
+///
+/// When `throttle` is true, the computation sleeps between chunks to avoid
+/// pegging a CPU core (important for large debug binaries — the unoptimised
+/// debug build can be 250 MB+).
+fn compute_exe_hash_inner(path: &Path, throttle: bool) -> std::io::Result<[u8; 32]> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut bytes_since_yield: usize = 0;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        if throttle {
+            bytes_since_yield += n;
+            // Sleep 200 ms every 256 KB of data hashed.  In debug mode each
+            // 256 KB chunk takes ~7 ms of CPU, so the duty cycle is roughly
+            // 7 / (7 + 200) ≈ 3.4 %.  For a 257 MB debug binary the total
+            // wall-clock time is ~218 s — acceptable for a one-time
+            // background baseline that runs after a 5 s startup delay.
+            if bytes_since_yield >= 256 * 1024 {
+                bytes_since_yield = 0;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
     }
     Ok(hasher.finalize().into())
 }
@@ -1654,7 +1682,11 @@ pub fn run_daemon(
             let (tx, rx) = std::sync::mpsc::channel();
             let path = p.clone();
             std::thread::spawn(move || {
-                if let Ok(h) = compute_exe_hash(&path) {
+                // Delay before hashing so short-lived daemons (e.g. tests)
+                // exit before we spend CPU.  The 5 s window is long enough
+                // for most integration-test lifetimes.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if let Ok(h) = compute_exe_hash_background(&path) {
                     let _ = tx.send(h);
                 }
             });
@@ -1856,6 +1888,14 @@ pub fn run_daemon(
     let mut compaction_error_count: u64 = 0;
     let mut archival_error_count: u64 = 0;
 
+    // Obtain the raw fd for poll()-based waiting. This lets the daemon
+    // sleep until an IPC connection arrives OR a timeout expires, instead
+    // of busy-polling with a fixed sleep.
+    let listener_fd = {
+        use std::os::unix::io::AsRawFd;
+        listener.as_raw_fd()
+    };
+
     while running {
         // Reap zombie child processes (agents that have exited).
         // Even though agents call setsid() to create a new session, they are
@@ -1864,6 +1904,39 @@ pub fn run_daemon(
         // zombies and is_process_alive(pid) keeps returning true.
         reap_zombies();
 
+        // Calculate how long to sleep. We wake on: incoming IPC connection,
+        // settling deadline, or poll interval — whichever comes first.
+        // Cap at 2s so zombie reaping and binary-change checks aren't delayed
+        // too long.
+        let mut poll_timeout_ms: i32 = 2000;
+        if let Some(deadline) = settling_deadline {
+            let until = deadline.saturating_duration_since(Instant::now());
+            poll_timeout_ms = poll_timeout_ms.min(until.as_millis().min(i32::MAX as u128) as i32);
+        }
+        if !daemon_cfg.paused {
+            let until_tick = daemon_cfg
+                .poll_interval
+                .saturating_sub(last_coordinator_tick.elapsed());
+            poll_timeout_ms =
+                poll_timeout_ms.min(until_tick.as_millis().min(i32::MAX as u128) as i32);
+        }
+        // Floor: don't spin faster than 50ms even with a deadline in the past.
+        poll_timeout_ms = poll_timeout_ms.max(50);
+
+        // Wait for an incoming connection or timeout.
+        let mut pollfd = libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&mut pollfd, 1, poll_timeout_ms) };
+
+        if poll_ret < 0 {
+            // EINTR (e.g. SIGCHLD) — just loop back to reap and retry.
+            continue;
+        }
+
+        // Try to accept; may still get WouldBlock if poll was a timeout.
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut wake_coordinator = false;
@@ -1917,8 +1990,8 @@ pub fn run_daemon(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No connection, sleep briefly
-                std::thread::sleep(Duration::from_millis(100));
+                // poll() timed out — no connection pending, fall through to
+                // tick checks.
             }
             Err(e) => {
                 logger.error(&format!("Accept error: {}", e));
