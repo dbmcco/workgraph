@@ -14,7 +14,7 @@ A task is the atom of work. It has an identity, a lifecycle, and a body of metad
 | `id`           | A slug derived from the title at creation time. The permanent key—used in every edge, every command, every reference. Once set, it never changes.                                                                                                                            |
 | `title`        | Human-readable name. Can be updated without breaking references.                                                                                                                                                                                                             |
 | `description`  | The body: acceptance criteria, context, constraints. What an agent (human or AI) needs to understand the work.                                                                                                                                                               |
-| `status`       | Lifecycle state. One of six values—see below.                                                                                                                                                                                                                                |
+| `status`       | Lifecycle state. One of eight values—see below.                                                                                                                                                                                                                              |
 | `estimate`     | Optional cost and hours. Used by budget fitting and forecasting.                                                                                                                                                                                                             |
 | `tags`         | Flat labels for filtering and grouping.                                                                                                                                                                                                                                      |
 | `skills`       | Required capabilities—matched against agent capabilities at dispatch time.                                                                                                                                                                                                   |
@@ -41,7 +41,7 @@ Tasks are not just descriptions of work—they are self-contained dispatch packe
 
 ## Status and Lifecycle
 
-A task moves through six statuses. Most follow the happy path; some take detours.
+A task moves through eight statuses. Most follow the happy path; some take detours.
 
 <figure>
 <pre><code>┌──────────────────────────────────────┐
@@ -50,24 +50,44 @@ A task moves through six statuses. Most follow the happy path; some take detours
          └──────┬──────────────────▲─────────────┘
                 │                  │
            claim│             retry│ / cycle re-activation
-                │                  │
+                │                  │        ▲ reject
          ┌──────▼──────────────────┴─────────────┐
          │           InProgress                   │
          │        (agent working)                 │
-         └──────┬─────────┬──────────┬───────────┘
-                │         │          │
-           done │    fail │     abandon│
-                │         │          │
-         ┌──────▼───┐ ┌──▼──────┐ ┌─▼──────────┐
-         │   Done   │ │ Failed  │ │ Abandoned   │
-         │ terminal │ │terminal │ │  terminal   │
-         └──────────┘ └─────────┘ └─────────────┘
+         └──┬──────┬─────────┬──────────┬────────┘
+            │      │         │          │
+            │ done │    fail │     abandon│
+            │      │         │          │
+            │      │  ┌──────▼──────┐ ┌─▼──────────┐
+            │      │  │   Failed    │ │ Abandoned   │
+            │      │  │  terminal   │ │  terminal   │
+            │      │  └─────────────┘ └─────────────┘
+            │      │
+       wait │      │  (no --verify)          (has --verify)
+            │      ├──────────────────┐─────────────────┐
+            │      │                  │                  │
+            │ ┌────▼─────┐    ┌──────▼─────────────┐    │
+            │ │   Done   │    │ PendingValidation   │    │
+            │ │ terminal │    │ (awaiting review)   │    │
+            │ └──────────┘    └───────┬─────────────┘    │
+            │                   approve│                  │
+            │                  ┌───────▼────┐             │
+            │                  │    Done    │             │
+            │                  │  terminal  │             │
+            │                  └────────────┘             │
+            │                                             │
+         ┌──▼──────────────────────────────────────┐
+         │  Waiting (parked by wg wait — resumed   │
+         │  when condition is met or wg resume)    │
+         └──────────────────────▲──────────────────┘
+                                │ resume
+                            (→ InProgress)
 
          ┌──────────────────────────────────────┐
          │  Blocked (explicit, rarely used)      │
          └──────────────────────────────────────┘
 </code></pre>
-<figcaption><p>Task state machine. The three terminal statuses share a critical property: they all unblock dependents.</p></figcaption>
+<figcaption><p>Task state machine. The eight statuses include three terminals (Done, Failed, Abandoned) that unblock dependents, plus PendingValidation and Waiting as non-terminal intermediate states.</p></figcaption>
 </figure>
 
 <span id="state-machine"></span>
@@ -78,7 +98,11 @@ A task moves through six statuses. Most follow the happy path; some take detours
 
 **Done**, **Failed**, and **Abandoned** are the three *terminal* statuses. A terminal task will not progress further without explicit intervention—retry, manual re-open, or cycle re-activation. The crucial design choice: all three terminal statuses unblock dependents. A failed upstream does not freeze the graph. The downstream task gets dispatched and can decide for itself what to do about a failed dependency—inspect the failure reason, skip the work, or adapt.
 
-**Blocked** exists as an explicit status but is rarely used. In practice, a task is *waiting* when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
+**PendingValidation** is entered when an agent calls `wg done` on a task that has `verify` criteria. The task is not yet terminal—it awaits external review. `wg approve` transitions it to Done; `wg reject` transitions it back to Open for re-dispatch (with the assignment cleared). After `max_rejections` (default: 3), rejection transitions the task to Failed instead.
+
+**Waiting** means an agent has voluntarily parked the task via `wg wait`. The task is not terminal and will not be re-dispatched. It resumes (returning to InProgress) when its wait condition is met—a timer elapses, a dependent task reaches a target status, a message arrives, or a file changes—or when a human runs `wg resume`.
+
+**Blocked** exists as an explicit status but is rarely used. In practice, a task is *blocked* when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
 
 ## Terminal Statuses Unblock: A Design Choice
 
