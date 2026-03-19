@@ -2,7 +2,7 @@
 
 Canonical list of all key documentation files and their purpose. Used as the reference for future doc-sync runs.
 
-Last updated: 2026-03-19 (verified by ds3-ds2-doc-sync-spec)
+Last updated: 2026-03-19 (verified by ds4-doc-sync-ds3-ds2-doc-sync-spec)
 
 ---
 
@@ -23,6 +23,7 @@ Last updated: 2026-03-19 (verified by ds3-ds2-doc-sync-spec)
 | `docs/models.md` | Model, endpoint, and API key management guide | Users, agents |
 | `docs/MODEL_REGISTRY.md` | Model provider registry with quality tiers | Contributors |
 | `docs/AGENCY_AUDIT.md` | Agency audit | Contributors, operators |
+| `docs/agent-git-hygiene.md` | Git hygiene rules for multi-agent shared repos | Agents, operators |
 | `docs/guides/openrouter-setup.md` | OpenRouter provider setup guide | Users, operators |
 
 ## Embedded Documentation
@@ -88,6 +89,35 @@ Last updated: 2026-03-19 (verified by ds3-ds2-doc-sync-spec)
 | `docs/design/outbound-edge-viz.md` | Outbound edge visualization design | Implemented |
 | `docs/design/reopen-on-new-dep.md` | Reopen on new dependency design | Implemented |
 | `docs/design/cycle-delay-semantics.md` | Cycle delay semantics design | Implemented |
+| `docs/design/agent-isolation-decision.md` | Agent isolation architecture decision | Implemented |
+| `docs/design/agent-isolation-implementation.md` | Agent isolation implementation plan | Implemented |
+| `docs/design/agent-lifecycle.md` | Agent lifecycle state machine design | Implemented |
+| `docs/design/agent-message-queue.md` | Agent message queue design | Implemented |
+| `docs/design/automatic-task-placement.md` | Automatic task placement design | Implemented |
+| `docs/design/blog-setup-recommendation.md` | Blog/website setup recommendation | Reference |
+| `docs/design/coordinator-add-remove-modal.md` | TUI coordinator add/remove modal design | Implemented |
+| `docs/design/coordinator-agent-prompt.md` | Coordinator agent prompt design | Implemented |
+| `docs/design/coordinator-as-regular-agent.md` | Coordinator as regular agent refactor | Implemented |
+| `docs/design/coordinator-chat-protocol.md` | Coordinator chat protocol design | Implemented |
+| `docs/design/cycle-edge-viz.md` | Cycle edge visualization design | Implemented |
+| `docs/design/dangling-dependency-resolution.md` | Dangling dependency resolution design | Implemented |
+| `docs/design/design-deliberation-synthesis.md` | Deliberation pattern synthesis | Reference |
+| `docs/design/evolver-fanout.md` | Evolution fan-out design | Implemented |
+| `docs/design/executor-weight-tiers.md` | Executor weight tiers (exec-mode) design | Implemented |
+| `docs/design/generic-executor-design.md` | Generic executor design | Implemented |
+| `docs/design/liveness-detection.md` | Agent liveness detection design | Implemented |
+| `docs/design/mandatory-validation.md` | Mandatory validation gates design | Implemented |
+| `docs/design/message-discipline-design.md` | Message discipline design | Implemented |
+| `docs/design/model-cost-tracking.md` | Model cost tracking design | Implemented |
+| `docs/design/model-endpoint-key-ux.md` | Model/endpoint/key UX design | Implemented |
+| `docs/design/native-executor.md` | Native executor design | Design |
+| `docs/design/node-specific-chat-design.md` | Per-node chat design | Implemented |
+| `docs/design/self-hosting-architecture.md` | Self-hosting architecture design | Reference |
+| `docs/design/sleep-aware-liveness.md` | Sleep-aware liveness detection design | Implemented |
+| `docs/design/trace-functions.md` | Trace functions design (predecessor to func-rename) | Implemented |
+| `docs/design/tui-multi-panel.md` | TUI multi-panel layout design | Implemented |
+| `docs/design/unified-lifecycle-state-machine.md` | Unified lifecycle state machine design | Implemented |
+| `docs/design/wg-wait-design.md` | `wg wait` command design | Implemented |
 
 ## Research Documents
 
@@ -125,6 +155,34 @@ Last updated: 2026-03-19 (verified by ds3-ds2-doc-sync-spec)
 | `docs/research/validation-agent-self-checks.md` | Validation: agent self-check mechanisms | Research |
 | `docs/research/validation-teaching-agents.md` | Validation: teaching agents validation skills | Research |
 | `docs/research/validation-synthesis.md` | Validation: synthesis and recommendations | Research |
+| `docs/research/a2a-protocol-applicability.md` | A2A protocol applicability analysis | Research |
+| `docs/research/agency-pipeline-lifecycle.md` | Agency pipeline lifecycle research | Research |
+| `docs/research/agency-research.md` | Agency system research | Research |
+| `docs/research/agent-askuser-cross-executor-human-input.md` | Cross-executor human input research | Research |
+| `docs/research/checkpointing-systems-analysis.md` | Checkpointing systems analysis | Research |
+| `docs/research/communication-topology.md` | Communication topology research | Research |
+| `docs/research/compaction-regimes.md` | Compaction regimes research | Research |
+| `docs/research/compaction-timing-data-availability.md` | Compaction timing and data availability | Research |
+| `docs/research/coordination-model-design.md` | Coordination model design research | Research |
+| `docs/research/coordinator-interruption-mechanisms.md` | Coordinator interruption mechanisms | Research |
+| `docs/research/cycle-topology-analysis.md` | Cycle topology analysis | Research |
+| `docs/research/design-deliberation-consensus.md` | Design deliberation consensus | Research |
+| `docs/research/generic-tool-use-research.md` | Generic tool use research | Research |
+| `docs/research/local-model-integration.md` | Local model integration research | Research |
+| `docs/research/mcp-rust-integration.md` | MCP Rust integration research | Research |
+| `docs/research/message-triggered-resurrection.md` | Message-triggered resurrection research | Implemented |
+| `docs/research/model-provider-audit.md` | Model provider audit | Research |
+| `docs/research/native-executor-tool-gaps.md` | Native executor tool gaps analysis | Research |
+| `docs/research/openrouter-ecosystem-research.md` | OpenRouter ecosystem research | Research |
+| `docs/research/openrouter-integration.md` | OpenRouter integration research | Research |
+| `docs/research/placement-context-research.md` | Placement context research | Research |
+| `docs/research/placement-output-handling.md` | Placement output handling research | Research |
+| `docs/research/realtime-agent-chat.md` | Realtime agent chat research | Research |
+| `docs/research/task-priority-scheduling.md` | Task priority scheduling research | Research |
+| `docs/research/telegram-global-routing.md` | Telegram global routing research | Research |
+| `docs/research/tui-editor-widget-comparison.md` | TUI editor widget comparison | Research |
+| `docs/research/verify-cycle-interaction.md` | Verify/cycle interaction research | Research |
+| `docs/research/web-search-api-comparison.md` | Web search API comparison | Research |
 
 ## Other Documentation
 
@@ -138,7 +196,13 @@ Last updated: 2026-03-19 (verified by ds3-ds2-doc-sync-spec)
 | `docs/spec-bugfixes.md` | Bug fix specs |
 | `docs/fix-dag-terminology.md` | DAG terminology fix notes |
 | `docs/design-cyclic-workgraph.md` | Cyclic workgraph design |
+| `docs/design-cycle-failure-restart.md` | Cycle failure restart design |
+| `docs/design-bidirectional-agent-communication.md` | Bidirectional agent communication design |
+| `docs/design-pan-executor.md` | Pan-executor design |
+| `docs/design-unified-message-pane.md` | Unified message pane design |
+| `docs/design-verify-first-eval-pipeline.md` | Verify-first evaluation pipeline design |
 | `docs/survey-context-management.md` | Context management survey |
+| `docs/smoke-test-coordinator-modals.md` | Coordinator modals smoke test spec |
 | `docs/test-specs/trace-replay-test-spec.md` | Test specifications |
 
 ## Archive
