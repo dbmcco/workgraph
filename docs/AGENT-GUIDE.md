@@ -98,6 +98,11 @@ The placement agent (dispatched at the `fast` tier, typically haiku) examines th
 
 If `auto_place` is disabled, tasks are added directly in Open state and the user must wire dependencies manually with `--after`.
 
+You can also control placement via CLI flags on `wg add`:
+- `--no-place` — skip automatic placement entirely; make the task immediately available
+- `--place-near <IDS>` — hint: place near these tasks (comma-separated)
+- `--place-before <IDS>` — hint: place before these tasks (comma-separated)
+
 ---
 
 ## 2. Structure Rules
@@ -163,6 +168,11 @@ wg add "Revise draft" --id revise --after review
 - Use `wg done review --converged` to stop the loop when work has stabilized.
 - Use plain `wg done review` to let the cycle continue iterating.
 - Any cycle member can signal convergence — it stops the entire cycle.
+
+**Additional cycle flags:**
+- `--no-converge` — force all iterations to run (agents cannot signal convergence early)
+- `--no-restart-on-failure` — disable automatic cycle restart when a member fails (restart is on by default)
+- `--max-failure-restarts <N>` — cap the number of failure-triggered cycle restarts (default: 3)
 
 **Checking iteration state:**
 ```bash
@@ -567,6 +577,44 @@ wg add "Simple fix" --model haiku      # cheap model for simple work
 wg add "Complex design" --model opus   # strong model for hard work
 ```
 
+### Provider selection
+
+Control which AI provider is used for a task with `--provider`:
+
+```bash
+wg add "My task" --provider openrouter --model haiku
+wg edit my-task --provider anthropic
+```
+
+Supported providers: `anthropic`, `openai`, `openrouter`, `local`.
+
+### Execution modes
+
+Control the agent's toolset with `--exec-mode`:
+
+| Mode | What the agent gets | When to use |
+|------|-------------------|-------------|
+| `full` | All tools (default) | Implementation, integration |
+| `light` | Read-only tools | Research, review, analysis |
+| `bare` | Only `wg` CLI | Graph-only orchestration |
+| `shell` | No LLM — runs task `exec` command | Scripts, builds, non-AI work |
+
+```bash
+wg add "Research X" --exec-mode light
+wg add "Run tests" --exec-mode shell
+wg edit my-task --exec-mode bare
+```
+
+### Task scheduling
+
+Delay a task's availability with `--delay` or `--not-before`:
+
+```bash
+wg add "Follow-up check" --delay 1h        # available 1 hour from now
+wg add "Deploy" --not-before 2026-03-20T09:00:00Z  # ISO 8601 timestamp
+wg edit my-task --delay 30m
+```
+
 ### Context scopes
 
 Control how much context is assembled into an agent's prompt with `--context-scope`:
@@ -587,6 +635,53 @@ wg edit my-task --context-scope full        # override for debugging
 Scope is resolved at dispatch time by the coordinator. If not set on the task, the role's default scope is used (if the task has an assigned agent with a role that specifies a default scope), otherwise `task` is the implicit default.
 
 ---
+
+## 7b. Operational Commands
+
+These commands support ongoing project health and agent lifecycle management.
+
+### Compaction
+
+`wg compact` distills the current graph state into a `context.md` summary. When running as a service, the coordinator drives compaction via a `.compact-0` cycle task — this is the coordinator's self-introspection loop.
+
+```bash
+wg compact              # generate context.md from graph state
+```
+
+### Sweep
+
+`wg sweep` detects and recovers orphaned in-progress tasks — tasks claimed by agents that are no longer running.
+
+```bash
+wg sweep                # detect orphaned tasks
+wg sweep --fix          # unclaim and reopen orphaned tasks
+```
+
+### Checkpoint
+
+`wg checkpoint` saves a checkpoint for context preservation during long-running tasks. The coordinator also auto-checkpoints alive agents when turn/time thresholds are met.
+
+```bash
+wg checkpoint <task-id>
+```
+
+### Stats
+
+`wg stats` shows time counters and agent statistics.
+
+```bash
+wg stats                # project-wide stats
+```
+
+### Chat
+
+Send messages to the coordinator with `wg chat`. Useful for multi-coordinator setups:
+
+```bash
+wg chat "Deploy when ready"
+wg chat --attachment report.md "Review this"      # attach a file
+wg chat --coordinator my-coord "Target a specific coordinator"
+```
 
 ## 8. Manual Operation
 

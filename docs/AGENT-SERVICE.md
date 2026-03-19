@@ -56,7 +56,10 @@ Each tick does:
        c) Global API-down: if ≥50% of alive agents are zero-output,
           pause all spawning with exponential backoff (60s → 15min max)
 
- 1.5 Auto-checkpoint alive agents (if turn/time thresholds are met)
+ 1.5 Auto-checkpoint alive agents
+     Saves a checkpoint for agents that have exceeded the configured
+     turn count or elapsed time thresholds. This preserves context
+     for recovery if the agent is later killed or dies unexpectedly.
 
  2. Load graph
 
@@ -190,6 +193,29 @@ Run a single coordinator tick and exit. Useful for debugging.
 wg service tick [--max-agents <N>] [--executor <NAME>] [--model <MODEL>]
 ```
 
+### Multi-Coordinator Commands
+
+The service supports multiple concurrent coordinator sessions. Manage them with:
+
+```bash
+wg service create-coordinator   # create a new coordinator session
+wg service stop-coordinator     # stop a coordinator session (kill agent, reset to Open)
+wg service archive-coordinator  # archive a coordinator session (mark as Done)
+wg service delete-coordinator   # delete a coordinator session
+```
+
+Target a specific coordinator from `wg chat`:
+
+```bash
+wg chat --coordinator my-coord "Instructions for this coordinator"
+```
+
+Configure the maximum concurrent coordinators:
+
+```bash
+wg config --max-coordinators 2
+```
+
 ### `wg service install`
 
 Generate a systemd user service file.
@@ -235,23 +261,29 @@ When the coordinator spawns an agent for a task:
 1. **Claim**: The task is claimed (status → `in-progress`)
 2. **Model resolution**: task.model > executor.model > coordinator.model/CLI --model
 3. **Identity injection**: If the task has an `agent` field, the agent's role and tradeoff are loaded from `.workgraph/agency/` and rendered into an identity prompt section
-4. **Context scope resolution**: The task's `context_scope` determines how much context is assembled into the prompt:
+4. **Provider resolution**: If the task has a `provider` field (set via `wg add --provider` or `wg edit --provider`), the executor uses that provider. Supported providers: `anthropic`, `openai`, `openrouter`, `local`.
+5. **Exec-mode resolution**: The task's `exec_mode` determines the agent's toolset:
+   - `full` — all tools (default)
+   - `light` — read-only tools (research, review)
+   - `bare` — only `wg` CLI (graph orchestration)
+   - `shell` — no LLM; runs the task's `exec` command directly
+6. **Context scope resolution**: The task's `context_scope` determines how much context is assembled into the prompt:
    - `clean` — task description only (no dependency context)
    - `task` — task description + direct predecessor artifacts/logs (default)
    - `graph` — task + transitive dependency chain
    - `full` — everything: full graph state, all logs, all artifacts
    If no scope is set on the task, the assigned role's default scope is used; otherwise `task` is the implicit default.
-5. **Cycle context injection**: If the task is part of a structural cycle, the prompt includes:
+7. **Cycle context injection**: If the task is part of a structural cycle, the prompt includes:
    - The current `loop_iteration` (which pass this is)
    - A note about `--converged`: the agent can signal `wg done <task-id> --converged` to stop the cycle when work has stabilized
    - The `"converged"` tag is placed on the cycle header regardless of which member the agent completes
-6. **Wrapper script**: A bash script is generated at `.workgraph/agents/agent-N/run.sh`:
+8. **Wrapper script**: A bash script is generated at `.workgraph/agents/agent-N/run.sh`:
    - Runs the executor command (e.g., `claude --model opus --print "..."`)
    - Captures stdout/stderr to `output.log`
    - Sends heartbeats periodically
    - On exit: checks task status, marks done/failed based on exit code
-7. **Detach**: Process is launched with `setsid()` so it survives daemon restarts
-8. **Register**: Agent is added to the registry with PID, task_id, executor, model, and start time
+9. **Detach**: Process is launched with `setsid()` so it survives daemon restarts
+10. **Register**: Agent is added to the registry with PID, task_id, executor, model, and start time
 
 ### Manual spawning
 
@@ -340,6 +372,7 @@ wg config --global --model opus   # set default model globally
 
 [coordinator]
 max_agents = 4           # max parallel agents (default: 4)
+max_coordinators = 4     # max concurrent coordinator sessions (default: 4)
 interval = 30            # standalone coordinator tick interval
 poll_interval = 60       # daemon safety-net poll interval (default: 60)
 executor = "claude"      # executor for spawned agents
@@ -372,6 +405,44 @@ Set creator-agent/model via CLI:
 ```bash
 wg config --creator-agent <content-hash>
 wg config --creator-model haiku
+```
+
+### Eval gate configuration
+
+Control the evaluation gate that blocks task completion pending a minimum score:
+
+```bash
+wg config --eval-gate-threshold 0.7    # tasks scoring below 0.7 are rejected
+wg config --eval-gate-all true         # gate ALL tasks, not just --verify tasks
+```
+
+### FLIP verification
+
+When `flip_verification_threshold` is set, tasks with FLIP scores below the threshold automatically get a `.verify-flip-<task-id>` verification task dispatched to a stronger model (Opus):
+
+```toml
+[agency]
+flip_enabled = true
+flip_verification_threshold = 0.5
+flip_inference_model = "sonnet"
+flip_comparison_model = "sonnet"
+flip_verification_model = "opus"
+```
+
+### Retry context injection
+
+When a task is retried, the coordinator injects context from the previous attempt into the new agent's prompt. Control how much:
+
+```bash
+wg config --retry-context-tokens 2000   # max tokens of prior-attempt context (default: 2000, 0 = disabled)
+```
+
+### Compaction cycle
+
+The coordinator drives a `.compact-0` cycle task that periodically distills graph state into a `context.md` summary. This is the coordinator's self-introspection loop — it runs automatically as a structural cycle within the service.
+
+```bash
+wg compact              # manually trigger compaction
 ```
 
 ### Model hierarchy
