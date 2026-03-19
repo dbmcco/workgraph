@@ -781,6 +781,7 @@ fn handle_add_task(
         verify: verify.map(String::from),
         agent: None,
         loop_iteration: 0,
+        last_iteration_completed_at: None,
         cycle_failure_restarts: 0,
         ready_after: None,
         paused: false,

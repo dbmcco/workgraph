@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use workgraph::check::{OrphanRef, check_orphans};
-use workgraph::graph::Status;
+use workgraph::graph::{CycleAnalysis, Status};
 use workgraph::parser::load_graph;
 use workgraph::query::ready_tasks;
 use workgraph::service::compactor::CompactorState;
@@ -96,6 +96,21 @@ struct CompactionInfo {
     last_compaction: Option<String>,
 }
 
+/// Active cycle timing info
+#[derive(Debug, Clone, serde::Serialize)]
+struct CycleTimingInfo {
+    task_id: String,
+    iteration: u32,
+    max_iterations: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_iteration_completed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_due: Option<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay: Option<String>,
+}
+
 /// Full status output
 #[derive(Debug, Clone, serde::Serialize)]
 struct StatusOutput {
@@ -105,6 +120,8 @@ struct StatusOutput {
     tasks: TaskSummaryInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     compaction: Option<CompactionInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cycles: Vec<CycleTimingInfo>,
     recent: Vec<RecentActivityEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dangling_deps: Vec<DanglingDep>,
@@ -142,10 +159,13 @@ fn gather_status(dir: &Path) -> Result<StatusOutput> {
         None
     };
 
-    // 6. Recent activity
+    // 6. Cycle timing
+    let cycles = gather_cycle_timing(dir);
+
+    // 7. Recent activity
     let recent = gather_recent_activity(dir)?;
 
-    // 7. Dangling dependencies
+    // 8. Dangling dependencies
     let dangling_deps = gather_dangling_deps(dir);
 
     Ok(StatusOutput {
@@ -154,6 +174,7 @@ fn gather_status(dir: &Path) -> Result<StatusOutput> {
         agents,
         tasks,
         compaction,
+        cycles,
         recent,
         dangling_deps,
     })
@@ -411,6 +432,67 @@ fn gather_compaction_info(dir: &Path) -> Option<CompactionInfo> {
     })
 }
 
+fn gather_cycle_timing(dir: &Path) -> Vec<CycleTimingInfo> {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    let graph = match load_graph(&path) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    let cycle_analysis = CycleAnalysis::from_graph(&graph);
+    let now = Utc::now();
+    let mut results = Vec::new();
+
+    for cycle in &cycle_analysis.cycles {
+        // Find the config owner (cycle header with CycleConfig)
+        let config_owner = cycle.members.iter().find_map(|mid| {
+            let task = graph.get_task(mid)?;
+            task.cycle_config.as_ref()?;
+            Some(task)
+        });
+
+        let Some(owner) = config_owner else {
+            continue;
+        };
+        let cc = owner.cycle_config.as_ref().unwrap();
+
+        // Use last_iteration_completed_at from the config owner, falling back to completed_at
+        let last_completed = owner
+            .last_iteration_completed_at
+            .as_ref()
+            .or(owner.completed_at.as_ref())
+            .cloned();
+
+        // Next due: use ready_after if present, otherwise compute from last_completed + delay
+        let next_due = owner.ready_after.clone().or_else(|| {
+            let delay_secs = cc.delay.as_ref().and_then(|d| workgraph::graph::parse_delay(d))?;
+            let last_ts = last_completed.as_ref()?.parse::<DateTime<Utc>>().ok()?;
+            let next = last_ts + chrono::Duration::seconds(delay_secs as i64);
+            if next > now {
+                Some(next.to_rfc3339())
+            } else {
+                None
+            }
+        });
+
+        results.push(CycleTimingInfo {
+            task_id: owner.id.clone(),
+            iteration: owner.loop_iteration + 1, // 1-based display
+            max_iterations: cc.max_iterations,
+            last_iteration_completed: last_completed,
+            next_due,
+            status: owner.status.to_string(),
+            delay: cc.delay.clone(),
+        });
+    }
+
+    results
+}
+
 fn gather_dangling_deps(dir: &Path) -> Vec<DanglingDep> {
     let path = super::graph_path(dir);
     if !path.exists() {
@@ -519,6 +601,62 @@ fn print_status(status: &StatusOutput) {
         status.tasks.done_total,
         status.tasks.done_today
     );
+
+    // Active cycles
+    if !status.cycles.is_empty() {
+        println!();
+        println!("Cycles:");
+        for cycle in &status.cycles {
+            let iter_str = if cycle.max_iterations == 0 {
+                format!("{}/unlimited", cycle.iteration)
+            } else {
+                format!("{}/{}", cycle.iteration, cycle.max_iterations)
+            };
+
+            let last_str = match cycle.last_iteration_completed {
+                Some(ref ts) => {
+                    if let Ok(parsed) = ts.parse::<DateTime<Utc>>() {
+                        let ago = Utc::now().signed_duration_since(parsed).num_seconds();
+                        format!("last: {} ago", workgraph::format_duration(ago, true))
+                    } else {
+                        "last: unknown".to_string()
+                    }
+                }
+                None => "last: never".to_string(),
+            };
+
+            let next_str = match cycle.next_due {
+                Some(ref ts) => {
+                    if let Ok(parsed) = ts.parse::<DateTime<Utc>>() {
+                        let now = Utc::now();
+                        if parsed > now {
+                            let secs = (parsed - now).num_seconds();
+                            format!(
+                                "next: in {}",
+                                workgraph::format_duration(secs, true)
+                            )
+                        } else {
+                            "next: ready".to_string()
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            };
+
+            let timing = if next_str.is_empty() {
+                last_str
+            } else {
+                format!("{}, {}", last_str, next_str)
+            };
+
+            println!(
+                "  {} [{}] iter {} — {}",
+                cycle.task_id, cycle.status, iter_str, timing
+            );
+        }
+    }
 
     // Attention: dangling dependencies
     if !status.dangling_deps.is_empty() {

@@ -275,6 +275,10 @@ pub struct Task {
     /// Current cycle iteration (0 = first run, incremented on each re-activation)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub loop_iteration: u32,
+    /// Timestamp when the most recent cycle iteration completed (before re-activation).
+    /// Preserved across cycle resets so timing displays can show "last iteration completed X ago".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_iteration_completed_at: Option<String>,
     /// Number of failure-triggered cycle restarts consumed (on cycle config owner only)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cycle_failure_restarts: u32,
@@ -765,6 +769,8 @@ struct TaskHelper {
     #[serde(default)]
     loop_iteration: u32,
     #[serde(default)]
+    last_iteration_completed_at: Option<String>,
+    #[serde(default)]
     cycle_failure_restarts: u32,
     #[serde(default)]
     cycle_config: Option<CycleConfig>,
@@ -862,6 +868,7 @@ impl<'de> Deserialize<'de> for Task {
             verify: helper.verify,
             agent,
             loop_iteration: helper.loop_iteration,
+            last_iteration_completed_at: helper.last_iteration_completed_at,
             cycle_failure_restarts: helper.cycle_failure_restarts,
             cycle_config: helper.cycle_config,
             ready_after: helper.ready_after,
@@ -1391,6 +1398,10 @@ fn reactivate_cycle(
             // Abandoned members stay as-is — they opted out of future iterations
             if task.status == Status::Abandoned {
                 continue;
+            }
+            // Preserve completed_at as last_iteration_completed_at before clearing
+            if task.completed_at.is_some() {
+                task.last_iteration_completed_at = task.completed_at.clone();
             }
             task.status = Status::Open;
             task.assigned = None;

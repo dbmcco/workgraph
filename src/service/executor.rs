@@ -964,6 +964,7 @@ mod tests {
             verify: None,
             agent: None,
             loop_iteration: 0,
+            last_iteration_completed_at: None,
             cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,

@@ -70,6 +70,8 @@ struct TaskDetails {
     agent: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     loop_iteration: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_iteration_completed_at: Option<String>,
     #[serde(skip_serializing_if = "is_zero")]
     cycle_failure_restarts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +212,7 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         verify: task.verify.clone(),
         agent: task.agent.clone(),
         loop_iteration: task.loop_iteration,
+        last_iteration_completed_at: task.last_iteration_completed_at.clone(),
         cycle_failure_restarts: task.cycle_failure_restarts,
         cycle_config: task.cycle_config.clone(),
         ready_after: task.ready_after.clone(),
@@ -381,6 +384,47 @@ fn print_human_readable(details: &TaskDetails) {
             details.loop_iteration + 1,
             cc.max_iterations
         );
+
+        // Cycle timing: last iteration completed
+        if let Some(ref last_ts) = details.last_iteration_completed_at {
+            if let Ok(parsed) = last_ts.parse::<DateTime<Utc>>() {
+                let ago = Utc::now().signed_duration_since(parsed).num_seconds();
+                println!(
+                    "  Last iteration completed: {} ({} ago)",
+                    last_ts,
+                    workgraph::format_duration(ago, true)
+                );
+            } else {
+                println!("  Last iteration completed: {}", last_ts);
+            }
+        }
+
+        // Next due: compute from ready_after or last_iteration_completed_at + delay
+        let next_due = details.ready_after.clone().or_else(|| {
+            let delay_secs =
+                cc.delay.as_ref().and_then(|d| workgraph::graph::parse_delay(d))?;
+            let last_ts = details
+                .last_iteration_completed_at
+                .as_ref()?
+                .parse::<DateTime<Utc>>()
+                .ok()?;
+            let next = last_ts + chrono::Duration::seconds(delay_secs as i64);
+            Some(next.to_rfc3339())
+        });
+        if let Some(ref next_ts) = next_due {
+            if let Ok(parsed) = next_ts.parse::<DateTime<Utc>>() {
+                let now = Utc::now();
+                if parsed > now {
+                    let secs = (parsed - now).num_seconds();
+                    println!(
+                        "  Next iteration due: in {}",
+                        workgraph::format_duration(secs, true)
+                    );
+                } else {
+                    println!("  Next iteration due: ready now");
+                }
+            }
+        }
     }
 
     println!();
@@ -544,6 +588,7 @@ mod tests {
             verify: None,
             agent: None,
             loop_iteration: 0,
+            last_iteration_completed_at: None,
             cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
