@@ -453,18 +453,18 @@ fn print_human_readable(details: &TaskDetails) {
     // Token usage
     if let Some(ref usage) = details.token_usage {
         println!();
-        let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-        if cache_total > 0 {
+        let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+        if usage.cache_read_input_tokens > 0 {
             println!(
-                "Tokens: {}/{} (novel-in/out) +{} cached",
-                format_tokens(usage.input_tokens),
+                "Tokens: {}/{} (in/out) +{} cached",
+                format_tokens(novel_in),
                 format_tokens(usage.output_tokens),
-                format_tokens(cache_total)
+                format_tokens(usage.cache_read_input_tokens)
             );
         } else {
             println!(
                 "Tokens: {}/{} (in/out)",
-                format_tokens(usage.input_tokens),
+                format_tokens(novel_in),
                 format_tokens(usage.output_tokens)
             );
         }

@@ -822,7 +822,9 @@ pub struct ChatState {
     /// Mapping from rendered line index to message index (set each frame by renderer).
     /// Used for click-to-edit: determines which message a clicked line belongs to.
     pub line_to_message: Vec<Option<usize>>,
-    /// Per-coordinator input mode (ChatInput/MessageInput); saved/restored on coordinator switch.
+    /// Per-coordinator input mode — no longer restored on switch (always resets to Normal),
+    /// but kept for potential future use / debugging.
+    #[allow(dead_code)]
     pub input_mode: InputMode,
     /// Whether the user explicitly dismissed chat input with Esc (per-coordinator).
     pub chat_input_dismissed: bool,
@@ -3348,7 +3350,9 @@ impl VizApp {
             }
 
             // Build snapshot for change detection.
-            let total_tokens = usage.map(|u| u.input_tokens + u.output_tokens).unwrap_or(0);
+            let total_tokens = usage
+                .map(|u| u.input_tokens + u.cache_creation_input_tokens + u.output_tokens)
+                .unwrap_or(0);
 
             let snapshot = TaskSnapshot {
                 status: task.status,
@@ -4354,15 +4358,13 @@ impl VizApp {
         // ── Token usage (execution) ──
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
-            let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-            lines.push(format!("  Input:  →{}", format_tokens(usage.input_tokens)));
+            let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+            lines.push(format!("  Input:  →{}", format_tokens(novel_in)));
             lines.push(format!("  Output: ←{}", format_tokens(usage.output_tokens)));
-            if cache_total > 0 {
+            if usage.cache_read_input_tokens > 0 {
                 lines.push(format!(
-                    "  Cached: {} (read: {}, write: {})",
-                    format_tokens(cache_total),
+                    "  Cached: {} (read from cache)",
                     format_tokens(usage.cache_read_input_tokens),
-                    format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
             if usage.cost_usd > 0.0 {
@@ -4416,15 +4418,18 @@ impl VizApp {
             if !phase_entries.is_empty() {
                 lines.push("── § Agency Costs ──".to_string());
                 for (label, u) in &phase_entries {
-                    let cache = u.cache_read_input_tokens + u.cache_creation_input_tokens;
+                    let novel_in = u.input_tokens + u.cache_creation_input_tokens;
                     let mut detail = format!(
                         "  {} →{} ←{}",
                         label,
-                        format_tokens(u.input_tokens),
+                        format_tokens(novel_in),
                         format_tokens(u.output_tokens)
                     );
-                    if cache > 0 {
-                        detail.push_str(&format!("  (cached: {})", format_tokens(cache)));
+                    if u.cache_read_input_tokens > 0 {
+                        detail.push_str(&format!(
+                            "  (cached: {})",
+                            format_tokens(u.cache_read_input_tokens)
+                        ));
                     }
                     if u.cost_usd > 0.0 {
                         detail.push_str(&format!(" ${:.4}", u.cost_usd));
@@ -4627,15 +4632,13 @@ impl VizApp {
         // ── Token usage ──
         if let Some(ref usage) = task.token_usage {
             lines.push("── Tokens ──".to_string());
-            let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-            lines.push(format!("  Input:  →{}", format_tokens(usage.input_tokens)));
+            let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+            lines.push(format!("  Input:  →{}", format_tokens(novel_in)));
             lines.push(format!("  Output: ←{}", format_tokens(usage.output_tokens)));
-            if cache_total > 0 {
+            if usage.cache_read_input_tokens > 0 {
                 lines.push(format!(
-                    "  Cached: {} (read: {}, write: {})",
-                    format_tokens(cache_total),
+                    "  Cached: {} (read from cache)",
                     format_tokens(usage.cache_read_input_tokens),
-                    format_tokens(usage.cache_creation_input_tokens)
                 ));
             }
             if usage.cost_usd > 0.0 {
@@ -7091,14 +7094,8 @@ impl VizApp {
         if target_id == self.active_coordinator_id {
             return;
         }
-        // Save per-coordinator input mode and dismissed flag into the outgoing chat state
+        // Save dismissed flag into the outgoing chat state
         let mut current = std::mem::take(&mut self.chat);
-        if matches!(
-            self.input_mode,
-            InputMode::ChatInput | InputMode::MessageInput
-        ) {
-            current.input_mode = self.input_mode.clone();
-        }
         current.chat_input_dismissed = self.chat_input_dismissed;
         self.coordinator_chats
             .insert(self.active_coordinator_id, current);
@@ -7109,18 +7106,15 @@ impl VizApp {
             .remove(&target_id)
             .unwrap_or_default();
 
-        // Restore per-coordinator input mode: if the target had a chat-related mode, restore it;
-        // otherwise if we were in a chat-related mode from the previous coordinator, reset to Normal.
+        // Always reset to Normal when switching coordinators so arrow-key
+        // navigation doesn't get stuck in input mode. The user must explicitly
+        // re-enter chat/message input (Enter, click, 'c', etc.).
         if matches!(
-            self.chat.input_mode,
-            InputMode::ChatInput | InputMode::MessageInput
-        ) {
-            self.input_mode = self.chat.input_mode.clone();
-        } else if matches!(
             self.input_mode,
             InputMode::ChatInput | InputMode::MessageInput
         ) {
             self.input_mode = InputMode::Normal;
+            self.inspector_sub_focus = InspectorSubFocus::ChatHistory;
         }
         self.chat_input_dismissed = self.chat.chat_input_dismissed;
 

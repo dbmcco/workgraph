@@ -3887,19 +3887,21 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
                     // Token usage
                     if let Some(ref usage) = phase.token_usage {
-                        let cache_total =
-                            usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+                        let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
                         let mut spans: Vec<Span> = vec![Span::styled(
                             format!(
                                 "  Tokens: →{} ←{}",
-                                format_tokens(usage.input_tokens),
+                                format_tokens(novel_in),
                                 format_tokens(usage.output_tokens)
                             ),
                             Style::default().fg(Color::DarkGray),
                         )];
-                        if cache_total > 0 {
+                        if usage.cache_read_input_tokens > 0 {
                             spans.push(Span::styled(
-                                format!("  (cached: {})", format_tokens(cache_total)),
+                                format!(
+                                    "  (cached: {})",
+                                    format_tokens(usage.cache_read_input_tokens)
+                                ),
                                 Style::default().fg(Color::Rgb(80, 80, 80)),
                             ));
                         }
@@ -3980,7 +3982,7 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             .iter()
             .filter_map(|p| p.as_ref())
             .filter_map(|p| p.token_usage.as_ref())
-            .map(|u| u.input_tokens)
+            .map(|u| u.input_tokens + u.cache_creation_input_tokens)
             .sum();
         let total_output: u64 = phases
             .iter()
@@ -5875,12 +5877,12 @@ fn draw_help_overlay(frame: &mut Frame) {
 
 /// Render token breakdown spans: "→new_in ←out [+cached] (label) [$cost]"
 fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, label: &str) {
-    let new_input = format_tokens(usage.input_tokens);
+    let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+    let new_input = format_tokens(novel_in);
     let output = format_tokens(usage.output_tokens);
 
-    let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-    let token_str = if cache_total > 0 {
-        let cache = format_tokens(cache_total);
+    let token_str = if usage.cache_read_input_tokens > 0 {
+        let cache = format_tokens(usage.cache_read_input_tokens);
         format!("→{} ◎{} ←{}", new_input, cache, output)
     } else {
         format!("→{} ←{}", new_input, output)

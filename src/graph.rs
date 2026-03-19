@@ -598,15 +598,18 @@ pub fn format_token_display(
     let mut s = String::new();
 
     if let Some(u) = usage {
-        let cache_total = u.cache_read_input_tokens + u.cache_creation_input_tokens;
+        // With prompt caching, `input_tokens` only counts tokens outside any cache
+        // block (typically 1-3 per turn). The actual novel input is better represented
+        // by `input_tokens + cache_creation_input_tokens` (content newly written to cache).
+        let novel_in = u.input_tokens + u.cache_creation_input_tokens;
         s.push_str(&format!(
             "→{} ←{}",
-            format_tokens(u.input_tokens),
+            format_tokens(novel_in),
             format_tokens(u.output_tokens)
         ));
-        if cache_total > 0 {
-            // ◎ disk/circle symbol for cached tokens
-            s.push_str(&format!(" ◎{}", format_tokens(cache_total)));
+        if u.cache_read_input_tokens > 0 {
+            // ◎ disk/circle symbol for cached tokens (read from existing cache)
+            s.push_str(&format!(" ◎{}", format_tokens(u.cache_read_input_tokens)));
         }
     }
 
@@ -2233,13 +2236,15 @@ mod tests {
             cache_creation_input_tokens: 0,
         };
         // →novel_in ←out ◎cached ☀agency_total
+        // novel_in = input_tokens(4600) + cache_creation(5000) = 9600
+        // cached = cache_read(100000)
         assert_eq!(
             format_token_display(Some(&usage), Some(&agency)),
-            Some("→4.6k ←3.9k ◎105k §1.9k".to_string())
+            Some("→9.6k ←3.9k ◎100k §1.9k".to_string())
         );
         assert_eq!(
             format_token_display(Some(&usage), None),
-            Some("→4.6k ←3.9k ◎105k".to_string())
+            Some("→9.6k ←3.9k ◎100k".to_string())
         );
         // Only agency, no task usage
         assert_eq!(
@@ -2258,7 +2263,7 @@ mod tests {
         };
         assert_eq!(
             format_token_display(Some(&usage), Some(&zero_val)),
-            Some("→4.6k ←3.9k ◎105k".to_string())
+            Some("→9.6k ←3.9k ◎100k".to_string())
         );
         assert_eq!(format_token_display(None, Some(&zero_val)), None);
     }

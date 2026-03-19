@@ -688,15 +688,22 @@ fn agent_thread_main(
                 // Accumulate token usage in coordinator state for compaction gating.
                 // Done regardless of whether there was a text response, so even
                 // tool-only turns are counted.
-                if let Some((input_toks, output_toks)) = turn_token_usage {
-                    let total = input_toks.saturating_add(output_toks);
+                //
+                // BUG FIX: With prompt caching, the API's `input_tokens` only counts
+                // tokens outside any cache block (typically 1-3 per turn). The actual
+                // new content goes to `cache_creation_input_tokens`. We accumulate
+                // cache_creation + output to get a meaningful compaction signal.
+                if let Some((input_toks, output_toks, cache_creation_toks)) = turn_token_usage {
+                    let total = cache_creation_toks
+                        .saturating_add(input_toks)
+                        .saturating_add(output_toks);
                     if total > 0 {
                         let mut cs = super::CoordinatorState::load_or_default(dir);
                         cs.accumulated_tokens = cs.accumulated_tokens.saturating_add(total);
                         cs.save(dir);
                         logger.info(&format!(
-                            "Coordinator agent: turn used {} tokens (input={}, output={}), accumulated={}",
-                            total, input_toks, output_toks, cs.accumulated_tokens
+                            "Coordinator agent: turn used {} tokens (input={}, output={}, cache_creation={}), accumulated={}",
+                            total, input_toks, output_toks, cache_creation_toks, cs.accumulated_tokens
                         ));
                     }
                 }
@@ -861,6 +868,10 @@ enum ResponseEvent {
     TurnStats {
         input_tokens: u64,
         output_tokens: u64,
+        /// Tokens written to cache this turn (new content being cached).
+        /// With prompt caching, this is a better proxy for "novel input" than
+        /// `input_tokens`, which only counts tokens outside any cache block.
+        cache_creation_input_tokens: u64,
     },
     /// A tool result from Claude CLI's internal tool execution.
     ToolResult(String),
@@ -884,8 +895,8 @@ struct CollectedResponse {
     /// Full response text including tool calls, for the expanded view.
     /// None if the response had no tool calls (full == summary).
     full_text: Option<String>,
-    /// Per-turn token usage: (input_tokens, output_tokens).
-    token_usage: Option<(u64, u64)>,
+    /// Per-turn token usage: (input_tokens, output_tokens, cache_creation_input_tokens).
+    token_usage: Option<(u64, u64, u64)>,
 }
 
 /// Read stdout from the Claude CLI process line by line, parse stream-json
@@ -964,10 +975,17 @@ fn stdout_reader(
                             .get("output_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
-                        if input_tokens > 0 || output_tokens > 0 {
+                        let cache_creation_input_tokens = usage
+                            .get("cache_creation_input_tokens")
+                            .or_else(|| usage.get("cacheCreationInputTokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if input_tokens > 0 || output_tokens > 0 || cache_creation_input_tokens > 0
+                        {
                             let _ = tx.send(ResponseEvent::TurnStats {
                                 input_tokens,
                                 output_tokens,
+                                cache_creation_input_tokens,
                             });
                         }
                     }
@@ -1063,6 +1081,7 @@ fn collect_response(
     let mut has_tool_calls = false;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut total_cache_creation_input_tokens: u64 = 0;
     // Accumulate streaming text for progressive display in the TUI.
     // Uses the same box-drawing format as format_full_response() so that the
     // transition from streaming to finalized display is seamless.
@@ -1081,6 +1100,7 @@ fn collect_response(
                 has_tool_calls,
                 total_input_tokens,
                 total_output_tokens,
+                total_cache_creation_input_tokens,
             );
         }
 
@@ -1159,10 +1179,13 @@ fn collect_response(
             Ok(ResponseEvent::TurnStats {
                 input_tokens,
                 output_tokens,
+                cache_creation_input_tokens,
             }) => {
                 // Accumulate per-turn token usage across all sub-turns in the exchange.
                 total_input_tokens = total_input_tokens.saturating_add(input_tokens);
                 total_output_tokens = total_output_tokens.saturating_add(output_tokens);
+                total_cache_creation_input_tokens = total_cache_creation_input_tokens
+                    .saturating_add(cache_creation_input_tokens);
             }
             Ok(ResponseEvent::TurnComplete) => {
                 // The assistant finished its turn.
@@ -1177,6 +1200,7 @@ fn collect_response(
                     has_tool_calls,
                     total_input_tokens,
                     total_output_tokens,
+                    total_cache_creation_input_tokens,
                 );
             }
             Ok(ResponseEvent::StreamEnd) => {
@@ -1186,6 +1210,7 @@ fn collect_response(
                     has_tool_calls,
                     total_input_tokens,
                     total_output_tokens,
+                    total_cache_creation_input_tokens,
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1194,6 +1219,7 @@ fn collect_response(
                     has_tool_calls,
                     total_input_tokens,
                     total_output_tokens,
+                    total_cache_creation_input_tokens,
                 );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1202,6 +1228,7 @@ fn collect_response(
                     has_tool_calls,
                     total_input_tokens,
                     total_output_tokens,
+                    total_cache_creation_input_tokens,
                 );
             }
         }
@@ -1217,6 +1244,7 @@ fn build_collected_response(
     has_tool_calls: bool,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    total_cache_creation_input_tokens: u64,
 ) -> Option<CollectedResponse> {
     // Find the last text part for the summary
     let summary = parts
@@ -1242,8 +1270,15 @@ fn build_collected_response(
         None
     };
 
-    let token_usage = if total_input_tokens > 0 || total_output_tokens > 0 {
-        Some((total_input_tokens, total_output_tokens))
+    let token_usage = if total_input_tokens > 0
+        || total_output_tokens > 0
+        || total_cache_creation_input_tokens > 0
+    {
+        Some((
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_creation_input_tokens,
+        ))
     } else {
         None
     };
