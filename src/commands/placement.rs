@@ -83,7 +83,7 @@ pub fn extract_text_from_stream(raw_stream_path: &Path) -> Result<String> {
 ///
 /// Valid formats:
 /// - `wg edit <task-id> --after <dep1>,<dep2> --before <dep3>`
-/// - `no-op`
+/// - `no-op` (and variations: noop, no op, no_op, any case)
 pub fn parse_placement_command(text: &str, expected_task_id: &str) -> PlacementParseResult {
     if text.trim().is_empty() {
         return PlacementParseResult::Empty;
@@ -97,8 +97,8 @@ pub fn parse_placement_command(text: &str, expected_task_id: &str) -> PlacementP
             continue;
         }
 
-        // Check for no-op
-        if cleaned.eq_ignore_ascii_case("no-op") {
+        // Check for no-op (various spellings haiku may produce)
+        if is_noop(&cleaned) {
             return PlacementParseResult::Ok(PlacementCommand::NoOp);
         }
 
@@ -121,6 +121,18 @@ pub fn parse_placement_command(text: &str, expected_task_id: &str) -> PlacementP
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
     PlacementParseResult::Unparseable(last_line)
+}
+
+/// Check if a cleaned line represents a no-op command.
+///
+/// Handles common LLM variations: no-op, noop, no op, no_op, NO-OP, etc.
+/// Also strips trailing punctuation (e.g., "no-op.").
+fn is_noop(s: &str) -> bool {
+    let s = s
+        .trim()
+        .trim_end_matches(|c: char| c == '.' || c == '!' || c == ',' || c == ';');
+    let lower = s.trim().to_ascii_lowercase();
+    lower == "no-op" || lower == "noop" || lower == "no op" || lower == "no_op"
 }
 
 /// Strip markdown formatting artifacts from a line: backticks, code fences, bullet markers.
@@ -192,9 +204,11 @@ fn parse_wg_edit_command(line: &str, expected_task_id: &str) -> Option<Placement
             "--after" | "--blocked-by" => {
                 i += 1;
                 if i < remaining.len() {
-                    // Support comma-separated deps
+                    // Support comma-separated deps; strip trailing punctuation
                     for dep in remaining[i].split(',') {
-                        let dep = dep.trim();
+                        let dep = dep
+                            .trim()
+                            .trim_end_matches(|c: char| c == '.' || c == ';' || c == ')');
                         if !dep.is_empty() {
                             after.push(dep.to_string());
                         }
@@ -205,7 +219,9 @@ fn parse_wg_edit_command(line: &str, expected_task_id: &str) -> Option<Placement
                 i += 1;
                 if i < remaining.len() {
                     for dep in remaining[i].split(',') {
-                        let dep = dep.trim();
+                        let dep = dep
+                            .trim()
+                            .trim_end_matches(|c: char| c == '.' || c == ';' || c == ')');
                         if !dep.is_empty() {
                             before.push(dep.to_string());
                         }
@@ -320,7 +336,22 @@ pub fn parse_and_apply(
             Ok(format!("applied placement for '{}'", source_task_id))
         }
         PlacementParseResult::Unparseable(line) => {
-            anyhow::bail!("unparseable placement output: {}", line)
+            // Log the full text (truncated) for debugging
+            let text_preview = if text.len() > 500 {
+                format!(
+                    "{}...[truncated, {} bytes total]",
+                    &text[..500],
+                    text.len()
+                )
+            } else {
+                text.clone()
+            };
+            anyhow::bail!(
+                "unparseable placement output.\n  Last line: {}\n  Expected: 'wg edit {} --after <deps>' or 'no-op'\n  Full output:\n{}",
+                line,
+                source_task_id,
+                text_preview
+            )
         }
         PlacementParseResult::Empty => {
             anyhow::bail!("placement agent produced no text output")
@@ -438,8 +469,7 @@ mod tests {
 
     #[test]
     fn test_parse_wrong_task_id() {
-        let result =
-            parse_placement_command("wg edit wrong-task --after dep-a", "my-task");
+        let result = parse_placement_command("wg edit wrong-task --after dep-a", "my-task");
         assert!(matches!(result, PlacementParseResult::Unparseable(_)));
     }
 
@@ -466,10 +496,17 @@ mod tests {
     fn test_extract_text_from_stream() {
         let mut file = NamedTempFile::new().unwrap();
         // Write some JSONL events
-        writeln!(file, r#"{{"type":"system","system":"You are a placement agent"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"system","system":"You are a placement agent"}}"#
+        )
+        .unwrap();
         writeln!(file, r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"I'll analyze the task.\n\nwg edit my-task --after dep-a"}}]}}}}"#).unwrap();
-        writeln!(file, r#"{{"type":"result","usage":{{"input_tokens":100,"output_tokens":50}}}}"#)
-            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"result","usage":{{"input_tokens":100,"output_tokens":50}}}}"#
+        )
+        .unwrap();
         file.flush().unwrap();
 
         let text = extract_text_from_stream(file.path()).unwrap();
@@ -479,8 +516,11 @@ mod tests {
     #[test]
     fn test_extract_text_empty_stream() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, r#"{{"type":"result","usage":{{"input_tokens":0,"output_tokens":0}}}}"#)
-            .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"result","usage":{{"input_tokens":0,"output_tokens":0}}}}"#
+        )
+        .unwrap();
         file.flush().unwrap();
 
         let text = extract_text_from_stream(file.path()).unwrap();
@@ -489,10 +529,7 @@ mod tests {
 
     #[test]
     fn test_parse_edit_with_blocked_by_alias() {
-        let result = parse_placement_command(
-            "wg edit my-task --blocked-by dep-a",
-            "my-task",
-        );
+        let result = parse_placement_command("wg edit my-task --blocked-by dep-a", "my-task");
         match result {
             PlacementParseResult::Ok(PlacementCommand::Edit { after, .. }) => {
                 assert_eq!(after, vec!["dep-a"]);
@@ -573,10 +610,7 @@ mod tests {
 
     #[test]
     fn test_noop_backtick_wrapped() {
-        let result = parse_placement_command(
-            "Analysis complete.\n\n`no-op`",
-            "my-task",
-        );
+        let result = parse_placement_command("Analysis complete.\n\n`no-op`", "my-task");
         assert!(matches!(
             result,
             PlacementParseResult::Ok(PlacementCommand::NoOp)
@@ -620,5 +654,116 @@ mod tests {
             }
             other => panic!("Expected Edit, got {:?}", other),
         }
+    }
+
+    // --- Haiku leniency tests ---
+
+    #[test]
+    fn test_noop_without_hyphen() {
+        let result = parse_placement_command("After analysis:\n\nnoop", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_with_space() {
+        let result = parse_placement_command("no op", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_underscore() {
+        let result = parse_placement_command("no_op", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_uppercase() {
+        let result = parse_placement_command("reasoning...\n\nNOOP", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_mixed_case() {
+        let result = parse_placement_command("NoOp", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_with_trailing_period() {
+        let result = parse_placement_command("no-op.", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_noop_in_code_fence() {
+        let result =
+            parse_placement_command("Here's my answer:\n\n```\nno-op\n```", "my-task");
+        assert!(matches!(
+            result,
+            PlacementParseResult::Ok(PlacementCommand::NoOp)
+        ));
+    }
+
+    #[test]
+    fn test_command_with_trailing_period() {
+        let result =
+            parse_placement_command("wg edit my-task --after dep-a.", "my-task");
+        match result {
+            PlacementParseResult::Ok(PlacementCommand::Edit { after, .. }) => {
+                assert_eq!(after, vec!["dep-a"]);
+            }
+            other => panic!("Expected Edit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_with_trailing_commentary_same_line() {
+        // Haiku sometimes adds commentary on the same line
+        let result = parse_placement_command(
+            "wg edit my-task --after dep-a (this places it correctly)",
+            "my-task",
+        );
+        match result {
+            PlacementParseResult::Ok(PlacementCommand::Edit { after, .. }) => {
+                assert_eq!(after, vec!["dep-a"]);
+            }
+            other => panic!("Expected Edit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_is_noop_helper() {
+        assert!(is_noop("no-op"));
+        assert!(is_noop("noop"));
+        assert!(is_noop("no op"));
+        assert!(is_noop("no_op"));
+        assert!(is_noop("NO-OP"));
+        assert!(is_noop("NOOP"));
+        assert!(is_noop("NoOp"));
+        assert!(is_noop("No-Op"));
+        assert!(is_noop("no-op."));
+        assert!(is_noop("no-op!"));
+        assert!(is_noop("  no-op  "));
+        assert!(!is_noop("not a noop"));
+        assert!(!is_noop("wg edit"));
+        assert!(!is_noop(""));
     }
 }
