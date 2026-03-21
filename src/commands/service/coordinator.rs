@@ -2079,20 +2079,68 @@ fn spawn_eval_inline(
     use std::process::{Command, Stdio};
 
     let graph_path = graph_path(dir);
-    let mut graph = load_graph(&graph_path).context("Failed to load graph for eval spawn")?;
 
-    // Extract needed fields from the eval task before releasing the mutable borrow.
-    let (eval_task_status, eval_task_exec, eval_task_agent) = {
-        let task = graph.get_task_or_err(eval_task_id)?;
-        (task.status, task.exec.clone(), task.agent.clone())
-    };
+    // Set up minimal agent tracking (before modify_graph so we have the agent_id)
+    let mut agent_registry = AgentRegistry::load(dir)?;
+    let agent_id = format!("agent-{}", agent_registry.next_agent_id);
 
-    if eval_task_status != Status::Open {
-        anyhow::bail!(
-            "Eval task '{}' is not open (status: {:?})",
-            eval_task_id,
-            eval_task_status
-        );
+    // Create minimal output directory for log capture
+    let output_dir = dir.join("agents").join(&agent_id);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create eval output dir: {:?}", output_dir))?;
+    let output_file = output_dir.join("output.log");
+    let output_file_str = output_file.to_string_lossy().to_string();
+
+    let escaped_eval_id = eval_task_id.replace('\'', "'\\''");
+    let escaped_output = output_file_str.replace('\'', "'\\''");
+
+    // Atomically claim the task and extract needed fields.
+    // Using modify_graph prevents the "lost update" race where a concurrent
+    // `wg done` from a previously-spawned fast eval task saves between our
+    // read and write, and our write clobbers the Done status back to InProgress.
+    let mut eval_task_exec: Option<String> = None;
+    let mut eval_task_agent: Option<String> = None;
+    let mut claim_error: Option<String> = None;
+    let agent_id_clone = agent_id.clone();
+    let eval_model_msg = evaluator_model
+        .map(|m| format!(" --model {}", m))
+        .unwrap_or_default();
+
+    modify_graph(&graph_path, |graph| {
+        let task = match graph.get_task_mut(eval_task_id) {
+            Some(t) => t,
+            None => {
+                claim_error = Some(format!("Eval task '{}' not found", eval_task_id));
+                return false;
+            }
+        };
+
+        if task.status != Status::Open {
+            claim_error = Some(format!(
+                "Eval task '{}' is not open (status: {:?})",
+                eval_task_id, task.status
+            ));
+            return false;
+        }
+
+        eval_task_exec = task.exec.clone();
+        eval_task_agent = task.agent.clone();
+
+        task.status = Status::InProgress;
+        task.started_at = Some(Utc::now().to_rfc3339());
+        task.assigned = Some(agent_id_clone.clone());
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some(agent_id_clone.clone()),
+            message: format!("Spawned eval inline{}", eval_model_msg),
+        });
+
+        true
+    })
+    .context("Failed to load/save graph for eval spawn")?;
+
+    if let Some(err) = claim_error {
+        anyhow::bail!("{}", err);
     }
 
     // Use the task's exec command directly if it starts with "wg evaluate".
@@ -2121,20 +2169,6 @@ fn spawn_eval_inline(
     let special_agent_hash = eval_task_agent
         .clone()
         .or_else(|| config.agency.evaluator_agent.clone());
-
-    // Set up minimal agent tracking
-    let mut agent_registry = AgentRegistry::load(dir)?;
-    let agent_id = format!("agent-{}", agent_registry.next_agent_id);
-
-    // Create minimal output directory for log capture
-    let output_dir = dir.join("agents").join(&agent_id);
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("Failed to create eval output dir: {:?}", output_dir))?;
-    let output_file = output_dir.join("output.log");
-    let output_file_str = output_file.to_string_lossy().to_string();
-
-    let escaped_eval_id = eval_task_id.replace('\'', "'\\''");
-    let escaped_output = output_file_str.replace('\'', "'\\''");
 
     // Build the special agent performance recording command.
     // After `wg evaluate` completes, record an evaluation against the special
@@ -2196,23 +2230,6 @@ exit $EXIT_CODE"#,
         )
     };
 
-    // Claim the task before spawning
-    let task = graph.get_task_mut_or_err(eval_task_id)?;
-    task.status = Status::InProgress;
-    task.started_at = Some(Utc::now().to_rfc3339());
-    task.assigned = Some(agent_id.clone());
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: Some(agent_id.clone()),
-        message: format!(
-            "Spawned eval inline{}",
-            evaluator_model
-                .map(|m| format!(" --model {}", m))
-                .unwrap_or_default()
-        ),
-    });
-    save_graph(&graph, &graph_path).context("Failed to save graph after claiming eval task")?;
-
     // Fork the process
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&script);
@@ -2235,20 +2252,24 @@ exit $EXIT_CODE"#,
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Rollback the claim
-            if let Ok(mut rollback_graph) = load_graph(&graph_path)
-                && let Some(t) = rollback_graph.get_task_mut(eval_task_id)
-            {
-                t.status = Status::Open;
-                t.started_at = None;
-                t.assigned = None;
-                t.log.push(LogEntry {
-                    timestamp: Utc::now().to_rfc3339(),
-                    actor: Some(agent_id.clone()),
-                    message: format!("Eval spawn failed, reverting claim: {}", e),
-                });
-                let _ = save_graph(&rollback_graph, &graph_path);
-            }
+            // Rollback the claim atomically
+            let agent_id_rollback = agent_id.clone();
+            let err_msg = e.to_string();
+            let _ = modify_graph(&graph_path, |graph| {
+                if let Some(t) = graph.get_task_mut(eval_task_id) {
+                    t.status = Status::Open;
+                    t.started_at = None;
+                    t.assigned = None;
+                    t.log.push(LogEntry {
+                        timestamp: Utc::now().to_rfc3339(),
+                        actor: Some(agent_id_rollback.clone()),
+                        message: format!("Eval spawn failed, reverting claim: {}", err_msg),
+                    });
+                    true
+                } else {
+                    false
+                }
+            });
             return Err(anyhow::anyhow!("Failed to spawn eval process: {}", e));
         }
     };
@@ -2275,20 +2296,63 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
     use std::process::{Command, Stdio};
 
     let graph_path = graph_path(dir);
-    let mut graph = load_graph(&graph_path).context("Failed to load graph for assign spawn")?;
 
-    // Extract needed fields from the assign task before releasing the mutable borrow.
-    let (assign_task_status, assign_task_exec) = {
-        let task = graph.get_task_or_err(assign_task_id)?;
-        (task.status, task.exec.clone())
-    };
+    // Set up minimal agent tracking (before modify_graph so we have the agent_id)
+    let mut agent_registry = AgentRegistry::load(dir)?;
+    let agent_id = format!("agent-{}", agent_registry.next_agent_id);
 
-    if assign_task_status != Status::Open {
-        anyhow::bail!(
-            "Assignment task '{}' is not open (status: {:?})",
-            assign_task_id,
-            assign_task_status
-        );
+    // Create minimal output directory for log capture
+    let output_dir = dir.join("agents").join(&agent_id);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("Failed to create assign output dir: {:?}", output_dir))?;
+    let output_file = output_dir.join("output.log");
+    let output_file_str = output_file.to_string_lossy().to_string();
+
+    let escaped_assign_id = assign_task_id.replace('\'', "'\\''");
+    let escaped_output = output_file_str.replace('\'', "'\\''");
+
+    // Atomically claim the task and extract needed fields.
+    // Using modify_graph prevents the "lost update" race where a concurrent
+    // `wg done` from a previously-spawned fast inline task saves between our
+    // read and write, and our write clobbers the Done status back to InProgress.
+    let mut assign_task_exec: Option<String> = None;
+    let mut claim_error: Option<String> = None;
+    let agent_id_clone = agent_id.clone();
+
+    modify_graph(&graph_path, |graph| {
+        let task = match graph.get_task_mut(assign_task_id) {
+            Some(t) => t,
+            None => {
+                claim_error = Some(format!("Assignment task '{}' not found", assign_task_id));
+                return false;
+            }
+        };
+
+        if task.status != Status::Open {
+            claim_error = Some(format!(
+                "Assignment task '{}' is not open (status: {:?})",
+                assign_task_id, task.status
+            ));
+            return false;
+        }
+
+        assign_task_exec = task.exec.clone();
+
+        task.status = Status::InProgress;
+        task.started_at = Some(Utc::now().to_rfc3339());
+        task.assigned = Some(agent_id_clone.clone());
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some(agent_id_clone.clone()),
+            message: "Spawned assignment inline".to_string(),
+        });
+
+        true
+    })
+    .context("Failed to load/save graph for assign spawn")?;
+
+    if let Some(err) = claim_error {
+        anyhow::bail!("{}", err);
     }
 
     // Extract source task ID from the assign task ID (strip ".assign-" prefix)
@@ -2308,20 +2372,6 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
             source_task_id.replace('\'', "'\\''")
         )
     };
-
-    // Set up minimal agent tracking
-    let mut agent_registry = AgentRegistry::load(dir)?;
-    let agent_id = format!("agent-{}", agent_registry.next_agent_id);
-
-    // Create minimal output directory for log capture
-    let output_dir = dir.join("agents").join(&agent_id);
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("Failed to create assign output dir: {:?}", output_dir))?;
-    let output_file = output_dir.join("output.log");
-    let output_file_str = output_file.to_string_lossy().to_string();
-
-    let escaped_assign_id = assign_task_id.replace('\'', "'\\''");
-    let escaped_output = output_file_str.replace('\'', "'\\''");
 
     // Build the script: run assign, then mark done/failed
     let script = format!(
@@ -2343,18 +2393,6 @@ else
 fi
 exit $EXIT_CODE"#,
     );
-
-    // Claim the task before spawning
-    let task = graph.get_task_mut_or_err(assign_task_id)?;
-    task.status = Status::InProgress;
-    task.started_at = Some(Utc::now().to_rfc3339());
-    task.assigned = Some(agent_id.clone());
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: Some(agent_id.clone()),
-        message: "Spawned assignment inline".to_string(),
-    });
-    save_graph(&graph, &graph_path).context("Failed to save graph after claiming assign task")?;
 
     // Fork the process
     let mut cmd = Command::new("bash");
@@ -2378,20 +2416,24 @@ exit $EXIT_CODE"#,
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            // Rollback the claim
-            if let Ok(mut rollback_graph) = load_graph(&graph_path)
-                && let Some(t) = rollback_graph.get_task_mut(assign_task_id)
-            {
-                t.status = Status::Open;
-                t.started_at = None;
-                t.assigned = None;
-                t.log.push(LogEntry {
-                    timestamp: Utc::now().to_rfc3339(),
-                    actor: Some(agent_id.clone()),
-                    message: format!("Assignment spawn failed, reverting claim: {}", e),
-                });
-                let _ = save_graph(&rollback_graph, &graph_path);
-            }
+            // Rollback the claim atomically
+            let agent_id_rollback = agent_id.clone();
+            let err_msg = e.to_string();
+            let _ = modify_graph(&graph_path, |graph| {
+                if let Some(t) = graph.get_task_mut(assign_task_id) {
+                    t.status = Status::Open;
+                    t.started_at = None;
+                    t.assigned = None;
+                    t.log.push(LogEntry {
+                        timestamp: Utc::now().to_rfc3339(),
+                        actor: Some(agent_id_rollback.clone()),
+                        message: format!("Assignment spawn failed, reverting claim: {}", err_msg),
+                    });
+                    true
+                } else {
+                    false
+                }
+            });
             return Err(anyhow::anyhow!("Failed to spawn assignment process: {}", e));
         }
     };

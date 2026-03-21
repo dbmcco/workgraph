@@ -5,7 +5,7 @@ use workgraph::agency::capture_task_output;
 use workgraph::graph::{
     LogEntry, Status, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens,
 };
-use workgraph::parser::save_graph;
+use workgraph::parser::modify_graph;
 use workgraph::query;
 use workgraph::service::registry::AgentRegistry;
 
@@ -255,18 +255,27 @@ fn run_inner(
 
     // External validation: transition to PendingValidation instead of Done
     if validation_mode == "external" {
-        let task = graph
-            .get_task_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("Task '{}' disappeared from graph", id))?;
-        task.status = Status::PendingValidation;
-        task.completed_at = Some(Utc::now().to_rfc3339());
-        task.log.push(LogEntry {
-            timestamp: Utc::now().to_rfc3339(),
-            actor: task.assigned.clone(),
-            message: "Task pending external validation".to_string(),
-        });
-
-        save_graph(&graph, &path).context("Failed to save graph")?;
+        let id_ext = id.to_string();
+        let mut assigned_agent = None;
+        let graph = modify_graph(&path, |graph| {
+            let task = match graph.get_task_mut(&id_ext) {
+                Some(t) => t,
+                None => return false,
+            };
+            if task.status.is_terminal() {
+                return false;
+            }
+            assigned_agent = task.assigned.clone();
+            task.status = Status::PendingValidation;
+            task.completed_at = Some(Utc::now().to_rfc3339());
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: task.assigned.clone(),
+                message: "Task pending external validation".to_string(),
+            });
+            true
+        })
+        .context("Failed to save graph")?;
         super::notify_graph_changed(dir);
 
         // Update agent registry for external validation path too
@@ -293,9 +302,7 @@ fn run_inner(
         println!("Task '{}' is pending external validation", id);
 
         // Archive agent conversation for provenance
-        if let Some(task) = graph.get_task(id)
-            && let Some(ref agent_id) = task.assigned
-        {
+        if let Some(ref agent_id) = assigned_agent {
             match super::log::archive_agent(dir, id, agent_id) {
                 Ok(archive_dir) => {
                     eprintln!("Agent archived to {}", archive_dir.display());
@@ -397,57 +404,84 @@ fn run_inner(
         false
     };
 
-    // Now mutate the task
-    let task = graph
-        .get_task_mut(id)
-        .ok_or_else(|| anyhow::anyhow!("Task '{}' disappeared from graph", id))?;
+    // Atomically load the freshest graph, apply the mutation, and save.
+    // Using modify_graph prevents the "lost update" race where a concurrent
+    // spawn_eval_inline (or any other graph writer) saves between our read
+    // and write, and our write clobbers its changes — or vice-versa.
+    //
+    // The pre-checks above (blockers, verify, validation) used a stale graph
+    // snapshot, but they are idempotent gates: if they passed on the stale
+    // version, they would also pass on the fresh version (task status can only
+    // move forward, blockers can only resolve, not un-resolve).
+    let mut cycle_reactivated = Vec::new();
+    let mut already_done = false;
 
-    task.status = Status::Done;
-    task.completed_at = Some(Utc::now().to_rfc3339());
+    // Resolve token usage outside the lock (registry read + file I/O).
+    let token_usage = AgentRegistry::load(dir)
+        .ok()
+        .and_then(|registry| {
+            let agent = registry.get_agent_by_task(id)?;
+            let output_path = std::path::Path::new(&agent.output_file);
+            let abs_path = if output_path.is_absolute() {
+                output_path.to_path_buf()
+            } else {
+                dir.parent().unwrap_or(dir).join(output_path)
+            };
+            parse_token_usage(&abs_path).or_else(|| parse_wg_tokens(&abs_path))
+        });
 
-    if converged_accepted && !task.tags.contains(&"converged".to_string()) {
-        task.tags.push("converged".to_string());
-    }
-
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: task.assigned.clone(),
-        message: if converged_accepted {
-            "Task marked as done (converged)".to_string()
-        } else if converged {
-            "Task marked as done (--converged ignored, cycle is forced)".to_string()
-        } else {
-            "Task marked as done".to_string()
-        },
-    });
-
-    // Extract token usage from agent output.log if available
-    if task.token_usage.is_none()
-        && let Ok(registry) = AgentRegistry::load(dir)
-        && let Some(agent) = registry.get_agent_by_task(id)
-    {
-        let output_path = std::path::Path::new(&agent.output_file);
-        // output_file may be relative to the project root (parent of .workgraph)
-        let abs_path = if output_path.is_absolute() {
-            output_path.to_path_buf()
-        } else {
-            dir.parent().unwrap_or(dir).join(output_path)
-        };
-        if let Some(usage) = parse_token_usage(&abs_path) {
-            task.token_usage = Some(usage);
-        } else if let Some(usage) = parse_wg_tokens(&abs_path) {
-            // Eval agents (.evaluate-*, .flip-*) emit __WG_TOKENS__ lines
-            // instead of Claude CLI type=result JSON.
-            task.token_usage = Some(usage);
-        }
-    }
-
-    // Evaluate structural cycle iteration
     let id_owned = id.to_string();
-    let cycle_analysis = graph.compute_cycle_analysis();
-    let cycle_reactivated = evaluate_cycle_iteration(&mut graph, &id_owned, &cycle_analysis);
+    let graph = modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(&id_owned) {
+            Some(t) => t,
+            None => return false,
+        };
 
-    save_graph(&graph, &path).context("Failed to save graph")?;
+        // Re-check: another writer may have marked it Done already
+        if task.status == Status::Done {
+            already_done = true;
+            return false;
+        }
+
+        task.status = Status::Done;
+        task.completed_at = Some(Utc::now().to_rfc3339());
+
+        if converged_accepted && !task.tags.contains(&"converged".to_string()) {
+            task.tags.push("converged".to_string());
+        }
+
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: task.assigned.clone(),
+            message: if converged_accepted {
+                "Task marked as done (converged)".to_string()
+            } else if converged {
+                "Task marked as done (--converged ignored, cycle is forced)".to_string()
+            } else {
+                "Task marked as done".to_string()
+            },
+        });
+
+        // Apply pre-resolved token usage
+        if task.token_usage.is_none() {
+            if let Some(ref usage) = token_usage {
+                task.token_usage = Some(usage.clone());
+            }
+        }
+
+        // Evaluate structural cycle iteration
+        let cycle_analysis = graph.compute_cycle_analysis();
+        cycle_reactivated = evaluate_cycle_iteration(graph, &id_owned, &cycle_analysis);
+
+        true
+    })
+    .context("Failed to save graph")?;
+
+    if already_done {
+        println!("Task '{}' is already done", id);
+        return Ok(());
+    }
+
     super::notify_graph_changed(dir);
 
     // Update agent registry to reflect task completion.
