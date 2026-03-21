@@ -797,14 +797,14 @@ fn coherency_after_archive_and_gc() {
     fs::create_dir_all(&wg_dir).unwrap();
     fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
 
-    // Add tasks, complete one, abandon another
+    // Add tasks, complete one, fail another, keep one open
     wg_ok(
         &wg_dir,
         &["add", "Done task", "--id", "done-task", "--immediate"],
     );
     wg_ok(
         &wg_dir,
-        &["add", "Abandon task", "--id", "abandon-task", "--immediate"],
+        &["add", "Fail task", "--id", "fail-task", "--immediate"],
     );
     wg_ok(
         &wg_dir,
@@ -812,12 +812,12 @@ fn coherency_after_archive_and_gc() {
     );
 
     wg_ok(&wg_dir, &["done", "done-task"]);
-    wg_ok(&wg_dir, &["abandon", "abandon-task"]);
+    wg_ok(&wg_dir, &["fail", "fail-task", "--reason", "test"]);
 
-    // Archive done tasks
+    // Archive done tasks (archives Done + Abandoned, but not Failed)
     wg_ok(&wg_dir, &["archive", "--yes"]);
 
-    // GC abandoned tasks
+    // GC failed tasks
     wg_ok(&wg_dir, &["gc"]);
 
     // Archived and gc'd tasks should NOT be in graph
@@ -827,8 +827,8 @@ fn coherency_after_archive_and_gc() {
         "done-task should be archived"
     );
     assert!(
-        graph.get_task("abandon-task").is_none(),
-        "abandon-task should be gc'd"
+        graph.get_task("fail-task").is_none(),
+        "fail-task should be gc'd"
     );
     assert!(
         graph.get_task("keep-task").is_some(),
@@ -841,7 +841,7 @@ fn coherency_after_archive_and_gc() {
 
     assert!(ops.contains(&"add_task"));
     assert!(ops.contains(&"done"));
-    assert!(ops.contains(&"abandon"));
+    assert!(ops.contains(&"fail"));
     assert!(ops.contains(&"archive"));
     assert!(ops.contains(&"gc"));
 }
