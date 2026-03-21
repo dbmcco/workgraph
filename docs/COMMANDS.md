@@ -1392,11 +1392,11 @@ wg matrix <SUBCOMMAND> [OPTIONS]
 **Subcommands:**
 | Subcommand | Description |
 |------------|-------------|
-| `listen` | Listen for Matrix messages |
-| `send` | Send a message to Matrix |
-| `status` | Check Matrix connection status |
-| `login` | Authenticate with Matrix server |
-| `logout` | Disconnect from Matrix server |
+| `listen` | Start the Matrix message listener |
+| `send` | Send a message to a Matrix room |
+| `status` | Show Matrix connection status |
+| `login` | Login with password (caches access token) |
+| `logout` | Logout and clear cached credentials |
 
 ---
 
@@ -1428,6 +1428,260 @@ wg agency init
 ```bash
 wg agency init
 # Creates default roles and tradeoffs to get started with agent identities
+```
+
+---
+
+### `wg agency migrate`
+
+Migrate old-format agency store (`roles/`, `motivations/`, `agents/`) to the `primitives/` + `cache/` format.
+
+```bash
+wg agency migrate [--dry-run]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be migrated without writing |
+
+---
+
+### `wg agency scan`
+
+Scan the filesystem for agency stores.
+
+```bash
+wg agency scan <ROOT> [--max-depth <N>]
+```
+
+**Arguments:**
+- `ROOT` — Root directory to scan (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--max-depth <N>` | Maximum recursion depth (default: 10) |
+
+**Example:**
+```bash
+wg agency scan /home/erik --max-depth 5
+# Find all agency stores under the given root
+```
+
+---
+
+### `wg agency pull`
+
+Pull entities from another agency store into the local project.
+
+```bash
+wg agency pull <SOURCE> [OPTIONS]
+```
+
+**Arguments:**
+- `SOURCE` — Source store (path, named remote, or directory)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--entity <IDS>` | Only pull specific entity IDs (prefix match) |
+| `--type <TYPE>` | Only pull entities of this type (`role`, `tradeoff`, `agent`) |
+| `--dry-run` | Show what would be pulled without writing |
+| `--no-performance` | Skip merging performance data (copy definitions only) |
+| `--no-evaluations` | Skip copying evaluation JSON files |
+| `--force` | Overwrite local metadata instead of merging |
+| `--global` | Pull into `~/.workgraph/agency/` instead of local project |
+
+**Example:**
+```bash
+wg agency pull /home/alice/project
+# Pull all entities from Alice's agency store
+
+wg agency pull my-remote --type role --dry-run
+# Preview pulling only roles from a named remote
+```
+
+---
+
+### `wg agency push`
+
+Push local entities to another agency store.
+
+```bash
+wg agency push <TARGET> [OPTIONS]
+```
+
+**Arguments:**
+- `TARGET` — Target store (path, named remote, or directory)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--entity <IDS>` | Only push specific entity IDs |
+| `--type <TYPE>` | Only push entities of this type (`role`, `tradeoff`, `agent`) |
+| `--dry-run` | Show what would be pushed without writing |
+| `--no-performance` | Skip merging performance data (copy definitions only) |
+| `--no-evaluations` | Skip copying evaluation JSON files |
+| `--force` | Overwrite target metadata instead of merging |
+| `--global` | Push from `~/.workgraph/agency/` instead of local project |
+
+**Example:**
+```bash
+wg agency push /home/alice/project --type role
+# Push only roles to Alice's agency store
+```
+
+---
+
+### `wg agency merge`
+
+Merge entities from multiple agency stores.
+
+```bash
+wg agency merge [SOURCES]... [OPTIONS]
+```
+
+**Arguments:**
+- `[SOURCES]...` — Source stores (paths, named remotes, or directories)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--into <PATH>` | Merge into a specific target path instead of local project |
+| `--dry-run` | Show what would be merged without writing |
+
+**Example:**
+```bash
+wg agency merge /home/alice/project /home/bob/project
+# Merge entities from two stores into local
+
+wg agency merge store-a store-b --into /shared/agency --dry-run
+# Preview merging into a shared target
+```
+
+---
+
+### `wg agency remote`
+
+Manage named references to other agency stores.
+
+```bash
+wg agency remote <COMMAND>
+```
+
+| Command | Description |
+|---------|-------------|
+| `add <NAME> <PATH> [-d <TEXT>]` | Add a named remote agency store |
+| `remove <NAME>` | Remove a named remote |
+| `list` | List all configured remotes |
+| `show <NAME>` | Show details of a remote including entity counts |
+
+**Example:**
+```bash
+wg agency remote add alice /home/alice/project -d "Alice's agency"
+wg agency remote list
+wg agency remote show alice
+wg agency remote remove alice
+```
+
+---
+
+### `wg agency deferred`
+
+List pending deferred evolver operations awaiting human review.
+
+```bash
+wg agency deferred
+```
+
+---
+
+### `wg agency approve`
+
+Approve a deferred evolver operation.
+
+```bash
+wg agency approve <ID> [-n <NOTE>]
+```
+
+**Arguments:**
+- `ID` — Deferred operation ID (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-n, --note <NOTE>` | Optional note explaining approval |
+
+---
+
+### `wg agency reject`
+
+Reject a deferred evolver operation.
+
+```bash
+wg agency reject <ID> [-n <NOTE>]
+```
+
+**Arguments:**
+- `ID` — Deferred operation ID (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-n, --note <NOTE>` | Optional note explaining rejection |
+
+---
+
+### `wg agency create`
+
+Invoke the creator agent to discover and add new primitives.
+
+```bash
+wg agency create [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--model <MODEL>` | Model to use for the creator agent |
+| `--dry-run` | Show what would be created without writing |
+
+**Example:**
+```bash
+wg agency create --model opus
+# Use LLM to discover and add new roles/tradeoffs
+
+wg agency create --dry-run
+# Preview what would be created
+```
+
+---
+
+### `wg agency import`
+
+Import Agency's starter.csv primitives into WorkGraph.
+
+```bash
+wg agency import <CSV_PATH> [OPTIONS]
+```
+
+**Arguments:**
+- `CSV_PATH` — Path to the CSV file to import (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be imported without writing files |
+| `--tag <TAG>` | Provenance tag (default: `agency-import`) |
+
+**Example:**
+```bash
+wg agency import starter.csv --dry-run
+# Preview what would be imported
+
+wg agency import starter.csv --tag "external-v2"
+# Import with a custom provenance tag
 ```
 
 ---
@@ -1657,6 +1911,7 @@ wg evolve <SUBCOMMAND>
 | Subcommand | Description |
 |------------|-------------|
 | `run` | Trigger an evolution cycle on agency roles and tradeoffs |
+| `apply` | Apply a `synthesis-result.json` from a fan-out evolution run |
 | `review` | Review deferred evolver operations (list, approve, reject) |
 
 #### `wg evolve run`
@@ -1687,6 +1942,33 @@ wg evolve run [OPTIONS]
 | `retirement` | Remove consistently poor-performing entities |
 | `tradeoff-tuning` | Adjust constraints on existing tradeoffs |
 | `all` | Use all strategies as appropriate (default) |
+
+#### `wg evolve apply`
+
+Apply a synthesis-result.json from a fan-out evolution run.
+
+```bash
+wg evolve apply <SYNTHESIS_FILE> [OPTIONS]
+```
+
+**Arguments:**
+- `SYNTHESIS_FILE` — Path to `synthesis-result.json` (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-o, --output <PATH>` | Output path for `apply-results.json` (default: auto-derived from synthesis file path) |
+
+**Example:**
+```bash
+wg evolve apply .workgraph/agency/synthesis-result.json
+# Apply the synthesized evolution operations
+
+wg evolve apply synthesis-result.json -o results.json
+# Apply with a custom output path
+```
+
+---
 
 #### `wg evolve review`
 
