@@ -550,6 +550,10 @@ pub enum Commands {
         /// Edge color style: 'gray' (default), 'white', or 'mixed' (tree=white, arcs=gray)
         #[arg(long)]
         edge_color: Option<String>,
+
+        /// Force a specific output width in columns (default: auto-detect terminal width)
+        #[arg(long)]
+        columns: Option<u16>,
     },
 
     /// Output the full graph data (DOT format with archive support)
@@ -1578,7 +1582,7 @@ pub enum Commands {
         /// Path to the agent output directory (contains raw_stream.jsonl)
         output_dir: String,
 
-        /// Source task ID (the task being placed, without .place- prefix)
+        /// Source task ID (the task being placed)
         source_task_id: String,
     },
 }

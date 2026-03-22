@@ -1,6 +1,7 @@
 use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
+use unicode_width::UnicodeWidthChar;
 use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, format_token_display};
 use workgraph::messages::{CoordinatorMessageStatus, MessageStats};
 
@@ -1480,10 +1481,62 @@ pub(crate) fn visible_len(s: &str) -> usize {
         } else if ch == '\x1b' {
             in_escape = true;
         } else {
-            len += 1;
+            len += ch.width().unwrap_or(0);
         }
     }
     len
+}
+
+/// Truncate a string to at most `max_visible` visible columns,
+/// preserving ANSI escape sequences and appending a reset code if needed.
+/// Returns the original string unchanged if it fits.
+pub(crate) fn truncate_to_width(s: &str, max_visible: usize) -> String {
+    if visible_len(s) <= max_visible {
+        return s.to_string();
+    }
+
+    let mut result = String::with_capacity(s.len());
+    let mut vis = 0;
+    let mut in_escape = false;
+    let mut has_active_style = false;
+
+    for ch in s.chars() {
+        if in_escape {
+            result.push(ch);
+            if ch == 'm' {
+                in_escape = false;
+                // Track whether we have active styling (non-reset)
+                // A reset is \x1b[0m; anything else is active
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            has_active_style = true;
+            result.push(ch);
+        } else {
+            let w = ch.width().unwrap_or(0);
+            if vis + w > max_visible {
+                break;
+            }
+            result.push(ch);
+            vis += w;
+        }
+    }
+
+    // Ensure we reset any active ANSI styling
+    if has_active_style {
+        result.push_str("\x1b[0m");
+    }
+
+    result
+}
+
+/// Truncate all lines in a multiline string to `max_columns` visible width.
+pub(crate) fn truncate_lines(text: &str, max_columns: u16) -> String {
+    let max = max_columns as usize;
+    text.lines()
+        .map(|line| truncate_to_width(line, max))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -1783,46 +1836,6 @@ mod tests {
         // Parent task should appear with phase annotation
         assert!(result.text.contains("my-task"));
         assert!(result.text.contains("[⊞ assigning]"));
-    }
-
-    #[test]
-    fn test_ascii_shows_placing_phase() {
-        let mut graph = WorkGraph::new();
-        let mut parent = make_task("my-task", "My Task");
-        parent.status = Status::Open;
-        let mut place = make_internal_task(".place-my-task", "Place my-task", "assignment", vec![]);
-        place.status = Status::InProgress;
-        parent.after = vec![".place-my-task".to_string()];
-        graph.add_node(Node::Task(parent));
-        graph.add_node(Node::Task(place));
-
-        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
-        let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
-            &graph,
-            graph.tasks().collect(),
-            &annotations,
-        );
-        let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
-
-        let result = generate_ascii(
-            &graph,
-            &filtered,
-            &task_ids,
-            &annots,
-            &HashMap::new(),
-            &HashMap::new(),
-            LayoutMode::default(),
-            &HashSet::new(),
-            "gray",
-            &HashMap::new(),
-            &HashMap::new(),
-        );
-
-        // Internal task should NOT appear
-        assert!(!result.text.contains(".place-my-task"));
-        // Parent task should appear with phase annotation
-        assert!(result.text.contains("my-task"));
-        assert!(result.text.contains("[⊞ placing]"));
     }
 
     #[test]
@@ -5050,5 +5063,71 @@ mod tests {
             worker_pos,
             result.text
         );
+    }
+
+    #[test]
+    fn test_visible_len_plain() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len(""), 0);
+        assert_eq!(visible_len("├→ task"), 7);
+    }
+
+    #[test]
+    fn test_visible_len_with_ansi() {
+        assert_eq!(visible_len("\x1b[32mhello\x1b[0m"), 5);
+        assert_eq!(visible_len("\x1b[90m├→\x1b[0m test"), 7);
+        assert_eq!(visible_len("\x1b[38;5;219m[assigning]\x1b[0m"), 11);
+    }
+
+    #[test]
+    fn test_visible_len_unicode_width() {
+        // Box-drawing characters are single-width
+        assert_eq!(visible_len("─────"), 5);
+        assert_eq!(visible_len("│├└┐┘┤┼"), 7);
+        // Hourglass emoji is double-width
+        assert_eq!(visible_len("⏳"), 2);
+        assert_eq!(visible_len("ab⏳cd"), 6);
+    }
+
+    #[test]
+    fn test_truncate_to_width_no_truncation() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_to_width_plain() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_to_width_with_ansi() {
+        let s = "\x1b[32mhello\x1b[0m world";
+        let t = truncate_to_width(s, 5);
+        assert_eq!(visible_len(&t), 5);
+        assert!(t.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_truncate_to_width_unicode() {
+        // ⏳ is 2 columns wide — if only 1 column left, skip it
+        let s = "abc⏳";
+        assert_eq!(truncate_to_width(s, 4), "abc");
+        assert_eq!(truncate_to_width(s, 5), "abc⏳");
+        // With ANSI, the reset is appended
+        let s2 = "\x1b[33mabc⏳\x1b[0m";
+        let t = truncate_to_width(s2, 4);
+        assert_eq!(visible_len(&t), 3); // "abc" = 3, ⏳ doesn't fit
+        assert!(t.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_truncate_lines() {
+        let text = "short\nthis is a longer line\nok";
+        let result = truncate_lines(text, 10);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines[0], "short");
+        assert_eq!(visible_len(lines[1]), 10);
+        assert_eq!(lines[2], "ok");
     }
 }

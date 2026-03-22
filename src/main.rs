@@ -524,6 +524,7 @@ fn main() -> Result<()> {
             layout,
             tags,
             edge_color,
+            columns,
         } => {
             let layout_mode: commands::viz::LayoutMode = layout.parse().unwrap_or_default();
             let _explicit_static_format = dot || mermaid || graph || output.is_some();
@@ -532,6 +533,11 @@ fn main() -> Result<()> {
             // Resolve edge color: CLI flag > config > default ("gray")
             let resolved_edge_color = edge_color
                 .unwrap_or_else(|| Config::load_or_default(&workgraph_dir).viz.edge_color);
+
+            // Resolve max columns: --columns flag > terminal width > None
+            let max_columns = columns.or_else(|| {
+                crossterm::terminal::size().ok().map(|(cols, _)| cols)
+            });
 
             if use_tui {
                 let options = commands::viz::VizOptions {
@@ -547,6 +553,7 @@ fn main() -> Result<()> {
                     layout: layout_mode,
                     tags: tags.clone(),
                     edge_color: resolved_edge_color,
+                    max_columns: None, // TUI handles its own sizing
                 };
                 let mouse_override = if no_mouse { Some(false) } else { None };
                 tui::viz_viewer::run(workgraph_dir, options, mouse_override, false)
@@ -573,6 +580,7 @@ fn main() -> Result<()> {
                     layout: layout_mode,
                     tags,
                     edge_color: resolved_edge_color,
+                    max_columns,
                 };
                 commands::viz::run(&workgraph_dir, &options)
             }
@@ -1944,6 +1952,7 @@ fn main() -> Result<()> {
                 layout: commands::viz::LayoutMode::default(),
                 tags: vec![],
                 edge_color: resolved_edge_color,
+                max_columns: None, // TUI handles its own sizing
             };
             let mouse_override = if no_mouse { Some(false) } else { None };
             tui::viz_viewer::run(workgraph_dir, options, mouse_override, recording)
