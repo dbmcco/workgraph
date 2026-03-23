@@ -2062,7 +2062,26 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let editing_index = app.chat.editing_index;
 
-    for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
+    // When awaiting a coordinator response, hold unconsumed trailing user messages
+    // to render BELOW the streaming output. These are "pending" — submitted but not
+    // yet read by the coordinator, so visual order should match logical order.
+    let pending_start = if app.chat.awaiting_response {
+        let mut first_pending = app.chat.messages.len();
+        for i in (0..app.chat.messages.len()).rev() {
+            if app.chat.messages[i].role == super::state::ChatRole::User
+                && !app.is_chat_message_consumed(i)
+            {
+                first_pending = i;
+            } else {
+                break;
+            }
+        }
+        first_pending
+    } else {
+        app.chat.messages.len()
+    };
+
+    for (msg_idx, msg) in app.chat.messages[..pending_start].iter().enumerate() {
         let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
         let is_user = msg.role == super::state::ChatRole::User;
         let is_editable = is_user && !app.is_chat_message_consumed(msg_idx);
@@ -2346,6 +2365,89 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             rendered_lines.push(spinner_wave_line(elapsed, "  "));
             line_to_message.push(None);
         }
+        rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
+    }
+
+    // Render pending user messages BELOW the streaming output.
+    // These were submitted while the coordinator is still responding — they appear
+    // dimmed with a pending indicator to show they haven't been read yet.
+    let pending_text_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    for msg_idx in pending_start..app.chat.messages.len() {
+        let msg = &app.chat.messages[msg_idx];
+        let is_being_edited = editing_index == Some(msg_idx);
+
+        let prefix = "> ";
+        let role_style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+
+        let prefix_len = prefix.width();
+        let indent = " ".repeat(prefix_len);
+        let text_width = content_width.saturating_sub(prefix_len);
+
+        let md_lines = markdown_to_lines(&msg.text, text_width);
+        let wrapped: Vec<Line> = if md_lines.is_empty() {
+            vec![Line::from("")]
+        } else {
+            wrap_line_spans(&md_lines, text_width)
+        };
+
+        let msg_bg = if is_being_edited {
+            editing_msg_bg
+        } else {
+            pending_user_msg_bg
+        };
+
+        let mut first_line = true;
+        for line in &wrapped {
+            if first_line {
+                let mut spans = vec![Span::styled(prefix.to_string(), role_style)];
+                for span in line.spans.iter() {
+                    spans.push(Span::styled(
+                        span.content.clone(),
+                        pending_text_style,
+                    ));
+                }
+                if msg.edited {
+                    spans.push(Span::styled(" (edited)", pending_text_style));
+                }
+                spans.push(Span::styled(
+                    " (pending)",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ));
+                let built = apply_line_bg(Line::from(spans), msg_bg);
+                rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
+                first_line = false;
+            } else {
+                let mut spans = vec![Span::raw(indent.clone())];
+                for span in line.spans.iter() {
+                    spans.push(Span::styled(
+                        span.content.clone(),
+                        pending_text_style,
+                    ));
+                }
+                let built = apply_line_bg(Line::from(spans), msg_bg);
+                rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
+            }
+        }
+        // Attachment indicators.
+        for att_name in &msg.attachments {
+            let att_text = format!("{}[Attached: {}]", indent, att_name);
+            let att_line = apply_line_bg(
+                Line::from(Span::styled(att_text, pending_text_style)),
+                msg_bg,
+            );
+            rendered_lines.push(att_line);
+            line_to_message.push(Some(msg_idx));
+        }
+        // Blank line between messages.
         rendered_lines.push(Line::from(""));
         line_to_message.push(None);
     }
