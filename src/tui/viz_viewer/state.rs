@@ -176,6 +176,22 @@ pub struct AnnotationHitRegion {
     pub dot_task_ids: Vec<String>,
 }
 
+/// A "sticky" annotation that persists in the UI for a minimum duration
+/// even after the underlying system task has completed. This ensures
+/// transient states like "assigning" (which may last only 1-3 seconds)
+/// remain visible long enough for the user to notice.
+#[derive(Clone, Debug)]
+pub struct StickyAnnotation {
+    /// The annotation info (display text + source task IDs).
+    pub info: crate::commands::viz::AnnotationInfo,
+    /// When this annotation was last seen in the live graph state.
+    pub last_seen: Instant,
+}
+
+/// Minimum duration (in seconds) to display a transient annotation after
+/// it disappears from the live graph state.
+const STICKY_ANNOTATION_HOLD_SECS: u64 = 3;
+
 /// Transient flash state for a clicked annotation.
 #[derive(Clone, Debug)]
 pub struct AnnotationClickFlash {
@@ -1975,7 +1991,14 @@ pub struct VizApp {
     cycle_members: HashMap<String, HashSet<String>>,
     /// Phase annotation info per parent task: task_id → AnnotationInfo.
     /// Carries display text and source dot-task IDs for click resolution.
+    /// NOTE: This map is the *merged* view — it includes both live annotations
+    /// from the current graph state AND sticky annotations that are being held
+    /// past their live lifetime for visual continuity.
     pub annotation_map: HashMap<String, crate::commands::viz::AnnotationInfo>,
+    /// Sticky annotations: annotations that should persist in the UI for a
+    /// minimum duration even after the underlying system task completes.
+    /// Key is the parent task ID, value is the annotation info + timing.
+    sticky_annotations: HashMap<String, StickyAnnotation>,
     /// Clickable hit regions for phase annotations, computed from plain_lines + annotation_map.
     pub annotation_hit_regions: Vec<AnnotationHitRegion>,
     /// Active annotation click flash (for visual feedback). Clears after 500ms.
@@ -2283,6 +2306,7 @@ impl VizApp {
             char_edge_map: std::collections::HashMap::new(),
             cycle_members: HashMap::new(),
             annotation_map: HashMap::new(),
+            sticky_annotations: HashMap::new(),
             annotation_hit_regions: Vec::new(),
             annotation_click_flash: None,
             cycle_set: HashSet::new(),
@@ -2450,7 +2474,42 @@ impl VizApp {
                 self.reverse_edges = viz_output.reverse_edges;
                 self.char_edge_map = viz_output.char_edge_map;
                 self.cycle_members = viz_output.cycle_members;
-                self.annotation_map = viz_output.annotation_map;
+                // Merge live annotations with sticky annotations for visual continuity.
+                // This ensures transient states (assigning, evaluating) remain visible
+                // for at least STICKY_ANNOTATION_HOLD_SECS even after completion.
+                let now = Instant::now();
+                let live_annotations = viz_output.annotation_map;
+
+                // Update sticky annotations: refresh last_seen for live ones, keep recent stale ones.
+                for (parent_id, info) in &live_annotations {
+                    self.sticky_annotations.insert(
+                        parent_id.clone(),
+                        StickyAnnotation {
+                            info: info.clone(),
+                            last_seen: now,
+                        },
+                    );
+                }
+
+                // Build merged map: start with live annotations, then add stale stickies.
+                let mut merged = live_annotations;
+                let hold = std::time::Duration::from_secs(STICKY_ANNOTATION_HOLD_SECS);
+                self.sticky_annotations.retain(|parent_id, sticky| {
+                    if merged.contains_key(parent_id) {
+                        // Still live — keep in sticky map, already in merged.
+                        return true;
+                    }
+                    if sticky.last_seen.elapsed() < hold {
+                        // Expired from live state but within hold period — show it.
+                        merged.insert(parent_id.clone(), sticky.info.clone());
+                        true
+                    } else {
+                        // Past hold period — remove from sticky map.
+                        false
+                    }
+                });
+
+                self.annotation_map = merged;
                 self.compute_annotation_hit_regions();
 
                 // Detect newly appeared tasks and register splash animations.
@@ -3617,27 +3676,51 @@ impl VizApp {
                 .ok();
             if current_mtime != self.last_graph_mtime {
                 self.last_graph_mtime = current_mtime;
-                // Mark viz stale so the slow path does a full reload —
-                // the fast path only does targeted panel updates, not the
-                // full graph visualization.
-                self.graph_viz_stale = true;
+                // Full viz reload on every graph mutation — this catches
+                // transient states (assigning, evaluating) that would
+                // otherwise be missed by the 1-second slow-path tick.
+                let graph_path = self.workgraph_dir.join("graph.jsonl");
+                if let Ok(graph) = load_graph(&graph_path) {
+                    let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
+                    let prev_hud_scroll = self.hud_scroll;
+                    self.smart_follow_active = self.scroll.is_at_bottom();
+                    self.load_viz_from_graph(&graph);
+                    self.load_stats_from_graph(&graph);
+                    self.load_agent_monitor();
+                    self.update_agent_streams();
+                    if self.right_panel_tab == RightPanelTab::Firehose {
+                        self.update_firehose();
+                    }
+                    self.invalidate_hud();
+                    self.load_hud_detail();
+                    if prev_hud_task.is_some()
+                        && prev_hud_task
+                            == self.hud_detail.as_ref().map(|d| d.task_id.clone())
+                    {
+                        self.hud_scroll = prev_hud_scroll;
+                    }
+                    if !self.search_input.is_empty() {
+                        self.rerun_search();
+                    }
+                }
                 // Log pane: reload if active (log entries are in graph.jsonl).
                 if self.right_panel_tab == RightPanelTab::Log {
                     self.invalidate_log_pane();
                     self.load_log_pane();
-                    content_updated = true;
                 }
-                // HUD detail: refresh to show updated task info.
-                if self.hud_detail.is_some() {
-                    let prev_scroll = self.hud_scroll;
-                    let prev_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
-                    self.invalidate_hud();
-                    self.load_hud_detail();
-                    if prev_task == self.hud_detail.as_ref().map(|d| d.task_id.clone()) {
-                        self.hud_scroll = prev_scroll;
-                    }
-                    content_updated = true;
+                if self.right_panel_tab == RightPanelTab::Agency {
+                    self.invalidate_agency_lifecycle();
+                    self.load_agency_lifecycle();
                 }
+                if self.right_panel_tab == RightPanelTab::Files
+                    && let Some(ref mut fb) = self.file_browser
+                {
+                    fb.refresh();
+                }
+                if self.right_panel_tab == RightPanelTab::CoordLog {
+                    self.load_coord_log();
+                }
+                content_updated = true;
             }
 
             // Messages panel: check if the message file for the viewed task changed.
@@ -3735,8 +3818,15 @@ impl VizApp {
 
         let graph_changed = current_mtime != self.last_graph_mtime || self.graph_viz_stale;
         let needs_token_refresh = self.task_counts.in_progress > 0;
+        // Check if any sticky annotations have expired and need to be
+        // removed from the rendered viz output.
+        let hold = std::time::Duration::from_secs(STICKY_ANNOTATION_HOLD_SECS);
+        let has_expiring_stickies = self
+            .sticky_annotations
+            .values()
+            .any(|s| s.last_seen.elapsed() >= hold);
 
-        if graph_changed || needs_token_refresh {
+        if graph_changed || needs_token_refresh || has_expiring_stickies {
             self.graph_viz_stale = false;
             // Load graph once and share between viz and stats (avoids double read+parse).
             let graph_path = self.workgraph_dir.join("graph.jsonl");
@@ -3746,7 +3836,7 @@ impl VizApp {
                 let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
                 let prev_hud_scroll = self.hud_scroll;
 
-                if graph_changed {
+                if graph_changed || has_expiring_stickies {
                     self.last_graph_mtime = current_mtime;
                     // Update smart-follow state before reloading: track if user is at bottom.
                     self.smart_follow_active = self.scroll.is_at_bottom();
@@ -3884,6 +3974,14 @@ impl VizApp {
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed() < std::time::Duration::from_secs(6))
         {
+            return true;
+        }
+        // Sticky annotations awaiting expiry — need periodic redraws to
+        // remove them once the hold period elapses.
+        if self.sticky_annotations.values().any(|s| {
+            s.last_seen.elapsed()
+                < std::time::Duration::from_secs(STICKY_ANNOTATION_HOLD_SECS + 1)
+        }) {
             return true;
         }
         false
@@ -5345,6 +5443,7 @@ impl VizApp {
             char_edge_map: viz.char_edge_map.clone(),
             cycle_members: viz.cycle_members.clone(),
             annotation_map: viz.annotation_map.clone(),
+            sticky_annotations: HashMap::new(),
             annotation_hit_regions: Vec::new(),
             annotation_click_flash: None,
             cycle_set: HashSet::new(),
