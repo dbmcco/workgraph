@@ -19,6 +19,7 @@ When a human (or a planner task) says one of these words, you should know exactl
 | **map-reduce** | Data-parallel diamond: planner → N workers → reducer | Workers do the same kind of work on different data |
 | **scaffold** | Platform task → [stream tasks…] | Shared infrastructure first, then parallel features |
 | **diamond with specialists** | Planner forks to role-matched workers, synthesizer joins | The power pattern — combines structure + agency |
+| **chatroom** | `prep → [perspectives…] → discussion → synthesis` | Deliberation via messages; perspectives interact |
 
 If the request doesn't map to one of these, it's probably a **composition** — see §6.
 
@@ -151,7 +152,59 @@ wg add "UX review" --id ux-review --after artifact
 wg add "Summarize reviews" --id summary --after sec-review,perf-review,ux-review
 ```
 
-### 2.4 Loop — iterate until convergence
+### 2.4 Chat Room — deliberation via messages
+
+Use when a question needs multiple perspectives that interact with each other, not just independent reviews. Agents discuss via `wg msg` on a shared task.
+
+**Three phases:**
+
+**1. Preparation** — research tasks run in parallel:
+```bash
+wg add "Research: prior art" --id prep-prior-art
+wg add "Research: user impact" --id prep-user-impact
+wg add "Research: technical constraints" --id prep-tech
+```
+
+**2. Discussion** — a single task where agents post positions via messages:
+```bash
+wg add "Discussion: which approach to use?" --id discuss-approach \
+  --after prep-prior-art,prep-user-impact,prep-tech \
+  -d "Chat room discussion. Participants read prep artifacts via wg context,
+then post positions via: wg msg send discuss-approach 'My position: ...'
+Read and respond to others' messages before marking done."
+```
+
+**3. Synthesis** — extract a decision from the discussion:
+```bash
+wg add "Synthesize decision" --id synth-approach \
+  --after discuss-approach \
+  -d "Read discussion messages (wg msg list discuss-approach).
+Produce: decision + rationale + dissenting views + action items."
+```
+
+**Rules:**
+- **Preparation is not optional.** Agents without research produce shallow positions. Each prep task should produce a structured findings document.
+- **5-8 participants** is the sweet spot. Fewer loses diversity; more creates noise.
+- **The synthesis task is mandatory.** Without it, the discussion is interesting but not actionable.
+- **Messages, not artifacts.** Unlike scatter-gather (independent artifacts), chat room agents interact through `wg msg send` / `wg msg list` on the discussion task.
+
+**How participants interact:**
+```bash
+# Read preparation context
+wg context discuss-approach
+
+# Read what others have said
+wg msg list discuss-approach
+
+# Post your position
+wg msg send discuss-approach "Position: X because Y. Re @agent-3's concern about Z: ..."
+```
+
+**When to use chatroom vs. scatter-gather:**
+- **Scatter-gather:** independent assessments that don't need to interact (security review + perf review + UX review)
+- **Chat room:** positions that should respond to each other (design decisions, strategy, prioritization)
+
+### 2.5 Loop — iterate until convergence
 
 Use for iterative refinement: draft → review → revise, repeat.
 
@@ -182,7 +235,7 @@ wg cycles            # see all cycles and their current state
 
 Previous iterations' logs and artifacts are preserved. Review them with `wg log <task-id> --list` and `wg context <task-id>` to build on prior work rather than starting fresh.
 
-### 2.5 The Critical Structural Rule
+### 2.6 The Critical Structural Rule
 
 > **Same files = sequential edges. NEVER parallelize shared-file mutations.**
 
