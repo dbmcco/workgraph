@@ -214,6 +214,10 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         println!("  chat_history_max = {}", config.tui.chat_history_max);
         println!("  counters = \"{}\"", config.tui.counters);
         println!(
+            "  show_system_tasks = {}",
+            config.tui.show_system_tasks
+        );
+        println!(
             "  show_running_system_tasks = {}",
             config.tui.show_running_system_tasks
         );

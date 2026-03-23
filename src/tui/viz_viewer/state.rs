@@ -2218,6 +2218,10 @@ pub struct VizApp {
     /// Set by the fast path when graph.jsonl changes but the full viz wasn't reloaded.
     /// Checked by the slow path to ensure the viz reload isn't skipped.
     graph_viz_stale: bool,
+
+    // ── Event tracing ──
+    /// When `Some`, records all input events to a JSONL file for replay.
+    pub tracer: Option<super::trace::EventTracer>,
 }
 
 /// Scroll state for a 2D viewport.
@@ -2283,7 +2287,7 @@ impl VizApp {
             cycle_timing: Vec::new(),
             show_total_tokens: false,
             show_help: false,
-            show_system_tasks: false,
+            show_system_tasks: config.tui.show_system_tasks,
             show_running_system_tasks: config.tui.show_running_system_tasks,
             system_tasks_just_toggled: false,
             mouse_enabled,
@@ -2402,6 +2406,7 @@ impl VizApp {
             last_detail_output_mtime: None,
             hud_follow: false,
             graph_viz_stale: false,
+            tracer: None,
         };
         app.start_fs_watcher();
         // Load graph once for both viz and stats on startup.
@@ -5623,6 +5628,7 @@ impl VizApp {
             last_detail_output_mtime: None,
             hud_follow: false,
             graph_viz_stale: false,
+            tracer: None,
         }
     }
 
@@ -7946,6 +7952,17 @@ impl VizApp {
             section: ConfigSection::TuiSettings,
         });
         entries.push(ConfigEntry {
+            key: "tui.show_system_tasks".into(),
+            label: "Show system tasks".into(),
+            value: if config.tui.show_system_tasks {
+                "on".into()
+            } else {
+                "off".into()
+            },
+            edit_kind: ConfigEditKind::Toggle,
+            section: ConfigSection::TuiSettings,
+        });
+        entries.push(ConfigEntry {
             key: "tui.show_running_system_tasks".into(),
             label: "Show running system tasks".into(),
             value: if config.tui.show_running_system_tasks {
@@ -8613,6 +8630,12 @@ impl VizApp {
                 }
             }
             "tui.counters" => config.tui.counters = new_value,
+            "tui.show_system_tasks" => {
+                config.tui.show_system_tasks = new_value == "on";
+                self.show_system_tasks = config.tui.show_system_tasks;
+                self.system_tasks_just_toggled = true;
+                self.force_refresh();
+            }
             "tui.show_running_system_tasks" => {
                 config.tui.show_running_system_tasks = new_value == "on";
             }
@@ -8892,6 +8915,12 @@ impl VizApp {
             "agency.auto_create" => config.agency.auto_create = new_val == "on",
             "tui.show_token_counts" => config.tui.show_token_counts = new_val == "on",
             "tui.chat_history" => config.tui.chat_history = new_val == "on",
+            "tui.show_system_tasks" => {
+                config.tui.show_system_tasks = new_val == "on";
+                self.show_system_tasks = config.tui.show_system_tasks;
+                self.system_tasks_just_toggled = true;
+                self.force_refresh();
+            }
             "tui.show_running_system_tasks" => {
                 config.tui.show_running_system_tasks = new_val == "on";
             }
@@ -11500,6 +11529,7 @@ mod tui_config_panel_tests {
             "tui.chat_history",
             "tui.chat_history_max",
             "tui.counters",
+            "tui.show_system_tasks",
             "tui.show_running_system_tasks",
             // Agent
             "agent.heartbeat_timeout",
