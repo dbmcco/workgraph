@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod bundle;
 pub mod client;
+pub mod journal;
 pub mod openai_client;
 pub mod provider;
 pub mod tools;

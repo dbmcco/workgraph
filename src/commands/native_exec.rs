@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
+use workgraph::executor::native::journal;
 use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
 use workgraph::models::ModelRegistry;
@@ -117,6 +118,7 @@ pub fn run(
     }
 
     // Create and run the agent loop
+    let journal_path = journal::journal_path(workgraph_dir, task_id);
     let agent = AgentLoop::with_tool_support(
         client,
         registry,
@@ -124,7 +126,8 @@ pub fn run(
         max_turns,
         output_log,
         supports_tools,
-    );
+    )
+    .with_journal(journal_path, task_id.to_string());
 
     // Run the async agent loop
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;

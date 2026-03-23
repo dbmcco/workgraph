@@ -13,6 +13,7 @@ use serde::Serialize;
 use super::client::{
     ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason, Usage,
 };
+use super::journal::{EndReason, Journal, JournalEntryKind};
 use super::provider::Provider;
 use super::tools::ToolRegistry;
 use crate::stream_event::{self, StreamWriter, TotalUsage, TurnUsage};
@@ -45,6 +46,10 @@ pub struct AgentLoop {
     stream_writer: Option<StreamWriter>,
     /// Whether the model supports tool use. When false, tools are omitted from requests.
     supports_tools: bool,
+    /// Optional journal path for conversation persistence.
+    journal_path: Option<PathBuf>,
+    /// Task ID for journal metadata.
+    task_id: Option<String>,
 }
 
 /// NDJSON log entry types for the output file.
@@ -134,21 +139,72 @@ impl AgentLoop {
             output_log,
             stream_writer,
             supports_tools,
+            journal_path: None,
+            task_id: None,
         }
+    }
+
+    /// Set the journal path for conversation persistence.
+    pub fn with_journal(mut self, journal_path: PathBuf, task_id: String) -> Self {
+        self.journal_path = Some(journal_path);
+        self.task_id = Some(task_id);
+        self
     }
 
     /// Run the agent loop to completion.
     pub async fn run(&self, initial_message: &str) -> Result<AgentResult> {
+        // Open journal if configured
+        let mut journal = if let Some(ref path) = self.journal_path {
+            match Journal::open(path) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!("[native-agent] Warning: failed to open journal: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Write Init journal entry
+        if let Some(ref mut j) = journal {
+            let tool_defs = if self.supports_tools {
+                self.tools.definitions()
+            } else {
+                vec![]
+            };
+            let _ = j.append(JournalEntryKind::Init {
+                model: self.client.model().to_string(),
+                provider: self.client.name().to_string(),
+                system_prompt: self.system_prompt.clone(),
+                tools: tool_defs,
+                task_id: self.task_id.clone(),
+            });
+        }
+
         // Write Init stream event
         if let Some(ref sw) = self.stream_writer {
             sw.write_init("native", Some(self.client.model()), None);
         }
 
+        let initial_content = vec![ContentBlock::Text {
+            text: initial_message.to_string(),
+        }];
+
+        // Journal the initial user message
+        if let Some(ref mut j) = journal {
+            let _ = j.append(JournalEntryKind::Message {
+                role: Role::User,
+                content: initial_content.clone(),
+                usage: None,
+                response_id: None,
+                stop_reason: None,
+            });
+        }
+
         let mut messages: Vec<Message> = vec![Message {
             role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: initial_message.to_string(),
-            }],
+            content: initial_content,
         }];
 
         let mut total_usage = Usage::default();
@@ -188,6 +244,17 @@ impl AgentLoop {
 
             // Log the assistant turn
             self.log_turn(turns, &response);
+
+            // Journal the assistant message
+            if let Some(ref mut j) = journal {
+                let _ = j.append(JournalEntryKind::Message {
+                    role: Role::Assistant,
+                    content: response.content.clone(),
+                    usage: Some(response.usage.clone()),
+                    response_id: Some(response.id.clone()),
+                    stop_reason: response.stop_reason,
+                });
+            }
 
             // Write Turn stream event
             if let Some(ref sw) = self.stream_writer {
@@ -239,11 +306,21 @@ impl AgentLoop {
                     let result = AgentResult {
                         final_text,
                         turns,
-                        total_usage,
+                        total_usage: total_usage.clone(),
                         tool_calls,
                     };
                     self.log_result(&result);
                     self.write_stream_result(true, &result);
+
+                    // Journal End entry
+                    if let Some(ref mut j) = journal {
+                        let _ = j.append(JournalEntryKind::End {
+                            reason: EndReason::Complete,
+                            total_usage,
+                            turns: result.turns as u32,
+                        });
+                    }
+
                     return Ok(result);
                 }
                 Some(StopReason::ToolUse) => {
@@ -259,17 +336,27 @@ impl AgentLoop {
 
                             let output = self.tools.execute(name, input).await;
 
+                            let duration_ms = tool_start.elapsed().as_millis() as u64;
+
                             // Stream: tool end
                             if let Some(ref sw) = self.stream_writer {
-                                sw.write_tool_end(
-                                    name,
-                                    output.is_error,
-                                    tool_start.elapsed().as_millis() as u64,
-                                );
+                                sw.write_tool_end(name, output.is_error, duration_ms);
                             }
 
                             // Log the tool call
                             self.log_tool_call(name, input, &output.content, output.is_error);
+
+                            // Journal the tool execution
+                            if let Some(ref mut j) = journal {
+                                let _ = j.append(JournalEntryKind::ToolExecution {
+                                    tool_use_id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                    output: output.content.clone(),
+                                    is_error: output.is_error,
+                                    duration_ms,
+                                });
+                            }
 
                             tool_calls.push(ToolCallRecord {
                                 name: name.clone(),
@@ -285,6 +372,18 @@ impl AgentLoop {
                             });
                         }
                     }
+
+                    // Journal the tool results user message
+                    if let Some(ref mut j) = journal {
+                        let _ = j.append(JournalEntryKind::Message {
+                            role: Role::User,
+                            content: results.clone(),
+                            usage: None,
+                            response_id: None,
+                            stop_reason: None,
+                        });
+                    }
+
                     messages.push(Message {
                         role: Role::User,
                         content: results,
@@ -292,11 +391,24 @@ impl AgentLoop {
                 }
                 Some(StopReason::MaxTokens) => {
                     // Response truncated — prompt for continuation
+                    let continuation = vec![ContentBlock::Text {
+                        text: "Your response was truncated. Please continue.".to_string(),
+                    }];
+
+                    // Journal the continuation message
+                    if let Some(ref mut j) = journal {
+                        let _ = j.append(JournalEntryKind::Message {
+                            role: Role::User,
+                            content: continuation.clone(),
+                            usage: None,
+                            response_id: None,
+                            stop_reason: None,
+                        });
+                    }
+
                     messages.push(Message {
                         role: Role::User,
-                        content: vec![ContentBlock::Text {
-                            text: "Your response was truncated. Please continue.".to_string(),
-                        }],
+                        content: continuation,
                     });
                 }
                 None => {
@@ -314,11 +426,21 @@ impl AgentLoop {
                     let result = AgentResult {
                         final_text,
                         turns,
-                        total_usage,
+                        total_usage: total_usage.clone(),
                         tool_calls,
                     };
                     self.log_result(&result);
                     self.write_stream_result(true, &result);
+
+                    // Journal End entry
+                    if let Some(ref mut j) = journal {
+                        let _ = j.append(JournalEntryKind::End {
+                            reason: EndReason::Complete,
+                            total_usage,
+                            turns: result.turns as u32,
+                        });
+                    }
+
                     return Ok(result);
                 }
             }
@@ -328,11 +450,21 @@ impl AgentLoop {
         let result = AgentResult {
             final_text: "[max turns reached]".to_string(),
             turns,
-            total_usage,
+            total_usage: total_usage.clone(),
             tool_calls,
         };
         self.log_result(&result);
         self.write_stream_result(false, &result);
+
+        // Journal End entry for max turns
+        if let Some(ref mut j) = journal {
+            let _ = j.append(JournalEntryKind::End {
+                reason: EndReason::MaxTurns,
+                total_usage,
+                turns: result.turns as u32,
+            });
+        }
+
         Ok(result)
     }
 
