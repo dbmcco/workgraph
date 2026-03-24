@@ -637,6 +637,7 @@ fn handle_reconfigure(
                 daemon_cfg.executor = config.coordinator.executor;
                 daemon_cfg.poll_interval = Duration::from_secs(config.coordinator.poll_interval);
                 daemon_cfg.model = config.coordinator.model;
+                daemon_cfg.provider = config.coordinator.provider;
                 daemon_cfg.settling_delay =
                     Duration::from_millis(config.coordinator.settling_delay_ms);
             }
@@ -1357,6 +1358,7 @@ mod tests {
             executor: "claude".to_string(),
             poll_interval: Duration::from_secs(60),
             model: None,
+            provider: None,
             paused: false,
             settling_delay: Duration::from_millis(2000),
         };
@@ -1412,6 +1414,7 @@ poll_interval = 120
             executor: "claude".to_string(),
             poll_interval: Duration::from_secs(60),
             model: None,
+            provider: None,
             paused: false,
             settling_delay: Duration::from_millis(2000),
         };
@@ -1573,6 +1576,7 @@ poll_interval = 120
             executor: "claude".to_string(),
             poll_interval: Duration::from_secs(60),
             model: None,
+            provider: None,
             paused: false,
             settling_delay: Duration::from_millis(2000),
         };
@@ -1637,6 +1641,7 @@ poll_interval = 120
             executor: "claude".to_string(),
             poll_interval: Duration::from_secs(60),
             model: None,
+            provider: None,
             paused: false,
             settling_delay: Duration::from_millis(2000),
         };
@@ -1692,6 +1697,7 @@ poll_interval = 120
             executor: "claude".to_string(),
             poll_interval: Duration::from_secs(60),
             model: None,
+            provider: None,
             paused: false,
             settling_delay: Duration::from_millis(2000),
         };

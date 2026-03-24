@@ -1495,6 +1495,7 @@ fn main() -> Result<()> {
             poll_interval,
             coordinator_executor,
             coordinator_model,
+            coordinator_provider,
             matrix,
             homeserver,
             username,
@@ -1724,6 +1725,7 @@ fn main() -> Result<()> {
                     && poll_interval.is_none()
                     && coordinator_executor.is_none()
                     && coordinator_model.is_none()
+                    && coordinator_provider.is_none()
                     && auto_evaluate.is_none()
                     && auto_assign.is_none()
                     && assigner_model.is_none()
@@ -1772,6 +1774,7 @@ fn main() -> Result<()> {
                     poll_interval,
                     coordinator_executor.as_deref(),
                     coordinator_model.as_deref(),
+                    coordinator_provider.as_deref(),
                     auto_evaluate,
                     auto_assign,
                     assigner_model.as_deref(),

@@ -49,6 +49,9 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if let Some(ref m) = config.coordinator.model {
             println!("  model = \"{}\"", m);
         }
+        if let Some(ref p) = config.coordinator.provider {
+            println!("  provider = \"{}\"", p);
+        }
         println!();
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);
@@ -308,6 +311,7 @@ pub fn update(
     poll_interval: Option<u64>,
     coordinator_executor: Option<&str>,
     coordinator_model: Option<&str>,
+    coordinator_provider: Option<&str>,
     auto_evaluate: Option<bool>,
     auto_assign: Option<bool>,
     assigner_model: Option<&str>,
@@ -399,6 +403,12 @@ pub fn update(
     if let Some(m) = coordinator_model {
         config.coordinator.model = Some(m.to_string());
         println!("Set coordinator.model = \"{}\"", m);
+        changed = true;
+    }
+
+    if let Some(p) = coordinator_provider {
+        config.coordinator.provider = Some(p.to_string());
+        println!("Set coordinator.provider = \"{}\"", p);
         changed = true;
     }
 
@@ -1723,6 +1733,7 @@ mod tests {
             None,
             None,
             None, // coordinator_model
+            None, // coordinator_provider
             None,
             None,
             None,
@@ -1780,6 +1791,7 @@ mod tests {
             None,
             Some("shell"),
             None, // coordinator_model
+            None, // coordinator_provider
             None,
             None,
             None,
@@ -1837,6 +1849,7 @@ mod tests {
             Some(120),
             None,
             None, // coordinator_model
+            None, // coordinator_provider
             None,
             None,
             None,
@@ -1892,6 +1905,7 @@ mod tests {
             None,
             None,
             None, // coordinator_model
+            None, // coordinator_provider
             Some(true),
             Some(true),
             Some("sonnet"),

@@ -917,6 +917,7 @@ pub(crate) struct DaemonConfig {
     executor: String,
     poll_interval: Duration,
     model: Option<String>,
+    provider: Option<String>,
     paused: bool,
     /// Settling delay after GraphChanged events. During burst graph construction,
     /// multiple adds fire in rapid succession. Instead of ticking immediately on
@@ -1805,6 +1806,7 @@ pub fn run_daemon(
         model: cli_model
             .map(std::string::ToString::to_string)
             .or_else(|| config.coordinator.model.clone()),
+        provider: config.coordinator.provider.clone(),
         paused: false,
         settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
     };

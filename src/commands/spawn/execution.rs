@@ -236,7 +236,7 @@ pub(crate) fn spawn_agent_inner(
         resolve_provider(
             agent_preferred_provider.clone(),
             resolved_task_agent.provider.clone(),
-            None,
+            config.coordinator.provider.clone(),
         ),
     );
 

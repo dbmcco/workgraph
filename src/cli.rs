@@ -1112,6 +1112,10 @@ pub enum Commands {
         #[arg(long)]
         coordinator_model: Option<String>,
 
+        /// Set coordinator provider (e.g., openrouter, anthropic)
+        #[arg(long)]
+        coordinator_provider: Option<String>,
+
         /// Matrix configuration subcommand
         #[arg(long)]
         matrix: bool,
