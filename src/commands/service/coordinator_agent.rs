@@ -37,6 +37,7 @@ use workgraph::chat;
 use workgraph::graph::Status;
 use workgraph::parser::load_graph;
 use workgraph::service::compactor::{CompactorState, context_md_path};
+use workgraph::service::executor::ExecutorRegistry;
 use workgraph::service::registry::AgentRegistry;
 
 use crate::commands::{graph_path, is_process_alive};
@@ -307,6 +308,7 @@ impl CoordinatorAgent {
         coordinator_id: u32,
         model: Option<&str>,
         executor: Option<&str>,
+        provider: Option<&str>,
         logger: &DaemonLogger,
         event_log: SharedEventLog,
     ) -> Result<Self> {
@@ -323,6 +325,7 @@ impl CoordinatorAgent {
         let dir = dir.to_path_buf();
         let model = model.map(String::from);
         let executor = executor.to_string();
+        let provider = provider.map(String::from);
         let logger = logger.clone();
         let alive_clone = alive.clone();
         let pid_clone = pid.clone();
@@ -336,6 +339,7 @@ impl CoordinatorAgent {
                     coordinator_id,
                     model.as_deref(),
                     &executor,
+                    provider.as_deref(),
                     rx,
                     alive_clone,
                     pid_clone,
@@ -419,6 +423,7 @@ fn agent_thread_main(
     coordinator_id: u32,
     model: Option<&str>,
     executor: &str,
+    provider: Option<&str>,
     rx: mpsc::Receiver<ChatRequest>,
     alive: Arc<Mutex<bool>>,
     pid: Arc<Mutex<u32>>,
@@ -486,7 +491,7 @@ fn agent_thread_main(
 
         // Spawn the Claude CLI process
         logger.info("Coordinator agent: spawning Claude CLI process");
-        let spawn_result = spawn_claude_process(dir, model, logger);
+        let spawn_result = spawn_claude_process(dir, executor, model, provider, logger);
         let (mut child, mut stdin, stdout) = match spawn_result {
             Ok(handles) => handles,
             Err(e) => {
@@ -1843,12 +1848,25 @@ fn native_coordinator_loop(
 
 /// Spawn the Claude CLI process with stream-json pipes.
 ///
+/// Resolves the command binary from the executor registry (same path task agents
+/// use), so custom executor configs and `command_template` overrides apply.
+/// Falls back to the built-in `"claude"` default when no custom config exists.
+///
 /// Returns the child process, its stdin handle, and stdout handle.
 fn spawn_claude_process(
     dir: &Path,
+    executor: &str,
     model: Option<&str>,
+    provider: Option<&str>,
     logger: &DaemonLogger,
 ) -> Result<(Child, std::process::ChildStdin, std::process::ChildStdout)> {
+    // Resolve command from executor registry — same code path task agents use.
+    // This picks up custom `.workgraph/executors/<name>.toml` configs (including
+    // command overrides) and falls back to the built-in default ("claude").
+    let registry = ExecutorRegistry::new(dir);
+    let executor_config = registry.load_config(executor)?;
+    let command = &executor_config.executor.command;
+
     let system_prompt = build_system_prompt(dir);
 
     // Write system prompt to a temp file to avoid shell argument length issues
@@ -1857,7 +1875,7 @@ fn spawn_claude_process(
     std::fs::write(&prompt_file, &system_prompt)
         .context("Failed to write coordinator system prompt file")?;
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = Command::new(command);
     cmd.env_remove("CLAUDECODE");
     cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
     cmd.args([
@@ -1880,6 +1898,11 @@ fn spawn_claude_process(
         cmd.args(["--model", m]);
     }
 
+    // Pass provider when configured (e.g., "openrouter" for non-Anthropic models)
+    if let Some(p) = provider {
+        cmd.args(["--provider", p]);
+    }
+
     cmd.current_dir(dir.parent().unwrap_or(dir));
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -1895,8 +1918,10 @@ fn spawn_claude_process(
     cmd.stderr(stderr_file);
 
     logger.info(&format!(
-        "Coordinator agent: spawning claude with model={}, cwd={:?}, stderr={:?}",
+        "Coordinator agent: spawning {} with model={}, provider={}, cwd={:?}, stderr={:?}",
+        command,
         model.unwrap_or("default"),
+        provider.unwrap_or("default"),
         dir.parent().unwrap_or(dir),
         stderr_path,
     ));
