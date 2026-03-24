@@ -1905,6 +1905,7 @@ pub fn run_daemon(
             &dir,
             0, // coordinator ID
             daemon_cfg.model.as_deref(),
+            Some(&daemon_cfg.executor),
             &logger,
             event_log.clone(),
         ) {
@@ -2089,6 +2090,7 @@ pub fn run_daemon(
                             &dir,
                             cid,
                             daemon_cfg.model.as_deref(),
+                            Some(&daemon_cfg.executor),
                             &logger,
                             event_log.clone(),
                         ) {

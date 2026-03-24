@@ -306,10 +306,12 @@ impl CoordinatorAgent {
         dir: &Path,
         coordinator_id: u32,
         model: Option<&str>,
+        executor: Option<&str>,
         logger: &DaemonLogger,
         event_log: SharedEventLog,
     ) -> Result<Self> {
-        if !Self::is_claude_available() {
+        let executor = executor.unwrap_or("claude");
+        if executor == "claude" && !Self::is_claude_available() {
             anyhow::bail!(
                 "Claude CLI not found. Install it to enable the persistent coordinator agent."
             );
@@ -320,6 +322,7 @@ impl CoordinatorAgent {
 
         let dir = dir.to_path_buf();
         let model = model.map(String::from);
+        let executor = executor.to_string();
         let logger = logger.clone();
         let alive_clone = alive.clone();
         let pid_clone = pid.clone();
@@ -332,6 +335,7 @@ impl CoordinatorAgent {
                     &dir,
                     coordinator_id,
                     model.as_deref(),
+                    &executor,
                     rx,
                     alive_clone,
                     pid_clone,
@@ -414,12 +418,17 @@ fn agent_thread_main(
     dir: &Path,
     coordinator_id: u32,
     model: Option<&str>,
+    executor: &str,
     rx: mpsc::Receiver<ChatRequest>,
     alive: Arc<Mutex<bool>>,
     pid: Arc<Mutex<u32>>,
     logger: &DaemonLogger,
     event_log: &SharedEventLog,
 ) {
+    if executor == "native" {
+        native_coordinator_loop(dir, coordinator_id, model, rx, alive, pid, logger, event_log);
+        return;
+    }
     // Track restart timestamps for time-windowed rate limiting.
     // Instead of a simple counter, we track when each restart occurred
     // and only count restarts within the window.
@@ -1369,6 +1378,462 @@ fn format_tool_input(out: &mut String, input: &str) {
     // Fallback: raw input
     for line in input.lines() {
         out.push_str(&format!("│ {}\n", line));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native executor coordinator loop
+// ---------------------------------------------------------------------------
+
+/// Run the coordinator agent using the native executor (direct API calls).
+///
+/// This is the alternative to the Claude CLI path. Instead of spawning a child
+/// process, it creates an LLM provider and makes API calls directly, executing
+/// tool calls in-process.
+///
+/// The loop structure mirrors `agent_thread_main`'s Claude CLI path:
+/// - Crash recovery with time-windowed restart rate limiting
+/// - Context injection per user message
+/// - Token tracking, turn recording, and evaluation
+/// - Streaming updates to the TUI
+#[allow(clippy::too_many_arguments)]
+fn native_coordinator_loop(
+    dir: &Path,
+    coordinator_id: u32,
+    model: Option<&str>,
+    rx: mpsc::Receiver<ChatRequest>,
+    alive: Arc<Mutex<bool>>,
+    pid: Arc<Mutex<u32>>,
+    logger: &DaemonLogger,
+    event_log: &SharedEventLog,
+) {
+    use workgraph::executor::native::client::{
+        ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason,
+    };
+    use workgraph::executor::native::provider::create_provider_ext;
+    use workgraph::executor::native::tools::ToolRegistry;
+    use workgraph::executor::native::tools::bash::register_bash_tool;
+    use workgraph::models::ModelRegistry;
+
+    let system_prompt = build_system_prompt(dir);
+
+    // Write system prompt to file for debugging (same as Claude CLI path)
+    let prompt_file = dir.join("service").join("coordinator-prompt.txt");
+    let _ = std::fs::create_dir_all(prompt_file.parent().unwrap());
+    let _ = std::fs::write(&prompt_file, &system_prompt);
+
+    // Resolve model
+    let effective_model = model
+        .map(String::from)
+        .or_else(|| std::env::var("WG_MODEL").ok())
+        .unwrap_or_else(|| "claude-sonnet-4-5-20250514".to_string());
+
+    // Create the tokio runtime for async API calls
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            logger.error(&format!(
+                "Native coordinator: failed to create tokio runtime: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    // Create the LLM provider
+    let client = match create_provider_ext(dir, &effective_model, None, None, None) {
+        Ok(c) => c,
+        Err(e) => {
+            logger.error(&format!(
+                "Native coordinator: failed to create LLM provider for model '{}': {}",
+                effective_model, e
+            ));
+            return;
+        }
+    };
+
+    // Check tool support
+    let model_registry = ModelRegistry::load(dir).unwrap_or_default();
+    let supports_tools = model_registry.supports_tool_use(&effective_model);
+    if !supports_tools {
+        logger.warn(&format!(
+            "Native coordinator: model '{}' does not support tool use, coordinator may be limited",
+            effective_model
+        ));
+    }
+
+    // Build tool registry — coordinator only needs bash (for wg commands)
+    let working_dir = dir
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut registry = ToolRegistry::new();
+    register_bash_tool(&mut registry, working_dir);
+
+    logger.info(&format!(
+        "Native coordinator: initialized with model='{}', supports_tools={}",
+        effective_model, supports_tools
+    ));
+
+    // Mark as alive (no child PID for native — use thread ID as pseudo-PID)
+    *alive.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    *pid.lock().unwrap_or_else(|e| e.into_inner()) = std::process::id();
+
+    // Maintain conversation history across interactions
+    let mut conversation: Vec<Message> = Vec::new();
+    let mut last_interaction = chrono::Utc::now().to_rfc3339();
+    let mut turn_count: u32 = 0;
+
+    // Max API turns per user message (to prevent runaway tool loops)
+    let max_turns_per_message: usize = 50;
+
+    loop {
+        // Wait for a chat message (with timeout to detect shutdown)
+        let request = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(req) => req,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                logger.info("Native coordinator: channel closed, shutting down");
+                *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                return;
+            }
+        };
+
+        let turn_start = std::time::Instant::now();
+        logger.info(&format!(
+            "Native coordinator: processing request_id={}",
+            request.request_id
+        ));
+
+        // Build context injection with event log
+        let context = match build_coordinator_context(
+            dir,
+            &last_interaction,
+            Some(event_log),
+            coordinator_id,
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                logger.warn(&format!(
+                    "Native coordinator: failed to build context: {}",
+                    e
+                ));
+                String::new()
+            }
+        };
+
+        // Format the user message with context injection prepended
+        let full_content = if context.is_empty() {
+            format!("User message:\n{}", request.message)
+        } else {
+            format!("{}\n\n---\n\nUser message:\n{}", context, request.message)
+        };
+
+        // Add user message to conversation
+        conversation.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: full_content,
+            }],
+        });
+
+        // Process the message through the API, handling tool calls
+        let mut parts: Vec<ResponsePart> = Vec::new();
+        let mut has_tool_calls = false;
+        let mut total_input_tokens: u64 = 0;
+        let mut total_output_tokens: u64 = 0;
+        let mut total_cache_creation: u64 = 0;
+        let mut api_turns = 0;
+        let mut streaming_text = String::new();
+        let mut errored = false;
+
+        loop {
+            if api_turns >= max_turns_per_message {
+                logger.warn(&format!(
+                    "Native coordinator: max API turns ({}) reached for request_id={}",
+                    max_turns_per_message, request.request_id
+                ));
+                break;
+            }
+
+            let tool_defs = if supports_tools {
+                registry.definitions()
+            } else {
+                vec![]
+            };
+
+            let api_request = MessagesRequest {
+                model: client.model().to_string(),
+                max_tokens: client.max_tokens(),
+                system: Some(system_prompt.clone()),
+                messages: conversation.clone(),
+                tools: tool_defs,
+                stream: false,
+            };
+
+            let response: MessagesResponse = match rt.block_on(client.send(&api_request)) {
+                Ok(r) => r,
+                Err(e) => {
+                    logger.error(&format!(
+                        "Native coordinator: API request failed: {}",
+                        e
+                    ));
+                    let _ = chat::append_outbox_for(
+                        dir,
+                        coordinator_id,
+                        &format!("The coordinator encountered an API error: {}", e),
+                        &request.request_id,
+                    );
+                    chat::clear_streaming(dir, coordinator_id);
+                    errored = true;
+                    break;
+                }
+            };
+
+            api_turns += 1;
+
+            // Track token usage
+            total_input_tokens = total_input_tokens
+                .saturating_add(u64::from(response.usage.input_tokens));
+            total_output_tokens = total_output_tokens
+                .saturating_add(u64::from(response.usage.output_tokens));
+            total_cache_creation = total_cache_creation.saturating_add(
+                response
+                    .usage
+                    .cache_creation_input_tokens
+                    .map(u64::from)
+                    .unwrap_or(0),
+            );
+
+            // Process content blocks: extract text and tool calls
+            let mut tool_use_blocks = Vec::new();
+            for block in &response.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        // Stream text to TUI
+                        streaming_text.push_str(text);
+                        if !text.ends_with('\n') {
+                            streaming_text.push('\n');
+                        }
+                        let _ = chat::write_streaming(dir, coordinator_id, &streaming_text);
+                        parts.push(ResponsePart::Text(text.clone()));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        has_tool_calls = true;
+                        let input_str = serde_json::to_string(input).unwrap_or_default();
+
+                        // Stream tool call to TUI
+                        streaming_text.push_str(&format!("\n┌─ {} ", name));
+                        streaming_text
+                            .push_str(&"─".repeat(40usize.saturating_sub(name.len() + 4)));
+                        streaming_text.push('\n');
+                        if name == "bash" || name == "Bash" {
+                            if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+                                streaming_text.push_str(&format!("│ $ {}\n", cmd));
+                            } else {
+                                format_tool_input(&mut streaming_text, &input_str);
+                            }
+                        } else {
+                            format_tool_input(&mut streaming_text, &input_str);
+                        }
+                        let _ = chat::write_streaming(dir, coordinator_id, &streaming_text);
+
+                        parts.push(ResponsePart::ToolUse {
+                            name: name.clone(),
+                            input: input_str,
+                        });
+                        tool_use_blocks.push((id.clone(), name.clone(), input.clone()));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Add assistant response to conversation
+            conversation.push(Message {
+                role: Role::Assistant,
+                content: response.content.clone(),
+            });
+
+            // Check stop reason
+            match response.stop_reason {
+                Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
+                    // Done — no more tool calls to process
+                    break;
+                }
+                Some(StopReason::ToolUse) => {
+                    // Execute tool calls and add results to conversation
+                    let mut tool_results = Vec::new();
+                    for (id, name, input) in &tool_use_blocks {
+                        let output = rt.block_on(registry.execute(name, input));
+
+                        // Stream tool result to TUI
+                        if !output.content.trim().is_empty() {
+                            let lines: Vec<&str> = output.content.lines().collect();
+                            let max_lines = 15;
+                            if lines.len() > max_lines {
+                                for line in &lines[..max_lines] {
+                                    streaming_text.push_str(&format!("│ {}\n", line));
+                                }
+                                streaming_text.push_str(&format!(
+                                    "│ ... ({} more lines)\n",
+                                    lines.len() - max_lines
+                                ));
+                            } else {
+                                for line in &lines {
+                                    streaming_text.push_str(&format!("│ {}\n", line));
+                                }
+                            }
+                        }
+                        streaming_text.push_str("└─\n");
+                        let _ = chat::write_streaming(dir, coordinator_id, &streaming_text);
+
+                        parts.push(ResponsePart::ToolResult(output.content.clone()));
+                        tool_results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output.content,
+                            is_error: output.is_error,
+                        });
+                    }
+
+                    // Add tool results to conversation
+                    conversation.push(Message {
+                        role: Role::User,
+                        content: tool_results,
+                    });
+                    // Continue loop for next API call
+                }
+                Some(StopReason::MaxTokens) => {
+                    // Truncated — ask for continuation
+                    conversation.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "Your response was truncated. Please continue.".to_string(),
+                        }],
+                    });
+                    // Continue loop
+                }
+            }
+        }
+
+        if errored {
+            last_interaction = chrono::Utc::now().to_rfc3339();
+            continue;
+        }
+
+        // Build the collected response
+        let collected = build_collected_response(
+            &parts,
+            has_tool_calls,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_creation,
+        );
+
+        let response_info = match collected {
+            Some(resp) if !resp.summary.is_empty() => {
+                let len = resp.summary.len();
+                let summary_clone = resp.summary.clone();
+                logger.info(&format!(
+                    "Native coordinator: got response ({} chars{}) for request_id={}",
+                    len,
+                    if resp.full_text.is_some() {
+                        ", with tool calls"
+                    } else {
+                        ""
+                    },
+                    request.request_id
+                ));
+                if let Err(e) = chat::append_outbox_full_for(
+                    dir,
+                    coordinator_id,
+                    &resp.summary,
+                    resp.full_text,
+                    &request.request_id,
+                ) {
+                    logger.error(&format!(
+                        "Native coordinator: failed to write outbox: {}",
+                        e
+                    ));
+                }
+                Some((len, summary_clone))
+            }
+            Some(_) => {
+                logger.warn("Native coordinator: empty response from API");
+                let _ = chat::append_outbox_for(
+                    dir,
+                    coordinator_id,
+                    "The coordinator processed your message but produced no response text.",
+                    &request.request_id,
+                );
+                None
+            }
+            None => {
+                logger.warn("Native coordinator: no response from API");
+                let _ = chat::append_outbox_for(
+                    dir,
+                    coordinator_id,
+                    "The coordinator agent received no response from the API.",
+                    &request.request_id,
+                );
+                None
+            }
+        };
+
+        // Clear streaming file
+        chat::clear_streaming(dir, coordinator_id);
+
+        // Accumulate token usage for compaction gating
+        let total = total_cache_creation
+            .saturating_add(total_input_tokens)
+            .saturating_add(total_output_tokens);
+        if total > 0 {
+            let mut cs = super::CoordinatorState::load_or_default(dir);
+            cs.accumulated_tokens = cs.accumulated_tokens.saturating_add(total);
+            cs.save(dir);
+            logger.info(&format!(
+                "Native coordinator: turn used {} tokens (input={}, output={}, cache_creation={}), accumulated={}",
+                total, total_input_tokens, total_output_tokens, total_cache_creation, cs.accumulated_tokens
+            ));
+        }
+
+        // Record turn and run evaluation
+        if let Some((resp_len, ref resp_summary)) = response_info {
+            turn_count += 1;
+            record_coordinator_turn(
+                dir,
+                coordinator_id,
+                &request.message,
+                resp_len,
+                turn_start,
+            );
+
+            let eval_config = workgraph::config::Config::load_or_default(dir);
+            if should_evaluate_turn(turn_count, &eval_config.coordinator.eval_frequency) {
+                let eval_dir = dir.to_path_buf();
+                let eval_msg = request.message.clone();
+                let eval_resp = resp_summary.clone();
+                let eval_turn = turn_count;
+                std::thread::Builder::new()
+                    .name("coordinator-eval".to_string())
+                    .spawn(move || {
+                        evaluate_coordinator_turn(
+                            &eval_dir, eval_turn, &eval_msg, &eval_resp,
+                        );
+                    })
+                    .ok();
+            }
+        }
+
+        last_interaction = chrono::Utc::now().to_rfc3339();
+
+        // Trim conversation history to prevent unbounded growth.
+        // Keep the last 100 messages to maintain context while bounding memory.
+        if conversation.len() > 100 {
+            let drain_count = conversation.len() - 100;
+            conversation.drain(..drain_count);
+        }
     }
 }
 
