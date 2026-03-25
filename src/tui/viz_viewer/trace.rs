@@ -215,6 +215,7 @@ pub fn capture_state_context(app: &super::state::VizApp) -> StateContext {
             RightPanelTab::Files => "files",
             RightPanelTab::CoordLog => "coord_log",
             RightPanelTab::Firehose => "firehose",
+            RightPanelTab::Output => "output",
         })
     } else {
         None

@@ -1573,6 +1573,9 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         RightPanelTab::Firehose => {
             draw_firehose_tab(frame, app, content_area);
         }
+        RightPanelTab::Output => {
+            draw_output_tab(frame, app, content_area);
+        }
     }
 }
 
@@ -3185,6 +3188,300 @@ fn draw_firehose_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 /// Draw the Messages tab content (panel 3) — message queue for selected task.
 /// Uses chat-app style: incoming messages left-aligned, outgoing right-aligned,
 /// with a stats header showing sent/received/reply status.
+/// Draw the Output tab (panel 9) — live per-agent model output with markdown rendering.
+fn draw_output_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let width = area.width as usize;
+    if width < 4 || area.height < 3 {
+        return;
+    }
+
+    let agent_ids = app.output_pane_agent_ids();
+
+    // Empty state: no agents.
+    if agent_ids.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Agent Output",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "No agents are currently running.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Start the service: wg service start",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    // Agent tab bar (1 line at top).
+    let tab_bar_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let content_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+
+    // Draw agent tab bar.
+    {
+        // Color palette for agent dots — same Knuth hash as coordinator tabs.
+        const DOT_COLORS: &[Color] = &[
+            Color::Cyan,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Red,
+            Color::LightCyan,
+            Color::LightGreen,
+        ];
+        fn dot_color_from_id(agent_id: &str) -> Color {
+            // Simple hash from agent ID string.
+            let hash: u32 = agent_id.bytes().fold(0u32, |acc, b| {
+                acc.wrapping_mul(31).wrapping_add(b as u32)
+            });
+            DOT_COLORS[hash as usize % DOT_COLORS.len()]
+        }
+
+        let active_agent_id = app.output_pane.active_agent_id.clone();
+        let max_width = tab_bar_area.width as usize;
+        let mut spans: Vec<Span> = Vec::new();
+        let mut col: usize = 1;
+        let mut overflow = false;
+
+        spans.push(Span::raw(" "));
+
+        for (i, agent_id) in agent_ids.iter().enumerate() {
+            let is_active = active_agent_id.as_ref() == Some(agent_id);
+            let is_finished = app
+                .output_pane
+                .agent_texts
+                .get(agent_id)
+                .map(|t| t.finished)
+                .unwrap_or(false);
+            let color = dot_color_from_id(agent_id);
+
+            // Find task_id for this agent.
+            let task_label = app
+                .agent_monitor
+                .agents
+                .iter()
+                .find(|a| a.agent_id == *agent_id)
+                .and_then(|a| a.task_id.as_deref())
+                .unwrap_or("?");
+            let short_task = if task_label.len() > 20 {
+                format!("{}…", &task_label[..task_label.floor_char_boundary(19)])
+            } else {
+                task_label.to_string()
+            };
+
+            // Short agent suffix.
+            let short_agent = if agent_id.len() > 12 {
+                &agent_id[agent_id.len().saturating_sub(8)..]
+            } else {
+                agent_id.as_str()
+            };
+
+            let label = format!("{short_task} ({short_agent})");
+            // Tab width: dot(1) + space(1) + label + space(1)
+            let tab_content_width = 1 + 1 + label.len() + 1;
+            let sep_w: usize = if i > 0 { 1 } else { 0 };
+            let total_tab_width = sep_w + tab_content_width;
+
+            // Check if this tab fits.
+            let remaining = agent_ids.len() - i - 1;
+            let suffix_width = if remaining > 0 { 2 } else { 0 }; // "… "
+            if col + total_tab_width + suffix_width > max_width && remaining > 0 {
+                overflow = true;
+                break;
+            }
+
+            // Separator.
+            if i > 0 {
+                spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                col += sep_w;
+            }
+
+            // Dot.
+            if is_finished {
+                spans.push(Span::styled(" ○", Style::default().fg(Color::DarkGray)));
+            } else if is_active {
+                spans.push(Span::styled(
+                    " ◉",
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
+            }
+            col += 2;
+
+            // Label.
+            let label_style = if is_finished {
+                Style::default().fg(Color::DarkGray)
+            } else if is_active {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(format!(" {label}"), label_style));
+            col += 1 + label.len();
+
+            // Trailing space.
+            spans.push(Span::raw(" "));
+            col += 1;
+        }
+
+        if overflow {
+            spans.push(Span::styled("… ", Style::default().fg(Color::DarkGray)));
+        }
+
+        let tab_line = Line::from(spans);
+        frame.render_widget(Paragraph::new(vec![tab_line]), tab_bar_area);
+    }
+
+    // Render active agent's output.
+    let active_agent_id = match app.output_pane.active_agent_id.clone() {
+        Some(id) => id,
+        None => return,
+    };
+
+    let viewport_h = content_area.height as usize;
+    if viewport_h == 0 {
+        return;
+    }
+    app.output_pane.viewport_height = viewport_h;
+
+    // Get or create the text entry.
+    let text_entry = app
+        .output_pane
+        .agent_texts
+        .entry(active_agent_id.clone())
+        .or_default();
+
+    // Re-render markdown if dirty.
+    if text_entry.dirty || text_entry.rendered_lines.is_empty() {
+        if !text_entry.full_text.is_empty() {
+            text_entry.rendered_lines =
+                markdown_to_lines(&text_entry.full_text, width.saturating_sub(1));
+
+            // Add finish status line if agent is done.
+            if text_entry.finished {
+                let status = text_entry
+                    .finish_status
+                    .as_deref()
+                    .unwrap_or("unknown");
+                let (status_text, status_color) = match status {
+                    "done" => (
+                        format!("── agent finished (done) ──"),
+                        Color::Green,
+                    ),
+                    "failed" => (
+                        format!("── agent finished (failed) ──"),
+                        Color::Red,
+                    ),
+                    _ => (
+                        format!("── agent finished ({status}) ──"),
+                        Color::DarkGray,
+                    ),
+                };
+                text_entry.rendered_lines.push(Line::from(""));
+                text_entry.rendered_lines.push(Line::from(Span::styled(
+                    status_text,
+                    Style::default().fg(status_color),
+                )));
+            }
+        } else {
+            text_entry.rendered_lines = vec![Line::from(Span::styled(
+                "Waiting for output...",
+                Style::default().fg(Color::DarkGray),
+            ))];
+        }
+        text_entry.dirty = false;
+    }
+
+    let total_lines = text_entry.rendered_lines.len();
+    app.output_pane.total_rendered_lines = total_lines;
+
+    // Compute scroll position.
+    let max_scroll = total_lines.saturating_sub(viewport_h);
+    let scroll = {
+        let scroll_state = app
+            .output_pane
+            .agent_scrolls
+            .entry(active_agent_id.clone())
+            .or_default();
+
+        // Auto-follow: pin to bottom.
+        if scroll_state.auto_follow {
+            scroll_state.scroll = max_scroll;
+        }
+
+        // Clamp scroll.
+        let scroll = scroll_state.scroll.min(max_scroll);
+        scroll_state.scroll = scroll;
+        scroll
+    };
+
+    let text_entry = app
+        .output_pane
+        .agent_texts
+        .get(&active_agent_id)
+        .unwrap();
+    let end = (scroll + viewport_h).min(total_lines);
+    let visible: Vec<Line> = text_entry.rendered_lines[scroll..end].to_vec();
+
+    let paragraph = Paragraph::new(visible);
+    frame.render_widget(paragraph, content_area);
+
+    // Scrollbar.
+    if total_lines > viewport_h && app.panel_scrollbar_visible() {
+        draw_panel_scrollbar(frame, app, content_area, max_scroll, scroll);
+    }
+
+    // New content indicator when auto_follow is off.
+    let auto_follow = app
+        .output_pane
+        .agent_scrolls
+        .get(&active_agent_id)
+        .map(|s| s.auto_follow)
+        .unwrap_or(true);
+    if app.output_pane.has_new_content && !auto_follow {
+        let indicator = "▼ new output";
+        let indicator_len = indicator.len() as u16;
+        if content_area.width > indicator_len + 2 {
+            let ind_area = Rect {
+                x: content_area.x + content_area.width - indicator_len - 1,
+                y: content_area.y + content_area.height.saturating_sub(1),
+                width: indicator_len + 1,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    indicator,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                ind_area,
+            );
+        }
+    }
+}
+
 fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let width = area.width as usize;
     if width < 4 || area.height < 3 {
@@ -4907,6 +5204,7 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                     RightPanelTab::Files => "6:Files",
                     RightPanelTab::CoordLog => "7:Coord",
                     RightPanelTab::Firehose => "8:Fire",
+                    RightPanelTab::Output => "9:Out",
                 };
                 let mut hints: Vec<(&str, &str)> = Vec::new();
                 match tab {
@@ -4926,6 +5224,12 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                     | RightPanelTab::CoordLog
                     | RightPanelTab::Agency
                     | RightPanelTab::Firehose => {
+                        hints.push(("↑↓", "scroll"));
+                        hints.push(("PgUp/Dn", "page"));
+                        hints.push(("Home/End", "jump"));
+                    }
+                    RightPanelTab::Output => {
+                        hints.push(("←→", "agents"));
                         hints.push(("↑↓", "scroll"));
                         hints.push(("PgUp/Dn", "page"));
                         hints.push(("Home/End", "jump"));

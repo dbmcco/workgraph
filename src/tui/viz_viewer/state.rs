@@ -420,6 +420,7 @@ pub enum RightPanelTab {
     Files,    // 6
     CoordLog, // 7
     Firehose, // 8
+    Output,   // 9
 }
 
 impl RightPanelTab {
@@ -434,6 +435,7 @@ impl RightPanelTab {
             Self::Files => "Files",
             Self::CoordLog => "Coord",
             Self::Firehose => "Fire",
+            Self::Output => "Out",
         }
     }
 
@@ -448,6 +450,7 @@ impl RightPanelTab {
             Self::Files => 6,
             Self::CoordLog => 7,
             Self::Firehose => 8,
+            Self::Output => 9,
         }
     }
 
@@ -462,6 +465,7 @@ impl RightPanelTab {
             6 => Some(Self::Files),
             7 => Some(Self::CoordLog),
             8 => Some(Self::Firehose),
+            9 => Some(Self::Output),
             _ => None,
         }
     }
@@ -474,7 +478,7 @@ impl RightPanelTab {
         Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len()).unwrap()
     }
 
-    pub const ALL: [RightPanelTab; 9] = [
+    pub const ALL: [RightPanelTab; 10] = [
         Self::Chat,
         Self::Detail,
         Self::Log,
@@ -484,6 +488,7 @@ impl RightPanelTab {
         Self::Files,
         Self::CoordLog,
         Self::Firehose,
+        Self::Output,
     ];
 }
 
@@ -1558,6 +1563,84 @@ impl Default for FirehoseState {
     }
 }
 
+/// Per-agent scroll state for the Output pane.
+pub struct OutputAgentScroll {
+    /// Scroll offset (lines from top, 0 = top).
+    pub scroll: usize,
+    /// Whether auto-follow is active (pin to bottom).
+    pub auto_follow: bool,
+}
+
+impl Default for OutputAgentScroll {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            auto_follow: true,
+        }
+    }
+}
+
+/// Per-agent accumulated text buffer for the Output pane.
+pub struct OutputAgentText {
+    /// Accumulated extracted markdown text from output.log.
+    pub full_text: String,
+    /// Cached rendered lines from markdown_to_lines().
+    pub rendered_lines: Vec<ratatui::text::Line<'static>>,
+    /// Whether rendered_lines need to be regenerated.
+    pub dirty: bool,
+    /// Byte offset for incremental reads from output.log.
+    pub file_offset: u64,
+    /// Whether the agent has finished.
+    pub finished: bool,
+    /// Finish status (e.g. "done", "failed").
+    pub finish_status: Option<String>,
+}
+
+impl Default for OutputAgentText {
+    fn default() -> Self {
+        Self {
+            full_text: String::new(),
+            rendered_lines: Vec::new(),
+            dirty: false,
+            file_offset: 0,
+            finished: false,
+            finish_status: None,
+        }
+    }
+}
+
+/// Maximum characters kept in the Output pane per agent.
+const OUTPUT_MAX_CHARS: usize = 50_000;
+
+/// State for the Output pane (tab 9).
+pub struct OutputPaneState {
+    /// Currently selected agent ID.
+    pub active_agent_id: Option<String>,
+    /// Per-agent scroll states.
+    pub agent_scrolls: HashMap<String, OutputAgentScroll>,
+    /// Per-agent text buffers.
+    pub agent_texts: HashMap<String, OutputAgentText>,
+    /// Viewport height (set each frame by renderer).
+    pub viewport_height: usize,
+    /// Total rendered lines for the active agent (set each frame by renderer).
+    pub total_rendered_lines: usize,
+    /// Whether new content has arrived while auto_follow is off (for "new output" indicator).
+    pub has_new_content: bool,
+}
+
+impl Default for OutputPaneState {
+    fn default() -> Self {
+        Self {
+            active_agent_id: None,
+            agent_scrolls: HashMap::new(),
+            agent_texts: HashMap::new(),
+            viewport_height: 0,
+            total_rendered_lines: 0,
+            has_new_content: false,
+        }
+    }
+}
+
 /// Direction of a message relative to the task's assigned agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageDirection {
@@ -2125,6 +2208,9 @@ pub struct VizApp {
     // ── Firehose state (panel 8) ──
     pub firehose: FirehoseState,
 
+    // ── Output pane state (panel 9) ──
+    pub output_pane: OutputPaneState,
+
     // ── Agency lifecycle for selected task ──
     pub agency_lifecycle: Option<AgencyLifecycle>,
 
@@ -2411,6 +2497,7 @@ impl VizApp {
             last_service_badge_area: Rect::default(),
             time_counters: TimeCounters::new(&config.tui.counters),
             firehose: FirehoseState::default(),
+            output_pane: OutputPaneState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -3830,6 +3917,9 @@ impl VizApp {
                     if self.right_panel_tab == RightPanelTab::Firehose {
                         self.update_firehose();
                     }
+                    if self.right_panel_tab == RightPanelTab::Output {
+                        self.update_output_pane();
+                    }
                     self.invalidate_hud();
                     self.load_hud_detail();
                     if prev_hud_task.is_some()
@@ -3923,6 +4013,12 @@ impl VizApp {
             // Firehose: update if tab is active.
             if self.right_panel_tab == RightPanelTab::Firehose {
                 self.update_firehose();
+                content_updated = true;
+            }
+
+            // Output pane: update if tab is active.
+            if self.right_panel_tab == RightPanelTab::Output {
+                self.update_output_pane();
                 content_updated = true;
             }
 
@@ -4042,6 +4138,10 @@ impl VizApp {
                 // Update firehose with new agent output if Firehose tab is active.
                 if self.right_panel_tab == RightPanelTab::Firehose {
                     self.update_firehose();
+                }
+                // Update output pane with new agent output if Output tab is active.
+                if self.right_panel_tab == RightPanelTab::Output {
+                    self.update_output_pane();
                 }
                 // Preserve HUD scroll position when the selected task hasn't changed.
                 self.invalidate_hud();
@@ -5728,6 +5828,7 @@ impl VizApp {
             last_service_badge_area: Rect::default(),
             time_counters: TimeCounters::new("uptime,cumulative,active"),
             firehose: FirehoseState::default(),
+            output_pane: OutputPaneState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -6473,6 +6574,155 @@ impl VizApp {
                 }
             }
         }
+    }
+
+    /// Update the Output pane by reading agent output.log files and extracting assistant text.
+    /// Called when the Output tab is active. Reads incrementally from each agent's output.log
+    /// and accumulates extracted markdown text.
+    pub fn update_output_pane(&mut self) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let agents_dir = self.workgraph_dir.join("agents");
+
+        // Collect visible agents: Working + recently completed (Done/Failed).
+        let visible_agents: Vec<(String, Option<String>, AgentStatus)> = self
+            .agent_monitor
+            .agents
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    AgentStatus::Working | AgentStatus::Done | AgentStatus::Failed
+                )
+            })
+            .map(|a| (a.agent_id.clone(), a.task_id.clone(), a.status.clone()))
+            .collect();
+
+        let visible_ids: HashSet<String> = visible_agents.iter().map(|(id, _, _)| id.clone()).collect();
+
+        // Remove agents that are no longer visible (Dead agents with no recent activity).
+        self.output_pane
+            .agent_texts
+            .retain(|id, _| visible_ids.contains(id));
+        self.output_pane
+            .agent_scrolls
+            .retain(|id, _| visible_ids.contains(id));
+
+        // If the active agent is gone, auto-select the first Working agent.
+        if let Some(ref active_id) = self.output_pane.active_agent_id {
+            if !visible_ids.contains(active_id) {
+                self.output_pane.active_agent_id = None;
+            }
+        }
+        if self.output_pane.active_agent_id.is_none() {
+            self.output_pane.active_agent_id = visible_agents
+                .iter()
+                .find(|(_, _, s)| matches!(s, AgentStatus::Working))
+                .map(|(id, _, _)| id.clone())
+                .or_else(|| visible_agents.first().map(|(id, _, _)| id.clone()));
+        }
+
+        for (agent_id, _task_id, status) in &visible_agents {
+            let log_path = agents_dir.join(agent_id).join("output.log");
+            if !log_path.exists() {
+                continue;
+            }
+
+            let text_entry = self
+                .output_pane
+                .agent_texts
+                .entry(agent_id.clone())
+                .or_default();
+
+            // Mark finished agents.
+            if !text_entry.finished
+                && matches!(status, AgentStatus::Done | AgentStatus::Failed)
+            {
+                text_entry.finished = true;
+                text_entry.finish_status = Some(match status {
+                    AgentStatus::Done => "done".to_string(),
+                    AgentStatus::Failed => "failed".to_string(),
+                    _ => "unknown".to_string(),
+                });
+                text_entry.dirty = true;
+            }
+
+            // Open file and seek to last known position.
+            let mut file = match std::fs::File::open(&log_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len <= text_entry.file_offset {
+                continue; // No new data.
+            }
+
+            if file.seek(SeekFrom::Start(text_entry.file_offset)).is_err() {
+                continue;
+            }
+
+            let mut new_data = String::new();
+            if file.read_to_string(&mut new_data).is_err() {
+                continue;
+            }
+
+            text_entry.file_offset = file_len;
+
+            // Extract assistant text from the new JSONL lines.
+            let new_text = extract_assistant_text_from_log(&new_data);
+            if !new_text.is_empty() {
+                if !text_entry.full_text.is_empty() {
+                    text_entry.full_text.push_str("\n\n");
+                }
+                text_entry.full_text.push_str(&new_text);
+
+                // Cap at OUTPUT_MAX_CHARS.
+                if text_entry.full_text.len() > OUTPUT_MAX_CHARS {
+                    let trim_to = text_entry.full_text.len() - OUTPUT_MAX_CHARS;
+                    // Find a clean boundary (newline) to trim at.
+                    let boundary = text_entry.full_text[trim_to..]
+                        .find('\n')
+                        .map(|p| trim_to + p + 1)
+                        .unwrap_or(trim_to);
+                    text_entry.full_text = text_entry.full_text[boundary..].to_string();
+                }
+
+                text_entry.dirty = true;
+
+                // Signal new content for the indicator.
+                if let Some(ref active_id) = self.output_pane.active_agent_id {
+                    if active_id == agent_id {
+                        let scroll = self
+                            .output_pane
+                            .agent_scrolls
+                            .get(agent_id)
+                            .map(|s| !s.auto_follow)
+                            .unwrap_or(false);
+                        if scroll {
+                            self.output_pane.has_new_content = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the list of agent IDs visible in the Output pane tab bar, ordered by
+    /// Working first, then recently completed (Done/Failed).
+    pub fn output_pane_agent_ids(&self) -> Vec<String> {
+        let mut working: Vec<&AgentMonitorEntry> = Vec::new();
+        let mut completed: Vec<&AgentMonitorEntry> = Vec::new();
+        for a in &self.agent_monitor.agents {
+            match a.status {
+                AgentStatus::Working => working.push(a),
+                AgentStatus::Done | AgentStatus::Failed => completed.push(a),
+                _ => {}
+            }
+        }
+        let mut ids: Vec<String> = working.iter().map(|a| a.agent_id.clone()).collect();
+        ids.extend(completed.iter().map(|a| a.agent_id.clone()));
+        ids
     }
 
     /// Update the firehose view by reading new lines from all active agents' output.log files.
@@ -10872,7 +11122,7 @@ mod remap_panel_tests {
         let mut app = build_test_app();
         app.right_panel_visible = true;
         app.layout_mode = LayoutMode::TwoThirdsInspector;
-        app.right_panel_tab = RightPanelTab::Firehose; // last tab
+        app.right_panel_tab = RightPanelTab::Output; // last tab
 
         app.cycle_inspector_view_forward();
 
@@ -10891,7 +11141,7 @@ mod remap_panel_tests {
         app.cycle_inspector_view_backward();
 
         assert!(app.right_panel_visible);
-        assert_eq!(app.right_panel_tab, RightPanelTab::Firehose);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Output);
         assert!(app.slide_animation.is_some());
     }
 
@@ -10916,7 +11166,7 @@ mod remap_panel_tests {
         app.right_panel_visible = false;
         app.layout_mode = LayoutMode::Off;
 
-        // 9 tabs + 1 close = 10 presses
+        // 10 tabs + 1 close = 11 presses
         let expected_tabs = [
             Some(RightPanelTab::Chat),
             Some(RightPanelTab::Detail),
@@ -10927,6 +11177,7 @@ mod remap_panel_tests {
             Some(RightPanelTab::Files),
             Some(RightPanelTab::CoordLog),
             Some(RightPanelTab::Firehose),
+            Some(RightPanelTab::Output),
             None, // closed
         ];
 
@@ -11152,8 +11403,9 @@ mod firehose_tests {
         assert_eq!(RightPanelTab::Firehose.label(), "Fire");
         assert_eq!(RightPanelTab::from_index(8), Some(RightPanelTab::Firehose));
         assert_eq!(RightPanelTab::CoordLog.next(), RightPanelTab::Firehose);
-        assert_eq!(RightPanelTab::Firehose.next(), RightPanelTab::Chat);
-        assert_eq!(RightPanelTab::Chat.prev(), RightPanelTab::Firehose);
+        assert_eq!(RightPanelTab::Firehose.next(), RightPanelTab::Output);
+        assert_eq!(RightPanelTab::Output.next(), RightPanelTab::Chat);
+        assert_eq!(RightPanelTab::Chat.prev(), RightPanelTab::Output);
     }
 
     #[test]

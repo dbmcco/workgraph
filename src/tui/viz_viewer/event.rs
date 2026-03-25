@@ -1467,7 +1467,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.cycle_inspector_view_forward();
         }
 
-        // Left/Right: on Chat tab, cycle coordinators; otherwise cycle tabs
+        // Left/Right: on Chat tab, cycle coordinators; on Output tab, cycle agents; otherwise cycle tabs
         KeyCode::Left => {
             if app.right_panel_tab == RightPanelTab::Chat {
                 let ids = app.list_coordinator_ids();
@@ -1478,6 +1478,17 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                         .unwrap_or(0);
                     let prev = if pos == 0 { ids.len() - 1 } else { pos - 1 };
                     app.switch_coordinator(ids[prev]);
+                }
+            } else if app.right_panel_tab == RightPanelTab::Output {
+                let ids = app.output_pane_agent_ids();
+                if ids.len() > 1 {
+                    let pos = ids
+                        .iter()
+                        .position(|id| Some(id) == app.output_pane.active_agent_id.as_ref())
+                        .unwrap_or(0);
+                    let prev = if pos == 0 { ids.len() - 1 } else { pos - 1 };
+                    app.output_pane.active_agent_id = Some(ids[prev].clone());
+                    app.output_pane.has_new_content = false;
                 }
             } else {
                 app.right_panel_tab = app.right_panel_tab.prev();
@@ -1493,6 +1504,17 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                         .unwrap_or(0);
                     let next = (pos + 1) % ids.len();
                     app.switch_coordinator(ids[next]);
+                }
+            } else if app.right_panel_tab == RightPanelTab::Output {
+                let ids = app.output_pane_agent_ids();
+                if ids.len() > 1 {
+                    let pos = ids
+                        .iter()
+                        .position(|id| Some(id) == app.output_pane.active_agent_id.as_ref())
+                        .unwrap_or(0);
+                    let next = (pos + 1) % ids.len();
+                    app.output_pane.active_agent_id = Some(ids[next].clone());
+                    app.output_pane.has_new_content = false;
                 }
             } else {
                 app.right_panel_tab = app.right_panel_tab.next();
@@ -1630,6 +1652,32 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                 app.switch_coordinator(ids[next]);
             }
         }
+        // Output tab: '[' switches to previous agent
+        KeyCode::Char('[') if app.right_panel_tab == RightPanelTab::Output => {
+            let ids = app.output_pane_agent_ids();
+            if ids.len() > 1 {
+                let pos = ids
+                    .iter()
+                    .position(|id| Some(id) == app.output_pane.active_agent_id.as_ref())
+                    .unwrap_or(0);
+                let prev = if pos == 0 { ids.len() - 1 } else { pos - 1 };
+                app.output_pane.active_agent_id = Some(ids[prev].clone());
+                app.output_pane.has_new_content = false;
+            }
+        }
+        // Output tab: ']' switches to next agent
+        KeyCode::Char(']') if app.right_panel_tab == RightPanelTab::Output => {
+            let ids = app.output_pane_agent_ids();
+            if ids.len() > 1 {
+                let pos = ids
+                    .iter()
+                    .position(|id| Some(id) == app.output_pane.active_agent_id.as_ref())
+                    .unwrap_or(0);
+                let next = (pos + 1) % ids.len();
+                app.output_pane.active_agent_id = Some(ids[next].clone());
+                app.output_pane.has_new_content = false;
+            }
+        }
         // Chat tab: '+' creates a new coordinator session
         KeyCode::Char('+') if app.right_panel_tab == RightPanelTab::Chat => {
             super::state::editor_clear(&mut app.text_prompt.editor);
@@ -1708,6 +1756,20 @@ fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
             app.firehose.auto_tail = false;
             app.firehose.scroll = app.firehose.scroll.saturating_sub(amount);
         }
+        RightPanelTab::Output => {
+            if let Some(ref agent_id) = app.output_pane.active_agent_id.clone() {
+                let scroll_state = app
+                    .output_pane
+                    .agent_scrolls
+                    .entry(agent_id.clone())
+                    .or_default();
+                scroll_state.scroll = scroll_state.scroll.saturating_sub(amount);
+                if scroll_state.scroll == 0 {
+                    // At top — auto_follow definitely off
+                }
+                scroll_state.auto_follow = false;
+            }
+        }
     }
 }
 
@@ -1756,6 +1818,25 @@ fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
                 app.firehose.auto_tail = true;
             }
         }
+        RightPanelTab::Output => {
+            if let Some(ref agent_id) = app.output_pane.active_agent_id.clone() {
+                let scroll_state = app
+                    .output_pane
+                    .agent_scrolls
+                    .entry(agent_id.clone())
+                    .or_default();
+                scroll_state.scroll += amount;
+                let max = app
+                    .output_pane
+                    .total_rendered_lines
+                    .saturating_sub(app.output_pane.viewport_height);
+                if scroll_state.scroll >= max {
+                    scroll_state.scroll = max;
+                    scroll_state.auto_follow = true;
+                    app.output_pane.has_new_content = false;
+                }
+            }
+        }
     }
 }
 
@@ -1793,6 +1874,17 @@ fn right_panel_scroll_to_top(app: &mut VizApp) {
             app.firehose.auto_tail = false;
             app.firehose.scroll = 0;
         }
+        RightPanelTab::Output => {
+            if let Some(ref agent_id) = app.output_pane.active_agent_id.clone() {
+                let scroll_state = app
+                    .output_pane
+                    .agent_scrolls
+                    .entry(agent_id.clone())
+                    .or_default();
+                scroll_state.scroll = 0;
+                scroll_state.auto_follow = false;
+            }
+        }
     }
 }
 
@@ -1828,6 +1920,18 @@ fn right_panel_scroll_to_bottom(app: &mut VizApp) {
         RightPanelTab::Firehose => {
             app.firehose.auto_tail = true;
             app.firehose.scroll = usize::MAX;
+        }
+        RightPanelTab::Output => {
+            if let Some(ref agent_id) = app.output_pane.active_agent_id.clone() {
+                let scroll_state = app
+                    .output_pane
+                    .agent_scrolls
+                    .entry(agent_id.clone())
+                    .or_default();
+                scroll_state.scroll = usize::MAX;
+                scroll_state.auto_follow = true;
+                app.output_pane.has_new_content = false;
+            }
         }
     }
 }
@@ -2695,6 +2799,27 @@ fn vscrollbar_jump_panel(app: &mut VizApp, row: u16) {
             let new_scroll = jump(max_scroll);
             app.firehose.scroll = new_scroll;
             app.firehose.auto_tail = new_scroll >= max_scroll;
+        }
+        RightPanelTab::Output => {
+            let total = app.output_pane.total_rendered_lines;
+            let viewport = app.output_pane.viewport_height;
+            let max_scroll = total.saturating_sub(viewport);
+            if max_scroll == 0 {
+                return;
+            }
+            if let Some(ref agent_id) = app.output_pane.active_agent_id.clone() {
+                let scroll_state = app
+                    .output_pane
+                    .agent_scrolls
+                    .entry(agent_id.clone())
+                    .or_default();
+                let new_scroll = jump(max_scroll);
+                scroll_state.scroll = new_scroll;
+                scroll_state.auto_follow = new_scroll >= max_scroll;
+                if scroll_state.auto_follow {
+                    app.output_pane.has_new_content = false;
+                }
+            }
         }
         _ => {}
     }
