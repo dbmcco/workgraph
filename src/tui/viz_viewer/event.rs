@@ -2761,6 +2761,13 @@ fn vscrollbar_jump_panel(app: &mut VizApp, row: u16) {
                 return;
             }
             app.log_pane.scroll = jump(max_scroll);
+            // Update auto-tail based on whether the user dragged to the bottom.
+            if app.log_pane.scroll >= max_scroll {
+                app.log_pane.auto_tail = true;
+                app.log_pane.has_new_content = false;
+            } else {
+                app.log_pane.auto_tail = false;
+            }
         }
         RightPanelTab::Messages => {
             let total = app.messages_panel.total_wrapped_lines;

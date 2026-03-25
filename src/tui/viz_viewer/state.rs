@@ -3032,6 +3032,12 @@ impl VizApp {
         // Invalidate HUD, lifecycle, and log pane so they reload for the new selection.
         self.invalidate_hud();
         self.invalidate_agency_lifecycle();
+        // Reset log auto-tail when the selected task actually changes, so the new
+        // task's log opens pinned to the bottom (same as terminal emulators).
+        if self.log_pane.task_id.as_deref() != Some(&selected_id) {
+            self.log_pane.auto_tail = true;
+            self.log_pane.has_new_content = false;
+        }
         self.invalidate_log_pane();
         // Only invalidate the messages panel when the selected task actually changed.
         // Unconditional invalidation caused the editor to be re-created on every
@@ -5475,9 +5481,10 @@ impl VizApp {
             .total_wrapped_lines
             .saturating_sub(self.log_pane.viewport_height);
         self.log_pane.scroll = (self.log_pane.scroll + amount).min(max_scroll);
-        // If we reached the bottom, resume auto-tail.
+        // If we reached the bottom, resume auto-tail and clear "new output" indicator.
         if self.log_pane.scroll >= max_scroll {
             self.log_pane.auto_tail = true;
+            self.log_pane.has_new_content = false;
         }
     }
 
@@ -5495,6 +5502,7 @@ impl VizApp {
             .saturating_sub(self.log_pane.viewport_height);
         self.log_pane.scroll = max_scroll;
         self.log_pane.auto_tail = true;
+        self.log_pane.has_new_content = false;
     }
 
     /// Toggle log pane JSON mode.
