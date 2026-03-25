@@ -1566,6 +1566,106 @@ pub fn format_duration_compact(secs: u64) -> String {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// HUD Vitals bar
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// State for the always-visible vitals strip at the bottom of the TUI.
+pub struct VitalsState {
+    /// Number of agents currently alive.
+    pub agents_alive: usize,
+    /// Task status counts for the vitals bar.
+    pub open: usize,
+    pub running: usize,
+    pub done: usize,
+    /// Time of the last operations.jsonl modification (for "last event X ago").
+    pub last_event_time: Option<SystemTime>,
+    /// Coordinator last tick time (parsed from coordinator-state).
+    pub coord_last_tick: Option<SystemTime>,
+    /// Whether the service daemon is running.
+    pub daemon_running: bool,
+}
+
+impl Default for VitalsState {
+    fn default() -> Self {
+        Self {
+            agents_alive: 0,
+            open: 0,
+            running: 0,
+            done: 0,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: false,
+        }
+    }
+}
+
+/// Format a vitals bar string from the current state.
+/// Returns a compact one-line string like:
+/// `● 2 agents | 8 open · 3 running · 45 done | last event 4s ago | coord ● 3s`
+pub fn format_vitals(vitals: &VitalsState) -> String {
+    let mut parts = Vec::new();
+
+    // Agent count
+    let dot = if vitals.agents_alive > 0 { "●" } else { "○" };
+    parts.push(format!("{} {} agents", dot, vitals.agents_alive));
+
+    // Task counts
+    parts.push(format!(
+        "{} open · {} running · {} done",
+        vitals.open, vitals.running, vitals.done
+    ));
+
+    // Last event
+    let event_str = match vitals.last_event_time {
+        Some(t) => match t.elapsed() {
+            Ok(d) => format!("last event {} ago", format_duration_compact(d.as_secs())),
+            Err(_) => "last event just now".to_string(),
+        },
+        None => "no events".to_string(),
+    };
+    parts.push(event_str);
+
+    // Coordinator heartbeat
+    if vitals.daemon_running {
+        let coord_str = match vitals.coord_last_tick {
+            Some(t) => match t.elapsed() {
+                Ok(d) => format!("coord ● {}", format_duration_compact(d.as_secs())),
+                Err(_) => "coord ● 0s".to_string(),
+            },
+            None => "coord ● –".to_string(),
+        };
+        parts.push(coord_str);
+    } else {
+        parts.push("coord ○ down".to_string());
+    }
+
+    parts.join(" | ")
+}
+
+/// Classify the staleness of a duration for color coding.
+/// Returns: Green (<30s), Yellow (30s-5m), Red (>5m).
+pub fn vitals_staleness_color(secs: u64) -> VitalsStaleness {
+    if secs < 30 {
+        VitalsStaleness::Fresh
+    } else if secs < 300 {
+        VitalsStaleness::Stale
+    } else {
+        VitalsStaleness::Dead
+    }
+}
+
+/// Staleness level for vitals color coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VitalsStaleness {
+    /// <30s — green
+    Fresh,
+    /// 30s–5m — yellow
+    Stale,
+    /// >5m — red
+    Dead,
+}
+
 /// The lightning bolt character for the wave animation (downwards zigzag arrow — reliably 1-cell wide).
 pub const WAVE_BOLT: &str = "↯";
 
@@ -2764,6 +2864,9 @@ pub struct VizApp {
     /// Hit-test area for the service health badge (set each frame by renderer).
     pub last_service_badge_area: Rect,
 
+    // ── HUD vitals bar ──
+    pub vitals: VitalsState,
+
     // Time counters
     pub time_counters: TimeCounters,
 
@@ -3070,6 +3173,7 @@ impl VizApp {
             agent_streams: HashMap::new(),
             service_health: ServiceHealthState::default(),
             last_service_badge_area: Rect::default(),
+            vitals: VitalsState::default(),
             time_counters: TimeCounters::new(&config.tui.counters),
             firehose: FirehoseState::default(),
             output_pane: OutputPaneState::default(),
@@ -3144,6 +3248,7 @@ impl VizApp {
         app.load_agent_monitor();
         app.check_coordinator_status();
         app.update_service_health();
+        app.update_vitals();
         app.update_time_counters();
         app.load_chat_history();
         app
@@ -4678,6 +4783,7 @@ impl VizApp {
         // Poll service health every ~2 seconds for responsive agent count updates.
         if self.service_health.last_poll.elapsed() >= std::time::Duration::from_secs(2) {
             self.update_service_health();
+            self.update_vitals();
         }
 
         // Auto-refresh config panel when config.toml changes on disk,
@@ -6562,6 +6668,7 @@ impl VizApp {
             agent_streams: HashMap::new(),
             service_health: ServiceHealthState::default(),
             last_service_badge_area: Rect::default(),
+            vitals: VitalsState::default(),
             time_counters: TimeCounters::new("uptime,cumulative,active"),
             firehose: FirehoseState::default(),
             output_pane: OutputPaneState::default(),
@@ -8091,6 +8198,34 @@ impl VizApp {
         };
 
         self.service_health.last_poll = Instant::now();
+    }
+
+    /// Update the HUD vitals bar state from existing app state and cheap syscalls.
+    pub fn update_vitals(&mut self) {
+        // Agent count: reuse service_health (already refreshed)
+        self.vitals.agents_alive = self.service_health.agents_alive;
+        self.vitals.daemon_running =
+            self.service_health.level != ServiceHealthLevel::Red;
+
+        // Task counts: reuse already-computed task_counts
+        self.vitals.open = self.task_counts.open;
+        self.vitals.running = self.task_counts.in_progress;
+        self.vitals.done = self.task_counts.done;
+
+        // Last event time: operations.jsonl mtime (cheap stat syscall)
+        let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
+        self.vitals.last_event_time = std::fs::metadata(&ops_path)
+            .and_then(|m| m.modified())
+            .ok();
+
+        // Coordinator last tick: parse from coordinator-state
+        use crate::commands::service::CoordinatorState;
+        let coord = CoordinatorState::load_or_default_for(&self.workgraph_dir, 0);
+        self.vitals.coord_last_tick = coord.last_tick.as_ref().and_then(|ts| {
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .ok()
+                .map(|dt| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64))
+        });
     }
 
     pub fn update_time_counters(&mut self) {
@@ -14244,5 +14379,123 @@ mod nav_stack_tests {
             NavEntry::AgentDetail { agent_id: "b".into() }
         );
         assert_ne!(NavEntry::Dashboard, NavEntry::TaskDetail { task_id: "t".into() });
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests for HUD vitals bar formatting
+// ══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod vitals_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn vitals_staleness_fresh() {
+        assert_eq!(vitals_staleness_color(0), VitalsStaleness::Fresh);
+        assert_eq!(vitals_staleness_color(15), VitalsStaleness::Fresh);
+        assert_eq!(vitals_staleness_color(29), VitalsStaleness::Fresh);
+    }
+
+    #[test]
+    fn vitals_staleness_stale() {
+        assert_eq!(vitals_staleness_color(30), VitalsStaleness::Stale);
+        assert_eq!(vitals_staleness_color(120), VitalsStaleness::Stale);
+        assert_eq!(vitals_staleness_color(299), VitalsStaleness::Stale);
+    }
+
+    #[test]
+    fn vitals_staleness_dead() {
+        assert_eq!(vitals_staleness_color(300), VitalsStaleness::Dead);
+        assert_eq!(vitals_staleness_color(3600), VitalsStaleness::Dead);
+    }
+
+    #[test]
+    fn format_vitals_zero_agents() {
+        let v = VitalsState {
+            agents_alive: 0,
+            open: 5,
+            running: 0,
+            done: 10,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: false,
+        };
+        let s = format_vitals(&v);
+        assert!(s.contains("○ 0 agents"), "got: {}", s);
+        assert!(s.contains("5 open"), "got: {}", s);
+        assert!(s.contains("0 running"), "got: {}", s);
+        assert!(s.contains("10 done"), "got: {}", s);
+        assert!(s.contains("no events"), "got: {}", s);
+        assert!(s.contains("coord ○ down"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_vitals_with_agents() {
+        let now = SystemTime::now();
+        let v = VitalsState {
+            agents_alive: 3,
+            open: 8,
+            running: 3,
+            done: 45,
+            last_event_time: Some(now - Duration::from_secs(4)),
+            coord_last_tick: Some(now - Duration::from_secs(2)),
+            daemon_running: true,
+        };
+        let s = format_vitals(&v);
+        assert!(s.contains("● 3 agents"), "got: {}", s);
+        assert!(s.contains("8 open"), "got: {}", s);
+        assert!(s.contains("3 running"), "got: {}", s);
+        assert!(s.contains("45 done"), "got: {}", s);
+        assert!(s.contains("last event"), "got: {}", s);
+        assert!(s.contains("coord ●"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_vitals_single_agent() {
+        let v = VitalsState {
+            agents_alive: 1,
+            open: 2,
+            running: 1,
+            done: 0,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: true,
+        };
+        let s = format_vitals(&v);
+        assert!(s.contains("● 1 agents"), "got: {}", s);
+        assert!(s.contains("coord ● –"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_vitals_daemon_down() {
+        let v = VitalsState {
+            agents_alive: 0,
+            open: 0,
+            running: 0,
+            done: 0,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: false,
+        };
+        let s = format_vitals(&v);
+        assert!(s.contains("coord ○ down"), "got: {}", s);
+    }
+
+    #[test]
+    fn format_vitals_old_event() {
+        let now = SystemTime::now();
+        let v = VitalsState {
+            agents_alive: 0,
+            open: 0,
+            running: 0,
+            done: 100,
+            last_event_time: Some(now - Duration::from_secs(600)),
+            coord_last_tick: None,
+            daemon_running: false,
+        };
+        let s = format_vitals(&v);
+        // 600s = 10m
+        assert!(s.contains("last event 10m ago"), "got: {}", s);
     }
 }

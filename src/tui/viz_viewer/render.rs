@@ -10,8 +10,9 @@ use super::state::{
     ActivityEventKind, ChoiceDialogState, ConfigEditKind, ConfigSection, ConfirmAction,
     ControlPanelFocus, CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus, FocusedPanel,
     InputMode, LayoutMode, ResponsiveBreakpoint, RightPanelTab, ServiceHealthLevel,
-    SinglePanelView, SortMode, TaskFormField, TaskFormState, TextPromptAction, VizApp, WAVE_BOLT,
-    WAVE_NUM_BOLTS, extract_section_name, format_duration_compact, spinner_wave_pos,
+    SinglePanelView, SortMode, TaskFormField, TaskFormState, TextPromptAction, VitalsStaleness,
+    VizApp, WAVE_BOLT, WAVE_NUM_BOLTS, extract_section_name, format_duration_compact,
+    spinner_wave_pos, vitals_staleness_color,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -87,19 +88,21 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
     let area = frame.area();
 
-    // Layout: top status bar + middle area + bottom action hints.
+    // Layout: top status bar + middle area + vitals bar + bottom action hints.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // top status bar
             Constraint::Min(1),    // main content area
+            Constraint::Length(1), // vitals bar
             Constraint::Length(1), // bottom action hints
         ])
         .split(area);
 
     let status_area = chunks[0];
     let main_area = chunks[1];
-    let hints_area = chunks[2];
+    let vitals_area = chunks[2];
+    let hints_area = chunks[3];
 
     // Lazily load panel content if needed.
     if app.hud_detail.is_none() && app.selected_task_idx.is_some() {
@@ -495,6 +498,9 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
     // Service health badge — right-aligned pill on the status bar.
     draw_service_health_badge(frame, app, status_area);
+
+    // Vitals bar
+    draw_vitals_bar(frame, app, vitals_area);
 
     // Bottom action hints
     draw_action_hints(frame, app, hints_area);
@@ -6407,6 +6413,105 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     );
 }
 
+/// Render the HUD vitals bar: always-visible strip showing system health at a glance.
+///
+/// ```text
+/// | ● 2 agents | 8 open · 3 running · 45 done | last event 4s ago | coord ● 3s |
+/// ```
+fn draw_vitals_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let v = &app.vitals;
+
+    let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
+    let separator = " | ";
+
+    let mut spans: Vec<Span> = Vec::with_capacity(16);
+
+    // Agent count with dot indicator
+    let (dot, dot_color) = if v.agents_alive > 0 {
+        ("●", Color::Green)
+    } else {
+        ("○", Color::DarkGray)
+    };
+    spans.push(Span::styled(
+        format!(" {} {} agents", dot, v.agents_alive),
+        Style::default().fg(dot_color),
+    ));
+
+    // Task status counts
+    spans.push(Span::styled(separator, sep_style));
+    spans.push(Span::styled(
+        format!("{} open", v.open),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("{} running", v.running),
+        Style::default().fg(Color::Green),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("{} done", v.done),
+        Style::default().fg(Color::Cyan),
+    ));
+
+    // Time since last event with color coding
+    spans.push(Span::styled(separator, sep_style));
+    let (event_text, event_color) = match v.last_event_time {
+        Some(t) => match t.elapsed() {
+            Ok(d) => {
+                let secs = d.as_secs();
+                let color = match vitals_staleness_color(secs) {
+                    VitalsStaleness::Fresh => Color::Green,
+                    VitalsStaleness::Stale => Color::Yellow,
+                    VitalsStaleness::Dead => Color::Red,
+                };
+                (
+                    format!("last event {} ago", format_duration_compact(secs)),
+                    color,
+                )
+            }
+            Err(_) => ("last event just now".to_string(), Color::Green),
+        },
+        None => ("no events".to_string(), Color::DarkGray),
+    };
+    spans.push(Span::styled(event_text, Style::default().fg(event_color)));
+
+    // Coordinator heartbeat
+    spans.push(Span::styled(separator, sep_style));
+    if v.daemon_running {
+        let (coord_text, coord_color) = match v.coord_last_tick {
+            Some(t) => match t.elapsed() {
+                Ok(d) => {
+                    let secs = d.as_secs();
+                    let color = match vitals_staleness_color(secs) {
+                        VitalsStaleness::Fresh => Color::Green,
+                        VitalsStaleness::Stale => Color::Yellow,
+                        VitalsStaleness::Dead => Color::Red,
+                    };
+                    (
+                        format!("coord ● {}", format_duration_compact(secs)),
+                        color,
+                    )
+                }
+                Err(_) => ("coord ● 0s".to_string(), Color::Green),
+            },
+            None => ("coord ● –".to_string(), Color::DarkGray),
+        };
+        spans.push(Span::styled(coord_text, Style::default().fg(coord_color)));
+    } else {
+        spans.push(Span::styled(
+            "coord ○ down",
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    spans.push(Span::styled(" ", Style::default()));
+
+    let bar = Paragraph::new(Line::from(spans))
+        .style(Style::default().bg(Color::Rgb(25, 25, 25)));
+    frame.render_widget(bar, area);
+}
+
 /// Render the service health badge at the right end of the status bar.
 fn draw_service_health_badge(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let health = &app.service_health;
@@ -11528,8 +11633,8 @@ mod tests {
         assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
         // Graph area should have width == 40 (full terminal width).
         assert_eq!(app.last_graph_area.width, 40);
-        // Graph area height should be main_area height (total - 2 for status/hints bars).
-        assert_eq!(app.last_graph_area.height, 23);
+        // Graph area height should be main_area height (total - 3 for status/vitals/hints bars).
+        assert_eq!(app.last_graph_area.height, 22);
         // Right panel area should be empty (not shown).
         assert_eq!(app.last_right_panel_area, Rect::default());
     }
@@ -11810,5 +11915,109 @@ mod tests {
             assert_eq!(view.next().prev(), view, "next then prev should return to original");
             assert_eq!(view.prev().next(), view, "prev then next should return to original");
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Tests for HUD vitals bar rendering
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Render the vitals bar into a test buffer and return the text content.
+    fn render_vitals_to_string(vitals: &super::super::state::VitalsState, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use super::super::state::VitalsState;
+
+        let (viz, _) = build_test_graph_chain_plus_isolated();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.vitals = VitalsState {
+            agents_alive: vitals.agents_alive,
+            open: vitals.open,
+            running: vitals.running,
+            done: vitals.done,
+            last_event_time: vitals.last_event_time,
+            coord_last_tick: vitals.coord_last_tick,
+            daemon_running: vitals.daemon_running,
+        };
+
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, 1);
+                draw_vitals_bar(frame, &app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for x in 0..width {
+            let cell = buf.cell((x, 0)).unwrap();
+            text.push_str(cell.symbol());
+        }
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_zero_agents() {
+        use super::super::state::VitalsState;
+
+        let v = VitalsState {
+            agents_alive: 0,
+            open: 5,
+            running: 0,
+            done: 10,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: false,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(text.contains("0 agents"), "should show agent count, got: {}", text);
+        assert!(text.contains("5 open"), "should show open count, got: {}", text);
+        assert!(text.contains("0 running"), "should show running count, got: {}", text);
+        assert!(text.contains("10 done"), "should show done count, got: {}", text);
+        assert!(text.contains("no events"), "should show no events, got: {}", text);
+        assert!(text.contains("coord"), "should show coord status, got: {}", text);
+        assert!(text.contains("down"), "should show down, got: {}", text);
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_with_agents() {
+        use super::super::state::VitalsState;
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let v = VitalsState {
+            agents_alive: 2,
+            open: 8,
+            running: 3,
+            done: 45,
+            last_event_time: Some(now - Duration::from_secs(4)),
+            coord_last_tick: Some(now - Duration::from_secs(2)),
+            daemon_running: true,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(text.contains("2 agents"), "should show agent count, got: {}", text);
+        assert!(text.contains("8 open"), "should show open count, got: {}", text);
+        assert!(text.contains("3 running"), "should show running count, got: {}", text);
+        assert!(text.contains("45 done"), "should show done count, got: {}", text);
+        assert!(text.contains("last event"), "should show last event, got: {}", text);
+        assert!(text.contains("coord"), "should show coord status, got: {}", text);
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_single_agent() {
+        use super::super::state::VitalsState;
+
+        let v = VitalsState {
+            agents_alive: 1,
+            open: 0,
+            running: 1,
+            done: 0,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: true,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(text.contains("1 agents"), "should show 1 agent, got: {}", text);
     }
 }
