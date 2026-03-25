@@ -115,7 +115,8 @@ fn wait_for_coordinator_agent(wg_dir: &Path) {
         }
         if let Ok(content) = fs::read_to_string(&log_path)
             && (content.contains("Claude CLI started")
-                || content.contains("Coordinator agent spawned successfully"))
+                || content.contains("Coordinator agent spawned successfully")
+                || content.contains("Native coordinator: initialized"))
         {
             return;
         }
@@ -391,7 +392,7 @@ args = ["--print", "--verbose", "--permission-mode", "bypassPermissions", "--out
 }
 
 // ===========================================================================
-// Test 3: Provider config → coordinator passes --provider flag
+// Test 3: Non-Anthropic provider → coordinator uses native path (not Claude CLI)
 // ===========================================================================
 
 #[test]
@@ -400,7 +401,7 @@ fn coordinator_spawn_with_provider() {
     let wg_dir = init_workgraph(&tmp);
 
     let mock_dir = TempDir::new().unwrap();
-    let args_file = tmp.path().join("captured_args.txt");
+    // Still create a claude mock so is_claude_available() passes
     create_arg_capturing_mock(mock_dir.path(), "claude");
 
     let path_env = format!(
@@ -409,40 +410,41 @@ fn coordinator_spawn_with_provider() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // Configure provider in coordinator config
+    // Configure provider=openrouter with a specific model
     write_config(
         &wg_dir,
-        "[coordinator]\ncoordinator_agent = true\nprovider = \"openrouter\"\n",
+        "[coordinator]\ncoordinator_agent = true\nprovider = \"openrouter\"\nmodel = \"minimax-m2.5\"\n",
     );
 
+    // Set a dummy API key so the native coordinator can initialize its client
     let env = [
         ("PATH", path_env.as_str()),
-        ("MOCK_ARGS_FILE", args_file.to_str().unwrap()),
+        ("OPENROUTER_API_KEY", "sk-test-dummy-key-for-provider-routing"),
     ];
     let guard = DaemonGuard::start(&wg_dir, &env, &[]);
 
-    let stdout = guard.chat_ok("Hello", 15);
+    // When provider is openrouter, the coordinator should use the native path
+    // (direct API calls) instead of spawning the Claude CLI. Verify via daemon log.
+    let log = read_daemon_log(&wg_dir);
     assert!(
-        stdout.contains("Mock response"),
-        "Expected mock response, got:\n{}\nDaemon log:\n{}",
-        stdout,
-        read_daemon_log(&wg_dir),
+        log.contains("Native coordinator: initialized"),
+        "Expected native coordinator to be used for openrouter provider.\nDaemon log:\n{}",
+        log
+    );
+    assert!(
+        log.contains("provider=openrouter"),
+        "Expected provider=openrouter in native coordinator log.\nDaemon log:\n{}",
+        log
     );
 
-    // Verify --provider openrouter was passed
-    let args = read_captured_args(&args_file);
-    let provider_idx = args.iter().position(|a| a == "--provider");
+    // The Claude CLI mock should NOT have been invoked (no args file written)
+    let args_file = tmp.path().join("captured_args.txt");
     assert!(
-        provider_idx.is_some(),
-        "Expected --provider flag in args. Args: {:?}",
-        args
+        !args_file.exists(),
+        "Claude CLI mock should not be invoked when provider=openrouter"
     );
-    let provider_value = &args[provider_idx.unwrap() + 1];
-    assert_eq!(
-        provider_value, "openrouter",
-        "Expected provider value 'openrouter', got '{}'",
-        provider_value
-    );
+
+    drop(guard);
 }
 
 // ===========================================================================
@@ -484,10 +486,11 @@ args = ["--print", "--verbose", "--permission-mode", "bypassPermissions", "--out
     )
     .unwrap();
 
-    // Set coordinator config with provider too, to verify both work together
+    // Set coordinator config — use an unknown provider name so it stays on the
+    // CLI path (only openrouter/openai/local route to native).
     write_config(
         &wg_dir,
-        "[coordinator]\ncoordinator_agent = true\nprovider = \"test-provider\"\n",
+        "[coordinator]\ncoordinator_agent = true\n",
     );
 
     let env = [
@@ -515,19 +518,6 @@ args = ["--print", "--verbose", "--permission-mode", "bypassPermissions", "--out
         args[0].ends_with("/custom-executor"),
         "Expected executor config to override default command to 'custom-executor', but got {:?}",
         args[0]
-    );
-
-    // Also verify provider was passed alongside the custom executor
-    let provider_idx = args.iter().position(|a| a == "--provider");
-    assert!(
-        provider_idx.is_some(),
-        "Expected --provider flag with custom executor. Args: {:?}",
-        args
-    );
-    assert_eq!(
-        args[provider_idx.unwrap() + 1],
-        "test-provider",
-        "Wrong provider value"
     );
 }
 

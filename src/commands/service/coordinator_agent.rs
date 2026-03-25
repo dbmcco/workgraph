@@ -430,8 +430,27 @@ fn agent_thread_main(
     logger: &DaemonLogger,
     event_log: &SharedEventLog,
 ) {
-    if executor == "native" {
-        native_coordinator_loop(dir, coordinator_id, model, rx, alive, pid, logger, event_log);
+    // Use the native coordinator loop when the executor is "native" OR when the
+    // provider is non-Anthropic (openrouter, openai, local). The Claude CLI only
+    // understands Anthropic models, so non-Anthropic providers must go through the
+    // native path which makes direct API calls via OpenAI-compatible endpoints.
+    let use_native = executor == "native"
+        || matches!(
+            provider,
+            Some("openrouter") | Some("openai") | Some("local")
+        );
+    if use_native {
+        native_coordinator_loop(
+            dir,
+            coordinator_id,
+            model,
+            provider,
+            rx,
+            alive,
+            pid,
+            logger,
+            event_log,
+        );
         return;
     }
     // Track restart timestamps for time-windowed rate limiting.
@@ -1406,6 +1425,7 @@ fn native_coordinator_loop(
     dir: &Path,
     coordinator_id: u32,
     model: Option<&str>,
+    provider: Option<&str>,
     rx: mpsc::Receiver<ChatRequest>,
     alive: Arc<Mutex<bool>>,
     pid: Arc<Mutex<u32>>,
@@ -1427,11 +1447,30 @@ fn native_coordinator_loop(
     let _ = std::fs::create_dir_all(prompt_file.parent().unwrap());
     let _ = std::fs::write(&prompt_file, &system_prompt);
 
-    // Resolve model
-    let effective_model = model
+    // Resolve model: coordinator config > WG_MODEL env > default
+    let raw_model = model
         .map(String::from)
         .or_else(|| std::env::var("WG_MODEL").ok())
         .unwrap_or_else(|| "claude-sonnet-4-5-20250514".to_string());
+
+    // Resolve model alias through the model registry. This converts aliases
+    // like "minimax-m2.5" → "minimax/minimax-m2.5" (the actual API model ID)
+    // and also extracts provider/endpoint from the registry entry.
+    let config = workgraph::config::Config::load_or_default(dir);
+    let merged_config = workgraph::config::Config::load_merged(dir).unwrap_or_else(|_| config);
+    let (effective_model, registry_provider, registry_endpoint) =
+        if let Some(entry) = merged_config.registry_lookup(&raw_model) {
+            (entry.model.clone(), Some(entry.provider.clone()), entry.endpoint.clone())
+        } else {
+            (raw_model.clone(), None, None)
+        };
+
+    // Provider resolution: explicit override > registry entry > default
+    let effective_provider = provider
+        .map(String::from)
+        .or(registry_provider)
+        .or_else(|| merged_config.coordinator.provider.clone());
+    let effective_endpoint = registry_endpoint;
 
     // Create the tokio runtime for async API calls
     let rt = match tokio::runtime::Runtime::new() {
@@ -1445,8 +1484,15 @@ fn native_coordinator_loop(
         }
     };
 
-    // Create the LLM provider
-    let client = match create_provider_ext(dir, &effective_model, None, None, None) {
+    // Create the LLM provider, passing through the resolved provider and endpoint
+    // so that non-Anthropic providers (openrouter, openai, local) route correctly.
+    let client = match create_provider_ext(
+        dir,
+        &effective_model,
+        effective_provider.as_deref(),
+        effective_endpoint.as_deref(),
+        None,
+    ) {
         Ok(c) => c,
         Err(e) => {
             logger.error(&format!(
@@ -1477,8 +1523,10 @@ fn native_coordinator_loop(
     register_bash_tool(&mut registry, working_dir);
 
     logger.info(&format!(
-        "Native coordinator: initialized with model='{}', supports_tools={}",
-        effective_model, supports_tools
+        "Native coordinator: initialized with model='{}', provider={}, supports_tools={}",
+        effective_model,
+        effective_provider.as_deref().unwrap_or("default"),
+        supports_tools
     ));
 
     // Mark as alive (no child PID for native — use thread ID as pseudo-PID)
