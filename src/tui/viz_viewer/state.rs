@@ -7964,9 +7964,10 @@ impl VizApp {
         entries.push(ConfigEntry {
             key: "coordinator.executor".into(),
             label: "Executor".into(),
-            value: config.coordinator.executor.clone(),
+            value: config.coordinator.effective_executor(),
             edit_kind: ConfigEditKind::Choice(vec![
                 "claude".into(),
+                "native".into(),
                 "amplifier".into(),
                 "opencode".into(),
                 "codex".into(),
@@ -8663,7 +8664,7 @@ impl VizApp {
                     config.coordinator.poll_interval = v;
                 }
             }
-            "coordinator.executor" => config.coordinator.executor = new_value,
+            "coordinator.executor" => config.coordinator.executor = Some(new_value),
             "coordinator.model" => config.coordinator.model = Some(new_value),
             "coordinator.agent_timeout" => config.coordinator.agent_timeout = new_value,
             "coordinator.settling_delay_ms" => {

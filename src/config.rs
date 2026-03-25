@@ -4343,4 +4343,80 @@ model = "haiku"
         assert!(display.contains("ERROR:"));
         assert!(display.contains("Fix:"));
     }
+
+    // --- effective_executor tests ---
+
+    #[test]
+    fn test_effective_executor_default_no_provider() {
+        let config = Config::default();
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
+    #[test]
+    fn test_effective_executor_openrouter_auto_detects_native() {
+        let mut config = Config::default();
+        config.coordinator.provider = Some("openrouter".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_openai_auto_detects_native() {
+        let mut config = Config::default();
+        config.coordinator.provider = Some("openai".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_local_auto_detects_native() {
+        let mut config = Config::default();
+        config.coordinator.provider = Some("local".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_explicit_claude_overrides_openrouter() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("claude".to_string());
+        config.coordinator.provider = Some("openrouter".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
+    #[test]
+    fn test_effective_executor_explicit_native_preserved() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_anthropic_provider_stays_claude() {
+        let mut config = Config::default();
+        config.coordinator.provider = Some("anthropic".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
+    #[test]
+    fn test_effective_executor_roundtrip_toml_no_executor() {
+        // Config with provider but no executor should auto-detect after round-trip
+        let toml_str = r#"
+[coordinator]
+provider = "openrouter"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.coordinator.executor.is_none());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_roundtrip_toml_explicit_executor() {
+        // Config with explicit executor should preserve it after round-trip
+        let toml_str = r#"
+[coordinator]
+executor = "claude"
+provider = "openrouter"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.coordinator.executor, Some("claude".to_string()));
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
 }

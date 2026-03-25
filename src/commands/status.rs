@@ -240,7 +240,7 @@ fn gather_coordinator_info(dir: &Path) -> CoordinatorInfo {
     let config = workgraph::config::Config::load_or_default(dir);
     CoordinatorInfo {
         max_agents: config.coordinator.max_agents,
-        executor: config.coordinator.executor,
+        executor: config.coordinator.effective_executor(),
         model: config.coordinator.model,
         poll_interval: config.coordinator.poll_interval,
     }

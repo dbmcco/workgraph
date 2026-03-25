@@ -634,7 +634,7 @@ fn handle_reconfigure(
         match Config::load(dir) {
             Ok(config) => {
                 daemon_cfg.max_agents = config.coordinator.max_agents;
-                daemon_cfg.executor = config.coordinator.executor;
+                daemon_cfg.executor = config.coordinator.effective_executor();
                 daemon_cfg.poll_interval = Duration::from_secs(config.coordinator.poll_interval);
                 daemon_cfg.model = config.coordinator.model;
                 daemon_cfg.provider = config.coordinator.provider;

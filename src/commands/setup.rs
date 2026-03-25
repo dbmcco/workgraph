@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use dialoguer::{Confirm, Input, Select};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use workgraph::config::Config;
+use workgraph::config::{Config, ModelRegistryEntry};
 use workgraph::models::ModelRegistry;
 
 /// Marker used to detect whether workgraph directives are already present in CLAUDE.md.
@@ -49,25 +49,79 @@ Everything gets dispatched through `wg add` and `wg service start`.
 /// Choices gathered from the interactive wizard.
 #[derive(Debug, Clone)]
 pub struct SetupChoices {
+    pub provider: String,
     pub executor: String,
     pub model: String,
     pub agency_enabled: bool,
     pub evaluator_model: Option<String>,
     pub assigner_model: Option<String>,
     pub max_agents: usize,
+    /// Endpoint config for non-Anthropic providers
+    pub endpoint: Option<EndpointChoices>,
+    /// Model registry entries to add
+    pub model_registry_entries: Vec<ModelRegistryEntry>,
+}
+
+/// Endpoint configuration gathered from the wizard.
+#[derive(Debug, Clone)]
+pub struct EndpointChoices {
+    pub name: String,
+    pub provider: String,
+    pub url: String,
+    pub api_key_env: Option<String>,
+    pub api_key_file: Option<String>,
 }
 
 /// Build a Config from wizard choices, optionally layered on top of an existing config.
 pub fn build_config(choices: &SetupChoices, base: Option<&Config>) -> Config {
+    use workgraph::config::{EndpointConfig, EndpointsConfig, RoleModelConfig};
+
     let mut config = base.cloned().unwrap_or_default();
 
-    config.coordinator.executor = choices.executor.clone();
+    config.coordinator.executor = Some(choices.executor.clone());
     config.agent.executor = choices.executor.clone();
 
     config.agent.model = choices.model.clone();
     config.coordinator.model = Some(choices.model.clone());
 
     config.coordinator.max_agents = choices.max_agents;
+
+    // Set coordinator provider for non-Anthropic providers
+    if choices.provider != "anthropic" {
+        config.coordinator.provider = Some(choices.provider.clone());
+    }
+
+    // Set models.default with provider
+    if choices.provider != "anthropic" {
+        config.models.default = Some(RoleModelConfig {
+            provider: Some(choices.provider.clone()),
+            model: Some(choices.model.clone()),
+            tier: None,
+            endpoint: None,
+        });
+    }
+
+    // Configure endpoint
+    if let Some(ref ep) = choices.endpoint {
+        let endpoint = EndpointConfig {
+            name: ep.name.clone(),
+            provider: ep.provider.clone(),
+            url: Some(ep.url.clone()),
+            model: None,
+            api_key: None,
+            api_key_file: ep.api_key_file.clone(),
+            api_key_env: ep.api_key_env.clone(),
+            is_default: true,
+        };
+        config.llm_endpoints = EndpointsConfig {
+            endpoints: vec![endpoint],
+        };
+    }
+
+    // Add model registry entries
+    if !choices.model_registry_entries.is_empty() {
+        config.model_registry = choices.model_registry_entries.clone();
+    }
 
     config.agency.auto_assign = choices.agency_enabled;
     config.agency.auto_evaluate = choices.agency_enabled;
@@ -89,10 +143,42 @@ pub fn format_summary(choices: &SetupChoices) -> String {
     lines.push(format!("  executor = \"{}\"", choices.executor));
     lines.push(format!("  model = \"{}\"", choices.model));
     lines.push(format!("  max_agents = {}", choices.max_agents));
+    if choices.provider != "anthropic" {
+        lines.push(format!("  provider = \"{}\"", choices.provider));
+    }
     lines.push(String::new());
     lines.push("[agent]".to_string());
     lines.push(format!("  executor = \"{}\"", choices.executor));
     lines.push(format!("  model = \"{}\"", choices.model));
+    if choices.provider != "anthropic" {
+        lines.push(String::new());
+        lines.push("[models.default]".to_string());
+        lines.push(format!("  provider = \"{}\"", choices.provider));
+        lines.push(format!("  model = \"{}\"", choices.model));
+    }
+    if let Some(ref ep) = choices.endpoint {
+        lines.push(String::new());
+        lines.push("[[llm_endpoints.endpoints]]".to_string());
+        lines.push(format!("  name = \"{}\"", ep.name));
+        lines.push(format!("  provider = \"{}\"", ep.provider));
+        lines.push(format!("  url = \"{}\"", ep.url));
+        if let Some(ref env) = ep.api_key_env {
+            lines.push(format!("  api_key_env = \"{}\"", env));
+        }
+        if let Some(ref file) = ep.api_key_file {
+            lines.push(format!("  api_key_file = \"{}\"", file));
+        }
+        lines.push("  is_default = true".to_string());
+    }
+    if !choices.model_registry_entries.is_empty() {
+        for entry in &choices.model_registry_entries {
+            lines.push(String::new());
+            lines.push("[[model_registry]]".to_string());
+            lines.push(format!("  id = \"{}\"", entry.id));
+            lines.push(format!("  provider = \"{}\"", entry.provider));
+            lines.push(format!("  model = \"{}\"", entry.model));
+        }
+    }
     lines.push(String::new());
     lines.push("[agency]".to_string());
     lines.push(format!("  auto_assign = {}", choices.agency_enabled));
@@ -196,72 +282,89 @@ pub fn run() -> Result<()> {
     );
     println!();
 
-    // 1. Executor
-    let executor_options = &["claude", "amplifier", "custom"];
-    let current_executor_idx = executor_options
+    // 1. Provider selection (primary decision point)
+    let provider_options = &[
+        "Anthropic (direct)",
+        "OpenRouter",
+        "OpenAI",
+        "Local (Ollama/vLLM)",
+        "Custom",
+    ];
+    let provider_keys = &["anthropic", "openrouter", "openai", "local", "custom"];
+
+    let current_provider = existing
+        .coordinator
+        .provider
+        .as_deref()
+        .unwrap_or("anthropic");
+    let current_provider_idx = provider_keys
         .iter()
-        .position(|&e| e == existing.coordinator.executor)
+        .position(|&p| p == current_provider)
         .unwrap_or(0);
 
-    let executor_idx = Select::new()
-        .with_prompt("Which executor backend?")
-        .items(executor_options)
-        .default(current_executor_idx)
+    let provider_idx = Select::new()
+        .with_prompt("Which LLM provider?")
+        .items(provider_options)
+        .default(current_provider_idx)
         .interact()?;
 
-    let executor = if executor_idx == 2 {
-        // Custom executor
-        let custom: String = Input::new()
-            .with_prompt("Custom executor name")
-            .default(existing.coordinator.executor.clone())
-            .interact_text()?;
-        custom
-    } else {
-        executor_options[executor_idx].to_string()
+    let provider = provider_keys[provider_idx].to_string();
+
+    // 2. Auto-set executor based on provider, with override option
+    let default_executor = match provider.as_str() {
+        "anthropic" => "claude",
+        "openrouter" | "openai" | "local" => "native",
+        _ => "native",
     };
 
-    // 2. Default model (from model registry)
-    let registry = ModelRegistry::with_defaults();
-    let model_options = registry.model_choices_with_descriptions();
-    let model_labels: Vec<String> = model_options
-        .iter()
-        .map(|(name, desc)| format!("{} — {}", name, desc))
-        .collect();
+    println!();
+    println!("  Executor auto-set to '{}' for {} provider.", default_executor, provider);
 
-    let current_model = existing
-        .coordinator
-        .model
-        .as_deref()
-        .unwrap_or(&existing.agent.model);
-    let current_model_idx = model_options
-        .iter()
-        .position(|(name, _)| name == current_model)
-        .unwrap_or(0);
-
-    let model_idx = Select::new()
-        .with_prompt("Default model for agents?")
-        .items(&model_labels)
-        .default(current_model_idx)
+    let override_executor = Confirm::new()
+        .with_prompt("Override executor?")
+        .default(false)
         .interact()?;
 
-    let model = if model_idx < model_options.len() {
-        model_options[model_idx].0.clone()
+    let executor = if override_executor {
+        let executor_options = &["claude", "native", "amplifier", "custom"];
+        let current_idx = executor_options
+            .iter()
+            .position(|&e| e == default_executor)
+            .unwrap_or(0);
+        let idx = Select::new()
+            .with_prompt("Which executor backend?")
+            .items(executor_options)
+            .default(current_idx)
+            .interact()?;
+        if idx == 3 {
+            let custom: String = Input::new()
+                .with_prompt("Custom executor name")
+                .interact_text()?;
+            custom
+        } else {
+            executor_options[idx].to_string()
+        }
     } else {
-        // Shouldn't happen with Select, but handle gracefully
-        let custom: String = Input::new()
-            .with_prompt("Custom model ID")
-            .interact_text()?;
-        custom
+        default_executor.to_string()
+    };
+
+    // 3. Provider-specific configuration
+    let (endpoint, model_registry_entries, model) = match provider.as_str() {
+        "openrouter" => configure_openrouter(&existing)?,
+        "openai" => configure_openai(&existing)?,
+        "local" => configure_local(&existing)?,
+        "custom" => configure_custom_provider(&existing)?,
+        _ => configure_anthropic(&existing)?,
     };
 
     // 4. Agency
+    println!();
     let agency_enabled = Confirm::new()
         .with_prompt("Enable agency (auto-assign agents to tasks, auto-evaluate completed work)?")
         .default(existing.agency.auto_assign || existing.agency.auto_evaluate)
         .interact()?;
 
     let (evaluator_model, assigner_model) = if agency_enabled {
-        // Evaluator model
         let eval_options = &[
             "haiku (recommended, lightweight)",
             "sonnet",
@@ -280,10 +383,9 @@ pub fn run() -> Result<()> {
         let eval_model = match eval_idx {
             0 => Some("haiku".to_string()),
             1 => Some("sonnet".to_string()),
-            _ => None, // same as default = don't set, falls through to agent.model
+            _ => None,
         };
 
-        // Assigner model
         let assign_options = &["haiku (recommended, cheap)", "sonnet", "same as default"];
         let current_assign_idx = match existing.agency.assigner_model.as_deref() {
             Some("sonnet") => 1,
@@ -313,12 +415,15 @@ pub fn run() -> Result<()> {
         .interact_text()?;
 
     let choices = SetupChoices {
+        provider: provider.clone(),
         executor,
         model,
         agency_enabled,
         evaluator_model,
         assigner_model,
         max_agents,
+        endpoint,
+        model_registry_entries,
     };
 
     // 6. Summary and confirmation
@@ -359,15 +464,349 @@ pub fn run() -> Result<()> {
     println!("Setup complete.");
     println!();
     println!("Summary:");
+    println!("  Provider:  {}", choices.provider);
     println!("  Executor:  {}", choices.executor);
     println!("  Model:     {}", choices.model);
     println!("  Agents:    {} max parallel", choices.max_agents);
+    if choices.endpoint.is_some() {
+        println!("  Endpoint:  configured");
+    }
     println!("  Skill:     {}", skill_status);
     println!("  CLAUDE.md: {}", claude_md_status);
     println!();
     println!("Run `wg init` in a project directory to get started.");
 
     Ok(())
+}
+
+/// Configure OpenRouter provider: API key, model selection, endpoint.
+fn configure_openrouter(
+    existing: &Config,
+) -> Result<(Option<EndpointChoices>, Vec<ModelRegistryEntry>, String)> {
+    println!();
+    println!("OpenRouter configuration");
+    println!("────────────────────────");
+
+    // API key setup
+    let api_key_options = &[
+        "Environment variable (OPENROUTER_API_KEY)",
+        "Key file (e.g., ~/.config/openrouter/key)",
+    ];
+    let key_idx = Select::new()
+        .with_prompt("How should the API key be provided?")
+        .items(api_key_options)
+        .default(0)
+        .interact()?;
+
+    let (api_key_env, api_key_file) = if key_idx == 0 {
+        // Check if the env var is already set
+        if std::env::var("OPENROUTER_API_KEY").is_ok() {
+            println!("  OPENROUTER_API_KEY is set in your environment.");
+        } else {
+            println!("  Set OPENROUTER_API_KEY in your shell profile before running agents.");
+            println!("  Example: export OPENROUTER_API_KEY=sk-or-...");
+        }
+        (Some("OPENROUTER_API_KEY".to_string()), None)
+    } else {
+        let default_path = "~/.config/openrouter/key".to_string();
+        let key_path: String = Input::new()
+            .with_prompt("Path to API key file")
+            .default(default_path)
+            .interact_text()?;
+        println!("  Make sure the key file exists and contains your OpenRouter API key.");
+        (None, Some(key_path))
+    };
+
+    // Model selection
+    println!();
+    let model_method_options = &[
+        "Enter model ID manually",
+        "Use popular defaults (Claude via OpenRouter)",
+    ];
+    let method_idx = Select::new()
+        .with_prompt("How would you like to select models?")
+        .items(model_method_options)
+        .default(1)
+        .interact()?;
+
+    let (model, registry_entries) = if method_idx == 0 {
+        // Manual model entry
+        let current_model = existing
+            .coordinator
+            .model
+            .as_deref()
+            .unwrap_or("anthropic/claude-sonnet-4");
+        let model_id: String = Input::new()
+            .with_prompt("Default model ID (OpenRouter format, e.g., anthropic/claude-sonnet-4)")
+            .default(current_model.to_string())
+            .interact_text()?;
+
+        let entry = ModelRegistryEntry {
+            id: model_id.clone(),
+            provider: "openrouter".to_string(),
+            model: model_id.clone(),
+            tier: workgraph::config::Tier::Standard,
+            ..Default::default()
+        };
+
+        (model_id, vec![entry])
+    } else {
+        // Popular defaults
+        let entries = default_openrouter_registry();
+        let model_labels: Vec<String> = entries
+            .iter()
+            .map(|e| format!("{} — {}", e.id, e.model))
+            .collect();
+
+        let default_idx = entries
+            .iter()
+            .position(|e| e.id == "sonnet")
+            .unwrap_or(0);
+
+        let idx = Select::new()
+            .with_prompt("Default model?")
+            .items(&model_labels)
+            .default(default_idx)
+            .interact()?;
+
+        let model = entries[idx].id.clone();
+        (model, entries)
+    };
+
+    let endpoint = EndpointChoices {
+        name: "openrouter".to_string(),
+        provider: "openrouter".to_string(),
+        url: "https://openrouter.ai/api/v1".to_string(),
+        api_key_env,
+        api_key_file,
+    };
+
+    Ok((Some(endpoint), registry_entries, model))
+}
+
+/// Configure OpenAI provider.
+fn configure_openai(
+    existing: &Config,
+) -> Result<(Option<EndpointChoices>, Vec<ModelRegistryEntry>, String)> {
+    println!();
+    println!("OpenAI configuration");
+    println!("────────────────────");
+
+    let api_key_options = &[
+        "Environment variable (OPENAI_API_KEY)",
+        "Key file",
+    ];
+    let key_idx = Select::new()
+        .with_prompt("How should the API key be provided?")
+        .items(api_key_options)
+        .default(0)
+        .interact()?;
+
+    let (api_key_env, api_key_file) = if key_idx == 0 {
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            println!("  OPENAI_API_KEY is set in your environment.");
+        } else {
+            println!("  Set OPENAI_API_KEY in your shell profile before running agents.");
+        }
+        (Some("OPENAI_API_KEY".to_string()), None)
+    } else {
+        let key_path: String = Input::new()
+            .with_prompt("Path to API key file")
+            .default("~/.config/openai/key".to_string())
+            .interact_text()?;
+        (None, Some(key_path))
+    };
+
+    let current_model = existing
+        .coordinator
+        .model
+        .as_deref()
+        .unwrap_or("gpt-4o");
+    let model_id: String = Input::new()
+        .with_prompt("Default model ID")
+        .default(current_model.to_string())
+        .interact_text()?;
+
+    let entry = ModelRegistryEntry {
+        id: model_id.clone(),
+        provider: "openai".to_string(),
+        model: model_id.clone(),
+        tier: workgraph::config::Tier::Standard,
+        ..Default::default()
+    };
+
+    let endpoint = EndpointChoices {
+        name: "openai".to_string(),
+        provider: "openai".to_string(),
+        url: "https://api.openai.com/v1".to_string(),
+        api_key_env,
+        api_key_file,
+    };
+
+    Ok((Some(endpoint), vec![entry], model_id))
+}
+
+/// Configure local provider (Ollama/vLLM).
+fn configure_local(
+    existing: &Config,
+) -> Result<(Option<EndpointChoices>, Vec<ModelRegistryEntry>, String)> {
+    println!();
+    println!("Local LLM configuration (Ollama/vLLM)");
+    println!("──────────────────────────────────────");
+
+    let url: String = Input::new()
+        .with_prompt("API endpoint URL")
+        .default("http://localhost:11434/v1".to_string())
+        .interact_text()?;
+
+    let current_model = existing
+        .coordinator
+        .model
+        .as_deref()
+        .unwrap_or("llama3");
+    let model_id: String = Input::new()
+        .with_prompt("Default model ID")
+        .default(current_model.to_string())
+        .interact_text()?;
+
+    let entry = ModelRegistryEntry {
+        id: model_id.clone(),
+        provider: "local".to_string(),
+        model: model_id.clone(),
+        tier: workgraph::config::Tier::Standard,
+        ..Default::default()
+    };
+
+    let endpoint = EndpointChoices {
+        name: "local".to_string(),
+        provider: "local".to_string(),
+        url,
+        api_key_env: None,
+        api_key_file: None,
+    };
+
+    Ok((Some(endpoint), vec![entry], model_id))
+}
+
+/// Configure custom provider.
+fn configure_custom_provider(
+    existing: &Config,
+) -> Result<(Option<EndpointChoices>, Vec<ModelRegistryEntry>, String)> {
+    println!();
+    println!("Custom provider configuration");
+    println!("─────────────────────────────");
+
+    let provider_name: String = Input::new()
+        .with_prompt("Provider name")
+        .default("custom".to_string())
+        .interact_text()?;
+
+    let url: String = Input::new()
+        .with_prompt("API endpoint URL")
+        .interact_text()?;
+
+    let api_key_env: String = Input::new()
+        .with_prompt("Environment variable for API key (leave empty for none)")
+        .default(String::new())
+        .interact_text()?;
+
+    let current_model = existing
+        .coordinator
+        .model
+        .as_deref()
+        .unwrap_or("default");
+    let model_id: String = Input::new()
+        .with_prompt("Default model ID")
+        .default(current_model.to_string())
+        .interact_text()?;
+
+    let entry = ModelRegistryEntry {
+        id: model_id.clone(),
+        provider: provider_name.clone(),
+        model: model_id.clone(),
+        tier: workgraph::config::Tier::Standard,
+        ..Default::default()
+    };
+
+    let endpoint = EndpointChoices {
+        name: provider_name.clone(),
+        provider: provider_name,
+        url,
+        api_key_env: if api_key_env.is_empty() {
+            None
+        } else {
+            Some(api_key_env)
+        },
+        api_key_file: None,
+    };
+
+    Ok((Some(endpoint), vec![entry], model_id))
+}
+
+/// Configure Anthropic (direct) provider — uses existing model registry flow.
+fn configure_anthropic(
+    existing: &Config,
+) -> Result<(Option<EndpointChoices>, Vec<ModelRegistryEntry>, String)> {
+    println!();
+    let registry = ModelRegistry::with_defaults();
+    let model_options = registry.model_choices_with_descriptions();
+    let model_labels: Vec<String> = model_options
+        .iter()
+        .map(|(name, desc)| format!("{} — {}", name, desc))
+        .collect();
+
+    let current_model = existing
+        .coordinator
+        .model
+        .as_deref()
+        .unwrap_or(&existing.agent.model);
+    let current_model_idx = model_options
+        .iter()
+        .position(|(name, _)| name == current_model)
+        .unwrap_or(0);
+
+    let model_idx = Select::new()
+        .with_prompt("Default model for agents?")
+        .items(&model_labels)
+        .default(current_model_idx)
+        .interact()?;
+
+    let model = model_options[model_idx].0.clone();
+
+    Ok((None, vec![], model))
+}
+
+/// Default OpenRouter model registry entries for Claude models.
+fn default_openrouter_registry() -> Vec<ModelRegistryEntry> {
+    vec![
+        ModelRegistryEntry {
+            id: "opus".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-opus-4".to_string(),
+            tier: workgraph::config::Tier::Premium,
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            ..Default::default()
+        },
+        ModelRegistryEntry {
+            id: "sonnet".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-sonnet-4".to_string(),
+            tier: workgraph::config::Tier::Standard,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            ..Default::default()
+        },
+        ModelRegistryEntry {
+            id: "haiku".to_string(),
+            provider: "openrouter".to_string(),
+            model: "anthropic/claude-haiku-4".to_string(),
+            tier: workgraph::config::Tier::Fast,
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            ..Default::default()
+        },
+    ]
 }
 
 /// Check if the wg Claude Code skill is installed.
@@ -501,17 +940,19 @@ mod tests {
     #[test]
     fn test_build_config_defaults() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "opus".to_string(),
             agency_enabled: true,
             evaluator_model: Some("sonnet".to_string()),
             assigner_model: Some("haiku".to_string()),
             max_agents: 4,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
-        assert_eq!(config.coordinator.executor, "claude");
+        assert_eq!(config.coordinator.executor, Some("claude".to_string()));
         assert_eq!(config.agent.executor, "claude");
         assert_eq!(config.agent.model, "opus");
         assert_eq!(config.coordinator.model, Some("opus".to_string()));
@@ -525,17 +966,19 @@ mod tests {
     #[test]
     fn test_build_config_amplifier() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "amplifier".to_string(),
-
             model: "sonnet".to_string(),
             agency_enabled: false,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 8,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
-        assert_eq!(config.coordinator.executor, "amplifier");
+        assert_eq!(config.coordinator.executor, Some("amplifier".to_string()));
         assert_eq!(config.agent.executor, "amplifier");
         assert_eq!(config.agent.model, "sonnet");
         assert_eq!(config.coordinator.max_agents, 8);
@@ -553,13 +996,15 @@ mod tests {
         base.log.rotation_threshold = 5_000_000;
 
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "haiku".to_string(),
             agency_enabled: true,
             evaluator_model: Some("sonnet".to_string()),
             assigner_model: None,
             max_agents: 2,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, Some(&base));
@@ -581,13 +1026,15 @@ mod tests {
     #[test]
     fn test_build_config_agency_disabled() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "opus".to_string(),
             agency_enabled: false,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 4,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
@@ -601,13 +1048,15 @@ mod tests {
     fn test_build_config_same_as_default_models() {
         // When user picks "same as default", evaluator/assigner models are None
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "sonnet".to_string(),
             agency_enabled: true,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 4,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
@@ -620,13 +1069,15 @@ mod tests {
     #[test]
     fn test_format_summary_basic() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "opus".to_string(),
             agency_enabled: true,
             evaluator_model: Some("sonnet".to_string()),
             assigner_model: Some("haiku".to_string()),
             max_agents: 4,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let summary = format_summary(&choices);
@@ -642,13 +1093,15 @@ mod tests {
     #[test]
     fn test_format_summary_agency_disabled() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "amplifier".to_string(),
-
             model: "sonnet".to_string(),
             agency_enabled: false,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 8,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let summary = format_summary(&choices);
@@ -662,20 +1115,22 @@ mod tests {
     #[test]
     fn test_build_config_roundtrip_through_toml() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
-
             model: "opus".to_string(),
             agency_enabled: true,
             evaluator_model: Some("sonnet".to_string()),
             assigner_model: Some("haiku".to_string()),
             max_agents: 6,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let reloaded: Config = toml::from_str(&toml_str).unwrap();
 
-        assert_eq!(reloaded.coordinator.executor, "claude");
+        assert_eq!(reloaded.coordinator.executor, Some("claude".to_string()));
         assert_eq!(reloaded.agent.model, "opus");
         assert_eq!(reloaded.coordinator.max_agents, 6);
         assert!(reloaded.agency.auto_assign);
@@ -687,12 +1142,15 @@ mod tests {
     #[test]
     fn test_format_summary_includes_executor_and_model() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "claude".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 3,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
         let summary = format_summary(&choices);
         assert!(summary.contains("executor = \"claude\""));
@@ -710,18 +1168,178 @@ mod tests {
     #[test]
     fn test_build_config_custom_executor() {
         let choices = SetupChoices {
+            provider: "anthropic".to_string(),
             executor: "my-custom-executor".to_string(),
-
             model: "haiku".to_string(),
             agency_enabled: false,
             evaluator_model: None,
             assigner_model: None,
             max_agents: 1,
+            endpoint: None,
+            model_registry_entries: vec![],
         };
 
         let config = build_config(&choices, None);
-        assert_eq!(config.coordinator.executor, "my-custom-executor");
+        assert_eq!(
+            config.coordinator.executor,
+            Some("my-custom-executor".to_string())
+        );
         assert_eq!(config.agent.executor, "my-custom-executor");
+    }
+
+    #[test]
+    fn test_build_config_openrouter_provider() {
+        let choices = SetupChoices {
+            provider: "openrouter".to_string(),
+            executor: "native".to_string(),
+            model: "sonnet".to_string(),
+            agency_enabled: false,
+            evaluator_model: None,
+            assigner_model: None,
+            max_agents: 4,
+            endpoint: Some(EndpointChoices {
+                name: "openrouter".to_string(),
+                provider: "openrouter".to_string(),
+                url: "https://openrouter.ai/api/v1".to_string(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                api_key_file: None,
+            }),
+            model_registry_entries: default_openrouter_registry(),
+        };
+
+        let config = build_config(&choices, None);
+
+        // Executor and provider
+        assert_eq!(config.coordinator.executor, Some("native".to_string()));
+        assert_eq!(config.agent.executor, "native");
+        assert_eq!(
+            config.coordinator.provider,
+            Some("openrouter".to_string())
+        );
+
+        // models.default
+        let models_default = config.models.default.as_ref().unwrap();
+        assert_eq!(models_default.provider, Some("openrouter".to_string()));
+        assert_eq!(models_default.model, Some("sonnet".to_string()));
+
+        // Endpoint
+        assert_eq!(config.llm_endpoints.endpoints.len(), 1);
+        let ep = &config.llm_endpoints.endpoints[0];
+        assert_eq!(ep.name, "openrouter");
+        assert_eq!(ep.provider, "openrouter");
+        assert_eq!(ep.url, Some("https://openrouter.ai/api/v1".to_string()));
+        assert_eq!(ep.api_key_env, Some("OPENROUTER_API_KEY".to_string()));
+        assert!(ep.is_default);
+
+        // Model registry
+        assert!(!config.model_registry.is_empty());
+        let sonnet = config
+            .model_registry
+            .iter()
+            .find(|e| e.id == "sonnet")
+            .unwrap();
+        assert_eq!(sonnet.provider, "openrouter");
+        assert_eq!(sonnet.model, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_build_config_openrouter_roundtrip_toml() {
+        let choices = SetupChoices {
+            provider: "openrouter".to_string(),
+            executor: "native".to_string(),
+            model: "sonnet".to_string(),
+            agency_enabled: true,
+            evaluator_model: Some("haiku".to_string()),
+            assigner_model: Some("haiku".to_string()),
+            max_agents: 2,
+            endpoint: Some(EndpointChoices {
+                name: "openrouter".to_string(),
+                provider: "openrouter".to_string(),
+                url: "https://openrouter.ai/api/v1".to_string(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                api_key_file: None,
+            }),
+            model_registry_entries: default_openrouter_registry(),
+        };
+
+        let config = build_config(&choices, None);
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let reloaded: Config = toml::from_str(&toml_str).unwrap();
+
+        // Verify everything survives round-trip
+        assert_eq!(reloaded.coordinator.provider, Some("openrouter".to_string()));
+        assert_eq!(reloaded.coordinator.effective_executor(), "native");
+        assert_eq!(reloaded.llm_endpoints.endpoints.len(), 1);
+        assert!(!reloaded.model_registry.is_empty());
+        let models_default = reloaded.models.default.as_ref().unwrap();
+        assert_eq!(models_default.provider, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_format_summary_openrouter() {
+        let choices = SetupChoices {
+            provider: "openrouter".to_string(),
+            executor: "native".to_string(),
+            model: "sonnet".to_string(),
+            agency_enabled: false,
+            evaluator_model: None,
+            assigner_model: None,
+            max_agents: 4,
+            endpoint: Some(EndpointChoices {
+                name: "openrouter".to_string(),
+                provider: "openrouter".to_string(),
+                url: "https://openrouter.ai/api/v1".to_string(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                api_key_file: None,
+            }),
+            model_registry_entries: default_openrouter_registry(),
+        };
+
+        let summary = format_summary(&choices);
+        assert!(summary.contains("executor = \"native\""));
+        assert!(summary.contains("provider = \"openrouter\""));
+        assert!(summary.contains("[models.default]"));
+        assert!(summary.contains("[[llm_endpoints.endpoints]]"));
+        assert!(summary.contains("api_key_env = \"OPENROUTER_API_KEY\""));
+        assert!(summary.contains("[[model_registry]]"));
+    }
+
+    #[test]
+    fn test_format_summary_anthropic_no_extra_sections() {
+        let choices = SetupChoices {
+            provider: "anthropic".to_string(),
+            executor: "claude".to_string(),
+            model: "opus".to_string(),
+            agency_enabled: false,
+            evaluator_model: None,
+            assigner_model: None,
+            max_agents: 4,
+            endpoint: None,
+            model_registry_entries: vec![],
+        };
+
+        let summary = format_summary(&choices);
+        // Anthropic provider should NOT include extra sections
+        assert!(!summary.contains("[models.default]"));
+        assert!(!summary.contains("[[llm_endpoints.endpoints]]"));
+        assert!(!summary.contains("[[model_registry]]"));
+        assert!(!summary.contains("provider = "));
+    }
+
+    #[test]
+    fn test_default_openrouter_registry() {
+        let entries = default_openrouter_registry();
+        assert_eq!(entries.len(), 3);
+
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"opus"));
+        assert!(ids.contains(&"sonnet"));
+        assert!(ids.contains(&"haiku"));
+
+        for entry in &entries {
+            assert_eq!(entry.provider, "openrouter");
+            assert!(entry.model.starts_with("anthropic/"));
+        }
     }
 
     #[test]

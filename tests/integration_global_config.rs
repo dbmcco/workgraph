@@ -496,7 +496,7 @@ executor = "amplifier"
     let config = load_merged_custom(&global_dir, &local_dir);
 
     assert_eq!(config.coordinator.max_agents, 8, "inherited from global");
-    assert_eq!(config.coordinator.executor, "amplifier", "local overrides");
+    assert_eq!(config.coordinator.executor, Some("amplifier".to_string()), "local overrides");
     assert_eq!(config.coordinator.interval, 30, "inherited from global");
     assert_eq!(
         config.coordinator.poll_interval, 120,
@@ -690,7 +690,7 @@ model = "opus"
     assert_eq!(config.coordinator.max_agents, 12);
     assert_eq!(config.coordinator.interval, 45);
     assert_eq!(config.coordinator.poll_interval, 180);
-    assert_eq!(config.coordinator.executor, "shell");
+    assert_eq!(config.coordinator.executor, Some("shell".to_string()));
     assert_eq!(config.coordinator.model, Some("opus".to_string()));
 }
 
