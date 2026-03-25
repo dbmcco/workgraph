@@ -46,6 +46,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use workgraph::graph::{Node, Task, WorkGraph};
+    use workgraph::parser::{load_graph, save_graph};
+    use crate::commands::load_workgraph_mut;
 
     fn setup_dir_with_task(task_id: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();

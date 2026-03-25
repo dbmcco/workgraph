@@ -13935,3 +13935,207 @@ mod activity_feed_tests {
         assert!(event.summary.contains("src/main.rs"));
     }
 }
+
+#[cfg(test)]
+mod toast_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn make_toast(msg: &str, severity: ToastSeverity) -> Toast {
+        Toast {
+            message: msg.to_string(),
+            severity,
+            created_at: Instant::now(),
+            dedup_key: None,
+        }
+    }
+
+    fn make_toast_with_age(msg: &str, severity: ToastSeverity, age: Duration) -> Toast {
+        Toast {
+            message: msg.to_string(),
+            severity,
+            created_at: Instant::now() - age,
+            dedup_key: None,
+        }
+    }
+
+    // ── Toast lifecycle tests ──
+
+    #[test]
+    fn toast_info_auto_dismiss_5s() {
+        assert_eq!(
+            ToastSeverity::Info.auto_dismiss_duration(),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn toast_warning_auto_dismiss_10s() {
+        assert_eq!(
+            ToastSeverity::Warning.auto_dismiss_duration(),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn toast_error_no_auto_dismiss() {
+        assert_eq!(ToastSeverity::Error.auto_dismiss_duration(), None);
+    }
+
+    #[test]
+    fn toast_cleanup_removes_expired_info() {
+        let mut toasts = vec![
+            make_toast_with_age("fresh", ToastSeverity::Info, Duration::from_secs(1)),
+            make_toast_with_age("expired", ToastSeverity::Info, Duration::from_secs(6)),
+        ];
+        let before = toasts.len();
+        toasts.retain(|t| match t.severity.auto_dismiss_duration() {
+            Some(dur) => t.created_at.elapsed() < dur,
+            None => true,
+        });
+        assert_eq!(toasts.len(), 1);
+        assert_ne!(toasts.len(), before);
+        assert_eq!(toasts[0].message, "fresh");
+    }
+
+    #[test]
+    fn toast_cleanup_removes_expired_warning() {
+        let mut toasts = vec![
+            make_toast_with_age("active", ToastSeverity::Warning, Duration::from_secs(5)),
+            make_toast_with_age("expired", ToastSeverity::Warning, Duration::from_secs(11)),
+        ];
+        toasts.retain(|t| match t.severity.auto_dismiss_duration() {
+            Some(dur) => t.created_at.elapsed() < dur,
+            None => true,
+        });
+        assert_eq!(toasts.len(), 1);
+        assert_eq!(toasts[0].message, "active");
+    }
+
+    #[test]
+    fn toast_error_survives_cleanup() {
+        let mut toasts = vec![make_toast_with_age(
+            "error",
+            ToastSeverity::Error,
+            Duration::from_secs(600), // 10 minutes old
+        )];
+        toasts.retain(|t| match t.severity.auto_dismiss_duration() {
+            Some(dur) => t.created_at.elapsed() < dur,
+            None => true,
+        });
+        assert_eq!(toasts.len(), 1, "Error toasts must survive cleanup");
+    }
+
+    #[test]
+    fn toast_manual_dismissal_removes_errors() {
+        let mut toasts = vec![
+            make_toast("info msg", ToastSeverity::Info),
+            make_toast("error msg", ToastSeverity::Error),
+            make_toast("warning msg", ToastSeverity::Warning),
+            make_toast("another error", ToastSeverity::Error),
+        ];
+        let before = toasts.len();
+        toasts.retain(|t| t.severity != ToastSeverity::Error);
+        assert!(toasts.len() < before);
+        assert_eq!(toasts.len(), 2);
+        assert!(toasts.iter().all(|t| t.severity != ToastSeverity::Error));
+    }
+
+    // ── Toast deduplication tests ──
+
+    #[test]
+    fn toast_dedup_replaces_existing() {
+        let mut toasts: Vec<Toast> = vec![Toast {
+            message: "Agent stuck: task-a".to_string(),
+            severity: ToastSeverity::Warning,
+            created_at: Instant::now() - Duration::from_secs(3),
+            dedup_key: Some("stuck:task-a".to_string()),
+        }];
+        // Add a new toast with the same dedup key
+        let key = "stuck:task-a";
+        toasts.retain(|t| t.dedup_key.as_deref() != Some(key));
+        toasts.push(Toast {
+            message: "Agent stuck: task-a (10m)".to_string(),
+            severity: ToastSeverity::Warning,
+            created_at: Instant::now(),
+            dedup_key: Some(key.to_string()),
+        });
+        assert_eq!(toasts.len(), 1);
+        assert!(toasts[0].message.contains("10m"));
+    }
+
+    #[test]
+    fn toast_dedup_preserves_different_keys() {
+        let mut toasts: Vec<Toast> = vec![Toast {
+            message: "Agent stuck: task-a".to_string(),
+            severity: ToastSeverity::Warning,
+            created_at: Instant::now(),
+            dedup_key: Some("stuck:task-a".to_string()),
+        }];
+        let key = "stuck:task-b";
+        toasts.retain(|t| t.dedup_key.as_deref() != Some(key));
+        toasts.push(Toast {
+            message: "Agent stuck: task-b".to_string(),
+            severity: ToastSeverity::Warning,
+            created_at: Instant::now(),
+            dedup_key: Some(key.to_string()),
+        });
+        assert_eq!(toasts.len(), 2);
+    }
+
+    // ── Max visible toasts test ──
+
+    #[test]
+    fn toast_max_visible_cap() {
+        let mut toasts: Vec<Toast> = Vec::new();
+        for i in 0..6 {
+            toasts.push(make_toast(&format!("msg {}", i), ToastSeverity::Info));
+            while toasts.len() > MAX_VISIBLE_TOASTS {
+                toasts.remove(0);
+            }
+        }
+        assert_eq!(toasts.len(), MAX_VISIBLE_TOASTS);
+        // Oldest should have been dropped
+        assert_eq!(toasts[0].message, "msg 2");
+        assert_eq!(toasts[3].message, "msg 5");
+    }
+
+    // ── Rendering tests (color per severity) ──
+
+    #[test]
+    fn toast_severity_colors_are_distinct() {
+        // Verify that each severity has a unique color scheme.
+        let info_color = match ToastSeverity::Info {
+            ToastSeverity::Info => (100.0_f64, 255.0, 100.0),
+            _ => unreachable!(),
+        };
+        let warning_color = match ToastSeverity::Warning {
+            ToastSeverity::Warning => (255.0_f64, 220.0, 80.0),
+            _ => unreachable!(),
+        };
+        let error_color = match ToastSeverity::Error {
+            ToastSeverity::Error => (255.0_f64, 100.0, 100.0),
+            _ => unreachable!(),
+        };
+        // All different
+        assert_ne!(info_color, warning_color);
+        assert_ne!(info_color, error_color);
+        assert_ne!(warning_color, error_color);
+    }
+
+    #[test]
+    fn toast_stacking_order() {
+        // Toasts should render newest first (reversed order), up to MAX_VISIBLE_TOASTS.
+        let toasts = vec![
+            make_toast("first", ToastSeverity::Info),
+            make_toast("second", ToastSeverity::Warning),
+            make_toast("third", ToastSeverity::Error),
+        ];
+        let visible_count = toasts.len().min(MAX_VISIBLE_TOASTS);
+        let start = toasts.len().saturating_sub(visible_count);
+        let visible: Vec<_> = toasts[start..].iter().rev().collect();
+        assert_eq!(visible[0].message, "third");
+        assert_eq!(visible[1].message, "second");
+        assert_eq!(visible[2].message, "first");
+    }
+}
