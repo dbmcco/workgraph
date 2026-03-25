@@ -34,6 +34,8 @@ pub enum AgentStatus {
     Stopping,
     /// Agent voluntarily parked via `wg wait` (exited cleanly, task is Waiting)
     Parked,
+    /// Agent is frozen via SIGSTOP (process stopped but in memory)
+    Frozen,
     /// Agent has completed its task
     Done,
     /// Agent failed

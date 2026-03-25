@@ -56,6 +56,10 @@ pub enum IpcRequest {
     Pause,
     /// Resume the coordinator (triggers immediate tick)
     Resume,
+    /// Freeze all running agents (SIGSTOP) and pause the coordinator
+    Freeze,
+    /// Thaw all frozen agents (SIGCONT) and resume the coordinator
+    Thaw,
     /// Reconfigure the coordinator at runtime.
     /// If all fields are None, re-read config.toml from disk.
     Reconfigure {
@@ -322,6 +326,18 @@ fn handle_request(
             IpcResponse::success(serde_json::json!({
                 "status": "resumed",
             }))
+        }
+        IpcRequest::Freeze => {
+            logger.info("IPC Freeze: sending SIGSTOP to all agents and pausing coordinator");
+            handle_freeze(dir, daemon_cfg, logger)
+        }
+        IpcRequest::Thaw => {
+            logger.info("IPC Thaw: sending SIGCONT to frozen agents and resuming coordinator");
+            let resp = handle_thaw(dir, daemon_cfg, logger);
+            if resp.ok {
+                *wake_coordinator = true;
+            }
+            resp
         }
         IpcRequest::Reconfigure {
             max_agents,
@@ -599,6 +615,179 @@ fn handle_shutdown(dir: &Path, kill_agents: bool, logger: &DaemonLogger) -> IpcR
         "status": "shutting_down",
         "kill_agents": kill_agents,
     }))
+}
+
+/// Handle freeze: send SIGSTOP to all alive agent processes, pause coordinator,
+/// and update registry + coordinator state.
+#[cfg(unix)]
+fn handle_freeze(
+    dir: &Path,
+    daemon_cfg: &mut DaemonConfig,
+    logger: &DaemonLogger,
+) -> IpcResponse {
+    use workgraph::service::registry::AgentStatus;
+
+    let mut coord_state = CoordinatorState::load_or_default(dir);
+    if coord_state.frozen {
+        return IpcResponse::success(serde_json::json!({
+            "status": "already_frozen",
+            "frozen_pids": coord_state.frozen_pids,
+        }));
+    }
+
+    let mut registry = match AgentRegistry::load(dir) {
+        Ok(r) => r,
+        Err(e) => return IpcResponse::error(&format!("Failed to load registry: {}", e)),
+    };
+
+    let mut frozen_pids = Vec::new();
+    let mut failed_pids = Vec::new();
+
+    for agent in registry.agents.values_mut() {
+        if !agent.is_alive() {
+            continue;
+        }
+        let pid = agent.pid as i32;
+        if unsafe { libc::kill(pid, libc::SIGSTOP) } == 0 {
+            frozen_pids.push(agent.pid);
+            agent.status = AgentStatus::Frozen;
+            logger.info(&format!("Sent SIGSTOP to agent {} (PID {})", agent.id, agent.pid));
+        } else {
+            let err = std::io::Error::last_os_error();
+            logger.warn(&format!(
+                "Failed to SIGSTOP agent {} (PID {}): {}",
+                agent.id, agent.pid, err
+            ));
+            failed_pids.push(agent.pid);
+        }
+    }
+
+    if let Err(e) = registry.save(dir) {
+        logger.error(&format!("Failed to save registry after freeze: {}", e));
+    }
+
+    // Pause coordinator so no new agents are spawned
+    daemon_cfg.paused = true;
+    coord_state.paused = true;
+    coord_state.frozen = true;
+    coord_state.frozen_pids = frozen_pids.clone();
+    coord_state.save(dir);
+
+    logger.info(&format!(
+        "Freeze complete: {} agents frozen, {} failed",
+        frozen_pids.len(),
+        failed_pids.len()
+    ));
+
+    IpcResponse::success(serde_json::json!({
+        "status": "frozen",
+        "frozen_count": frozen_pids.len(),
+        "frozen_pids": frozen_pids,
+        "failed_pids": failed_pids,
+    }))
+}
+
+#[cfg(not(unix))]
+fn handle_freeze(
+    _dir: &Path,
+    _daemon_cfg: &mut DaemonConfig,
+    _logger: &DaemonLogger,
+) -> IpcResponse {
+    IpcResponse::error("Freeze is only supported on Unix systems")
+}
+
+/// Handle thaw: send SIGCONT to all frozen agent processes, resume coordinator,
+/// and update registry + coordinator state.
+#[cfg(unix)]
+fn handle_thaw(
+    dir: &Path,
+    daemon_cfg: &mut DaemonConfig,
+    logger: &DaemonLogger,
+) -> IpcResponse {
+    use crate::commands::is_process_alive;
+    use workgraph::service::registry::AgentStatus;
+
+    let mut coord_state = CoordinatorState::load_or_default(dir);
+    if !coord_state.frozen {
+        return IpcResponse::success(serde_json::json!({
+            "status": "not_frozen",
+        }));
+    }
+
+    let mut registry = match AgentRegistry::load(dir) {
+        Ok(r) => r,
+        Err(e) => return IpcResponse::error(&format!("Failed to load registry: {}", e)),
+    };
+
+    let mut thawed_pids = Vec::new();
+    let mut dead_pids = Vec::new();
+    let mut failed_pids = Vec::new();
+
+    for agent in registry.agents.values_mut() {
+        if agent.status != AgentStatus::Frozen {
+            continue;
+        }
+
+        if !is_process_alive(agent.pid) {
+            // Agent died while frozen (e.g., OOM killed)
+            agent.status = AgentStatus::Dead;
+            dead_pids.push(agent.pid);
+            logger.warn(&format!(
+                "Agent {} (PID {}) died while frozen",
+                agent.id, agent.pid
+            ));
+            continue;
+        }
+
+        let pid = agent.pid as i32;
+        if unsafe { libc::kill(pid, libc::SIGCONT) } == 0 {
+            agent.status = AgentStatus::Working;
+            thawed_pids.push(agent.pid);
+            logger.info(&format!("Sent SIGCONT to agent {} (PID {})", agent.id, agent.pid));
+        } else {
+            let err = std::io::Error::last_os_error();
+            logger.warn(&format!(
+                "Failed to SIGCONT agent {} (PID {}): {}",
+                agent.id, agent.pid, err
+            ));
+            failed_pids.push(agent.pid);
+        }
+    }
+
+    if let Err(e) = registry.save(dir) {
+        logger.error(&format!("Failed to save registry after thaw: {}", e));
+    }
+
+    // Resume coordinator
+    daemon_cfg.paused = false;
+    coord_state.paused = false;
+    coord_state.frozen = false;
+    coord_state.frozen_pids.clear();
+    coord_state.save(dir);
+
+    logger.info(&format!(
+        "Thaw complete: {} agents thawed, {} dead, {} failed",
+        thawed_pids.len(),
+        dead_pids.len(),
+        failed_pids.len()
+    ));
+
+    IpcResponse::success(serde_json::json!({
+        "status": "thawed",
+        "thawed_count": thawed_pids.len(),
+        "thawed_pids": thawed_pids,
+        "dead_pids": dead_pids,
+        "failed_pids": failed_pids,
+    }))
+}
+
+#[cfg(not(unix))]
+fn handle_thaw(
+    _dir: &Path,
+    _daemon_cfg: &mut DaemonConfig,
+    _logger: &DaemonLogger,
+) -> IpcResponse {
+    IpcResponse::error("Thaw is only supported on Unix systems")
 }
 
 /// Handle reconfigure request: update daemon config at runtime.

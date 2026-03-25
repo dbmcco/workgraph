@@ -30,6 +30,7 @@ fn effective_status(agent: &AgentEntry) -> String {
             AgentStatus::Working => "working".to_string(),
             AgentStatus::Idle => "idle".to_string(),
             AgentStatus::Stopping => "stopping".to_string(),
+            AgentStatus::Frozen => "frozen".to_string(),
             AgentStatus::Done => "done".to_string(),
             AgentStatus::Failed => "failed".to_string(),
             AgentStatus::Dead => "dead".to_string(),

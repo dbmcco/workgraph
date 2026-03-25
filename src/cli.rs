@@ -3004,6 +3004,22 @@ pub enum ServiceCommands {
     /// Resume the coordinator
     Resume,
 
+    /// Freeze all agents (SIGSTOP) and pause the service
+    ///
+    /// Sends SIGSTOP to all running agent processes, stopping them immediately
+    /// while keeping all state in memory. Also pauses the coordinator so no new
+    /// agents are spawned. Use `wg service thaw` to resume.
+    ///
+    /// Note: TCP connections may time out if frozen too long (~30-60s).
+    /// Agents/executors should handle reconnection on resume.
+    Freeze,
+
+    /// Thaw frozen agents (SIGCONT) and resume the service
+    ///
+    /// Sends SIGCONT to all previously frozen agent processes, resuming them
+    /// exactly where they left off. Also resumes the coordinator.
+    Thaw,
+
     /// Generate a systemd user service file for the wg service daemon
     Install,
 

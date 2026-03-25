@@ -1903,6 +1903,8 @@ fn main() -> Result<()> {
             ),
             ServiceCommands::Pause => commands::service::run_pause(&workgraph_dir, cli.json),
             ServiceCommands::Resume => commands::service::run_resume(&workgraph_dir, cli.json),
+            ServiceCommands::Freeze => commands::service::run_freeze(&workgraph_dir, cli.json),
+            ServiceCommands::Thaw => commands::service::run_thaw(&workgraph_dir, cli.json),
             ServiceCommands::Install => commands::service::generate_systemd_service(&workgraph_dir),
             ServiceCommands::Tick {
                 max_agents,
