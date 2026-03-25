@@ -3575,6 +3575,91 @@ model = "haiku"
         );
     }
 
+    // ---- EndpointsConfig::find_default tests ----
+
+    #[test]
+    fn test_find_default_empty() {
+        let endpoints = EndpointsConfig::default();
+        assert!(endpoints.find_default().is_none());
+    }
+
+    #[test]
+    fn test_find_default_returns_default_endpoint() {
+        let endpoints = EndpointsConfig {
+            endpoints: vec![
+                EndpointConfig {
+                    name: "openai".to_string(),
+                    provider: "openai".to_string(),
+                    url: None,
+                    model: None,
+                    api_key: None,
+                    api_key_file: None,
+                    api_key_env: None,
+                    is_default: false,
+                },
+                EndpointConfig {
+                    name: "openrouter".to_string(),
+                    provider: "openrouter".to_string(),
+                    url: None,
+                    model: None,
+                    api_key: None,
+                    api_key_file: None,
+                    api_key_env: None,
+                    is_default: true,
+                },
+            ],
+        };
+        let ep = endpoints.find_default().unwrap();
+        assert_eq!(ep.name, "openrouter");
+    }
+
+    #[test]
+    fn test_find_default_falls_back_to_first() {
+        let endpoints = EndpointsConfig {
+            endpoints: vec![EndpointConfig {
+                name: "only".to_string(),
+                provider: "openai".to_string(),
+                url: None,
+                model: None,
+                api_key: None,
+                api_key_file: None,
+                api_key_env: None,
+                is_default: false,
+            }],
+        };
+        let ep = endpoints.find_default().unwrap();
+        assert_eq!(ep.name, "only");
+    }
+
+    #[test]
+    fn test_find_default_resolves_api_key_for_non_matching_provider() {
+        // Simulates the bug scenario: model resolves to provider "openai" but
+        // the only configured endpoint has provider "openrouter". find_for_provider("openai")
+        // returns None but find_default() returns the openrouter endpoint.
+        let endpoints = EndpointsConfig {
+            endpoints: vec![EndpointConfig {
+                name: "openrouter".to_string(),
+                provider: "openrouter".to_string(),
+                url: None,
+                model: None,
+                api_key: Some("sk-or-test-key".to_string()),
+                api_key_file: None,
+                api_key_env: None,
+                is_default: true,
+            }],
+        };
+        // Provider-based lookup misses
+        assert!(endpoints.find_for_provider("openai").is_none());
+        // Default fallback finds it
+        let ep = endpoints.find_default().unwrap();
+        assert_eq!(ep.provider, "openrouter");
+        let key = ep.resolve_api_key(None).unwrap();
+        assert_eq!(key.as_deref(), Some("sk-or-test-key"));
+        // Verify env var names for the provider
+        let env_vars = EndpointConfig::env_var_names_for_provider(&ep.provider);
+        assert!(env_vars.contains(&"OPENROUTER_API_KEY"));
+    }
+
     // ---- EndpointConfig::resolve_api_key tests ----
 
     #[test]
