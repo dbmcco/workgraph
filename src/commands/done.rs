@@ -1424,4 +1424,40 @@ mod tests {
             "Agent should have a completed_at timestamp"
         );
     }
+
+    #[test]
+    fn test_done_verify_pipe_syntax() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("t1", "Task with pipe verify", Status::InProgress);
+        task.verify = Some("echo hello | grep hello".to_string());
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "t1", false, false);
+        assert!(result.is_ok(), "Pipe in verify command should work: {:?}", result.err());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Done);
+    }
+
+    #[test]
+    fn test_done_verify_pipe_failure_propagates() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("t1", "Task with failing pipe verify", Status::InProgress);
+        task.verify = Some("echo hello | grep nonexistent".to_string());
+        setup_workgraph(dir_path, vec![task]);
+
+        let result = run(dir_path, "t1", false, false);
+        assert!(result.is_err(), "Failing pipe should propagate error");
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::InProgress);
+    }
 }
