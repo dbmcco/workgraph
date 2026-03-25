@@ -411,16 +411,17 @@ pub enum InspectorSubFocus {
 /// Which tab is active in the right panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightPanelTab {
-    Chat,     // 0
-    Detail,   // 1
-    Log,      // 2
-    Messages, // 3
-    Agency,   // 4
-    Config,   // 5
-    Files,    // 6
-    CoordLog, // 7
-    Firehose, // 8
-    Output,   // 9
+    Chat,      // 0
+    Detail,    // 1
+    Log,       // 2
+    Messages,  // 3
+    Agency,    // 4
+    Config,    // 5
+    Files,     // 6
+    CoordLog,  // 7
+    Firehose,  // 8
+    Output,    // 9
+    Dashboard, // 10
 }
 
 impl RightPanelTab {
@@ -436,6 +437,7 @@ impl RightPanelTab {
             Self::CoordLog => "Coord",
             Self::Firehose => "Fire",
             Self::Output => "Live",
+            Self::Dashboard => "Dash",
         }
     }
 
@@ -451,6 +453,7 @@ impl RightPanelTab {
             Self::CoordLog => 7,
             Self::Firehose => 8,
             Self::Output => 9,
+            Self::Dashboard => 10,
         }
     }
 
@@ -466,6 +469,7 @@ impl RightPanelTab {
             7 => Some(Self::CoordLog),
             8 => Some(Self::Firehose),
             9 => Some(Self::Output),
+            10 => Some(Self::Dashboard),
             _ => None,
         }
     }
@@ -478,7 +482,7 @@ impl RightPanelTab {
         Self::from_index((self.index() + Self::ALL.len() - 1) % Self::ALL.len()).unwrap()
     }
 
-    pub const ALL: [RightPanelTab; 10] = [
+    pub const ALL: [RightPanelTab; 11] = [
         Self::Chat,
         Self::Detail,
         Self::Log,
@@ -489,6 +493,7 @@ impl RightPanelTab {
         Self::CoordLog,
         Self::Firehose,
         Self::Output,
+        Self::Dashboard,
     ];
 }
 
@@ -700,6 +705,37 @@ pub enum SinglePanelView {
     Graph,
     /// Show the detail/inspector panel.
     Detail,
+    /// Show the log/output panel.
+    Log,
+}
+
+impl SinglePanelView {
+    /// Cycle to the next panel: Graph → Detail → Log → Graph.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Graph => Self::Detail,
+            Self::Detail => Self::Log,
+            Self::Log => Self::Graph,
+        }
+    }
+
+    /// Cycle to the previous panel: Graph → Log → Detail → Graph.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Graph => Self::Log,
+            Self::Detail => Self::Graph,
+            Self::Log => Self::Detail,
+        }
+    }
+
+    /// Human-readable label for breadcrumb display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Graph => "Graph",
+            Self::Detail => "Detail",
+            Self::Log => "Log",
+        }
+    }
 }
 
 /// Input modes — at most one is active at a time.
@@ -1091,6 +1127,163 @@ pub struct AgentMonitorEntry {
     pub started_at: Option<String>,
     /// ISO 8601 completion timestamp (for Done/Failed/Dead agents)
     pub completed_at: Option<String>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Dashboard state
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Activity level classification for dashboard agents.
+/// Determined by time since last output file modification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DashboardAgentActivity {
+    /// Output modified <30s ago.
+    Active,
+    /// Output modified 30s–5m ago.
+    Slow,
+    /// Output modified >5m ago.
+    Stuck,
+    /// Agent process has exited (Done/Failed/Dead).
+    Exited,
+}
+
+impl DashboardAgentActivity {
+    /// Classify an agent based on registry status and seconds since last output modification.
+    pub fn classify(status: AgentStatus, secs_since_output: Option<i64>) -> Self {
+        match status {
+            AgentStatus::Done | AgentStatus::Failed | AgentStatus::Dead => Self::Exited,
+            AgentStatus::Parked | AgentStatus::Frozen | AgentStatus::Stopping => Self::Exited,
+            _ => match secs_since_output {
+                Some(s) if s < 30 => Self::Active,
+                Some(s) if s < 300 => Self::Slow,
+                Some(_) => Self::Stuck,
+                // No output file yet — treat as active if still starting
+                None => Self::Active,
+            },
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Slow => "slow",
+            Self::Stuck => "stuck",
+            Self::Exited => "exited",
+        }
+    }
+}
+
+/// A single row in the dashboard agent table.
+#[derive(Clone, Debug)]
+pub struct DashboardAgentRow {
+    pub agent_id: String,
+    pub task_id: String,
+    pub task_title: Option<String>,
+    pub activity: DashboardAgentActivity,
+    pub elapsed_secs: Option<i64>,
+    pub model: Option<String>,
+    pub latest_snippet: Option<String>,
+}
+
+/// Coordinator card data for the dashboard.
+#[derive(Clone, Debug)]
+pub struct DashboardCoordinatorCard {
+    pub id: u32,
+    pub enabled: bool,
+    pub paused: bool,
+    pub frozen: bool,
+    pub ticks: u64,
+    pub agents_alive: usize,
+    pub tasks_ready: usize,
+    pub max_agents: usize,
+    pub model: Option<String>,
+    pub accumulated_tokens: u64,
+}
+
+/// State for the Dashboard panel tab.
+pub struct DashboardState {
+    /// Scroll offset for the dashboard content.
+    pub scroll: usize,
+    /// Total rendered lines (set each frame by renderer, for scrollbar).
+    pub total_rendered_lines: usize,
+    /// Viewport height (set each frame by renderer).
+    pub viewport_height: usize,
+    /// Selected row in the agent table (for Enter/k/t keybinds).
+    pub selected_row: usize,
+    /// Cached coordinator cards (refreshed each load_agent_monitor cycle).
+    pub coordinator_cards: Vec<DashboardCoordinatorCard>,
+    /// Cached agent rows (refreshed each load_agent_monitor cycle).
+    pub agent_rows: Vec<DashboardAgentRow>,
+    /// Activity sparkline buckets: number of events per time bucket (last N buckets).
+    /// Each bucket covers `sparkline_bucket_secs` seconds.
+    pub sparkline_data: Vec<u64>,
+    /// Seconds per sparkline bucket.
+    pub sparkline_bucket_secs: u64,
+    /// Timestamp of the most recently recorded sparkline event.
+    pub sparkline_last_event: Option<std::time::Instant>,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self {
+            scroll: 0,
+            total_rendered_lines: 0,
+            viewport_height: 0,
+            selected_row: 0,
+            coordinator_cards: Vec::new(),
+            agent_rows: Vec::new(),
+            sparkline_data: vec![0; 30], // 30 buckets
+            sparkline_bucket_secs: 10,   // 10s per bucket = 5 min window
+            sparkline_last_event: None,
+        }
+    }
+}
+
+impl DashboardState {
+    /// Record an activity event (agent start/stop/status change) for sparkline.
+    pub fn record_sparkline_event(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.sparkline_last_event {
+            let elapsed = now.duration_since(last).as_secs();
+            let buckets_to_shift = (elapsed / self.sparkline_bucket_secs.max(1)) as usize;
+            if buckets_to_shift > 0 {
+                let shift = buckets_to_shift.min(self.sparkline_data.len());
+                // Shift existing data left
+                self.sparkline_data.rotate_left(shift);
+                let len = self.sparkline_data.len();
+                for v in &mut self.sparkline_data[len - shift..] {
+                    *v = 0;
+                }
+            }
+        }
+        self.sparkline_last_event = Some(now);
+        if let Some(last) = self.sparkline_data.last_mut() {
+            *last += 1;
+        }
+    }
+
+    /// Compute sparkline values from a list of event timestamps (for initial population).
+    pub fn compute_sparkline_from_timestamps(&mut self, timestamps: &[std::time::SystemTime]) {
+        let bucket_count = self.sparkline_data.len();
+        self.sparkline_data = vec![0; bucket_count];
+        if timestamps.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let window_secs = (bucket_count as u64) * self.sparkline_bucket_secs;
+        for ts in timestamps {
+            if let Ok(age) = now.duration_since(*ts) {
+                let age_secs = age.as_secs();
+                if age_secs < window_secs {
+                    let bucket_idx =
+                        bucket_count - 1 - (age_secs / self.sparkline_bucket_secs.max(1)) as usize;
+                    if bucket_idx < bucket_count {
+                        self.sparkline_data[bucket_idx] += 1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2528,6 +2721,9 @@ pub struct VizApp {
     // ── Output pane state (panel 9) ──
     pub output_pane: OutputPaneState,
 
+    // ── Dashboard pane state (panel 10) ──
+    pub dashboard: DashboardState,
+
     // ── Agency lifecycle for selected task ──
     pub agency_lifecycle: Option<AgencyLifecycle>,
 
@@ -2822,6 +3018,7 @@ impl VizApp {
             time_counters: TimeCounters::new(&config.tui.counters),
             firehose: FirehoseState::default(),
             output_pane: OutputPaneState::default(),
+            dashboard: DashboardState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -6311,6 +6508,7 @@ impl VizApp {
             time_counters: TimeCounters::new("uptime,cumulative,active"),
             firehose: FirehoseState::default(),
             output_pane: OutputPaneState::default(),
+            dashboard: DashboardState::default(),
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
@@ -6433,19 +6631,33 @@ impl VizApp {
         };
     }
 
-    /// Toggle between Graph and Detail in single-panel (compact) mode.
+    /// Cycle forward through panels in single-panel (compact) mode: Graph → Detail → Log → Graph.
     /// Also updates focused_panel to match.
     pub fn toggle_single_panel_view(&mut self) {
-        self.single_panel_view = match self.single_panel_view {
+        self.set_single_panel_view(self.single_panel_view.next());
+    }
+
+    /// Cycle backward through panels in single-panel (compact) mode: Graph → Log → Detail → Graph.
+    pub fn prev_single_panel_view(&mut self) {
+        self.set_single_panel_view(self.single_panel_view.prev());
+    }
+
+    /// Set the single-panel view and update focused_panel + right_panel_tab accordingly.
+    fn set_single_panel_view(&mut self, view: SinglePanelView) {
+        self.single_panel_view = view;
+        match view {
             SinglePanelView::Graph => {
-                self.focused_panel = FocusedPanel::RightPanel;
-                SinglePanelView::Detail
+                self.focused_panel = FocusedPanel::Graph;
             }
             SinglePanelView::Detail => {
-                self.focused_panel = FocusedPanel::Graph;
-                SinglePanelView::Graph
+                self.focused_panel = FocusedPanel::RightPanel;
+                self.right_panel_tab = RightPanelTab::Detail;
             }
-        };
+            SinglePanelView::Log => {
+                self.focused_panel = FocusedPanel::RightPanel;
+                self.right_panel_tab = RightPanelTab::Log;
+            }
+        }
     }
 
     /// Toggle right panel visibility.
@@ -6915,6 +7127,87 @@ impl VizApp {
             Err(_) => {
                 self.agent_monitor.agents.clear();
             }
+        }
+        self.load_dashboard();
+    }
+
+    /// Refresh dashboard state from agent monitor data + coordinator state.
+    pub fn load_dashboard(&mut self) {
+        use crate::commands::service::CoordinatorState;
+
+        // ── Coordinator card ──
+        let cs = CoordinatorState::load_or_default(&self.workgraph_dir);
+        self.dashboard.coordinator_cards = vec![DashboardCoordinatorCard {
+            id: 0,
+            enabled: cs.enabled,
+            paused: cs.paused,
+            frozen: cs.frozen,
+            ticks: cs.ticks,
+            agents_alive: cs.agents_alive,
+            tasks_ready: cs.tasks_ready,
+            max_agents: cs.max_agents,
+            model: cs.model.clone(),
+            accumulated_tokens: cs.accumulated_tokens,
+        }];
+
+        // ── Agent rows from monitor entries ──
+        let agents_dir = self.workgraph_dir.join("agents");
+        let prev_count = self.dashboard.agent_rows.len();
+        self.dashboard.agent_rows = self
+            .agent_monitor
+            .agents
+            .iter()
+            .map(|entry| {
+                // Determine seconds since last output file modification
+                let secs_since_output = agents_dir
+                    .join(&entry.agent_id)
+                    .join("output.log")
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+                    .map(|d| d.as_secs() as i64);
+
+                let snippet = self
+                    .agent_streams
+                    .get(&entry.agent_id)
+                    .and_then(|s| s.latest_snippet.clone());
+
+                DashboardAgentRow {
+                    agent_id: entry.agent_id.clone(),
+                    task_id: entry.task_id.clone().unwrap_or_default(),
+                    task_title: entry.task_title.clone(),
+                    activity: DashboardAgentActivity::classify(entry.status, secs_since_output),
+                    elapsed_secs: entry.runtime_secs,
+                    model: None, // populated from registry below if available
+                    latest_snippet: snippet,
+                }
+            })
+            .collect();
+
+        // Populate model from the registry if available
+        if let Ok(registry) = AgentRegistry::load(&self.workgraph_dir) {
+            for row in &mut self.dashboard.agent_rows {
+                if let Some(agent) = registry.agents.get(&row.agent_id) {
+                    row.model = agent.model.clone();
+                }
+            }
+        }
+
+        // Record sparkline event if agent count changed
+        let new_count = self.dashboard.agent_rows.len();
+        if new_count != prev_count {
+            self.dashboard.record_sparkline_event();
+        }
+
+        // Clamp selected row
+        if !self.dashboard.agent_rows.is_empty() {
+            self.dashboard.selected_row = self
+                .dashboard
+                .selected_row
+                .min(self.dashboard.agent_rows.len() - 1);
+        } else {
+            self.dashboard.selected_row = 0;
         }
     }
 
@@ -10627,6 +10920,8 @@ fn extract_enriched_text_from_log(content: &str) -> String {
             }
         } else if msg_type == "result" {
             // Tool result — show a compact one-line summary.
+            // Strip ANSI escape codes since tool output (e.g. from Bash) may
+            // contain terminal colors that would appear as raw escape sequences.
             let content_arr = val
                 .get("content")
                 .and_then(|c| c.as_array());
@@ -10635,12 +10930,16 @@ fn extract_enriched_text_from_log(content: &str) -> String {
             if let Some(arr) = content_arr {
                 for block in arr {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                        let line_count = text.lines().count();
+                        let clean = String::from_utf8(
+                            strip_ansi_escapes::strip(text.as_bytes()),
+                        )
+                        .unwrap_or_else(|_| text.to_string());
+                        let line_count = clean.lines().count();
                         let is_error = block
                             .get("is_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let first_line = text.lines().next().unwrap_or("").trim();
+                        let first_line = clean.lines().next().unwrap_or("").trim();
                         let short = if first_line.len() > 60 {
                             format!("{}…", &first_line[..first_line.floor_char_boundary(60)])
                         } else {
@@ -10655,9 +10954,13 @@ fn extract_enriched_text_from_log(content: &str) -> String {
                     }
                 }
             } else if let Some(text) = val.get("content").and_then(|c| c.as_str()) {
-                // Simple string content.
-                let line_count = text.lines().count();
-                let first_line = text.lines().next().unwrap_or("").trim();
+                // Simple string content — also strip ANSI.
+                let clean = String::from_utf8(
+                    strip_ansi_escapes::strip(text.as_bytes()),
+                )
+                .unwrap_or_else(|_| text.to_string());
+                let line_count = clean.lines().count();
+                let first_line = clean.lines().next().unwrap_or("").trim();
                 let short = if first_line.len() > 60 {
                     format!("{}…", &first_line[..first_line.floor_char_boundary(60)])
                 } else {

@@ -148,7 +148,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     // Phase 1: Compute viewport dimensions from layout (needed for deferred centering).
     match app.responsive_breakpoint {
         ResponsiveBreakpoint::Compact => {
-            // Single-panel mode: show graph OR detail, never both.
+            // Single-panel mode: show graph OR detail OR log, one at a time.
             match app.single_panel_view {
                 SinglePanelView::Graph => {
                     app.last_graph_area = main_area;
@@ -158,7 +158,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     app.scroll.viewport_height = main_area.height as usize;
                     app.scroll.viewport_width = main_area.width as usize;
                 }
-                SinglePanelView::Detail => {
+                SinglePanelView::Detail | SinglePanelView::Log => {
                     app.last_graph_area = Rect::default();
                     app.scroll.viewport_height = 0;
                     app.scroll.viewport_width = 0;
@@ -302,7 +302,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                         app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
                     );
                 }
-                SinglePanelView::Detail => {
+                SinglePanelView::Detail | SinglePanelView::Log => {
                     draw_right_panel(frame, app, main_area);
                     app.last_graph_hscrollbar_area = Rect::default();
                 }
@@ -1757,6 +1757,9 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         RightPanelTab::Output => {
             draw_output_tab(frame, app, content_area);
         }
+        RightPanelTab::Dashboard => {
+            // Dashboard tab rendering handled by another agent.
+        }
     }
 }
 
@@ -3123,8 +3126,8 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             format!("{} {}", AGENT_MARKER, s)
         };
 
-        // Word-wrap the marker line.
-        if wrap_width > 0 && message.len() > wrap_width {
+        // Word-wrap the marker line (use display width, not byte length).
+        if wrap_width > 0 && message.width() > wrap_width {
             let wrapped = word_wrap(&message, wrap_width);
             for (i, wl) in wrapped.iter().enumerate() {
                 if i == 0 {
@@ -3147,8 +3150,65 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
     }
 
-    // Append the rendered agent output — same rendered lines as the Output tab produces.
-    composed_lines.extend(app.log_pane.agent_output.rendered_lines.iter().cloned());
+    // Append the rendered agent output with word wrapping and tool-box awareness,
+    // matching the Chat view's rendering for visual parity.
+    let agent_lines = &app.log_pane.agent_output.rendered_lines;
+    if !agent_lines.is_empty() {
+        let border_style = Style::default().fg(Color::DarkGray);
+        let tool_name_style = Style::default()
+            .fg(Color::Indexed(75))
+            .add_modifier(Modifier::BOLD);
+        let tool_content_style = Style::default().fg(Color::Indexed(252));
+
+        for line in agent_lines {
+            let lt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if lt.starts_with("┌─") {
+                // Tool header: border in DarkGray, tool name highlighted.
+                let after_prefix = lt.get(7..).unwrap_or("");
+                let name_end = after_prefix.find(['─', ' ']).unwrap_or(after_prefix.len());
+                let tool_name = after_prefix[..name_end].trim();
+                let rest_start = 7 + name_end;
+                let rest = lt.get(rest_start..).unwrap_or("");
+                composed_lines.push(Line::from(vec![
+                    Span::styled("┌─ ", border_style),
+                    Span::styled(tool_name.to_string(), tool_name_style),
+                    Span::styled(format!(" {}", rest.trim_start()), border_style),
+                ]));
+            } else if lt.starts_with("└─") {
+                composed_lines.push(Line::from(Span::styled(lt, border_style)));
+            } else if lt.starts_with("│ ") {
+                // Tool content line: │ in DarkGray, content in readable color.
+                let content = lt.get(4..).unwrap_or("");
+                let pipe_display_w: usize = 2;
+                let cont_display_w: usize = 4;
+                let wrap_w = render_width.saturating_sub(cont_display_w);
+                if wrap_w == 0 || content.width() <= render_width.saturating_sub(pipe_display_w) {
+                    composed_lines.push(Line::from(vec![
+                        Span::styled("│ ", border_style),
+                        Span::styled(content.to_string(), tool_content_style),
+                    ]));
+                } else {
+                    let wrapped_content = word_wrap(content, wrap_w);
+                    for (i, w) in wrapped_content.iter().enumerate() {
+                        if i == 0 {
+                            composed_lines.push(Line::from(vec![
+                                Span::styled("│ ", border_style),
+                                Span::styled(w.to_string(), tool_content_style),
+                            ]));
+                        } else {
+                            composed_lines.push(Line::from(vec![
+                                Span::styled("│   ", border_style),
+                                Span::styled(w.to_string(), tool_content_style),
+                            ]));
+                        }
+                    }
+                }
+            } else {
+                // Normal line — word-wrap with style preservation.
+                composed_lines.extend(wrap_line_spans(std::slice::from_ref(line), render_width));
+            }
+        }
+    }
 
     let total_lines = composed_lines.len();
     app.log_pane.total_wrapped_lines = total_lines;
@@ -3885,6 +3945,305 @@ fn draw_output_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             );
         }
     }
+}
+
+fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    use super::state::DashboardAgentActivity;
+    use ratatui::widgets::Sparkline;
+
+    let width = area.width as usize;
+    if width < 4 || area.height < 3 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── Coordinator Cards ──
+    lines.push(Line::from(Span::styled(
+        "── Coordinators ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if app.dashboard.coordinator_cards.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No coordinators running",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for card in &app.dashboard.coordinator_cards {
+            let status_icon = if !card.enabled {
+                Span::styled("⏹ ", Style::default().fg(Color::Red))
+            } else if card.frozen {
+                Span::styled("❄ ", Style::default().fg(Color::Blue))
+            } else if card.paused {
+                Span::styled("⏸ ", Style::default().fg(Color::Yellow))
+            } else {
+                Span::styled("▶ ", Style::default().fg(Color::Green))
+            };
+
+            let state_label = if !card.enabled {
+                "stopped"
+            } else if card.frozen {
+                "frozen"
+            } else if card.paused {
+                "paused"
+            } else {
+                "running"
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                status_icon,
+                Span::styled(
+                    format!("Coordinator #{}", card.id),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({})", state_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            // Stats row
+            lines.push(Line::from(vec![
+                Span::styled("    Agents: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", card.agents_alive, card.max_agents),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Ready: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", card.tasks_ready),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Ticks: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", card.ticks),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+
+            // Model + tokens
+            let mut model_spans = vec![Span::styled("    ", Style::default())];
+            if let Some(ref model) = card.model {
+                model_spans.push(Span::styled(
+                    format!("Model: {}", model),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if card.accumulated_tokens > 0 {
+                model_spans.push(Span::styled(
+                    format!("  Tokens: {}", format_tokens(card.accumulated_tokens)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if model_spans.len() > 1 {
+                lines.push(Line::from(model_spans));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Agent Table ──
+    lines.push(Line::from(Span::styled(
+        "── Agents ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if app.dashboard.agent_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No agents registered",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<12} {:<8} {:<8} ", "AGENT", "STATUS", "TIME"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "TASK",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for (i, row) in app.dashboard.agent_rows.iter().enumerate() {
+            let is_selected = i == app.dashboard.selected_row;
+            let activity_color = match row.activity {
+                DashboardAgentActivity::Active => Color::Green,
+                DashboardAgentActivity::Slow => Color::Yellow,
+                DashboardAgentActivity::Stuck => Color::Red,
+                DashboardAgentActivity::Exited => Color::DarkGray,
+            };
+
+            let elapsed_str = row
+                .elapsed_secs
+                .map(|s| format_duration_compact(s as u64))
+                .unwrap_or_else(|| "—".to_string());
+
+            let task_display = row.task_title.as_deref().unwrap_or(&row.task_id);
+
+            let row_style = if is_selected {
+                Style::default().bg(Color::Rgb(40, 40, 60))
+            } else {
+                Style::default()
+            };
+
+            let selector = if is_selected { "▸ " } else { "  " };
+
+            lines.push(Line::from(vec![
+                Span::styled(selector, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:<12} ", &row.agent_id),
+                    row_style.fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<8} ", row.activity.label()),
+                    row_style.fg(activity_color),
+                ),
+                Span::styled(
+                    format!("{:<8} ", elapsed_str),
+                    row_style.fg(Color::DarkGray),
+                ),
+                Span::styled(task_display, row_style.fg(Color::White)),
+            ]));
+
+            // Show latest snippet for active agents
+            if matches!(
+                row.activity,
+                DashboardAgentActivity::Active | DashboardAgentActivity::Slow
+            ) {
+                if let Some(ref snippet) = row.latest_snippet {
+                    let max_len = width.saturating_sub(6);
+                    let truncated = if snippet.len() > max_len {
+                        format!("{}…", &snippet[..max_len.saturating_sub(1)])
+                    } else {
+                        snippet.clone()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", Style::default()),
+                        Span::styled(
+                            truncated,
+                            Style::default().fg(Color::Rgb(100, 100, 100)),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    // ── Graph Summary ──
+    lines.push(Line::from(Span::styled(
+        "── Graph Summary ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let tc = &app.task_counts;
+    lines.push(Line::from(vec![
+        Span::styled("  Total: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.total), Style::default().fg(Color::White)),
+        Span::styled("  Done: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.done), Style::default().fg(Color::Green)),
+        Span::styled("  In-progress: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}", tc.in_progress),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Open: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.open), Style::default().fg(Color::White)),
+        Span::styled("  Failed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.failed), Style::default().fg(Color::Red)),
+        Span::styled("  Blocked: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}", tc.blocked),
+            Style::default().fg(Color::Magenta),
+        ),
+    ]));
+
+    // Progress bar
+    if tc.total > 0 {
+        let pct = (tc.done as f64 / tc.total as f64 * 100.0) as u16;
+        let bar_width = width.saturating_sub(12).min(40);
+        let filled = (pct as usize * bar_width) / 100;
+        let empty = bar_width.saturating_sub(filled);
+        lines.push(Line::from(vec![
+            Span::styled("  [", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+            Span::styled(
+                "░".repeat(empty),
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ),
+            Span::styled("] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}%", pct), Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // ── Activity Sparkline ──
+    lines.push(Line::from(Span::styled(
+        "── Activity ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let sparkline_height: u16 = 3;
+    let total_text_lines = lines.len() as u16;
+
+    // Render the text portion
+    let text_height = area.height.saturating_sub(sparkline_height + 1);
+    let para = Paragraph::new(lines).scroll((app.dashboard.scroll as u16, 0));
+
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: text_height.min(area.height),
+    };
+    frame.render_widget(para, text_area);
+
+    // Sparkline at the bottom if there's room
+    let sparkline_y = area.y + text_area.height;
+    if sparkline_y + sparkline_height <= area.y + area.height {
+        let sparkline_area = Rect {
+            x: area.x + 1,
+            y: sparkline_y,
+            width: area.width.saturating_sub(2),
+            height: sparkline_height,
+        };
+
+        if sparkline_area.height > 0 && sparkline_area.width > 0 {
+            let data = &app.dashboard.sparkline_data;
+            let sparkline = Sparkline::default()
+                .data(data)
+                .style(Style::default().fg(Color::Green));
+            frame.render_widget(sparkline, sparkline_area);
+        }
+    }
+
+    // Update metrics for scrollbar support
+    app.dashboard.total_rendered_lines = total_text_lines as usize + sparkline_height as usize;
+    app.dashboard.viewport_height = area.height as usize;
 }
 
 fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
@@ -5584,12 +5943,16 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
             }
             FocusedPanel::Graph => {
                 let tab_hint = if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
-                    ("Tab", "detail")
+                    ("Tab/]/[", "panels")
                 } else {
                     ("Tab", "panel")
                 };
                 (
-                    "Graph",
+                    if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                        "▸Graph"
+                    } else {
+                        "Graph"
+                    },
                     "NAV",
                     Color::Rgb(120, 120, 120),
                     vec![
@@ -5618,6 +5981,7 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                     RightPanelTab::CoordLog => "7:Coord",
                     RightPanelTab::Firehose => "8:Fire",
                     RightPanelTab::Output => "9:Out",
+                    RightPanelTab::Dashboard => "10:Dash",
                 };
                 let mut hints: Vec<(&str, &str)> = Vec::new();
                 match tab {
@@ -5661,13 +6025,33 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         hints.push(("Enter", "open"));
                         hints.push(("Esc", "back"));
                     }
+                    RightPanelTab::Dashboard => {
+                        hints.push(("↑↓", "select"));
+                        hints.push(("Enter", "drill-down"));
+                        hints.push(("k", "kill"));
+                        hints.push(("t", "task detail"));
+                    }
                 }
                 // Common hints for all right-panel tabs.
-                hints.push(("Tab", "graph"));
+                if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                    hints.push(("Tab/]/[", "panels"));
+                } else {
+                    hints.push(("Tab", "graph"));
+                }
                 hints.push(("i/I", "resize pane"));
                 hints.push(("?", "help"));
                 hints.push(("Alt←→", "cycle views"));
-                (tab_label, "NAV", Color::Rgb(120, 120, 120), hints)
+                // In compact mode, prefix the tab label with a breadcrumb indicator.
+                let label: &str = if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                    match app.single_panel_view {
+                        SinglePanelView::Detail => "▸Detail",
+                        SinglePanelView::Log => "▸Log",
+                        _ => tab_label,
+                    }
+                } else {
+                    tab_label
+                };
+                (label, "NAV", Color::Rgb(120, 120, 120), hints)
             }
         },
     }

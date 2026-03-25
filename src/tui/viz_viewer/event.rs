@@ -11,8 +11,8 @@ use ratatui::layout::Position;
 use super::render;
 use super::state::{
     ChoiceDialogAction, ChoiceDialogState, CommandEffect, ConfigEditKind, ConfirmAction,
-    ControlPanelFocus, FocusedPanel, InputMode, InspectorSubFocus, RightPanelTab, TaskFormField,
-    TextPromptAction, VizApp,
+    ControlPanelFocus, FocusedPanel, InputMode, InspectorSubFocus, ResponsiveBreakpoint,
+    RightPanelTab, TaskFormField, TextPromptAction, VizApp,
 };
 
 /// Apply the current mouse capture state to the terminal.
@@ -1020,6 +1020,14 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.toggle_panel_focus();
         }
 
+        // ]/[: cycle single-panel views in compact mode
+        KeyCode::Char(']') if app.responsive_breakpoint == ResponsiveBreakpoint::Compact => {
+            app.toggle_single_panel_view();
+        }
+        KeyCode::Char('[') if app.responsive_breakpoint == ResponsiveBreakpoint::Compact => {
+            app.prev_single_panel_view();
+        }
+
         // t: toggle trace (was Tab)
         KeyCode::Char('t') => {
             app.toggle_trace();
@@ -1421,6 +1429,14 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.toggle_panel_focus();
         }
 
+        // ]/[: cycle single-panel views in compact mode
+        KeyCode::Char(']') if app.responsive_breakpoint == ResponsiveBreakpoint::Compact => {
+            app.toggle_single_panel_view();
+        }
+        KeyCode::Char('[') if app.responsive_breakpoint == ResponsiveBreakpoint::Compact => {
+            app.prev_single_panel_view();
+        }
+
         // Backslash: toggle right panel
         KeyCode::Char('\\') => {
             app.toggle_right_panel();
@@ -1629,6 +1645,42 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             }
         }
 
+        // Dashboard tab: Enter = drill-down to agent output, k = kill, t = task detail
+        KeyCode::Enter if app.right_panel_tab == RightPanelTab::Dashboard => {
+            // Drill-down: switch to Output tab focused on the selected agent
+            if let Some(row) = app.dashboard.agent_rows.get(app.dashboard.selected_row) {
+                let agent_id = row.agent_id.clone();
+                app.output_pane.active_agent_id = Some(agent_id);
+                app.right_panel_tab = RightPanelTab::Output;
+            }
+        }
+        KeyCode::Char('k') if app.right_panel_tab == RightPanelTab::Dashboard => {
+            // Kill selected agent (send SIGTERM via IPC)
+            if let Some(row) = app.dashboard.agent_rows.get(app.dashboard.selected_row) {
+                let agent_id = row.agent_id.clone();
+                let wg_dir = app.workgraph_dir.clone();
+                // Best-effort kill via the kill command
+                let _ = std::process::Command::new("wg")
+                    .arg("kill")
+                    .arg(&agent_id)
+                    .current_dir(&wg_dir)
+                    .output();
+                app.load_agent_monitor();
+            }
+        }
+        KeyCode::Char('t') if app.right_panel_tab == RightPanelTab::Dashboard => {
+            // Jump to task detail for the selected agent's task
+            if let Some(row) = app.dashboard.agent_rows.get(app.dashboard.selected_row) {
+                let task_id = row.task_id.clone();
+                app.load_hud_detail_for_task(&task_id);
+                app.right_panel_tab = RightPanelTab::Detail;
+            }
+        }
+        KeyCode::Char('b') if app.right_panel_tab == RightPanelTab::Dashboard => {
+            // Back: return to graph focus
+            app.focused_panel = FocusedPanel::Graph;
+        }
+
         // Chat tab: '[' / ']' cycle between coordinator tabs
         KeyCode::Char('[') if app.right_panel_tab == RightPanelTab::Chat => {
             let ids = app.list_coordinator_ids();
@@ -1774,6 +1826,9 @@ fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
                 scroll_state.auto_follow = false;
             }
         }
+        RightPanelTab::Dashboard => {
+            app.dashboard.selected_row = app.dashboard.selected_row.saturating_sub(amount);
+        }
     }
 }
 
@@ -1845,6 +1900,10 @@ fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
                 }
             }
         }
+        RightPanelTab::Dashboard => {
+            let max = app.dashboard.agent_rows.len().saturating_sub(1);
+            app.dashboard.selected_row = (app.dashboard.selected_row + amount).min(max);
+        }
     }
 }
 
@@ -1897,6 +1956,9 @@ fn right_panel_scroll_to_top(app: &mut VizApp) {
                 scroll_state.auto_follow = false;
             }
         }
+        RightPanelTab::Dashboard => {
+            app.dashboard.selected_row = 0;
+        }
     }
 }
 
@@ -1948,6 +2010,9 @@ fn right_panel_scroll_to_bottom(app: &mut VizApp) {
                 scroll_state.auto_follow = true;
                 app.output_pane.has_new_content = false;
             }
+        }
+        RightPanelTab::Dashboard => {
+            app.dashboard.selected_row = app.dashboard.agent_rows.len().saturating_sub(1);
         }
     }
 }
