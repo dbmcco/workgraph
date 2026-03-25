@@ -1238,7 +1238,7 @@ pub struct DashboardAgentRow {
 }
 
 /// Coordinator card data for the dashboard.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DashboardCoordinatorCard {
     pub id: u32,
     pub enabled: bool,
@@ -7194,20 +7194,30 @@ impl VizApp {
     pub fn load_dashboard(&mut self) {
         use crate::commands::service::CoordinatorState;
 
-        // ── Coordinator card ──
-        let cs = CoordinatorState::load_or_default(&self.workgraph_dir);
-        self.dashboard.coordinator_cards = vec![DashboardCoordinatorCard {
-            id: 0,
-            enabled: cs.enabled,
-            paused: cs.paused,
-            frozen: cs.frozen,
-            ticks: cs.ticks,
-            agents_alive: cs.agents_alive,
-            tasks_ready: cs.tasks_ready,
-            max_agents: cs.max_agents,
-            model: cs.model.clone(),
-            accumulated_tokens: cs.accumulated_tokens,
-        }];
+        // ── Coordinator cards (one per coordinator) ──
+        let all_states = CoordinatorState::load_all(&self.workgraph_dir);
+        self.dashboard.coordinator_cards = if all_states.is_empty() {
+            vec![DashboardCoordinatorCard {
+                id: 0,
+                ..Default::default()
+            }]
+        } else {
+            all_states
+                .iter()
+                .map(|(id, cs)| DashboardCoordinatorCard {
+                    id: *id,
+                    enabled: cs.enabled,
+                    paused: cs.paused,
+                    frozen: cs.frozen,
+                    ticks: cs.ticks,
+                    agents_alive: cs.agents_alive,
+                    tasks_ready: cs.tasks_ready,
+                    max_agents: cs.max_agents,
+                    model: cs.model.clone(),
+                    accumulated_tokens: cs.accumulated_tokens,
+                })
+                .collect()
+        };
 
         // ── Agent rows from monitor entries ──
         let agents_dir = self.workgraph_dir.join("agents");
@@ -7996,8 +8006,8 @@ impl VizApp {
             }
         });
 
-        // Load coordinator state
-        let coord = CoordinatorState::load_or_default(dir);
+        // Load coordinator state (coordinator 0 = dispatch state)
+        let coord = CoordinatorState::load_or_default_for(dir, 0);
         self.service_health.paused = coord.paused;
         self.service_health.agents_max = coord.max_agents;
 
@@ -8121,9 +8131,9 @@ impl VizApp {
         // Compaction progress
         if self.time_counters.show_compact {
             use crate::commands::service::CoordinatorState;
-            let cs = CoordinatorState::load_or_default(&self.workgraph_dir);
             let config = Config::load(&self.workgraph_dir).unwrap_or_default();
-            self.time_counters.compact_accumulated = cs.accumulated_tokens;
+            self.time_counters.compact_accumulated =
+                CoordinatorState::total_accumulated_tokens(&self.workgraph_dir);
             self.time_counters.compact_threshold = config.effective_compaction_threshold();
         }
 
@@ -14163,5 +14173,76 @@ mod dashboard_tests {
         assert_eq!(DashboardAgentActivity::Slow.label(), "slow");
         assert_eq!(DashboardAgentActivity::Stuck.label(), "stuck");
         assert_eq!(DashboardAgentActivity::Exited.label(), "exited");
+    }
+}
+
+#[cfg(test)]
+mod nav_stack_tests {
+    use super::*;
+
+    #[test]
+    fn new_nav_stack_is_empty() {
+        let stack = NavStack::default();
+        assert!(stack.is_empty());
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn push_increases_len() {
+        let mut stack = NavStack::default();
+        stack.push(NavEntry::Dashboard);
+        assert_eq!(stack.len(), 1);
+        assert!(!stack.is_empty());
+    }
+
+    #[test]
+    fn pop_returns_last_pushed() {
+        let mut stack = NavStack::default();
+        stack.push(NavEntry::Dashboard);
+        stack.push(NavEntry::AgentDetail { agent_id: "a1".into() });
+        assert_eq!(stack.pop(), Some(NavEntry::AgentDetail { agent_id: "a1".into() }));
+        assert_eq!(stack.pop(), Some(NavEntry::Dashboard));
+    }
+
+    #[test]
+    fn pop_on_empty_returns_none() {
+        let mut stack = NavStack::default();
+        assert_eq!(stack.pop(), None);
+        assert!(stack.is_empty());
+        assert_eq!(stack.pop(), None);
+    }
+
+    #[test]
+    fn clear_empties_the_stack() {
+        let mut stack = NavStack::default();
+        stack.push(NavEntry::Dashboard);
+        stack.push(NavEntry::TaskDetail { task_id: "t1".into() });
+        stack.clear();
+        assert!(stack.is_empty());
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn full_drilldown_chain_push_and_pop() {
+        let mut stack = NavStack::default();
+        stack.push(NavEntry::Dashboard);
+        stack.push(NavEntry::AgentDetail { agent_id: "agent-42".into() });
+        stack.push(NavEntry::TaskDetail { task_id: "implement-feature".into() });
+        assert_eq!(stack.len(), 3);
+
+        assert_eq!(stack.pop(), Some(NavEntry::TaskDetail { task_id: "implement-feature".into() }));
+        assert_eq!(stack.pop(), Some(NavEntry::AgentDetail { agent_id: "agent-42".into() }));
+        assert_eq!(stack.pop(), Some(NavEntry::Dashboard));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn nav_entry_equality() {
+        assert_eq!(NavEntry::Dashboard, NavEntry::Dashboard);
+        assert_ne!(
+            NavEntry::AgentDetail { agent_id: "a".into() },
+            NavEntry::AgentDetail { agent_id: "b".into() }
+        );
+        assert_ne!(NavEntry::Dashboard, NavEntry::TaskDetail { task_id: "t".into() });
     }
 }

@@ -1569,7 +1569,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dir = temp_dir.path();
 
-        // Create initial coordinator state on disk
+        // Create initial coordinator state on disk (per-ID file)
         let coord = CoordinatorState {
             enabled: true,
             max_agents: 4,
@@ -1578,7 +1578,7 @@ mod tests {
             ..Default::default()
         };
         fs::create_dir_all(dir.join("service")).unwrap();
-        coord.save(dir);
+        coord.save_for(dir, 0);
 
         let mut cfg = DaemonConfig {
             max_agents: 4,
@@ -1607,7 +1607,7 @@ mod tests {
         assert_eq!(cfg.model, Some("haiku".to_string()));
 
         // Verify persisted state was updated
-        let loaded = CoordinatorState::load(dir).unwrap();
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
         assert_eq!(loaded.max_agents, 8);
         assert_eq!(loaded.executor, "opencode");
     }
@@ -1634,7 +1634,7 @@ poll_interval = 120
             executor: "claude".to_string(),
             ..Default::default()
         };
-        coord.save(dir);
+        coord.save_for(dir, 0);
 
         let mut cfg = DaemonConfig {
             max_agents: 4,

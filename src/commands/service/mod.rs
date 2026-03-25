@@ -432,6 +432,7 @@ impl CoordinatorState {
     }
 
     /// Load all coordinator states from per-ID files in the service directory.
+    /// Falls back to the legacy shared file when no per-ID files are found.
     /// Returns a sorted vec of (coordinator_id, state) pairs.
     pub fn load_all(dir: &Path) -> Vec<(u32, Self)> {
         let service_dir = dir.join("service");
@@ -450,6 +451,12 @@ impl CoordinatorState {
                         }
                     }
                 }
+            }
+        }
+        // Fall back to legacy file if no per-ID files found
+        if results.is_empty() {
+            if let Some(state) = Self::load(dir) {
+                results.push((0, state));
             }
         }
         results.sort_by_key(|(id, _)| *id);
@@ -4379,5 +4386,350 @@ mod tests {
         CoordinatorState::remove(dir);
         assert!(CoordinatorState::load_for(dir, 0).is_none());
         assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn test_per_coord_state_load_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // No files → empty
+        assert!(CoordinatorState::load_all(dir).is_empty());
+
+        // Create three coordinators
+        CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            enabled: true,
+            max_agents: 2,
+            accumulated_tokens: 200,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        CoordinatorState {
+            enabled: true,
+            max_agents: 6,
+            accumulated_tokens: 300,
+            ..Default::default()
+        }
+        .save_for(dir, 5);
+
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 3);
+        // Should be sorted by ID
+        assert_eq!(all[0].0, 0);
+        assert_eq!(all[1].0, 1);
+        assert_eq!(all[2].0, 5);
+        assert_eq!(all[0].1.accumulated_tokens, 100);
+        assert_eq!(all[1].1.accumulated_tokens, 200);
+        assert_eq!(all[2].1.accumulated_tokens, 300);
+    }
+
+    #[test]
+    fn test_per_coord_state_load_all_legacy_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Write only a legacy file
+        let legacy = CoordinatorState {
+            enabled: true,
+            max_agents: 8,
+            accumulated_tokens: 42,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, 0);
+        assert_eq!(all[0].1.accumulated_tokens, 42);
+    }
+
+    #[test]
+    fn test_per_coord_state_total_accumulated_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Empty dir → 0
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 0);
+
+        // Coordinator 0: 100 tokens
+        CoordinatorState {
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        // Coordinator 1: 250 tokens
+        CoordinatorState {
+            accumulated_tokens: 250,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        // Coordinator 2: 650 tokens
+        CoordinatorState {
+            accumulated_tokens: 650,
+            ..Default::default()
+        }
+        .save_for(dir, 2);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 1000);
+    }
+
+    #[test]
+    fn test_per_coord_state_reset_all_accumulated_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        CoordinatorState {
+            accumulated_tokens: 5000,
+            max_agents: 4,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            accumulated_tokens: 3000,
+            max_agents: 2,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 8000);
+
+        CoordinatorState::reset_all_accumulated_tokens(dir);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 0);
+        // Non-token fields should be preserved
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(c0.max_agents, 4);
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(c1.max_agents, 2);
+    }
+
+    #[test]
+    fn test_per_coord_state_remove_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create per-ID files and a legacy file
+        CoordinatorState::default().save_for(dir, 0);
+        CoordinatorState::default().save_for(dir, 1);
+        CoordinatorState::default().save_for(dir, 5);
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, "{}").unwrap();
+
+        assert_eq!(CoordinatorState::load_all(dir).len(), 3);
+        assert!(legacy_path.exists());
+
+        CoordinatorState::remove_all(dir);
+
+        assert!(CoordinatorState::load_all(dir).is_empty());
+        assert!(!legacy_path.exists());
+        assert!(CoordinatorState::load_for(dir, 0).is_none());
+        assert!(CoordinatorState::load_for(dir, 1).is_none());
+        assert!(CoordinatorState::load_for(dir, 5).is_none());
+    }
+
+    #[test]
+    fn test_per_coord_state_migrate_legacy() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let legacy = CoordinatorState {
+            enabled: true,
+            max_agents: 8,
+            accumulated_tokens: 999,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let per_id_path = coordinator_state_path(dir, 0);
+        assert!(!per_id_path.exists());
+
+        CoordinatorState::migrate_legacy(dir);
+
+        // Legacy file should be removed
+        assert!(!legacy_path.exists());
+        // Per-ID file should exist with same data
+        assert!(per_id_path.exists());
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 8);
+        assert_eq!(loaded.accumulated_tokens, 999);
+        assert_eq!(loaded.executor, "claude");
+    }
+
+    #[test]
+    fn test_per_coord_state_migrate_legacy_noop_when_per_id_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create both legacy and per-ID files
+        let legacy = CoordinatorState {
+            max_agents: 99,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let per_id = CoordinatorState {
+            max_agents: 4,
+            ..Default::default()
+        };
+        per_id.save_for(dir, 0);
+
+        CoordinatorState::migrate_legacy(dir);
+
+        // Per-ID file should keep its original data (not overwritten by legacy)
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 4);
+        // Legacy file should NOT be removed (migration is a no-op)
+        assert!(legacy_path.exists());
+    }
+
+    #[test]
+    fn test_per_coord_state_update_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        CoordinatorState {
+            paused: false,
+            max_agents: 4,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            paused: false,
+            max_agents: 2,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        // Pause all coordinators
+        CoordinatorState::update_all(dir, |cs| cs.paused = true);
+
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert!(c0.paused);
+        assert_eq!(c0.max_agents, 4); // Unchanged
+
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert!(c1.paused);
+        assert_eq!(c1.max_agents, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_per_coord_state_two_coordinators_simultaneous_write() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Initialize state for two coordinators
+        CoordinatorState::default().save_for(dir, 0);
+        CoordinatorState::default().save_for(dir, 1);
+
+        let dir_a = dir.to_path_buf();
+        let dir_b = dir.to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+
+        // Thread A writes coordinator 0 repeatedly
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            for i in 0..100u64 {
+                let mut state = CoordinatorState::load_or_default_for(&dir_a, 0);
+                state.accumulated_tokens = i;
+                state.ticks = i;
+                state.max_agents = 4;
+                state.save_for(&dir_a, 0);
+            }
+        });
+
+        // Thread B writes coordinator 1 repeatedly
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            for i in 0..100u64 {
+                let mut state = CoordinatorState::load_or_default_for(&dir_b, 1);
+                state.accumulated_tokens = i * 10;
+                state.ticks = i;
+                state.max_agents = 8;
+                state.save_for(&dir_b, 1);
+            }
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // Both files should exist and be valid JSON (no corruption from concurrent writes)
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(c0.max_agents, 4);
+        assert_eq!(c0.ticks, 99);
+        assert_eq!(c0.accumulated_tokens, 99);
+
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(c1.max_agents, 8);
+        assert_eq!(c1.ticks, 99);
+        assert_eq!(c1.accumulated_tokens, 990);
+    }
+
+    #[test]
+    fn test_per_coord_state_service_status_reads_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create state for coordinators 0, 1, 2
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 200,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 300,
+            ..Default::default()
+        }
+        .save_for(dir, 2);
+
+        // load_all should return all three
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 3);
+
+        // total_accumulated_tokens should sum all
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 600);
+
+        // Coordinator 0 should be loadable independently
+        let c0 = CoordinatorState::load_or_default_for(dir, 0);
+        assert_eq!(c0.accumulated_tokens, 100);
     }
 }

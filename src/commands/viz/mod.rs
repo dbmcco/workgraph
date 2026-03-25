@@ -583,13 +583,13 @@ pub fn generate_viz_output_from_graph(
             .get_task(".compact-0")
             .map(|t| t.status)
             .unwrap_or(Status::Open);
-        let coord_state = crate::commands::service::CoordinatorState::load_or_default(dir);
+        let total_tokens = crate::commands::service::CoordinatorState::total_accumulated_tokens(dir);
         let config = workgraph::config::Config::load(dir).unwrap_or_default();
         let threshold = config.effective_compaction_threshold();
         let compactor_state = workgraph::service::compactor::CompactorState::load(dir);
         let annotation_text = compact_node_annotation(
             compact_task_status,
-            coord_state.accumulated_tokens,
+            total_tokens,
             threshold,
             compactor_state.last_compaction.as_deref(),
         );

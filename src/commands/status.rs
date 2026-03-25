@@ -227,7 +227,7 @@ fn gather_service_status(dir: &Path) -> Result<ServiceStatusInfo> {
 
 fn gather_coordinator_info(dir: &Path) -> CoordinatorInfo {
     // Try to get runtime state from coordinator (if daemon is running)
-    if let Some(coord) = CoordinatorState::load(dir) {
+    if let Some(coord) = CoordinatorState::load_for(dir, 0) {
         return CoordinatorInfo {
             max_agents: coord.max_agents,
             executor: coord.executor,
@@ -429,8 +429,7 @@ fn gather_compaction_info(dir: &Path) -> Option<CompactionInfo> {
         return None;
     }
 
-    let coord = CoordinatorState::load_or_default(dir);
-    let accumulated = coord.accumulated_tokens;
+    let accumulated = CoordinatorState::total_accumulated_tokens(dir);
     let percent = if threshold > 0 {
         ((accumulated as f64 / threshold as f64) * 100.0).min(100.0) as u8
     } else {
