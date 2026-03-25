@@ -10055,6 +10055,7 @@ mod tests {
             &graph,
             graph.tasks().collect(),
             &empty_annotations,
+            false,
         );
         let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
 
@@ -10204,6 +10205,7 @@ mod tests {
             &graph,
             graph.tasks().collect(),
             &empty_annotations,
+            false,
         );
         let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
 
