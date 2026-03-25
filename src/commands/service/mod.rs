@@ -1699,7 +1699,6 @@ fn run_graph_compaction(dir: &Path, compaction_error_count: &mut u64, logger: &D
             }
         }
     }
-
     // Check if .compact-0 is cycle-ready (uses cycle-aware readiness, not terminal check)
     {
         let graph = match load_graph(&gp) {

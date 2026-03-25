@@ -2816,6 +2816,18 @@ fn spawn_agents_for_ready_tasks(
             continue;
         }
 
+        // Board-routed tasks belong to the shared workboard / agent-service
+        // execution plane, not the repo-local coordinator. During graph
+        // separation, stale copies may still exist in repo graphs; the repo
+        // daemon must leave them untouched.
+        if task.exec.is_none() && task.tags.iter().any(|tag| tag.starts_with("board:")) {
+            eprintln!(
+                "[coordinator] Skipping shared board task '{}': board tags are handled outside the repo coordinator",
+                task.id,
+            );
+            continue;
+        }
+
         // Respawn throttle: detect rapid respawn loops and back off
         if let Err(reason) = check_respawn_throttle(task, &gp) {
             eprintln!("[coordinator] Skipping '{}': {}", task.id, reason);
@@ -2954,6 +2966,19 @@ fn spawn_agents_for_ready_tasks(
         } else {
             default_model.map(String::from)
         };
+
+        // Tasks explicitly assigned to non-agency agents (e.g. external
+        // service actors like "sam" or "derek") should not be executed by the
+        // repo-local coordinator. They are durable routing hints, not local
+        // worker identities. Exec tasks are exempt — they always run via shell.
+        if task.agent.is_some() && agent_entity.is_none() && task.exec.is_none() {
+            eprintln!(
+                "[coordinator] Skipping externally assigned task '{}': agent='{}' is not a local agency agent",
+                task.id,
+                task.agent.as_deref().unwrap_or(""),
+            );
+            continue;
+        }
 
         // Auto-detect native executor for non-Anthropic models.
         // If the resolved executor is "claude" but the effective model is a non-Anthropic
