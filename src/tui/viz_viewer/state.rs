@@ -3603,7 +3603,7 @@ impl VizApp {
                         && let Some(ref agent_id) = task.assigned
                     {
                         let short = if agent_id.len() > 10 {
-                            &agent_id[..10]
+                            &agent_id[..agent_id.floor_char_boundary(10)]
                         } else {
                             agent_id
                         };

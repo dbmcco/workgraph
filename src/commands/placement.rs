@@ -340,7 +340,7 @@ pub fn parse_and_apply(
             let text_preview = if text.len() > 500 {
                 format!(
                     "{}...[truncated, {} bytes total]",
-                    &text[..500],
+                    &text[..text.floor_char_boundary(500)],
                     text.len()
                 )
             } else {

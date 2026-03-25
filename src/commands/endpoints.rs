@@ -294,7 +294,7 @@ pub fn run_test(workgraph_dir: &Path, name: &str) -> Result<()> {
                 println!("  Authentication: FAILED — check your API key");
                 if !body.is_empty() {
                     let truncated = if body.len() > 200 {
-                        format!("{}...", &body[..200])
+                        format!("{}...", &body[..body.floor_char_boundary(200)])
                     } else {
                         body
                     };
@@ -306,7 +306,7 @@ pub fn run_test(workgraph_dir: &Path, name: &str) -> Result<()> {
                 println!("  Connectivity: OK (server responded)");
                 if !body.is_empty() {
                     let truncated = if body.len() > 200 {
-                        format!("{}...", &body[..200])
+                        format!("{}...", &body[..body.floor_char_boundary(200)])
                     } else {
                         body
                     };

@@ -6531,7 +6531,7 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ));
                     let truncated = if msg.len() > 40 {
-                        format!("{}...", &msg[..40])
+                        format!("{}...", &msg[..msg.floor_char_boundary(40)])
                     } else {
                         msg.clone()
                     };

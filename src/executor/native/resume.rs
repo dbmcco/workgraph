@@ -236,7 +236,7 @@ fn summarize_messages(messages: &[Message]) -> String {
                     if !trimmed.is_empty() {
                         if trimmed.len() > 200 {
                             key_texts
-                                .push(format!("{}...", &trimmed[..200]));
+                                .push(format!("{}...", &trimmed[..trimmed.floor_char_boundary(200)]));
                         } else {
                             key_texts.push(trimmed.to_string());
                         }
@@ -244,17 +244,18 @@ fn summarize_messages(messages: &[Message]) -> String {
                 }
                 ContentBlock::ToolUse { name, input, .. } => {
                     // Summarize tool calls
-                    let input_summary = if input.to_string().len() > 100 {
-                        format!("{}...", &input.to_string()[..100])
+                    let input_str = input.to_string();
+                    let input_summary = if input_str.len() > 100 {
+                        format!("{}...", &input_str[..input_str.floor_char_boundary(100)])
                     } else {
-                        input.to_string()
+                        input_str
                     };
                     tool_calls_seen.push(format!("{}({})", name, input_summary));
                 }
                 ContentBlock::ToolResult { content, is_error, .. } => {
                     if *is_error {
                         let preview = if content.len() > 100 {
-                            format!("{}...", &content[..100])
+                            format!("{}...", &content[..content.floor_char_boundary(100)])
                         } else {
                             content.clone()
                         };
@@ -439,7 +440,7 @@ fn detect_stale_state(entries: &[JournalEntry], working_dir: &Path) -> Vec<Strin
                             annotations.push(format!(
                                 "NOTE: Prior session ran bash command: {} (effects may have changed)",
                                 if cmd.len() > 100 {
-                                    format!("{}...", &cmd[..100])
+                                    format!("{}...", &cmd[..cmd.floor_char_boundary(100)])
                                 } else {
                                     cmd.to_string()
                                 }

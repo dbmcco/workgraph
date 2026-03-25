@@ -64,7 +64,7 @@ pub fn run_send(
         );
     }
     let msg = if message.len() > MAX_MESSAGE_SIZE {
-        &message[..MAX_MESSAGE_SIZE]
+        &message[..message.floor_char_boundary(MAX_MESSAGE_SIZE)]
     } else {
         message
     };
@@ -186,7 +186,7 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>, coordinator_id: u3
                 "Warning: Message truncated to {}KB",
                 MAX_MESSAGE_SIZE / 1024
             );
-            &trimmed[..MAX_MESSAGE_SIZE]
+            &trimmed[..trimmed.floor_char_boundary(MAX_MESSAGE_SIZE)]
         } else {
             trimmed
         };

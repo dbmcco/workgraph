@@ -384,7 +384,7 @@ fn print_ops(_id: &str, ops: &[OperationEntry]) {
             if detail_str.len() <= 120 {
                 println!("    {}", detail_str);
             } else {
-                println!("    {}...", &detail_str[..117]);
+                println!("    {}...", &detail_str[..detail_str.floor_char_boundary(117)]);
             }
         }
     }

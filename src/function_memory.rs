@@ -449,7 +449,7 @@ pub fn render_run_summaries(summaries: &[RunSummary], inclusions: &MemoryInclusi
                 .map(|(k, v)| {
                     let rendered = crate::function::render_value(v);
                     let truncated = if rendered.len() > 80 {
-                        format!("{}...", &rendered[..77])
+                        format!("{}...", &rendered[..rendered.floor_char_boundary(77)])
                     } else {
                         rendered
                     };

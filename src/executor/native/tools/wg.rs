@@ -63,7 +63,7 @@ fn generate_id(title: &str) -> String {
 
     // Truncate to reasonable length
     if slug.len() > 50 {
-        slug[..50].to_string()
+        slug[..slug.floor_char_boundary(50)].to_string()
     } else {
         slug
     }
