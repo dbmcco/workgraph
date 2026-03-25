@@ -2,13 +2,14 @@
 """Compress interaction-raw.cast into a 45-60s time-lapse with scene markers.
 
 Scene-aware compression tuned for the interaction screencast:
-- Scene 0 (CLI): moderate — show commands, crush wait between them
-- Scene 1 (Launch): moderate — typing visible
-- Scene 2 (Chat): typing real-speed, coordinator think-time crushed
-- Scene 3 (Agents): heavy on wait, keep status transitions visible
+- Scene 0 (CLI): fast typing (3×), output waits short
+- Scene 1 (Launch): fast typing (3×)
+- Scene 2 (Chat): fast typing (3×), coordinator response SLOWED DOWN to be visible
+- Scene 3 (Agents): moderate — keep status transitions visible
 - Scene 4 (Detail View): moderate — live output is the payoff
-- Scene 5 (Round 2): same as Scene 2
-- Scene 6 (Survey + Exit): moderate, navigation real-speed
+- Scene 5 (Round 2): fast typing (3×), coordinator moderate
+- Scene 6 (Results): slow — let viewer read haiku output
+- Scene 7 (Survey + Exit): moderate navigation, clean exit
 """
 
 import json
@@ -23,30 +24,35 @@ TIMEMAP_PATH = "screencast/recordings/interaction-timemap.json"
 SCENE_PAUSE = 0.5
 
 # Per-scene compression: (interaction_speed, activity_speed, short_wait_cap, long_wait_cap)
-#   interaction_speed: multiplier for gaps <0.3s (typing/keystrokes)
-#   activity_speed: multiplier for gaps 0.3-1s (TUI updating)
-#   short_wait_cap: cap for gaps 1-3s
-#   long_wait_cap: cap for gaps >3s
+#   interaction_speed: divides gaps <0.3s (typing/keystrokes). Higher = faster typing.
+#   activity_speed: divides gaps 0.3-1s (TUI updating). Higher = faster updates.
+#   short_wait_cap: cap for gaps 1-3s (coordinator think-time, agent waits)
+#   long_wait_cap: cap for gaps >3s (long pauses between actions)
 SCENE_PARAMS = {
-    # Scene 0 (~5s target): CLI commands — typing visible, output waits crushed
-    "cli":         (1.0, 2.0, 0.20, 0.12),
-    # Scene 1 (~4s target): typing + TUI launch
-    "launch":      (1.0, 2.0, 0.25, 0.20),
-    # Scene 2 (~8s target): typing real-speed, coordinator wait crushed
-    "chat":        (1.0, 1.5, 0.20, 0.15),
-    # Scene 3 (~10s target): agent spawn waits crushed, transitions visible
-    "agents":      (1.5, 3.0, 0.15, 0.10),
-    # Scene 4 (~15s target): moderate — live output is the key moment
-    "detail":      (1.0, 2.0, 0.30, 0.25),
-    # Scene 5 (~7s target): typing real-speed, coordinator wait crushed
-    "round2":      (1.0, 1.5, 0.20, 0.15),
-    # Scene 6 (~6s target): navigation + exit — heavy compression
-    "survey":      (1.5, 3.0, 0.10, 0.06),
-    # Exit
-    "exit":        (1.0, 2.0, 0.30, 0.20),
+    # Scene 0 (~3-4s target): CLI — typing 3× faster, output waits short
+    "cli":         (3.0, 2.0, 0.15, 0.10),
+    # Scene 1 (~2-3s target): typing 3× faster
+    "launch":      (3.0, 2.0, 0.20, 0.15),
+    # Scene 2 (~4-6s target): typing 3×, but SLOW DOWN coordinator response
+    "chat":        (3.0, 1.2, 0.40, 0.30),
+    # Scene 3 (~6-8s target): moderate — keep status transitions visible
+    "agents":      (1.5, 1.5, 0.25, 0.20),
+    # Scene 4 (~12-15s target): near real-speed for live output (the payoff)
+    "detail":      (1.0, 1.5, 0.40, 0.35),
+    # Scene 5 (~4-6s target): typing 3×, coordinator moderate
+    "round2":      (3.0, 1.5, 0.30, 0.20),
+    # Scene 6 (~6-8s target): results — slow enough to read haiku output
+    "results":     (1.0, 1.5, 0.50, 0.40),
+    # Scene 7 (~3-4s target): final survey navigation + exit
+    "survey":      (1.5, 2.0, 0.20, 0.15),
+    # Exit — clean
+    "exit":        (1.0, 2.0, 0.20, 0.15),
 }
 
 DEFAULT_PARAMS = (1.5, 3.0, 0.20, 0.15)
+
+
+SCENES_OVERRIDE_PATH = "screencast/recordings/interaction-scenes.json"
 
 
 def load_cast(path):
@@ -55,6 +61,37 @@ def load_cast(path):
     header = json.loads(lines[0])
     frames = [json.loads(line) for line in lines[1:]]
     return header, frames, lines
+
+
+def load_scene_overrides(frames):
+    """Load explicit scene boundaries from JSON override file.
+
+    File format: {"cli": 0.0, "launch": 7.6, "chat": 10.0, ...}
+    Values are timestamps in seconds. Converted to frame indices.
+
+    Returns list of (scene_name, start_frame_idx) or None if no file.
+    """
+    import os
+    if not os.path.exists(SCENES_OVERRIDE_PATH):
+        return None
+
+    with open(SCENES_OVERRIDE_PATH) as f:
+        overrides = json.load(f)
+
+    scenes = []
+    for scene_name, start_time in overrides.items():
+        # Find the frame closest to this timestamp
+        best_idx = 0
+        best_diff = float("inf")
+        for i, frame in enumerate(frames):
+            diff = abs(frame[0] - start_time)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        scenes.append((scene_name, best_idx))
+
+    scenes.sort(key=lambda x: x[1])
+    return scenes
 
 
 def detect_scenes(frames):
@@ -69,10 +106,13 @@ def detect_scenes(frames):
     agents_started = False
     detail_started = False
     round2_started = False
+    results_started = False
     survey_started = False
 
     # Track previous task count for detecting jumps
     prev_task_count = 0
+    agents_start_frame = 0
+    round2_start_frame = 0
 
     for i, frame in enumerate(frames):
         clean = re.sub(r'\x1b\[[^a-zA-Z]*[a-zA-Z]', '', frame[2])
@@ -119,6 +159,7 @@ def detect_scenes(frames):
                 # Check if roast-related content visible
                 if "snark" in clean.lower() or "roast" in clean.lower() or task_count >= 10:
                     round2_started = True
+                    round2_start_frame = i
                     # Look back to find typing start
                     typing_start = i
                     for j in range(max(0, i - 30), i):
@@ -130,23 +171,43 @@ def detect_scenes(frames):
 
             prev_task_count = task_count
 
-        # Survey/exit: after round2, detect navigation (fast consecutive frames)
-        if round2_started and not survey_started:
-            if i > 0 and (frames[i][0] - frames[i-1][0]) < 0.5:
-                survey_started = True
-                scenes.append(("survey", i))
+        # Results reveal: after round2, detect when draft-haikus Log tab is shown
+        # (the user navigates to draft-haikus and presses 2 for Log tab)
+        if round2_started and not results_started and i > round2_start_frame + 20:
+            # Look for "draft-haiku" appearing in inspector area with Log tab active
+            if "draft-haiku" in clean.lower() and "2:Log" in clean:
+                results_started = True
+                scenes.append(("results", i))
+
+        # Survey/exit: after results (or round2 if no results), detect fast navigation
+        if (results_started or round2_started) and not survey_started:
+            # Survey starts when we see rapid upward navigation after results
+            if results_started and i > 0:
+                # Detect consecutive fast frames (rapid arrow key navigation)
+                if i > 0 and (frames[i][0] - frames[i-1][0]) < 0.5:
+                    # Only after results scene has had some time
+                    result_scene_idx = next((idx for name, idx in scenes if name == "results"), 0)
+                    if i > result_scene_idx + 30:
+                        survey_started = True
+                        scenes.append(("survey", i))
+            elif not results_started and i > round2_start_frame + 50:
+                if i > 0 and (frames[i][0] - frames[i-1][0]) < 0.5:
+                    survey_started = True
+                    scenes.append(("survey", i))
 
     # If we didn't detect all scenes, add reasonable defaults
     if not launch_started:
-        scenes.append(("launch", len(frames) // 8))
+        scenes.append(("launch", len(frames) // 10))
     if not agents_started:
         scenes.append(("agents", len(frames) // 4))
     if not detail_started:
         scenes.append(("detail", len(frames) // 3))
     if not round2_started:
-        scenes.append(("round2", 2 * len(frames) // 3))
+        scenes.append(("round2", len(frames) // 2))
+    if not results_started:
+        scenes.append(("results", 3 * len(frames) // 4))
     if not survey_started:
-        scenes.append(("survey", 5 * len(frames) // 6))
+        scenes.append(("survey", 7 * len(frames) // 8))
 
     # Sort by frame index
     scenes.sort(key=lambda x: x[1])
@@ -238,7 +299,12 @@ def main():
     print(f"  Raw duration: {raw_duration:.1f}s ({raw_duration/60:.1f} min)")
 
     print("\nDetecting scenes...")
-    scenes = detect_scenes(frames)
+    scenes = load_scene_overrides(frames)
+    if scenes:
+        print(f"  Using explicit scene overrides from {SCENES_OVERRIDE_PATH}")
+    else:
+        scenes = detect_scenes(frames)
+        print("  Using auto-detected scenes")
     for name, idx in scenes:
         print(f"  {name}: frame {idx}, t={frames[idx][0]:.1f}s")
 

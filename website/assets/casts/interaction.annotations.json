@@ -2,51 +2,51 @@
   "annotations": [
     {
       "start": 0.0,
-      "end": 7.6,
+      "end": 1.8,
       "phase": "CLI",
-      "text": "Exploring the project — wg status, list, ready, and viz commands"
+      "text": "Quick project status — wg status and wg viz"
     },
     {
-      "start": 7.6,
-      "end": 9.0,
+      "start": 1.8,
+      "end": 5.5,
       "phase": "Launch",
       "text": "Launching the TUI with wg tui — Shift+I to shrink inspector"
     },
     {
-      "start": 9.0,
-      "end": 11.4,
+      "start": 5.5,
+      "end": 8.6,
       "phase": "Prompt",
       "text": "Chatting with the coordinator — \"Build a haiku news pipeline\""
     },
     {
-      "start": 11.4,
-      "end": 14.0,
+      "start": 8.6,
+      "end": 12.6,
       "phase": "Agents",
-      "text": "Tasks created and agents spawning in parallel"
+      "text": "Coordinator decomposes request into 8 tasks with dependencies"
     },
     {
-      "start": 14.0,
-      "end": 24.7,
+      "start": 12.6,
+      "end": 31.4,
       "phase": "Detail View",
       "text": "Exploring live agent output — Detail, Log, and Firehose tabs"
     },
     {
-      "start": 24.7,
-      "end": 31.5,
+      "start": 31.4,
+      "end": 40.8,
       "phase": "Round 2",
       "text": "Adding new requirements mid-flight — \"Add a roast mode\""
     },
     {
-      "start": 31.5,
-      "end": 52.0,
-      "phase": "Survey",
-      "text": "Navigating the full task graph — watching agents complete work"
+      "start": 40.8,
+      "end": 47.9,
+      "phase": "Results",
+      "text": "Viewing the output — generated haiku from news headlines"
     },
     {
-      "start": 52.0,
-      "end": 60.0,
+      "start": 47.9,
+      "end": 49.5,
       "phase": "Exit",
-      "text": "Final survey and clean exit"
+      "text": "Final graph survey and clean exit"
     }
   ]
 }

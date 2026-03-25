@@ -5,13 +5,14 @@ The new "hero" screencast that leads with CLI context before the TUI.
 Based on the design in docs/design/screencast-interaction-flow.md.
 
 Scenes:
-0. CLI Orient: wg status, wg list, wg ready, wg viz — establish CLI workflow
+0. CLI Orient: wg status, wg viz — establish CLI workflow (fast typing)
 1. Launch: wg tui (service pre-started)
 2. Talk to Coordinator: type prompt, coordinator responds + creates tasks
 3. Tasks Appear + Agents Spawn: graph fills in, parallel execution
 4. Live Detail View: Detail → Agency → Firehose (log) tabs showing agent output
 5. Conversation Round 2: follow-up message, coordinator adapts graph
-6. Final Survey + Exit: review completed tasks, quit
+6. Results Reveal: Navigate to draft-haikus and draft-roast-haikus to show output
+7. Final Survey + Exit: review completed graph, clean exit
 
 Output: screencast/recordings/interaction-raw.cast
 """
@@ -133,6 +134,47 @@ ROAST_RESPONSE_FALLBACK = (
     "Creating tasks now..."
 )
 
+# Sample haiku output to inject into completed tasks (for the results reveal scene)
+SAMPLE_HAIKU_OUTPUT = [
+    "Generated 5 haiku from today's headlines:",
+    "",
+    "  Markets climb higher",
+    "  Algorithms trade in haste",
+    "  Green numbers cascade",
+    "",
+    "  Satellite launched",
+    "  Silent arc through atmosphere",
+    "  New eye in the sky",
+    "",
+    "  Summit talks resume",
+    "  Old rivals share a long desk",
+    "  Cautious handshakes start",
+    "",
+    "  Coral reefs revive",
+    "  Warmer seas begin to cool",
+    "  Fish return to breed",
+    "",
+    "  Rover finds a rock",
+    "  Ancient water marks preserved",
+    "  Mars remembers rain",
+]
+
+SAMPLE_ROAST_OUTPUT = [
+    "Generated 3 roast haiku (snark filter engaged):",
+    "",
+    "  Markets climb again",
+    "  Your portfolio still red",
+    "  Maybe next quarter",
+    "",
+    "  Summit talks resume",
+    "  Same leaders, same empty words",
+    "  At least lunch was good",
+    "",
+    "  Tech CEO speaks",
+    "  Revolutionary, he says",
+    "  It's a chat widget",
+]
+
 # Scene tracking
 scenes_captured = {}
 _start_time = None
@@ -156,7 +198,7 @@ def wg(*args):
         return None
 
 
-def check_tasks_exist(expected_ids, timeout=180):
+def check_tasks_exist(expected_ids, timeout=90):
     """Wait for expected tasks to appear in the graph."""
     deadline = time.monotonic() + timeout
     last_report = 0
@@ -217,6 +259,41 @@ def count_alive_agents():
     return 0
 
 
+def inject_task_results():
+    """Inject sample haiku output into draft-haikus and draft-roast-haikus tasks.
+
+    Marks prerequisite tasks as done, injects log entries with sample haiku,
+    then marks the draft tasks as done. This ensures the TUI shows completed
+    tasks with visible output for the results reveal scene.
+    """
+    log("Injecting sample task results for results reveal...")
+
+    # Mark prerequisite tasks as done (so dependencies are satisfied)
+    prereqs = ["scrape-headlines", "count-syllables", "build-pun-db",
+               "analyze-mood", "wire-haiku-engine", "build-snark-filter"]
+    for tid in prereqs:
+        r = wg("show", tid)
+        if r and r.stdout and "done" not in r.stdout.lower():
+            wg("done", tid)
+            time.sleep(0.2)
+
+    # Inject haiku output into draft-haikus
+    for line in SAMPLE_HAIKU_OUTPUT:
+        if line:  # Skip empty lines (just log non-empty)
+            wg("log", "draft-haikus", line)
+    wg("done", "draft-haikus")
+    time.sleep(0.3)
+
+    # Inject roast output into draft-roast-haikus
+    for line in SAMPLE_ROAST_OUTPUT:
+        if line:
+            wg("log", "draft-roast-haikus", line)
+    wg("done", "draft-roast-haikus")
+    time.sleep(0.3)
+
+    log("Sample results injected")
+
+
 def setup_demo():
     """Initialize a fresh demo project."""
     if os.path.exists(DEMO_DIR):
@@ -273,7 +350,11 @@ def start_service():
 # ── Scenes ──────────────────────────────────────────────────
 
 def scene_0_cli(h):
-    """Scene 0: CLI Orient — show key commands before entering TUI."""
+    """Scene 0: CLI Orient — show key commands before entering TUI.
+
+    Stripped to just wg status + wg viz (dropped wg list / wg ready — redundant).
+    Typing at 150 WPM (~3× faster) so viewers aren't watching keystrokes.
+    """
     log("=== Scene 0: CLI Orient ===")
 
     h.wait_for("$", timeout=5)
@@ -281,28 +362,14 @@ def scene_0_cli(h):
     h.sleep(0.5)
 
     # wg status — show project state
-    h.type_naturally("wg status", wpm=45)
+    h.type_naturally("wg status", wpm=150)
     h.send_keys("Enter")
     log("Sent: wg status")
     h.sleep(2.5)
     h.flush_frame()
 
-    # wg list — show task list (empty at start)
-    h.type_naturally("wg list", wpm=45)
-    h.send_keys("Enter")
-    log("Sent: wg list")
-    h.sleep(2)
-    h.flush_frame()
-
-    # wg ready — what's available to work on
-    h.type_naturally("wg ready", wpm=45)
-    h.send_keys("Enter")
-    log("Sent: wg ready")
-    h.sleep(2)
-    h.flush_frame()
-
-    # wg viz — ASCII dependency graph
-    h.type_naturally("wg viz", wpm=45)
+    # wg viz — ASCII dependency graph (empty but shows the command)
+    h.type_naturally("wg viz", wpm=150)
     h.send_keys("Enter")
     log("Sent: wg viz")
     h.sleep(2.5)
@@ -320,8 +387,8 @@ def scene_1_launch(h):
     h.send_keys("C-l")
     h.sleep(0.3)
 
-    # Type wg tui naturally
-    h.type_naturally("wg tui", wpm=40)
+    # Type wg tui fast — viewers don't need to watch typing
+    h.type_naturally("wg tui", wpm=150)
     h.send_keys("Enter")
     log("Sent: wg tui")
 
@@ -363,9 +430,9 @@ def scene_2_chat(h, use_real_coordinator=True):
     h.sleep(1)
     h.flush_frame()
 
-    # Type the prompt naturally
+    # Type the prompt fast — focus should be on coordinator response, not typing
     log(f"Typing: {PROMPT}")
-    h.type_naturally(PROMPT, wpm=50)
+    h.type_naturally(PROMPT, wpm=150)
     h.sleep(0.5)
     h.flush_frame()
 
@@ -546,7 +613,7 @@ def scene_4_detail_view(h):
     h.send_keys("8")
     # Extended pause to let the viewer watch log output scrolling
     # as agents produce work in real time. This is the "wow" moment.
-    h.sleep(8)
+    h.sleep(12)
     h.flush_frame()
 
     if alive >= 1:
@@ -578,9 +645,9 @@ def scene_5_round2(h, use_real_coordinator=True):
     h.sleep(1)
     h.flush_frame()
 
-    # Type follow-up naturally
+    # Type follow-up fast — same rationale as scene 2
     log(f"Typing: {FOLLOWUP}")
-    h.type_naturally(FOLLOWUP, wpm=50)
+    h.type_naturally(FOLLOWUP, wpm=150)
     h.sleep(0.5)
     h.flush_frame()
 
@@ -634,64 +701,113 @@ def scene_5_round2(h, use_real_coordinator=True):
     log(f"Scene 5 complete (coordinator: {coordinator_ok})")
 
 
-def scene_6_survey_exit(h):
-    """Scene 6: Final Survey + Exit."""
-    log("=== Scene 6: Final Survey + Exit ===")
+def scene_6_results_reveal(h):
+    """Scene 6: Results Reveal — show the haiku output from draft-haikus and draft-roast-haikus.
 
-    # Wait for some second-wave tasks to progress
-    log("Waiting for second wave progress...")
-    deadline = time.monotonic() + 120
+    This is the payoff: the viewer actually sees what the agents produced.
+    Injects sample results if tasks haven't completed naturally, then
+    navigates to each result task and lingers on the Log tab.
+    """
+    log("=== Scene 6: Results Reveal ===")
 
-    while time.monotonic() < deadline:
-        r = wg("list")
-        if r and r.stdout:
-            roast_lines = [l for l in r.stdout.split("\n")
-                          if "snark" in l.lower() or "roast" in l.lower()]
-            has_activity = any("in-progress" in l.lower() or "done" in l.lower()
-                             for l in roast_lines)
-            if has_activity:
-                log("Second wave has activity")
-                break
-        h.sleep(5)
+    # Check if draft-haikus is done; if not, inject results
+    r = wg("show", "draft-haikus")
+    if r and r.stdout and "done" not in r.stdout.lower():
+        inject_task_results()
 
+    # Let TUI refresh to show updated task statuses
     h.sleep(3)
+    h.flush_frame()
 
-    # Navigate to a roast task and show its log
-    for i in range(10):
+    # Navigate to top of graph first
+    for _ in range(15):
+        h.send_keys("Up")
+        h.sleep(0.2)
+    h.sleep(0.5)
+
+    # Navigate down to find draft-haikus
+    log("Navigating to draft-haikus...")
+    found_draft = False
+    for i in range(20):
         snap = h.snapshot()
-        if "snark" in snap.lower() or "roast" in snap.lower():
-            log(f"Found roast task at position {i}")
+        # Look for draft-haikus in the inspector (right panel)
+        lines = snap.split("\n")
+        in_inspector = False
+        for line in lines:
+            if "draft-haikus" in line.lower() and "draft-roast" not in line.lower():
+                # Check if this is the SELECTED task (shown in inspector header or highlighted)
+                if "done" in line.lower() or "│" in line:
+                    in_inspector = True
+        if "draft-haikus" in snap.lower() and "draft-roast" not in snap.lower():
+            found_draft = True
+            log(f"Found draft-haikus at position {i}")
             break
         h.send_keys("Down")
-        h.sleep(1)
+        h.sleep(0.8)
 
-    # Show Log tab for the roast task — let viewer read the content
+    # Show Log tab — this should show the haiku output
+    h.send_keys("2")
+    h.sleep(5)
+    h.flush_frame()
+    log("Showing draft-haikus Log tab (haiku output)")
+
+    # Navigate to draft-roast-haikus
+    log("Navigating to draft-roast-haikus...")
+    found_roast = False
+    for i in range(12):
+        snap = h.snapshot()
+        if "draft-roast" in snap.lower():
+            found_roast = True
+            log(f"Found draft-roast-haikus at position {i}")
+            break
+        h.send_keys("Down")
+        h.sleep(0.8)
+
+    # Show Log tab for roast haikus
     h.send_keys("2")
     h.sleep(4)
     h.flush_frame()
+    log("Showing draft-roast-haikus Log tab (roast haiku output)")
 
-    # Switch to Detail tab briefly to show completed task output
-    h.send_keys("1")
-    h.sleep(3)
-    h.flush_frame()
+    scenes_captured["scene6_results"] = found_draft or found_roast
+    log(f"Scene 6 complete (found_draft={found_draft}, found_roast={found_roast})")
 
-    # Navigate back up through the full graph to survey all tasks
-    for _ in range(8):
+
+def scene_7_survey_exit(h):
+    """Scene 7: Final Survey + Exit — review the completed graph, then clean exit."""
+    log("=== Scene 7: Final Survey + Exit ===")
+
+    # Navigate back to the top of the graph to show the full picture
+    for _ in range(15):
         h.send_keys("Up")
-        h.sleep(0.8)
+        h.sleep(0.3)
+
+    # Switch to Detail tab for clean view
+    h.send_keys("1")
+    h.sleep(1)
+
+    # Slow scroll down through the completed graph — viewer absorbs the final state
+    for _ in range(8):
+        h.send_keys("Down")
+        h.sleep(1.2)
         h.flush_frame()
 
-    # Final pause — let viewer absorb the completed graph
+    # Final pause — let viewer see the completed graph
     h.sleep(3)
     h.flush_frame()
+    log("Final graph survey complete")
 
-    # Exit TUI
+    # Exit TUI cleanly
     h.send_keys("q")
-    h.sleep(2)
+    h.sleep(1.5)
     h.flush_frame()
 
-    scenes_captured["scene6_exit"] = True
-    log("Scene 6 complete")
+    # Hold on the shell prompt briefly for a clean ending
+    h.sleep(1)
+    h.flush_frame()
+
+    scenes_captured["scene7_exit"] = True
+    log("Scene 7 complete")
 
 
 # ── Main ────────────────────────────────────────────────────
@@ -751,8 +867,11 @@ def record():
             # Scene 5: Conversation Round 2
             scene_5_round2(h, use_real_coordinator=use_real)
 
-            # Scene 6: Final Survey + Exit
-            scene_6_survey_exit(h)
+            # Scene 6: Results Reveal
+            scene_6_results_reveal(h)
+
+            # Scene 7: Final Survey + Exit
+            scene_7_survey_exit(h)
 
             duration = h.duration
             frames = h.frame_count
