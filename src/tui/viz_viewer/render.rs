@@ -11047,7 +11047,7 @@ mod tests {
 
     #[test]
     fn test_responsive_breakpoint_from_width() {
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         // Compact: < 50
         assert_eq!(ResponsiveBreakpoint::from_width(0), ResponsiveBreakpoint::Compact);
@@ -11071,7 +11071,7 @@ mod tests {
         // Render at 40-col width (phone-like, Termux/Blink Shell).
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11090,7 +11090,7 @@ mod tests {
         // Render at 60-col width (narrow terminal).
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11108,7 +11108,7 @@ mod tests {
         // Render at 100-col width (standard terminal).
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11127,7 +11127,7 @@ mod tests {
         // span the full main area (minus status/hints bars).
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::{ResponsiveBreakpoint, SinglePanelView};
+        use crate::tui::viz_viewer::state::{ResponsiveBreakpoint, SinglePanelView};
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11153,7 +11153,7 @@ mod tests {
         // should render — graph area should be zeroed out.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::{ResponsiveBreakpoint, SinglePanelView};
+        use crate::tui::viz_viewer::state::{ResponsiveBreakpoint, SinglePanelView};
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11175,11 +11175,11 @@ mod tests {
     #[test]
     fn test_responsive_compact_toggle_single_panel() {
         // Verify that toggle_single_panel_view switches between Graph and Detail.
-        use super::state::{FocusedPanel, SinglePanelView};
+        use crate::tui::viz_viewer::state::{FocusedPanel, SinglePanelView};
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
-        app.responsive_breakpoint = super::state::ResponsiveBreakpoint::Compact;
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
         app.single_panel_view = SinglePanelView::Graph;
         app.focused_panel = FocusedPanel::Graph;
 
@@ -11200,12 +11200,12 @@ mod tests {
         // side-by-side split with constrained proportions.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
         app.right_panel_visible = true;
-        app.layout_mode = LayoutMode::TwoThirdsInspector;
+        app.layout_mode = crate::tui::viz_viewer::state::LayoutMode::TwoThirdsInspector;
 
         let backend = TestBackend::new(60, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -11230,7 +11230,7 @@ mod tests {
         // breakpoint changes dynamically.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use super::state::ResponsiveBreakpoint;
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
@@ -11264,11 +11264,11 @@ mod tests {
     fn test_responsive_compact_tab_toggles_panel_focus() {
         // In compact mode, toggle_panel_focus should switch single_panel_view
         // instead of just changing focus.
-        use super::state::{FocusedPanel, SinglePanelView};
+        use crate::tui::viz_viewer::state::{FocusedPanel, SinglePanelView};
 
         let (viz, _) = build_hud_test_graph();
         let mut app = build_app_from_viz_output(&viz, "a");
-        app.responsive_breakpoint = super::state::ResponsiveBreakpoint::Compact;
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
         app.single_panel_view = SinglePanelView::Graph;
         app.focused_panel = FocusedPanel::Graph;
 
