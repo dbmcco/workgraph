@@ -7,11 +7,11 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    ChoiceDialogState, ConfigEditKind, ConfigSection, ConfirmAction, ControlPanelFocus,
-    CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus, FocusedPanel, InputMode, LayoutMode,
-    RightPanelTab, ServiceHealthLevel, SortMode, TaskFormField, TaskFormState, TextPromptAction,
-    VizApp, WAVE_BOLT, WAVE_NUM_BOLTS, extract_section_name, format_duration_compact,
-    spinner_wave_pos,
+    ActivityEventKind, ChoiceDialogState, ConfigEditKind, ConfigSection, ConfirmAction,
+    ControlPanelFocus, CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus, FocusedPanel,
+    InputMode, LayoutMode, ResponsiveBreakpoint, RightPanelTab, ServiceHealthLevel,
+    SinglePanelView, SortMode, TaskFormField, TaskFormState, TextPromptAction, VizApp, WAVE_BOLT,
+    WAVE_NUM_BOLTS, extract_section_name, format_duration_compact, spinner_wave_pos,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -123,9 +123,14 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     {
         app.load_agency_lifecycle();
     }
-    // Lazy-load coordinator log on first switch to CoordLog tab.
-    if app.right_panel_tab == RightPanelTab::CoordLog && app.coord_log.rendered_lines.is_empty() {
-        app.load_coord_log();
+    // Lazy-load coordinator log + activity feed on first switch to CoordLog tab.
+    if app.right_panel_tab == RightPanelTab::CoordLog {
+        if app.coord_log.rendered_lines.is_empty() {
+            app.load_coord_log();
+        }
+        if app.activity_feed.events.is_empty() {
+            app.load_activity_feed();
+        }
     }
     // Lazy-init file browser on first switch to Files tab.
     if app.right_panel_tab == RightPanelTab::Files && app.file_browser.is_none() {
@@ -136,60 +141,132 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         app.update_firehose();
     }
 
+    // ── Responsive breakpoint detection ──
+    // Recomputed each frame from the terminal width. Drives layout decisions below.
+    app.responsive_breakpoint = ResponsiveBreakpoint::from_width(area.width);
+
     // Phase 1: Compute viewport dimensions from layout (needed for deferred centering).
-    match app.layout_mode {
-        LayoutMode::FullInspector => {
-            app.last_graph_area = Rect::default();
-            app.scroll.viewport_height = 0;
-            app.scroll.viewport_width = 0;
-        }
-        LayoutMode::Off => {
-            app.last_graph_area = main_area;
-            app.last_right_panel_area = Rect::default();
-            app.last_tab_bar_area = Rect::default();
-            app.last_right_content_area = Rect::default();
-            app.scroll.viewport_height = main_area.height as usize;
-            app.scroll.viewport_width = main_area.width as usize;
-        }
-        LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
-            if app.right_panel_visible {
-                if area.width >= SIDE_MIN_WIDTH {
-                    let right_width =
-                        (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
-                    let left_width = main_area.width.saturating_sub(right_width);
-                    let split = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Length(left_width),
-                            Constraint::Length(right_width),
-                        ])
-                        .split(main_area);
-                    app.last_graph_area = split[0];
-                    app.scroll.viewport_height = split[0].height as usize;
-                    app.scroll.viewport_width = split[0].width as usize;
-                } else {
-                    let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
-                        / 100)
-                        .max(5) as u16;
-                    let top_height = main_area.height.saturating_sub(panel_height);
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(top_height),
-                            Constraint::Length(panel_height),
-                        ])
-                        .split(main_area);
-                    app.last_graph_area = split[0];
-                    app.scroll.viewport_height = split[0].height as usize;
-                    app.scroll.viewport_width = split[0].width as usize;
+    match app.responsive_breakpoint {
+        ResponsiveBreakpoint::Compact => {
+            // Single-panel mode: show graph OR detail, never both.
+            match app.single_panel_view {
+                SinglePanelView::Graph => {
+                    app.last_graph_area = main_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = main_area.height as usize;
+                    app.scroll.viewport_width = main_area.width as usize;
                 }
-            } else {
-                app.last_graph_area = main_area;
-                app.last_right_panel_area = Rect::default();
-                app.last_tab_bar_area = Rect::default();
-                app.last_right_content_area = Rect::default();
-                app.scroll.viewport_height = main_area.height as usize;
-                app.scroll.viewport_width = main_area.width as usize;
+                SinglePanelView::Detail => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                }
+            }
+        }
+        ResponsiveBreakpoint::Narrow => {
+            // Narrow split: side-by-side at ~40/60 or stacked, depending on split layout.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                }
+                LayoutMode::Off => {
+                    app.last_graph_area = main_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = main_area.height as usize;
+                    app.scroll.viewport_width = main_area.width as usize;
+                }
+                _ => {
+                    if app.right_panel_visible {
+                        // In narrow mode, use a compact side-by-side split.
+                        // Graph gets 40%, inspector gets 60% (minimum useful inspector width).
+                        let right_pct = app.right_panel_percent.max(50).min(70);
+                        let right_width =
+                            (main_area.width as u32 * right_pct as u32 / 100) as u16;
+                        let left_width = main_area.width.saturating_sub(right_width);
+                        let split = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(left_width),
+                                Constraint::Length(right_width),
+                            ])
+                            .split(main_area);
+                        app.last_graph_area = split[0];
+                        app.scroll.viewport_height = split[0].height as usize;
+                        app.scroll.viewport_width = split[0].width as usize;
+                    } else {
+                        app.last_graph_area = main_area;
+                        app.last_right_panel_area = Rect::default();
+                        app.last_tab_bar_area = Rect::default();
+                        app.last_right_content_area = Rect::default();
+                        app.scroll.viewport_height = main_area.height as usize;
+                        app.scroll.viewport_width = main_area.width as usize;
+                    }
+                }
+            }
+        }
+        ResponsiveBreakpoint::Full => {
+            // Full layout: existing behavior, unchanged.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                }
+                LayoutMode::Off => {
+                    app.last_graph_area = main_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = main_area.height as usize;
+                    app.scroll.viewport_width = main_area.width as usize;
+                }
+                LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
+                    if app.right_panel_visible {
+                        if area.width >= SIDE_MIN_WIDTH {
+                            let right_width =
+                                (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
+                            let left_width = main_area.width.saturating_sub(right_width);
+                            let split = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Length(left_width),
+                                    Constraint::Length(right_width),
+                                ])
+                                .split(main_area);
+                            app.last_graph_area = split[0];
+                            app.scroll.viewport_height = split[0].height as usize;
+                            app.scroll.viewport_width = split[0].width as usize;
+                        } else {
+                            let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
+                                / 100)
+                                .max(5) as u16;
+                            let top_height = main_area.height.saturating_sub(panel_height);
+                            let split = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Length(top_height),
+                                    Constraint::Length(panel_height),
+                                ])
+                                .split(main_area);
+                            app.last_graph_area = split[0];
+                            app.scroll.viewport_height = split[0].height as usize;
+                            app.scroll.viewport_width = split[0].width as usize;
+                        }
+                    } else {
+                        app.last_graph_area = main_area;
+                        app.last_right_panel_area = Rect::default();
+                        app.last_tab_bar_area = Rect::default();
+                        app.last_right_content_area = Rect::default();
+                        app.scroll.viewport_height = main_area.height as usize;
+                        app.scroll.viewport_width = main_area.width as usize;
+                    }
+                }
             }
         }
     }
@@ -205,106 +282,210 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     }
 
     // Phase 3: Draw content using the (possibly updated) scroll offset.
-    match app.layout_mode {
-        LayoutMode::FullInspector => {
-            draw_right_panel(frame, app, main_area);
-            app.last_graph_hscrollbar_area = Rect::default();
-        }
-        LayoutMode::Off => {
-            draw_viz_content(frame, app, main_area);
-            if app.scroll.content_height > app.scroll.viewport_height
-                && app.graph_scrollbar_visible()
-            {
-                draw_scrollbar(frame, app, main_area);
+    match app.responsive_breakpoint {
+        ResponsiveBreakpoint::Compact => {
+            // Single-panel mode: draw only the active panel.
+            match app.single_panel_view {
+                SinglePanelView::Graph => {
+                    draw_viz_content(frame, app, main_area);
+                    if app.scroll.content_height > app.scroll.viewport_height
+                        && app.graph_scrollbar_visible()
+                    {
+                        draw_scrollbar(frame, app, main_area);
+                    }
+                    app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                        frame,
+                        main_area,
+                        app.scroll.content_width,
+                        app.scroll.viewport_width,
+                        app.scroll.offset_x,
+                        app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                    );
+                }
+                SinglePanelView::Detail => {
+                    draw_right_panel(frame, app, main_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
             }
-            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
-                frame,
-                main_area,
-                app.scroll.content_width,
-                app.scroll.viewport_width,
-                app.scroll.offset_x,
-                app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
-            );
         }
-        LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
-            if app.right_panel_visible {
-                if area.width >= SIDE_MIN_WIDTH {
-                    let right_width =
-                        (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
-                    let left_width = main_area.width.saturating_sub(right_width);
-                    let split = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Length(left_width),
-                            Constraint::Length(right_width),
-                        ])
-                        .split(main_area);
-
-                    let viz_area = split[0];
-                    let right_area = split[1];
-
-                    draw_viz_content(frame, app, viz_area);
+        ResponsiveBreakpoint::Narrow => {
+            // Narrow split mode.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    draw_right_panel(frame, app, main_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    draw_viz_content(frame, app, main_area);
                     if app.scroll.content_height > app.scroll.viewport_height
                         && app.graph_scrollbar_visible()
                     {
-                        draw_scrollbar(frame, app, viz_area);
+                        draw_scrollbar(frame, app, main_area);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
                         frame,
-                        viz_area,
+                        main_area,
                         app.scroll.content_width,
                         app.scroll.viewport_width,
                         app.scroll.offset_x,
                         app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
                     );
-                    draw_right_panel(frame, app, right_area);
-                } else {
-                    let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
-                        / 100)
-                        .max(5) as u16;
-                    let top_height = main_area.height.saturating_sub(panel_height);
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(top_height),
-                            Constraint::Length(panel_height),
-                        ])
-                        .split(main_area);
+                }
+                _ => {
+                    if app.right_panel_visible {
+                        let right_pct = app.right_panel_percent.max(50).min(70);
+                        let right_width =
+                            (main_area.width as u32 * right_pct as u32 / 100) as u16;
+                        let left_width = main_area.width.saturating_sub(right_width);
+                        let split = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(left_width),
+                                Constraint::Length(right_width),
+                            ])
+                            .split(main_area);
 
-                    let viz_area = split[0];
-                    let right_area = split[1];
+                        let viz_area = split[0];
+                        let right_area = split[1];
 
-                    draw_viz_content(frame, app, viz_area);
+                        draw_viz_content(frame, app, viz_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, viz_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            viz_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                        draw_right_panel(frame, app, right_area);
+                    } else {
+                        draw_viz_content(frame, app, main_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, main_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            main_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                    }
+                }
+            }
+        }
+        ResponsiveBreakpoint::Full => {
+            // Full layout: existing behavior.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    draw_right_panel(frame, app, main_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    draw_viz_content(frame, app, main_area);
                     if app.scroll.content_height > app.scroll.viewport_height
                         && app.graph_scrollbar_visible()
                     {
-                        draw_scrollbar(frame, app, viz_area);
+                        draw_scrollbar(frame, app, main_area);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
                         frame,
-                        viz_area,
+                        main_area,
                         app.scroll.content_width,
                         app.scroll.viewport_width,
                         app.scroll.offset_x,
                         app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
                     );
-                    draw_right_panel(frame, app, right_area);
                 }
-            } else {
-                draw_viz_content(frame, app, main_area);
-                if app.scroll.content_height > app.scroll.viewport_height
-                    && app.graph_scrollbar_visible()
-                {
-                    draw_scrollbar(frame, app, main_area);
+                LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
+                    if app.right_panel_visible {
+                        if area.width >= SIDE_MIN_WIDTH {
+                            let right_width =
+                                (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
+                            let left_width = main_area.width.saturating_sub(right_width);
+                            let split = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Length(left_width),
+                                    Constraint::Length(right_width),
+                                ])
+                                .split(main_area);
+
+                            let viz_area = split[0];
+                            let right_area = split[1];
+
+                            draw_viz_content(frame, app, viz_area);
+                            if app.scroll.content_height > app.scroll.viewport_height
+                                && app.graph_scrollbar_visible()
+                            {
+                                draw_scrollbar(frame, app, viz_area);
+                            }
+                            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                                frame,
+                                viz_area,
+                                app.scroll.content_width,
+                                app.scroll.viewport_width,
+                                app.scroll.offset_x,
+                                app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                            );
+                            draw_right_panel(frame, app, right_area);
+                        } else {
+                            let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
+                                / 100)
+                                .max(5) as u16;
+                            let top_height = main_area.height.saturating_sub(panel_height);
+                            let split = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Length(top_height),
+                                    Constraint::Length(panel_height),
+                                ])
+                                .split(main_area);
+
+                            let viz_area = split[0];
+                            let right_area = split[1];
+
+                            draw_viz_content(frame, app, viz_area);
+                            if app.scroll.content_height > app.scroll.viewport_height
+                                && app.graph_scrollbar_visible()
+                            {
+                                draw_scrollbar(frame, app, viz_area);
+                            }
+                            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                                frame,
+                                viz_area,
+                                app.scroll.content_width,
+                                app.scroll.viewport_width,
+                                app.scroll.offset_x,
+                                app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                            );
+                            draw_right_panel(frame, app, right_area);
+                        }
+                    } else {
+                        draw_viz_content(frame, app, main_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, main_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            main_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                    }
                 }
-                app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
-                    frame,
-                    main_area,
-                    app.scroll.content_width,
-                    app.scroll.viewport_width,
-                    app.scroll.offset_x,
-                    app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
-                );
             }
         }
     }
@@ -3050,19 +3231,27 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 }
 
-/// Draw the Coordinator Log tab (panel 7) — daemon activity log.
+/// Draw the Coordinator Log tab (panel 7) — activity feed from operations.jsonl.
 fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    // If we have activity feed events, render the semantic view.
+    // Otherwise fall back to the raw daemon.log display.
+    if !app.activity_feed.events.is_empty() {
+        draw_activity_feed(frame, app, area);
+        return;
+    }
+
+    // Fallback: raw daemon.log (original behavior).
     if app.coord_log.rendered_lines.is_empty() {
         let msg = Paragraph::new(vec![
             Line::from(Span::styled(
-                "Coordinator Log",
+                "Activity Feed",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "No coordinator activity yet.",
+                "No activity yet.",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
@@ -3150,6 +3339,100 @@ fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             total_lines.saturating_sub(viewport_h),
             scroll,
         );
+    }
+}
+
+/// Render the semantic activity feed from parsed operations.jsonl events.
+fn draw_activity_feed(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let viewport_h = area.height as usize;
+    app.activity_feed.viewport_height = viewport_h;
+    if viewport_h == 0 {
+        return;
+    }
+    let wrap_width = area.width as usize;
+    let mut wrapped_lines: Vec<Line> = Vec::new();
+
+    for event in &app.activity_feed.events {
+        let (icon_color, icon_style) = activity_event_style(&event.kind);
+        // Format: "HH:MM:SS icon summary"
+        let time_span = Span::styled(
+            format!("{} ", event.time_short),
+            Style::default().fg(Color::DarkGray),
+        );
+        let icon_span = Span::styled(format!("{} ", event.icon()), icon_style);
+        let summary_span = Span::styled(event.summary.clone(), Style::default().fg(icon_color));
+
+        let prefix_len = event.time_short.len() + 1 + event.icon().len() + 1;
+        let text_width = wrap_width.saturating_sub(prefix_len);
+
+        if text_width == 0 || event.summary.is_empty() {
+            wrapped_lines.push(Line::from(vec![time_span, icon_span, summary_span]));
+        } else if event.summary.width() > text_width {
+            let wrapped = word_wrap(&event.summary, text_width);
+            let indent = " ".repeat(prefix_len);
+            for (i, wl) in wrapped.iter().enumerate() {
+                if i == 0 {
+                    wrapped_lines.push(Line::from(vec![
+                        time_span.clone(),
+                        icon_span.clone(),
+                        Span::styled(wl.to_string(), Style::default().fg(icon_color)),
+                    ]));
+                } else {
+                    wrapped_lines.push(Line::from(Span::styled(
+                        format!("{}{}", indent, wl),
+                        Style::default().fg(icon_color),
+                    )));
+                }
+            }
+        } else {
+            wrapped_lines.push(Line::from(vec![time_span, icon_span, summary_span]));
+        }
+    }
+
+    let total_lines = wrapped_lines.len();
+    app.activity_feed.total_wrapped_lines = total_lines;
+    let scroll = app
+        .activity_feed
+        .scroll
+        .min(total_lines.saturating_sub(viewport_h));
+    let end = (scroll + viewport_h).min(total_lines);
+    let visible_lines: Vec<Line> = wrapped_lines[scroll..end].to_vec();
+    let paragraph = Paragraph::new(visible_lines);
+    frame.render_widget(paragraph, area);
+    if total_lines > viewport_h && app.panel_scrollbar_visible() {
+        draw_panel_scrollbar(
+            frame,
+            app,
+            area,
+            total_lines.saturating_sub(viewport_h),
+            scroll,
+        );
+    }
+}
+
+/// Return (foreground color, icon Style) for an activity event kind.
+fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
+    match kind {
+        ActivityEventKind::TaskCreated => (Color::Blue, Style::default().fg(Color::Blue)),
+        ActivityEventKind::StatusChange => (Color::Yellow, Style::default().fg(Color::Yellow)),
+        ActivityEventKind::AgentSpawned => (Color::Green, Style::default().fg(Color::Green)),
+        ActivityEventKind::AgentCompleted => (
+            Color::Green,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ActivityEventKind::AgentFailed => (
+            Color::Red,
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ActivityEventKind::CoordinatorTick => {
+            (Color::DarkGray, Style::default().fg(Color::DarkGray))
+        }
+        ActivityEventKind::VerificationResult => (Color::Cyan, Style::default().fg(Color::Cyan)),
+        ActivityEventKind::UserAction => (Color::White, Style::default().fg(Color::White)),
     }
 }
 
@@ -5299,22 +5582,29 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                     )
                 }
             }
-            FocusedPanel::Graph => (
-                "Graph",
-                "NAV",
-                Color::Rgb(120, 120, 120),
-                vec![
-                    ("↑↓", "select"),
-                    ("Enter", "inspect"),
-                    ("Tab", "panel"),
-                    ("/", "search"),
-                    ("a", "add"),
-                    ("D", "done"),
-                    ("i/I", "resize pane"),
-                    ("?", "help"),
-                    ("Alt←→", "cycle views"),
-                ],
-            ),
+            FocusedPanel::Graph => {
+                let tab_hint = if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                    ("Tab", "detail")
+                } else {
+                    ("Tab", "panel")
+                };
+                (
+                    "Graph",
+                    "NAV",
+                    Color::Rgb(120, 120, 120),
+                    vec![
+                        ("↑↓", "select"),
+                        ("Enter", "inspect"),
+                        tab_hint,
+                        ("/", "search"),
+                        ("a", "add"),
+                        ("D", "done"),
+                        ("i/I", "resize pane"),
+                        ("?", "help"),
+                        ("Alt←→", "cycle views"),
+                    ],
+                )
+            }
             FocusedPanel::RightPanel => {
                 let tab = &app.right_panel_tab;
                 let tab_label: &str = match tab {
@@ -10749,5 +11039,247 @@ mod tests {
             assert_eq!(status_color, expected_color, "Status '{status}' should use correct color");
             assert!(status_text.contains(status), "Status text should contain the status string");
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Responsive breakpoint tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_responsive_breakpoint_from_width() {
+        use super::state::ResponsiveBreakpoint;
+
+        // Compact: < 50
+        assert_eq!(ResponsiveBreakpoint::from_width(0), ResponsiveBreakpoint::Compact);
+        assert_eq!(ResponsiveBreakpoint::from_width(30), ResponsiveBreakpoint::Compact);
+        assert_eq!(ResponsiveBreakpoint::from_width(40), ResponsiveBreakpoint::Compact);
+        assert_eq!(ResponsiveBreakpoint::from_width(49), ResponsiveBreakpoint::Compact);
+
+        // Narrow: 50–80
+        assert_eq!(ResponsiveBreakpoint::from_width(50), ResponsiveBreakpoint::Narrow);
+        assert_eq!(ResponsiveBreakpoint::from_width(60), ResponsiveBreakpoint::Narrow);
+        assert_eq!(ResponsiveBreakpoint::from_width(80), ResponsiveBreakpoint::Narrow);
+
+        // Full: > 80
+        assert_eq!(ResponsiveBreakpoint::from_width(81), ResponsiveBreakpoint::Full);
+        assert_eq!(ResponsiveBreakpoint::from_width(100), ResponsiveBreakpoint::Full);
+        assert_eq!(ResponsiveBreakpoint::from_width(200), ResponsiveBreakpoint::Full);
+    }
+
+    #[test]
+    fn test_responsive_compact_40_cols_no_panic() {
+        // Render at 40-col width (phone-like, Termux/Blink Shell).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::ResponsiveBreakpoint;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // After drawing at 40 cols, breakpoint should be Compact.
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+    }
+
+    #[test]
+    fn test_responsive_narrow_60_cols_no_panic() {
+        // Render at 60-col width (narrow terminal).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::ResponsiveBreakpoint;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+    }
+
+    #[test]
+    fn test_responsive_full_100_cols_no_panic() {
+        // Render at 100-col width (standard terminal).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::ResponsiveBreakpoint;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+    }
+
+    #[test]
+    fn test_responsive_compact_single_panel_graph_view() {
+        // In compact mode with SinglePanelView::Graph, the graph area should
+        // span the full main area (minus status/hints bars).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::{ResponsiveBreakpoint, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.single_panel_view = SinglePanelView::Graph;
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+        // Graph area should have width == 40 (full terminal width).
+        assert_eq!(app.last_graph_area.width, 40);
+        // Graph area height should be main_area height (total - 2 for status/hints bars).
+        assert_eq!(app.last_graph_area.height, 23);
+        // Right panel area should be empty (not shown).
+        assert_eq!(app.last_right_panel_area, Rect::default());
+    }
+
+    #[test]
+    fn test_responsive_compact_single_panel_detail_view() {
+        // In compact mode with SinglePanelView::Detail, only the inspector
+        // should render — graph area should be zeroed out.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::{ResponsiveBreakpoint, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.single_panel_view = SinglePanelView::Detail;
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+        // Graph area should be zeroed (not visible).
+        assert_eq!(app.last_graph_area, Rect::default());
+        // Right panel area should be non-empty (it's the active view).
+        assert!(app.last_right_panel_area.width > 0);
+        assert!(app.last_right_panel_area.height > 0);
+    }
+
+    #[test]
+    fn test_responsive_compact_toggle_single_panel() {
+        // Verify that toggle_single_panel_view switches between Graph and Detail.
+        use super::state::{FocusedPanel, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = super::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Toggle: Graph -> Detail
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+
+        // Toggle: Detail -> Graph
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
+    }
+
+    #[test]
+    fn test_responsive_narrow_split_layout() {
+        // In narrow mode (50-80 cols) with inspector visible, should use
+        // side-by-side split with constrained proportions.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::ResponsiveBreakpoint;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.right_panel_visible = true;
+        app.layout_mode = LayoutMode::TwoThirdsInspector;
+
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+        // Both panels should be visible.
+        assert!(app.last_graph_area.width > 0, "graph should have width");
+        assert!(app.last_right_panel_area.width > 0, "inspector should have width");
+        // Total widths should sum to terminal width.
+        assert_eq!(
+            app.last_graph_area.width + app.last_right_panel_area.width,
+            60,
+            "graph + inspector should span full width"
+        );
+    }
+
+    #[test]
+    fn test_responsive_resize_dynamic_breakpoint() {
+        // Simulate resize by drawing at different widths and verifying
+        // breakpoint changes dynamically.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use super::state::ResponsiveBreakpoint;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        // Start wide
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+
+        // "Resize" to narrow
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+
+        // "Resize" to compact
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+
+        // "Resize" back to full
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+    }
+
+    #[test]
+    fn test_responsive_compact_tab_toggles_panel_focus() {
+        // In compact mode, toggle_panel_focus should switch single_panel_view
+        // instead of just changing focus.
+        use super::state::{FocusedPanel, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = super::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Tab in compact mode should switch to Detail view.
+        app.toggle_panel_focus();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+
+        // Tab again should switch back to Graph view.
+        app.toggle_panel_focus();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
     }
 }

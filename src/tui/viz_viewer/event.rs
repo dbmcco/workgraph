@@ -1750,7 +1750,11 @@ fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
             // File browser handles its own scrolling.
         }
         RightPanelTab::CoordLog => {
-            app.coord_log_scroll_up(amount);
+            if !app.activity_feed.events.is_empty() {
+                app.activity_feed_scroll_up(amount);
+            } else {
+                app.coord_log_scroll_up(amount);
+            }
         }
         RightPanelTab::Firehose => {
             app.firehose.auto_tail = false;
@@ -1806,7 +1810,11 @@ fn right_panel_scroll_down(app: &mut VizApp, amount: usize) {
             // File browser handles its own scrolling.
         }
         RightPanelTab::CoordLog => {
-            app.coord_log_scroll_down(amount);
+            if !app.activity_feed.events.is_empty() {
+                app.activity_feed_scroll_down(amount);
+            } else {
+                app.coord_log_scroll_down(amount);
+            }
         }
         RightPanelTab::Firehose => {
             app.firehose.scroll += amount;
@@ -1868,7 +1876,11 @@ fn right_panel_scroll_to_top(app: &mut VizApp) {
         }
         RightPanelTab::Files => {}
         RightPanelTab::CoordLog => {
-            app.coord_log_scroll_to_top();
+            if !app.activity_feed.events.is_empty() {
+                app.activity_feed_scroll_to_top();
+            } else {
+                app.coord_log_scroll_to_top();
+            }
         }
         RightPanelTab::Firehose => {
             app.firehose.auto_tail = false;
@@ -1915,7 +1927,11 @@ fn right_panel_scroll_to_bottom(app: &mut VizApp) {
         }
         RightPanelTab::Files => {}
         RightPanelTab::CoordLog => {
-            app.coord_log_scroll_to_bottom();
+            if !app.activity_feed.events.is_empty() {
+                app.activity_feed_scroll_to_bottom();
+            } else {
+                app.coord_log_scroll_to_bottom();
+            }
         }
         RightPanelTab::Firehose => {
             app.firehose.auto_tail = true;

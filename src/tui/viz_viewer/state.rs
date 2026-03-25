@@ -664,6 +664,44 @@ impl LayoutMode {
     }
 }
 
+/// Responsive layout breakpoint determined by terminal width.
+///
+/// Detected dynamically on each frame from `frame.area().width`:
+/// - `Compact`: < 50 cols — single-panel mode (graph OR detail, Tab to switch)
+/// - `Narrow`: 50–80 cols — narrow split, hide non-essential columns
+/// - `Full`: > 80 cols — current full layout (no change)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponsiveBreakpoint {
+    /// < 50 cols: single-panel mode.
+    Compact,
+    /// 50–80 cols: narrow split with hidden non-essential columns.
+    Narrow,
+    /// > 80 cols: full layout.
+    Full,
+}
+
+impl ResponsiveBreakpoint {
+    /// Determine the breakpoint from terminal width.
+    pub fn from_width(width: u16) -> Self {
+        if width < 50 {
+            Self::Compact
+        } else if width <= 80 {
+            Self::Narrow
+        } else {
+            Self::Full
+        }
+    }
+}
+
+/// Which panel is shown in single-panel (compact) mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinglePanelView {
+    /// Show the graph panel.
+    Graph,
+    /// Show the detail/inspector panel.
+    Detail,
+}
+
 /// Input modes — at most one is active at a time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputMode {
@@ -1522,6 +1560,271 @@ impl Default for CoordLogState {
     }
 }
 
+// ── Activity Feed (semantic operations.jsonl view) ──
+
+/// Typed event categories for the activity feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityEventKind {
+    /// Task created (+, blue)
+    TaskCreated,
+    /// Status change (→, yellow): pause, resume, retry, unclaim, abandon, edit, assign
+    StatusChange,
+    /// Agent spawned (▶, green): claim
+    AgentSpawned,
+    /// Agent completed (✓, green bold): done
+    AgentCompleted,
+    /// Agent failed (✗, red bold): fail
+    AgentFailed,
+    /// Coordinator tick (⟳, dim): replay, apply
+    CoordinatorTick,
+    /// Verification result: approve
+    VerificationResult,
+    /// User action: gc, archive, link, unlink, publish, trace_export, artifact_add
+    UserAction,
+}
+
+/// A single parsed activity event from operations.jsonl.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ActivityEvent {
+    /// ISO-8601 timestamp.
+    pub timestamp: String,
+    /// Short time string for display (HH:MM:SS).
+    pub time_short: String,
+    /// The raw operation name from the log.
+    pub op: String,
+    /// Typed event category.
+    pub kind: ActivityEventKind,
+    /// Associated task ID, if any.
+    pub task_id: Option<String>,
+    /// Actor (agent ID or "user"), if present.
+    pub actor: Option<String>,
+    /// Human-readable summary line.
+    pub summary: String,
+}
+
+impl ActivityEvent {
+    /// Parse an operations.jsonl line into a typed ActivityEvent.
+    pub fn parse(line: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        let timestamp = v.get("timestamp")?.as_str()?.to_string();
+        let op = v.get("op")?.as_str()?.to_string();
+        let task_id = v.get("task_id").and_then(|t| t.as_str()).map(String::from);
+        let actor = v.get("actor").and_then(|a| a.as_str()).map(String::from);
+        let detail = v.get("detail").cloned().unwrap_or(serde_json::Value::Null);
+
+        let kind = match op.as_str() {
+            "add_task" => ActivityEventKind::TaskCreated,
+            "claim" => ActivityEventKind::AgentSpawned,
+            "done" => ActivityEventKind::AgentCompleted,
+            "fail" => ActivityEventKind::AgentFailed,
+            "abandon" | "pause" | "resume" | "retry" | "unclaim" | "edit" | "assign" => {
+                ActivityEventKind::StatusChange
+            }
+            "approve" => ActivityEventKind::VerificationResult,
+            "replay" | "apply" => ActivityEventKind::CoordinatorTick,
+            _ => ActivityEventKind::UserAction,
+        };
+
+        let time_short = parse_time_short(&timestamp);
+        let summary = format_event_summary(&op, &task_id, &actor, &detail);
+
+        Some(ActivityEvent {
+            timestamp,
+            time_short,
+            op,
+            kind,
+            task_id,
+            actor,
+            summary,
+        })
+    }
+
+    /// Icon prefix for display.
+    pub fn icon(&self) -> &'static str {
+        match self.kind {
+            ActivityEventKind::TaskCreated => "+",
+            ActivityEventKind::StatusChange => "→",
+            ActivityEventKind::AgentSpawned => "▶",
+            ActivityEventKind::AgentCompleted => "✓",
+            ActivityEventKind::AgentFailed => "✗",
+            ActivityEventKind::CoordinatorTick => "⟳",
+            ActivityEventKind::VerificationResult => "◆",
+            ActivityEventKind::UserAction => "●",
+        }
+    }
+}
+
+/// Extract HH:MM:SS from an ISO-8601 timestamp.
+fn parse_time_short(ts: &str) -> String {
+    // Expect format like "2026-02-18T20:24:52.488..."
+    if let Some(t_pos) = ts.find('T') {
+        let after_t = &ts[t_pos + 1..];
+        // Take up to 8 chars for HH:MM:SS
+        let end = after_t.len().min(8);
+        after_t[..end].to_string()
+    } else {
+        ts.chars().take(8).collect()
+    }
+}
+
+/// Build a human-readable summary line from operation fields.
+fn format_event_summary(
+    op: &str,
+    task_id: &Option<String>,
+    actor: &Option<String>,
+    detail: &serde_json::Value,
+) -> String {
+    let tid = task_id.as_deref().unwrap_or("");
+    match op {
+        "add_task" => {
+            let title = detail
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or(tid);
+            format!("Task created: {}", title)
+        }
+        "claim" => {
+            let who = actor.as_deref().unwrap_or("agent");
+            format!("{} claimed {}", who, tid)
+        }
+        "done" => format!("Completed: {}", tid),
+        "fail" => {
+            let reason = detail
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            format!("Failed: {} ({})", tid, reason)
+        }
+        "abandon" => {
+            let reason = detail
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .map(|r| format!(" ({})", r))
+                .unwrap_or_default();
+            format!("Abandoned: {}{}", tid, reason)
+        }
+        "pause" => format!("Paused: {}", tid),
+        "resume" => format!("Resumed: {}", tid),
+        "retry" => {
+            let attempt = detail.get("attempt").and_then(|a| a.as_u64()).unwrap_or(0);
+            format!("Retry #{}: {}", attempt, tid)
+        }
+        "unclaim" => {
+            let who = actor.as_deref().unwrap_or("agent");
+            format!("{} released {}", who, tid)
+        }
+        "edit" => format!("Edited: {}", tid),
+        "assign" => {
+            let agent = detail
+                .get("agent_hash")
+                .and_then(|h| h.as_str())
+                .map(|h| &h[..h.len().min(8)])
+                .unwrap_or("agent");
+            format!("Assigned {} to {}", tid, agent)
+        }
+        "approve" => format!("Approved: {}", tid),
+        "replay" => {
+            let count = detail
+                .get("reset_count")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
+            format!("Replay: reset {} tasks", count)
+        }
+        "apply" => {
+            let func = detail
+                .get("function_id")
+                .and_then(|f| f.as_str())
+                .unwrap_or("function");
+            format!("Applied function: {}", func)
+        }
+        "gc" => {
+            let removed = detail
+                .get("removed")
+                .and_then(|r| r.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("GC: removed {} tasks", removed)
+        }
+        "archive" => {
+            let count = detail
+                .get("task_ids")
+                .and_then(|t| t.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("Archived {} tasks", count)
+        }
+        "link" => {
+            let dep = detail
+                .get("dependency")
+                .and_then(|d| d.as_str())
+                .unwrap_or("?");
+            format!("Linked {} → {}", tid, dep)
+        }
+        "unlink" => {
+            let dep = detail
+                .get("dependency")
+                .and_then(|d| d.as_str())
+                .unwrap_or("?");
+            format!("Unlinked {} → {}", tid, dep)
+        }
+        "publish" => format!("Published: {}", tid),
+        "artifact_add" => {
+            let path = detail
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("file");
+            format!("Artifact: {} → {}", tid, path)
+        }
+        "trace_export" => {
+            let vis = detail
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .unwrap_or("internal");
+            format!("Trace export ({})", vis)
+        }
+        _ => {
+            if tid.is_empty() {
+                format!("{}", op)
+            } else {
+                format!("{}: {}", op, tid)
+            }
+        }
+    }
+}
+
+/// State for the Activity Feed — semantic view of operations.jsonl.
+pub struct ActivityFeedState {
+    /// Ring buffer of parsed activity events (max 500).
+    pub events: VecDeque<ActivityEvent>,
+    /// Byte offset of last read position in operations.jsonl.
+    pub last_offset: u64,
+    /// Current scroll position (line index of top of viewport).
+    pub scroll: usize,
+    /// Whether auto-tail is active (scroll follows new events).
+    pub auto_tail: bool,
+    /// Viewport height in lines (set by renderer).
+    pub viewport_height: usize,
+    /// Total rendered lines after word-wrapping (set by renderer).
+    pub total_wrapped_lines: usize,
+}
+
+/// Maximum number of events kept in the activity feed ring buffer.
+pub const ACTIVITY_FEED_MAX_EVENTS: usize = 500;
+
+impl Default for ActivityFeedState {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            last_offset: 0,
+            scroll: 0,
+            auto_tail: true,
+            viewport_height: 0,
+            total_wrapped_lines: 0,
+        }
+    }
+}
+
 /// A single line in the firehose view — one output line from one agent.
 #[derive(Clone)]
 pub struct FirehoseLine {
@@ -2173,6 +2476,10 @@ pub struct VizApp {
     pub hud_size: HudSize,
     /// Layout mode for five-state cycle (1/3 → 1/2 → 2/3 → full → off).
     pub layout_mode: LayoutMode,
+    /// Current responsive breakpoint (recomputed each frame from terminal width).
+    pub responsive_breakpoint: ResponsiveBreakpoint,
+    /// Which panel is shown in compact (< 50 cols) single-panel mode.
+    pub single_panel_view: SinglePanelView,
     /// Current input mode.
     pub input_mode: InputMode,
     /// Deferred centering: set during state refresh, consumed by render after viewport_height is known.
@@ -2229,6 +2536,9 @@ pub struct VizApp {
 
     // ── Coordinator log state (panel 7) ──
     pub coord_log: CoordLogState,
+
+    // ── Activity feed state (semantic operations.jsonl view, replaces raw coord log) ──
+    pub activity_feed: ActivityFeedState,
 
     // ── Messages panel state (panel 3) ──
     pub messages_panel: MessagesPanelState,
@@ -2349,6 +2659,8 @@ pub struct VizApp {
     last_messages_mtime: Option<SystemTime>,
     /// Last mtime of the daemon.log for coord log panel.
     last_daemon_log_mtime: Option<SystemTime>,
+    /// Last mtime of operations.jsonl for activity feed.
+    last_ops_log_mtime: Option<SystemTime>,
     /// Last mtime of the chat outbox for the active coordinator.
     last_chat_outbox_mtime: Option<SystemTime>,
     /// Last mtime of the output.log for the currently-displayed task (Detail tab live refresh).
@@ -2488,6 +2800,8 @@ impl VizApp {
                 .panel_percent(),
             hud_size: HudSize::Normal,
             layout_mode: LayoutMode::from_config_str(&config.tui.default_inspector_size),
+            responsive_breakpoint: ResponsiveBreakpoint::Full,
+            single_panel_view: SinglePanelView::Graph,
 
             input_mode: InputMode::Normal,
             needs_center_on_selected: false,
@@ -2511,6 +2825,7 @@ impl VizApp {
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
+            activity_feed: ActivityFeedState::default(),
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
             task_message_statuses: HashMap::new(),
@@ -2553,6 +2868,7 @@ impl VizApp {
             _fs_watcher: None,
             last_messages_mtime: None,
             last_daemon_log_mtime: None,
+            last_ops_log_mtime: None,
             last_chat_outbox_mtime: None,
             last_detail_output_mtime: None,
             hud_follow: false,
@@ -3971,6 +4287,7 @@ impl VizApp {
                 }
                 if self.right_panel_tab == RightPanelTab::CoordLog {
                     self.load_coord_log();
+                    self.load_activity_feed();
                 }
                 content_updated = true;
             }
@@ -3993,13 +4310,20 @@ impl VizApp {
                 }
             }
 
-            // Coordinator log: check if daemon.log changed.
+            // Coordinator log: check if daemon.log or operations.jsonl changed.
             if self.right_panel_tab == RightPanelTab::CoordLog {
                 let log_path = self.workgraph_dir.join("service").join("daemon.log");
                 let log_mtime = std::fs::metadata(&log_path).and_then(|m| m.modified()).ok();
                 if log_mtime != self.last_daemon_log_mtime {
                     self.last_daemon_log_mtime = log_mtime;
                     self.load_coord_log();
+                    content_updated = true;
+                }
+                let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
+                let ops_mtime = std::fs::metadata(&ops_path).and_then(|m| m.modified()).ok();
+                if ops_mtime != self.last_ops_log_mtime {
+                    self.last_ops_log_mtime = ops_mtime;
+                    self.load_activity_feed();
                     content_updated = true;
                 }
             }
@@ -4209,6 +4533,7 @@ impl VizApp {
                 // Refresh coordinator log if CoordLog tab is active.
                 if self.right_panel_tab == RightPanelTab::CoordLog {
                     self.load_coord_log();
+                    self.load_activity_feed();
                 }
             }
         }
@@ -5522,6 +5847,7 @@ impl VizApp {
             self.right_panel_visible = true;
             self.right_panel_tab = RightPanelTab::CoordLog;
             self.load_coord_log();
+            self.load_activity_feed();
         }
     }
 
@@ -5603,6 +5929,90 @@ impl VizApp {
             .saturating_sub(self.coord_log.viewport_height);
         self.coord_log.scroll = max_scroll;
         self.coord_log.auto_tail = true;
+    }
+
+    // ── Activity Feed (operations.jsonl semantic view) ──
+
+    /// Load new entries from operations.jsonl into the activity feed (incremental).
+    pub fn load_activity_feed(&mut self) {
+        use std::io::{Seek, SeekFrom};
+        let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
+        let file = match std::fs::File::open(&ops_path) {
+            Ok(f) => f,
+            Err(_) => {
+                // Fall back to coord_log if no operations.jsonl exists.
+                return;
+            }
+        };
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // File was truncated (rotation) — reset.
+        if file_len < self.activity_feed.last_offset {
+            self.activity_feed.events.clear();
+            self.activity_feed.last_offset = 0;
+        }
+        if file_len == self.activity_feed.last_offset {
+            return;
+        }
+        let mut reader = BufReader::new(file);
+        if self.activity_feed.last_offset > 0
+            && reader
+                .seek(SeekFrom::Start(self.activity_feed.last_offset))
+                .is_err()
+        {
+            return;
+        }
+        let mut buf = String::new();
+        while reader.read_line(&mut buf).unwrap_or(0) > 0 {
+            let line = buf.trim();
+            if !line.is_empty() {
+                if let Some(event) = ActivityEvent::parse(line) {
+                    self.activity_feed.events.push_back(event);
+                    // Enforce ring buffer max.
+                    if self.activity_feed.events.len() > ACTIVITY_FEED_MAX_EVENTS {
+                        self.activity_feed.events.pop_front();
+                    }
+                }
+            }
+            buf.clear();
+        }
+        self.activity_feed.last_offset = file_len;
+        if self.activity_feed.auto_tail {
+            self.activity_feed.scroll = usize::MAX;
+        }
+    }
+
+    /// Scroll activity feed up.
+    pub fn activity_feed_scroll_up(&mut self, amount: usize) {
+        self.activity_feed.scroll = self.activity_feed.scroll.saturating_sub(amount);
+        self.activity_feed.auto_tail = false;
+    }
+
+    /// Scroll activity feed down.
+    pub fn activity_feed_scroll_down(&mut self, amount: usize) {
+        let max_scroll = self
+            .activity_feed
+            .total_wrapped_lines
+            .saturating_sub(self.activity_feed.viewport_height);
+        self.activity_feed.scroll = (self.activity_feed.scroll + amount).min(max_scroll);
+        if self.activity_feed.scroll >= max_scroll {
+            self.activity_feed.auto_tail = true;
+        }
+    }
+
+    /// Scroll activity feed to top.
+    pub fn activity_feed_scroll_to_top(&mut self) {
+        self.activity_feed.scroll = 0;
+        self.activity_feed.auto_tail = false;
+    }
+
+    /// Scroll activity feed to bottom.
+    pub fn activity_feed_scroll_to_bottom(&mut self) {
+        let max_scroll = self
+            .activity_feed
+            .total_wrapped_lines
+            .saturating_sub(self.activity_feed.viewport_height);
+        self.activity_feed.scroll = max_scroll;
+        self.activity_feed.auto_tail = true;
     }
 
     // ── Messages panel (panel 3) ──
@@ -5880,6 +6290,8 @@ impl VizApp {
             right_panel_percent: 35,
             hud_size: HudSize::Normal,
             layout_mode: LayoutMode::ThirdInspector,
+            responsive_breakpoint: ResponsiveBreakpoint::Full,
+            single_panel_view: SinglePanelView::Graph,
 
             input_mode: InputMode::Normal,
             needs_center_on_selected: false,
@@ -5903,6 +6315,7 @@ impl VizApp {
             agency_lifecycle: None,
             log_pane: LogPaneState::default(),
             coord_log: CoordLogState::default(),
+            activity_feed: ActivityFeedState::default(),
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
             task_message_statuses: HashMap::new(),
@@ -5945,6 +6358,7 @@ impl VizApp {
             _fs_watcher: None,
             last_messages_mtime: None,
             last_daemon_log_mtime: None,
+            last_ops_log_mtime: None,
             last_chat_outbox_mtime: None,
             last_detail_output_mtime: None,
             hud_follow: false,
@@ -5985,8 +6399,14 @@ impl VizApp {
     // ── Multi-panel methods ──
 
     /// Toggle focus between Graph and RightPanel.
+    /// In compact mode, switches the single-panel view instead.
     /// In full-inspector or off mode, focus stays locked to the visible content.
     pub fn toggle_panel_focus(&mut self) {
+        // In compact mode, Tab switches the single-panel view.
+        if self.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+            self.toggle_single_panel_view();
+            return;
+        }
         match self.layout_mode {
             LayoutMode::FullInspector => {
                 // Only the panel is visible; stay focused on it.
@@ -6011,6 +6431,21 @@ impl VizApp {
                 }
             }
             FocusedPanel::RightPanel => FocusedPanel::Graph,
+        };
+    }
+
+    /// Toggle between Graph and Detail in single-panel (compact) mode.
+    /// Also updates focused_panel to match.
+    pub fn toggle_single_panel_view(&mut self) {
+        self.single_panel_view = match self.single_panel_view {
+            SinglePanelView::Graph => {
+                self.focused_panel = FocusedPanel::RightPanel;
+                SinglePanelView::Detail
+            }
+            SinglePanelView::Detail => {
+                self.focused_panel = FocusedPanel::Graph;
+                SinglePanelView::Graph
+            }
         };
     }
 
@@ -12864,5 +13299,287 @@ mod touch_echo_tests {
         app.touch_echo_enabled = false;
         app.touch_echoes.clear();
         assert!(app.touch_echoes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod activity_feed_tests {
+    use super::*;
+
+    fn make_op_line(op: &str, task_id: Option<&str>, actor: Option<&str>) -> String {
+        let mut obj = serde_json::json!({
+            "timestamp": "2026-03-25T14:30:45.123456789+00:00",
+            "op": op,
+            "detail": {}
+        });
+        if let Some(tid) = task_id {
+            obj["task_id"] = serde_json::Value::String(tid.to_string());
+        }
+        if let Some(a) = actor {
+            obj["actor"] = serde_json::Value::String(a.to_string());
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    fn make_op_line_with_detail(
+        op: &str,
+        task_id: Option<&str>,
+        detail: serde_json::Value,
+    ) -> String {
+        let mut obj = serde_json::json!({
+            "timestamp": "2026-03-25T14:30:45.123456789+00:00",
+            "op": op,
+            "detail": detail
+        });
+        if let Some(tid) = task_id {
+            obj["task_id"] = serde_json::Value::String(tid.to_string());
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    // ── Parsing tests (all event types) ──
+
+    #[test]
+    fn parse_task_created() {
+        let line = make_op_line_with_detail(
+            "add_task",
+            Some("my-task"),
+            serde_json::json!({"title": "My Task"}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert_eq!(event.kind, ActivityEventKind::TaskCreated);
+        assert_eq!(event.op, "add_task");
+        assert_eq!(event.task_id.as_deref(), Some("my-task"));
+        assert_eq!(event.icon(), "+");
+        assert!(event.summary.contains("My Task"));
+        assert_eq!(event.time_short, "14:30:45");
+    }
+
+    #[test]
+    fn parse_agent_spawned() {
+        let line = make_op_line("claim", Some("build-feature"), Some("agent-42"));
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert_eq!(event.kind, ActivityEventKind::AgentSpawned);
+        assert_eq!(event.icon(), "▶");
+        assert!(event.summary.contains("agent-42"));
+        assert!(event.summary.contains("build-feature"));
+    }
+
+    #[test]
+    fn parse_agent_completed() {
+        let line = make_op_line("done", Some("build-feature"), None);
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert_eq!(event.kind, ActivityEventKind::AgentCompleted);
+        assert_eq!(event.icon(), "✓");
+        assert!(event.summary.contains("build-feature"));
+    }
+
+    #[test]
+    fn parse_agent_failed() {
+        let line = make_op_line_with_detail(
+            "fail",
+            Some("build-feature"),
+            serde_json::json!({"reason": "Agent exited with code 1"}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert_eq!(event.kind, ActivityEventKind::AgentFailed);
+        assert_eq!(event.icon(), "✗");
+        assert!(event.summary.contains("Agent exited"));
+    }
+
+    #[test]
+    fn parse_status_changes() {
+        for op in &["abandon", "pause", "resume", "retry", "unclaim", "edit", "assign"] {
+            let line = make_op_line(op, Some("some-task"), None);
+            let event = ActivityEvent::parse(&line).unwrap();
+            assert_eq!(
+                event.kind,
+                ActivityEventKind::StatusChange,
+                "Expected StatusChange for op={}",
+                op
+            );
+            assert_eq!(event.icon(), "→");
+        }
+    }
+
+    #[test]
+    fn parse_coordinator_tick() {
+        for op in &["replay", "apply"] {
+            let line = make_op_line(op, None, None);
+            let event = ActivityEvent::parse(&line).unwrap();
+            assert_eq!(
+                event.kind,
+                ActivityEventKind::CoordinatorTick,
+                "Expected CoordinatorTick for op={}",
+                op
+            );
+            assert_eq!(event.icon(), "⟳");
+        }
+    }
+
+    #[test]
+    fn parse_verification_result() {
+        let line = make_op_line("approve", Some("build-feature"), None);
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert_eq!(event.kind, ActivityEventKind::VerificationResult);
+        assert_eq!(event.icon(), "◆");
+    }
+
+    #[test]
+    fn parse_user_actions() {
+        for op in &["gc", "archive", "link", "unlink", "publish", "trace_export", "artifact_add"] {
+            let line = make_op_line(op, Some("t"), None);
+            let event = ActivityEvent::parse(&line).unwrap();
+            assert_eq!(
+                event.kind,
+                ActivityEventKind::UserAction,
+                "Expected UserAction for op={}",
+                op
+            );
+            assert_eq!(event.icon(), "●");
+        }
+    }
+
+    #[test]
+    fn parse_invalid_json_returns_none() {
+        assert!(ActivityEvent::parse("not json").is_none());
+        assert!(ActivityEvent::parse("{}").is_none()); // missing required fields
+        assert!(ActivityEvent::parse("{\"timestamp\":\"t\"}").is_none()); // missing op
+    }
+
+    #[test]
+    fn parse_time_short_extraction() {
+        assert_eq!(
+            parse_time_short("2026-03-25T14:30:45.123+00:00"),
+            "14:30:45"
+        );
+        assert_eq!(
+            parse_time_short("2026-01-01T00:00:00Z"),
+            "00:00:00"
+        );
+    }
+
+    // ── Ring buffer tests ──
+
+    #[test]
+    fn ring_buffer_overflow() {
+        let mut state = ActivityFeedState::default();
+        // Fill beyond max.
+        for i in 0..(ACTIVITY_FEED_MAX_EVENTS + 50) {
+            let line = make_op_line("done", Some(&format!("task-{}", i)), None);
+            if let Some(event) = ActivityEvent::parse(&line) {
+                state.events.push_back(event);
+                if state.events.len() > ACTIVITY_FEED_MAX_EVENTS {
+                    state.events.pop_front();
+                }
+            }
+        }
+        assert_eq!(state.events.len(), ACTIVITY_FEED_MAX_EVENTS);
+        // The oldest remaining should be task-50 (first 50 were evicted).
+        assert_eq!(state.events.front().unwrap().task_id.as_deref(), Some("task-50"));
+        let expected_last = format!("task-{}", ACTIVITY_FEED_MAX_EVENTS + 49);
+        assert_eq!(
+            state.events.back().unwrap().task_id.as_deref(),
+            Some(expected_last.as_str())
+        );
+    }
+
+    #[test]
+    fn auto_tail_default_on() {
+        let state = ActivityFeedState::default();
+        assert!(state.auto_tail);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn scroll_pause_disengages_auto_tail() {
+        let mut state = ActivityFeedState::default();
+        state.auto_tail = true;
+        state.total_wrapped_lines = 100;
+        state.viewport_height = 20;
+        state.scroll = 80; // at bottom
+
+        // Simulate scroll up.
+        state.scroll = state.scroll.saturating_sub(5);
+        state.auto_tail = false;
+
+        assert!(!state.auto_tail);
+        assert_eq!(state.scroll, 75);
+    }
+
+    #[test]
+    fn scroll_to_bottom_re_engages_auto_tail() {
+        let mut state = ActivityFeedState::default();
+        state.auto_tail = false;
+        state.total_wrapped_lines = 100;
+        state.viewport_height = 20;
+
+        // Scroll to bottom.
+        let max_scroll = state.total_wrapped_lines.saturating_sub(state.viewport_height);
+        state.scroll = max_scroll;
+        state.auto_tail = true;
+
+        assert!(state.auto_tail);
+        assert_eq!(state.scroll, 80);
+    }
+
+    // ── Summary formatting tests ──
+
+    #[test]
+    fn format_gc_summary() {
+        let line = make_op_line_with_detail(
+            "gc",
+            None,
+            serde_json::json!({"removed": [{"id":"a"}, {"id":"b"}, {"id":"c"}]}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert!(event.summary.contains("3 tasks"));
+    }
+
+    #[test]
+    fn format_archive_summary() {
+        let line = make_op_line_with_detail(
+            "archive",
+            None,
+            serde_json::json!({"task_ids": ["a", "b"]}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert!(event.summary.contains("2 tasks"));
+    }
+
+    #[test]
+    fn format_retry_summary() {
+        let line = make_op_line_with_detail(
+            "retry",
+            Some("flaky-task"),
+            serde_json::json!({"attempt": 3}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert!(event.summary.contains("#3"));
+        assert!(event.summary.contains("flaky-task"));
+    }
+
+    #[test]
+    fn format_link_summary() {
+        let line = make_op_line_with_detail(
+            "link",
+            Some("child-task"),
+            serde_json::json!({"action": "add", "dependency": "parent-task"}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert!(event.summary.contains("child-task"));
+        assert!(event.summary.contains("parent-task"));
+    }
+
+    #[test]
+    fn format_artifact_add_summary() {
+        let line = make_op_line_with_detail(
+            "artifact_add",
+            Some("my-task"),
+            serde_json::json!({"path": "src/main.rs"}),
+        );
+        let event = ActivityEvent::parse(&line).unwrap();
+        assert!(event.summary.contains("my-task"));
+        assert!(event.summary.contains("src/main.rs"));
     }
 }
