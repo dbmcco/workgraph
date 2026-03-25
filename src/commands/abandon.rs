@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::save_graph;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -10,58 +10,102 @@ use super::graph_path;
 use workgraph::parser::load_graph;
 
 pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String]) -> Result<()> {
-    let (mut graph, path) = super::load_workgraph_mut(dir)?;
-
-    let task = graph.get_task_mut_or_err(id)?;
-
-    if task.status == Status::Done {
-        anyhow::bail!("Task '{}' is already done and cannot be abandoned", id);
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
     }
 
-    if task.status == Status::Abandoned {
+    let mut error: Option<anyhow::Error> = None;
+    let mut already_abandoned = false;
+    let mut prev_assigned: Option<String> = None;
+    let mut cascade_targets: Vec<String> = Vec::new();
+
+    let _graph = modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
+
+        if task.status == Status::Done {
+            error = Some(anyhow::anyhow!(
+                "Task '{}' is already done and cannot be abandoned",
+                id
+            ));
+            return false;
+        }
+
+        if task.status == Status::Abandoned {
+            already_abandoned = true;
+            return false;
+        }
+
+        prev_assigned = task.assigned.clone();
+        task.status = Status::Abandoned;
+        task.failure_reason = reason.map(String::from);
+        if !superseded_by.is_empty() {
+            task.superseded_by = superseded_by.to_vec();
+        }
+
+        let log_message = match reason {
+            Some(r) => format!("Task abandoned: {}", r),
+            None => "Task abandoned".to_string(),
+        };
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: task.assigned.clone(),
+            message: log_message,
+        });
+
+        // Cascade abandon to system tasks that depend on this task.
+        // We match both by direct dependency (dot-prefixed tasks listing `id` in their `after`)
+        // AND by naming convention (.evaluate-X, .flip-X, .verify-X) to handle transitive cases
+        // — e.g. when FLIP is enabled, .evaluate-X depends on .flip-X, not X directly.
+        let eval_id = format!(".evaluate-{}", id);
+        let flip_id = format!(".flip-{}", id);
+        let verify_id = format!(".verify-{}", id);
+        cascade_targets = graph
+            .tasks()
+            .filter(|t| {
+                if t.status.is_terminal() {
+                    return false;
+                }
+                let is_system_dep =
+                    t.id.starts_with('.') && t.after.contains(&id.to_string());
+                let is_eval_scaffold =
+                    t.id == eval_id || t.id == flip_id || t.id == verify_id;
+                is_system_dep || is_eval_scaffold
+            })
+            .map(|t| t.id.clone())
+            .collect();
+
+        for target_id in &cascade_targets {
+            if let Some(t) = graph.get_task_mut(target_id) {
+                t.status = Status::Abandoned;
+                t.failure_reason = Some(format!("Parent task '{}' was abandoned", id));
+                t.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: None,
+                    message: format!("Auto-abandoned: parent '{}' was abandoned", id),
+                });
+            }
+        }
+
+        true
+    })
+    .context("Failed to save graph")?;
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    if already_abandoned {
         println!("Task '{}' is already abandoned", id);
         return Ok(());
     }
 
-    let prev_assigned = task.assigned.clone();
-    task.status = Status::Abandoned;
-    task.failure_reason = reason.map(String::from);
-    if !superseded_by.is_empty() {
-        task.superseded_by = superseded_by.to_vec();
-    }
-
-    let log_message = match reason {
-        Some(r) => format!("Task abandoned: {}", r),
-        None => "Task abandoned".to_string(),
-    };
-    task.log.push(LogEntry {
-        timestamp: Utc::now().to_rfc3339(),
-        actor: task.assigned.clone(),
-        message: log_message,
-    });
-
-    // Cascade abandon to system tasks that depend on this task
-    let cascade_targets: Vec<String> = graph
-        .tasks()
-        .filter(|t| {
-            t.id.starts_with('.') && t.after.contains(&id.to_string()) && !t.status.is_terminal()
-        })
-        .map(|t| t.id.clone())
-        .collect();
-
-    for target_id in &cascade_targets {
-        if let Some(t) = graph.get_task_mut(target_id) {
-            t.status = Status::Abandoned;
-            t.failure_reason = Some(format!("Parent task '{}' was abandoned", id));
-            t.log.push(LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                actor: None,
-                message: format!("Auto-abandoned: parent '{}' was abandoned", id),
-            });
-        }
-    }
-
-    save_graph(&graph, &path).context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     let config = workgraph::config::Config::load_or_default(dir);
@@ -198,6 +242,43 @@ mod tests {
                 .status,
             Status::Done
         );
+    }
+
+    #[test]
+    fn test_abandon_cascades_eval_scaffold_with_flip() {
+        // When FLIP is enabled, the chain is: task → .flip-task → .evaluate-task
+        // .evaluate-task depends on .flip-task, NOT on task directly.
+        // The cascade must still abandon .evaluate-task.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".workgraph");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Main task")));
+
+        let mut flip = make_task(".flip-t1", "FLIP t1");
+        flip.after = vec!["t1".to_string()];
+        graph.add_node(Node::Task(flip));
+
+        let mut eval = make_task(".evaluate-t1", "Eval t1");
+        eval.after = vec![".flip-t1".to_string()]; // depends on .flip-t1, not t1
+        graph.add_node(Node::Task(eval));
+
+        // Normal dependent should NOT be cascaded
+        let mut dep = make_task("t2", "Depends on t1");
+        dep.after = vec!["t1".to_string()];
+        graph.add_node(Node::Task(dep));
+
+        setup_graph(&dir, &graph);
+        assert!(run(&dir, "t1", Some("decomposed"), &[]).is_ok());
+
+        let g = load_graph(graph_path(&dir)).unwrap();
+        assert_eq!(g.get_task("t1").unwrap().status, Status::Abandoned);
+        assert_eq!(g.get_task(".flip-t1").unwrap().status, Status::Abandoned);
+        assert_eq!(
+            g.get_task(".evaluate-t1").unwrap().status,
+            Status::Abandoned
+        );
+        // Normal dependent unaffected
+        assert_eq!(g.get_task("t2").unwrap().status, Status::Open);
     }
 
     #[test]
