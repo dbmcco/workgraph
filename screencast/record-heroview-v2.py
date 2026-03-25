@@ -236,6 +236,7 @@ def phase_0_cli(h):
     h.send_keys("Enter")
     log("Sent: wg status")
     h.sleep(2)
+    h.flush_frame()
 
     snap = h.snapshot()
     log(f"Phase 0 done. Has output: {len(snap.strip()) > 20}")
@@ -261,6 +262,9 @@ def phase_1_launch(h):
     # Let viewer orient to TUI layout
     h.sleep(2)
     h.flush_frame()
+
+    # System tasks should be hidden via config (show_system_tasks = false)
+    # Do NOT press '.' here — it would TOGGLE them ON.
 
     # Shrink inspector panel to make graph prominent
     for _ in range(3):
@@ -392,64 +396,72 @@ def phase_4_progression(h):
 
 
 def phase_5_results(h):
-    """Phase 5: Results Reveal — navigate to spring-haiku, show its haiku output.
+    """Phase 5: Results Reveal — navigate to compile-collection first (full collection),
+    then peek at spring-haiku for individual task output.
 
-    spring-haiku has only 5 log entries (claimed + 3 haiku lines + done)
-    which all fit cleanly in the inspector panel. The viewer can read the poem.
-    Then we show winter-haiku for a second poem.
+    Per storyboard: compile-collection's log shows all four poems together.
+    5s linger on the collection, then quick peek at spring-haiku.
     """
     log("=== Phase 5: Results Reveal ===")
 
     # After phase_4's Escape from chat, we're in Normal mode but with
     # RightPanel focus (Up/Down scroll the panel, not navigate tasks).
     # Press Escape once to return focus to the Graph panel.
-    # (In RightPanel focus, Escape → FocusedPanel::Graph.
-    #  In Graph focus, Escape would quit the TUI — so exactly ONE Escape.)
     h.send_keys("Escape")
     h.sleep(0.3)
 
-    # Navigate to top of graph
+    # Navigate to compile-collection. From current position, navigate
+    # through the graph to find it. First go to top.
     for _ in range(15):
         h.send_keys("Up")
         h.sleep(0.1)
     h.sleep(0.5)
 
-    # Now we should be at the first user task (spring-haiku).
-    # Switch to Log tab to show its haiku content.
+    # Navigate down to find compile-collection
+    # Graph order varies, so navigate and check
+    for _ in range(6):
+        h.send_keys("Down")
+        h.sleep(0.3)
+        snap = h.snapshot()
+        if "compile-collection" in snap:
+            log("Found compile-collection")
+            break
+    h.flush_frame()
+
+    # Switch to Log tab to show the full haiku collection
     h.send_keys("2")
     h.sleep(1)
     h.flush_frame()
 
     snap = h.snapshot()
-    has_haiku = any(kw in snap for kw in ["Cherry", "blossoms", "Soft rain", "leaves"])
-    log(f"spring-haiku Log tab — haiku visible: {has_haiku}")
+    has_collection = any(kw in snap for kw in ["Four Seasons", "Collection", "Cherry", "Snow"])
+    log(f"compile-collection Log tab — collection visible: {has_collection}")
 
-    if not has_haiku:
-        # System tasks might be at top. Try Down once to reach spring-haiku.
-        h.send_keys("Down")
-        h.sleep(0.5)
-        h.send_keys("Down")
-        h.sleep(0.5)
-        snap = h.snapshot()
-        has_haiku = any(kw in snap for kw in ["Cherry", "blossoms", "Soft rain"])
-        log(f"After Down×2 — haiku visible: {has_haiku}")
-
-    # LINGER — 5+ seconds for viewer to read the spring haiku
+    # LINGER — 5+ seconds for viewer to read the full collection
     h.sleep(5)
     h.flush_frame()
-    log("Spring haiku displayed")
+    log("Full haiku collection displayed")
 
-    # Navigate down to winter-haiku for a second poem
-    # From spring-haiku, winter is 4-5 positions down (past compile, format, summer, autumn)
-    for _ in range(5):
+    # Navigate to spring-haiku for individual task output peek
+    for _ in range(10):
+        h.send_keys("Up")
+        h.sleep(0.1)
+    h.sleep(0.3)
+
+    # Find spring-haiku
+    for _ in range(6):
+        snap = h.snapshot()
+        if "spring-haiku" in snap:
+            log("Found spring-haiku")
+            break
         h.send_keys("Down")
-        h.sleep(0.4)
+        h.sleep(0.3)
     h.flush_frame()
 
-    # Linger on winter haiku
-    h.sleep(2)
+    # Brief peek at individual task's log
+    h.sleep(1)
     h.flush_frame()
-    log("Winter haiku displayed")
+    log("Spring haiku individual view displayed")
 
 
 def phase_6_exit(h):
@@ -501,9 +513,8 @@ def record():
     log("=== Setup ===")
     setup_demo()
 
-    # Start the service (needed for wg service start to show something)
-    wg("service", "start", "--force")
-    time.sleep(2)
+    # Do NOT pre-start the service — let Phase 0's `wg service start` do it
+    # so the viewer sees a clean "Service started" message.
 
     try:
         shell_cmd = (
