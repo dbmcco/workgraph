@@ -164,6 +164,30 @@ pub(crate) fn spawn_agent_inner(
     let (effective_model, registry_provider, registry_endpoint) =
         resolve_model_via_registry(effective_model_raw, task_model.as_ref(), &config, dir)?;
 
+    // --- Pre-flight model validation ---
+    // Validate OpenRouter-style models against the cached model list before spawning.
+    // This is a warning/suggestion system, not a hard gate.
+    let (effective_model, model_validation_warning) = {
+        let mut model = effective_model;
+        let mut warning: Option<String> = None;
+        if let Some(ref m) = model {
+            if m.contains('/') && !BUILTIN_TIER_ALIASES.contains(&m.as_str()) {
+                let validation =
+                    workgraph::executor::native::openai_client::validate_openrouter_model(m, dir);
+                if !validation.was_valid {
+                    if let Some(ref w) = validation.warning {
+                        eprintln!("[spawn] WARNING: {}", w);
+                    }
+                    warning = validation.warning;
+                    model = Some(validation.model);
+                } else {
+                    eprintln!("[spawn] Model '{}' validated against model cache", m);
+                }
+            }
+        }
+        (model, warning)
+    };
+
     // Override model in template vars with effective model
     if let Some(ref m) = effective_model {
         vars.model = m.clone();
@@ -441,6 +465,7 @@ pub(crate) fn spawn_agent_inner(
     let task_agent_for_audit_clone = task_agent_for_audit.clone();
     let temp_agent_id_clone = temp_agent_id.clone();
     let task_id_str = task_id.to_string();
+    let model_validation_warning_clone = model_validation_warning.clone();
 
     let mut claim_error: Option<anyhow::Error> = None;
     modify_graph(&graph_path, |graph| {
@@ -468,6 +493,16 @@ pub(crate) fn spawn_agent_inner(
                     .unwrap_or_default()
             ),
         });
+
+        // Log pre-flight model validation result
+        if let Some(ref warning) = model_validation_warning_clone {
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: Some("spawn".to_string()),
+                user: None,
+                message: format!("Pre-flight model validation: {}", warning),
+            });
+        }
 
         // Create .assign-* audit trail if missing (defense-in-depth).
         let assign_task_id = format!(".assign-{}", task_id_str);
