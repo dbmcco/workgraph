@@ -156,6 +156,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 SinglePanelView::Graph => {
                     app.last_graph_area = main_area;
                     app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
                     app.last_tab_bar_area = Rect::default();
                     app.last_right_content_area = Rect::default();
                     app.scroll.viewport_height = main_area.height as usize;
@@ -179,6 +180,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 LayoutMode::Off => {
                     app.last_graph_area = main_area;
                     app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
                     app.last_tab_bar_area = Rect::default();
                     app.last_right_content_area = Rect::default();
                     app.scroll.viewport_height = main_area.height as usize;
@@ -205,6 +207,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     } else {
                         app.last_graph_area = main_area;
                         app.last_right_panel_area = Rect::default();
+                        app.last_divider_area = Rect::default();
                         app.last_tab_bar_area = Rect::default();
                         app.last_right_content_area = Rect::default();
                         app.scroll.viewport_height = main_area.height as usize;
@@ -224,6 +227,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                 LayoutMode::Off => {
                     app.last_graph_area = main_area;
                     app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
                     app.last_tab_bar_area = Rect::default();
                     app.last_right_content_area = Rect::default();
                     app.scroll.viewport_height = main_area.height as usize;
@@ -264,6 +268,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     } else {
                         app.last_graph_area = main_area;
                         app.last_right_panel_area = Rect::default();
+                        app.last_divider_area = Rect::default();
                         app.last_tab_bar_area = Rect::default();
                         app.last_right_content_area = Rect::default();
                         app.scroll.viewport_height = main_area.height as usize;
@@ -1653,6 +1658,20 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let is_full_panel = app.layout_mode == LayoutMode::FullInspector;
 
+    // Store divider hit area: the left border column of the panel (± 1 col for easier grab).
+    // Only meaningful in split mode where both panels are visible.
+    if !is_full_panel && area.width > 0 && app.last_graph_area.width > 0 {
+        // Hit area: 3 columns centered on the left border for easier grabbing.
+        let div_x = area.x.saturating_sub(1);
+        let div_w = 3.min(area.x.saturating_sub(app.last_graph_area.x) + 1);
+        app.last_divider_area = Rect::new(div_x, area.y, div_w, area.height);
+    } else {
+        app.last_divider_area = Rect::default();
+    }
+
+    let divider_active = app.divider_hover
+        || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::Divider);
+
     // In full-panel mode: no borders (edge-to-edge content for clean copy-paste).
     // In split mode: minimal single-line border, dim when unfocused.
     let inner = if is_full_panel {
@@ -1660,7 +1679,9 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     } else {
         let is_focused = app.focused_panel == FocusedPanel::RightPanel;
         let is_chat_tab = app.right_panel_tab == RightPanelTab::Chat;
-        let border_color = if is_chat_tab && app.chat.coordinator_active {
+        let border_color = if divider_active {
+            Color::Yellow
+        } else if is_chat_tab && app.chat.coordinator_active {
             Color::Cyan
         } else if is_focused {
             Color::White

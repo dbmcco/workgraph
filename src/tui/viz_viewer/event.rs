@@ -2071,6 +2071,12 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
         app.last_panel_scrollbar_area.height > 0 && app.last_panel_scrollbar_area.contains(pos);
     let in_coordinator_bar =
         app.last_coordinator_bar_area.height > 0 && app.last_coordinator_bar_area.contains(pos);
+    let in_divider =
+        app.last_divider_area.width > 0 && app.last_divider_area.contains(pos);
+
+    // Track hover state for the divider (visual indicator).
+    app.divider_hover = in_divider
+        || app.scrollbar_drag == Some(ScrollbarDragTarget::Divider);
 
     match kind {
         MouseEventKind::ScrollUp => {
@@ -2204,7 +2210,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 }
                 return;
             }
-            if in_graph_vscrollbar {
+            if in_divider {
+                // Click on divider between graph and inspector: start resize drag.
+                app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
+                return;
+            } else if in_graph_vscrollbar {
                 // Click on graph vertical scrollbar: start drag and jump.
                 app.focused_panel = FocusedPanel::Graph;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Graph);
@@ -2458,7 +2468,23 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.scrollbar_drag == Some(ScrollbarDragTarget::Graph) {
+            if app.scrollbar_drag == Some(ScrollbarDragTarget::Divider) {
+                // Dragging the divider: compute new right_panel_percent from mouse column.
+                // The right panel starts at `column` and extends to the right edge.
+                let total_width = app.last_graph_area.width + app.last_right_panel_area.width;
+                if total_width > 0 {
+                    let left_x = app.last_graph_area.x;
+                    let right_edge = left_x + total_width;
+                    // The panel width = distance from mouse column to the right edge.
+                    let panel_width = right_edge.saturating_sub(column);
+                    let pct = (panel_width as u32 * 100 / total_width as u32) as u16;
+                    // Clamp: neither panel below 15%.
+                    let clamped = pct.max(15).min(85);
+                    app.right_panel_percent = clamped;
+                    app.layout_mode =
+                        super::state::VizApp::layout_mode_for_percent(clamped);
+                }
+            } else if app.scrollbar_drag == Some(ScrollbarDragTarget::Graph) {
                 app.record_graph_scroll_activity();
                 vscrollbar_jump_graph(app, row);
             } else if app.scrollbar_drag == Some(ScrollbarDragTarget::Panel) {

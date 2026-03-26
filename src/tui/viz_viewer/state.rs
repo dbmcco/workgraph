@@ -548,6 +548,8 @@ pub enum ScrollbarDragTarget {
     /// Dragging the right panel horizontal scrollbar.
     #[allow(dead_code)]
     PanelHorizontal,
+    /// Dragging the vertical divider between graph and inspector panels.
+    Divider,
 }
 
 /// Sort mode for task ordering in the graph view.
@@ -2759,6 +2761,10 @@ pub struct VizApp {
     pub last_graph_area: Rect,
     /// The full right panel area (including border) from the last render frame.
     pub last_right_panel_area: Rect,
+    /// The divider column between graph and inspector (for mouse hit-testing).
+    pub last_divider_area: Rect,
+    /// Whether the mouse is hovering over the divider.
+    pub divider_hover: bool,
     /// The tab bar area inside the right panel from the last render frame.
     pub last_tab_bar_area: Rect,
     /// The content area inside the right panel (below tab bar) from the last render frame.
@@ -3153,6 +3159,8 @@ impl VizApp {
             scroll_axis_swapped: false,
             last_graph_area: Rect::default(),
             last_right_panel_area: Rect::default(),
+            last_divider_area: Rect::default(),
+            divider_hover: false,
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
@@ -6731,6 +6739,8 @@ impl VizApp {
             scroll_axis_swapped: false,
             last_graph_area: Rect::default(),
             last_right_panel_area: Rect::default(),
+            last_divider_area: Rect::default(),
+            divider_hover: false,
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
@@ -7098,7 +7108,7 @@ impl VizApp {
     }
 
     /// Map a percentage to the nearest LayoutMode bracket.
-    fn layout_mode_for_percent(pct: u16) -> LayoutMode {
+    pub(super) fn layout_mode_for_percent(pct: u16) -> LayoutMode {
         if pct >= 100 {
             LayoutMode::FullInspector
         } else if pct >= 59 {
