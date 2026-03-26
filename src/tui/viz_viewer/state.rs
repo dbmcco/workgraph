@@ -701,6 +701,14 @@ impl LayoutMode {
         )
     }
 
+    /// Whether this is a normal split mode (both graph and inspector visible).
+    pub fn is_normal_split(&self) -> bool {
+        matches!(
+            self,
+            Self::ThirdInspector | Self::HalfInspector | Self::TwoThirdsInspector
+        )
+    }
+
     /// Whether this mode shows the graph.
     pub fn has_graph(&self) -> bool {
         matches!(
@@ -2765,6 +2773,18 @@ pub struct VizApp {
     pub last_divider_area: Rect,
     /// Whether the mouse is hovering over the divider.
     pub divider_hover: bool,
+    /// The last "normal" split mode. Used to restore from FullInspector or Off.
+    pub last_split_mode: LayoutMode,
+    /// The last "normal" split percentage. Used to restore from FullInspector or Off.
+    pub last_split_percent: u16,
+    /// Hit area for the minimized inspector strip (1-col, right edge, Off mode).
+    pub last_minimized_strip_area: Rect,
+    /// Hit area for the full-screen restore strip (1-col, left edge, FullInspector mode).
+    pub last_fullscreen_restore_area: Rect,
+    /// Whether the mouse is hovering over the minimized strip.
+    pub minimized_strip_hover: bool,
+    /// Whether the mouse is hovering over the full-screen restore strip.
+    pub fullscreen_restore_hover: bool,
     /// The tab bar area inside the right panel from the last render frame.
     pub last_tab_bar_area: Rect,
     /// The content area inside the right panel (below tab bar) from the last render frame.
@@ -3161,6 +3181,12 @@ impl VizApp {
             last_right_panel_area: Rect::default(),
             last_divider_area: Rect::default(),
             divider_hover: false,
+            last_split_mode: LayoutMode::TwoThirdsInspector,
+            last_split_percent: 67,
+            last_minimized_strip_area: Rect::default(),
+            last_fullscreen_restore_area: Rect::default(),
+            minimized_strip_hover: false,
+            fullscreen_restore_hover: false,
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
@@ -3918,28 +3944,11 @@ impl VizApp {
             return false;
         }
 
-        // Only auto-navigate to the new task when the user is on the Chat tab.
-        // On other tabs (Detail, Log, Msg, Agency) the user is examining something
-        // specific and shouldn't have their focus interrupted.
-        if self.right_panel_tab != RightPanelTab::Chat {
-            // Still show the notification so the user knows a task was added,
-            // but don't move the selection or scroll.
-            self.push_toast(format!("New task: {}", task_id), ToastSeverity::Info);
-            return false;
-        }
-
-        // Find the task in the current task_order.
-        if let Some(idx) = self.task_order.iter().position(|id| id == &task_id) {
-            self.selected_task_idx = Some(idx);
-            // The splash animation (registered earlier in refresh_data) provides
-            // the visual highlight for new tasks. Don't also set jump_target here
-            // — its 2s lifetime outlasts the 1.5s splash, causing a yellow flash
-            // after the smooth fade finishes.
-            self.push_toast(format!("New task: {}", task_id), ToastSeverity::Info);
-            true
-        } else {
-            false
-        }
+        // Show notification but never move the viewport or selection — the user's
+        // scroll position should remain stable when new tasks appear. The splash
+        // animation (registered earlier in refresh_data) provides visual highlight.
+        self.push_toast(format!("New task: {}", task_id), ToastSeverity::Info);
+        false
     }
 
     // ── Splash animations ──
@@ -6741,6 +6750,12 @@ impl VizApp {
             last_right_panel_area: Rect::default(),
             last_divider_area: Rect::default(),
             divider_hover: false,
+            last_split_mode: LayoutMode::TwoThirdsInspector,
+            last_split_percent: 67,
+            last_minimized_strip_area: Rect::default(),
+            last_fullscreen_restore_area: Rect::default(),
+            minimized_strip_hover: false,
+            fullscreen_restore_hover: false,
             last_tab_bar_area: Rect::default(),
             last_right_content_area: Rect::default(),
             last_chat_input_area: Rect::default(),
@@ -7615,6 +7630,85 @@ impl VizApp {
                                 }
                             }
                         }
+                    }
+                    "turn" => {
+                        // Native executor format
+                        info.message_count += 1;
+                        if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
+                            for block in content {
+                                let block_type =
+                                    block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                match block_type {
+                                    "text" => {
+                                        if let Some(text) =
+                                            block.get("text").and_then(|v| v.as_str())
+                                        {
+                                            let trimmed = text.trim();
+                                            if !trimmed.is_empty() {
+                                                let snippet =
+                                                    trimmed.lines().last().unwrap_or(trimmed);
+                                                let snippet = if snippet.len() > 120 {
+                                                    format!(
+                                                        "{}…",
+                                                        &snippet
+                                                            [..snippet.floor_char_boundary(120)]
+                                                    )
+                                                } else {
+                                                    snippet.to_string()
+                                                };
+                                                info.latest_snippet = Some(snippet);
+                                                info.latest_is_tool = false;
+                                            }
+                                        }
+                                    }
+                                    "tool_use" => {
+                                        let name = block
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        info.latest_snippet = Some(name.to_string());
+                                        info.latest_is_tool = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    "tool_call" => {
+                        // Native executor tool call log
+                        let name =
+                            val.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let detail = match name {
+                            "Bash" | "bash" => val
+                                .get("input")
+                                .and_then(|i| i.get("command"))
+                                .and_then(|v| v.as_str())
+                                .map(|c| {
+                                    let c = c.trim();
+                                    if c.len() > 80 {
+                                        format!(
+                                            "{name}: {}…",
+                                            &c[..c.floor_char_boundary(80)]
+                                        )
+                                    } else {
+                                        format!("{name}: {c}")
+                                    }
+                                }),
+                            "Read" | "Write" | "Edit" => val
+                                .get("input")
+                                .and_then(|i| i.get("file_path"))
+                                .and_then(|v| v.as_str())
+                                .map(|p| format!("{name}: {p}")),
+                            "Grep" | "Glob" => val
+                                .get("input")
+                                .and_then(|i| i.get("pattern"))
+                                .and_then(|v| v.as_str())
+                                .map(|p| format!("{name}: {p}")),
+                            _ => None,
+                        };
+                        info.latest_snippet =
+                            Some(detail.unwrap_or_else(|| name.to_string()));
+                        info.latest_is_tool = true;
                     }
                     "user" | "result" => {
                         info.message_count += 1;
@@ -11304,6 +11398,88 @@ fn extract_enriched_text_from_log(content: &str) -> String {
                     }
                     _ => {}
                 }
+            }
+        } else if msg_type == "turn" {
+            // Native executor format: {"type":"turn","turn":N,"role":"assistant","content":[...]}
+            if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
+                for block in content {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match block_type {
+                        "text" => {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                let trimmed_text = text.trim();
+                                if !trimmed_text.is_empty() {
+                                    parts.push(trimmed_text.to_string());
+                                }
+                            }
+                        }
+                        "tool_use" => {
+                            let name =
+                                block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                            let summary = format!("┌─ {} ────\n└─", name);
+                            parts.push(summary);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if msg_type == "tool_call" {
+            // Native executor format: {"type":"tool_call","name":"...","input":...,"output":"...","is_error":bool}
+            let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+            let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            let detail = match name {
+                "Bash" | "bash" => val
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(|c| {
+                        let c = c.trim();
+                        if c.len() > 80 {
+                            format!("{}…", &c[..c.floor_char_boundary(80)])
+                        } else {
+                            c.to_string()
+                        }
+                    }),
+                "Read" | "Write" | "Edit" => val
+                    .get("input")
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .map(|p| p.to_string()),
+                "Grep" | "Glob" => val
+                    .get("input")
+                    .and_then(|i| i.get("pattern"))
+                    .and_then(|v| v.as_str())
+                    .map(|p| p.to_string()),
+                _ => None,
+            };
+            let header = match detail {
+                Some(d) => format!("┌─ {} ────\n│ {}", name, d),
+                None => format!("┌─ {} ────", name),
+            };
+
+            // Show tool output summary
+            if let Some(output) = val.get("output").and_then(|v| v.as_str()) {
+                let clean = String::from_utf8(
+                    strip_ansi_escapes::strip(output.as_bytes()),
+                )
+                .unwrap_or_else(|_| output.to_string());
+                let line_count = clean.lines().count();
+                let first_line = clean.lines().next().unwrap_or("").trim();
+                let short = if first_line.len() > 60 {
+                    format!("{}…", &first_line[..first_line.floor_char_boundary(60)])
+                } else {
+                    first_line.to_string()
+                };
+                let prefix = if is_error { "  ↳ error:" } else { "  ↳" };
+                let result_line = if line_count > 1 {
+                    format!("{} {} ({} lines)", prefix, short, line_count)
+                } else {
+                    format!("{} {}", prefix, short)
+                };
+                parts.push(format!("{}\n{}\n└─", header, result_line));
+            } else {
+                parts.push(format!("{}\n└─", header));
             }
         } else if msg_type == "result" {
             // Tool result — show a compact one-line summary.
