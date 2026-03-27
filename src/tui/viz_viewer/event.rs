@@ -43,11 +43,12 @@ fn set_mouse_capture(enabled: bool, any_motion: bool) -> Result<()> {
 }
 
 /// Returns true when mode 1003 (any-event tracking) should be enabled.
-/// Enabled on all terminals except behind mosh, which conflicts with 1003.
-/// This enables hover detection for UI elements like the hidden divider strip,
-/// and helps with Termux touch drag events that may lack the button-held flag.
+/// Only enabled in Termux (without mosh), where touch drag events may lack
+/// the button-held flag. Enabling 1003 globally causes the outer terminal
+/// to report all motion events, which breaks touch gesture translation in
+/// terminal emulators like Termux when running inside tmux.
 pub(super) fn detect_any_motion_support() -> bool {
-    std::env::var_os("MOSH_SERVER_PID").is_none()
+    std::env::var_os("TERMUX_VERSION").is_some() && std::env::var_os("MOSH_SERVER_PID").is_none()
 }
 
 pub fn run_event_loop(

@@ -136,8 +136,8 @@ fn restore_terminal() -> Result<()> {
     // Best-effort cleanup: don't short-circuit on individual failures
     // so that later steps still run even if an earlier one fails.
     let r1 = disable_raw_mode();
-    // Disable mouse modes with raw escape sequences (matching event.rs)
-    let r2 = io::stdout().write_all(b"\x1b[?1006l\x1b[?1000l");
+    // Disable mouse modes with raw escape sequences (matching event.rs set_mouse_capture)
+    let r2 = io::stdout().write_all(b"\x1b[?1003l\x1b[?1006l\x1b[?1002l");
     // Pop kitty keyboard enhancement (no-op if it wasn't pushed).
     let r3 = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     let r4 = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
