@@ -2672,21 +2672,29 @@ fn check_respawn_throttle(task: &Task, graph_path: &Path) -> std::result::Result
 /// Check if a model string represents a non-Anthropic model that requires the
 /// native executor instead of the Claude CLI.
 ///
-/// Checks two things:
-/// 1. If the model contains a `/` and doesn't start with `anthropic/`, it's a
+/// Checks three things in order:
+/// 1. If the model uses `provider:model` format, the provider prefix determines
+///    the executor directly (only `claude:*` uses the Claude CLI).
+/// 2. If the model contains a `/` and doesn't start with `anthropic/`, it's a
 ///    non-Anthropic full model ID (e.g. `google/gemini-2.0-flash-001`).
-/// 2. If the model is a registry alias (e.g. `gemini-flash`), look up its provider
+/// 3. If the model is a registry alias (e.g. `gemini-flash`), look up its provider
 ///    in the registry — if the provider isn't `anthropic`, it needs native.
 ///
 /// Returns `false` for Anthropic models, bare Anthropic model names, and
 /// built-in tier aliases (`haiku`, `sonnet`, `opus`).
 pub(crate) fn requires_native_executor(model: &str, config: &Config) -> bool {
-    // Direct provider/model format check
-    if model.contains('/') {
-        return !model.starts_with("anthropic/");
+    // 1. Unified provider:model check — provider prefix determines executor directly
+    let spec = workgraph::config::parse_model_spec(model);
+    if let Some(ref prefix) = spec.provider {
+        return workgraph::config::provider_to_executor(prefix) != "claude";
     }
-    // Registry alias check: look up the model and check its provider
-    if let Some(entry) = config.registry_lookup(model) {
+
+    // 2. Legacy: direct provider/model format check (org/model without provider: prefix)
+    if spec.model_id.contains('/') {
+        return !spec.model_id.starts_with("anthropic/");
+    }
+    // 3. Registry alias check: look up the model and check its provider
+    if let Some(entry) = config.registry_lookup(&spec.model_id) {
         return entry.provider != "anthropic";
     }
     // Bare model names without registry entries are assumed Anthropic-compatible
@@ -4573,6 +4581,43 @@ mod tests {
         let config = Config::default();
         // "haiku" is a built-in registry alias with provider "anthropic"
         assert!(!requires_native_executor("haiku", &config));
+    }
+
+    // provider:model format tests
+    #[test]
+    fn test_requires_native_for_openrouter_prefix() {
+        let config = Config::default();
+        assert!(requires_native_executor(
+            "openrouter:deepseek/deepseek-v3.2",
+            &config
+        ));
+        assert!(requires_native_executor(
+            "openrouter:minimax/minimax-m2.5",
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_does_not_require_native_for_claude_prefix() {
+        let config = Config::default();
+        assert!(!requires_native_executor("claude:opus", &config));
+        assert!(!requires_native_executor("claude:sonnet", &config));
+        assert!(!requires_native_executor(
+            "claude:claude-sonnet-4-6",
+            &config
+        ));
+    }
+
+    #[test]
+    fn test_requires_native_for_other_provider_prefixes() {
+        let config = Config::default();
+        assert!(requires_native_executor("openai:gpt-5", &config));
+        assert!(requires_native_executor(
+            "gemini:gemini-2.0-flash-001",
+            &config
+        ));
+        assert!(requires_native_executor("ollama:llama3", &config));
+        assert!(requires_native_executor("local:my-model", &config));
     }
 
     ///.assign-* tasks with `assignment` tag and `exec` field are detected as inline

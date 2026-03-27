@@ -1494,25 +1494,37 @@ fn native_coordinator_loop(
         .or_else(|| std::env::var("WG_MODEL").ok())
         .unwrap_or_else(|| "claude-sonnet-4-5-20250514".to_string());
 
+    // Parse provider:model spec. If the model has an explicit provider prefix,
+    // extract it for provider resolution and use the model_id for registry lookup.
+    let spec = workgraph::config::parse_model_spec(&raw_model);
+    let spec_provider = spec
+        .provider
+        .as_deref()
+        .map(workgraph::config::provider_to_native_provider)
+        .map(String::from);
+
     // Resolve model alias through the model registry. This converts aliases
     // like "minimax-m2.5" → "minimax/minimax-m2.5" (the actual API model ID)
     // and also extracts provider/endpoint from the registry entry.
     let config = workgraph::config::Config::load_or_default(dir);
     let merged_config = workgraph::config::Config::load_merged(dir).unwrap_or(config);
     let (effective_model, registry_provider, registry_endpoint) =
-        if let Some(entry) = merged_config.registry_lookup(&raw_model) {
+        if let Some(entry) = merged_config.registry_lookup(&spec.model_id) {
             (
                 entry.model.clone(),
                 Some(entry.provider.clone()),
                 entry.endpoint.clone(),
             )
+        } else if spec.provider.is_some() {
+            // Has provider prefix but not in registry — use model_id as-is
+            (spec.model_id.clone(), None, None)
         } else {
             (raw_model.clone(), None, None)
         };
 
-    // Provider resolution: explicit override > registry entry > default
-    let effective_provider = provider
-        .map(String::from)
+    // Provider resolution: spec prefix > explicit override > registry entry > default
+    let effective_provider = spec_provider
+        .or_else(|| provider.map(String::from))
         .or(registry_provider)
         .or_else(|| merged_config.coordinator.provider.clone());
     let effective_endpoint = registry_endpoint;
@@ -2531,6 +2543,15 @@ pub fn build_coordinator_context(
                 ));
             }
         }
+    }
+
+    // --- Injected History Context (from Ctrl+H history browser) ---
+    if let Some(injected) = workgraph::chat::take_injected_context(dir, coordinator_id) {
+        parts.push(format!(
+            "\n### Injected History Context\n\
+             _The user selected this from conversation history for your reference:_\n\n{}",
+            injected
+        ));
     }
 
     parts.push(format!(

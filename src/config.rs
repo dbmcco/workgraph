@@ -518,6 +518,10 @@ impl EndpointConfig {
             "anthropic" => "https://api.anthropic.com",
             "openai" => "https://api.openai.com/v1",
             "openrouter" => "https://openrouter.ai/api/v1",
+            "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
+            "ollama" => "http://localhost:11434/v1",
+            "llamacpp" => "http://localhost:8080/v1",
+            "vllm" => "http://localhost:8000/v1",
             "local" => "http://localhost:11434/v1",
             _ => "",
         }
@@ -1092,6 +1096,90 @@ pub struct ResolvedModel {
 }
 
 // ---------------------------------------------------------------------------
+// Unified provider:model naming
+// ---------------------------------------------------------------------------
+
+/// Known provider prefixes for the `provider:model` naming convention.
+///
+/// The `:` delimiter is unambiguous: provider names never contain `:`,
+/// and model IDs may contain `/` but never `:`.
+pub const KNOWN_PROVIDERS: &[&str] = &[
+    "claude",
+    "openrouter",
+    "openai",
+    "codex",
+    "gemini",
+    "ollama",
+    "llamacpp",
+    "vllm",
+    "local",
+    "native",
+];
+
+/// Result of parsing a `provider:model` spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// Provider prefix, if explicitly specified (e.g., `"openrouter"`).
+    /// `None` for bare model names (backward compat).
+    pub provider: Option<String>,
+    /// The model identifier sent to the provider's API.
+    pub model_id: String,
+}
+
+/// Parse a model spec into provider and model ID components.
+///
+/// - `"openrouter:deepseek/deepseek-v3.2"` → `ModelSpec { provider: Some("openrouter"), model_id: "deepseek/deepseek-v3.2" }`
+/// - `"claude:opus"` → `ModelSpec { provider: Some("claude"), model_id: "opus" }`
+/// - `"opus"` → `ModelSpec { provider: None, model_id: "opus" }`
+/// - `"deepseek/deepseek-v3.2"` → `ModelSpec { provider: None, model_id: "deepseek/deepseek-v3.2" }`
+///
+/// Only recognized provider prefixes are treated as providers. If the text before
+/// `:` is not in `KNOWN_PROVIDERS`, the entire string is treated as a bare model name
+/// (e.g., `"deepseek-coder-v2:16b"` for Ollama model tags).
+pub fn parse_model_spec(spec: &str) -> ModelSpec {
+    if let Some((prefix, rest)) = spec.split_once(':') {
+        if KNOWN_PROVIDERS.contains(&prefix) {
+            return ModelSpec {
+                provider: Some(prefix.to_string()),
+                model_id: rest.to_string(),
+            };
+        }
+    }
+    ModelSpec {
+        provider: None,
+        model_id: spec.to_string(),
+    }
+}
+
+/// Map a provider prefix to the executor type it requires.
+///
+/// - `claude` → `"claude"` (Claude CLI)
+/// - `codex` → `"codex"` (Codex CLI)
+/// - All others → `"native"` (OpenAI-compatible API)
+pub fn provider_to_executor(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => "native",
+    }
+}
+
+/// Map a provider prefix to the internal provider name used by the native executor.
+///
+/// This determines which API wire format and default URL to use.
+pub fn provider_to_native_provider(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "anthropic",
+        "openrouter" => "openrouter",
+        "openai" => "openai",
+        "gemini" => "openai", // Gemini uses OpenAI-compatible endpoint
+        "ollama" | "llamacpp" | "vllm" | "local" => "local",
+        "native" => "openai", // auto-detect, use openai-compat
+        _ => "anthropic",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------
 
@@ -1239,18 +1327,27 @@ impl Config {
             Tier::Premium => tiers.premium.as_deref(),
         }?;
 
-        if let Some(entry) = self.registry_lookup(model_id) {
+        // Parse provider:model prefix if present
+        let spec = parse_model_spec(model_id);
+        let lookup_id = &spec.model_id;
+
+        if let Some(entry) = self.registry_lookup(lookup_id) {
             Some(ResolvedModel {
                 model: entry.model.clone(),
-                provider: Some(entry.provider.clone()),
+                provider: spec
+                    .provider
+                    .map(|p| provider_to_native_provider(&p).to_string())
+                    .or_else(|| Some(entry.provider.clone())),
                 registry_entry: Some(entry),
                 endpoint: None,
             })
         } else {
-            // Model ID not in registry — treat as a bare model name
+            // Not in registry — use parsed provider or None
             Some(ResolvedModel {
-                model: model_id.to_string(),
-                provider: None,
+                model: spec.model_id,
+                provider: spec
+                    .provider
+                    .map(|p| provider_to_native_provider(&p).to_string()),
                 registry_entry: None,
                 endpoint: None,
             })
@@ -1301,12 +1398,20 @@ impl Config {
         if let Some(role_cfg) = self.models.get_role(role)
             && let Some(ref model) = role_cfg.model
         {
-            if let Some(entry) = self.registry_lookup(model) {
+            // Parse provider:model prefix from the model string
+            let spec = parse_model_spec(model);
+            let spec_provider = spec
+                .provider
+                .as_deref()
+                .map(provider_to_native_provider)
+                .map(String::from);
+            let lookup_model = &spec.model_id;
+
+            if let Some(entry) = self.registry_lookup(lookup_model) {
                 return ResolvedModel {
                     model: entry.model.clone(),
-                    provider: role_cfg
-                        .provider
-                        .clone()
+                    provider: spec_provider
+                        .or_else(|| role_cfg.provider.clone())
                         .or_else(|| Some(entry.provider.clone()))
                         .or_else(|| default_provider.clone()),
                     registry_entry: Some(entry),
@@ -1314,10 +1419,9 @@ impl Config {
                 };
             }
             return ResolvedModel {
-                model: model.clone(),
-                provider: role_cfg
-                    .provider
-                    .clone()
+                model: spec.model_id.clone(),
+                provider: spec_provider
+                    .or_else(|| role_cfg.provider.clone())
                     .or_else(|| default_provider.clone()),
                 registry_entry: None,
                 endpoint: resolve_endpoint(role),
@@ -1345,17 +1449,27 @@ impl Config {
             _ => None,
         };
         if let Some(model) = legacy_model {
-            if let Some(entry) = self.registry_lookup(model) {
+            let spec = parse_model_spec(model);
+            let spec_provider = spec
+                .provider
+                .as_deref()
+                .map(provider_to_native_provider)
+                .map(String::from);
+            let lookup_model = &spec.model_id;
+
+            if let Some(entry) = self.registry_lookup(lookup_model) {
                 return ResolvedModel {
                     model: entry.model.clone(),
-                    provider: resolve_provider(role).or_else(|| Some(entry.provider.clone())),
+                    provider: spec_provider
+                        .or_else(|| resolve_provider(role))
+                        .or_else(|| Some(entry.provider.clone())),
                     registry_entry: Some(entry),
                     endpoint: resolve_endpoint(role),
                 };
             }
             return ResolvedModel {
-                model: model.clone(),
-                provider: resolve_provider(role),
+                model: spec.model_id.clone(),
+                provider: spec_provider.or_else(|| resolve_provider(role)),
                 registry_entry: None,
                 endpoint: resolve_endpoint(role),
             };
@@ -1388,34 +1502,52 @@ impl Config {
         if let Some(default_cfg) = self.models.get_role(DispatchRole::Default)
             && let Some(ref model) = default_cfg.model
         {
-            if let Some(entry) = self.registry_lookup(model) {
+            let spec = parse_model_spec(model);
+            let spec_provider = spec
+                .provider
+                .as_deref()
+                .map(provider_to_native_provider)
+                .map(String::from);
+
+            if let Some(entry) = self.registry_lookup(&spec.model_id) {
                 return ResolvedModel {
                     model: entry.model.clone(),
-                    provider: default_provider.or_else(|| Some(entry.provider.clone())),
+                    provider: spec_provider
+                        .or(default_provider)
+                        .or_else(|| Some(entry.provider.clone())),
                     registry_entry: Some(entry),
                     endpoint: default_endpoint,
                 };
             }
             return ResolvedModel {
-                model: model.clone(),
-                provider: default_provider,
+                model: spec.model_id,
+                provider: spec_provider.or(default_provider),
                 registry_entry: None,
                 endpoint: default_endpoint,
             };
         }
 
         // 6. Global fallback
-        if let Some(entry) = self.registry_lookup(&self.agent.model) {
+        let fallback_spec = parse_model_spec(&self.agent.model);
+        let fallback_provider = fallback_spec
+            .provider
+            .as_deref()
+            .map(provider_to_native_provider)
+            .map(String::from);
+
+        if let Some(entry) = self.registry_lookup(&fallback_spec.model_id) {
             return ResolvedModel {
                 model: entry.model.clone(),
-                provider: default_provider.or_else(|| Some(entry.provider.clone())),
+                provider: fallback_provider
+                    .or(default_provider)
+                    .or_else(|| Some(entry.provider.clone())),
                 registry_entry: Some(entry),
                 endpoint: default_endpoint,
             };
         }
         ResolvedModel {
-            model: self.agent.model.clone(),
-            provider: default_provider,
+            model: fallback_spec.model_id,
+            provider: fallback_provider.or(default_provider),
             registry_entry: None,
             endpoint: default_endpoint,
         }
@@ -2042,6 +2174,14 @@ impl CoordinatorConfig {
         } else if let Some(ref provider) = self.provider {
             if NON_ANTHROPIC_PROVIDERS.contains(&provider.as_str()) {
                 "native".to_string()
+            } else {
+                "claude".to_string()
+            }
+        } else if let Some(ref model) = self.model {
+            // Infer executor from provider:model prefix
+            let spec = parse_model_spec(model);
+            if let Some(ref prefix) = spec.provider {
+                provider_to_executor(prefix).to_string()
             } else {
                 "claude".to_string()
             }
@@ -4655,5 +4795,234 @@ provider = "openrouter"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.coordinator.executor, Some("claude".to_string()));
         assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_model_spec: unified provider:model parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_model_spec_with_known_provider() {
+        let spec = parse_model_spec("openrouter:deepseek/deepseek-v3.2");
+        assert_eq!(spec.provider.as_deref(), Some("openrouter"));
+        assert_eq!(spec.model_id, "deepseek/deepseek-v3.2");
+    }
+
+    #[test]
+    fn test_parse_model_spec_claude_prefix() {
+        let spec = parse_model_spec("claude:opus");
+        assert_eq!(spec.provider.as_deref(), Some("claude"));
+        assert_eq!(spec.model_id, "opus");
+    }
+
+    #[test]
+    fn test_parse_model_spec_bare_name() {
+        let spec = parse_model_spec("opus");
+        assert_eq!(spec.provider, None);
+        assert_eq!(spec.model_id, "opus");
+    }
+
+    #[test]
+    fn test_parse_model_spec_legacy_slash_format() {
+        // Legacy org/model format should NOT be parsed as provider:model
+        let spec = parse_model_spec("deepseek/deepseek-v3.2");
+        assert_eq!(spec.provider, None);
+        assert_eq!(spec.model_id, "deepseek/deepseek-v3.2");
+    }
+
+    #[test]
+    fn test_parse_model_spec_ollama_model_tag() {
+        // Ollama model tags contain `:` but the prefix isn't a known provider
+        let spec = parse_model_spec("deepseek-coder-v2:16b");
+        assert_eq!(spec.provider, None);
+        assert_eq!(spec.model_id, "deepseek-coder-v2:16b");
+    }
+
+    #[test]
+    fn test_parse_model_spec_ollama_provider_prefix() {
+        // But "ollama:" IS a known provider prefix
+        let spec = parse_model_spec("ollama:llama3");
+        assert_eq!(spec.provider.as_deref(), Some("ollama"));
+        assert_eq!(spec.model_id, "llama3");
+    }
+
+    #[test]
+    fn test_parse_model_spec_all_known_providers() {
+        for provider in KNOWN_PROVIDERS {
+            let input = format!("{}:test-model", provider);
+            let spec = parse_model_spec(&input);
+            assert_eq!(
+                spec.provider.as_deref(),
+                Some(*provider),
+                "Failed for provider: {}",
+                provider
+            );
+            assert_eq!(spec.model_id, "test-model");
+        }
+    }
+
+    #[test]
+    fn test_provider_to_executor_mapping() {
+        assert_eq!(provider_to_executor("claude"), "claude");
+        assert_eq!(provider_to_executor("codex"), "codex");
+        assert_eq!(provider_to_executor("openrouter"), "native");
+        assert_eq!(provider_to_executor("openai"), "native");
+        assert_eq!(provider_to_executor("gemini"), "native");
+        assert_eq!(provider_to_executor("ollama"), "native");
+        assert_eq!(provider_to_executor("local"), "native");
+    }
+
+    #[test]
+    fn test_provider_to_native_provider_mapping() {
+        assert_eq!(provider_to_native_provider("openrouter"), "openrouter");
+        assert_eq!(provider_to_native_provider("openai"), "openai");
+        assert_eq!(provider_to_native_provider("claude"), "anthropic");
+        assert_eq!(provider_to_native_provider("gemini"), "openai");
+        assert_eq!(provider_to_native_provider("ollama"), "local");
+        assert_eq!(provider_to_native_provider("local"), "local");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_tier with provider:model format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_tier_with_provider_prefix() {
+        let mut config = Config::default();
+        config.tiers.fast = Some("openrouter:qwen/qwen-turbo".into());
+        let resolved = config.resolve_tier(Tier::Fast).unwrap();
+        // Model ID should be the bare part (no prefix)
+        assert_eq!(resolved.model, "qwen/qwen-turbo");
+        // Provider should be derived from the prefix
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+        assert!(resolved.registry_entry.is_none());
+    }
+
+    #[test]
+    fn test_resolve_tier_claude_prefix() {
+        let mut config = Config::default();
+        config.tiers.premium = Some("claude:opus".into());
+        let resolved = config.resolve_tier(Tier::Premium).unwrap();
+        // "claude" prefix → maps to "anthropic" native provider, but "opus"
+        // is in the built-in registry, so registry should take precedence
+        assert_eq!(resolved.model, "claude-opus-4-6");
+        assert_eq!(resolved.provider, Some("anthropic".to_string()));
+        assert!(resolved.registry_entry.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_model_for_role with provider:model format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_model_for_role_with_provider_prefix() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("openrouter:deepseek/deepseek-v3.2".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "deepseek/deepseek-v3.2");
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_claude_prefix_strips_for_api() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("claude:claude-sonnet-4-6".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        // Model ID should be the bare part without the claude: prefix
+        assert_eq!(resolved.model, "claude-sonnet-4-6");
+        assert_eq!(resolved.provider, Some("anthropic".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_provider_prefix_overrides_separate_provider() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("openrouter:qwen/qwen-turbo".into()),
+            provider: Some("anthropic".into()), // This should be overridden
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "qwen/qwen-turbo");
+        // The provider prefix should win over the separate provider field
+        assert_eq!(resolved.provider, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_bare_name_backward_compat() {
+        // Bare model names should still work exactly as before
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("gpt-4o-mini".into()),
+            provider: Some("openai".into()),
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "gpt-4o-mini");
+        assert_eq!(resolved.provider, Some("openai".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_ollama_local_provider() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("ollama:llama3".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "llama3");
+        assert_eq!(resolved.provider, Some("local".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_gemini_provider() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("gemini:gemini-2.0-flash-001".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "gemini-2.0-flash-001");
+        // Gemini maps to "openai" native provider (OpenAI-compatible endpoint)
+        assert_eq!(resolved.provider, Some("openai".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // default_url_for_provider: new provider URLs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_url_for_new_providers() {
+        assert_eq!(
+            EndpointConfig::default_url_for_provider("ollama"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            EndpointConfig::default_url_for_provider("llamacpp"),
+            "http://localhost:8080/v1"
+        );
+        assert_eq!(
+            EndpointConfig::default_url_for_provider("vllm"),
+            "http://localhost:8000/v1"
+        );
+        assert_eq!(
+            EndpointConfig::default_url_for_provider("gemini"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
     }
 }

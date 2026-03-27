@@ -1145,6 +1145,38 @@ fn resolve_model_via_registry(
         None => return Ok((None, None, None)),
     };
 
+    // Parse unified provider:model spec. If the model has an explicit provider
+    // prefix (e.g. "openrouter:deepseek/deepseek-v3.2"), extract it and use
+    // the model ID for registry lookup.
+    let spec = workgraph::config::parse_model_spec(&model_str);
+    if let Some(ref provider_prefix) = spec.provider {
+        let native_provider = Some(
+            workgraph::config::provider_to_native_provider(provider_prefix).to_string(),
+        );
+        // Try registry lookup on the bare model part for endpoint resolution
+        let merged = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
+        let endpoint = merged
+            .registry_lookup(&spec.model_id)
+            .or_else(|| {
+                merged
+                    .effective_registry()
+                    .into_iter()
+                    .find(|e| e.model == spec.model_id)
+            })
+            .and_then(|e| e.endpoint.clone());
+        // For the claude executor, pass just the model_id (no prefix) since the
+        // Claude CLI doesn't understand provider:model format.
+        // For native/other executors, preserve the full spec so create_provider_ext
+        // can re-parse the provider prefix.
+        let effective = if workgraph::config::provider_to_executor(provider_prefix) == "claude" {
+            spec.model_id.clone()
+        } else {
+            model_str.clone()
+        };
+        return Ok((Some(effective), native_provider, endpoint));
+    }
+
+    // No provider prefix — fall back to existing resolution logic.
     // Load merged config for registry lookup (includes global + local + builtins)
     let merged = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
 

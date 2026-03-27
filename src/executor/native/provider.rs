@@ -85,9 +85,21 @@ pub fn create_provider_ext(
 
     let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
 
-    // Resolve provider name: override > config > env var > model heuristic
-    let provider_name = provider_override
-        .map(String::from)
+    // Parse unified provider:model spec (e.g. "openrouter:deepseek/deepseek-v3.2").
+    // When a known provider prefix is present, it takes priority over all other
+    // provider resolution paths.
+    let spec = crate::config::parse_model_spec(model);
+    // Keep the original prefix for URL resolution (e.g., "ollama" → localhost:11434)
+    let original_prefix = spec.provider.clone();
+    let spec_provider = spec
+        .provider
+        .as_deref()
+        .map(crate::config::provider_to_native_provider)
+        .map(String::from);
+
+    // Resolve provider name: spec prefix > override > config > env var > model heuristic
+    let provider_name = spec_provider
+        .or_else(|| provider_override.map(String::from))
         .or_else(|| {
             native_cfg
                 .and_then(|c| c.get("provider"))
@@ -96,21 +108,24 @@ pub fn create_provider_ext(
         })
         .or_else(|| std::env::var("WG_LLM_PROVIDER").ok())
         .unwrap_or_else(|| {
-            if model.starts_with("anthropic/") {
+            // Legacy heuristic fallback for bare model names
+            if spec.model_id.starts_with("anthropic/") {
                 "anthropic".to_string()
-            } else if model.contains('/') {
+            } else if spec.model_id.contains('/') {
                 "openai".to_string()
             } else {
                 "anthropic".to_string()
             }
         });
 
-    // Strip provider prefix from model name when routing to native provider.
-    // e.g. "anthropic/claude-sonnet-4-20250514" → "claude-sonnet-4-20250514"
+    // Use the parsed model ID (provider prefix stripped) for API calls.
+    // Also strip legacy "anthropic/" prefix for backward compatibility.
     let model = if provider_name == "anthropic" {
-        model.strip_prefix("anthropic/").unwrap_or(model)
+        spec.model_id
+            .strip_prefix("anthropic/")
+            .unwrap_or(&spec.model_id)
     } else {
-        model
+        &spec.model_id
     };
 
     // Look up endpoint config: by name first, then by provider, then default endpoint
@@ -177,8 +192,11 @@ pub fn create_provider_ext(
                 // Fall back to the provider's known default URL so that non-OpenRouter
                 // providers (e.g. "openai", "local") don't silently hit the OpenRouter
                 // endpoint via OpenAiClient's DEFAULT_BASE_URL.
+                // Use the original provider prefix (e.g., "ollama", "gemini") for URL
+                // lookup, falling back to the resolved provider_name.
+                let url_lookup = original_prefix.as_deref().unwrap_or(&provider_name);
                 let default_url =
-                    crate::config::EndpointConfig::default_url_for_provider(&provider_name);
+                    crate::config::EndpointConfig::default_url_for_provider(url_lookup);
                 if !default_url.is_empty() {
                     client = client.with_base_url(default_url);
                 }
