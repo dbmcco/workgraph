@@ -53,6 +53,10 @@ pub struct Message {
     /// Delivery status tracking.
     #[serde(default)]
     pub status: DeliveryStatus,
+    /// ISO 8601 timestamp of when the message was read by the agent.
+    /// Set when `update_message_statuses()` transitions status to `Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
 }
 
 fn default_priority() -> String {
@@ -145,6 +149,7 @@ pub fn send_message(
         body: body.to_string(),
         priority: priority.to_string(),
         status: DeliveryStatus::Sent,
+        read_at: None,
     };
 
     // Append the message as a single JSON line
@@ -302,8 +307,12 @@ pub fn update_message_statuses(
     let mut messages = list_messages(workgraph_dir, task_id)?;
     let mut changed = false;
 
+    let now = Utc::now().to_rfc3339();
     for msg in &mut messages {
         if id_set.contains(&msg.id) && status_rank(&new_status) > status_rank(&msg.status) {
+            if new_status == DeliveryStatus::Read && msg.read_at.is_none() {
+                msg.read_at = Some(now.clone());
+            }
             msg.status = new_status.clone();
             changed = true;
         }
@@ -750,6 +759,7 @@ pub fn deliver_message(
         body: body.to_string(),
         priority: priority.to_string(),
         status: DeliveryStatus::Sent,
+        read_at: None,
     };
     let delivered = adapter.deliver(workgraph_dir, agent, &msg)?;
 
@@ -947,6 +957,32 @@ mod tests {
     }
 
     #[test]
+    fn test_read_at_timestamp_set_on_read() {
+        let (_tmp, wg_dir) = setup();
+
+        send_message(&wg_dir, "task-1", "Hello", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "World", "user", "normal").unwrap();
+
+        // Before reading: read_at should be None.
+        let msgs = list_messages(&wg_dir, "task-1").unwrap();
+        assert!(msgs[0].read_at.is_none());
+        assert!(msgs[1].read_at.is_none());
+
+        // Read the messages as agent-1.
+        let unread = read_unread(&wg_dir, "task-1", "agent-1").unwrap();
+        assert_eq!(unread.len(), 2);
+
+        // After reading: read_at should be set.
+        let msgs = list_messages(&wg_dir, "task-1").unwrap();
+        assert!(msgs[0].read_at.is_some(), "read_at should be set after read_unread");
+        assert!(msgs[1].read_at.is_some(), "read_at should be set after read_unread");
+
+        // The read_at should be a valid RFC 3339 timestamp.
+        let read_at = msgs[0].read_at.as_ref().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(read_at).is_ok());
+    }
+
+    #[test]
     fn test_separate_cursors_per_agent() {
         let (_tmp, wg_dir) = setup();
 
@@ -1114,6 +1150,7 @@ mod tests {
             body: "Hello agent".to_string(),
             priority: "normal".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let delivered = adapter.deliver(&wg_dir, &agent, &msg).unwrap();
@@ -1146,6 +1183,7 @@ mod tests {
             body: "Context update".to_string(),
             priority: "urgent".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let delivered = adapter.deliver(&wg_dir, &agent, &msg).unwrap();
@@ -1180,6 +1218,7 @@ mod tests {
                 body: format!("Message {}", i),
                 priority: "normal".to_string(),
                 status: DeliveryStatus::Sent,
+                read_at: None,
             };
             adapter.deliver(&wg_dir, &agent, &msg).unwrap();
         }
@@ -1238,6 +1277,7 @@ mod tests {
             body: "Auto-create dir".to_string(),
             priority: "normal".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let adapter = ClaudeMessageAdapter;
