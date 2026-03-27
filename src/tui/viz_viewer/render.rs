@@ -1837,15 +1837,30 @@ fn draw_fullscreen_borders(frame: &mut Frame, app: &super::state::VizApp) {
     let no_mouse = !app.any_motion_mouse;
 
     // Left border (restore strip).
+    // Always render so the area is claimed — invisible when not hovered.
+    // In no-mouse environments (Mosh), always show the strip since hover is unavailable.
     let left = app.last_fullscreen_restore_area;
-    if left.width > 0 && (app.fullscreen_restore_hover || no_mouse) {
-        draw_restore_strip(frame, left, app.fullscreen_restore_hover);
+    if left.width > 0 {
+        if app.fullscreen_restore_hover || no_mouse {
+            draw_restore_strip(frame, left, app.fullscreen_restore_hover);
+        } else {
+            // Invisible: plain spaces with default terminal background.
+            let lines: Vec<Line> = (0..left.height).map(|_| Line::from(" ")).collect();
+            frame.render_widget(Paragraph::new(lines), left);
+        }
     }
 
     // Right border.
+    // Always render so the area is claimed — invisible when not hovered.
+    // In no-mouse environments (Mosh), always show the border since hover is unavailable.
     let right = app.last_fullscreen_right_border_area;
-    if right.width > 0 && (app.fullscreen_right_hover || no_mouse) {
-        draw_fullscreen_border_col(frame, right, '▐', app.fullscreen_right_hover);
+    if right.width > 0 {
+        if app.fullscreen_right_hover || no_mouse {
+            draw_fullscreen_border_col(frame, right, '▐', app.fullscreen_right_hover);
+        } else {
+            let lines: Vec<Line> = (0..right.height).map(|_| Line::from(" ")).collect();
+            frame.render_widget(Paragraph::new(lines), right);
+        }
     }
 
     // Top border.
