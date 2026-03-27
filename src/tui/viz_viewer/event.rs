@@ -2295,21 +2295,24 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             } else if in_fullscreen_right || in_fullscreen_top || in_fullscreen_bottom {
                 // Click on any fullscreen border: restore to normal split.
                 app.restore_from_extreme();
-            } else if in_divider {
-                // Click on divider between graph and inspector: start resize drag.
-                app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
             } else if in_graph_vscrollbar {
                 // Click on graph vertical scrollbar: start drag and jump.
+                // Checked before in_divider because the scrollbar column overlaps
+                // the wide (3-col) divider grab zone.
                 app.focused_panel = FocusedPanel::Graph;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Graph);
                 app.record_graph_scroll_activity();
                 vscrollbar_jump_graph(app, row);
             } else if in_panel_vscrollbar {
                 // Click on panel vertical scrollbar: start drag and jump.
+                // Checked before in_divider for the same overlap reason.
                 app.focused_panel = FocusedPanel::RightPanel;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Panel);
                 app.record_panel_scroll_activity();
                 vscrollbar_jump_panel(app, row);
+            } else if in_divider {
+                // Click on divider between graph and inspector: start resize drag.
+                app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
             } else if in_graph_hscrollbar {
                 app.focused_panel = FocusedPanel::Graph;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::GraphHorizontal);
@@ -4795,6 +4798,45 @@ mod scrollbar_tests {
         assert_eq!(
             app.scroll.offset_x, 0,
             "Swapped ScrollUp should scroll left"
+        );
+    }
+
+    #[test]
+    fn scrollbar_click_wins_over_overlapping_divider() {
+        // The graph scrollbar column overlaps with the 3-column-wide divider
+        // grab zone. Scrollbar clicks must take priority over the divider.
+        let (mut app, _tmp) = build_test_app();
+        setup_graph_scroll(&mut app, 100, 20);
+        // Graph occupies columns 0–79, scrollbar is the rightmost column (79).
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 20,
+        };
+        app.last_graph_scrollbar_area = Rect {
+            x: 79,
+            y: 0,
+            width: 1,
+            height: 20,
+        };
+        // Right panel starts at column 80; divider grab zone = columns 79–81.
+        // Column 79 overlaps with the scrollbar.
+        app.last_divider_area = Rect {
+            x: 79,
+            y: 0,
+            width: 3,
+            height: 20,
+        };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        // Click on column 79 (the overlapping column).
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 79);
+        assert_eq!(
+            app.scrollbar_drag,
+            Some(ScrollbarDragTarget::Graph),
+            "Scrollbar should win over divider when they overlap"
         );
     }
 }
