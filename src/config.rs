@@ -4797,6 +4797,33 @@ provider = "openrouter"
         assert_eq!(config.coordinator.effective_executor(), "claude");
     }
 
+    #[test]
+    fn test_effective_executor_infers_native_from_model_prefix() {
+        let mut config = Config::default();
+        config.coordinator.executor = None;
+        config.coordinator.provider = None;
+        config.coordinator.model = Some("openrouter:minimax/minimax-m2.5".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_effective_executor_infers_claude_from_claude_prefix() {
+        let mut config = Config::default();
+        config.coordinator.executor = None;
+        config.coordinator.provider = None;
+        config.coordinator.model = Some("claude:opus".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
+    #[test]
+    fn test_effective_executor_bare_model_stays_claude() {
+        let mut config = Config::default();
+        config.coordinator.executor = None;
+        config.coordinator.provider = None;
+        config.coordinator.model = Some("opus".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "claude");
+    }
+
     // -----------------------------------------------------------------------
     // parse_model_spec: unified provider:model parsing
     // -----------------------------------------------------------------------
