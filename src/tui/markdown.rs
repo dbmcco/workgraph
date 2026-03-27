@@ -149,7 +149,12 @@ impl MdRenderer {
                 self.push_style(|s| s.fg(color).add_modifier(Modifier::BOLD));
             }
             Event::Start(Tag::Paragraph) => {
-                if !self.lines.is_empty() && !self.in_code_block {
+                // Only insert a blank separator when current_spans is empty.
+                // Inside a list item, current_spans holds the marker (e.g. "1. ");
+                // flushing here would strand the marker on its own line, separated
+                // from the item text.
+                if !self.lines.is_empty() && !self.in_code_block && self.current_spans.is_empty()
+                {
                     self.blank_line();
                 }
             }
@@ -632,6 +637,78 @@ mod tests {
         assert!(texts[1].contains("│ $ ls"), "second line: command");
         assert!(texts[2].contains("│ file.txt"), "third line: output");
         assert!(texts[3].contains("└─"), "fourth line: closing box");
+    }
+
+    #[test]
+    fn test_ordered_list_compact() {
+        // Numbered list items must not have blank lines between number and content.
+        let md = "1. First\n2. Second\n3. Third";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        assert_eq!(texts.len(), 3, "3 items = 3 lines, got {:?}", texts);
+        assert!(texts[0].contains("1.") && texts[0].contains("First"));
+        assert!(texts[1].contains("2.") && texts[1].contains("Second"));
+        assert!(texts[2].contains("3.") && texts[2].contains("Third"));
+    }
+
+    #[test]
+    fn test_ordered_list_loose_compact() {
+        // Even "loose" lists (blank lines between items in source) should
+        // render each item on a single line with marker + content together.
+        let md = "1. First\n\n2. Second\n\n3. Third";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        // Each item should have marker and content on the same line.
+        let item_lines: Vec<&String> = texts.iter().filter(|t| !t.is_empty()).collect();
+        assert_eq!(
+            item_lines.len(),
+            3,
+            "3 non-blank lines for 3 items, got {:?}",
+            texts
+        );
+        assert!(item_lines[0].contains("1.") && item_lines[0].contains("First"));
+        assert!(item_lines[1].contains("2.") && item_lines[1].contains("Second"));
+        assert!(item_lines[2].contains("3.") && item_lines[2].contains("Third"));
+    }
+
+    #[test]
+    fn test_bullet_list_compact() {
+        let md = "- Alpha\n\n- Beta\n\n- Gamma";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        let item_lines: Vec<&String> = texts.iter().filter(|t| !t.is_empty()).collect();
+        assert_eq!(
+            item_lines.len(),
+            3,
+            "3 non-blank lines for 3 items, got {:?}",
+            texts
+        );
+        assert!(item_lines[0].contains("Alpha"));
+        assert!(item_lines[1].contains("Beta"));
+        assert!(item_lines[2].contains("Gamma"));
+    }
+
+    #[test]
+    fn test_nested_list() {
+        let md = "1. Outer\n   - Inner A\n   - Inner B\n2. Second";
+        let lines = markdown_to_lines(md, 80);
+        let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
+        // Outer items should have their markers with content.
+        assert!(
+            texts.iter().any(|t| t.contains("1.") && t.contains("Outer")),
+            "outer item 1 should be compact: {:?}",
+            texts
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Inner A")),
+            "nested item A present: {:?}",
+            texts
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("Inner B")),
+            "nested item B present: {:?}",
+            texts
+        );
     }
 
     #[test]
