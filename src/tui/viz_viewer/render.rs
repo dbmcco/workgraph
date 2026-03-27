@@ -12,7 +12,7 @@ use super::state::{
     InputMode, LayoutMode, ResponsiveBreakpoint, RightPanelTab, ServiceHealthLevel,
     SinglePanelView, SortMode, TaskFormField, TaskFormState, TextPromptAction, ToastSeverity,
     VitalsStaleness, VizApp, WAVE_BOLT, WAVE_NUM_BOLTS, extract_section_name,
-    format_duration_compact, spinner_wave_pos, vitals_staleness_color,
+    format_duration_compact, format_relative_time, spinner_wave_pos, vitals_staleness_color,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
@@ -2595,9 +2595,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let editing_index = app.chat.editing_index;
 
+    // Subtle magenta-tinted background for sent-to-agent messages.
+    let sent_msg_bg = Color::Rgb(30, 20, 30);
+
     for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
         let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
         let is_user = msg.role == super::state::ChatRole::User;
+        let is_sent_message = msg.role == super::state::ChatRole::SentMessage;
         let is_editable = is_user && !app.is_chat_message_consumed(msg_idx);
         let is_being_edited = editing_index == Some(msg_idx);
 
@@ -2621,6 +2625,15 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 "! ".to_string(),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
+            super::state::ChatRole::SentMessage => {
+                let target = msg.target_task.as_deref().unwrap_or("task");
+                (
+                    format!("→ {}: ", target),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
         };
 
         let prefix_len = prefix.width();
@@ -2733,9 +2746,22 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                             .add_modifier(Modifier::ITALIC),
                     ));
                 }
+                // Append read-at annotation for sent messages.
+                if is_sent_message {
+                    if let Some(read_at) = &msg.read_at {
+                        let now = chrono::Utc::now();
+                        let rel = format_relative_time(read_at, &now);
+                        spans.push(Span::styled(
+                            format!("  read {}", rel),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
                 let mut built = Line::from(spans);
                 if is_user {
                     built = apply_line_bg(built, msg_bg);
+                } else if is_sent_message {
+                    built = apply_line_bg(built, sent_msg_bg);
                 }
                 rendered_lines.push(built);
                 line_to_message.push(Some(msg_idx));
@@ -2747,6 +2773,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 let mut built = Line::from(spans);
                 if is_user {
                     built = apply_line_bg(built, msg_bg);
+                } else if is_sent_message {
+                    built = apply_line_bg(built, sent_msg_bg);
                 }
                 rendered_lines.push(built);
                 line_to_message.push(Some(msg_idx));
@@ -4750,6 +4778,15 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             format!(" {}", status_icon),
             Style::default().fg(status_color),
         ));
+        // Show read-at timestamp when available (e.g., "read 2m ago").
+        if let Some(read_at) = &entry.read_at {
+            let now = chrono::Utc::now();
+            let read_rel = format_relative_time(read_at, &now);
+            header_spans.push(Span::styled(
+                format!(" read {}", read_rel),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if !unanswered_marker.is_empty() {
             header_spans.push(Span::styled(
                 unanswered_marker,

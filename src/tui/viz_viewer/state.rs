@@ -1067,6 +1067,14 @@ pub struct ChatMessage {
     pub inbox_id: Option<u64>,
     /// The user who sent this message (from `current_user()`).
     pub user: Option<String>,
+    /// Target task ID for SentMessage role (which task the message was sent to).
+    pub target_task: Option<String>,
+    /// ISO 8601 timestamp for temporal ordering of interleaved messages.
+    pub msg_timestamp: Option<String>,
+    /// ISO 8601 timestamp of when the agent read this message.
+    pub read_at: Option<String>,
+    /// Message queue ID (for deduplication during polling).
+    pub msg_queue_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1074,6 +1082,9 @@ pub enum ChatRole {
     User,
     Coordinator,
     System,
+    /// A message sent to an agent's task via `wg msg send`, shown interleaved
+    /// at the temporal position where the agent read it.
+    SentMessage,
 }
 
 /// Serializable chat message for persistence to disk.
@@ -1090,15 +1101,33 @@ struct PersistedChatMessage {
     edited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    msg_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    msg_queue_id: Option<u64>,
 }
 
-/// Path to the persisted chat history file.
-fn chat_history_path(workgraph_dir: &std::path::Path) -> std::path::PathBuf {
-    workgraph_dir.join("chat-history.json")
+/// Path to the persisted chat history file for a specific coordinator.
+/// Coordinator 0 uses `chat-history.json` (backward compatible);
+/// other coordinators use `chat-history-{cid}.json`.
+fn chat_history_path(workgraph_dir: &std::path::Path, coordinator_id: u32) -> std::path::PathBuf {
+    if coordinator_id == 0 {
+        workgraph_dir.join("chat-history.json")
+    } else {
+        workgraph_dir.join(format!("chat-history-{}.json", coordinator_id))
+    }
 }
 
-/// Save chat messages to disk. Respects config for max history size.
-fn save_chat_history(workgraph_dir: &std::path::Path, messages: &[ChatMessage]) {
+/// Save chat messages to disk for a specific coordinator. Respects config for max history size.
+fn save_chat_history(
+    workgraph_dir: &std::path::Path,
+    coordinator_id: u32,
+    messages: &[ChatMessage],
+) {
     let config = Config::load_or_default(workgraph_dir);
     if !config.tui.chat_history {
         return;
@@ -1112,28 +1141,36 @@ fn save_chat_history(workgraph_dir: &std::path::Path, messages: &[ChatMessage]) 
                 ChatRole::User => "user".to_string(),
                 ChatRole::Coordinator => "coordinator".to_string(),
                 ChatRole::System => "system".to_string(),
+                ChatRole::SentMessage => "sent_message".to_string(),
             },
             text: m.text.clone(),
             full_text: m.full_text.clone(),
             attachments: m.attachments.clone(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: m.msg_timestamp.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
             edited: m.edited,
             user: m.user.clone(),
+            target_task: m.target_task.clone(),
+            msg_timestamp: m.msg_timestamp.clone(),
+            read_at: m.read_at.clone(),
+            msg_queue_id: m.msg_queue_id,
         })
         .collect();
-    let path = chat_history_path(workgraph_dir);
+    let path = chat_history_path(workgraph_dir, coordinator_id);
     if let Ok(json) = serde_json::to_string(&persisted) {
         let _ = std::fs::write(&path, json);
     }
 }
 
-/// Load persisted chat history from disk.
-fn load_persisted_chat_history(workgraph_dir: &std::path::Path) -> Vec<ChatMessage> {
+/// Load persisted chat history from disk for a specific coordinator.
+fn load_persisted_chat_history(
+    workgraph_dir: &std::path::Path,
+    coordinator_id: u32,
+) -> Vec<ChatMessage> {
     let config = Config::load_or_default(workgraph_dir);
     if !config.tui.chat_history {
         return vec![];
     }
-    let path = chat_history_path(workgraph_dir);
+    let path = chat_history_path(workgraph_dir, coordinator_id);
     let data = match std::fs::read_to_string(&path) {
         Ok(d) => d,
         Err(_) => return vec![],
@@ -1148,6 +1185,7 @@ fn load_persisted_chat_history(workgraph_dir: &std::path::Path) -> Vec<ChatMessa
             role: match p.role.as_str() {
                 "user" => ChatRole::User,
                 "coordinator" => ChatRole::Coordinator,
+                "sent_message" => ChatRole::SentMessage,
                 _ => ChatRole::System,
             },
             text: p.text,
@@ -1156,8 +1194,42 @@ fn load_persisted_chat_history(workgraph_dir: &std::path::Path) -> Vec<ChatMessa
             edited: p.edited,
             inbox_id: None,
             user: p.user,
+            target_task: p.target_task,
+            msg_timestamp: p.msg_timestamp,
+            read_at: p.read_at,
+            msg_queue_id: p.msg_queue_id,
         })
         .collect()
+}
+
+/// Persisted TUI state for focus restoration across restarts.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PersistedTuiState {
+    /// Which coordinator was focused when the TUI was last closed.
+    #[serde(default)]
+    active_coordinator_id: u32,
+    /// Which right panel tab was active.
+    #[serde(default)]
+    right_panel_tab: String,
+}
+
+fn tui_state_path(workgraph_dir: &std::path::Path) -> std::path::PathBuf {
+    workgraph_dir.join("tui-state.json")
+}
+
+fn save_tui_state(workgraph_dir: &std::path::Path, coordinator_id: u32, tab: &RightPanelTab) {
+    let state = PersistedTuiState {
+        active_coordinator_id: coordinator_id,
+        right_panel_tab: format!("{:?}", tab),
+    };
+    if let Ok(json) = serde_json::to_string(&state) {
+        let _ = std::fs::write(tui_state_path(workgraph_dir), json);
+    }
+}
+
+fn load_tui_state(workgraph_dir: &std::path::Path) -> Option<PersistedTuiState> {
+    let data = std::fs::read_to_string(tui_state_path(workgraph_dir)).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 /// State for the agent monitor panel.
@@ -2348,6 +2420,11 @@ pub struct MessageEntry {
     pub direction: MessageDirection,
     /// Delivery status of this message.
     pub delivery_status: workgraph::messages::DeliveryStatus,
+    /// ISO 8601 timestamp of when this message was read by the agent (if read).
+    pub read_at: Option<String>,
+    /// Original send timestamp (ISO 8601) for temporal sorting / future use.
+    #[allow(dead_code)]
+    pub send_timestamp: String,
 }
 
 /// Summary stats for the messages panel header.
@@ -2574,6 +2651,8 @@ pub enum CommandEffect {
     ArchiveCoordinator(u32),
     /// A coordinator's agent was stopped. On success, show notification.
     StopCoordinator(u32),
+    /// A coordinator's current generation was interrupted (SIGINT, not kill).
+    InterruptCoordinator(u32),
     /// An endpoint connectivity test completed. String is the endpoint name.
     EndpointTest(String),
 }
@@ -3308,6 +3387,9 @@ impl VizApp {
             app.load_viz();
             app.load_stats();
         }
+        // Restore TUI focus state from previous session (before ensure_user_coordinator
+        // so that the user's last-focused coordinator is preserved).
+        app.restore_tui_state();
         app.ensure_user_coordinator();
         app.load_agent_monitor();
         app.check_coordinator_status();
@@ -3843,8 +3925,8 @@ impl VizApp {
     }
 
     /// Scroll the viewport so the selected task stays within the middle 60% of
-    /// the viewport (a "comfort zone"). If the task is in the top or bottom 20%,
-    /// recenter it to the middle — similar to vim's `scrolloff`.
+    /// the viewport (a "comfort zone"). Uses minimal scrolling — like vim's
+    /// `scrolloff` — instead of re-centering when a task exits the zone.
     pub fn scroll_to_selected_task(&mut self) {
         let task_id = match self.selected_task_idx.and_then(|i| self.task_order.get(i)) {
             Some(id) => id,
@@ -3859,9 +3941,17 @@ impl VizApp {
             let margin = vh / 5; // 20% margin top and bottom
             let comfort_top = self.scroll.offset_y + margin;
             let comfort_bottom = self.scroll.offset_y + vh.saturating_sub(margin);
-            if visible_pos < comfort_top || visible_pos >= comfort_bottom {
-                let half = vh / 2;
-                self.scroll.offset_y = visible_pos.saturating_sub(half);
+            if visible_pos < comfort_top {
+                // Task is above the comfort zone — scroll up just enough so it
+                // sits at the top edge of the comfort zone.  saturating_sub
+                // naturally clamps to 0 (can't scroll past the first line).
+                self.scroll.offset_y = visible_pos.saturating_sub(margin);
+                self.scroll.clamp();
+            } else if visible_pos >= comfort_bottom {
+                // Task is below the comfort zone — scroll down just enough so
+                // it sits at the bottom edge of the comfort zone.
+                self.scroll.offset_y =
+                    (visible_pos + margin + 1).saturating_sub(vh);
                 self.scroll.clamp();
             }
         }
@@ -6614,6 +6704,8 @@ impl VizApp {
                         is_urgent,
                         direction,
                         delivery_status: msg.status.clone(),
+                        read_at: None,
+                        send_timestamp: msg.timestamp.clone(),
                     });
                 }
 
@@ -7009,7 +7101,7 @@ impl VizApp {
 
     /// Apply a layout mode, updating panel visibility and focus.
     /// Saves the current split state when transitioning to FullInspector or Off.
-    fn apply_layout_mode(&mut self, mode: LayoutMode) {
+    pub fn apply_layout_mode(&mut self, mode: LayoutMode) {
         // Save the current normal split state before leaving it.
         if self.layout_mode.is_normal_split() && !mode.is_normal_split() {
             self.last_split_mode = self.layout_mode;
@@ -7255,8 +7347,12 @@ impl VizApp {
                             edited: false,
                             inbox_id: None,
                             user: None,
+                            target_task: None,
+                            msg_timestamp: None,
+                            read_at: None,
+                            msg_queue_id: None,
                         });
-                        save_chat_history(&self.workgraph_dir, &self.chat.messages);
+                        save_chat_history(&self.workgraph_dir, self.active_coordinator_id, &self.chat.messages);
                         // Clear awaiting on error — no response will come.
                         if self.chat.last_request_id.as_deref() == Some(&request_id) {
                             self.chat.awaiting_response = false;
@@ -7367,6 +7463,24 @@ impl VizApp {
                             .unwrap_or("unknown");
                         self.push_toast(
                             format!("Failed to stop coordinator: {}", err),
+                            ToastSeverity::Error,
+                        );
+                    }
+                }
+                CommandEffect::InterruptCoordinator(cid) => {
+                    if result.success {
+                        self.push_toast(
+                            format!("Interrupted coordinator {}", cid),
+                            ToastSeverity::Info,
+                        );
+                    } else {
+                        let err = result
+                            .output
+                            .lines()
+                            .find(|l| !l.is_empty())
+                            .unwrap_or("unknown");
+                        self.push_toast(
+                            format!("Failed to interrupt coordinator: {}", err),
                             ToastSeverity::Error,
                         );
                     }
@@ -8706,10 +8820,38 @@ impl VizApp {
         self.set_service_feedback(format!("PANIC KILL: {} agents killed, service stopped", n));
     }
 
-    /// Load chat history on startup.
-    /// Tries the persisted chat-history.json first, then falls back to inbox/outbox.
+    /// Load chat history on startup for the active coordinator.
+    /// Tries the persisted per-coordinator chat-history-{cid}.json first,
+    /// then falls back to inbox/outbox.
     pub fn load_chat_history(&mut self) {
-        let persisted = load_persisted_chat_history(&self.workgraph_dir);
+        self.load_chat_history_for_coordinator(self.active_coordinator_id);
+
+        // Also pre-load persisted chat for all other known coordinators so
+        // switch_coordinator doesn't lose history.
+        let other_ids: Vec<u32> = self
+            .list_coordinator_ids()
+            .into_iter()
+            .filter(|id| *id != self.active_coordinator_id)
+            .collect();
+        for cid in other_ids {
+            let msgs = load_persisted_chat_history(&self.workgraph_dir, cid);
+            if !msgs.is_empty() {
+                let mut state = ChatState::default();
+                state.messages = msgs;
+                // Set outbox cursor so we don't re-display old messages.
+                if let Ok(outbox) =
+                    workgraph::chat::read_outbox_since_for(&self.workgraph_dir, cid, 0)
+                {
+                    state.outbox_cursor = outbox.last().map(|m| m.id).unwrap_or(0);
+                }
+                self.coordinator_chats.entry(cid).or_insert(state);
+            }
+        }
+    }
+
+    /// Load chat history for a specific coordinator into self.chat.
+    fn load_chat_history_for_coordinator(&mut self, coordinator_id: u32) {
+        let persisted = load_persisted_chat_history(&self.workgraph_dir, coordinator_id);
         if !persisted.is_empty() {
             self.chat.messages = persisted;
         } else {
@@ -8747,12 +8889,20 @@ impl VizApp {
                     edited: false,
                     inbox_id,
                     user: msg.user.clone(),
+                    target_task: None,
+                    msg_timestamp: None,
+                    read_at: None,
+                    msg_queue_id: None,
                 });
             }
 
             // Persist the loaded history so next restart uses the file.
             if !self.chat.messages.is_empty() {
-                save_chat_history(&self.workgraph_dir, &self.chat.messages);
+                save_chat_history(
+                    &self.workgraph_dir,
+                    coordinator_id,
+                    &self.chat.messages,
+                );
             }
         }
 
@@ -8760,11 +8910,31 @@ impl VizApp {
         // Use the active coordinator's outbox (each coordinator has independent ID sequences).
         if let Ok(msgs) = workgraph::chat::read_outbox_since_for(
             &self.workgraph_dir,
-            self.active_coordinator_id,
+            coordinator_id,
             0,
         ) {
             self.chat.outbox_cursor = msgs.last().map(|m| m.id).unwrap_or(0);
         }
+    }
+
+    /// Save all coordinator chat states to disk (called on TUI exit).
+    pub fn save_all_chat_state(&self) {
+        // Save the active coordinator's chat.
+        save_chat_history(
+            &self.workgraph_dir,
+            self.active_coordinator_id,
+            &self.chat.messages,
+        );
+        // Save all other coordinators' chat states.
+        for (cid, state) in &self.coordinator_chats {
+            save_chat_history(&self.workgraph_dir, *cid, &state.messages);
+        }
+        // Save TUI focus state.
+        save_tui_state(
+            &self.workgraph_dir,
+            self.active_coordinator_id,
+            &self.right_panel_tab,
+        );
     }
 
     /// Poll for new coordinator responses in the outbox and streaming updates.
@@ -8810,11 +8980,18 @@ impl VizApp {
                 edited: false,
                 inbox_id: None,
                 user: msg.user.clone(),
+                target_task: None,
+                msg_timestamp: None,
+                read_at: None,
+                msg_queue_id: None,
             });
         }
 
+        // Interleave recently-read sent messages into the chat stream.
+        self.poll_interleaved_messages();
+
         // Persist updated chat history.
-        save_chat_history(&self.workgraph_dir, &self.chat.messages);
+        save_chat_history(&self.workgraph_dir, self.active_coordinator_id, &self.chat.messages);
 
         // Phase 1 trigger: New message → Info toast (only when Chat panel isn't focused,
         // so we don't show redundant toasts when the user is already reading the chat).
@@ -8849,6 +9026,116 @@ impl VizApp {
         }
     }
 
+    /// Poll for messages sent to agents that have been read, and interleave them
+    /// into the chat stream as `SentMessage` entries at their read-at position.
+    fn poll_interleaved_messages(&mut self) {
+        // Collect IDs of messages already shown in the chat stream for dedup.
+        let shown_ids: std::collections::HashSet<(String, u64)> = self
+            .chat
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::SentMessage)
+            .filter_map(|m| {
+                let task = m.target_task.as_ref()?;
+                let id = m.msg_queue_id?;
+                Some((task.clone(), id))
+            })
+            .collect();
+
+        // Scan message files for all tasks in the messages directory.
+        let msg_dir = self.workgraph_dir.join("messages");
+        let entries = match std::fs::read_dir(&msg_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let mut new_messages: Vec<ChatMessage> = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let fname = match path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f.to_string(),
+                None => continue,
+            };
+            // Only process .jsonl message files (skip .cursors directory).
+            if !fname.ends_with(".jsonl") {
+                continue;
+            }
+            let task_id = fname.trim_end_matches(".jsonl");
+
+            // Read messages for this task.
+            let msgs = match workgraph::messages::list_messages(&self.workgraph_dir, task_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            for msg in &msgs {
+                // Only interleave messages that have been read by the agent.
+                if !matches!(
+                    msg.status,
+                    workgraph::messages::DeliveryStatus::Read
+                        | workgraph::messages::DeliveryStatus::Acknowledged
+                ) {
+                    continue;
+                }
+
+                // Skip if already shown.
+                if shown_ids.contains(&(task_id.to_string(), msg.id)) {
+                    continue;
+                }
+
+                // Skip messages sent by agents (we only interleave incoming messages
+                // sent TO agents, i.e., from user/coordinator/tui).
+                let is_from_user = matches!(
+                    msg.sender.as_str(),
+                    "user" | "tui" | "coordinator"
+                );
+                if !is_from_user {
+                    continue;
+                }
+
+                new_messages.push(ChatMessage {
+                    role: ChatRole::SentMessage,
+                    text: msg.body.clone(),
+                    full_text: None,
+                    attachments: vec![],
+                    edited: false,
+                    inbox_id: None,
+                    user: Some(msg.sender.clone()),
+                    target_task: Some(task_id.to_string()),
+                    msg_timestamp: Some(msg.timestamp.clone()),
+                    read_at: None,
+                    msg_queue_id: Some(msg.id),
+                });
+            }
+        }
+
+        if new_messages.is_empty() {
+            return;
+        }
+
+        // Insert each new message at the correct temporal position based on read_at.
+        // We use the read_at timestamp to determine where the message belongs in the
+        // chat stream: it appears at the point the agent actually read it.
+        for msg in new_messages {
+            let read_at = msg.read_at.as_deref().unwrap_or("");
+            // Find insertion point: after the last message whose timestamp <= read_at.
+            // For non-SentMessage entries, we use msg_timestamp or fall back to
+            // "beginning of time" (they sort naturally by insertion order).
+            let insert_idx = self
+                .chat
+                .messages
+                .iter()
+                .rposition(|m| {
+                    let ts = m.msg_timestamp.as_deref().unwrap_or("");
+                    ts <= read_at
+                })
+                .map(|i| i + 1)
+                .unwrap_or(self.chat.messages.len());
+            self.chat.messages.insert(insert_idx, msg);
+        }
+    }
+
     /// Send a chat message to the coordinator via IPC.
     /// Appends the user message to display immediately and starts background send.
     pub fn send_chat_message(&mut self, text: String) {
@@ -8880,10 +9167,14 @@ impl VizApp {
             edited: false,
             inbox_id: None,
             user: Some(workgraph::current_user()),
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
         });
 
         // Persist updated chat history.
-        save_chat_history(&self.workgraph_dir, &self.chat.messages);
+        save_chat_history(&self.workgraph_dir, self.active_coordinator_id, &self.chat.messages);
 
         // Reset scroll to bottom.
         self.chat.scroll = 0;
@@ -9011,7 +9302,7 @@ impl VizApp {
                             &new_text,
                         );
                     }
-                    save_chat_history(&self.workgraph_dir, &self.chat.messages);
+                    save_chat_history(&self.workgraph_dir, self.active_coordinator_id, &self.chat.messages);
                 }
             }
             editor_clear(&mut self.chat.editor);
@@ -9038,7 +9329,7 @@ impl VizApp {
             );
         }
         self.chat.messages.remove(index);
-        save_chat_history(&self.workgraph_dir, &self.chat.messages);
+        save_chat_history(&self.workgraph_dir, self.active_coordinator_id, &self.chat.messages);
         // Clear edit state
         self.chat.editing_index = None;
         self.chat.history_cursor = None;
@@ -9130,11 +9421,20 @@ impl VizApp {
         self.coordinator_chats
             .insert(self.active_coordinator_id, current);
 
-        // Load target chat state (or create new default)
+        // Load target chat state: try in-memory first, then persisted file, then default.
         self.chat = self
             .coordinator_chats
             .remove(&target_id)
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                let msgs = load_persisted_chat_history(&self.workgraph_dir, target_id);
+                if msgs.is_empty() {
+                    ChatState::default()
+                } else {
+                    let mut state = ChatState::default();
+                    state.messages = msgs;
+                    state
+                }
+            });
 
         // Initialize outbox cursor for newly created chat states so we don't
         // re-display old messages or miss new ones (each coordinator has independent
@@ -9178,6 +9478,33 @@ impl VizApp {
         }
     }
 
+    /// Restore TUI focus state from the previous session's tui-state.json.
+    /// Sets `active_coordinator_id` and `right_panel_tab` if the persisted
+    /// coordinator still exists in the graph.
+    fn restore_tui_state(&mut self) {
+        if let Some(state) = load_tui_state(&self.workgraph_dir) {
+            let known_ids = self.list_coordinator_ids();
+            if known_ids.contains(&state.active_coordinator_id) {
+                self.active_coordinator_id = state.active_coordinator_id;
+                // Restore right panel tab.
+                self.right_panel_tab = match state.right_panel_tab.as_str() {
+                    "Chat" => RightPanelTab::Chat,
+                    "Detail" => RightPanelTab::Detail,
+                    "Log" => RightPanelTab::Log,
+                    "Messages" => RightPanelTab::Messages,
+                    "Agency" => RightPanelTab::Agency,
+                    "Config" => RightPanelTab::Config,
+                    "Files" => RightPanelTab::Files,
+                    "CoordLog" => RightPanelTab::CoordLog,
+                    "Firehose" => RightPanelTab::Firehose,
+                    "Output" => RightPanelTab::Output,
+                    "Dashboard" => RightPanelTab::Dashboard,
+                    _ => RightPanelTab::Chat,
+                };
+            }
+        }
+    }
+
     /// On TUI startup, auto-create a coordinator labeled with the current
     /// WG_USER identity if none exists for that user. This ensures each user
     /// gets their own coordinator managing their own agent budget.
@@ -9201,12 +9528,15 @@ impl VizApp {
             self.create_coordinator(Some(user.clone()));
         }
 
-        // If user already has a coordinator, switch to it
-        if let Some((cid, _)) = coordinators
-            .iter()
-            .find(|(_, label)| *label == expected_label)
-        {
-            self.active_coordinator_id = *cid;
+        // Only switch to the user's coordinator if no valid focus was restored
+        // from tui-state.json (i.e., still on the default coordinator 0).
+        if self.active_coordinator_id == 0 {
+            if let Some((cid, _)) = coordinators
+                .iter()
+                .find(|(_, label)| *label == expected_label)
+            {
+                self.active_coordinator_id = *cid;
+            }
         }
     }
 
@@ -9448,6 +9778,27 @@ impl VizApp {
             vec!["kill".to_string(), agent_id.clone()],
             CommandEffect::RefreshAndNotify(format!("Killed {} on task '{}'", agent_id, task_id)),
         );
+    }
+
+    /// Interrupt the active coordinator's current generation.
+    ///
+    /// Sends `InterruptCoordinator` IPC to the daemon, which sends SIGINT
+    /// to the Claude CLI subprocess. The process stays alive and can accept
+    /// new messages immediately.
+    pub fn interrupt_coordinator(&mut self) {
+        let cid = self.active_coordinator_id;
+        self.exec_command(
+            vec![
+                "service".to_string(),
+                "interrupt-coordinator".to_string(),
+                cid.to_string(),
+            ],
+            CommandEffect::InterruptCoordinator(cid),
+        );
+        // Optimistically clear awaiting state — the response collector
+        // will write whatever partial text it has to the outbox.
+        self.chat.awaiting_response = false;
+        self.chat.streaming_text.clear();
     }
 
     // ── Config panel ──
@@ -11637,7 +11988,7 @@ fn format_timestamp(ts: &str) -> String {
 
 /// Format an ISO 8601 timestamp as a relative time string (e.g. "5m ago", "2h ago").
 /// Falls back to short datetime if parsing fails.
-fn format_relative_time(ts: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
+pub fn format_relative_time(ts: &str, now: &chrono::DateTime<chrono::Utc>) -> String {
     let dt = match chrono::DateTime::parse_from_rfc3339(ts) {
         Ok(dt) => dt.with_timezone(&chrono::Utc),
         Err(_) => return ts.to_string(),

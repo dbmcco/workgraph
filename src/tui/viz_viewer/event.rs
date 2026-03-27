@@ -61,6 +61,9 @@ pub fn run_event_loop(
 
     let result = run_event_loop_inner(terminal, app, shared_screen);
 
+    // Save all coordinator chat states and TUI focus state before exit.
+    app.save_all_chat_state();
+
     // Always disable mouse capture on exit
     let _ = set_mouse_capture(false, false);
 
@@ -839,7 +842,10 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             return;
         }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if in_edit_mode {
+            if app.chat.awaiting_response {
+                // Interrupt the running coordinator instead of clearing input
+                app.interrupt_coordinator();
+            } else if in_edit_mode {
                 app.cancel_chat_edit_mode();
             } else {
                 editor_clear(&mut app.chat.editor);
@@ -1003,9 +1009,14 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 app.should_quit = true;
             }
         }
-        // Ctrl+C: kill the agent on the focused task (not quit — use `q` to quit)
+        // Ctrl+C: interrupt coordinator if awaiting response in chat tab,
+        // otherwise kill the agent on the focused task.
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.kill_focused_agent();
+            if app.chat.awaiting_response && app.right_panel_tab == RightPanelTab::Chat {
+                app.interrupt_coordinator();
+            } else {
+                app.kill_focused_agent();
+            }
         }
 
         // Search
@@ -1275,6 +1286,22 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.toggle_archive_browser();
         }
 
+        // Enter: open detail view for the selected task.
+        // Agency tasks (.evaluate-*, .assign-*, .place-*, .flip-*, .create-*) drill
+        // through to fullscreen detail so their logs/scores are immediately visible.
+        KeyCode::Enter => {
+            if let Some(task_id) = app.selected_task_id().map(|s| s.to_string()) {
+                app.load_hud_detail_for_task(&task_id);
+                app.right_panel_visible = true;
+                app.right_panel_tab = RightPanelTab::Detail;
+                if is_agency_task_id(&task_id) {
+                    app.apply_layout_mode(super::state::LayoutMode::FullInspector);
+                } else {
+                    app.focused_panel = FocusedPanel::RightPanel;
+                }
+            }
+        }
+
         // Digit keys 0-9: switch right panel tab
         KeyCode::Char(d @ '0'..='9') => {
             let idx = (d as u8 - b'0') as usize;
@@ -1423,9 +1450,13 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         // Global keys that work in right panel too
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('q') => app.should_quit = true,
-        // Ctrl+C: kill the agent on the focused task (same as graph panel)
+        // Ctrl+C: interrupt coordinator if awaiting response, else kill focused agent
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.kill_focused_agent();
+            if app.chat.awaiting_response && app.right_panel_tab == RightPanelTab::Chat {
+                app.interrupt_coordinator();
+            } else {
+                app.kill_focused_agent();
+            }
         }
 
         // Tab: switch panel focus back to graph
@@ -2410,6 +2441,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                             }
                             app.right_panel_visible = true;
                             app.right_panel_tab = RightPanelTab::Detail;
+                            // Agency annotations → fullscreen so logs/scores are
+                            // immediately readable without manual resizing.
+                            if region.dot_task_ids.iter().any(|id| is_agency_task_id(id)) {
+                                app.apply_layout_mode(super::state::LayoutMode::FullInspector);
+                            }
                             // Trigger annotation flash.
                             app.annotation_click_flash = Some(super::state::AnnotationClickFlash {
                                 orig_line: region.orig_line,
@@ -3583,6 +3619,16 @@ fn nav_stack_pop(app: &mut VizApp) {
             app.focused_panel = FocusedPanel::Graph;
         }
     }
+}
+
+/// Check whether a task ID belongs to the agency pipeline (internal system tasks
+/// whose logs/scores are more useful than their graph position).
+fn is_agency_task_id(id: &str) -> bool {
+    id.starts_with(".evaluate-")
+        || id.starts_with(".assign-")
+        || id.starts_with(".place-")
+        || id.starts_with(".flip-")
+        || id.starts_with(".create-")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
