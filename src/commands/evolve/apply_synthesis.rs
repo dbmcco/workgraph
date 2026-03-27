@@ -278,6 +278,8 @@ fn apply_create_role_from_skill_names(
                     created_at: chrono::Utc::now(),
                 },
                 access_control: AccessControl::default(),
+                domain_tags: vec![],
+                metadata: std::collections::HashMap::new(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };

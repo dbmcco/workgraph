@@ -186,6 +186,8 @@ mod tests {
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: workgraph::agency::AccessControl::default(),
+            domain_tags: vec![],
+            metadata: std::collections::HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         }

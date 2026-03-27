@@ -632,6 +632,8 @@ mod tests {
             },
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         }

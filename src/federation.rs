@@ -1127,6 +1127,8 @@ fn merge_component(target: &RoleComponent, source: &RoleComponent) -> RoleCompon
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1151,6 +1153,8 @@ fn merge_outcome(target: &DesiredOutcome, source: &DesiredOutcome) -> DesiredOut
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
         requires_human_oversight: target.requires_human_oversight,
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1190,6 +1194,8 @@ fn merge_tradeoff(target: &TradeoffConfig, source: &TradeoffConfig) -> TradeoffC
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1285,6 +1291,8 @@ mod tests {
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }
@@ -1837,6 +1845,8 @@ mod tests {
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }
@@ -1852,6 +1862,8 @@ mod tests {
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
             requires_human_oversight: true,
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }

@@ -1,18 +1,48 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use workgraph::agency::{
     self, AccessControl, AccessPolicy, ComponentCategory, ContentRef, DesiredOutcome, Lineage,
     PerformanceRecord, RoleComponent, TradeoffConfig,
 };
 
-/// `wg agency import <csv-path>` — import Agency's starter.csv primitives into WorkGraph.
+/// Detected CSV format based on header or column count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CsvFormat {
+    /// Old 7-column format: type,name,description,col4,col5,domain_tags,quality_score
+    Legacy,
+    /// Agency 9-column format: type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope
+    Agency,
+}
+
+/// Detect the CSV format from the header row.
+fn detect_format(headers: &csv::StringRecord) -> CsvFormat {
+    // Check by column count first
+    if headers.len() >= 9 {
+        return CsvFormat::Agency;
+    }
+    // Also check by header names for explicit detection
+    if let Some(col3) = headers.get(3) {
+        let col3 = col3.trim().to_lowercase();
+        if col3 == "quality" || col3 == "domain_specificity" {
+            return CsvFormat::Agency;
+        }
+    }
+    CsvFormat::Legacy
+}
+
+/// `wg agency import <csv-path>` -- import Agency's starter.csv primitives into WorkGraph.
 ///
-/// CSV columns: type, name, description, col4 (category/acceptable), col5 (content/criteria/unacceptable), domain_tags, quality_score
+/// Supports two CSV formats:
 ///
-/// Conversion:
-/// - type=skill → RoleComponent
-/// - type=outcome → DesiredOutcome
-/// - type=tradeoff → TradeoffConfig
+/// **Legacy (7 columns):** type,name,description,col4,col5,domain_tags,quality_score
+///   - type: skill | outcome | tradeoff
+///
+/// **Agency (9 columns):** type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope
+///   - type: role_component | desired_outcome | trade_off_config
+///
+/// Both formats are auto-detected. Legacy type names (skill/outcome/tradeoff) are also
+/// accepted in the 9-column format and vice versa.
 pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str>) -> Result<()> {
     let provenance_tag = tag.unwrap_or("agency-import");
     let agency_dir = workgraph_dir.join("agency");
@@ -25,6 +55,8 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
         .with_context(|| format!("Failed to read '{}'", csv_path))?;
     let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
 
+    let format = detect_format(reader.headers().context("Failed to read CSV headers")?);
+
     let mut components_count = 0u32;
     let mut outcomes_count = 0u32;
     let mut tradeoffs_count = 0u32;
@@ -36,13 +68,22 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
         let ptype = record.get(0).unwrap_or("").trim();
         let name = record.get(1).unwrap_or("").trim().to_string();
         let description = record.get(2).unwrap_or("").trim().to_string();
-        let col4 = record.get(3).unwrap_or("").trim().to_string();
-        let col5 = record.get(4).unwrap_or("").trim().to_string();
-        // col6 = domain_tags (informational only)
-        let quality_score: Option<f64> = record.get(6).and_then(|s| s.trim().parse().ok());
+
+        // Parse format-specific columns
+        let (quality_score, domain_tags, metadata, parent_content_hash) = match format {
+            CsvFormat::Agency => parse_agency_columns(&record),
+            CsvFormat::Legacy => parse_legacy_columns(&record),
+        };
+
+        let mut parent_ids = vec![];
+        if let Some(ref pch) = parent_content_hash {
+            if !pch.is_empty() {
+                parent_ids.push(pch.clone());
+            }
+        }
 
         let lineage = Lineage {
-            parent_ids: vec![],
+            parent_ids,
             generation: 0,
             created_by: format!("{}-v{}", provenance_tag, env!("CARGO_PKG_VERSION")),
             created_at: chrono::Utc::now(),
@@ -59,8 +100,16 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
             evaluations: vec![],
         };
 
-        match ptype {
-            "skill" => {
+        // Normalize type names: accept both old and new format names
+        let normalized_type = match ptype {
+            "skill" | "role_component" => "component",
+            "outcome" | "desired_outcome" => "outcome",
+            "tradeoff" | "trade_off_config" => "tradeoff",
+            other => other,
+        };
+
+        match normalized_type {
+            "component" => {
                 let content = ContentRef::Inline(description.clone());
                 let category = ComponentCategory::Translated;
                 let id = agency::content_hash_component(&description, &category, &content);
@@ -77,6 +126,8 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
                         performance,
                         lineage,
                         access_control,
+                        domain_tags,
+                        metadata,
                         former_agents: vec![],
                         former_deployments: vec![],
                     };
@@ -88,11 +139,18 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
                 components_count += 1;
             }
             "outcome" => {
-                let success_criteria: Vec<String> = col5
-                    .split('\n')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                // In legacy format, col5 contains newline-separated success criteria.
+                // In Agency format, there's no separate criteria column; use description as-is.
+                let success_criteria = match format {
+                    CsvFormat::Legacy => {
+                        let col5 = record.get(4).unwrap_or("").trim().to_string();
+                        col5.split('\n')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    }
+                    CsvFormat::Agency => vec![],
+                };
                 let id = agency::content_hash_outcome(&description, &success_criteria);
 
                 if dry_run {
@@ -107,6 +165,8 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
                         lineage,
                         access_control,
                         requires_human_oversight: true,
+                        domain_tags,
+                        metadata,
                         former_agents: vec![],
                         former_deployments: vec![],
                     };
@@ -118,16 +178,31 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
                 outcomes_count += 1;
             }
             "tradeoff" => {
-                let acceptable: Vec<String> = col4
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let unacceptable: Vec<String> = col5
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                // In legacy format, col4=acceptable tradeoffs, col5=unacceptable tradeoffs (comma-separated).
+                // In Agency format, the description is a single coherent trade-off statement;
+                // we store it as the description and use the description as a single acceptable entry.
+                let (acceptable, unacceptable) = match format {
+                    CsvFormat::Legacy => {
+                        let col4 = record.get(3).unwrap_or("").trim().to_string();
+                        let col5 = record.get(4).unwrap_or("").trim().to_string();
+                        let acc: Vec<String> = col4
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let unacc: Vec<String> = col5
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        (acc, unacc)
+                    }
+                    CsvFormat::Agency => {
+                        // Description is the complete trade-off statement.
+                        // Don't split into acceptable/unacceptable lists.
+                        (vec![], vec![])
+                    }
+                };
                 let id = agency::content_hash_tradeoff(&acceptable, &unacceptable, &description);
 
                 if dry_run {
@@ -142,6 +217,8 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
                         performance,
                         lineage,
                         access_control,
+                        domain_tags,
+                        metadata,
                         former_agents: vec![],
                         former_deployments: vec![],
                     };
@@ -178,6 +255,91 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
     Ok(())
 }
 
+/// Parse columns from Agency's 9-column CSV format.
+///
+/// Columns: type(0), name(1), description(2), quality(3), domain_specificity(4),
+///          domain(5), origin_instance_id(6), parent_content_hash(7), scope(8)
+fn parse_agency_columns(
+    record: &csv::StringRecord,
+) -> (Option<f64>, Vec<String>, HashMap<String, String>, Option<String>) {
+    // quality (col3): integer 0-100, map to avg_score as 0.0-1.0
+    let quality_score: Option<f64> = record.get(3).and_then(|s| {
+        let s = s.trim();
+        s.parse::<f64>().ok().map(|v| v / 100.0)
+    });
+
+    // domain_specificity (col4): store as metadata
+    let domain_specificity = record
+        .get(4)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // domain (col5): comma-separated tags
+    let domain_tags: Vec<String> = record
+        .get(5)
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // origin_instance_id (col6): store as metadata
+    let origin_instance_id = record
+        .get(6)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // parent_content_hash (col7): store in lineage.parent_ids
+    let parent_content_hash = record.get(7).map(|s| s.trim().to_string());
+
+    // scope (col8): store as metadata
+    let scope = record
+        .get(8)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let mut metadata = HashMap::new();
+    if !scope.is_empty() {
+        metadata.insert("scope".to_string(), scope);
+    }
+    if !domain_specificity.is_empty() {
+        metadata.insert("domain_specificity".to_string(), domain_specificity);
+    }
+    if !origin_instance_id.is_empty() {
+        metadata.insert("origin_instance_id".to_string(), origin_instance_id);
+    }
+    if let Some(ref pch) = parent_content_hash {
+        if !pch.is_empty() {
+            metadata.insert("parent_content_hash".to_string(), pch.clone());
+        }
+    }
+
+    (quality_score, domain_tags, metadata, parent_content_hash)
+}
+
+/// Parse columns from the legacy 7-column CSV format.
+///
+/// Columns: type(0), name(1), description(2), col4(3), col5(4), domain_tags(5), quality_score(6)
+fn parse_legacy_columns(
+    record: &csv::StringRecord,
+) -> (Option<f64>, Vec<String>, HashMap<String, String>, Option<String>) {
+    let quality_score: Option<f64> = record.get(6).and_then(|s| s.trim().parse().ok());
+
+    let domain_tags: Vec<String> = record
+        .get(5)
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (quality_score, domain_tags, HashMap::new(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +367,38 @@ mod tests {
         writeln!(
             f,
             "tradeoff,Speed vs Quality,Balances speed and quality,Fast execution,Incomplete analysis,general,0.75"
+        )
+        .unwrap();
+        csv_path
+    }
+
+    fn write_agency_format_csv(dir: &Path) -> std::path::PathBuf {
+        let csv_path = dir.join("test_agency_9col.csv");
+        let mut f = std::fs::File::create(&csv_path).unwrap();
+        writeln!(
+            f,
+            "type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "role_component,Identify Gaps,Identify gaps and errors in provided content,85,high,\"analysis,review\",inst-001,abc123,task"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "desired_outcome,Accurate Analysis,Analysis is thorough and identifies all issues,90,medium,analysis,inst-002,,task"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "trade_off_config,Prefer Depth,When depth and breadth conflict: prefer deeper analysis of fewer items over shallow coverage of many,70,low,\"analysis,research\",inst-003,def456,task"
+        )
+        .unwrap();
+        // A meta-scope primitive
+        writeln!(
+            f,
+            "role_component,Assign by Expertise,Match agent skills to task requirements using domain tags,80,high,meta,inst-004,,meta:assigner"
         )
         .unwrap();
         csv_path
@@ -262,7 +456,7 @@ mod tests {
         run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
         run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
 
-        // Same count — content hashing deduplicates
+        // Same count -- content hashing deduplicates
         let comp_count = std::fs::read_dir(wg_dir.join("agency/primitives/components"))
             .unwrap()
             .count();
@@ -301,5 +495,204 @@ mod tests {
             names1, names2,
             "Content hashes should be stable across imports"
         );
+    }
+
+    #[test]
+    fn test_agency_import_9col_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // Verify files were created: 2 components, 1 outcome, 1 tradeoff
+        let components_dir = wg_dir.join("agency/primitives/components");
+        let outcomes_dir = wg_dir.join("agency/primitives/outcomes");
+        let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
+
+        let comp_count = std::fs::read_dir(&components_dir).unwrap().count();
+        let out_count = std::fs::read_dir(&outcomes_dir).unwrap().count();
+        let trade_count = std::fs::read_dir(&tradeoffs_dir).unwrap().count();
+
+        assert_eq!(comp_count, 2, "Expected 2 components (task + meta:assigner)");
+        assert_eq!(out_count, 1, "Expected 1 outcome");
+        assert_eq!(trade_count, 1, "Expected 1 tradeoff");
+    }
+
+    #[test]
+    fn test_agency_import_9col_metadata_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // Read all components and check metadata
+        let components_dir = wg_dir.join("agency/primitives/components");
+        let mut found_task_scope = false;
+        let mut found_meta_scope = false;
+
+        for entry in std::fs::read_dir(&components_dir).unwrap() {
+            let entry = entry.unwrap();
+            let component: RoleComponent =
+                agency::load_component(&entry.path()).unwrap();
+
+            // Check that domain_tags are populated
+            assert!(!component.domain_tags.is_empty(), "domain_tags should be populated");
+
+            // Check scope metadata
+            if let Some(scope) = component.metadata.get("scope") {
+                if scope == "task" {
+                    found_task_scope = true;
+                    assert_eq!(
+                        component.metadata.get("domain_specificity").map(|s| s.as_str()),
+                        Some("high")
+                    );
+                    assert!(component.metadata.contains_key("origin_instance_id"));
+                }
+                if scope == "meta:assigner" {
+                    found_meta_scope = true;
+                }
+            }
+        }
+
+        assert!(found_task_scope, "Should have a task-scope component");
+        assert!(found_meta_scope, "Should have a meta:assigner-scope component");
+    }
+
+    #[test]
+    fn test_agency_import_9col_quality_maps_to_score() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // Read the outcome and check that quality (90) mapped to avg_score (0.90)
+        let outcomes_dir = wg_dir.join("agency/primitives/outcomes");
+        for entry in std::fs::read_dir(&outcomes_dir).unwrap() {
+            let entry = entry.unwrap();
+            let outcome: DesiredOutcome =
+                agency::load_outcome(&entry.path()).unwrap();
+            assert_eq!(outcome.performance.avg_score, Some(0.90));
+        }
+    }
+
+    #[test]
+    fn test_agency_import_9col_domain_maps_to_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // Read the tradeoff and check domain tags
+        let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
+        for entry in std::fs::read_dir(&tradeoffs_dir).unwrap() {
+            let entry = entry.unwrap();
+            let tradeoff: TradeoffConfig =
+                agency::load_tradeoff(&entry.path()).unwrap();
+            assert!(
+                tradeoff.domain_tags.contains(&"analysis".to_string()),
+                "Expected 'analysis' in domain_tags, got: {:?}",
+                tradeoff.domain_tags
+            );
+            assert!(
+                tradeoff.domain_tags.contains(&"research".to_string()),
+                "Expected 'research' in domain_tags, got: {:?}",
+                tradeoff.domain_tags
+            );
+        }
+    }
+
+    #[test]
+    fn test_agency_import_9col_tradeoff_uses_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // Tradeoff should use description as-is, with empty acceptable/unacceptable lists
+        let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
+        for entry in std::fs::read_dir(&tradeoffs_dir).unwrap() {
+            let entry = entry.unwrap();
+            let tradeoff: TradeoffConfig =
+                agency::load_tradeoff(&entry.path()).unwrap();
+            assert!(
+                tradeoff.acceptable_tradeoffs.is_empty(),
+                "Agency format should not split description into acceptable list"
+            );
+            assert!(
+                tradeoff.unacceptable_tradeoffs.is_empty(),
+                "Agency format should not split description into unacceptable list"
+            );
+            assert!(
+                tradeoff.description.contains("depth and breadth conflict"),
+                "Description should be preserved as-is"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agency_import_9col_parent_content_hash_in_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let csv_path = write_agency_format_csv(tmp.path());
+        run(&wg_dir, csv_path.to_str().unwrap(), false, None).unwrap();
+
+        // The "Identify Gaps" component has parent_content_hash=abc123
+        let components_dir = wg_dir.join("agency/primitives/components");
+        let mut found_with_parent = false;
+        for entry in std::fs::read_dir(&components_dir).unwrap() {
+            let entry = entry.unwrap();
+            let component: RoleComponent =
+                agency::load_component(&entry.path()).unwrap();
+            if component.name == "Identify Gaps" {
+                assert!(
+                    component.lineage.parent_ids.contains(&"abc123".to_string()),
+                    "parent_content_hash should be in lineage.parent_ids"
+                );
+                found_with_parent = true;
+            }
+        }
+        assert!(found_with_parent, "Should find the Identify Gaps component");
+    }
+
+    #[test]
+    fn test_detect_format_agency() {
+        let header = csv::StringRecord::from(vec![
+            "type",
+            "name",
+            "description",
+            "quality",
+            "domain_specificity",
+            "domain",
+            "origin_instance_id",
+            "parent_content_hash",
+            "scope",
+        ]);
+        assert_eq!(detect_format(&header), CsvFormat::Agency);
+    }
+
+    #[test]
+    fn test_detect_format_legacy() {
+        let header = csv::StringRecord::from(vec![
+            "type",
+            "name",
+            "description",
+            "col4",
+            "col5",
+            "domain_tags",
+            "quality_score",
+        ]);
+        assert_eq!(detect_format(&header), CsvFormat::Legacy);
     }
 }

@@ -193,6 +193,10 @@ pub struct RoleComponent {
     #[serde(default)]
     pub access_control: AccessControl,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_deployments: Vec<DeploymentRef>,
@@ -215,6 +219,10 @@ pub struct DesiredOutcome {
     pub access_control: AccessControl,
     #[serde(default = "default_true")]
     pub requires_human_oversight: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -242,6 +250,10 @@ pub struct TradeoffConfig {
     pub lineage: Lineage,
     #[serde(default)]
     pub access_control: AccessControl,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

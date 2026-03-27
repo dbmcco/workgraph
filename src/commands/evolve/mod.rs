@@ -853,6 +853,8 @@ mod tests {
             },
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         }];
@@ -1381,6 +1383,8 @@ Let me know if you'd like me to adjust anything."#;
                 created_at: chrono::Utc::now(),
             },
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1533,6 +1537,8 @@ Let me know if you'd like me to adjust anything."#;
                 created_at: chrono::Utc::now(),
             },
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1555,6 +1561,8 @@ Let me know if you'd like me to adjust anything."#;
                 created_at: chrono::Utc::now(),
             },
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1624,6 +1632,8 @@ Let me know if you'd like me to adjust anything."#;
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1676,6 +1686,8 @@ Let me know if you'd like me to adjust anything."#;
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1688,6 +1700,8 @@ Let me know if you'd like me to adjust anything."#;
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1743,6 +1757,8 @@ Let me know if you'd like me to adjust anything."#;
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -1796,6 +1812,8 @@ Let me know if you'd like me to adjust anything."#;
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };
@@ -2220,6 +2238,8 @@ Let me know if you'd like me to adjust anything."#;
             },
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         }]
@@ -2473,6 +2493,8 @@ Let me know if you'd like me to adjust anything."#;
             },
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         }];
@@ -2741,6 +2763,8 @@ Let me know if you'd like me to adjust anything."#;
             },
             lineage: Lineage::default(),
             access_control: AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: vec![],
             former_deployments: vec![],
         };

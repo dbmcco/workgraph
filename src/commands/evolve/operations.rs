@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use workgraph::agency::{
@@ -314,6 +314,8 @@ fn apply_create_motivation(
             created_at: chrono::Utc::now(),
         },
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     };
@@ -387,6 +389,8 @@ fn apply_modify_motivation(
         performance: PerformanceRecord::default(),
         lineage,
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     };
@@ -547,6 +551,8 @@ fn apply_wording_mutation(
                 performance: PerformanceRecord::default(),
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -587,6 +593,8 @@ fn apply_wording_mutation(
                 performance: PerformanceRecord::default(),
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -623,6 +631,8 @@ fn apply_wording_mutation(
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
                 requires_human_oversight: source.requires_human_oversight,
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
