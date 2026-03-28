@@ -2,7 +2,7 @@
 
 Canonical list of all key documentation files and their purpose. Used as the reference for future doc-sync runs.
 
-Last updated: 2026-03-21 (verified by doc-refresh-mar21-ds4-doc-sync-ds3-ds2-doc-sync-spec)
+Last updated: 2026-03-28 (verified by doc-sync-mar28-ds4-doc-sync-ds3-ds2-doc-sync-spec)
 
 ---
 
@@ -25,6 +25,7 @@ Last updated: 2026-03-21 (verified by doc-refresh-mar21-ds4-doc-sync-ds3-ds2-doc
 | `docs/AGENCY_AUDIT.md` | Agency audit | Contributors, operators |
 | `docs/agent-git-hygiene.md` | Git hygiene rules for multi-agent shared repos | Agents, operators |
 | `docs/guides/openrouter-setup.md` | OpenRouter provider setup guide | Users, operators |
+| `docs/guides/server-setup.md` | Server setup guide | Users, operators |
 
 ## Embedded Documentation
 
@@ -32,7 +33,7 @@ Last updated: 2026-03-21 (verified by doc-refresh-mar21-ds4-doc-sync-ds3-ds2-doc
 |------|---------|----------|
 | `src/commands/quickstart.rs` | Quickstart text shown by `wg quickstart` — onboarding cheat sheet | AI agents, new users |
 | `CLAUDE.md` | Project-level Claude Code instructions | AI agents |
-| `~/.claude/CLAUDE.md` | Global Claude Code instructions | AI agents |
+| `~/.claude/CLAUDE.md` | Global Claude Code instructions (may not exist) | AI agents |
 
 ## Manual (Typst)
 
@@ -118,6 +119,22 @@ Last updated: 2026-03-21 (verified by doc-refresh-mar21-ds4-doc-sync-ds3-ds2-doc
 | `docs/design/tui-multi-panel.md` | TUI multi-panel layout design | Implemented |
 | `docs/design/unified-lifecycle-state-machine.md` | Unified lifecycle state machine design | Implemented |
 | `docs/design/wg-wait-design.md` | `wg wait` command design | Implemented |
+| `docs/design/agent-roundtable-cycle.md` | Agent roundtable cycle design | Design |
+| `docs/design/client-implementation-plan.md` | Client implementation plan | Design |
+| `docs/design/demo-medley-catalog.md` | Demo/screencast medley catalog | Reference |
+| `docs/design/federation-architecture.md` | Federation architecture design | Design |
+| `docs/design/hero-screencast-scenarios.md` | Hero screencast scenarios | Reference |
+| `docs/design/hero-screencast-storyboard-v2.md` | Hero screencast storyboard v2 | Reference |
+| `docs/design/heroview-screencast-v2-script.md` | Heroview screencast v2 script | Reference |
+| `docs/design/live-sync-and-liveness.md` | Live sync and liveness design | Design |
+| `docs/design/multi-user-platform-architecture.md` | Multi-user platform architecture | Design |
+| `docs/design/provider-model-naming.md` | Provider/model naming conventions | Design |
+| `docs/design/screencast-freshness-pipeline.md` | Screencast freshness pipeline design | Design |
+| `docs/design/screencast-interaction-flow.md` | Screencast interaction flow design | Reference |
+| `docs/design/screencast-repertoire.md` | Screencast repertoire catalog | Reference |
+| `docs/design/terminal-wrapping-strategy.md` | Terminal wrapping strategy design | Design |
+| `docs/design/tui-inspector-tri-state.md` | TUI inspector tri-state design | Implemented |
+| `docs/design/tui-multiplexing-concurrent-access.md` | TUI multiplexing concurrent access | Design |
 
 ## Research Documents
 
@@ -183,6 +200,41 @@ Last updated: 2026-03-21 (verified by doc-refresh-mar21-ds4-doc-sync-ds3-ds2-doc
 | `docs/research/tui-editor-widget-comparison.md` | TUI editor widget comparison | Research |
 | `docs/research/verify-cycle-interaction.md` | Verify/cycle interaction research | Research |
 | `docs/research/web-search-api-comparison.md` | Web search API comparison | Research |
+| `docs/research/agency-bureau-pull-mechanism.md` | Agency bureau pull mechanism research | Research |
+| `docs/research/compaction-metrics-and-visibility.md` | Compaction metrics and visibility | Research |
+| `docs/research/compaction-metrics-visibility.md` | Compaction metrics visibility (alternate) | Research |
+| `docs/research/coordinator-spawn-vs-task-agent-spawn.md` | Coordinator vs task agent spawn comparison | Research |
+| `docs/research/hero-screencast-pacing.md` | Hero screencast pacing research | Research |
+| `docs/research/log-view-scrollbar-research.md` | Log view scrollbar research | Research |
+| `docs/research/multi-user-tui-feasibility.md` | Multi-user TUI feasibility study | Research |
+| `docs/research/native-executor-dual-api-audit.md` | Native executor dual API audit | Research |
+| `docs/research/primitive-pool-sync.md` | Primitive pool sync research | Research |
+| `docs/research/ranked-model-list.md` | Ranked model list research | Research |
+| `docs/research/unified-conversation-layer-design.md` | Unified conversation layer design | Research |
+
+## Report Documents (additional)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `docs/reports/openrouter-model-config-guide.md` | OpenRouter model configuration guide | Current |
+| `docs/reports/per-task-model-override.md` | Per-task model override report | Current |
+| `docs/reports/or-executor-research.md` | OpenRouter executor research | Current |
+| `docs/reports/bug-report-dynamic-model-list-browsing.md` | Bug report: dynamic model list browsing | Current |
+| `docs/reports/native-executor-streaming-investigation.md` | Native executor streaming investigation | Current |
+| `docs/reports/vizview-notification-investigation.md` | VizView notification investigation | Current |
+| `docs/reports/tui-chat-message-interleaving-investigation.md` | TUI chat message interleaving investigation | Current |
+| `docs/reports/cycle-deadlock-investigation.md` | Cycle deadlock investigation | Current |
+
+## Plan Documents
+
+| File | Purpose |
+|------|---------|
+| `docs/plans/server-side-multi-user-workplan.md` | Server-side multi-user work plan |
+| `docs/plans/tui-liveness-monitoring-workplan.md` | TUI liveness monitoring work plan |
+| `docs/plans/federation-and-distributed-sync.md` | Federation and distributed sync plan |
+| `docs/plans/integrated-multi-user-roadmap.md` | Integrated multi-user roadmap |
+| `docs/plans/fs-watcher-validation.md` | FS watcher validation plan |
+| `docs/plans/coordinator-chat-history-design.md` | Coordinator chat history design plan |
 
 ## Other Documentation
 
