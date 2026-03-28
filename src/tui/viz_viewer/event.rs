@@ -2546,6 +2546,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 // so subsequent drags track relative to the grab point.
                 app.divider_drag_offset =
                     column as i16 - new_panel_x as i16;
+                app.divider_drag_start_pct = pct;
+                app.divider_drag_start_col = column;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
             } else if in_fullscreen_right || in_fullscreen_top || in_fullscreen_bottom {
                 // Click on any fullscreen border: restore to normal split.
@@ -2567,11 +2569,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 vscrollbar_jump_panel(app, row);
             } else if in_divider {
                 // Click on divider between graph and inspector: start resize drag.
-                // Record offset from click column to the actual divider border
-                // so the first Drag event won't shift the border due to integer
-                // rounding in the percent↔width conversion.
-                app.divider_drag_offset =
-                    column as i16 - app.last_right_panel_area.x as i16;
+                // Record the starting percent and column so the drag handler can
+                // use delta-based calculation, avoiding the lossy percent↔width
+                // round-trip that causes an initial snap on drag start.
+                app.divider_drag_start_pct = app.right_panel_percent;
+                app.divider_drag_start_col = column;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
             } else if in_graph_hscrollbar {
                 app.focused_panel = FocusedPanel::Graph;
@@ -2843,21 +2845,15 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         0
                     };
                 if total_width > 0 {
-                    let left_x = app.last_graph_area.x;
-                    let right_edge = left_x + total_width;
-                    // Apply the click-to-divider offset so the border stays
-                    // anchored at its original column (no integer-rounding jump).
-                    let adjusted = (column as i32 - app.divider_drag_offset as i32)
-                        .clamp(left_x as i32, right_edge as i32)
-                        as u16;
-                    let panel_width = right_edge.saturating_sub(adjusted);
-                    let raw_pct = (panel_width as u32 * 100 / total_width as u32) as u16;
-                    // Smooth single-column dragging: full 0–100% range with no
-                    // snap thresholds or clamping.  Stay in a normal-split
-                    // LayoutMode during the drag so both panel areas remain
-                    // valid for next-frame hit-testing (FullInspector / Off
-                    // restructure layout areas and would break the drag).
-                    let pct = raw_pct.clamp(0, 100);
+                    // Delta-based percent calculation: compute how far the mouse
+                    // moved from the drag start column and convert that to a
+                    // percent change.  This avoids the lossy percent↔width
+                    // round-trip (integer division) that caused an initial snap
+                    // when the divider drag started.
+                    let delta = column as i32 - app.divider_drag_start_col as i32;
+                    let delta_pct = delta * 100 / total_width as i32;
+                    let pct =
+                        (app.divider_drag_start_pct as i32 - delta_pct).clamp(0, 100) as u16;
                     app.right_panel_percent = pct;
                     app.right_panel_visible = true;
                     // Preserve last non-extreme split state for restore.
@@ -2920,6 +2916,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             if app.scrollbar_drag.is_some() {
                 app.scrollbar_drag = None;
                 app.divider_drag_offset = 0;
+                app.divider_drag_start_pct = 0;
+                app.divider_drag_start_col = 0;
             }
             app.graph_pan_last = None;
         }
@@ -5195,6 +5193,94 @@ mod scrollbar_tests {
             app.right_panel_percent, pct_before_drag,
             "First drag at same position should not change panel percent"
         );
+    }
+
+    #[test]
+    fn general_divider_drag_start_does_not_snap() {
+        // Regression: clicking the divider in normal split mode used to cause a
+        // 1-2 column snap on the first drag event due to lossy percent↔width
+        // integer-division round-trip.  The delta-based drag handler avoids this.
+        let (mut app, _tmp) = build_test_app();
+
+        let total_width: u16 = 157;
+        let main_height: u16 = 40;
+
+        // Test several percent values that are prone to rounding errors.
+        for start_pct in [33u16, 37, 50, 67, 71, 25, 80] {
+            let panel_width = (total_width as u32 * start_pct as u32 / 100) as u16;
+            let graph_width = total_width - panel_width;
+
+            app.right_panel_percent = start_pct;
+            app.right_panel_visible = true;
+            app.layout_mode =
+                super::super::state::VizApp::layout_mode_for_percent(start_pct);
+            app.last_graph_area = Rect {
+                x: 0,
+                y: 0,
+                width: graph_width,
+                height: main_height,
+            };
+            app.last_right_panel_area = Rect {
+                x: graph_width,
+                y: 0,
+                width: panel_width,
+                height: main_height,
+            };
+            // Divider grab zone: 3 columns centered on the panel border.
+            app.last_divider_area = Rect {
+                x: graph_width.saturating_sub(1),
+                y: 0,
+                width: 3,
+                height: main_height,
+            };
+            // Clear areas that shouldn't be active.
+            app.last_graph_scrollbar_area = Rect::default();
+            app.last_panel_scrollbar_area = Rect::default();
+            app.last_graph_hscrollbar_area = Rect::default();
+            app.last_minimized_strip_area = Rect::default();
+            app.last_fullscreen_restore_area = Rect::default();
+            app.last_fullscreen_right_border_area = Rect::default();
+            app.last_fullscreen_top_border_area = Rect::default();
+            app.last_fullscreen_bottom_border_area = Rect::default();
+            app.scrollbar_drag = None;
+
+            // Click on the divider (at the panel border column).
+            let click_col = graph_width;
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                10,
+                click_col,
+            );
+            assert_eq!(
+                app.scrollbar_drag,
+                Some(ScrollbarDragTarget::Divider),
+                "pct={start_pct}: divider drag should start"
+            );
+
+            // First drag at the same column: percent must NOT change.
+            let pct_before = app.right_panel_percent;
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                10,
+                click_col,
+            );
+            assert_eq!(
+                app.right_panel_percent, pct_before,
+                "pct={start_pct}: first drag at same column should not change percent \
+                 (was {pct_before}, got {})",
+                app.right_panel_percent,
+            );
+
+            // Release.
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                10,
+                click_col,
+            );
+        }
     }
 }
 

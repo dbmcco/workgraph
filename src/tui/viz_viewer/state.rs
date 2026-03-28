@@ -3461,6 +3461,12 @@ pub struct VizApp {
     /// divider drag starts.  Applied during Drag events so the divider stays
     /// anchored to its original position (avoids an integer-rounding jump).
     pub divider_drag_offset: i16,
+    /// The right_panel_percent at the moment the divider drag started.
+    /// Used by the delta-based drag handler to avoid percent↔width round-trip
+    /// rounding errors that cause an initial snap on drag start.
+    pub divider_drag_start_pct: u16,
+    /// The column where the divider drag started.
+    pub divider_drag_start_col: u16,
     /// Last mouse position during a graph-body drag-to-pan gesture (col, row).
     pub graph_pan_last: Option<(u16, u16)>,
 
@@ -3728,6 +3734,8 @@ impl VizApp {
             panel_scroll_activity: None,
             scrollbar_drag: None,
             divider_drag_offset: 0,
+            divider_drag_start_pct: 0,
+            divider_drag_start_col: 0,
             graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
@@ -7479,6 +7487,8 @@ impl VizApp {
             panel_scroll_activity: None,
             scrollbar_drag: None,
             divider_drag_offset: 0,
+            divider_drag_start_pct: 0,
+            divider_drag_start_col: 0,
             graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
