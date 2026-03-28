@@ -381,6 +381,9 @@ wg service resume           # Resume dispatching
 | `wg service delete-coordinator` | Delete a coordinator session |
 | `wg service archive-coordinator` | Archive a coordinator session (mark as Done) |
 | `wg service stop-coordinator` | Stop a coordinator session (kill agent, reset to Open) |
+| `wg service freeze` | SIGSTOP all running agents and pause coordinator |
+| `wg service thaw` | SIGCONT all frozen agents and resume coordinator |
+| `wg service interrupt-coordinator` | Interrupt a coordinator's current generation |
 | `wg agents` | List all agents |
 | `wg agents --alive` | Only alive agents |
 | `wg agents --working` | Only working agents |
@@ -706,6 +709,14 @@ Every spawned agent receives these environment variables:
 | `WG_AGENT_ID` | Your agent ID |
 | `WG_EXECUTOR_TYPE` | Executor type: `claude`, `amplifier`, or `shell` |
 | `WG_MODEL` | Model you're running on (e.g. `opus`, `sonnet`, `haiku`) — set when a model is configured |
+| `WG_USER` | The current user identity |
+| `WG_ENDPOINT` / `WG_ENDPOINT_NAME` | The endpoint name (set when an endpoint is configured) |
+| `WG_LLM_PROVIDER` | The LLM provider (e.g. `anthropic`, `openrouter`) |
+| `WG_ENDPOINT_URL` | The endpoint URL (set when an endpoint is configured) |
+| `WG_API_KEY` | The API key for the endpoint (set when an endpoint is configured) |
+| `WG_WORKTREE_PATH` | Path to the agent's isolated git worktree (set when worktree isolation is active) |
+| `WG_BRANCH` | The worktree branch name (set when worktree isolation is active) |
+| `WG_PROJECT_ROOT` | Path to the main project root (set when worktree isolation is active) |
 
 ### Multi-executor awareness
 
