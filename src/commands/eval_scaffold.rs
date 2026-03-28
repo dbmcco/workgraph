@@ -507,7 +507,8 @@ mod tests {
     #[test]
     fn test_scaffold_creates_eval_task() {
         let dir = tempdir().unwrap();
-        let config = Config::default();
+        let mut config = Config::default();
+        config.agency.flip_enabled = false;
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("my-task", "My Task")));
 
@@ -679,7 +680,8 @@ mod tests {
     #[test]
     fn test_scaffold_eval_depends_on_source_when_flip_disabled() {
         let dir = tempdir().unwrap();
-        let config = Config::default(); // flip_enabled = false
+        let mut config = Config::default();
+        config.agency.flip_enabled = false;
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("my-task", "My Task")));
 
@@ -696,7 +698,8 @@ mod tests {
     #[test]
     fn test_scaffold_flip_via_task_tag() {
         let dir = tempdir().unwrap();
-        let config = Config::default(); // flip_enabled = false globally
+        let mut config = Config::default();
+        config.agency.flip_enabled = false; // flip_enabled = false globally
         let mut graph = WorkGraph::new();
         let mut task = make_task("my-task", "My Task");
         task.tags = vec!["flip-eval".to_string()]; // per-task opt-in
