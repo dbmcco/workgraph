@@ -983,11 +983,18 @@ impl CycleAnalysis {
     pub fn from_graph(graph: &WorkGraph) -> Self {
         use crate::cycle::NamedGraph;
 
+        // Sort tasks by ID for deterministic node numbering and adjacency
+        // list ordering. Back-edge detection via DFS is sensitive to
+        // successor order; non-deterministic HashMap iteration previously
+        // caused different back-edge sets across runs.
+        let mut sorted_tasks: Vec<&Task> = graph.tasks().collect();
+        sorted_tasks.sort_by(|a, b| a.id.cmp(&b.id));
+
         let mut named = NamedGraph::new();
-        for task in graph.tasks() {
+        for task in &sorted_tasks {
             named.add_node(&task.id);
         }
-        for task in graph.tasks() {
+        for task in &sorted_tasks {
             for dep_id in &task.after {
                 if graph.get_task(dep_id).is_some() {
                     named.add_edge(dep_id, &task.id);

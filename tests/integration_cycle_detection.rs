@@ -3399,13 +3399,16 @@ fn test_deep_guard_authority_blocks_self_convergence() {
     );
 }
 
-// --- 9.5 First-iteration ordering: B must NOT be ready until A is done ---
+// --- 9.5 First-iteration ordering: only header ready, B waits for A ---
 
 #[test]
 fn test_deep_first_iteration_ordering_b_waits_for_a() {
-    // B (cycle header with --after A) must NOT be ready until A is done,
-    // even though back-edge exists and both are in SCC.
-    // This is the KEY test — the whole point of the exemption fix.
+    // A ↔ B cycle. B has --max-iterations (cycle_config).
+    // Auto back-edge creates: A.after=[B], B.after=[A].
+    // Header = A (alphabetically first in isolated SCC).
+    // Back-edge: B→A (adj direction) = A's dep on B is skipped.
+    // Forward edge: A→B (adj direction) = B's dep on A blocks.
+    // Only A should be ready; B waits for A to complete.
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp, vec![]);
 
@@ -3425,9 +3428,6 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
         ],
     );
 
-    // Both are Open. Auto back-edge: A.after=[B], B.after=[A].
-    // A should be ready (worker exempts B via Path 1).
-    // B should also be ready (bootstrap: B has cc, iteration 0, A is in-SCC).
     let graph = load_graph(wg_dir.join("graph.jsonl")).unwrap();
     let analysis = graph.compute_cycle_analysis();
 
@@ -3441,12 +3441,12 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
 
     assert!(
         ready_ids.contains(&"a"),
-        "A should be ready (exempt from B's back-edge). Ready: {:?}",
+        "A (header) should be ready (back-edge from B skipped). Ready: {:?}",
         ready_ids
     );
     assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready (bootstrap: iteration 0, A is in-SCC). Ready: {:?}",
+        !ready_ids.contains(&"b"),
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -3455,9 +3455,9 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
 fn test_deep_first_iteration_ordering_unit_test() {
     // Same test but purely in-memory (no CLI):
     // A.after = [B] (back-edge), B.after = [A] (forward dep).
-    // B has cycle_config → B is the cycle header/iterator.
-    // A should be ready (exempt from B via Path 1 worker exemption).
-    // B should also be ready (bootstrap: iteration 0, A is in-SCC).
+    // Header = A (alphabetically first in isolated SCC).
+    // Back-edge: B→A in adj = A's dep on B skipped → A ready.
+    // Forward: A→B in adj = B's dep on A blocks → B not ready.
     let mut a = make_task("a", "Task A");
     a.after = vec!["b".to_string()];
     let mut b = make_task("b", "Task B");
@@ -3479,12 +3479,12 @@ fn test_deep_first_iteration_ordering_unit_test() {
 
     assert!(
         ready_ids.contains(&"a"),
-        "A should be ready: its blocker B has cycle_config → exempt. Ready: {:?}",
+        "A (header) should be ready: back-edge from B skipped. Ready: {:?}",
         ready_ids
     );
     assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready (bootstrap: iteration 0, A is in-SCC). Ready: {:?}",
+        !ready_ids.contains(&"b"),
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -5869,8 +5869,10 @@ fn test_deadlock_breaker_three_task_symmetric_cycle() {
 
 #[test]
 fn test_deadlock_breaker_does_not_fire_when_member_in_progress() {
-    // A ↔ B, both have cycle_config, but B is InProgress.
-    // Path 3 should NOT fire (not all members Open — no deadlock).
+    // A ↔ B, both have cycle_config, B is InProgress.
+    // Back-edge exemption is structural — A's dep on B is a back-edge
+    // regardless of B's status. A is Open → A is ready.
+    // (B is InProgress, not Open, so B is not considered for readiness.)
     let mut a = make_task("a", "Task A");
     a.after = vec!["b".to_string()];
     a.cycle_config = Some(CycleConfig {
@@ -5900,18 +5902,30 @@ fn test_deadlock_breaker_does_not_fire_when_member_in_progress() {
     let analysis = graph.compute_cycle_analysis();
 
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
+    // A is ready: its dep on B is a structural back-edge (always skipped).
+    // B is InProgress (not Open), so not a readiness candidate.
     assert!(
-        ready.is_empty(),
-        "No task should be ready when one member is InProgress. Got: {:?}",
-        ready.iter().map(|t| &t.id).collect::<Vec<_>>()
+        ready_ids.contains(&"a"),
+        "A should be ready (back-edge from B skipped, no other deps). Ready: {:?}",
+        ready_ids
+    );
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Only A should be ready (B is InProgress). Ready: {:?}",
+        ready_ids
     );
 }
 
 #[test]
 fn test_deadlock_breaker_asymmetric_config_not_triggered() {
-    // A(cc) → B(no cc), B → A. Asymmetric cycle_config.
-    // Path 1 (worker exemption) handles B. Path 3 should NOT fire for A.
+    // A(cc) ↔ B(no cc). A.after=[B], B.after=[A].
+    // Back-edge analysis is purely structural — cycle_config is irrelevant.
+    // Header = A (alphabetically first). Back-edge: B→A in adj.
+    // A's dep on B is skipped (back-edge) → A ready.
+    // B's dep on A is forward → B waits for A.
     let mut a = make_task("a", "Task A");
     a.after = vec!["b".to_string()];
     a.cycle_config = Some(CycleConfig {
@@ -5935,16 +5949,14 @@ fn test_deadlock_breaker_asymmetric_config_not_triggered() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // B should be ready via Path 1 (worker exemption).
-    // A should NOT be ready (Path 3 doesn't fire because not all members have cycle_config).
     assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready via worker exemption. Ready: {:?}",
+        ready_ids.contains(&"a"),
+        "A (header) should be ready (back-edge from B skipped). Ready: {:?}",
         ready_ids
     );
     assert!(
-        !ready_ids.contains(&"a"),
-        "A should NOT be ready (Path 3 should not fire for asymmetric config). Ready: {:?}",
+        !ready_ids.contains(&"b"),
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
         ready_ids
     );
 }
