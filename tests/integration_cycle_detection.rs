@@ -446,10 +446,10 @@ fn test_cycle_analysis_deterministic() {
 #[test]
 fn test_dispatch_header_ready_when_external_deps_done() {
     // 2-node cycle: worker ↔ validator.
-    // worker.after = [validator, x] (validator is back-edge blocker, x is external)
-    // validator.after = [worker] (forward dep)
-    // validator has cycle_config (the iterator).
-    // X is Done → worker should be ready (exempt from validator, X done).
+    // worker.after = [validator, x], validator.after = [worker].
+    // worker is the cycle entry (has external dep x). Back-edge: validator→worker.
+    // X is Done → worker is ready (back-edge from validator skipped).
+    // Validator blocked by worker (forward dep).
     let x = make_task_with_status("x", "External", Status::Done);
     let mut worker = make_task("worker", "Worker");
     worker.after = vec!["validator".to_string(), "x".to_string()];
@@ -472,12 +472,12 @@ fn test_dispatch_header_ready_when_external_deps_done() {
 
     assert!(
         ready_ids.contains(&"worker"),
-        "Worker should be ready (exempt from validator iterator, external X done). Ready: {:?}",
+        "Worker (header) should be ready (back-edge from validator skipped, X done). Ready: {:?}",
         ready_ids
     );
     assert!(
-        ready_ids.contains(&"validator"),
-        "Validator should be ready (bootstrap: iteration 0, worker is in-SCC). Ready: {:?}",
+        !ready_ids.contains(&"validator"),
+        "Validator should NOT be ready (forward dep on worker). Ready: {:?}",
         ready_ids
     );
 }
@@ -543,9 +543,11 @@ fn test_dispatch_non_header_waits_for_predecessor() {
 
 #[test]
 fn test_dispatch_non_iterator_not_ready_when_pred_open() {
-    // 3-node cycle: B → C → A (execution order). A is the iterator.
-    // When B is Done, C becomes ready (exempt from A). A stays blocked by C.
-    // Verify forward deps within cycle are still enforced.
+    // 3-node cycle: B(Done) → C → A (execution order). A is the iterator.
+    // SCC = {a, c}. C is the cycle entry (has external dep B). Header = C.
+    // Back-edge: a→c (A feeds back to C). Forward: c→a.
+    // C: B Done + A back-edge skipped → READY.
+    // A: forward dep on C (Open) → blocked.
     let b = make_task_with_status("b", "B (done)", Status::Done);
     let mut c = make_task("c", "C (worker 2)");
     c.after = vec!["b".to_string(), "a".to_string()]; // a is auto-back-edge
@@ -566,27 +568,29 @@ fn test_dispatch_non_iterator_not_ready_when_pred_open() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // C should be ready: B is Done, A is iterator (exempt).
+    // C should be ready: B is Done, A is back-edge (skipped).
     assert!(
         ready_ids.contains(&"c"),
-        "C should be ready (B done, exempt from A iterator). Ready: {:?}",
+        "C (header) should be ready (B done, A back-edge skipped). Ready: {:?}",
         ready_ids
     );
-    // A should also be ready: bootstrap exempts C (in-SCC) on iteration 0, B is Done.
+    // A should NOT be ready: forward dep on C (Open).
     assert!(
-        ready_ids.contains(&"a"),
-        "A should be ready (bootstrap: iteration 0, C is in-SCC, B is Done). Ready: {:?}",
+        !ready_ids.contains(&"a"),
+        "A should NOT be ready (forward dep on C is Open). Ready: {:?}",
         ready_ids
     );
 }
 
 #[test]
-fn test_dispatch_header_without_config_not_exempt() {
-    // Cycle: A → B → A. A has NO cycle_config.
-    // Back-edge exemption requires cycle_config on header.
+fn test_dispatch_no_config_header_still_ready() {
+    // Cycle: A ↔ B. Neither has cycle_config.
+    // Back-edge exemption is purely structural — cycle_config is not required.
+    // The header (a, smallest ID) is ready because its back-edge blocker is skipped.
+    // B is blocked by A (forward dep).
+    // Without cycle_config the cycle won't re-iterate, but the first pass executes.
     let mut a = make_task("a", "A (no config)");
     a.after = vec!["b".to_string()];
-    // No cycle_config!
     let mut b = make_task("b", "B");
     b.after = vec!["a".to_string()];
 
@@ -596,21 +600,27 @@ fn test_dispatch_header_without_config_not_exempt() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // Without cycle_config, back-edge exemption doesn't apply → deadlock
-    assert!(
-        ready_ids.is_empty(),
-        "No tasks should be ready (unconfigured cycle → deadlock). Ready: {:?}",
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Header should be ready (back-edge exemption is structural). Ready: {:?}",
         ready_ids
+    );
+    assert_eq!(
+        ready_ids[0],
+        analysis.cycles[0].header,
+        "The ready task should be the cycle header"
     );
 }
 
 #[test]
 fn test_dispatch_back_edge_exemption_only_for_iterator_blocker() {
-    // 3-node cycle: B → C → A (execution order). A is the iterator (cycle_config).
-    // B has no cycle deps → READY.
-    // C.after = [B, A]: B is forward dep, A is auto-back-edge → C exempt from A.
-    //   But B is Open → C NOT ready.
-    // A.after = [C]: forward dep → A NOT ready.
+    // 3-node: B(Open, no deps) → C → A (execution order). A is the iterator.
+    // SCC = {a, c}. C is entry (has external dep B). Header = C.
+    // Back-edge: a→c. Forward: c→a.
+    // B: no deps → READY.
+    // C: B Open → blocked.
+    // A: forward dep on C (Open) → blocked.
     let b = make_task("b", "B (worker 1)");
     let mut c = make_task("c", "C (worker 2)");
     c.after = vec!["b".to_string(), "a".to_string()]; // a is auto-back-edge
@@ -631,21 +641,22 @@ fn test_dispatch_back_edge_exemption_only_for_iterator_blocker() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // B should be ready (no deps). C blocked by B (B is Open, not in SCC with C).
-    // A should be ready (bootstrap: iteration 0, C is in-SCC).
+    // B should be ready (no deps).
     assert!(
         ready_ids.contains(&"b"),
         "B should be ready (no deps). Ready: {:?}",
         ready_ids
     );
-    assert!(
-        ready_ids.contains(&"a"),
-        "A should be ready (bootstrap: iteration 0, C is in-SCC). Ready: {:?}",
-        ready_ids
-    );
+    // C blocked by B (B is Open, not terminal).
     assert!(
         !ready_ids.contains(&"c"),
         "C should NOT be ready (B is Open). Ready: {:?}",
+        ready_ids
+    );
+    // A blocked by C (forward dep, C is Open).
+    assert!(
+        !ready_ids.contains(&"a"),
+        "A should NOT be ready (forward dep on C). Ready: {:?}",
         ready_ids
     );
 }
@@ -669,8 +680,8 @@ fn test_dispatch_non_cycle_tasks_unaffected() {
 }
 
 #[test]
-fn test_dispatch_reiteration_worker_ready_after_reopen() {
-    // After cycle re-opens, the worker should again be ready (exempt from iterator).
+fn test_dispatch_reiteration_header_ready_after_reopen() {
+    // After cycle re-opens, the header should be ready (back-edge skipped).
     // Simulate: all cycle members re-opened (Open status, loop_iteration > 0).
     let mut worker = make_task("worker", "Worker");
     worker.after = vec!["validator".to_string()];
@@ -693,29 +704,36 @@ fn test_dispatch_reiteration_worker_ready_after_reopen() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    assert!(
-        ready_ids.contains(&"worker"),
-        "Worker should be ready on re-iteration (exempt from validator). Ready: {:?}",
+    // Exactly one task (the cycle header) should be ready after re-open.
+    let header = &analysis.cycles[0].header;
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Exactly one task (the header) should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        !ready_ids.contains(&"validator"),
-        "Validator should NOT be ready (worker is Open). Ready: {:?}",
-        ready_ids
+    assert_eq!(
+        ready_ids[0], header.as_str(),
+        "The cycle header should be ready on re-iteration"
     );
 }
 
 #[test]
 fn test_dispatch_cycle_header_not_exempt_from_forward_deps() {
     // Context-scopes scenario: design → integrate → verify (cycle via back-edges).
-    // verify has cycle_config (--max-iterations 3). Auto-back-edges add verify
-    // to design.after and integrate.after, forming an SCC.
+    // verify has cycle_config. Auto-back-edges add verify to design.after and
+    // integrate.after, forming an SCC = {design, integrate, verify}.
     //
-    // When design is Done and integrate is Open:
-    //   - integrate should be ready (worker exempt from verify back-edge, design Done)
-    //   - verify must NOT be ready (must wait for integrate, its forward dep)
+    // External dep x (Done) → design makes design the deterministic entry/header.
+    // Back-edges from DFS: verify→design, verify→integrate.
+    //
+    // When design is Done:
+    //   - integrate: design Done + verify back-edge skipped → READY
+    //   - verify: forward dep on integrate (Open) → blocked
+    let x = make_task_with_status("x", "External", Status::Done);
+
     let mut design = make_task_with_status("design", "Design", Status::Done);
-    design.after = vec!["verify".to_string()]; // auto-back-edge
+    design.after = vec!["verify".to_string(), "x".to_string()]; // auto-back-edge + external
 
     let mut integrate = make_task("integrate", "Integrate");
     integrate.after = vec!["design".to_string(), "verify".to_string()]; // forward + auto-back-edge
@@ -731,20 +749,25 @@ fn test_dispatch_cycle_header_not_exempt_from_forward_deps() {
         max_failure_restarts: None,
     });
 
-    let graph = build_graph(vec![design, integrate, verify]);
+    let graph = build_graph(vec![x, design, integrate, verify]);
     let analysis = graph.compute_cycle_analysis();
+
+    assert_eq!(
+        analysis.cycles[0].header, "design",
+        "Design should be the cycle header (external entry from x)"
+    );
 
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
     assert!(
         ready_ids.contains(&"integrate"),
-        "Integrate should be ready (worker exempt from verify, design Done). Ready: {:?}",
+        "Integrate should be ready (design Done, verify back-edge skipped). Ready: {:?}",
         ready_ids
     );
     assert!(
-        ready_ids.contains(&"verify"),
-        "Verify should be ready (bootstrap: iteration 0, integrate is in-SCC, design Done). Ready: {:?}",
+        !ready_ids.contains(&"verify"),
+        "Verify must NOT be ready (forward dep on integrate is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -781,6 +804,203 @@ fn test_dispatch_cycle_header_ready_when_all_forward_deps_done() {
         "Verify should be ready (all forward deps Done). Ready: {:?}",
         ready_ids
     );
+}
+
+// ===========================================================================
+// 2b. Sequential dispatch ordering tests (back-edge exemption)
+// ===========================================================================
+
+#[test]
+fn test_dispatch_two_task_cycle_sequential_order() {
+    // 2-task cycle: A ↔ B, A has cycle_config (max_iterations=2).
+    // External dep X (Done) → A, making A the deterministic entry/header.
+    // Iteration 0: A ready (back-edge from B skipped, X done) → complete A → B ready.
+    // Iteration 1: cycle resets → A ready again → complete A → B ready → cycle done.
+    let x = make_task_with_status("x", "External", Status::Done);
+
+    let mut a = make_task("a", "A");
+    a.after = vec!["b".to_string(), "x".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 2,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task("b", "B");
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![x, a, b]);
+
+    // --- Iteration 0 ---
+    let analysis = graph.compute_cycle_analysis();
+    assert_eq!(analysis.cycles[0].header, "a", "A should be the header");
+
+    // Step 1: Only A should be ready
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 0 step 1: only A ready");
+
+    // Step 2: Complete A → B should be ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Iteration 0 step 2: only B ready");
+
+    // Step 3: Complete B → cycle should re-open (both A and B done)
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+    assert_eq!(reactivated.len(), 2, "Both tasks should be re-activated");
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+    assert_eq!(graph.get_task("b").unwrap().loop_iteration, 1);
+
+    // --- Iteration 1 ---
+    let analysis = graph.compute_cycle_analysis();
+
+    // Step 4: A should be ready again
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 1 step 1: only A ready");
+
+    // Step 5: Complete A → B ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Iteration 1 step 2: only B ready");
+
+    // Step 6: Complete B → max_iterations reached, no re-open
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
+    );
+}
+
+#[test]
+fn test_dispatch_three_task_cycle_sequential_order() {
+    // 3-task cycle: A → B → C → A, A has cycle_config.
+    // External dep X (Done) → A, making A the deterministic header.
+    // Dispatch order: A first, then B, then C.
+    let x = make_task_with_status("x", "External", Status::Done);
+
+    let mut a = make_task("a", "A");
+    a.after = vec!["c".to_string(), "x".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 2,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task("b", "B");
+    b.after = vec!["a".to_string()];
+
+    let mut c = make_task("c", "C");
+    c.after = vec!["b".to_string()];
+
+    let mut graph = build_graph(vec![x, a, b, c]);
+
+    // --- Iteration 0 ---
+    let analysis = graph.compute_cycle_analysis();
+    assert_eq!(analysis.cycles[0].header, "a", "A should be the header");
+
+    // Step 1: Only A ready (back-edge C→A skipped, X done)
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Step 1: only A ready");
+
+    // Step 2: Complete A → only B ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Step 2: only B ready (A done)");
+
+    // Step 3: Complete B → only C ready
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["c"], "Step 3: only C ready (A+B done)");
+
+    // Step 4: Complete C → cycle re-opens (all done, iteration < max)
+    graph.get_task_mut("c").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+    assert_eq!(reactivated.len(), 3, "All three should re-activate");
+
+    // --- Iteration 1 ---
+    let analysis = graph.compute_cycle_analysis();
+
+    // Step 5: A ready again
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 1: only A ready");
+
+    // Complete full cycle
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    graph.get_task_mut("c").unwrap().status = Status::Done;
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
+    );
+}
+
+#[test]
+fn test_dispatch_self_loop_ready_on_all_iterations() {
+    // Self-loop: A → A with cycle_config.
+    // A should be ready on every iteration (back-edge A→A always skipped).
+    let mut a = make_task("a", "A");
+    a.after = vec!["a".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![a]);
+
+    // Iteration 0
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 0");
+    assert_eq!(ready[0].id, "a");
+
+    // Complete and re-open
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+
+    // Iteration 1: still ready
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 1");
+    assert_eq!(ready[0].id, "a");
+
+    // Complete and re-open again
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 2);
+
+    // Iteration 2: still ready
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 2");
+
+    // Complete → at max_iterations, no re-open
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert!(reactivated.is_empty(), "Should not re-activate at max_iterations");
 }
 
 // ===========================================================================
@@ -3507,25 +3727,20 @@ fn test_deep_three_task_cycle_unit() {
         assert_eq!(task.loop_iteration, 1);
     }
 
-    // Ordering after re-open: B should be ready (after A, which has cycle_config → exempt).
-    // C should wait for B. A should wait for C.
+    // Ordering after re-open: only the cycle header should be ready
+    // (back-edge to header skipped, all forward deps block non-headers).
     let analysis = graph.compute_cycle_analysis();
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
-    assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready (exempt from A iterator). Ready: {:?}",
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Only the cycle header should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        !ready_ids.contains(&"c"),
-        "C should wait for B. Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        !ready_ids.contains(&"a"),
-        "A should wait for C. Ready: {:?}",
-        ready_ids
+    assert_eq!(
+        ready_ids[0], analysis.cycles[0].header,
+        "The ready task should be the cycle header"
     );
 }
 
@@ -3957,10 +4172,8 @@ fn test_deep_parallel_cycles_no_interference() {
 #[test]
 fn test_deep_parallel_cycles_dispatch_independence() {
     // Verify dispatch doesn't mix tasks from different cycles.
-    // Cycle 1: A ↔ B (B has cycle_config)
-    // Cycle 2: C ↔ D (D has cycle_config)
-    // All Open. A should be ready (exempt from B), C should be ready (exempt from D).
-    // B and D should NOT be ready.
+    // Cycle 1: A ↔ B, Cycle 2: C ↔ D.
+    // With back-edge exemption, only each cycle's header is ready.
     let mut a = make_task("a", "A");
     a.after = vec!["b".to_string()];
     let mut b = make_task("b", "B");
@@ -3997,28 +4210,29 @@ fn test_deep_parallel_cycles_dispatch_independence() {
     );
 
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
-    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    let mut ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    ready_ids.sort();
 
-    assert!(
-        ready_ids.contains(&"a"),
-        "A should be ready (exempt from B). Ready: {:?}",
+    // Exactly one task from each cycle should be ready (the header).
+    assert_eq!(
+        ready_ids.len(),
+        2,
+        "Exactly two tasks (one per cycle header) should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        ready_ids.contains(&"c"),
-        "C should be ready (exempt from D). Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready (bootstrap: iteration 0, A is in-SCC). Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        ready_ids.contains(&"d"),
-        "D should be ready (bootstrap: iteration 0, C is in-SCC). Ready: {:?}",
-        ready_ids
-    );
+
+    // Each ready task should be its cycle's header.
+    for task in &ready {
+        let cycle_idx = analysis
+            .task_to_cycle
+            .get(&task.id)
+            .expect("Ready task should be in a cycle");
+        assert_eq!(
+            analysis.cycles[*cycle_idx].header, task.id,
+            "Ready task {} should be its cycle's header",
+            task.id
+        );
+    }
 }
 
 // --- 9.13 Nested structure: outer cycle contains inner non-cycle tasks ---
@@ -4103,10 +4317,12 @@ fn test_deep_nested_structure_dependent_non_cycle() {
         ready_ids
     );
 
-    // Worker should be ready (exempt from validator iterator)
+    // Only the cycle header should be ready (back-edge to header skipped)
+    let header = &analysis.cycles[0].header;
     assert!(
-        ready_ids.contains(&"worker"),
-        "Worker should be ready. Ready: {:?}",
+        ready_ids.contains(&header.as_str()),
+        "Cycle header ({}) should be ready. Ready: {:?}",
+        header,
         ready_ids
     );
 }

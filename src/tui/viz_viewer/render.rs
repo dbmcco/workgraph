@@ -10990,35 +10990,14 @@ mod tests {
 
         let app = build_cycle_app(&graph, "a");
 
-        // Self-loop: the SCC detection should include 'a' in its own cycle.
-        // Note: Tarjan's SCC may or may not include single-node self-loops
-        // as non-trivial SCCs depending on the implementation.
-        // The cycle_members map is built from cycle_analysis.cycles which
-        // may only contain SCCs with >1 member. Self-loops need special handling.
-        //
-        // If cycle_set is populated, verify yellow edges.
-        // If not, this reveals a gap in the implementation.
-        if app.cycle_set.contains("a") {
-            // Self-loop detected in SCC — verify yellow edges exist
-            assert!(
-                has_any_yellow_edge(&app, "a"),
-                "Self-loop: cycle_set includes 'a' but no yellow edges.\nViz:\n{}",
-                app.lines.join("\n")
-            );
-        } else {
-            // Self-loops may not be detected by the SCC algorithm as non-trivial SCCs.
-            // This is acceptable behavior — document it.
-            eprintln!(
-                "Note: Self-loop A→A not detected as cycle by SCC. \
-                       cycle_set is empty. This is expected if SCC algorithm \
-                       only reports components with >1 member."
-            );
-            assert!(
-                !has_any_yellow_edge(&app, "a"),
-                "Self-loop: cycle_set is empty, so no yellow edges expected.\nViz:\n{}",
-                app.lines.join("\n")
-            );
-        }
+        // Self-loop: the SCC detection includes 'a' in its own cycle.
+        // The ↺ symbol is rendered but isn't tracked in char_edge_map
+        // (it's a status indicator, not an arrow), so yellow edge
+        // detection won't find it. Verify cycle_set membership instead.
+        assert!(
+            app.cycle_set.contains("a"),
+            "Self-loop should be detected as a cycle member"
+        );
     }
 
     // ── Test 6: Nested cycles (larger SCC) ──
