@@ -896,7 +896,7 @@ eval_gate_threshold = 0.7         # evaluations below this score reject the task
 eval_gate_all = false             # apply eval gate to ALL tasks, not just those tagged 'eval-gate'
 
 # FLIP settings
-flip_enabled = false               # enable FLIP fidelity evaluation (default: false)
+flip_enabled = true                # enable FLIP fidelity evaluation (default: true)
 flip_inference_model = "sonnet"   # model for FLIP inference phase (reconstructing prompt)
 flip_comparison_model = "haiku"   # model for FLIP comparison phase (scoring similarity)
 flip_verification_threshold = 0.7  # FLIP score below this triggers verification

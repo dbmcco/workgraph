@@ -29,7 +29,8 @@ fn make_task(id: &str, title: &str, status: Status) -> Task {
 
 #[test]
 fn test_flip_disabled_eval_depends_on_source() {
-    let config = Config::default(); // flip_enabled = false by default
+    let mut config = Config::default();
+    config.agency.flip_enabled = false; // Explicitly disable FLIP for this test
     let mut graph = WorkGraph::new();
     graph.add_node(Node::Task(make_task("task-x", "Task X", Status::Open)));
 

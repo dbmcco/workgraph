@@ -1951,7 +1951,7 @@ impl Default for AgencyConfig {
             auto_assign_grace_seconds: default_auto_assign_grace_seconds(),
             eval_gate_threshold: None,
             eval_gate_all: false,
-            flip_enabled: false,
+            flip_enabled: true,
             flip_inference_model: None,
             flip_comparison_model: None,
             flip_verification_threshold: default_flip_verification_threshold(),
