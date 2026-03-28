@@ -104,6 +104,9 @@ The following terms have precise meanings throughout this manual. They are defin
   [*checkpoint*], [A snapshot of an agent's progress during long-running tasks. `wg checkpoint` saves the current state so that if the agent is interrupted, a replacement can resume from the checkpoint rather than starting over.],
   [*event stream*], [A real-time feed of graph mutations produced by `wg watch`. Events are typed (`task.created`, `task.completed`, `evaluation.recorded`, etc.) and filterable by category or task ID. Enables external adapters to observe and react without polling.],
   [*adapter*], [An external tool that translates between an external system's vocabulary and workgraph's ingestion points. The generic pattern: observe (via `wg watch`) → translate → ingest (via `wg` CLI) → react. A conceptual pattern, not a formal type.],
+  [*dispatch role*], [A named system function with its own model and provider assignment. Roles include _default_, _task\_agent_, _evaluator_, _assigner_, _evolver_, _triage_, _verification_, _compactor_, _placer_, and others. Managed via `wg model routing` and `wg model set`. Enables cost-optimized model allocation: cheap models for routine roles, capable models for complex work.],
+  [*peer*], [A registered reference to another workgraph project for cross-repo communication. Managed via `wg peer add/remove/list/status`. Tasks can be created in a peer's graph via `wg add --repo <peer-name>`. Distinct from federation (which shares agency identities)---peer communication shares _work_.],
+  [*agency import*], [Importing agency primitives (roles, motivations) from external sources via `wg agency import`. Supports local CSV files, remote URLs (`--url`), and configured upstream bureaus (`--upstream`). Change detection via manifest hashing prevents redundant imports.],
 )
 
 #pagebreak()

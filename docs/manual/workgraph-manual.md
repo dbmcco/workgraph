@@ -66,6 +66,9 @@ The following terms have precise meanings throughout this manual. They are defin
 | *checkpoint* | A snapshot of an agent's progress during long-running tasks. `wg checkpoint` saves the current state so that if the agent is interrupted, a replacement can resume from the checkpoint rather than starting over. |
 | *event stream* | A real-time feed of graph mutations produced by `wg watch`. Events are typed (`task.created`, `task.completed`, `evaluation.recorded`, etc.) and filterable by category or task ID. Enables external adapters to observe and react without polling. |
 | *adapter* | An external tool that translates between an external system's vocabulary and workgraph's ingestion points. The generic pattern: observe (via `wg watch`) → translate → ingest (via `wg` CLI) → react. A conceptual pattern, not a formal type. |
+| *dispatch role* | A named system function with its own model and provider assignment. Roles include _default_, _task_agent_, _evaluator_, _assigner_, _evolver_, _triage_, _verification_, _compactor_, _placer_, and others. Managed via `wg model routing` and `wg model set`. Enables cost-optimized model allocation: cheap models for routine roles, capable models for complex work. |
+| *peer* | A registered reference to another workgraph project for cross-repo communication. Managed via `wg peer add/remove/list/status`. Tasks can be created in a peer's graph via `wg add --repo <peer-name>`. Distinct from federation (which shares agency identities)—peer communication shares _work_. |
+| *agency import* | Importing agency primitives (roles, motivations) from external sources via `wg agency import`. Supports local CSV files, remote URLs (`--url`), and configured upstream bureaus (`--upstream`). Change detection via manifest hashing prevents redundant imports. |
 
 
 ---
@@ -793,7 +796,7 @@ Both types are evaluated using the same rubric. But human agent evaluations are 
 
 ## Composition in Practice
 
-To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates four starter roles and four starter motivations:
+To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates starter roles and starter motivations from a bundled CSV. Alternatively, `wg agency import` supports importing primitives from a local CSV file (`wg agency import path/to/file.csv`), a remote URL (`wg agency import --url <URL>`), or a configured upstream bureau (`wg agency import --upstream`). The `--dry-run` flag previews what would be imported. Change detection via manifest hashing ensures repeated imports skip already-imported entities. The default starter set includes four roles and four motivations:
 
 |                   |                         |
 |:------------------|:------------------------|
@@ -927,7 +930,7 @@ For each ready task, the coordinator proceeds as follows:
 
 The task's `exec_mode` field further controls execution weight: `full` (default—complete tool access), `light` (read-only tools, suitable for analysis and review tasks), `bare` (only `wg` CLI commands, no file editing), or `shell` (no LLM—runs the task's `exec` field directly, like the shell executor). Exec-mode and executor are complementary: the executor determines *which backend* runs the task; exec-mode determines *how much autonomy* the agent has within that backend.
 
-**Resolve the model and provider.** Model selection follows a priority chain: the task's own `model` field takes precedence, then the coordinator's configured model, then the agent identity's model preference. Provider selection follows the same chain via the `provider` field (`anthropic`, `openai`, `openrouter`, or `local`). This lets you pin specific tasks to specific models and providers—a cheap model on OpenRouter for routine evaluation tasks, a capable Anthropic model for complex implementation.
+**Resolve the model and provider.** Model selection uses a *dispatch role routing* system. Every system function—task agents, evaluators, assigners, evolvers, triage, verifiers, compactors, placers—has its own configurable model and provider assignment, managed via `wg model routing` and `wg model set`. The task's own `model` field overrides the routing table for work tasks. Models can be specified using the unified `provider/model-name` format (e.g., `openrouter/meta-llama/llama-3.3-70b-instruct`) or as bare model names with a separate `--provider` flag. Provider options include `anthropic`, `openai`, `openrouter`, or `local`. This architecture lets you assign cheap, fast models to routine roles (evaluation, triage, assignment) while reserving capable models for complex work and evolution.
 
 **Build context from dependencies.** The coordinator reads each terminal dependency's artifacts (file paths recorded by the previous agent) and recent log entries. This context is injected into the prompt so the new agent knows what upstream work produced and what decisions were made. The agent does not start from a blank slate—it inherits the trail of work that came before it.
 
@@ -1082,7 +1085,13 @@ Coordinator sessions are managed via service subcommands:
 - `wg service archive-coordinator` archives a completed session (marks it done).
 - `wg service delete-coordinator` removes a session entirely.
 
-The maximum number of concurrent coordinators is configured via `wg config --max-coordinators`. The `wg chat --coordinator <ID>` flag targets messages to a specific coordinator session.
+The maximum number of concurrent coordinators is configured via `wg config --max-coordinators`. The `wg chat --coordinator <ID>` flag targets messages to a specific coordinator session. Coordinators share context across sessions—completed work and decisions from one coordinator's scope are visible to agents dispatched by another, preventing duplication and enabling continuity across workstreams.
+
+## Peer Communication
+
+Workgraph projects can communicate across repository boundaries through the *peer* system. `wg peer add <name> <path>` registers another workgraph instance as a named peer. Tasks can be created in a peer's graph via `wg add "title" --repo <peer-name>`, enabling cross-repo task dispatch without leaving the local CLI.
+
+`wg peer list` shows all configured peers with their service status (whether the peer's daemon is running). `wg peer status` performs a quick health check across all peers. This is distinct from agency federation (which shares identities and evaluations)—peer communication shares *work* across project boundaries.
 
 ## Compaction, Sweep, and Checkpoint
 

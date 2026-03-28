@@ -163,7 +163,7 @@ Both types are evaluated using the same rubric. But human agent evaluations are 
 
 ## Composition in Practice
 
-To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates four starter roles and four starter motivations:
+To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates starter roles and starter motivations from a bundled CSV. Alternatively, `wg agency import` supports importing primitives from a local CSV file (`wg agency import path/to/file.csv`), a remote URL (`wg agency import --url <URL>`), or a configured upstream bureau (`wg agency import --upstream`). The `--dry-run` flag previews what would be imported. Change detection via manifest hashing ensures repeated imports skip already-imported entities. The default starter set includes four roles and four motivations:
 
 |                   |                         |
 |:------------------|:------------------------|
