@@ -291,42 +291,57 @@ fn try_upstream_pull(workgraph_dir: &Path) {
     }
 }
 
-/// Try to auto-import primitives from the bundled CSV (`agency/starter.csv`).
+/// The full upstream primitive pool, compiled into the binary.
+/// This ensures `wg init` seeds the complete pool regardless of whether
+/// the on-disk `agency/starter.csv` file exists at the project root.
+const EMBEDDED_STARTER_CSV: &[u8] = include_bytes!("../../agency/starter.csv");
+
+/// Try to auto-import primitives from the bundled CSV.
 ///
-/// Conditions for import:
-/// 1. The bundled CSV exists at `<project_root>/agency/starter.csv`
-/// 2. No import manifest exists yet at `.workgraph/agency/import-manifest.yaml`
+/// Import sources (checked in order):
+/// 1. On-disk `<project_root>/agency/starter.csv` (for development/overrides)
+/// 2. Embedded CSV compiled into the binary (always available)
 ///
-/// If the CSV is missing, this is a no-op (hardcoded starters remain as fallback).
-/// If the manifest already exists, we skip to avoid re-importing on repeated `wg agency init`.
+/// Skips if the import manifest already exists (idempotency).
 fn try_csv_import(workgraph_dir: &Path) -> Result<()> {
     let manifest = agency_import::manifest_path(workgraph_dir);
     if manifest.exists() {
         return Ok(());
     }
 
-    // Resolve project root: .workgraph lives inside it
-    let project_root = match workgraph_dir.parent() {
-        Some(root) => root,
-        None => return Ok(()),
+    // Prefer on-disk CSV (allows overrides during development)
+    let project_root = workgraph_dir.parent();
+    let on_disk_csv = project_root.map(|root| root.join("agency/starter.csv"));
+    let use_on_disk = on_disk_csv.as_ref().is_some_and(|p| p.exists());
+
+    let (source_label, csv_bytes): (&str, &[u8]) = if use_on_disk {
+        let path = on_disk_csv.as_ref().unwrap();
+        // Read on-disk file; fall back to embedded if read fails
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                // Leak is fine: this runs once during init
+                let leaked: &'static [u8] = Vec::leak(bytes);
+                ("agency/starter.csv (on-disk)", leaked)
+            }
+            Err(_) => ("agency/starter.csv (embedded)", EMBEDDED_STARTER_CSV),
+        }
+    } else {
+        ("agency/starter.csv (embedded)", EMBEDDED_STARTER_CSV)
     };
 
-    let csv_path = project_root.join("agency/starter.csv");
-    if !csv_path.exists() {
-        return Ok(());
-    }
-
-    let csv_str = csv_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Non-UTF8 path for bundled CSV"))?;
-
-    println!("Importing primitives from bundled CSV...");
-    let counts = agency_import::run(workgraph_dir, csv_str, false, Some("bundled-starter"))?;
+    println!("Importing primitives from {}...", source_label);
+    let counts = agency_import::run_from_bytes(
+        workgraph_dir,
+        source_label,
+        csv_bytes,
+        false,
+        Some("bundled-starter"),
+    )?;
 
     let total = counts.role_components + counts.desired_outcomes + counts.trade_off_configs;
     println!(
-        "Imported {} primitives from agency/starter.csv ({} components, {} outcomes, {} tradeoffs).",
-        total, counts.role_components, counts.desired_outcomes, counts.trade_off_configs
+        "Imported {} primitives from {} ({} components, {} outcomes, {} tradeoffs).",
+        total, source_label, counts.role_components, counts.desired_outcomes, counts.trade_off_configs
     );
 
     Ok(())
@@ -541,28 +556,44 @@ trade_off_config,Test Tradeoff,Tradeoff description,70,0,,inst-4,,task
     }
 
     #[test]
-    fn test_agency_init_fallback_without_csv() {
-        // Without a bundled CSV, init should still work using hardcoded starters
+    fn test_agency_init_imports_embedded_csv_without_on_disk_file() {
+        // Even without an on-disk CSV, the embedded CSV should be imported
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         run(&wg_dir).unwrap();
 
-        // No manifest should be created
+        // Manifest should be created from embedded CSV
         let manifest_path = wg_dir.join("agency/import-manifest.yaml");
         assert!(
-            !manifest_path.exists(),
-            "import-manifest.yaml should NOT exist without CSV"
+            manifest_path.exists(),
+            "import-manifest.yaml should exist from embedded CSV"
         );
 
-        // But hardcoded starters should be present
+        // Should have hundreds of primitives from the full pool
         let components_dir = wg_dir.join("agency/primitives/components");
         let comp_count = std::fs::read_dir(&components_dir).unwrap().count();
         assert!(
-            comp_count >= 8,
-            "Expected at least 8 hardcoded components, got {}",
+            comp_count >= 100,
+            "Expected at least 100 components from embedded CSV, got {}",
             comp_count
+        );
+
+        let outcomes_dir = wg_dir.join("agency/primitives/outcomes");
+        let outcome_count = std::fs::read_dir(&outcomes_dir).unwrap().count();
+        assert!(
+            outcome_count >= 50,
+            "Expected at least 50 outcomes from embedded CSV, got {}",
+            outcome_count
+        );
+
+        let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
+        let tradeoff_count = std::fs::read_dir(&tradeoffs_dir).unwrap().count();
+        assert!(
+            tradeoff_count >= 100,
+            "Expected at least 100 tradeoffs from embedded CSV, got {}",
+            tradeoff_count
         );
     }
 
