@@ -163,9 +163,9 @@ fn config_set_model() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp);
 
-    let output = wg_ok(&wg_dir, &["config", "--model", "haiku"]);
+    let output = wg_ok(&wg_dir, &["config", "--model", "claude:haiku"]);
     assert!(output.contains("Set agent.model"));
-    assert!(output.contains("haiku"));
+    assert!(output.contains("claude:haiku"));
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn config_set_multiple_values() {
             "--executor",
             "amplifier",
             "--model",
-            "sonnet",
+            "claude:sonnet",
             "--max-agents",
             "3",
         ],
