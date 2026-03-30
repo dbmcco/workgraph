@@ -1340,6 +1340,7 @@ impl Config {
     /// Built-in Anthropic model defaults.
     fn builtin_registry() -> Vec<ModelRegistryEntry> {
         vec![
+            // Legacy model entries (for backward compatibility)
             ModelRegistryEntry {
                 id: "haiku".into(),
                 provider: "anthropic".into(),
@@ -1370,6 +1371,49 @@ impl Config {
             },
             ModelRegistryEntry {
                 id: "opus".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-4-6".into(),
+                tier: Tier::Premium,
+                context_window: 200_000,
+                max_output_tokens: 32000,
+                cost_per_input_mtok: 15.0,
+                cost_per_output_mtok: 75.0,
+                prompt_caching: true,
+                cache_read_discount: 0.1,
+                cache_write_premium: 1.25,
+                ..Default::default()
+            },
+            // New colon-separated format entries
+            ModelRegistryEntry {
+                id: "claude:haiku".into(),
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-5-20251001".into(),
+                tier: Tier::Fast,
+                context_window: 200_000,
+                max_output_tokens: 8192,
+                cost_per_input_mtok: 0.25,
+                cost_per_output_mtok: 1.25,
+                prompt_caching: true,
+                cache_read_discount: 0.1,
+                cache_write_premium: 1.25,
+                ..Default::default()
+            },
+            ModelRegistryEntry {
+                id: "claude:sonnet".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+                tier: Tier::Standard,
+                context_window: 200_000,
+                max_output_tokens: 16384,
+                cost_per_input_mtok: 3.0,
+                cost_per_output_mtok: 15.0,
+                prompt_caching: true,
+                cache_read_discount: 0.1,
+                cache_write_premium: 1.25,
+                ..Default::default()
+            },
+            ModelRegistryEntry {
+                id: "claude:opus".into(),
                 provider: "anthropic".into(),
                 model: "claude-opus-4-6".into(),
                 tier: Tier::Premium,
@@ -2977,7 +3021,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.agent.executor, "claude");
-        assert_eq!(config.agent.model, "opus");
+        assert_eq!(config.agent.model, "claude:opus");
         assert_eq!(config.agent.interval, 10);
     }
 
@@ -3682,10 +3726,13 @@ model = "haiku"
     fn test_effective_registry_returns_builtins_when_empty() {
         let config = Config::default();
         let registry = config.effective_registry();
-        assert_eq!(registry.len(), 3);
-        assert_eq!(registry[0].id, "haiku");
-        assert_eq!(registry[1].id, "sonnet");
-        assert_eq!(registry[2].id, "opus");
+        assert_eq!(registry.len(), 6);
+        assert!(registry.iter().any(|e| e.id == "haiku"));
+        assert!(registry.iter().any(|e| e.id == "sonnet"));
+        assert!(registry.iter().any(|e| e.id == "opus"));
+        assert!(registry.iter().any(|e| e.id == "claude:haiku"));
+        assert!(registry.iter().any(|e| e.id == "claude:sonnet"));
+        assert!(registry.iter().any(|e| e.id == "claude:opus"));
     }
 
     #[test]
@@ -3699,8 +3746,8 @@ model = "haiku"
             ..Default::default()
         }];
         let registry = config.effective_registry();
-        // 3 built-in + 1 custom = 4
-        assert_eq!(registry.len(), 4);
+        // 6 built-in + 1 custom = 7
+        assert_eq!(registry.len(), 7);
         assert!(registry.iter().any(|e| e.id == "custom"));
         assert!(registry.iter().any(|e| e.id == "haiku"));
     }
@@ -3716,8 +3763,8 @@ model = "haiku"
             ..Default::default()
         }];
         let registry = config.effective_registry();
-        // 2 remaining built-ins + 1 override = 3
-        assert_eq!(registry.len(), 3);
+        // 5 remaining built-ins + 1 override = 6
+        assert_eq!(registry.len(), 6);
         let haiku = registry.iter().find(|e| e.id == "haiku").unwrap();
         assert_eq!(haiku.model, "my-haiku");
         assert_eq!(haiku.provider, "local");
