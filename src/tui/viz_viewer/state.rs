@@ -14631,6 +14631,18 @@ mod tui_config_panel_tests {
                         }
                         "coordinator.agent_timeout" => "45m",
                         "tui.counters" => "uptime,active",
+                        // Model and tier fields require provider:model format
+                        k if k.starts_with("tiers.")
+                            || k == "coordinator.model"
+                            || k == "agent.model"
+                            || (k.starts_with("models.") && k.ends_with(".model")) =>
+                        {
+                            "claude:test-model"
+                        }
+                        // Provider fields are deprecated (skip_serializing) — skip them
+                        k if k.starts_with("models.") && k.ends_with(".provider") => {
+                            continue;
+                        }
                         _ => "test-value",
                     };
 
@@ -14912,35 +14924,13 @@ mod tui_config_panel_tests {
             .unwrap();
         app.config_panel.selected = idx;
         app.config_panel.editing = true;
-        app.config_panel.edit_buffer = "sonnet".to_string();
+        app.config_panel.edit_buffer = "claude:sonnet".to_string();
         app.save_config_entry();
 
         // Use Config::load (local-only) to avoid global config bleeding in
         let config = Config::load(&app.workgraph_dir).unwrap();
         let default_model = config.models.default.as_ref().and_then(|c| c.model.clone());
-        assert_eq!(default_model, Some("sonnet".to_string()));
-
-        // Set a provider
-        app.load_config_panel();
-        let key = "models.default.provider";
-        let idx = app
-            .config_panel
-            .entries
-            .iter()
-            .position(|e| e.key == key)
-            .unwrap();
-        app.config_panel.selected = idx;
-        app.config_panel.editing = true;
-        app.config_panel.edit_buffer = "openrouter".to_string();
-        app.save_config_entry();
-
-        let config = Config::load(&app.workgraph_dir).unwrap();
-        let default_provider = config
-            .models
-            .default
-            .as_ref()
-            .and_then(|c| c.provider.clone());
-        assert_eq!(default_provider, Some("openrouter".to_string()));
+        assert_eq!(default_model, Some("claude:sonnet".to_string()));
 
         // Set to inherit (clear)
         app.load_config_panel();
@@ -14975,11 +14965,14 @@ mod tui_config_panel_tests {
             .unwrap();
         app.config_panel.selected = idx;
         app.config_panel.editing = true;
-        app.config_panel.edit_buffer = "custom-fast-model".to_string();
+        app.config_panel.edit_buffer = "claude:custom-fast-model".to_string();
         app.save_config_entry();
 
         let config = Config::load(&app.workgraph_dir).unwrap();
-        assert_eq!(config.tiers.fast, Some("custom-fast-model".to_string()));
+        assert_eq!(
+            config.tiers.fast,
+            Some("claude:custom-fast-model".to_string())
+        );
 
         // Set standard tier
         app.load_config_panel();
@@ -14992,11 +14985,14 @@ mod tui_config_panel_tests {
             .unwrap();
         app.config_panel.selected = idx;
         app.config_panel.editing = true;
-        app.config_panel.edit_buffer = "custom-standard".to_string();
+        app.config_panel.edit_buffer = "claude:custom-standard".to_string();
         app.save_config_entry();
 
         let config = Config::load(&app.workgraph_dir).unwrap();
-        assert_eq!(config.tiers.standard, Some("custom-standard".to_string()));
+        assert_eq!(
+            config.tiers.standard,
+            Some("claude:custom-standard".to_string())
+        );
 
         // Set premium tier
         app.load_config_panel();
@@ -15009,11 +15005,14 @@ mod tui_config_panel_tests {
             .unwrap();
         app.config_panel.selected = idx;
         app.config_panel.editing = true;
-        app.config_panel.edit_buffer = "custom-premium".to_string();
+        app.config_panel.edit_buffer = "claude:custom-premium".to_string();
         app.save_config_entry();
 
         let config = Config::load(&app.workgraph_dir).unwrap();
-        assert_eq!(config.tiers.premium, Some("custom-premium".to_string()));
+        assert_eq!(
+            config.tiers.premium,
+            Some("claude:custom-premium".to_string())
+        );
     }
 
     #[test]

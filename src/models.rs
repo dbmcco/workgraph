@@ -75,6 +75,17 @@ impl ModelEntry {
         self.id.rsplit('/').next().unwrap_or(&self.id)
     }
 
+    /// Return a provider:short_name string suitable for config values.
+    /// Maps the registry provider to the config provider prefix
+    /// (e.g., "anthropic" → "claude", others stay as-is).
+    pub fn config_spec(&self) -> String {
+        let prefix = match self.provider.as_str() {
+            "anthropic" => "claude",
+            other => other,
+        };
+        format!("{}:{}", prefix, self.short_name())
+    }
+
     /// Whether this model supports tool use (function calling).
     pub fn supports_tool_use(&self) -> bool {
         self.capabilities.iter().any(|c| c == "tool_use")
@@ -361,10 +372,10 @@ impl ModelRegistry {
         };
         let mut entries: Vec<&ModelEntry> = self.models.values().collect();
         entries.sort_by_key(|e| (tier_order(&e.tier), e.id.clone()));
-        entries.iter().map(|e| e.short_name().to_string()).collect()
+        entries.iter().map(|e| e.config_spec()).collect()
     }
 
-    /// Return (short_name, description) pairs for setup wizard display.
+    /// Return (config_spec, description) pairs for setup wizard display.
     pub fn model_choices_with_descriptions(&self) -> Vec<(String, String)> {
         let tier_order = |t: &ModelTier| -> u8 {
             match t {
@@ -379,7 +390,7 @@ impl ModelRegistry {
             .iter()
             .map(|e| {
                 let desc = format!("{} tier, {}", e.tier, e.provider);
-                (e.short_name().to_string(), desc)
+                (e.config_spec(), desc)
             })
             .collect()
     }
@@ -389,7 +400,13 @@ impl ModelRegistry {
 pub fn load_model_choices(workgraph_dir: &std::path::Path) -> Vec<String> {
     ModelRegistry::load(workgraph_dir)
         .map(|r| r.model_choices())
-        .unwrap_or_else(|_| vec!["opus".into(), "sonnet".into(), "haiku".into()])
+        .unwrap_or_else(|_| {
+            vec![
+                "claude:opus".into(),
+                "claude:sonnet".into(),
+                "claude:haiku".into(),
+            ]
+        })
 }
 
 /// Load model choices with descriptions, falling back to defaults.
@@ -400,9 +417,18 @@ pub fn load_model_choices_with_descriptions(
         .map(|r| r.model_choices_with_descriptions())
         .unwrap_or_else(|_| {
             vec![
-                ("opus".into(), "Most capable, best for complex tasks".into()),
-                ("sonnet".into(), "Balanced capability and speed".into()),
-                ("haiku".into(), "Fastest, best for simple tasks".into()),
+                (
+                    "claude:opus".into(),
+                    "Most capable, best for complex tasks".into(),
+                ),
+                (
+                    "claude:sonnet".into(),
+                    "Balanced capability and speed".into(),
+                ),
+                (
+                    "claude:haiku".into(),
+                    "Fastest, best for simple tasks".into(),
+                ),
             ]
         })
 }

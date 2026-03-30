@@ -81,21 +81,28 @@ pub fn build_config(choices: &SetupChoices, base: Option<&Config>) -> Config {
     config.coordinator.executor = Some(choices.executor.clone());
     config.agent.executor = choices.executor.clone();
 
-    config.agent.model = choices.model.clone();
-    config.coordinator.model = Some(choices.model.clone());
+    // Build provider:model format if the model doesn't already include a provider prefix
+    let model_spec = if choices.model.contains(':') {
+        choices.model.clone()
+    } else {
+        // Map provider name to provider prefix for model spec
+        let prefix = match choices.provider.as_str() {
+            "anthropic" => "claude",
+            other => other,
+        };
+        format!("{}:{}", prefix, choices.model)
+    };
+
+    config.agent.model = model_spec.clone();
+    config.coordinator.model = Some(model_spec.clone());
 
     config.coordinator.max_agents = choices.max_agents;
 
-    // Set coordinator provider for non-Anthropic providers
-    if choices.provider != "anthropic" {
-        config.coordinator.provider = Some(choices.provider.clone());
-    }
-
-    // Set models.default with provider
+    // Set models.default with provider:model format
     if choices.provider != "anthropic" {
         config.models.default = Some(RoleModelConfig {
-            provider: Some(choices.provider.clone()),
-            model: Some(choices.model.clone()),
+            provider: None,
+            model: Some(model_spec.clone()),
             tier: None,
             endpoint: None,
         });
@@ -139,22 +146,29 @@ pub fn build_config(choices: &SetupChoices, base: Option<&Config>) -> Config {
 /// Format a summary of what will be written.
 pub fn format_summary(choices: &SetupChoices) -> String {
     let mut lines = Vec::new();
+    // Build provider:model format for summary
+    let model_spec = if choices.model.contains(':') {
+        choices.model.clone()
+    } else {
+        let prefix = match choices.provider.as_str() {
+            "anthropic" => "claude",
+            other => other,
+        };
+        format!("{}:{}", prefix, choices.model)
+    };
+
     lines.push("[coordinator]".to_string());
     lines.push(format!("  executor = \"{}\"", choices.executor));
-    lines.push(format!("  model = \"{}\"", choices.model));
+    lines.push(format!("  model = \"{}\"", model_spec));
     lines.push(format!("  max_agents = {}", choices.max_agents));
-    if choices.provider != "anthropic" {
-        lines.push(format!("  provider = \"{}\"", choices.provider));
-    }
     lines.push(String::new());
     lines.push("[agent]".to_string());
     lines.push(format!("  executor = \"{}\"", choices.executor));
-    lines.push(format!("  model = \"{}\"", choices.model));
+    lines.push(format!("  model = \"{}\"", model_spec));
     if choices.provider != "anthropic" {
         lines.push(String::new());
         lines.push("[models.default]".to_string());
-        lines.push(format!("  provider = \"{}\"", choices.provider));
-        lines.push(format!("  model = \"{}\"", choices.model));
+        lines.push(format!("  model = \"{}\"", model_spec));
     }
     if let Some(ref ep) = choices.endpoint {
         lines.push(String::new());
@@ -939,8 +953,8 @@ mod tests {
         let config = build_config(&choices, None);
         assert_eq!(config.coordinator.executor, Some("claude".to_string()));
         assert_eq!(config.agent.executor, "claude");
-        assert_eq!(config.agent.model, "opus");
-        assert_eq!(config.coordinator.model, Some("opus".to_string()));
+        assert_eq!(config.agent.model, "claude:opus");
+        assert_eq!(config.coordinator.model, Some("claude:opus".to_string()));
         assert_eq!(config.coordinator.max_agents, 4);
         assert!(config.agency.auto_assign);
         assert!(config.agency.auto_evaluate);
@@ -965,7 +979,7 @@ mod tests {
         let config = build_config(&choices, None);
         assert_eq!(config.coordinator.executor, Some("amplifier".to_string()));
         assert_eq!(config.agent.executor, "amplifier");
-        assert_eq!(config.agent.model, "sonnet");
+        assert_eq!(config.agent.model, "claude:sonnet");
         assert_eq!(config.coordinator.max_agents, 8);
         assert!(!config.agency.auto_assign);
         assert!(!config.agency.auto_evaluate);
@@ -994,7 +1008,7 @@ mod tests {
 
         let config = build_config(&choices, Some(&base));
         // Wizard-set values
-        assert_eq!(config.agent.model, "haiku");
+        assert_eq!(config.agent.model, "claude:haiku");
         assert_eq!(config.coordinator.max_agents, 2);
         assert!(config.agency.auto_assign);
         assert_eq!(config.agency.evaluator_model, Some("sonnet".to_string()));
@@ -1067,7 +1081,7 @@ mod tests {
 
         let summary = format_summary(&choices);
         assert!(summary.contains("executor = \"claude\""));
-        assert!(summary.contains("model = \"opus\""));
+        assert!(summary.contains("model = \"claude:opus\""));
         assert!(summary.contains("max_agents = 4"));
         assert!(summary.contains("auto_assign = true"));
         assert!(summary.contains("auto_evaluate = true"));
@@ -1116,7 +1130,7 @@ mod tests {
         let reloaded: Config = toml::from_str(&toml_str).unwrap();
 
         assert_eq!(reloaded.coordinator.executor, Some("claude".to_string()));
-        assert_eq!(reloaded.agent.model, "opus");
+        assert_eq!(reloaded.agent.model, "claude:opus");
         assert_eq!(reloaded.coordinator.max_agents, 6);
         assert!(reloaded.agency.auto_assign);
         assert!(reloaded.agency.auto_evaluate);
@@ -1139,7 +1153,7 @@ mod tests {
         };
         let summary = format_summary(&choices);
         assert!(summary.contains("executor = \"claude\""));
-        assert!(summary.contains("model = \"sonnet\""));
+        assert!(summary.contains("model = \"claude:sonnet\""));
         assert!(summary.contains("max_agents = 3"));
     }
 
@@ -1194,15 +1208,18 @@ mod tests {
 
         let config = build_config(&choices, None);
 
-        // Executor and provider
+        // Executor — provider is now embedded in model spec, not a separate field
         assert_eq!(config.coordinator.executor, Some("native".to_string()));
         assert_eq!(config.agent.executor, "native");
-        assert_eq!(config.coordinator.provider, Some("openrouter".to_string()));
+        // coordinator.provider is no longer set (deprecated)
 
-        // models.default
+        // models.default — provider embedded in model spec
         let models_default = config.models.default.as_ref().unwrap();
-        assert_eq!(models_default.provider, Some("openrouter".to_string()));
-        assert_eq!(models_default.model, Some("sonnet".to_string()));
+        assert_eq!(models_default.provider, None);
+        assert_eq!(
+            models_default.model,
+            Some("openrouter:sonnet".to_string())
+        );
 
         // Endpoint
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
@@ -1249,15 +1266,18 @@ mod tests {
         let reloaded: Config = toml::from_str(&toml_str).unwrap();
 
         // Verify everything survives round-trip
-        assert_eq!(
-            reloaded.coordinator.provider,
-            Some("openrouter".to_string())
-        );
+        // coordinator.provider is deprecated and skip_serializing, so it won't round-trip
+        assert_eq!(reloaded.coordinator.provider, None);
         assert_eq!(reloaded.coordinator.effective_executor(), "native");
         assert_eq!(reloaded.llm_endpoints.endpoints.len(), 1);
         assert!(!reloaded.model_registry.is_empty());
         let models_default = reloaded.models.default.as_ref().unwrap();
-        assert_eq!(models_default.provider, Some("openrouter".to_string()));
+        // Provider is now embedded in model spec, not separate field
+        assert_eq!(
+            models_default.model,
+            Some("openrouter:sonnet".to_string())
+        );
+        assert_eq!(models_default.provider, None);
     }
 
     #[test]

@@ -163,12 +163,12 @@ mod model_management_new_user_setup {
         assert_eq!(entry.endpoint.as_deref(), Some("my-openrouter"));
 
         // Step 4: Set default model (like `wg model set-default`)
-        set_default_model(dir, "my-fast");
+        set_default_model(dir, "openrouter:my-fast");
 
         // Verify default was set
         let config = Config::load(dir).unwrap();
         let default_role = config.models.get_role(DispatchRole::Default).unwrap();
-        assert_eq!(default_role.model.as_deref(), Some("my-fast"));
+        assert_eq!(default_role.model.as_deref(), Some("openrouter:my-fast"));
 
         // Step 5: Verify the full lookup chain works
         let merged = Config::load_merged(dir).unwrap();
@@ -257,7 +257,7 @@ mod model_management_per_task_override {
         let dir = tmp.path();
 
         // Set up: sonnet as default
-        set_default_model(dir, "sonnet");
+        set_default_model(dir, "claude:sonnet");
 
         // Add a custom model alias
         add_registry_entry(
@@ -281,7 +281,7 @@ mod model_management_per_task_override {
 
         // Simulate task with --model my-custom
         let task_model = Some("my-custom".to_string());
-        let resolved = resolve_model(task_model, None, None, Some("sonnet"));
+        let resolved = resolve_model(task_model, None, None, Some("claude:sonnet"));
         assert_eq!(resolved, Some("my-custom".to_string()));
 
         // Registry lookup resolves the alias
@@ -296,11 +296,11 @@ mod model_management_per_task_override {
         let tmp = setup_workgraph_dir();
         let dir = tmp.path();
 
-        set_default_model(dir, "sonnet");
+        set_default_model(dir, "claude:sonnet");
 
         // No task model → falls through to coordinator model
-        let resolved = resolve_model(None, None, None, Some("sonnet"));
-        assert_eq!(resolved, Some("sonnet".to_string()));
+        let resolved = resolve_model(None, None, None, Some("claude:sonnet"));
+        assert_eq!(resolved, Some("claude:sonnet".to_string()));
 
         // "sonnet" should resolve via builtin registry
         let merged = Config::load_merged(dir).unwrap();
@@ -370,8 +370,8 @@ mod model_management_per_task_override {
 
         // Config: evaluator uses opus, default uses sonnet
         let mut config = Config::load(dir).unwrap();
-        config.models.set_model(DispatchRole::Default, "sonnet");
-        config.models.set_model(DispatchRole::Evaluator, "opus");
+        config.models.set_model(DispatchRole::Default, "claude:sonnet");
+        config.models.set_model(DispatchRole::Evaluator, "claude:opus");
         config.save(dir).unwrap();
 
         let loaded = Config::load(dir).unwrap();
@@ -778,11 +778,11 @@ mod model_management_error_paths {
         let tmp = setup_workgraph_dir();
         let dir = tmp.path();
 
-        set_default_model(dir, "nonexistent");
+        set_default_model(dir, "claude:nonexistent");
 
         let loaded = Config::load(dir).unwrap();
         let default = loaded.models.get_role(DispatchRole::Default).unwrap();
-        assert_eq!(default.model.as_deref(), Some("nonexistent"));
+        assert_eq!(default.model.as_deref(), Some("claude:nonexistent"));
 
         // But registry_lookup won't find it
         let merged = Config::load_merged(dir).unwrap();
@@ -911,11 +911,11 @@ mod model_management_backward_compat {
         let tmp = setup_workgraph_dir();
         let dir = tmp.path();
 
-        set_default_model(dir, "opus");
+        set_default_model(dir, "claude:opus");
 
         let config = Config::load(dir).unwrap();
         let default = config.models.get_role(DispatchRole::Default).unwrap();
-        assert_eq!(default.model.as_deref(), Some("opus"));
+        assert_eq!(default.model.as_deref(), Some("claude:opus"));
 
         // Resolve role should work and find opus
         let resolved = config.resolve_model_for_role(DispatchRole::Default);
@@ -1078,11 +1078,11 @@ mod model_management_config_persistence {
         let tmp = setup_workgraph_dir();
         let dir = tmp.path();
 
-        set_default_model(dir, "opus");
+        set_default_model(dir, "claude:opus");
 
         let loaded = Config::load(dir).unwrap();
         let default = loaded.models.get_role(DispatchRole::Default).unwrap();
-        assert_eq!(default.model.as_deref(), Some("opus"));
+        assert_eq!(default.model.as_deref(), Some("claude:opus"));
     }
 
     #[test]
@@ -1190,12 +1190,12 @@ mod model_management_config_persistence {
         );
 
         // Set as default
-        set_default_model(dir, "round-model");
+        set_default_model(dir, "openrouter:round-model");
 
         // Set per-role model
         {
             let mut config = Config::load(dir).unwrap();
-            config.models.set_model(DispatchRole::Evaluator, "opus");
+            config.models.set_model(DispatchRole::Evaluator, "claude:opus");
             config.save(dir).unwrap();
         }
 
@@ -1219,11 +1219,11 @@ mod model_management_config_persistence {
 
         // Default model
         let default = loaded.models.get_role(DispatchRole::Default).unwrap();
-        assert_eq!(default.model.as_deref(), Some("round-model"));
+        assert_eq!(default.model.as_deref(), Some("openrouter:round-model"));
 
         // Per-role model
         let eval_role = loaded.models.get_role(DispatchRole::Evaluator).unwrap();
-        assert_eq!(eval_role.model.as_deref(), Some("opus"));
+        assert_eq!(eval_role.model.as_deref(), Some("claude:opus"));
 
         // Verify registry lookup still works after reload
         let merged = Config::load_merged(dir).unwrap();
@@ -1330,12 +1330,13 @@ mod model_management_config_persistence {
         // Set up per-role model routing
         {
             let mut config = Config::load(dir).unwrap();
-            config.models.set_model(DispatchRole::Evaluator, "opus");
             config
                 .models
-                .set_provider(DispatchRole::Evaluator, "openrouter");
+                .set_model(DispatchRole::Evaluator, "openrouter:opus");
             config.models.set_endpoint(DispatchRole::Evaluator, "my-ep");
-            config.models.set_model(DispatchRole::Triage, "haiku");
+            config
+                .models
+                .set_model(DispatchRole::Triage, "claude:haiku");
             config.save(dir).unwrap();
         }
 
@@ -1343,11 +1344,10 @@ mod model_management_config_persistence {
         let loaded = Config::load(dir).unwrap();
 
         let eval = loaded.models.get_role(DispatchRole::Evaluator).unwrap();
-        assert_eq!(eval.model.as_deref(), Some("opus"));
-        assert_eq!(eval.provider.as_deref(), Some("openrouter"));
+        assert_eq!(eval.model.as_deref(), Some("openrouter:opus"));
         assert_eq!(eval.endpoint.as_deref(), Some("my-ep"));
 
         let triage = loaded.models.get_role(DispatchRole::Triage).unwrap();
-        assert_eq!(triage.model.as_deref(), Some("haiku"));
+        assert_eq!(triage.model.as_deref(), Some("claude:haiku"));
     }
 }

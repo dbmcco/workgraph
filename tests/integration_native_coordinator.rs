@@ -249,13 +249,13 @@ fn native_coordinator_model_registry_has_openrouter_models() {
 fn native_coordinator_config_parsing() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
 
     let config = workgraph::config::Config::load(&wg_dir).unwrap();
     assert_eq!(config.coordinator.executor.as_deref(), Some("native"));
     assert_eq!(
         config.coordinator.model.as_deref(),
-        Some("deepseek/deepseek-chat-v3")
+        Some("openrouter:deepseek/deepseek-chat-v3")
     );
     assert!(config.coordinator.coordinator_agent);
 }
@@ -391,7 +391,7 @@ fn native_coordinator_endpoint_from_config() {
 [coordinator]
 coordinator_agent = true
 executor = "native"
-model = "deepseek/deepseek-chat-v3"
+model = "openrouter:deepseek/deepseek-chat-v3"
 
 [native_executor]
 api_base = "https://openrouter.ai/api/v1"
@@ -673,7 +673,7 @@ async fn native_coordinator_journal_with_openrouter_model() {
 fn native_coordinator_service_startup_no_api_key() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
 
     // Write native_executor config to set provider = "openai" explicitly
     let existing = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
@@ -722,7 +722,7 @@ fn native_coordinator_service_startup_no_api_key() {
 fn native_coordinator_service_startup_with_api_key() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
 
     // Write native_executor config to set provider = "openai" explicitly
     // (overrides WG_LLM_PROVIDER env var that may be inherited).
@@ -842,7 +842,7 @@ done
 fn native_coordinator_chat_routing() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
 
     // Write native_executor config to set provider = "openai" explicitly
     let existing = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
@@ -928,7 +928,7 @@ fn native_coordinator_task_dispatch_with_shell_executor() {
         r#"[coordinator]
 coordinator_agent = true
 executor = "native"
-model = "deepseek/deepseek-chat-v3"
+model = "openrouter:deepseek/deepseek-chat-v3"
 poll_interval = 2
 
 [native_executor]
@@ -1084,7 +1084,7 @@ fn native_coordinator_real_e2e_chat() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
     // Use deepseek-chat-v3 (budget tier, cheap)
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
     let _guard = DaemonGuard::new(&wg_dir);
 
     // Start daemon
@@ -1147,7 +1147,7 @@ fn native_coordinator_real_e2e_chat() {
 fn native_coordinator_real_e2e_error_recovery() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
-    configure_native_coordinator(&wg_dir, "deepseek/deepseek-chat-v3");
+    configure_native_coordinator(&wg_dir, "openrouter:deepseek/deepseek-chat-v3");
     let _guard = DaemonGuard::new(&wg_dir);
 
     let output = wg_cmd(

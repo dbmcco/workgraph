@@ -394,10 +394,10 @@ fn coordinator_spawn_with_provider() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // Configure provider=openrouter with a specific model
+    // Configure with provider:model format (provider embedded in model spec)
     write_config(
         &wg_dir,
-        "[coordinator]\ncoordinator_agent = true\nprovider = \"openrouter\"\nmodel = \"minimax-m2.5\"\n",
+        "[coordinator]\ncoordinator_agent = true\nmodel = \"openrouter:minimax-m2.5\"\n",
     );
 
     // Set a dummy API key so the native coordinator can initialize its client.
@@ -525,10 +525,10 @@ fn coordinator_spawn_model_passthrough() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // Configure a specific model
+    // Configure a specific model using provider:model format
     write_config(
         &wg_dir,
-        "[coordinator]\ncoordinator_agent = true\nmodel = \"claude-sonnet-4-20250514\"\n",
+        "[coordinator]\ncoordinator_agent = true\nmodel = \"claude:claude-sonnet-4-20250514\"\n",
     );
 
     let env = [

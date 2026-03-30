@@ -52,9 +52,6 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if let Some(ref m) = config.coordinator.model {
             println!("  model = \"{}\"", m);
         }
-        if let Some(ref p) = config.coordinator.provider {
-            println!("  provider = \"{}\"", p);
-        }
         println!();
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);
@@ -373,6 +370,13 @@ pub fn update(
     }
 
     if let Some(m) = model {
+        // Validate provider:model format
+        if let Err(e) = workgraph::config::parse_model_spec_strict(m) {
+            anyhow::bail!(
+                "Invalid model format: {}. Use provider:model format (e.g., 'claude:opus').",
+                e
+            );
+        }
         config.agent.model = m.to_string();
         println!("Set agent.model = \"{}\"", m);
         changed = true;
@@ -416,15 +420,30 @@ pub fn update(
     }
 
     if let Some(m) = coordinator_model {
+        // Validate provider:model format
+        if let Err(e) = workgraph::config::parse_model_spec_strict(m) {
+            anyhow::bail!(
+                "Invalid model format: {}. Use provider:model format (e.g., 'claude:opus').",
+                e
+            );
+        }
         config.coordinator.model = Some(m.to_string());
+        config.coordinator.provider = None; // Clear deprecated field
         println!("Set coordinator.model = \"{}\"", m);
         changed = true;
     }
 
     if let Some(p) = coordinator_provider {
-        config.coordinator.provider = Some(p.to_string());
-        println!("Set coordinator.provider = \"{}\"", p);
-        changed = true;
+        anyhow::bail!(
+            "--coordinator-provider is deprecated. Use provider:model format in --coordinator-model instead.\n\
+             Example: wg config --coordinator-model {}:{}",
+            if p == "anthropic" { "claude" } else { p },
+            config
+                .coordinator
+                .model
+                .as_deref()
+                .unwrap_or(&config.agent.model),
+        );
     }
 
     // Agency settings
@@ -1044,27 +1063,38 @@ pub fn update_model_routing(
         }
         let role: DispatchRole = args[0].parse()?;
         let model = &args[1];
+
+        // Validate provider:model format
+        if let Err(e) = workgraph::config::parse_model_spec_strict(model) {
+            anyhow::bail!(
+                "Invalid model format: {}. Use provider:model format (e.g., 'claude:opus').",
+                e
+            );
+        }
+
         config.models.set_model(role, model);
         println!("Set models.{}.model = \"{}\"", role, model);
 
         // Validate: warn if model ID is not in the registry
-        if config.registry_lookup(model).is_none() {
+        let spec = workgraph::config::parse_model_spec(model);
+        let lookup_id = &spec.model_id;
+        if config.registry_lookup(lookup_id).is_none() {
             eprintln!(
                 "Warning: model '{}' is not in the registry. It will be used as a raw model ID.",
-                model
+                lookup_id
             );
             eprintln!(
                 "  If this is a short alias, add it with: wg config --registry-add --id {} ...",
-                model
+                lookup_id
             );
         } else {
             // Informational: check tier compatibility
-            if let Some(entry) = config.registry_lookup(model) {
+            if let Some(entry) = config.registry_lookup(lookup_id) {
                 let role_tier = role.default_tier();
                 if entry.tier != role_tier {
                     eprintln!(
                         "Note: model '{}' is tier '{}' but role '{}' defaults to tier '{}'.",
-                        model, entry.tier, role, role_tier
+                        lookup_id, entry.tier, role, role_tier
                     );
                 }
             }
@@ -1076,11 +1106,18 @@ pub fn update_model_routing(
         if args.len() != 2 {
             anyhow::bail!("--set-provider requires exactly 2 arguments: <role> <provider>");
         }
-        let role: DispatchRole = args[0].parse()?;
+        let role_name = &args[0];
         let provider = &args[1];
-        config.models.set_provider(role, provider);
-        println!("Set models.{}.provider = \"{}\"", role, provider);
-        changed = true;
+        anyhow::bail!(
+            "--set-provider is deprecated. Use provider:model format in --set-model instead.\n\
+             Example: wg config --set-model {} {}:MODEL",
+            role_name,
+            if provider == "anthropic" {
+                "claude"
+            } else {
+                provider
+            },
+        );
     }
 
     if let Some(args) = set_endpoint {
@@ -1740,7 +1777,7 @@ mod tests {
             temp_dir.path(),
             ConfigScope::Local,
             Some("opencode"),
-            Some("gpt-4"),
+            Some("openai:gpt-4"),
             Some(30),
             None, // max_agents
             None, // max_coordinators
@@ -1785,7 +1822,7 @@ mod tests {
 
         let config = Config::load(temp_dir.path()).unwrap();
         assert_eq!(config.agent.executor, "opencode");
-        assert_eq!(config.agent.model, "gpt-4");
+        assert_eq!(config.agent.model, "openai:gpt-4");
         assert_eq!(config.agent.interval, 30);
     }
 

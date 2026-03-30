@@ -176,7 +176,7 @@ pub fn run(workgraph_dir: &Path) -> Result<()> {
     // Use [models.*] table format instead of deprecated agency.*_model fields.
     if config.models.assigner.is_none() {
         config.models.assigner = Some(workgraph::config::RoleModelConfig {
-            model: Some("haiku".to_string()),
+            model: Some("claude:haiku".to_string()),
             provider: None,
             tier: None,
             endpoint: None,
@@ -185,7 +185,7 @@ pub fn run(workgraph_dir: &Path) -> Result<()> {
     }
     if config.models.evaluator.is_none() {
         config.models.evaluator = Some(workgraph::config::RoleModelConfig {
-            model: Some("haiku".to_string()),
+            model: Some("claude:haiku".to_string()),
             provider: None,
             tier: None,
             endpoint: None,

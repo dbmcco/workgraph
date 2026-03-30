@@ -695,14 +695,11 @@ mod config_roundtrip_tests {
             }],
         };
 
-        // Set up model routing
+        // Set up model routing (provider:model format)
         config.models.set_model(
             DispatchRole::Evaluator,
-            "anthropic/claude-sonnet-4-20250514",
+            "openrouter:anthropic/claude-sonnet-4-20250514",
         );
-        config
-            .models
-            .set_provider(DispatchRole::Evaluator, "openrouter");
         config
             .models
             .set_endpoint(DispatchRole::Evaluator, "or-prod");

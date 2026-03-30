@@ -132,7 +132,7 @@ pub fn run_remove(dir: &Path, alias: &str, force: bool, global: bool, json: bool
 
 /// `wg model set-default <alias>` — set the default model for agent dispatch.
 pub fn run_set_default(dir: &Path, alias: &str, global: bool) -> Result<()> {
-    use workgraph::config::{Config, DispatchRole};
+    use workgraph::config::{parse_model_spec, Config, DispatchRole};
 
     let scope = if global {
         ConfigScope::Global
@@ -140,9 +140,13 @@ pub fn run_set_default(dir: &Path, alias: &str, global: bool) -> Result<()> {
         ConfigScope::Local
     };
 
+    // Parse provider:model format for registry lookup
+    let spec = parse_model_spec(alias);
+    let lookup_id = &spec.model_id;
+
     // Validate alias exists in the effective registry
     let merged = Config::load_merged(dir)?;
-    if merged.registry_lookup(alias).is_none() {
+    if merged.registry_lookup(lookup_id).is_none() {
         anyhow::bail!(
             "Model '{}' not found in the registry.\n  \
              Try: `wg models search {}` to find valid alternatives\n  \
@@ -317,15 +321,15 @@ mod tests {
         let tmp = setup_dir();
         let dir = tmp.path();
 
-        // "sonnet" is a built-in, so it should be available
-        run_set_default(dir, "sonnet", false).unwrap();
+        // "sonnet" is a built-in, so it should be available via provider:model
+        run_set_default(dir, "claude:sonnet", false).unwrap();
 
         let config = Config::load(dir).unwrap();
         let default = config
             .models
             .get_role(workgraph::config::DispatchRole::Default)
             .unwrap();
-        assert_eq!(default.model.as_deref(), Some("sonnet"));
+        assert_eq!(default.model.as_deref(), Some("claude:sonnet"));
     }
 
     #[test]
@@ -344,14 +348,14 @@ mod tests {
         let tmp = setup_dir();
         let dir = tmp.path();
 
-        run_set(dir, "evaluator", "opus", None, None, false).unwrap();
+        run_set(dir, "evaluator", "claude:opus", None, None, false).unwrap();
 
         let config = Config::load(dir).unwrap();
         let role = config
             .models
             .get_role(workgraph::config::DispatchRole::Evaluator)
             .unwrap();
-        assert_eq!(role.model.as_deref(), Some("opus"));
+        assert_eq!(role.model.as_deref(), Some("claude:opus"));
     }
 
     #[test]
@@ -391,12 +395,12 @@ mod tests {
         let tmp = setup_dir();
         let dir = tmp.path();
 
-        // Add a model and set it as default
+        // Add a model and set it as default using provider:model format
         run_add(
             dir, "my-model", "openai", None, "standard", None, None, None, None, false,
         )
         .unwrap();
-        run_set_default(dir, "my-model", false).unwrap();
+        run_set_default(dir, "openai:my-model", false).unwrap();
 
         // Verify it is the default
         let config = Config::load(dir).unwrap();
@@ -404,7 +408,7 @@ mod tests {
             .models
             .get_role(workgraph::config::DispatchRole::Default)
             .unwrap();
-        assert_eq!(default.model.as_deref(), Some("my-model"));
+        assert_eq!(default.model.as_deref(), Some("openai:my-model"));
 
         // Removing with --force should succeed (the non-force path calls process::exit
         // which can't be tested in-process)

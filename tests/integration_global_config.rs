@@ -667,7 +667,7 @@ fn merge_empty_both_yields_defaults() {
 
     let config = load_merged_custom(&global_dir, &local_dir);
     assert_eq!(config.agent.executor, "claude");
-    assert_eq!(config.agent.model, "opus");
+    assert_eq!(config.agent.model, "claude:opus");
     assert_eq!(config.coordinator.max_agents, 4);
     assert_eq!(config.coordinator.interval, 30);
 }
@@ -684,7 +684,7 @@ max_agents = 12
 interval = 45
 poll_interval = 180
 executor = "shell"
-model = "opus"
+model = "claude:opus"
 "#,
         ),
     );
@@ -695,7 +695,7 @@ model = "opus"
     assert_eq!(config.coordinator.interval, 45);
     assert_eq!(config.coordinator.poll_interval, 180);
     assert_eq!(config.coordinator.executor, Some("shell".to_string()));
-    assert_eq!(config.coordinator.model, Some("opus".to_string()));
+    assert_eq!(config.coordinator.model, Some("claude:opus".to_string()));
 }
 
 #[test]
@@ -704,14 +704,14 @@ fn config_save_and_load_roundtrip_local() {
     let local_dir = setup_local_dir(&tmp, None);
 
     let mut config = Config::default();
-    config.agent.model = "haiku".to_string();
+    config.agent.model = "claude:haiku".to_string();
     config.coordinator.max_agents = 16;
     config.agency.evaluator_model = Some("sonnet".to_string());
     config.agency.auto_evaluate = true;
     config.save(&local_dir).unwrap();
 
     let loaded = Config::load(&local_dir).unwrap();
-    assert_eq!(loaded.agent.model, "haiku");
+    assert_eq!(loaded.agent.model, "claude:haiku");
     assert_eq!(loaded.coordinator.max_agents, 16);
     assert_eq!(loaded.agency.evaluator_model, Some("sonnet".to_string()));
     assert!(loaded.agency.auto_evaluate);

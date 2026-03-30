@@ -2003,7 +2003,9 @@ fn spawn_claude_process(
     cmd.args(["--allowedTools", "Bash(wg:*)"]);
 
     if let Some(m) = model {
-        cmd.args(["--model", m]);
+        // Strip provider prefix (e.g., "claude:opus" → "opus") for the CLI
+        let spec = workgraph::config::parse_model_spec(m);
+        cmd.args(["--model", &spec.model_id]);
     }
 
     // Note: the Claude CLI does not support --provider. Provider routing is
