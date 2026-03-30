@@ -1286,6 +1286,19 @@ pub fn provider_to_native_provider(provider: &str) -> &'static str {
     }
 }
 
+/// Reverse map: internal provider name → user-facing `provider:model` prefix.
+///
+/// This is the inverse of [`provider_to_native_provider`] for display purposes.
+pub fn native_provider_to_prefix(provider: &str) -> &str {
+    match provider {
+        "anthropic" => "claude",
+        "openrouter" => "openrouter",
+        "openai" => "openai",
+        "local" => "local",
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config validation
 // ---------------------------------------------------------------------------

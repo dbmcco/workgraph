@@ -112,10 +112,20 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if let Some(threshold) = config.agency.flip_verification_threshold {
             println!("  flip_verification_threshold = {}", threshold);
         }
-        println!(
-            "  flip_verification_model = \"{}\"",
-            config.agency.flip_verification_model
-        );
+        {
+            // Display flip_verification_model in provider:model format
+            let resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
+            let display = if let Some(ref entry) = resolved.registry_entry {
+                let prefix = workgraph::config::native_provider_to_prefix(&entry.provider);
+                format!("{}:{}", prefix, entry.id)
+            } else if let Some(ref provider) = resolved.provider {
+                let prefix = workgraph::config::native_provider_to_prefix(provider);
+                format!("{}:{}", prefix, resolved.model)
+            } else {
+                resolved.model.clone()
+            };
+            println!("  flip_verification_model = \"{}\"", display);
+        }
         println!("  auto_place = {}", config.agency.auto_place);
         if config.agency.auto_evolve {
             println!("  auto_evolve = {}", config.agency.auto_evolve);
@@ -182,19 +192,16 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
             for role in DispatchRole::ALL {
                 let resolved = config.resolve_model_for_role(*role);
                 let tier = role.default_tier();
-                // Use the registry entry short ID if available, otherwise truncate model name
-                let display_model = resolved
-                    .registry_entry
-                    .as_ref()
-                    .map(|e| e.id.clone())
-                    .unwrap_or_else(|| {
-                        let m = &resolved.model;
-                        if m.len() > 12 {
-                            m[..12].to_string()
-                        } else {
-                            m.to_string()
-                        }
-                    });
+                // Display as provider:id (e.g., "claude:opus") for consistency
+                let display_model = if let Some(ref entry) = resolved.registry_entry {
+                    let prefix = workgraph::config::native_provider_to_prefix(&entry.provider);
+                    format!("{}:{}", prefix, entry.id)
+                } else if let Some(ref provider) = resolved.provider {
+                    let prefix = workgraph::config::native_provider_to_prefix(provider);
+                    format!("{}:{}", prefix, resolved.model)
+                } else {
+                    resolved.model.clone()
+                };
 
                 let auto_str = match auto_status(role) {
                     Some(status) => format!(", auto: {}", status),
