@@ -1760,8 +1760,7 @@ mod tests {
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids.len(), 1, "Only the header should be ready");
         assert_eq!(
-            ready[0].id,
-            cycle_analysis.cycles[0].header,
+            ready[0].id, cycle_analysis.cycles[0].header,
             "The ready task should be the cycle header"
         );
     }
@@ -1790,8 +1789,7 @@ mod tests {
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids.len(), 1, "Only the header should be ready");
         assert_eq!(
-            ready[0].id,
-            cycle_analysis.cycles[0].header,
+            ready[0].id, cycle_analysis.cycles[0].header,
             "The ready task should be the cycle header"
         );
     }
@@ -1824,8 +1822,7 @@ mod tests {
 
         assert_eq!(ready.len(), 1, "Only the header should be ready");
         assert_eq!(
-            ready[0].id,
-            cycle_analysis.cycles[0].header,
+            ready[0].id, cycle_analysis.cycles[0].header,
             "The ready task should be the cycle header"
         );
     }
@@ -1859,7 +1856,10 @@ mod tests {
 
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert!(!ids.contains(&"a"), "A should be blocked by external dep C");
-        assert!(!ids.contains(&"b"), "B should be blocked by A (forward dep)");
+        assert!(
+            !ids.contains(&"b"),
+            "B should be blocked by A (forward dep)"
+        );
     }
 
     #[test]
@@ -1890,7 +1890,10 @@ mod tests {
 
         let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids.len(), 1, "Only the header should be ready");
-        assert!(ids.contains(&"a"), "A (header) should be ready after C done");
+        assert!(
+            ids.contains(&"a"),
+            "A (header) should be ready after C done"
+        );
     }
 
     #[test]
@@ -1935,7 +1938,11 @@ mod tests {
         let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
 
         // The header's back-edge blocker is skipped; the non-header waits.
-        assert_eq!(ready.len(), 1, "Exactly one task (the header) should be ready");
+        assert_eq!(
+            ready.len(),
+            1,
+            "Exactly one task (the header) should be ready"
+        );
         let header_id = &cycle_analysis.cycles[0].header;
         assert_eq!(
             ready[0].id, *header_id,

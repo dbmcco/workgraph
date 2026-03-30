@@ -108,8 +108,7 @@ pub fn run_chat_compaction(workgraph_dir: &Path, coordinator_id: u32) -> Result<
     };
 
     // Read new messages since last compaction
-    let new_inbox =
-        chat::read_inbox_since_for(workgraph_dir, coordinator_id, state.last_inbox_id)?;
+    let new_inbox = chat::read_inbox_since_for(workgraph_dir, coordinator_id, state.last_inbox_id)?;
     let new_outbox =
         chat::read_outbox_since_for(workgraph_dir, coordinator_id, state.last_outbox_id)?;
 
@@ -118,7 +117,10 @@ pub fn run_chat_compaction(workgraph_dir: &Path, coordinator_id: u32) -> Result<
         if output_path.exists() {
             return Ok(output_path);
         }
-        anyhow::bail!("No chat messages to compact for coordinator {}", coordinator_id);
+        anyhow::bail!(
+            "No chat messages to compact for coordinator {}",
+            coordinator_id
+        );
     }
 
     // Interleave by timestamp
@@ -144,7 +146,11 @@ pub fn run_chat_compaction(workgraph_dir: &Path, coordinator_id: u32) -> Result<
     fs::write(&output_path, &result.text)?;
 
     // Track the max IDs we've now compacted
-    let max_inbox_id = new_inbox.iter().map(|m| m.id).max().unwrap_or(state.last_inbox_id);
+    let max_inbox_id = new_inbox
+        .iter()
+        .map(|m| m.id)
+        .max()
+        .unwrap_or(state.last_inbox_id);
     let max_outbox_id = new_outbox
         .iter()
         .map(|m| m.id)
@@ -170,7 +176,10 @@ fn format_messages_for_prompt(messages: &[ChatMessage]) -> String {
     for msg in messages {
         // Truncate very long messages to keep prompt manageable
         let content = if msg.content.len() > 500 {
-            format!("{}...", &msg.content[..msg.content.floor_char_boundary(500)])
+            format!(
+                "{}...",
+                &msg.content[..msg.content.floor_char_boundary(500)]
+            )
         } else {
             msg.content.clone()
         };

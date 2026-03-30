@@ -275,18 +275,22 @@ fn try_upstream_pull(workgraph_dir: &Path) {
 
     match agency_import::run_import(workgraph_dir, opts) {
         Ok(counts) => {
-            let total =
-                counts.role_components + counts.desired_outcomes + counts.trade_off_configs;
+            let total = counts.role_components + counts.desired_outcomes + counts.trade_off_configs;
             if total > 0 {
                 println!(
                     "Pulled {} primitives from upstream bureau ({} components, {} outcomes, {} tradeoffs).",
-                    total, counts.role_components, counts.desired_outcomes, counts.trade_off_configs
+                    total,
+                    counts.role_components,
+                    counts.desired_outcomes,
+                    counts.trade_off_configs
                 );
             }
         }
         Err(e) => {
             eprintln!("Warning: failed to pull upstream agency bureau: {}", e);
-            eprintln!("  Init continues without upstream data. Run `wg agency import --upstream` later.");
+            eprintln!(
+                "  Init continues without upstream data. Run `wg agency import --upstream` later."
+            );
         }
     }
 }
@@ -341,7 +345,11 @@ fn try_csv_import(workgraph_dir: &Path) -> Result<()> {
     let total = counts.role_components + counts.desired_outcomes + counts.trade_off_configs;
     println!(
         "Imported {} primitives from {} ({} components, {} outcomes, {} tradeoffs).",
-        total, source_label, counts.role_components, counts.desired_outcomes, counts.trade_off_configs
+        total,
+        source_label,
+        counts.role_components,
+        counts.desired_outcomes,
+        counts.trade_off_configs
     );
 
     Ok(())
@@ -513,8 +521,7 @@ trade_off_config,Test Tradeoff,Tradeoff description,70,0,,inst-4,,task
 
         // Parse manifest and verify counts
         let manifest_str = std::fs::read_to_string(&manifest_path).unwrap();
-        let manifest: agency_import::ImportManifest =
-            serde_yaml::from_str(&manifest_str).unwrap();
+        let manifest: agency_import::ImportManifest = serde_yaml::from_str(&manifest_str).unwrap();
         assert_eq!(manifest.counts.role_components, 2);
         assert_eq!(manifest.counts.desired_outcomes, 1);
         assert_eq!(manifest.counts.trade_off_configs, 1);
@@ -552,7 +559,10 @@ trade_off_config,Test Tradeoff,Tradeoff description,70,0,,inst-4,,task
 
         let manifest2 = std::fs::read_to_string(&manifest_path).unwrap();
         // Manifest should be unchanged (same content, not rewritten)
-        assert_eq!(manifest1, manifest2, "Manifest should not be rewritten on second init");
+        assert_eq!(
+            manifest1, manifest2,
+            "Manifest should not be rewritten on second init"
+        );
     }
 
     #[test]
@@ -654,6 +664,9 @@ trade_off_config,Test Tradeoff,Tradeoff description,70,0,,inst-4,,task
 
         // Agency data should still be created (from hardcoded starters)
         let agents_dir = wg_dir.join("agency/cache/agents");
-        assert!(agents_dir.exists(), "agents should be created despite upstream failure");
+        assert!(
+            agents_dir.exists(),
+            "agents should be created despite upstream failure"
+        );
     }
 }

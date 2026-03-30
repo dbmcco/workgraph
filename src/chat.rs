@@ -916,10 +916,7 @@ fn rotate_to_archive(path: &Path, archive_dir: &Path) -> Result<()> {
         .with_context(|| format!("Failed to create archive dir: {}", archive_dir.display()))?;
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("chat");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chat");
     let archive_name = format!("{}-{}.jsonl", stem, timestamp);
     let dest = archive_dir.join(&archive_name);
 
@@ -1367,8 +1364,12 @@ pub fn share_context(
             from_coordinator
         );
     }
-    let raw = fs::read_to_string(&summary_path)
-        .with_context(|| format!("Failed to read context summary for coordinator {}", from_coordinator))?;
+    let raw = fs::read_to_string(&summary_path).with_context(|| {
+        format!(
+            "Failed to read context summary for coordinator {}",
+            from_coordinator
+        )
+    })?;
     let raw = raw.trim();
     if raw.is_empty() {
         anyhow::bail!(
@@ -1414,7 +1415,10 @@ fn format_messages_as_text(messages: &[ChatMessage]) -> String {
         };
         // Truncate very long messages
         let content = if msg.content.len() > 1000 {
-            format!("{}...", &msg.content[..msg.content.floor_char_boundary(1000)])
+            format!(
+                "{}...",
+                &msg.content[..msg.content.floor_char_boundary(1000)]
+            )
         } else {
             msg.content.clone()
         };
@@ -2173,7 +2177,11 @@ mod tests {
 
     // --- Archive rotation tests ---
 
-    fn setup_with_config(max_size: u64, max_messages: usize, retention_days: u32) -> (TempDir, PathBuf) {
+    fn setup_with_config(
+        max_size: u64,
+        max_messages: usize,
+        retention_days: u32,
+    ) -> (TempDir, PathBuf) {
         let (tmp, wg_dir) = setup();
         let config_content = format!(
             "[chat]\nmax_file_size = {}\nmax_messages = {}\nretention_days = {}\n",
@@ -2276,7 +2284,11 @@ mod tests {
         append_inbox(&wg_dir, "no match here", "req-3").unwrap();
 
         let results = search_all_history_for(&wg_dir, 0, "needle").unwrap();
-        assert_eq!(results.len(), 2, "Should find needle in both archive and active");
+        assert_eq!(
+            results.len(),
+            2,
+            "Should find needle in both archive and active"
+        );
     }
 
     #[test]
@@ -2593,11 +2605,7 @@ mod tests {
         for cid in [1, 2, 3] {
             let dir = wg_dir.join("chat").join(cid.to_string());
             fs::create_dir_all(&dir).unwrap();
-            fs::write(
-                dir.join("context-summary.md"),
-                format!("Summary {}", cid),
-            )
-            .unwrap();
+            fs::write(dir.join("context-summary.md"), format!("Summary {}", cid)).unwrap();
         }
 
         // Restrict coordinator 2
@@ -2639,10 +2647,12 @@ mod tests {
         // No summary exists
         let result = share_context(&wg_dir, 0, 1, None);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no compacted context summary"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no compacted context summary")
+        );
     }
 
     #[test]
@@ -2678,7 +2688,11 @@ mod tests {
 
         // Search should find "alpha" in archive (inbox + outbox) and active inbox
         let results = search_all_history_for(&wg_dir, 0, "alpha").unwrap();
-        assert_eq!(results.len(), 3, "alpha appears in archived inbox, archived outbox, and active");
+        assert_eq!(
+            results.len(),
+            3,
+            "alpha appears in archived inbox, archived outbox, and active"
+        );
 
         // Search should find "beta" only in active
         let results = search_all_history_for(&wg_dir, 0, "beta").unwrap();
@@ -2718,9 +2732,7 @@ mod tests {
         let has_summary = segments
             .iter()
             .any(|s| s.source == HistorySource::ContextSummary);
-        let has_archive = segments
-            .iter()
-            .any(|s| s.source == HistorySource::Archive);
+        let has_archive = segments.iter().any(|s| s.source == HistorySource::Archive);
         let has_active = segments
             .iter()
             .any(|s| s.source == HistorySource::ActiveChat);
@@ -2846,7 +2858,11 @@ mod tests {
         append_inbox(&wg_dir, "batch3 msg", "req-3").unwrap();
 
         let all = read_all_history_for(&wg_dir, 0).unwrap();
-        assert_eq!(all.len(), 4, "3 inbox + 1 outbox across 2 archives + active");
+        assert_eq!(
+            all.len(),
+            4,
+            "3 inbox + 1 outbox across 2 archives + active"
+        );
 
         // Search should span all
         let found = search_all_history_for(&wg_dir, 0, "batch").unwrap();
@@ -2854,7 +2870,10 @@ mod tests {
 
         // Archives should be multiple files
         let archives = list_archives_for(&wg_dir, 0).unwrap();
-        assert!(archives.len() >= 3, "At least 3 archive files from 2 rotations");
+        assert!(
+            archives.len() >= 3,
+            "At least 3 archive files from 2 rotations"
+        );
     }
 
     /// maybe_rotate_after_write triggers rotation when thresholds are exceeded.
@@ -2912,8 +2931,7 @@ mod tests {
 
         // Load cross-coordinator segments
         let labels = vec![(1, "Other Team".to_string())];
-        let cross_segments =
-            load_cross_coordinator_segments(&wg_dir, 0, &labels, &[]).unwrap();
+        let cross_segments = load_cross_coordinator_segments(&wg_dir, 0, &labels, &[]).unwrap();
         assert_eq!(cross_segments.len(), 1);
         assert!(cross_segments[0].label.contains("Other Team"));
 
@@ -2950,8 +2968,7 @@ mod tests {
 
         // Coordinator 0: lots of raw messages + a summary
         for i in 0..10 {
-            append_inbox_for(&wg_dir, 0, &format!("raw msg {}", i), &format!("req-{}", i))
-                .unwrap();
+            append_inbox_for(&wg_dir, 0, &format!("raw msg {}", i), &format!("req-{}", i)).unwrap();
         }
         force_rotate_for(&wg_dir, 0).unwrap();
 

@@ -1216,10 +1216,7 @@ mod tests {
         // models.default — provider embedded in model spec
         let models_default = config.models.default.as_ref().unwrap();
         assert_eq!(models_default.provider, None);
-        assert_eq!(
-            models_default.model,
-            Some("openrouter:sonnet".to_string())
-        );
+        assert_eq!(models_default.model, Some("openrouter:sonnet".to_string()));
 
         // Endpoint
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
@@ -1273,10 +1270,7 @@ mod tests {
         assert!(!reloaded.model_registry.is_empty());
         let models_default = reloaded.models.default.as_ref().unwrap();
         // Provider is now embedded in model spec, not separate field
-        assert_eq!(
-            models_default.model,
-            Some("openrouter:sonnet".to_string())
-        );
+        assert_eq!(models_default.model, Some("openrouter:sonnet".to_string()));
         assert_eq!(models_default.provider, None);
     }
 

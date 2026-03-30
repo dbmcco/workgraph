@@ -101,20 +101,29 @@ fn smoke_triage_basic_chain_recovery() {
     let (_tmp, wg_dir) = setup();
 
     // Build the chain: task-a → task-b → task-c
-    wg_ok(
-        &wg_dir,
-        &["add", "Task A", "--id", "task-a", "--immediate"],
-    );
+    wg_ok(&wg_dir, &["add", "Task A", "--id", "task-a", "--immediate"]);
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task B", "--id", "task-b", "--after", "task-a", "--immediate",
+            "add",
+            "Task B",
+            "--id",
+            "task-b",
+            "--after",
+            "task-a",
+            "--immediate",
         ],
     );
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task C", "--id", "task-c", "--after", "task-b", "--immediate",
+            "add",
+            "Task C",
+            "--id",
+            "task-c",
+            "--after",
+            "task-b",
+            "--immediate",
         ],
     );
 
@@ -236,14 +245,17 @@ fn smoke_triage_cascading_failure_loop_guard() {
     let (_tmp, wg_dir) = setup();
 
     // Build: task-a → task-b
-    wg_ok(
-        &wg_dir,
-        &["add", "Task A", "--id", "task-a", "--immediate"],
-    );
+    wg_ok(&wg_dir, &["add", "Task A", "--id", "task-a", "--immediate"]);
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task B", "--id", "task-b", "--after", "task-a", "--immediate",
+            "add",
+            "Task B",
+            "--id",
+            "task-b",
+            "--after",
+            "task-a",
+            "--immediate",
         ],
     );
 
@@ -278,7 +290,12 @@ fn smoke_triage_cascading_failure_loop_guard() {
     wg_ok(&wg_dir, &["claim", "fix-v1"]);
     wg_ok(
         &wg_dir,
-        &["fail", "fix-v1", "--reason", "memory limit config not found"],
+        &[
+            "fail",
+            "fix-v1",
+            "--reason",
+            "memory limit config not found",
+        ],
     );
 
     // task-a is still blocked by fix-v1 (which is Failed=terminal),
@@ -288,7 +305,12 @@ fn smoke_triage_cascading_failure_loop_guard() {
     wg_ok(&wg_dir, &["claim", "task-a"]);
     wg_ok(
         &wg_dir,
-        &["fail", "task-a", "--reason", "OOM persists after fix-v1 failed"],
+        &[
+            "fail",
+            "task-a",
+            "--reason",
+            "OOM persists after fix-v1 failed",
+        ],
     );
 
     // ── Round 2: task-b triages again ───────────────────────────────────
@@ -320,10 +342,7 @@ fn smoke_triage_cascading_failure_loop_guard() {
 
     // task-a runs again and fails
     wg_ok(&wg_dir, &["claim", "task-a"]);
-    wg_ok(
-        &wg_dir,
-        &["fail", "task-a", "--reason", "still OOM"],
-    );
+    wg_ok(&wg_dir, &["fail", "task-a", "--reason", "still OOM"]);
 
     // ── Round 3: task-b triages one more time ───────────────────────────
     wg_ok(&wg_dir, &["claim", "task-b"]);
@@ -413,14 +432,8 @@ fn smoke_triage_multiple_failed_deps() {
     // Build: task-x ──┐
     //                  ├──→ task-m
     // Build: task-y ──┘
-    wg_ok(
-        &wg_dir,
-        &["add", "Task X", "--id", "task-x", "--immediate"],
-    );
-    wg_ok(
-        &wg_dir,
-        &["add", "Task Y", "--id", "task-y", "--immediate"],
-    );
+    wg_ok(&wg_dir, &["add", "Task X", "--id", "task-x", "--immediate"]);
+    wg_ok(&wg_dir, &["add", "Task Y", "--id", "task-y", "--immediate"]);
     wg_ok(
         &wg_dir,
         &[
@@ -436,15 +449,9 @@ fn smoke_triage_multiple_failed_deps() {
 
     // Both deps fail
     wg_ok(&wg_dir, &["claim", "task-x"]);
-    wg_ok(
-        &wg_dir,
-        &["fail", "task-x", "--reason", "network timeout"],
-    );
+    wg_ok(&wg_dir, &["fail", "task-x", "--reason", "network timeout"]);
     wg_ok(&wg_dir, &["claim", "task-y"]);
-    wg_ok(
-        &wg_dir,
-        &["fail", "task-y", "--reason", "validation error"],
-    );
+    wg_ok(&wg_dir, &["fail", "task-y", "--reason", "validation error"]);
 
     // task-m should be ready (both deps are terminal)
     assert!(
@@ -556,14 +563,17 @@ fn smoke_triage_regression_new_failure() {
     let (_tmp, wg_dir) = setup();
 
     // Build: task-a → task-b
-    wg_ok(
-        &wg_dir,
-        &["add", "Task A", "--id", "task-a", "--immediate"],
-    );
+    wg_ok(&wg_dir, &["add", "Task A", "--id", "task-a", "--immediate"]);
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task B", "--id", "task-b", "--after", "task-a", "--immediate",
+            "add",
+            "Task B",
+            "--id",
+            "task-b",
+            "--after",
+            "task-a",
+            "--immediate",
         ],
     );
 

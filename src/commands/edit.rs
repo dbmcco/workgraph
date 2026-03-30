@@ -51,10 +51,7 @@ pub fn run(
     // Validate model uses provider:model format
     if let Some(m) = model {
         if let Err(e) = workgraph::config::parse_model_spec_strict(m) {
-            anyhow::bail!(
-                "Invalid --model format: {}",
-                e
-            );
+            anyhow::bail!("Invalid --model format: {}", e);
         }
     }
 

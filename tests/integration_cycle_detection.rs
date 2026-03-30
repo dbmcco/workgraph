@@ -607,8 +607,7 @@ fn test_dispatch_no_config_header_still_ready() {
         ready_ids
     );
     assert_eq!(
-        ready_ids[0],
-        analysis.cycles[0].header,
+        ready_ids[0], analysis.cycles[0].header,
         "The ready task should be the cycle header"
     );
 }
@@ -713,7 +712,8 @@ fn test_dispatch_reiteration_header_ready_after_reopen() {
         ready_ids
     );
     assert_eq!(
-        ready_ids[0], header.as_str(),
+        ready_ids[0],
+        header.as_str(),
         "The cycle header should be ready on re-iteration"
     );
 }
@@ -1000,7 +1000,10 @@ fn test_dispatch_self_loop_ready_on_all_iterations() {
     // Complete → at max_iterations, no re-open
     graph.get_task_mut("a").unwrap().status = Status::Done;
     let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
-    assert!(reactivated.is_empty(), "Should not re-activate at max_iterations");
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
+    );
 }
 
 // ===========================================================================
@@ -6001,13 +6004,28 @@ fn test_deadlock_breaker_e2e_two_task_cycle() {
     // Create A and B with mutual dependencies and cycle_config
     wg_ok(
         &wg_dir,
-        &["add", "Task A", "--id", "a", "--max-iterations", "3", "--immediate"],
+        &[
+            "add",
+            "Task A",
+            "--id",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
     );
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task B", "--id", "b", "--after", "a",
-            "--max-iterations", "3", "--immediate",
+            "add",
+            "Task B",
+            "--id",
+            "b",
+            "--after",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
         ],
     );
 
@@ -6061,20 +6079,42 @@ fn test_deadlock_breaker_e2e_three_task_cycle() {
 
     wg_ok(
         &wg_dir,
-        &["add", "Task A", "--id", "a", "--max-iterations", "3", "--immediate"],
-    );
-    wg_ok(
-        &wg_dir,
         &[
-            "add", "Task B", "--id", "b", "--after", "a",
-            "--max-iterations", "3", "--immediate",
+            "add",
+            "Task A",
+            "--id",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
         ],
     );
     wg_ok(
         &wg_dir,
         &[
-            "add", "Task C", "--id", "c", "--after", "b",
-            "--max-iterations", "3", "--immediate",
+            "add",
+            "Task B",
+            "--id",
+            "b",
+            "--after",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task C",
+            "--id",
+            "c",
+            "--after",
+            "b",
+            "--max-iterations",
+            "3",
+            "--immediate",
         ],
     );
 
@@ -6139,16 +6179,21 @@ fn test_archived_cycle_header_suppresses_reset() {
     );
 
     // Both tasks should remain Done
-    assert_eq!(graph.get_task("coordinator-0").unwrap().status, Status::Done);
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Done
+    );
     assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Done);
 
     // loop_iteration should NOT have been incremented
     assert_eq!(
-        graph.get_task("coordinator-0").unwrap().loop_iteration, 0,
+        graph.get_task("coordinator-0").unwrap().loop_iteration,
+        0,
         "Header loop_iteration should remain 0"
     );
     assert_eq!(
-        graph.get_task("archive-0").unwrap().loop_iteration, 0,
+        graph.get_task("archive-0").unwrap().loop_iteration,
+        0,
         "Archive task loop_iteration should remain 0"
     );
 }
@@ -6180,7 +6225,10 @@ fn test_archived_cycle_header_suppresses_evaluate_all() {
         "evaluate_all should not reactivate archived cycle, got: {:?}",
         reactivated
     );
-    assert_eq!(graph.get_task("coordinator-0").unwrap().status, Status::Done);
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Done
+    );
     assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Done);
 }
 
@@ -6211,6 +6259,9 @@ fn test_non_archived_cycle_still_resets_normally() {
         2,
         "Non-archived cycle should reactivate both members"
     );
-    assert_eq!(graph.get_task("coordinator-0").unwrap().status, Status::Open);
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Open
+    );
     assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Open);
 }

@@ -471,9 +471,7 @@ fn main() -> Result<()> {
             superseded_by,
         } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by),
         Commands::Retry { id } => commands::retry::run(&workgraph_dir, &id),
-        Commands::Requeue { id, reason } => {
-            commands::requeue::run(&workgraph_dir, &id, &reason)
-        }
+        Commands::Requeue { id, reason } => commands::requeue::run(&workgraph_dir, &id, &reason),
         Commands::Approve { id } => commands::approve::run(&workgraph_dir, &id),
         Commands::Reject { id, reason } => commands::reject::run(&workgraph_dir, &id, &reason),
         Commands::Claim { id, actor } => {
@@ -558,7 +556,16 @@ fn main() -> Result<()> {
                     max_columns: None, // TUI handles its own sizing
                 };
                 let mouse_override = if no_mouse { Some(false) } else { None };
-                tui::viz_viewer::run(workgraph_dir, options, mouse_override, false, None, false, None, false)
+                tui::viz_viewer::run(
+                    workgraph_dir,
+                    options,
+                    mouse_override,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                )
             } else {
                 let fmt = if dot {
                     commands::viz::OutputFormat::Dot

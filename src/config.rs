@@ -1210,7 +1210,8 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
     if spec.is_empty() {
         return Err(ModelSpecError {
             input: spec.to_string(),
-            message: "Model spec cannot be empty. Use provider:model format (e.g., 'claude:opus').".to_string(),
+            message: "Model spec cannot be empty. Use provider:model format (e.g., 'claude:opus')."
+                .to_string(),
         });
     }
 
@@ -1252,7 +1253,10 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
             "Invalid model format '{}'. Models must use provider:model format. \
              For example: 'claude:{}', 'openrouter:{}', 'openai:{}'. \
              Known providers: {}.",
-            spec, spec, spec, spec,
+            spec,
+            spec,
+            spec,
+            spec,
             KNOWN_PROVIDERS.join(", "),
         ),
     })
@@ -2978,8 +2982,7 @@ impl Config {
 
         // Rule 2: executor='claude' but provider is non-Anthropic — auto-routed to native
         // "claude" and "anthropic" are both considered Anthropic providers
-        let is_anthropic_provider =
-            |p: &str| -> bool { p == "anthropic" || p == "claude" };
+        let is_anthropic_provider = |p: &str| -> bool { p == "anthropic" || p == "claude" };
         if executor == "claude"
             && let Some(p) = provider
             && !is_anthropic_provider(p)

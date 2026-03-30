@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use workgraph::graph::{
-    Node, Status, WorkGraph, create_user_board_task, is_user_board,
-    resolve_user_board_alias,
+    Node, Status, WorkGraph, create_user_board_task, is_user_board, resolve_user_board_alias,
 };
 use workgraph::parser::{load_graph, modify_graph, save_graph};
 
@@ -161,7 +160,14 @@ fn test_user_board_msg_send_auto_creates() {
     // Send a message to a user board that doesn't exist yet
     let out = wg_cmd(
         dir,
-        &["msg", "send", ".user-testuser-0", "Hello from test", "--from", "test-agent"],
+        &[
+            "msg",
+            "send",
+            ".user-testuser-0",
+            "Hello from test",
+            "--from",
+            "test-agent",
+        ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -238,8 +244,14 @@ fn test_user_board_chained_archive_creates_sequence() {
     assert!(out.status.success());
 
     let graph = graph_at(dir);
-    assert_eq!(graph.get_task(".user-multi-0").unwrap().status, Status::Done);
-    assert_eq!(graph.get_task(".user-multi-1").unwrap().status, Status::Done);
+    assert_eq!(
+        graph.get_task(".user-multi-0").unwrap().status,
+        Status::Done
+    );
+    assert_eq!(
+        graph.get_task(".user-multi-1").unwrap().status,
+        Status::Done
+    );
     let board2 = graph.get_task(".user-multi-2").unwrap();
     assert_eq!(board2.status, Status::InProgress);
     assert!(board2.tags.contains(&"user-board".to_string()));

@@ -40,7 +40,14 @@ fn setup_workgraph(dir: &Path, tasks: Vec<Task>) -> std::path::PathBuf {
 
 fn wg_requeue(wg_dir: &Path, task_id: &str, reason: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_wg"))
-        .args(["--dir", wg_dir.to_str().unwrap(), "requeue", task_id, "--reason", reason])
+        .args([
+            "--dir",
+            wg_dir.to_str().unwrap(),
+            "requeue",
+            task_id,
+            "--reason",
+            reason,
+        ])
         .output()
         .expect("Failed to execute wg requeue")
 }
@@ -219,11 +226,20 @@ fn test_triage_end_to_end_flow() {
 
     // Fix task is ready
     let ready = ready_tasks(&graph);
-    assert!(ready.iter().any(|t| t.id == "fix-parser"), "Fix task should be ready");
+    assert!(
+        ready.iter().any(|t| t.id == "fix-parser"),
+        "Fix task should be ready"
+    );
     // task-a blocked by fix
-    assert!(!ready.iter().any(|t| t.id == "task-a"), "task-a should be blocked by fix task");
+    assert!(
+        !ready.iter().any(|t| t.id == "task-a"),
+        "task-a should be blocked by fix task"
+    );
     // task-b blocked by task-a (not terminal)
-    assert!(!ready.iter().any(|t| t.id == "task-b"), "task-b should be blocked by task-a");
+    assert!(
+        !ready.iter().any(|t| t.id == "task-b"),
+        "task-b should be blocked by task-a"
+    );
 
     // Step 6: Fix completes → task-a ready
     {
@@ -235,7 +251,10 @@ fn test_triage_end_to_end_flow() {
     }
     let graph = load_graph(&path).unwrap();
     let ready = ready_tasks(&graph);
-    assert!(ready.iter().any(|t| t.id == "task-a"), "task-a should be ready after fix completes");
+    assert!(
+        ready.iter().any(|t| t.id == "task-a"),
+        "task-a should be ready after fix completes"
+    );
 
     // Step 7: task-a succeeds → task-b ready
     {
@@ -247,7 +266,10 @@ fn test_triage_end_to_end_flow() {
     }
     let graph = load_graph(&path).unwrap();
     let ready = ready_tasks(&graph);
-    assert!(ready.iter().any(|t| t.id == "task-b"), "task-b should be ready now");
+    assert!(
+        ready.iter().any(|t| t.id == "task-b"),
+        "task-b should be ready now"
+    );
     assert_eq!(graph.get_task("task-b").unwrap().triage_count, 1);
 }
 

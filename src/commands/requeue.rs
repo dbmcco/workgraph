@@ -183,10 +183,7 @@ mod tests {
     fn test_requeue_failed_task_errors() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
-        setup_workgraph(
-            dir_path,
-            vec![make_task("t1", "Test task", Status::Failed)],
-        );
+        setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Failed)]);
 
         let result = run(dir_path, "t1", "reason");
         assert!(result.is_err());

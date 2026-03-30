@@ -56,10 +56,7 @@ pub fn run_init(dir: &Path, name: Option<&str>) -> Result<()> {
 pub fn run_list(dir: &Path, json: bool) -> Result<()> {
     let (graph, _path) = super::load_workgraph(dir)?;
 
-    let mut boards: Vec<_> = graph
-        .tasks()
-        .filter(|t| is_user_board(&t.id))
-        .collect();
+    let mut boards: Vec<_> = graph.tasks().filter(|t| is_user_board(&t.id)).collect();
 
     boards.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -248,10 +245,12 @@ mod tests {
 
         let result = run_archive(dir, Some("nobody"));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No active user board"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No active user board")
+        );
     }
 
     #[test]

@@ -260,8 +260,8 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     app.inspector_is_beside = false;
                     if app.right_panel_visible {
                         let panel_height =
-                            (main_area.height as u32 * app.right_panel_percent as u32 / 100)
-                                .max(5) as u16;
+                            (main_area.height as u32 * app.right_panel_percent as u32 / 100).max(5)
+                                as u16;
                         let top_height = main_area.height.saturating_sub(panel_height);
                         let split = Layout::default()
                             .direction(Direction::Vertical)
@@ -473,9 +473,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     }
                     // Strip content only drawn on hover; space always reserved.
                     let strip = app.last_minimized_strip_area;
-                    if strip.width > 0
-                        && (app.minimized_strip_hover || !app.any_motion_mouse)
-                    {
+                    if strip.width > 0 && (app.minimized_strip_hover || !app.any_motion_mouse) {
                         draw_minimized_strip(frame, strip, true);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
@@ -491,8 +489,8 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     // Narrow mode: inspector below (vertical split).
                     if app.right_panel_visible {
                         let panel_height =
-                            (main_area.height as u32 * app.right_panel_percent as u32 / 100)
-                                .max(5) as u16;
+                            (main_area.height as u32 * app.right_panel_percent as u32 / 100).max(5)
+                                as u16;
                         let top_height = main_area.height.saturating_sub(panel_height);
                         let split = Layout::default()
                             .direction(Direction::Vertical)
@@ -560,9 +558,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
                     }
                     // Strip content only drawn on hover; space always reserved.
                     let strip = app.last_minimized_strip_area;
-                    if strip.width > 0
-                        && (app.minimized_strip_hover || !app.any_motion_mouse)
-                    {
+                    if strip.width > 0 && (app.minimized_strip_hover || !app.any_motion_mouse) {
                         draw_minimized_strip(frame, strip, true);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
@@ -1208,7 +1204,8 @@ fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // When the Messages tab is active on a user board, those lines get a subtle yellow highlight.
     let messages_on_user_board = app.right_panel_visible
         && app.right_panel_tab == RightPanelTab::Messages
-        && app.selected_task_idx
+        && app
+            .selected_task_idx
             .and_then(|idx| app.task_order.get(idx))
             .is_some_and(|id| workgraph::graph::is_user_board(id));
     let user_board_lines: HashSet<usize> = if messages_on_user_board {
@@ -1791,7 +1788,10 @@ fn draw_history_browser(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let content_lines: Vec<&str> = content.lines().collect();
         let total = content_lines.len();
         let viewport_h = area.height.saturating_sub(2) as usize;
-        let scroll = app.history_browser.preview_scroll.min(total.saturating_sub(viewport_h));
+        let scroll = app
+            .history_browser
+            .preview_scroll
+            .min(total.saturating_sub(viewport_h));
         app.history_browser.preview_scroll = scroll;
 
         let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
@@ -1824,8 +1824,7 @@ fn draw_history_browser(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             lines.push(Line::from(""));
         }
 
-        let paragraph =
-            Paragraph::new(lines).style(Style::default().bg(Color::Rgb(20, 20, 30)));
+        let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Rgb(20, 20, 30)));
         frame.render_widget(paragraph, area);
 
         app.last_graph_area = area;
@@ -2092,7 +2091,11 @@ fn draw_fullscreen_borders(frame: &mut Frame, app: &super::state::VizApp) {
 
 /// Draw a single-column vertical border strip (for right edge).
 fn draw_fullscreen_border_col(frame: &mut Frame, area: Rect, ch: char, hover: bool) {
-    let fg = if hover { Color::Yellow } else { Color::DarkGray };
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     let lines: Vec<Line> = (0..area.height)
         .map(|_| Line::from(Span::styled(ch.to_string(), Style::default().fg(fg))))
         .collect();
@@ -2101,7 +2104,11 @@ fn draw_fullscreen_border_col(frame: &mut Frame, area: Rect, ch: char, hover: bo
 
 /// Draw a single-row horizontal border strip (for top/bottom edge).
 fn draw_fullscreen_border_row(frame: &mut Frame, area: Rect, ch: char, hover: bool) {
-    let fg = if hover { Color::Yellow } else { Color::DarkGray };
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     let text: String = (0..area.width).map(|_| ch).collect();
     let line = Line::from(Span::styled(text, Style::default().fg(fg)));
     frame.render_widget(Paragraph::new(vec![line]), area);
@@ -2177,7 +2184,8 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let is_focused = app.focused_panel == FocusedPanel::RightPanel;
         let is_chat_tab = app.right_panel_tab == RightPanelTab::Chat;
         let is_user_board_active = app.right_panel_tab == RightPanelTab::Messages
-            && app.selected_task_idx
+            && app
+                .selected_task_idx
                 .and_then(|idx| app.task_order.get(idx))
                 .is_some_and(|id| workgraph::graph::is_user_board(id));
         let border_color = if divider_active {
@@ -2606,10 +2614,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         1
     };
     // Reserve 1 line for the search bar when searching or showing results.
-    let chat_search_active = app.input_mode == InputMode::ChatSearch
-        || !app.chat.search.query.is_empty();
+    let chat_search_active =
+        app.input_mode == InputMode::ChatSearch || !app.chat.search.query.is_empty();
     let search_bar_height: u16 = if chat_search_active { 1 } else { 0 };
-    let msg_area_height = area.height.saturating_sub(input_height).saturating_sub(search_bar_height);
+    let msg_area_height = area
+        .height
+        .saturating_sub(input_height)
+        .saturating_sub(search_bar_height);
 
     // Coordinator + user board tab bar — always visible so the user can discover [+]
     let coordinator_entries = app.list_coordinator_ids_and_labels();
@@ -2644,7 +2655,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
 
         // Determine which user board is currently selected (if any).
-        let selected_user_board: Option<String> = app.selected_task_idx
+        let selected_user_board: Option<String> = app
+            .selected_task_idx
             .and_then(|idx| app.task_order.get(idx))
             .filter(|id| workgraph::graph::is_user_board(id))
             .cloned();
@@ -2780,7 +2792,9 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 if is_active {
                     spans.push(Span::styled(
                         " ◉",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 } else {
                     spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
@@ -2925,11 +2939,16 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     // Show "older messages" indicator when there's more history to load.
     if app.chat.has_more_history {
-        let remaining = app.chat.total_history_count.saturating_sub(app.chat.messages.len());
+        let remaining = app
+            .chat
+            .total_history_count
+            .saturating_sub(app.chat.messages.len());
         let label = format!("  --- {} older messages (scroll up to load) ---", remaining);
         rendered_lines.push(Line::from(Span::styled(
             label,
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
         line_to_message.push(None);
         rendered_lines.push(Line::from(""));
@@ -2975,12 +2994,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                             let dashes_total = content_width.saturating_sub(label.len() + 2);
                             let left = dashes_total / 2;
                             let right = dashes_total - left;
-                            let divider_text = format!(
-                                "{} {} {}",
-                                "─".repeat(left),
-                                label,
-                                "─".repeat(right),
-                            );
+                            let divider_text =
+                                format!("{} {} {}", "─".repeat(left), label, "─".repeat(right),);
                             rendered_lines.push(Line::from(""));
                             line_to_message.push(None);
                             rendered_lines.push(Line::from(Span::styled(
@@ -3166,8 +3181,14 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 // Delivery status for user messages.
                 if is_user {
                     // Check if a coordinator message follows (= delivered).
-                    let has_response = app.chat.messages.get(msg_idx + 1..)
-                        .map(|rest| rest.iter().any(|m| m.role == super::state::ChatRole::Coordinator))
+                    let has_response = app
+                        .chat
+                        .messages
+                        .get(msg_idx + 1..)
+                        .map(|rest| {
+                            rest.iter()
+                                .any(|m| m.role == super::state::ChatRole::Coordinator)
+                        })
                         .unwrap_or(false);
                     let status_span = if has_response {
                         Span::styled("  ✓✓", Style::default().fg(Color::DarkGray))
@@ -3377,7 +3398,10 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Apply search highlights to visible lines.
     if !app.chat.search.query.is_empty() && !app.chat.search.matches.is_empty() {
         let query_lower = app.chat.search.query.to_lowercase();
-        let current_msg_idx = app.chat.search.current_match
+        let current_msg_idx = app
+            .chat
+            .search
+            .current_match
             .and_then(|idx| app.chat.search.matches.get(idx))
             .map(|m| m.message_idx);
         let highlight_bg = Color::Rgb(80, 80, 0); // yellow-ish highlight for matches
@@ -3387,7 +3411,11 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             let global_line_idx = scroll_from_top + line_idx;
             if let Some(Some(_msg_idx)) = app.chat.line_to_message.get(global_line_idx) {
                 let is_current_msg = current_msg_idx == Some(*_msg_idx);
-                let bg = if is_current_msg { current_bg } else { highlight_bg };
+                let bg = if is_current_msg {
+                    current_bg
+                } else {
+                    highlight_bg
+                };
                 *line = highlight_query_in_line(line.clone(), &query_lower, bg);
             }
         }
@@ -3443,9 +3471,16 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 /// Draw the chat search bar showing the current query and match count.
 fn draw_chat_search_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     let is_active = app.input_mode == InputMode::ChatSearch;
-    let color = if is_active { Color::Cyan } else { Color::DarkGray };
+    let color = if is_active {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let mut spans = vec![
-        Span::styled("/ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "/ ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             app.chat.search.query.clone(),
             Style::default().fg(Color::White),
@@ -3458,7 +3493,10 @@ fn draw_chat_search_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
             let idx = app.chat.search.current_match.unwrap_or(0);
             format!(" [{}/{}]", idx + 1, app.chat.search.matches.len())
         };
-        spans.push(Span::styled(match_info, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            match_info,
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     if is_active && app.chat.search.query.is_empty() {
         spans.push(Span::styled(
@@ -5491,10 +5529,7 @@ fn highlight_query_in_line<'a>(line: Line<'a>, query_lower: &str, bg: Color) -> 
                 let abs_pos = start + pos;
                 // Text before the match.
                 if abs_pos > last {
-                    new_spans.push(Span::styled(
-                        text[last..abs_pos].to_string(),
-                        span.style,
-                    ));
+                    new_spans.push(Span::styled(text[last..abs_pos].to_string(), span.style));
                 }
                 // The match itself.
                 let match_end = abs_pos + query_lower.len();
@@ -12667,7 +12702,10 @@ mod tests {
         let backend = TestBackend::new(110, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.inspector_is_beside, "110 cols: should still be side-by-side");
+        assert!(
+            app.inspector_is_beside,
+            "110 cols: should still be side-by-side"
+        );
 
         // Zoom in to 95: below SIDE_MIN_WIDTH, moves to bottom.
         let backend = TestBackend::new(95, 40);
@@ -12679,25 +12717,37 @@ mod tests {
         let backend = TestBackend::new(70, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.inspector_is_beside, "70 cols: should stay bottom (no oscillation)");
+        assert!(
+            !app.inspector_is_beside,
+            "70 cols: should stay bottom (no oscillation)"
+        );
 
         // Zoom in to 45 (Compact): single panel mode.
         let backend = TestBackend::new(45, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.inspector_is_beside, "45 cols: compact mode, not beside");
+        assert!(
+            !app.inspector_is_beside,
+            "45 cols: compact mode, not beside"
+        );
 
         // Zoom back out to 105: still below SIDE_RESTORE_WIDTH (120), stays bottom (hysteresis).
         let backend = TestBackend::new(105, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.inspector_is_beside, "105 cols: hysteresis — stays bottom until 120");
+        assert!(
+            !app.inspector_is_beside,
+            "105 cols: hysteresis — stays bottom until 120"
+        );
 
         // Zoom out to 125: above SIDE_RESTORE_WIDTH, restores to side-by-side.
         let backend = TestBackend::new(125, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.inspector_is_beside, "125 cols: restores to side-by-side");
+        assert!(
+            app.inspector_is_beside,
+            "125 cols: restores to side-by-side"
+        );
     }
 
     #[test]

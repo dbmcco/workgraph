@@ -370,8 +370,12 @@ mod model_management_per_task_override {
 
         // Config: evaluator uses opus, default uses sonnet
         let mut config = Config::load(dir).unwrap();
-        config.models.set_model(DispatchRole::Default, "claude:sonnet");
-        config.models.set_model(DispatchRole::Evaluator, "claude:opus");
+        config
+            .models
+            .set_model(DispatchRole::Default, "claude:sonnet");
+        config
+            .models
+            .set_model(DispatchRole::Evaluator, "claude:opus");
         config.save(dir).unwrap();
 
         let loaded = Config::load(dir).unwrap();
@@ -1195,7 +1199,9 @@ mod model_management_config_persistence {
         // Set per-role model
         {
             let mut config = Config::load(dir).unwrap();
-            config.models.set_model(DispatchRole::Evaluator, "claude:opus");
+            config
+                .models
+                .set_model(DispatchRole::Evaluator, "claude:opus");
             config.save(dir).unwrap();
         }
 

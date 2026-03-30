@@ -437,11 +437,7 @@ pub fn next_user_board_seq(graph: &WorkGraph, handle: &str) -> u32 {
     graph
         .tasks()
         .filter(|t| t.id.starts_with(&prefix))
-        .filter_map(|t| {
-            t.id.rsplit('-')
-                .next()
-                .and_then(|n| n.parse::<u32>().ok())
-        })
+        .filter_map(|t| t.id.rsplit('-').next().and_then(|n| n.parse::<u32>().ok()))
         .max()
         .map(|n| n + 1)
         .unwrap_or(0)
@@ -2759,10 +2755,7 @@ mod tests {
     #[test]
     fn test_resolve_user_board_alias_non_user_board_passthrough() {
         let graph = WorkGraph::new();
-        assert_eq!(
-            resolve_user_board_alias(&graph, "my-task"),
-            "my-task"
-        );
+        assert_eq!(resolve_user_board_alias(&graph, "my-task"), "my-task");
     }
 
     #[test]

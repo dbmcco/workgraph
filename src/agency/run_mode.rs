@@ -75,8 +75,7 @@ fn scope_matches(primitive_scope: Option<&str>, required_scope: &str) -> bool {
     match primitive_scope {
         None | Some("") => true, // No scope = matches everything (backward compat)
         Some(scope) => {
-            scope == required_scope
-                || (scope == "meta" && required_scope.starts_with("meta:"))
+            scope == required_scope || (scope == "meta" && required_scope.starts_with("meta:"))
         }
     }
 }
@@ -747,18 +746,11 @@ mod tests {
             ("task-comp-1".to_string(), Some(0.8), 5_u32, 0.5_f64),
             ("task-comp-2".to_string(), Some(0.6), 3, 0.3),
         ];
-        let meta_candidates = vec![
-            ("meta-comp".to_string(), Some(0.9), 10, 0.5),
-        ];
+        let meta_candidates = vec![("meta-comp".to_string(), Some(0.9), 10, 0.5)];
 
         // For a regular task, only task candidates should be considered
-        let (selected, scores) = select_primitive_ucb1(
-            &task_candidates,
-            20,
-            std::f64::consts::SQRT_2,
-            1.5,
-        )
-        .unwrap();
+        let (selected, scores) =
+            select_primitive_ucb1(&task_candidates, 20, std::f64::consts::SQRT_2, 1.5).unwrap();
 
         // Selection should be from task candidates only
         assert!(
@@ -770,13 +762,8 @@ mod tests {
         assert!(!scores.contains_key("meta-comp"));
 
         // For meta tasks, only meta candidates should be considered
-        let (meta_selected, meta_scores) = select_primitive_ucb1(
-            &meta_candidates,
-            20,
-            std::f64::consts::SQRT_2,
-            1.5,
-        )
-        .unwrap();
+        let (meta_selected, meta_scores) =
+            select_primitive_ucb1(&meta_candidates, 20, std::f64::consts::SQRT_2, 1.5).unwrap();
         assert_eq!(meta_selected, "meta-comp");
         assert!(!meta_scores.contains_key("task-comp-1"));
     }
@@ -866,7 +853,10 @@ mod tests {
                 // Also acceptable if no candidate was found (e.g., all filtered out)
             }
             other => {
-                panic!("Expected RoleComponent or NovelComposition, got: {:?}", other);
+                panic!(
+                    "Expected RoleComponent or NovelComposition, got: {:?}",
+                    other
+                );
             }
         }
 
@@ -882,7 +872,10 @@ mod tests {
             }
             ExperimentDimension::NovelComposition => {}
             other => {
-                panic!("Expected RoleComponent or NovelComposition, got: {:?}", other);
+                panic!(
+                    "Expected RoleComponent or NovelComposition, got: {:?}",
+                    other
+                );
             }
         }
     }

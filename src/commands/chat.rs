@@ -242,12 +242,24 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>, coordinator_id: u3
 }
 
 /// Display chat history (interleaved inbox + outbox by timestamp).
-pub fn run_history(dir: &Path, json: bool, coordinator_id: u32, history_depth: Option<usize>) -> Result<()> {
+pub fn run_history(
+    dir: &Path,
+    json: bool,
+    coordinator_id: u32,
+    history_depth: Option<usize>,
+) -> Result<()> {
     let history = chat::read_history_for(dir, coordinator_id)?;
 
     if json {
         let to_serialize = match history_depth {
-            Some(n) => history.into_iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>(),
+            Some(n) => history
+                .into_iter()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
             None => history,
         };
         println!("{}", serde_json::to_string_pretty(&to_serialize)?);
@@ -307,11 +319,17 @@ pub fn run_rotate(dir: &Path, coordinator_id: u32) -> Result<()> {
     let rotated_tui = chat::force_rotate_tui_history_for(dir, coordinator_id)?;
 
     if rotated_ipc || rotated_tui {
-        println!("Chat files rotated to archive for coordinator {}.", coordinator_id);
+        println!(
+            "Chat files rotated to archive for coordinator {}.",
+            coordinator_id
+        );
         let archives = chat::list_archives_for(dir, coordinator_id)?;
         println!("{} archived file(s) total.", archives.len());
     } else {
-        println!("No chat files to rotate for coordinator {}.", coordinator_id);
+        println!(
+            "No chat files to rotate for coordinator {}.",
+            coordinator_id
+        );
     }
 
     // Also run retention cleanup
@@ -327,9 +345,15 @@ pub fn run_rotate(dir: &Path, coordinator_id: u32) -> Result<()> {
 pub fn run_cleanup(dir: &Path, coordinator_id: u32) -> Result<()> {
     let cleaned = chat::cleanup_archives_for(dir, coordinator_id)?;
     if cleaned > 0 {
-        println!("Cleaned up {} expired archive(s) for coordinator {}.", cleaned, coordinator_id);
+        println!(
+            "Cleaned up {} expired archive(s) for coordinator {}.",
+            cleaned, coordinator_id
+        );
     } else {
-        println!("No expired archives to clean up for coordinator {}.", coordinator_id);
+        println!(
+            "No expired archives to clean up for coordinator {}.",
+            coordinator_id
+        );
     }
     Ok(())
 }
@@ -341,7 +365,10 @@ pub fn run_cleanup(dir: &Path, coordinator_id: u32) -> Result<()> {
 /// as clearly-labeled imported context for the target coordinator.
 pub fn run_share(dir: &Path, from_id: u32, to_id: u32) -> Result<()> {
     if from_id == to_id {
-        anyhow::bail!("Source and target coordinator must be different (both are {})", from_id);
+        anyhow::bail!(
+            "Source and target coordinator must be different (both are {})",
+            from_id
+        );
     }
 
     // Look up coordinator label from graph
@@ -361,9 +388,7 @@ pub fn run_share(dir: &Path, from_id: u32, to_id: u32) -> Result<()> {
         from_id, label_str, to_id
     );
     eprintln!("({} bytes of imported context)", content.len());
-    eprintln!(
-        "The target coordinator will consume this on its next turn."
-    );
+    eprintln!("The target coordinator will consume this on its next turn.");
 
     Ok(())
 }

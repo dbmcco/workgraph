@@ -974,8 +974,14 @@ mod tests {
 
         // After reading: read_at should be set.
         let msgs = list_messages(&wg_dir, "task-1").unwrap();
-        assert!(msgs[0].read_at.is_some(), "read_at should be set after read_unread");
-        assert!(msgs[1].read_at.is_some(), "read_at should be set after read_unread");
+        assert!(
+            msgs[0].read_at.is_some(),
+            "read_at should be set after read_unread"
+        );
+        assert!(
+            msgs[1].read_at.is_some(),
+            "read_at should be set after read_unread"
+        );
 
         // The read_at should be a valid RFC 3339 timestamp.
         let read_at = msgs[0].read_at.as_ref().unwrap();

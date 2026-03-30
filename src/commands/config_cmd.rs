@@ -114,7 +114,8 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         }
         {
             // Display flip_verification_model in provider:model format
-            let resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
+            let resolved =
+                config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
             let display = if let Some(ref entry) = resolved.registry_entry {
                 let prefix = workgraph::config::native_provider_to_prefix(&entry.provider);
                 format!("{}:{}", prefix, entry.id)

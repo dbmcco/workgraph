@@ -2091,8 +2091,7 @@ args = ["--custom-flag"]
         let task = make_test_task("task-1", "Downstream task");
         let mut vars = TemplateVars::from_task(&task, Some("dep context"), None);
         vars.has_failed_deps = true;
-        vars.failed_deps_info =
-            "- dep-a: \"Build parser\" — Reason: cargo test failed".to_string();
+        vars.failed_deps_info = "- dep-a: \"Build parser\" — Reason: cargo test failed".to_string();
         let ctx = ScopeContext::default();
         let prompt = build_prompt(&vars, ContextScope::Task, &ctx);
 

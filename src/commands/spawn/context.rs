@@ -43,14 +43,8 @@ pub(crate) fn build_task_context(
 
             // Include context for Failed dependencies (triage support)
             if dep_task.status == Status::Failed {
-                let reason = dep_task
-                    .failure_reason
-                    .as_deref()
-                    .unwrap_or("unknown");
-                context_parts.push(format!(
-                    "From {} (FAILED): reason: {}",
-                    dep_id, reason
-                ));
+                let reason = dep_task.failure_reason.as_deref().unwrap_or("unknown");
+                context_parts.push(format!("From {} (FAILED): reason: {}", dep_id, reason));
                 if !dep_task.log.is_empty() {
                     let logs: Vec<&LogEntry> = dep_task.log.iter().rev().take(3).collect();
                     for entry in logs.iter().rev() {
@@ -1351,14 +1345,12 @@ mod tests {
         let mut dep_task = make_task("dep-a", "Build parser");
         dep_task.status = Status::Failed;
         dep_task.failure_reason = Some("cargo test test_parse_config failed".to_string());
-        dep_task.log = vec![
-            LogEntry {
-                timestamp: "2026-01-01T00:00:00Z".to_string(),
-                actor: Some("agent-1".to_string()),
-                user: None,
-                message: "Parser fails on nested keys".to_string(),
-            },
-        ];
+        dep_task.log = vec![LogEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            actor: Some("agent-1".to_string()),
+            user: None,
+            message: "Parser fails on nested keys".to_string(),
+        }];
         graph.add_node(Node::Task(dep_task));
 
         let mut task = make_task("task-b", "Use parser");

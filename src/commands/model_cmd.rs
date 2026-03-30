@@ -132,7 +132,7 @@ pub fn run_remove(dir: &Path, alias: &str, force: bool, global: bool, json: bool
 
 /// `wg model set-default <alias>` — set the default model for agent dispatch.
 pub fn run_set_default(dir: &Path, alias: &str, global: bool) -> Result<()> {
-    use workgraph::config::{parse_model_spec, Config, DispatchRole};
+    use workgraph::config::{Config, DispatchRole, parse_model_spec};
 
     let scope = if global {
         ConfigScope::Global

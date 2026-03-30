@@ -1639,9 +1639,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
 
         // Esc: clear chat search results first, then pop nav stack, otherwise go back to graph focus
         KeyCode::Esc => {
-            if !app.chat.search.query.is_empty()
-                && app.right_panel_tab == RightPanelTab::Chat
-            {
+            if !app.chat.search.query.is_empty() && app.right_panel_tab == RightPanelTab::Chat {
                 app.clear_chat_search();
             } else {
                 nav_stack_pop(app);
@@ -2001,8 +1999,9 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.chat.search.current_match = None;
             app.input_mode = InputMode::ChatSearch;
         }
-        KeyCode::Char('f') if modifiers.contains(KeyModifiers::CONTROL)
-            && app.right_panel_tab == RightPanelTab::Chat =>
+        KeyCode::Char('f')
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && app.right_panel_tab == RightPanelTab::Chat =>
         {
             app.chat.search.query.clear();
             app.chat.search.matches.clear();
@@ -2011,13 +2010,15 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         }
 
         // Chat tab: 'n' / 'N' navigate between search matches (after search accepted)
-        KeyCode::Char('n') if app.right_panel_tab == RightPanelTab::Chat
-            && !app.chat.search.matches.is_empty() =>
+        KeyCode::Char('n')
+            if app.right_panel_tab == RightPanelTab::Chat
+                && !app.chat.search.matches.is_empty() =>
         {
             app.chat_search_next();
         }
-        KeyCode::Char('N') if app.right_panel_tab == RightPanelTab::Chat
-            && !app.chat.search.matches.is_empty() =>
+        KeyCode::Char('N')
+            if app.right_panel_tab == RightPanelTab::Chat
+                && !app.chat.search.matches.is_empty() =>
         {
             app.chat_search_prev();
         }
@@ -2465,7 +2466,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                                 {
                                     let cid = *cid;
                                     let options = vec![
-                                        ('a', "Archive".into(), "Mark as done — work complete".into()),
+                                        (
+                                            'a',
+                                            "Archive".into(),
+                                            "Mark as done — work complete".into(),
+                                        ),
                                         (
                                             's',
                                             "Stop".into(),
@@ -2485,7 +2490,9 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                             TabBarEntryKind::UserBoard(task_id) => {
                                 // Select the user board task and switch to Messages tab.
                                 let task_id = task_id.clone();
-                                if let Some(idx) = app.task_order.iter().position(|id| *id == task_id) {
+                                if let Some(idx) =
+                                    app.task_order.iter().position(|id| *id == task_id)
+                                {
                                     app.selected_task_idx = Some(idx);
                                     app.recompute_trace();
                                     app.scroll_to_selected_task();
@@ -2520,11 +2527,10 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 let right_edge = left_x + total_width;
                 // Use the visual border position (not the click column) so the
                 // panel doesn't shrink on initial mousedown.
-                let border_col = app.last_fullscreen_restore_area.x
-                    + app.last_fullscreen_restore_area.width;
+                let border_col =
+                    app.last_fullscreen_restore_area.x + app.last_fullscreen_restore_area.width;
                 let panel_width = right_edge.saturating_sub(border_col);
-                let pct =
-                    ((panel_width as u32 * 100) / total_width as u32).clamp(1, 99) as u16;
+                let pct = ((panel_width as u32 * 100) / total_width as u32).clamp(1, 99) as u16;
                 app.right_panel_percent = pct;
                 app.layout_mode = super::state::VizApp::layout_mode_for_percent(pct);
                 if pct > 0 && pct < 100 {
@@ -2534,8 +2540,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 // Pre-update layout areas so the drag handler can compute
                 // consistent total_width before the next render frame
                 // (graph_area is still empty from FullInspector mode).
-                let right_width =
-                    (total_width as u32 * pct as u32 / 100) as u16;
+                let right_width = (total_width as u32 * pct as u32 / 100) as u16;
                 let left_width = total_width.saturating_sub(right_width);
                 app.last_graph_area.x = left_x;
                 app.last_graph_area.width = left_width;
@@ -2544,8 +2549,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.last_right_panel_area.width = right_width;
                 // Offset: click position relative to the new divider column,
                 // so subsequent drags track relative to the grab point.
-                app.divider_drag_offset =
-                    column as i16 - new_panel_x as i16;
+                app.divider_drag_offset = column as i16 - new_panel_x as i16;
                 app.divider_drag_start_pct = pct;
                 app.divider_drag_start_col = column;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
@@ -2771,8 +2775,9 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                                     .plain_lines
                                     .get(orig_line)
                                     .and_then(|line| {
-                                        let envelope_char_col =
-                                            line.char_indices().position(|(_, c)| is_message_indicator(c))?;
+                                        let envelope_char_col = line
+                                            .char_indices()
+                                            .position(|(_, c)| is_message_indicator(c))?;
                                         let after_envelope: String = line
                                             .chars()
                                             .skip(envelope_char_col + 1)
@@ -2852,8 +2857,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                     // when the divider drag started.
                     let delta = column as i32 - app.divider_drag_start_col as i32;
                     let delta_pct = delta * 100 / total_width as i32;
-                    let pct =
-                        (app.divider_drag_start_pct as i32 - delta_pct).clamp(0, 100) as u16;
+                    let pct = (app.divider_drag_start_pct as i32 - delta_pct).clamp(0, 100) as u16;
                     app.right_panel_percent = pct;
                     app.right_panel_visible = true;
                     // Preserve last non-extreme split state for restore.
@@ -5212,8 +5216,7 @@ mod scrollbar_tests {
 
             app.right_panel_percent = start_pct;
             app.right_panel_visible = true;
-            app.layout_mode =
-                super::super::state::VizApp::layout_mode_for_percent(start_pct);
+            app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
             app.last_graph_area = Rect {
                 x: 0,
                 y: 0,

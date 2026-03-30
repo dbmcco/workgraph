@@ -153,8 +153,7 @@ impl MdRenderer {
                 // Inside a list item, current_spans holds the marker (e.g. "1. ");
                 // flushing here would strand the marker on its own line, separated
                 // from the item text.
-                if !self.lines.is_empty() && !self.in_code_block && self.current_spans.is_empty()
-                {
+                if !self.lines.is_empty() && !self.in_code_block && self.current_spans.is_empty() {
                     self.blank_line();
                 }
             }
@@ -695,7 +694,9 @@ mod tests {
         let texts: Vec<String> = lines.iter().map(|l| line_text(l)).collect();
         // Outer items should have their markers with content.
         assert!(
-            texts.iter().any(|t| t.contains("1.") && t.contains("Outer")),
+            texts
+                .iter()
+                .any(|t| t.contains("1.") && t.contains("Outer")),
             "outer item 1 should be compact: {:?}",
             texts
         );

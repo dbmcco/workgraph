@@ -134,7 +134,12 @@ fn cleanup_and_count_alive(
 }
 
 /// Tags for daemon-managed loop tasks that should not be spawned as regular agents.
-const DAEMON_MANAGED_TAGS: &[&str] = &["compact-loop", "archive-loop", "coordinator-loop", "user-board"];
+const DAEMON_MANAGED_TAGS: &[&str] = &[
+    "compact-loop",
+    "archive-loop",
+    "coordinator-loop",
+    "user-board",
+];
 
 /// Check whether a task is managed by the daemon (not spawned as a regular agent).
 fn is_daemon_managed(task: &workgraph::graph::Task) -> bool {
@@ -965,7 +970,8 @@ fn build_auto_assign_tasks(
 
         // Design experiment for the assigner
         let learning_count = count_assignment_records(&agency_dir.join("assignments")) as u32;
-        let experiment = run_mode::design_experiment(&agency_dir, &config.agency, learning_count, &source_id);
+        let experiment =
+            run_mode::design_experiment(&agency_dir, &config.agency, learning_count, &source_id);
 
         let mode_context = render_assigner_mode_context(&AssignerModeContext {
             assignment_path,

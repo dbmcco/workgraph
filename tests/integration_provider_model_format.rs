@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use workgraph::config::{
-    parse_model_spec, parse_model_spec_strict, Config, RoleModelConfig, KNOWN_PROVIDERS,
+    Config, KNOWN_PROVIDERS, RoleModelConfig, parse_model_spec, parse_model_spec_strict,
 };
 use workgraph::graph::WorkGraph;
 use workgraph::models::{ModelEntry, ModelRegistry, ModelTier};
@@ -400,10 +400,7 @@ fn config_save_load_roundtrip_provider_model() {
 
     let loaded = Config::load(tmp.path()).unwrap();
     assert_eq!(loaded.agent.model, "openrouter:deepseek/deepseek-chat");
-    assert_eq!(
-        loaded.coordinator.model.as_deref(),
-        Some("claude:sonnet")
-    );
+    assert_eq!(loaded.coordinator.model.as_deref(), Some("claude:sonnet"));
 }
 
 #[test]

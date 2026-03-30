@@ -1555,9 +1555,7 @@ fn ensure_coordinator_task(dir: &Path) {
 /// The user board persists across coordinator restarts since it's a regular
 /// graph task stored in `graph.jsonl`.
 fn ensure_user_board(dir: &Path) {
-    use workgraph::graph::{
-        Node, create_user_board_task, is_user_board, next_user_board_seq,
-    };
+    use workgraph::graph::{Node, create_user_board_task, is_user_board, next_user_board_seq};
 
     let gp = graph_path(dir);
     let graph = match load_graph(&gp) {
@@ -1583,9 +1581,9 @@ fn ensure_user_board(dir: &Path) {
 
     if let Err(e) = workgraph::parser::modify_graph(&gp, |fresh| {
         // Double-check inside the lock that it doesn't already exist
-        let still_needs = !fresh.tasks().any(|t| {
-            is_user_board(&t.id) && t.id.starts_with(&prefix) && !t.status.is_terminal()
-        });
+        let still_needs = !fresh
+            .tasks()
+            .any(|t| is_user_board(&t.id) && t.id.starts_with(&prefix) && !t.status.is_terminal());
         if still_needs {
             fresh.add_node(Node::Task(task.clone()));
             true
@@ -1593,10 +1591,7 @@ fn ensure_user_board(dir: &Path) {
             false
         }
     }) {
-        eprintln!(
-            "[daemon] Failed to create user board '{}': {}",
-            task_id, e
-        );
+        eprintln!("[daemon] Failed to create user board '{}': {}", task_id, e);
     } else {
         eprintln!("[daemon] Auto-created user board '{}'", task_id);
     }

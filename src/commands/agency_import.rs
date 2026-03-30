@@ -271,9 +271,7 @@ pub fn run_from_bytes(
                             .collect();
                         (acc, unacc)
                     }
-                    CsvFormat::Agency => {
-                        (vec![], vec![])
-                    }
+                    CsvFormat::Agency => (vec![], vec![]),
                 };
                 let id = agency::content_hash_tradeoff(&acceptable, &unacceptable, &description);
 
@@ -341,7 +339,8 @@ pub fn run_from_bytes(
 /// Unified entry point for `wg agency import` supporting local file, URL, and upstream modes.
 pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCounts> {
     // Determine the CSV source
-    let source_count = opts.csv_path.is_some() as u8 + opts.url.is_some() as u8 + opts.upstream as u8;
+    let source_count =
+        opts.csv_path.is_some() as u8 + opts.url.is_some() as u8 + opts.upstream as u8;
     if source_count > 1 {
         anyhow::bail!("Specify only one of: CSV_PATH, --url, or --upstream");
     }
@@ -386,8 +385,11 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
                     println!("Up to date (hash: {}…)", &new_hash[..12]);
                     std::process::exit(1);
                 } else {
-                    println!("Upstream has changed (local: {}… remote: {}…)",
-                        &existing_manifest.content_hash[..12], &new_hash[..12]);
+                    println!(
+                        "Upstream has changed (local: {}… remote: {}…)",
+                        &existing_manifest.content_hash[..12],
+                        &new_hash[..12]
+                    );
                     std::process::exit(0);
                 }
             }
@@ -398,7 +400,13 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
             }
 
             // Hash differs — import
-            return run_from_bytes(workgraph_dir, &url, &csv_bytes, opts.dry_run, opts.tag.as_deref());
+            return run_from_bytes(
+                workgraph_dir,
+                &url,
+                &csv_bytes,
+                opts.dry_run,
+                opts.tag.as_deref(),
+            );
         }
     }
 
@@ -420,7 +428,13 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
         std::process::exit(0);
     }
 
-    run_from_bytes(workgraph_dir, &url, &csv_bytes, opts.dry_run, opts.tag.as_deref())
+    run_from_bytes(
+        workgraph_dir,
+        &url,
+        &csv_bytes,
+        opts.dry_run,
+        opts.tag.as_deref(),
+    )
 }
 
 /// Detected CSV format based on header or column count.
@@ -460,9 +474,14 @@ fn detect_format(headers: &csv::StringRecord) -> CsvFormat {
 ///
 /// Both formats are auto-detected. Legacy type names (skill/outcome/tradeoff) are also
 /// accepted in the 9-column format and vice versa.
-pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str>) -> Result<ImportCounts> {
-    let csv_bytes = std::fs::read(csv_path)
-        .with_context(|| format!("Failed to read '{}'", csv_path))?;
+pub fn run(
+    workgraph_dir: &Path,
+    csv_path: &str,
+    dry_run: bool,
+    tag: Option<&str>,
+) -> Result<ImportCounts> {
+    let csv_bytes =
+        std::fs::read(csv_path).with_context(|| format!("Failed to read '{}'", csv_path))?;
     run_from_bytes(workgraph_dir, csv_path, &csv_bytes, dry_run, tag)
 }
 
@@ -472,7 +491,12 @@ pub fn run(workgraph_dir: &Path, csv_path: &str, dry_run: bool, tag: Option<&str
 ///          domain(5), origin_instance_id(6), parent_content_hash(7), scope(8)
 fn parse_agency_columns(
     record: &csv::StringRecord,
-) -> (Option<f64>, Vec<String>, HashMap<String, String>, Option<String>) {
+) -> (
+    Option<f64>,
+    Vec<String>,
+    HashMap<String, String>,
+    Option<String>,
+) {
     // quality (col3): integer 0-100, map to avg_score as 0.0-1.0
     let quality_score: Option<f64> = record.get(3).and_then(|s| {
         let s = s.trim();
@@ -535,7 +559,12 @@ fn parse_agency_columns(
 /// Columns: type(0), name(1), description(2), col4(3), col5(4), domain_tags(5), quality_score(6)
 fn parse_legacy_columns(
     record: &csv::StringRecord,
-) -> (Option<f64>, Vec<String>, HashMap<String, String>, Option<String>) {
+) -> (
+    Option<f64>,
+    Vec<String>,
+    HashMap<String, String>,
+    Option<String>,
+) {
     let quality_score: Option<f64> = record.get(6).and_then(|s| s.trim().parse().ok());
 
     let domain_tags: Vec<String> = record
@@ -726,7 +755,10 @@ mod tests {
         let out_count = std::fs::read_dir(&outcomes_dir).unwrap().count();
         let trade_count = std::fs::read_dir(&tradeoffs_dir).unwrap().count();
 
-        assert_eq!(comp_count, 2, "Expected 2 components (task + meta:assigner)");
+        assert_eq!(
+            comp_count, 2,
+            "Expected 2 components (task + meta:assigner)"
+        );
         assert_eq!(out_count, 1, "Expected 1 outcome");
         assert_eq!(trade_count, 1, "Expected 1 tradeoff");
     }
@@ -747,18 +779,23 @@ mod tests {
 
         for entry in std::fs::read_dir(&components_dir).unwrap() {
             let entry = entry.unwrap();
-            let component: RoleComponent =
-                agency::load_component(&entry.path()).unwrap();
+            let component: RoleComponent = agency::load_component(&entry.path()).unwrap();
 
             // Check that domain_tags are populated
-            assert!(!component.domain_tags.is_empty(), "domain_tags should be populated");
+            assert!(
+                !component.domain_tags.is_empty(),
+                "domain_tags should be populated"
+            );
 
             // Check scope metadata
             if let Some(scope) = component.metadata.get("scope") {
                 if scope == "task" {
                     found_task_scope = true;
                     assert_eq!(
-                        component.metadata.get("domain_specificity").map(|s| s.as_str()),
+                        component
+                            .metadata
+                            .get("domain_specificity")
+                            .map(|s| s.as_str()),
                         Some("high")
                     );
                     assert!(component.metadata.contains_key("origin_instance_id"));
@@ -770,7 +807,10 @@ mod tests {
         }
 
         assert!(found_task_scope, "Should have a task-scope component");
-        assert!(found_meta_scope, "Should have a meta:assigner-scope component");
+        assert!(
+            found_meta_scope,
+            "Should have a meta:assigner-scope component"
+        );
     }
 
     #[test]
@@ -786,8 +826,7 @@ mod tests {
         let outcomes_dir = wg_dir.join("agency/primitives/outcomes");
         for entry in std::fs::read_dir(&outcomes_dir).unwrap() {
             let entry = entry.unwrap();
-            let outcome: DesiredOutcome =
-                agency::load_outcome(&entry.path()).unwrap();
+            let outcome: DesiredOutcome = agency::load_outcome(&entry.path()).unwrap();
             assert_eq!(outcome.performance.avg_score, Some(0.90));
         }
     }
@@ -805,8 +844,7 @@ mod tests {
         let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
         for entry in std::fs::read_dir(&tradeoffs_dir).unwrap() {
             let entry = entry.unwrap();
-            let tradeoff: TradeoffConfig =
-                agency::load_tradeoff(&entry.path()).unwrap();
+            let tradeoff: TradeoffConfig = agency::load_tradeoff(&entry.path()).unwrap();
             assert!(
                 tradeoff.domain_tags.contains(&"analysis".to_string()),
                 "Expected 'analysis' in domain_tags, got: {:?}",
@@ -833,8 +871,7 @@ mod tests {
         let tradeoffs_dir = wg_dir.join("agency/primitives/tradeoffs");
         for entry in std::fs::read_dir(&tradeoffs_dir).unwrap() {
             let entry = entry.unwrap();
-            let tradeoff: TradeoffConfig =
-                agency::load_tradeoff(&entry.path()).unwrap();
+            let tradeoff: TradeoffConfig = agency::load_tradeoff(&entry.path()).unwrap();
             assert!(
                 tradeoff.acceptable_tradeoffs.is_empty(),
                 "Agency format should not split description into acceptable list"
@@ -864,8 +901,7 @@ mod tests {
         let mut found_with_parent = false;
         for entry in std::fs::read_dir(&components_dir).unwrap() {
             let entry = entry.unwrap();
-            let component: RoleComponent =
-                agency::load_component(&entry.path()).unwrap();
+            let component: RoleComponent = agency::load_component(&entry.path()).unwrap();
             if component.name == "Identify Gaps" {
                 assert!(
                     component.lineage.parent_ids.contains(&"abc123".to_string()),
@@ -942,10 +978,7 @@ mod tests {
         run(&wg_dir, csv_path.to_str().unwrap(), true, None).unwrap();
 
         let mp = manifest_path(&wg_dir);
-        assert!(
-            !mp.exists(),
-            "Manifest should NOT be written on dry run"
-        );
+        assert!(!mp.exists(), "Manifest should NOT be written on dry run");
     }
 
     #[test]
@@ -968,7 +1001,10 @@ mod tests {
             serde_yaml::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
 
         assert_eq!(manifest1.content_hash, manifest2.content_hash);
-        assert_eq!(manifest1.counts.role_components, manifest2.counts.role_components);
+        assert_eq!(
+            manifest1.counts.role_components,
+            manifest2.counts.role_components
+        );
     }
 
     // --- Tests for the new URL/upstream import functionality ---
@@ -1137,7 +1173,12 @@ mod tests {
         };
         let result = run_import(&wg_dir, opts);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No upstream URL configured"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No upstream URL configured")
+        );
     }
 
     #[test]

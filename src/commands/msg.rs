@@ -36,9 +36,7 @@ pub fn run_send(
     // Lazy init: if targeting a user board that doesn't exist, auto-create it
     let effective_id = if graph.get_task(&resolved_id).is_none() && is_user_board(&resolved_id) {
         // Extract handle from the alias (e.g., ".user-erik" → "erik")
-        let handle = resolved_id
-            .strip_prefix(".user-")
-            .unwrap_or(&resolved_id);
+        let handle = resolved_id.strip_prefix(".user-").unwrap_or(&resolved_id);
         // Strip trailing -N if it's there
         let handle = if let Some(pos) = handle.rfind('-') {
             let suffix = &handle[pos + 1..];

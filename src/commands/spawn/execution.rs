@@ -135,10 +135,7 @@ pub(crate) fn spawn_agent_inner(
     for dep_id in &task.after {
         if let Some(dep_task) = graph.get_task(dep_id) {
             if dep_task.status == Status::Failed {
-                let reason = dep_task
-                    .failure_reason
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let reason = dep_task.failure_reason.as_deref().unwrap_or("unknown");
                 failed_deps_lines.push(format!(
                     "- {}: \"{}\" — Reason: {}",
                     dep_id, dep_task.title, reason
@@ -1171,9 +1168,8 @@ fn resolve_model_via_registry(
     // the model ID for registry lookup.
     let spec = workgraph::config::parse_model_spec(&model_str);
     if let Some(ref provider_prefix) = spec.provider {
-        let native_provider = Some(
-            workgraph::config::provider_to_native_provider(provider_prefix).to_string(),
-        );
+        let native_provider =
+            Some(workgraph::config::provider_to_native_provider(provider_prefix).to_string());
         // Try registry lookup on the bare model part for endpoint resolution
         let merged = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
         let endpoint = merged
