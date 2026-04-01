@@ -463,12 +463,10 @@ api_key = "test-oai-key"
 is_default = true
 
 [models.evaluator]
-model = "claude-sonnet-4-6"
-provider = "anthropic"
+model = "native:claude-sonnet-4-6"
 
 [models.triage]
-model = "gpt-4o-mini"
-provider = "openai"
+model = "openai:gpt-4o-mini"
 "#,
     );
     std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();

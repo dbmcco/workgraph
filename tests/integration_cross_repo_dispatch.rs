@@ -514,7 +514,7 @@ fn cli_add_with_repo_and_task_options() {
             "--deliverable",
             "output.rs",
             "--model",
-            "opus",
+            "claude:opus",
             "--verify",
             "cargo test",
         ])
@@ -539,7 +539,7 @@ fn cli_add_with_repo_and_task_options() {
     assert!(task.tags.contains(&"urgent".to_string()));
     assert!(task.skills.contains(&"rust".to_string()));
     assert!(task.deliverables.contains(&"output.rs".to_string()));
-    assert_eq!(task.model.as_deref(), Some("opus"));
+    assert_eq!(task.model.as_deref(), Some("claude:opus"));
     assert_eq!(task.verify.as_deref(), Some("cargo test"));
 }
 

@@ -105,14 +105,17 @@ fn make_task(id: &str, title: &str) -> Task {
 // ===========================================================================
 
 #[test]
-fn registry_no_config_returns_3_builtins() {
+fn registry_no_config_returns_6_builtins() {
     let config = Config::default();
     let registry = config.effective_registry();
-    assert_eq!(registry.len(), 3, "Expected 3 built-in entries");
+    assert_eq!(registry.len(), 6, "Expected 6 built-in entries (3 legacy + 3 claude:* format)");
     let ids: Vec<&str> = registry.iter().map(|e| e.id.as_str()).collect();
     assert!(ids.contains(&"haiku"));
     assert!(ids.contains(&"sonnet"));
     assert!(ids.contains(&"opus"));
+    assert!(ids.contains(&"claude:haiku"));
+    assert!(ids.contains(&"claude:sonnet"));
+    assert!(ids.contains(&"claude:opus"));
 }
 
 #[test]
@@ -126,14 +129,17 @@ fn registry_user_entries_override_builtins() {
         ..Default::default()
     }];
     let registry = config.effective_registry();
-    // 2 remaining built-ins + 1 override = 3
-    assert_eq!(registry.len(), 3);
+    // 5 remaining built-ins + 1 override = 6
+    assert_eq!(registry.len(), 6);
     let haiku = registry.iter().find(|e| e.id == "haiku").unwrap();
     assert_eq!(haiku.model, "my-custom-haiku");
     assert_eq!(haiku.provider, "local");
-    // Built-in sonnet and opus should still be present
+    // Built-in sonnet, opus, and claude:* entries should still be present
     assert!(registry.iter().any(|e| e.id == "sonnet"));
     assert!(registry.iter().any(|e| e.id == "opus"));
+    assert!(registry.iter().any(|e| e.id == "claude:haiku"));
+    assert!(registry.iter().any(|e| e.id == "claude:sonnet"));
+    assert!(registry.iter().any(|e| e.id == "claude:opus"));
 }
 
 #[test]
