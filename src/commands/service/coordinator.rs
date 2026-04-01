@@ -1747,40 +1747,6 @@ fn build_flip_verification_tasks(
 
         graph.add_node(Node::Task(verify_task));
 
-        // Create .assign-verify-* task so the verify task goes through agency pipeline
-        let assign_verify_id = format!(".assign-{}", verify_task_id);
-        if graph.get_task(&assign_verify_id).is_none() {
-            let assign_task = Task {
-                id: assign_verify_id.clone(),
-                title: format!(
-                    "Assign agent for: Verify (FLIP {:.2}): {}",
-                    eval.score, source_title
-                ),
-                status: Status::Open,
-                after: vec![],
-                before: vec![verify_task_id.clone()],
-                tags: vec!["assignment".to_string(), "agency".to_string()],
-                exec: Some(format!("wg assign {} --auto", verify_task_id)),
-                exec_mode: Some("bare".to_string()),
-                visibility: "internal".to_string(),
-                created_at: Some(Utc::now().to_rfc3339()),
-                ..Task::default()
-            };
-            graph.add_node(Node::Task(assign_task));
-
-            // Add blocking edge: verify task depends on its assignment
-            if let Some(vt) = graph.get_task_mut(&verify_task_id)
-                && !vt.after.iter().any(|a| a == &assign_verify_id)
-            {
-                vt.after.push(assign_verify_id.clone());
-            }
-
-            eprintln!(
-                "[coordinator] Created assignment task '{}' blocking '{}'",
-                assign_verify_id, verify_task_id,
-            );
-        }
-
         // Log the trigger on the source task
         if let Some(source) = graph.get_task_mut(source_task_id) {
             source.log.push(LogEntry {
@@ -1799,23 +1765,26 @@ fn build_flip_verification_tasks(
             verify_task_id, eval.score, threshold,
         );
 
-        // Add verify as additional dep on .evaluate-<task>
-        let eval_task_id = format!(".evaluate-{}", source_task_id);
-        if let Some(eval_task) = graph.get_task_mut(&eval_task_id)
-            && !eval_task.after.contains(&verify_task_id)
-        {
-            eval_task.after.push(verify_task_id.clone());
-        }
-
-        // Eagerly scaffold the eval task for the verification task
+        // Scaffold the full agency pipeline (.assign-*, .flip-*, .evaluate-*) for
+        // the verify task — it's a pipeline-eligible system task, so
+        // scaffold_full_pipeline handles it just like a regular task.
         let verify_title = format!("Verify (FLIP {:.2}): {}", eval.score, source_title);
-        crate::commands::eval_scaffold::scaffold_eval_task(
+        crate::commands::eval_scaffold::scaffold_full_pipeline(
             dir,
             graph,
             &verify_task_id,
             &verify_title,
             config,
         );
+
+        // Add verify as additional dep on .evaluate-<source> so the source's
+        // evaluation waits for verification to complete.
+        let eval_task_id = format!(".evaluate-{}", source_task_id);
+        if let Some(eval_task) = graph.get_task_mut(&eval_task_id)
+            && !eval_task.after.contains(&verify_task_id)
+        {
+            eval_task.after.push(verify_task_id.clone());
+        }
 
         modified = true;
     }
@@ -4971,16 +4940,23 @@ mod tests {
         let json = serde_json::to_string_pretty(&eval).unwrap();
         std::fs::write(&eval_path, json).unwrap();
 
-        // Config with FLIP verification threshold
+        // Config with FLIP verification threshold + agency pipeline enabled
         let mut config = Config::default();
         config.agency.flip_verification_threshold = Some(0.6);
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
 
         let modified = build_flip_verification_tasks(dir.path(), &mut graph, &config);
         assert!(modified, "should create verify task");
 
         // Check verify task exists and has FLIP context in description
-        let verify = graph.get_task(".verify-my-task").unwrap();
-        let desc = verify.description.as_deref().unwrap();
+        let desc = graph
+            .get_task(".verify-my-task")
+            .unwrap()
+            .description
+            .clone()
+            .unwrap();
 
         assert!(
             desc.contains("FLIP Evaluation Results"),
@@ -4999,7 +4975,7 @@ mod tests {
             "should include evaluator reasoning (notes)"
         );
 
-        // Check .assign-verify-* task was created
+        // Check .assign-verify-* task was created via scaffold_full_pipeline
         let assign = graph.get_task(".assign-.verify-my-task").unwrap();
         assert_eq!(assign.status, Status::Open);
         assert!(
@@ -5016,11 +4992,31 @@ mod tests {
         );
 
         // Check that .verify-my-task depends on .assign-verify-my-task
+        let verify = graph.get_task(".verify-my-task").unwrap();
         assert!(
             verify
                 .after
                 .contains(&".assign-.verify-my-task".to_string()),
             "verify task should be blocked by its assignment task"
+        );
+
+        // Check that .flip-.verify-my-task was created (full pipeline)
+        let flip = graph.get_task(".flip-.verify-my-task").unwrap();
+        assert!(
+            flip.after
+                .contains(&".verify-my-task".to_string()),
+            "flip task should depend on verify task"
+        );
+        assert!(
+            flip.tags.contains(&"flip".to_string()),
+            "should be tagged as flip"
+        );
+
+        // Check that .evaluate-.verify-my-task was created (full pipeline)
+        let eval = graph.get_task(".evaluate-.verify-my-task").unwrap();
+        assert!(
+            eval.tags.contains(&"evaluation".to_string()),
+            "should be tagged as evaluation"
         );
     }
 
@@ -5039,6 +5035,7 @@ mod tests {
         existing_assign.id = ".assign-.verify-t1".to_string();
         existing_assign.title = "Existing assign".to_string();
         existing_assign.status = Status::Open;
+        existing_assign.tags = vec!["assignment".to_string(), "agency".to_string()];
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(source));
@@ -5070,12 +5067,13 @@ mod tests {
 
         let mut config = Config::default();
         config.agency.flip_verification_threshold = Some(0.5);
+        config.agency.auto_assign = true;
 
         let modified = build_flip_verification_tasks(dir.path(), &mut graph, &config);
         assert!(modified, "should create verify task");
 
         // The .assign-verify task should not be duplicated — the existing one stays
-        // (idempotency check inside the function)
+        // (idempotency check inside scaffold_full_pipeline)
         let assign = graph.get_task(".assign-.verify-t1").unwrap();
         assert_eq!(
             assign.title, "Existing assign",

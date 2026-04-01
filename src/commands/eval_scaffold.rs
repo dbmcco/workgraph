@@ -21,6 +21,22 @@ use workgraph::graph::{Node, Status, Task, WorkGraph};
 /// Tasks with these tags do not get their own eval tasks (no meta-evaluation).
 const DOMINATED_TAGS: &[&str] = &["evaluation", "assignment", "flip", "placement"];
 
+/// System task prefixes that are eligible for the full agency pipeline.
+/// These tasks go through placement, assignment, FLIP, and evaluation like
+/// regular tasks — unlike other system tasks (`.evaluate-*`, `.assign-*`,
+/// `.flip-*`) which are infrastructure and skip the pipeline.
+const PIPELINE_ELIGIBLE_PREFIXES: &[&str] = &[".verify-"];
+
+/// Returns true if a system task (dot-prefixed) should still go through the
+/// agency pipeline. `.verify-*` tasks are the primary example: they need
+/// intelligent agent matching via the same placement/assignment/evaluation
+/// chain as regular tasks.
+pub fn is_pipeline_eligible_system_task(task_id: &str) -> bool {
+    PIPELINE_ELIGIBLE_PREFIXES
+        .iter()
+        .any(|prefix| task_id.starts_with(prefix))
+}
+
 /// Returns true if FLIP should run for a given task, based on global config
 /// and the task's `flip-eval` tag.
 fn should_run_flip(graph: &WorkGraph, task_id: &str, config: &Config) -> bool {
@@ -98,8 +114,8 @@ pub fn scaffold_full_pipeline(
     task_title: &str,
     config: &Config,
 ) -> bool {
-    // Skip system tasks and dominated-tag tasks
-    if workgraph::graph::is_system_task(task_id) {
+    // Skip system tasks (unless pipeline-eligible like .verify-*) and dominated-tag tasks
+    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
     if let Some(task) = graph.get_task(task_id)
@@ -276,8 +292,8 @@ pub fn scaffold_assign_task(graph: &mut WorkGraph, task_id: &str, task_title: &s
         return false;
     }
 
-    // Skip system tasks (no assign for .evaluate, .flip, etc.)
-    if workgraph::graph::is_system_task(task_id) {
+    // Skip system tasks (unless pipeline-eligible like .verify-*) — no assign for .evaluate, .flip, etc.
+    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
 
@@ -1059,5 +1075,125 @@ mod tests {
             graph.get_task(".assign-foo").is_some(),
             ".assign-foo must exist even when eval-scheduled tag is set"
         );
+    }
+
+    #[test]
+    fn test_verify_task_gets_full_agency_pipeline() {
+        // .verify-* tasks are pipeline-eligible system tasks — they should get
+        // .assign-*, .flip-*, and .evaluate-* scaffolded just like regular tasks.
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+
+        let mut graph = WorkGraph::new();
+        let mut verify_task = make_task(".verify-my-task", "Verify: my-task");
+        verify_task.tags = vec!["verification".to_string(), "agency".to_string()];
+        graph.add_node(Node::Task(verify_task));
+
+        let modified = scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            ".verify-my-task",
+            "Verify: my-task",
+            &config,
+        );
+        assert!(modified, "should scaffold pipeline for .verify-* task");
+
+        // .assign-.verify-my-task should exist and block .verify-my-task
+        let assign = graph.get_task(".assign-.verify-my-task").unwrap();
+        assert!(assign.tags.contains(&"assignment".to_string()));
+        assert_eq!(
+            assign.exec,
+            Some("wg assign .verify-my-task --auto".to_string())
+        );
+        let verify = graph.get_task(".verify-my-task").unwrap();
+        assert!(
+            verify
+                .after
+                .contains(&".assign-.verify-my-task".to_string()),
+            ".verify-* should depend on its .assign-* task"
+        );
+
+        // .flip-.verify-my-task should exist
+        let flip = graph.get_task(".flip-.verify-my-task").unwrap();
+        assert!(flip.after.contains(&".verify-my-task".to_string()));
+        assert!(flip.tags.contains(&"flip".to_string()));
+
+        // .evaluate-.verify-my-task should exist
+        let eval = graph.get_task(".evaluate-.verify-my-task").unwrap();
+        assert!(eval.tags.contains(&"evaluation".to_string()));
+    }
+
+    #[test]
+    fn test_non_verify_system_tasks_still_skip_pipeline() {
+        // System tasks like .evaluate-*, .flip-*, .assign-* should NOT get the pipeline.
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+
+        let mut graph = WorkGraph::new();
+        let mut eval_task = make_task(".evaluate-my-task", "Evaluate: my-task");
+        eval_task.tags = vec!["evaluation".to_string(), "agency".to_string()];
+        graph.add_node(Node::Task(eval_task));
+
+        let modified = scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            ".evaluate-my-task",
+            "Evaluate: my-task",
+            &config,
+        );
+        assert!(
+            !modified,
+            "should NOT scaffold pipeline for .evaluate-* task"
+        );
+        assert!(graph.get_task(".assign-.evaluate-my-task").is_none());
+    }
+
+    #[test]
+    fn test_verify_assign_task_idempotent() {
+        // If .assign-.verify-* already exists, scaffold_full_pipeline should not duplicate it.
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+
+        let mut graph = WorkGraph::new();
+        let mut verify_task = make_task(".verify-t1", "Verify: t1");
+        verify_task.tags = vec!["verification".to_string(), "agency".to_string()];
+        graph.add_node(Node::Task(verify_task));
+
+        // Pre-create the assign task
+        let mut existing_assign = make_task(".assign-.verify-t1", "Pre-existing assign");
+        existing_assign.tags = vec!["assignment".to_string(), "agency".to_string()];
+        graph.add_node(Node::Task(existing_assign));
+
+        let modified = scaffold_full_pipeline(
+            dir.path(),
+            &mut graph,
+            ".verify-t1",
+            "Verify: t1",
+            &config,
+        );
+        // Should still create .evaluate-* even if .assign-* exists
+        assert!(modified);
+
+        // Existing assign should be preserved
+        let assign = graph.get_task(".assign-.verify-t1").unwrap();
+        assert_eq!(assign.title, "Pre-existing assign");
+    }
+
+    #[test]
+    fn test_is_pipeline_eligible_system_task() {
+        assert!(is_pipeline_eligible_system_task(".verify-my-task"));
+        assert!(is_pipeline_eligible_system_task(".verify-feature-x"));
+        assert!(!is_pipeline_eligible_system_task(".evaluate-my-task"));
+        assert!(!is_pipeline_eligible_system_task(".assign-my-task"));
+        assert!(!is_pipeline_eligible_system_task(".flip-my-task"));
+        assert!(!is_pipeline_eligible_system_task("regular-task"));
     }
 }
