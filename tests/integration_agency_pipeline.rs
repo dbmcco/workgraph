@@ -860,11 +860,16 @@ fn resolve_model_source_reports_explicit_for_models_override() {
 }
 
 #[test]
-fn resolve_model_source_reports_legacy_for_agency_model() {
+fn resolve_model_source_reports_explicit_for_models_section() {
     let mut config = Config::default();
-    config.agency.evaluator_model = Some("haiku".to_string());
+    config.models.evaluator = Some(workgraph::config::RoleModelConfig {
+        model: Some("haiku".to_string()),
+        provider: None,
+        tier: None,
+        endpoint: None,
+    });
     let source = config.resolve_model_source(DispatchRole::Evaluator);
-    assert_eq!(source, "legacy");
+    assert_eq!(source, "explicit");
 }
 
 #[test]

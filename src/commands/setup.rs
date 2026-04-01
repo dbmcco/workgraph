@@ -53,8 +53,6 @@ pub struct SetupChoices {
     pub executor: String,
     pub model: String,
     pub agency_enabled: bool,
-    pub evaluator_model: Option<String>,
-    pub assigner_model: Option<String>,
     pub max_agents: usize,
     /// Endpoint config for non-Anthropic providers
     pub endpoint: Option<EndpointChoices>,
@@ -133,13 +131,6 @@ pub fn build_config(choices: &SetupChoices, base: Option<&Config>) -> Config {
     config.agency.auto_assign = choices.agency_enabled;
     config.agency.auto_evaluate = choices.agency_enabled;
 
-    if let Some(ref eval_model) = choices.evaluator_model {
-        config.agency.evaluator_model = Some(eval_model.clone());
-    }
-    if let Some(ref assign_model) = choices.assigner_model {
-        config.agency.assigner_model = Some(assign_model.clone());
-    }
-
     config
 }
 
@@ -197,12 +188,6 @@ pub fn format_summary(choices: &SetupChoices) -> String {
     lines.push("[agency]".to_string());
     lines.push(format!("  auto_assign = {}", choices.agency_enabled));
     lines.push(format!("  auto_evaluate = {}", choices.agency_enabled));
-    if let Some(ref m) = choices.evaluator_model {
-        lines.push(format!("  evaluator_model = \"{}\"", m));
-    }
-    if let Some(ref m) = choices.assigner_model {
-        lines.push(format!("  assigner_model = \"{}\"", m));
-    }
     lines.join("\n")
 }
 
@@ -381,50 +366,6 @@ pub fn run() -> Result<()> {
         .default(existing.agency.auto_assign || existing.agency.auto_evaluate)
         .interact()?;
 
-    let (evaluator_model, assigner_model) = if agency_enabled {
-        let eval_options = &[
-            "haiku (recommended, lightweight)",
-            "sonnet",
-            "same as default",
-        ];
-        let current_eval_idx = match existing.agency.evaluator_model.as_deref() {
-            Some("sonnet") => 1,
-            Some(m) if m == model => 2,
-            _ => 0,
-        };
-        let eval_idx = Select::new()
-            .with_prompt("Evaluator model?")
-            .items(eval_options)
-            .default(current_eval_idx)
-            .interact()?;
-        let eval_model = match eval_idx {
-            0 => Some("haiku".to_string()),
-            1 => Some("sonnet".to_string()),
-            _ => None,
-        };
-
-        let assign_options = &["haiku (recommended, cheap)", "sonnet", "same as default"];
-        let current_assign_idx = match existing.agency.assigner_model.as_deref() {
-            Some("sonnet") => 1,
-            Some(m) if m == model => 2,
-            _ => 0,
-        };
-        let assign_idx = Select::new()
-            .with_prompt("Assigner model?")
-            .items(assign_options)
-            .default(current_assign_idx)
-            .interact()?;
-        let assign_model = match assign_idx {
-            0 => Some("haiku".to_string()),
-            1 => Some("sonnet".to_string()),
-            _ => None,
-        };
-
-        (eval_model, assign_model)
-    } else {
-        (None, None)
-    };
-
     // 5. Max agents
     let max_agents: usize = Input::new()
         .with_prompt("Max parallel agents?")
@@ -436,8 +377,6 @@ pub fn run() -> Result<()> {
         executor,
         model,
         agency_enabled,
-        evaluator_model,
-        assigner_model,
         max_agents,
         endpoint,
         model_registry_entries,
@@ -943,8 +882,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "opus".to_string(),
             agency_enabled: true,
-            evaluator_model: Some("sonnet".to_string()),
-            assigner_model: Some("haiku".to_string()),
             max_agents: 4,
             endpoint: None,
             model_registry_entries: vec![],
@@ -958,8 +895,6 @@ mod tests {
         assert_eq!(config.coordinator.max_agents, 4);
         assert!(config.agency.auto_assign);
         assert!(config.agency.auto_evaluate);
-        assert_eq!(config.agency.evaluator_model, Some("sonnet".to_string()));
-        assert_eq!(config.agency.assigner_model, Some("haiku".to_string()));
     }
 
     #[test]
@@ -969,8 +904,6 @@ mod tests {
             executor: "amplifier".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 8,
             endpoint: None,
             model_registry_entries: vec![],
@@ -983,8 +916,6 @@ mod tests {
         assert_eq!(config.coordinator.max_agents, 8);
         assert!(!config.agency.auto_assign);
         assert!(!config.agency.auto_evaluate);
-        assert!(config.agency.evaluator_model.is_none());
-        assert!(config.agency.assigner_model.is_none());
     }
 
     #[test]
@@ -999,8 +930,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "haiku".to_string(),
             agency_enabled: true,
-            evaluator_model: Some("sonnet".to_string()),
-            assigner_model: None,
             max_agents: 2,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1011,7 +940,6 @@ mod tests {
         assert_eq!(config.agent.model, "claude:haiku");
         assert_eq!(config.coordinator.max_agents, 2);
         assert!(config.agency.auto_assign);
-        assert_eq!(config.agency.evaluator_model, Some("sonnet".to_string()));
 
         // Preserved from base
         assert_eq!(config.project.name, Some("my-project".to_string()));
@@ -1029,8 +957,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "opus".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 4,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1039,20 +965,15 @@ mod tests {
         let config = build_config(&choices, None);
         assert!(!config.agency.auto_assign);
         assert!(!config.agency.auto_evaluate);
-        assert!(config.agency.evaluator_model.is_none());
-        assert!(config.agency.assigner_model.is_none());
     }
 
     #[test]
     fn test_build_config_same_as_default_models() {
-        // When user picks "same as default", evaluator/assigner models are None
         let choices = SetupChoices {
             provider: "anthropic".to_string(),
             executor: "claude".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: true,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 4,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1061,8 +982,6 @@ mod tests {
         let config = build_config(&choices, None);
         assert!(config.agency.auto_assign);
         assert!(config.agency.auto_evaluate);
-        assert!(config.agency.evaluator_model.is_none());
-        assert!(config.agency.assigner_model.is_none());
     }
 
     #[test]
@@ -1072,8 +991,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "opus".to_string(),
             agency_enabled: true,
-            evaluator_model: Some("sonnet".to_string()),
-            assigner_model: Some("haiku".to_string()),
             max_agents: 4,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1085,8 +1002,6 @@ mod tests {
         assert!(summary.contains("max_agents = 4"));
         assert!(summary.contains("auto_assign = true"));
         assert!(summary.contains("auto_evaluate = true"));
-        assert!(summary.contains("evaluator_model = \"sonnet\""));
-        assert!(summary.contains("assigner_model = \"haiku\""));
     }
 
     #[test]
@@ -1096,8 +1011,6 @@ mod tests {
             executor: "amplifier".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 8,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1107,8 +1020,6 @@ mod tests {
         assert!(summary.contains("executor = \"amplifier\""));
         assert!(summary.contains("auto_assign = false"));
         assert!(summary.contains("auto_evaluate = false"));
-        assert!(!summary.contains("evaluator_model"));
-        assert!(!summary.contains("assigner_model"));
     }
 
     #[test]
@@ -1118,8 +1029,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "opus".to_string(),
             agency_enabled: true,
-            evaluator_model: Some("sonnet".to_string()),
-            assigner_model: Some("haiku".to_string()),
             max_agents: 6,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1134,8 +1043,6 @@ mod tests {
         assert_eq!(reloaded.coordinator.max_agents, 6);
         assert!(reloaded.agency.auto_assign);
         assert!(reloaded.agency.auto_evaluate);
-        assert_eq!(reloaded.agency.evaluator_model, Some("sonnet".to_string()));
-        assert_eq!(reloaded.agency.assigner_model, Some("haiku".to_string()));
     }
 
     #[test]
@@ -1145,8 +1052,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 3,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1171,8 +1076,6 @@ mod tests {
             executor: "my-custom-executor".to_string(),
             model: "haiku".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 1,
             endpoint: None,
             model_registry_entries: vec![],
@@ -1193,8 +1096,6 @@ mod tests {
             executor: "native".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 4,
             endpoint: Some(EndpointChoices {
                 name: "openrouter".to_string(),
@@ -1245,8 +1146,6 @@ mod tests {
             executor: "native".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: true,
-            evaluator_model: Some("haiku".to_string()),
-            assigner_model: Some("haiku".to_string()),
             max_agents: 2,
             endpoint: Some(EndpointChoices {
                 name: "openrouter".to_string(),
@@ -1281,8 +1180,6 @@ mod tests {
             executor: "native".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 4,
             endpoint: Some(EndpointChoices {
                 name: "openrouter".to_string(),
@@ -1310,8 +1207,6 @@ mod tests {
             executor: "claude".to_string(),
             model: "opus".to_string(),
             agency_enabled: false,
-            evaluator_model: None,
-            assigner_model: None,
             max_agents: 4,
             endpoint: None,
             model_registry_entries: vec![],

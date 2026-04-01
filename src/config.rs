@@ -1534,11 +1534,10 @@ impl Config {
     ///
     /// Resolution order:
     /// 1. `models.<role>.model` (role-specific override in [models] section)
-    /// 2. Legacy per-role config (e.g., `agency.evaluator_model` for Evaluator)
-    /// 3. `models.<role>.tier` (role tier override via tier system)
-    /// 4. Role `default_tier()` → `tiers.<tier>` → registry lookup
-    /// 5. `models.default.model` (default in [models] section)
-    /// 6. `agent.model` (global fallback)
+    /// 2. `models.<role>.tier` (role tier override via tier system)
+    /// 3. Role `default_tier()` → `tiers.<tier>` → registry lookup
+    /// 4. `models.default.model` (default in [models] section)
+    /// 5. `agent.model` (global fallback)
     ///
     /// Provider resolution follows the same cascade but only from [models].
     pub fn resolve_model_for_role(&self, role: DispatchRole) -> ResolvedModel {
@@ -1604,54 +1603,7 @@ impl Config {
             };
         }
 
-        // 2. Legacy per-role config (backward compatibility)
-        let legacy_model = match role {
-            DispatchRole::Evaluator => self.agency.evaluator_model.as_ref(),
-            DispatchRole::Assigner => self.agency.assigner_model.as_ref(),
-            DispatchRole::Evolver => self.agency.evolver_model.as_ref(),
-            DispatchRole::Creator => self.agency.creator_model.as_ref(),
-            DispatchRole::Triage => self.agency.triage_model.as_ref(),
-            DispatchRole::FlipInference => self.agency.flip_inference_model.as_ref(),
-            DispatchRole::FlipComparison => self.agency.flip_comparison_model.as_ref(),
-            // Verification: use the non-optional legacy field only if it differs
-            // from the old hardcoded default (meaning the user explicitly set it)
-            DispatchRole::Verification => {
-                if self.agency.flip_verification_model != "opus" {
-                    Some(&self.agency.flip_verification_model)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if let Some(model) = legacy_model {
-            let spec = parse_model_spec(model);
-            let spec_provider = spec
-                .provider
-                .as_deref()
-                .map(provider_to_native_provider)
-                .map(String::from);
-            let lookup_model = &spec.model_id;
-
-            if let Some(entry) = self.registry_lookup(lookup_model) {
-                return ResolvedModel {
-                    model: entry.model.clone(),
-                    provider: spec_provider
-                        .or_else(|| resolve_provider(role))
-                        .or_else(|| Some(entry.provider.clone())),
-                    registry_entry: Some(entry),
-                    endpoint: resolve_endpoint(role),
-                };
-            }
-            return ResolvedModel {
-                model: spec.model_id.clone(),
-                provider: spec_provider.or_else(|| resolve_provider(role)),
-                registry_entry: None,
-                endpoint: resolve_endpoint(role),
-            };
-        }
-
-        // 3. Role tier override: [models.<role>].tier
+        // 2. Role tier override: [models.<role>].tier
         if let Some(role_cfg) = self.models.get_role(role)
             && let Some(tier) = role_cfg.tier
             && let Some(mut resolved) = self.resolve_tier(tier)
@@ -1664,7 +1616,7 @@ impl Config {
             return resolved;
         }
 
-        // 4. Role default_tier() → tiers.<tier> → registry lookup
+        // 3. Role default_tier() → tiers.<tier> → registry lookup
         if let Some(mut resolved) = self.resolve_tier(role.default_tier()) {
             // Allow role/default provider to override registry provider
             if let Some(p) = resolve_provider(role) {
@@ -1674,7 +1626,7 @@ impl Config {
             return resolved;
         }
 
-        // 5. Check [models.default]
+        // 4. Check [models.default]
         if let Some(default_cfg) = self.models.get_role(DispatchRole::Default)
             && let Some(ref model) = default_cfg.model
         {
@@ -1703,7 +1655,7 @@ impl Config {
             };
         }
 
-        // 6. Global fallback
+        // 5. Global fallback
         let fallback_spec = parse_model_spec(&self.agent.model);
         let fallback_provider = fallback_spec
             .provider
@@ -1731,7 +1683,7 @@ impl Config {
 
     /// Determine the source of model resolution for a role.
     ///
-    /// Returns one of: "explicit", "legacy", "tier-override", "tier-default", "fallback"
+    /// Returns one of: "explicit", "tier-override", "tier-default", "fallback"
     pub fn resolve_model_source(&self, role: DispatchRole) -> &'static str {
         // 1. Role-specific [models] config (direct model override)
         if let Some(role_cfg) = self.models.get_role(role)
@@ -1740,111 +1692,22 @@ impl Config {
             return "explicit";
         }
 
-        // 2. Legacy per-role config
-        let legacy_model = match role {
-            DispatchRole::Evaluator => self.agency.evaluator_model.as_ref(),
-            DispatchRole::Assigner => self.agency.assigner_model.as_ref(),
-            DispatchRole::Evolver => self.agency.evolver_model.as_ref(),
-            DispatchRole::Creator => self.agency.creator_model.as_ref(),
-            DispatchRole::Triage => self.agency.triage_model.as_ref(),
-            DispatchRole::FlipInference => self.agency.flip_inference_model.as_ref(),
-            DispatchRole::FlipComparison => self.agency.flip_comparison_model.as_ref(),
-            DispatchRole::Verification => {
-                if self.agency.flip_verification_model != "opus" {
-                    Some(&self.agency.flip_verification_model)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        if legacy_model.is_some() {
-            return "legacy";
-        }
-
-        // 3. Role tier override
+        // 2. Role tier override
         if let Some(role_cfg) = self.models.get_role(role)
             && role_cfg.tier.is_some()
         {
             return "tier-override";
         }
 
-        // 4. Role default_tier() → registry
+        // 3. Role default_tier() → registry
         if self.resolve_tier(role.default_tier()).is_some() {
             return "tier-default";
         }
 
-        // 5/6. Fallback
+        // 4/5. Fallback
         "fallback"
     }
 
-    /// Check for legacy `agency.*_model` fields and emit deprecation warnings to stderr.
-    /// Returns the list of deprecated fields found (useful for testing).
-    pub fn check_legacy_deprecations(&self) -> Vec<String> {
-        let legacy_fields: &[(&str, &Option<String>, &str)] = &[
-            (
-                "agency.evaluator_model",
-                &self.agency.evaluator_model,
-                "evaluator",
-            ),
-            (
-                "agency.assigner_model",
-                &self.agency.assigner_model,
-                "assigner",
-            ),
-            (
-                "agency.evolver_model",
-                &self.agency.evolver_model,
-                "evolver",
-            ),
-            (
-                "agency.creator_model",
-                &self.agency.creator_model,
-                "creator",
-            ),
-            ("agency.triage_model", &self.agency.triage_model, "triage"),
-            (
-                "agency.flip_inference_model",
-                &self.agency.flip_inference_model,
-                "flip_inference",
-            ),
-            (
-                "agency.flip_comparison_model",
-                &self.agency.flip_comparison_model,
-                "flip_comparison",
-            ),
-        ];
-
-        let mut deprecated = Vec::new();
-
-        for (field, value, role) in legacy_fields {
-            if value.is_some() {
-                eprintln!(
-                    "Warning: {} is deprecated. Use [models.{}] model = \"{}\" instead. \
-                     Migrate with: wg config --set-model {} {}",
-                    field,
-                    role,
-                    value.as_ref().unwrap(),
-                    role,
-                    value.as_ref().unwrap(),
-                );
-                deprecated.push(field.to_string());
-            }
-        }
-
-        // Special case: flip_verification_model is non-optional with default "opus"
-        // Only warn if user explicitly changed it from default
-        if self.agency.flip_verification_model != "opus" {
-            eprintln!(
-                "Warning: agency.flip_verification_model is deprecated. Use [models.verification] model = \"{}\" instead. \
-                 Migrate with: wg config --set-model verification {}",
-                self.agency.flip_verification_model, self.agency.flip_verification_model,
-            );
-            deprecated.push("agency.flip_verification_model".to_string());
-        }
-
-        deprecated
-    }
 }
 
 fn default_auto_create_threshold() -> u32 {
@@ -1867,9 +1730,6 @@ fn default_bizarre_ideation_interval() -> u32 {
 }
 fn default_flip_verification_threshold() -> Option<f64> {
     Some(0.7)
-}
-fn default_flip_verification_model() -> String {
-    "opus".to_string()
 }
 fn default_evolution_interval() -> u64 {
     7200
@@ -1902,24 +1762,9 @@ pub struct AgencyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigner_agent: Option<String>,
 
-    /// Content-hash of agent to use as evaluator (None = use evaluator_model fallback)
+    /// Content-hash of agent to use as evaluator (None = use default pipeline)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_agent: Option<String>,
-
-    /// Model to use for assigner agents (None = use default agent model).
-    /// Fallback when assigner_agent is not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assigner_model: Option<String>,
-
-    /// Model to use for evaluator agents (None = use default agent model).
-    /// Fallback when evaluator_agent is not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evaluator_model: Option<String>,
-
-    /// Model to use for evolver agents (None = use default agent model).
-    /// Fallback when evolver_agent is not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evolver_model: Option<String>,
 
     /// Content-hash of agent to use as evolver
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1928,11 +1773,6 @@ pub struct AgencyConfig {
     /// Content-hash of agent to use as agent creator (None = not configured)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_agent: Option<String>,
-
-    /// Model to use for agent creator (None = use default agent model).
-    /// Fallback when creator_agent is not set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creator_model: Option<String>,
 
     /// Content-hash of agent to use as placer (None = not configured)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1963,10 +1803,6 @@ pub struct AgencyConfig {
     /// Automatically triage dead agents to assess work progress before respawning
     #[serde(default)]
     pub auto_triage: bool,
-
-    /// Model to use for triage (default: "haiku")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub triage_model: Option<String>,
 
     /// Timeout in seconds for triage calls (default: 30)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2027,27 +1863,12 @@ pub struct AgencyConfig {
     #[serde(default)]
     pub flip_enabled: bool,
 
-    /// Model to use for FLIP inference phase (reconstructing the prompt from output).
-    /// Default: "sonnet" (needs creative reconstruction ability).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flip_inference_model: Option<String>,
-
-    /// Model to use for FLIP comparison phase (scoring similarity).
-    /// Default: "haiku" (comparison is simpler).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flip_comparison_model: Option<String>,
-
     /// FLIP score threshold below which automatic Opus verification is triggered.
     /// When a FLIP evaluation scores below this threshold, the coordinator creates
     /// a verification task that independently checks whether the work was done.
     /// Default: 0.7. Set to None to disable.
     #[serde(default = "default_flip_verification_threshold")]
     pub flip_verification_threshold: Option<f64>,
-
-    /// Model to use for FLIP-triggered verification agents.
-    /// Default: "opus" (highest capability for independent verification).
-    #[serde(default = "default_flip_verification_model")]
-    pub flip_verification_model: String,
 
     /// Automatically trigger evolution cycles based on evaluation data.
     /// When enabled, the coordinator creates `.evolve-*` meta-tasks
@@ -2104,19 +1925,14 @@ impl Default for AgencyConfig {
             auto_assign: false,
             assigner_agent: None,
             evaluator_agent: None,
-            assigner_model: None,
-            evaluator_model: None,
-            evolver_model: None,
             evolver_agent: None,
             creator_agent: None,
-            creator_model: None,
             placer_agent: None,
             auto_place: false,
             auto_create: false,
             auto_create_threshold: default_auto_create_threshold(),
             retention_heuristics: None,
             auto_triage: false,
-            triage_model: None,
             triage_timeout: None,
             triage_max_log_bytes: None,
             exploration_interval: default_exploration_interval(),
@@ -2128,10 +1944,7 @@ impl Default for AgencyConfig {
             eval_gate_threshold: None,
             eval_gate_all: false,
             flip_enabled: true,
-            flip_inference_model: None,
-            flip_comparison_model: None,
             flip_verification_threshold: default_flip_verification_threshold(),
-            flip_verification_model: default_flip_verification_model(),
             auto_evolve: false,
             evolution_interval: default_evolution_interval(),
             evolution_threshold: default_evolution_threshold(),
@@ -2696,10 +2509,7 @@ impl Config {
     /// their configuration is being ignored.
     pub fn load_or_default(workgraph_dir: &Path) -> Self {
         match Self::load_merged(workgraph_dir) {
-            Ok(config) => {
-                config.check_legacy_deprecations();
-                config
-            }
+            Ok(config) => config,
             Err(e) => {
                 eprintln!("Warning: {}, using defaults", e);
                 Self::default()
@@ -3261,10 +3071,7 @@ name = "My Project"
         assert!(!config.agency.auto_evaluate);
         assert!(!config.agency.auto_assign);
         assert!(config.agency.assigner_agent.is_none());
-        assert!(config.agency.assigner_model.is_none());
         assert!(config.agency.evaluator_agent.is_none());
-        assert!(config.agency.evaluator_model.is_none());
-        assert!(config.agency.evolver_model.is_none());
         assert!(config.agency.evolver_agent.is_none());
         assert!(config.agency.retention_heuristics.is_none());
         // Run mode continuum defaults
@@ -3284,9 +3091,6 @@ name = "My Project"
 [agency]
 auto_evaluate = true
 auto_assign = true
-assigner_model = "haiku"
-evaluator_model = "haiku"
-evolver_model = "opus-4-5"
 assigner_agent = "abc123"
 evaluator_agent = "def456"
 evolver_agent = "ghi789"
@@ -3295,9 +3099,6 @@ retention_heuristics = "Retire roles scoring below 0.3 after 10 evaluations"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.agency.auto_evaluate);
         assert!(config.agency.auto_assign);
-        assert_eq!(config.agency.assigner_model, Some("haiku".to_string()));
-        assert_eq!(config.agency.evaluator_model, Some("haiku".to_string()));
-        assert_eq!(config.agency.evolver_model, Some("opus-4-5".to_string()));
         assert_eq!(config.agency.assigner_agent, Some("abc123".to_string()));
         assert_eq!(config.agency.evaluator_agent, Some("def456".to_string()));
         assert_eq!(config.agency.evolver_agent, Some("ghi789".to_string()));
@@ -3314,13 +3115,11 @@ retention_heuristics = "Retire roles scoring below 0.3 after 10 evaluations"
         let mut config = Config::default();
         config.agency.auto_evaluate = true;
         config.agency.evolver_agent = Some("abc123".to_string());
-        config.agency.evaluator_model = Some("sonnet".to_string());
         config.save(temp_dir.path()).unwrap();
 
         let loaded = Config::load(temp_dir.path()).unwrap();
         assert!(loaded.agency.auto_evaluate);
         assert_eq!(loaded.agency.evolver_agent, Some("abc123".to_string()));
-        assert_eq!(loaded.agency.evaluator_model, Some("sonnet".to_string()));
     }
 
     #[test]
@@ -3577,19 +3376,9 @@ model = "claude:haiku"
     }
 
     #[test]
-    fn test_resolve_triage_legacy_override() {
-        // Legacy agency.triage_model should take priority over tier default
-        let mut config = Config::default();
-        config.agency.triage_model = Some("gpt-4o-mini".to_string());
-        let resolved = config.resolve_model_for_role(DispatchRole::Triage);
-        assert_eq!(resolved.model, "gpt-4o-mini");
-    }
-
-    #[test]
     fn test_resolve_models_section_override() {
         // [models.triage] should take highest priority
         let mut config = Config::default();
-        config.agency.triage_model = Some("legacy-model".to_string());
         config.models.triage = Some(RoleModelConfig {
             model: Some("routing-model".to_string()),
             provider: Some("openrouter".to_string()),
@@ -3602,93 +3391,11 @@ model = "claude:haiku"
     }
 
     #[test]
-    fn test_resolve_verification_legacy_override() {
-        // If user explicitly sets flip_verification_model to non-default, it should be used
-        // "sonnet" is a registry ID, so it resolves to the full API model path
-        let mut config = Config::default();
-        config.agency.flip_verification_model = "sonnet".to_string();
-        let resolved = config.resolve_model_for_role(DispatchRole::Verification);
-        assert_eq!(resolved.model, "claude-sonnet-4-20250514");
-        assert!(resolved.registry_entry.is_some());
-    }
-
-    #[test]
     fn test_resolve_evaluator_uses_standard_tier() {
         // Evaluator resolves via Standard tier → sonnet registry entry
         let config = Config::default();
         let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
         assert_eq!(resolved.model, "claude-sonnet-4-20250514");
-    }
-
-    #[test]
-    fn test_deprecation_no_warnings_on_default() {
-        let config = Config::default();
-        let deprecated = config.check_legacy_deprecations();
-        assert!(
-            deprecated.is_empty(),
-            "Default config should have no deprecation warnings"
-        );
-    }
-
-    #[test]
-    fn test_deprecation_warning_evaluator_model() {
-        let mut config = Config::default();
-        config.agency.evaluator_model = Some("haiku".to_string());
-        let deprecated = config.check_legacy_deprecations();
-        assert!(deprecated.contains(&"agency.evaluator_model".to_string()));
-    }
-
-    #[test]
-    fn test_deprecation_warning_multiple_fields() {
-        let mut config = Config::default();
-        config.agency.evaluator_model = Some("haiku".to_string());
-        config.agency.assigner_model = Some("sonnet".to_string());
-        config.agency.triage_model = Some("haiku".to_string());
-        let deprecated = config.check_legacy_deprecations();
-        assert_eq!(deprecated.len(), 3);
-        assert!(deprecated.contains(&"agency.evaluator_model".to_string()));
-        assert!(deprecated.contains(&"agency.assigner_model".to_string()));
-        assert!(deprecated.contains(&"agency.triage_model".to_string()));
-    }
-
-    #[test]
-    fn test_deprecation_warning_flip_verification_non_default() {
-        let mut config = Config::default();
-        config.agency.flip_verification_model = "sonnet".to_string();
-        let deprecated = config.check_legacy_deprecations();
-        assert!(deprecated.contains(&"agency.flip_verification_model".to_string()));
-    }
-
-    #[test]
-    fn test_deprecation_no_warning_flip_verification_default() {
-        let mut config = Config::default();
-        config.agency.flip_verification_model = "opus".to_string();
-        let deprecated = config.check_legacy_deprecations();
-        assert!(
-            !deprecated.contains(&"agency.flip_verification_model".to_string()),
-            "Default 'opus' should not trigger deprecation"
-        );
-    }
-
-    #[test]
-    fn test_deprecation_no_warning_default_config() {
-        let config = Config::default();
-        let deprecated = config.check_legacy_deprecations();
-        assert!(
-            deprecated.is_empty(),
-            "Default config should have no deprecation warnings"
-        );
-    }
-
-    #[test]
-    fn test_legacy_fields_still_resolve() {
-        // Legacy fields should still work through resolve_model_for_role
-        // "haiku" is a registry ID, so it resolves to the full API model path
-        let mut config = Config::default();
-        config.agency.evaluator_model = Some("haiku".to_string());
-        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
-        assert_eq!(resolved.model, "claude-haiku-4-5-20251001");
-        assert!(resolved.registry_entry.is_some());
     }
 
     #[test]
@@ -3794,29 +3501,6 @@ model = "claude:haiku"
             Some("openrouter".to_string()),
             "Default provider should cascade to tier-resolved roles"
         );
-    }
-
-    #[test]
-    fn test_default_provider_cascades_to_legacy_model() {
-        // Legacy model config should also get the default provider
-        let mut config = Config::default();
-        config.models.default = Some(RoleModelConfig {
-            model: None,
-            provider: Some("openrouter".to_string()),
-            tier: None,
-            endpoint: None,
-        });
-        config.agency.evaluator_model = Some("haiku".to_string());
-
-        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
-        // "haiku" is a registry ID → resolves to full API model path
-        assert_eq!(resolved.model, "claude-haiku-4-5-20251001");
-        assert_eq!(
-            resolved.provider,
-            Some("openrouter".to_string()),
-            "Default provider should cascade to legacy model roles"
-        );
-        assert!(resolved.registry_entry.is_some());
     }
 
     #[test]
@@ -4754,31 +4438,10 @@ model = "claude:haiku"
         assert!(resolved.registry_entry.is_none());
     }
 
-    #[test]
-    fn test_registry_resolve_step2_legacy_model() {
-        // Step 2: legacy evaluator_model = "haiku" resolves via registry
-        let mut config = Config::default();
-        config.agency.evaluator_model = Some("haiku".to_string());
-        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
-        assert_eq!(resolved.model, "claude-haiku-4-5-20251001");
-        assert!(resolved.registry_entry.is_some());
-        assert_eq!(resolved.registry_entry.unwrap().id, "haiku");
-    }
-
-    #[test]
-    fn test_registry_resolve_step2_legacy_passthrough() {
-        // Step 2: legacy model not in registry passes through
-        let mut config = Config::default();
-        config.agency.evaluator_model = Some("my-custom-llm".to_string());
-        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
-        assert_eq!(resolved.model, "my-custom-llm");
-        assert!(resolved.registry_entry.is_none());
-    }
-
-    // Note: Steps 5 and 6 are currently unreachable because effective_tiers()
-    // always fills defaults, so step 4 (resolve_tier with default tier) always
+    // Note: Steps 4 and 5 are currently unreachable because effective_tiers()
+    // always fills defaults, so step 3 (resolve_tier with default tier) always
     // succeeds. The registry lookup code is added for correctness if that changes.
-    // The registry lookup pattern is identical to steps 1/2 which are tested above.
+    // The registry lookup pattern is identical to step 1 which is tested above.
 
     // -----------------------------------------------------------------------
     // validate_config tests

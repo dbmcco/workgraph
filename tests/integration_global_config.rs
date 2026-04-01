@@ -191,18 +191,18 @@ max_agents = 8
 }
 
 // ===========================================================================
-// 4. Merge: global evaluator_model=sonnet, local evaluator_model=haiku → haiku
+// 4. Merge: global auto_evaluate=false, local auto_evaluate=true → true
 // ===========================================================================
 
 #[test]
-fn merge_local_overrides_global_evaluator_model() {
+fn merge_local_overrides_global_auto_evaluate() {
     let tmp = TempDir::new().unwrap();
     let global_dir = setup_global_dir(
         &tmp,
         Some(
             r#"
 [agency]
-evaluator_model = "sonnet"
+auto_evaluate = false
 "#,
         ),
     );
@@ -211,16 +211,15 @@ evaluator_model = "sonnet"
         Some(
             r#"
 [agency]
-evaluator_model = "haiku"
+auto_evaluate = true
 "#,
         ),
     );
 
     let config = load_merged_custom(&global_dir, &local_dir);
-    assert_eq!(
-        config.agency.evaluator_model,
-        Some("haiku".to_string()),
-        "local evaluator_model should override global"
+    assert!(
+        config.agency.auto_evaluate,
+        "local auto_evaluate should override global"
     );
 }
 
@@ -553,18 +552,17 @@ model = "haiku"
 }
 
 // ===========================================================================
-// 10. Evaluate uses merged evaluator_model
+// 10. Agency settings merge correctly from global
 // ===========================================================================
 
 #[test]
-fn evaluate_uses_merged_evaluator_model_from_global() {
+fn agency_auto_evaluate_from_global() {
     let tmp = TempDir::new().unwrap();
     let global_dir = setup_global_dir(
         &tmp,
         Some(
             r#"
 [agency]
-evaluator_model = "sonnet"
 auto_evaluate = true
 "#,
         ),
@@ -572,34 +570,7 @@ auto_evaluate = true
     let local_dir = setup_local_dir(&tmp, None);
 
     let config = load_merged_custom(&global_dir, &local_dir);
-    assert_eq!(config.agency.evaluator_model, Some("sonnet".to_string()));
     assert!(config.agency.auto_evaluate);
-}
-
-#[test]
-fn evaluate_local_overrides_global_evaluator_model() {
-    let tmp = TempDir::new().unwrap();
-    let global_dir = setup_global_dir(
-        &tmp,
-        Some(
-            r#"
-[agency]
-evaluator_model = "sonnet"
-"#,
-        ),
-    );
-    let local_dir = setup_local_dir(
-        &tmp,
-        Some(
-            r#"
-[agency]
-evaluator_model = "haiku"
-"#,
-        ),
-    );
-
-    let config = load_merged_custom(&global_dir, &local_dir);
-    assert_eq!(config.agency.evaluator_model, Some("haiku".to_string()));
 }
 
 // ===========================================================================
@@ -623,8 +594,6 @@ max_agents = 8
 
 [agency]
 auto_evaluate = true
-evaluator_model = "sonnet"
-assigner_model = "opus"
 "#,
         ),
     );
@@ -636,7 +605,6 @@ assigner_model = "opus"
 model = "haiku"
 
 [agency]
-evaluator_model = "haiku"
 auto_assign = true
 "#,
         ),
@@ -652,9 +620,7 @@ auto_assign = true
     // coordinator: global inherited
     assert_eq!(config.coordinator.max_agents, 8);
 
-    // agency: local evaluator_model overrides, global assigner_model inherited
-    assert_eq!(config.agency.evaluator_model, Some("haiku".to_string()));
-    assert_eq!(config.agency.assigner_model, Some("opus".to_string()));
+    // agency: global auto_evaluate inherited, local auto_assign applied
     assert!(config.agency.auto_evaluate);
     assert!(config.agency.auto_assign);
 }
@@ -706,14 +672,12 @@ fn config_save_and_load_roundtrip_local() {
     let mut config = Config::default();
     config.agent.model = "claude:haiku".to_string();
     config.coordinator.max_agents = 16;
-    config.agency.evaluator_model = Some("sonnet".to_string());
     config.agency.auto_evaluate = true;
     config.save(&local_dir).unwrap();
 
     let loaded = Config::load(&local_dir).unwrap();
     assert_eq!(loaded.agent.model, "claude:haiku");
     assert_eq!(loaded.coordinator.max_agents, 16);
-    assert_eq!(loaded.agency.evaluator_model, Some("sonnet".to_string()));
     assert!(loaded.agency.auto_evaluate);
 }
 
@@ -724,7 +688,7 @@ fn config_save_and_load_roundtrip_global() {
 
     let mut config = Config::default();
     config.coordinator.max_agents = 10;
-    config.agency.evolver_model = Some("opus".to_string());
+    config.agency.auto_evaluate = true;
     fs::write(
         global_dir.join("config.toml"),
         toml::to_string_pretty(&config).unwrap(),
@@ -734,7 +698,7 @@ fn config_save_and_load_roundtrip_global() {
     let loaded: Config =
         toml::from_str(&fs::read_to_string(global_dir.join("config.toml")).unwrap()).unwrap();
     assert_eq!(loaded.coordinator.max_agents, 10);
-    assert_eq!(loaded.agency.evolver_model, Some("opus".to_string()));
+    assert!(loaded.agency.auto_evaluate);
 }
 
 #[test]

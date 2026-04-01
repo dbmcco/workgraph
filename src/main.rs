@@ -1553,19 +1553,14 @@ fn main() -> Result<()> {
             room,
             auto_evaluate,
             auto_assign,
-            assigner_model,
-            evaluator_model,
-            evolver_model,
             assigner_agent,
             evaluator_agent,
             evolver_agent,
             creator_agent,
-            creator_model,
             retention_heuristics,
             auto_triage,
             auto_place,
             auto_create,
-            triage_model,
             triage_timeout,
             triage_max_log_bytes,
             max_child_tasks,
@@ -1574,10 +1569,7 @@ fn main() -> Result<()> {
             eval_gate_threshold,
             eval_gate_all,
             flip_enabled,
-            flip_inference_model,
-            flip_comparison_model,
             flip_verification_threshold,
-            flip_verification_model,
             chat_history,
             chat_history_max,
             tui_counters,
@@ -1777,19 +1769,14 @@ fn main() -> Result<()> {
                     && coordinator_provider.is_none()
                     && auto_evaluate.is_none()
                     && auto_assign.is_none()
-                    && assigner_model.is_none()
-                    && evaluator_model.is_none()
-                    && evolver_model.is_none()
                     && assigner_agent.is_none()
                     && evaluator_agent.is_none()
                     && evolver_agent.is_none()
                     && creator_agent.is_none()
-                    && creator_model.is_none()
                     && retention_heuristics.is_none()
                     && auto_triage.is_none()
                     && auto_place.is_none()
                     && auto_create.is_none()
-                    && triage_model.is_none()
                     && triage_timeout.is_none()
                     && triage_max_log_bytes.is_none()
                     && max_child_tasks.is_none()
@@ -1798,10 +1785,7 @@ fn main() -> Result<()> {
                     && eval_gate_threshold.is_none()
                     && eval_gate_all.is_none()
                     && flip_enabled.is_none()
-                    && flip_inference_model.is_none()
-                    && flip_comparison_model.is_none()
                     && flip_verification_threshold.is_none()
-                    && flip_verification_model.is_none()
                     && chat_history.is_none()
                     && chat_history_max.is_none()
                     && tui_counters.is_none()
@@ -1826,19 +1810,14 @@ fn main() -> Result<()> {
                     coordinator_provider.as_deref(),
                     auto_evaluate,
                     auto_assign,
-                    assigner_model.as_deref(),
-                    evaluator_model.as_deref(),
-                    evolver_model.as_deref(),
                     assigner_agent.as_deref(),
                     evaluator_agent.as_deref(),
                     evolver_agent.as_deref(),
                     creator_agent.as_deref(),
-                    creator_model.as_deref(),
                     retention_heuristics.as_deref(),
                     auto_triage,
                     auto_place,
                     auto_create,
-                    triage_model.as_deref(),
                     triage_timeout,
                     triage_max_log_bytes,
                     max_child_tasks,
@@ -1847,10 +1826,7 @@ fn main() -> Result<()> {
                     eval_gate_threshold,
                     eval_gate_all,
                     flip_enabled,
-                    flip_inference_model.as_deref(),
-                    flip_comparison_model.as_deref(),
                     flip_verification_threshold,
-                    flip_verification_model.as_deref(),
                     chat_history,
                     chat_history_max,
                     tui_counters.as_deref(),

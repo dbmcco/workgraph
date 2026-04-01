@@ -807,15 +807,17 @@ fn test_auto_evaluate_unblocks_on_failed_source() {
 
 #[test]
 fn test_auto_evaluate_task_has_exec_and_model() {
-    // Verify that auto-evaluate tasks get the exec command and evaluator_model
+    // Verify that auto-evaluate tasks get the exec command and model from models section
     let tmp = TempDir::new().unwrap();
     let (wg_dir, graph_path) = setup_workgraph(&tmp);
 
-    // Write config with evaluator_model
+    // Write config with models.evaluator section
     let config_content = r#"
 [agency]
 auto_evaluate = true
-evaluator_model = "sonnet"
+
+[models.evaluator]
+model = "claude:sonnet"
 "#;
     fs::write(wg_dir.join("config.toml"), config_content).unwrap();
 
@@ -845,6 +847,7 @@ evaluator_model = "sonnet"
 
     for (task_id, task_title) in &tasks_needing_eval {
         let eval_task_id = format!("evaluate-{}", task_id);
+        let resolved_model = config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
         let eval_task = Task {
             id: eval_task_id.clone(),
             title: format!("Evaluate: {}", task_title),
@@ -852,7 +855,7 @@ evaluator_model = "sonnet"
             after: vec![task_id.clone()],
             tags: vec!["evaluation".to_string(), "agency".to_string()],
             exec: Some(format!("wg evaluate {}", task_id)),
-            model: config.agency.evaluator_model.clone(),
+            model: Some(resolved_model.model),
             agent: config.agency.evaluator_agent.clone(),
             ..Task::default()
         };
@@ -865,7 +868,13 @@ evaluator_model = "sonnet"
 
     // The eval task should have exec and model set
     assert_eq!(eval.exec.as_deref(), Some("wg evaluate my-task"));
-    assert_eq!(eval.model.as_deref(), Some("sonnet"));
+    // resolve_model_for_role expands "claude:sonnet" to the full model ID
+    assert!(eval.model.is_some(), "eval task should have a model set");
+    assert!(
+        eval.model.as_deref().unwrap().contains("sonnet"),
+        "model should be a sonnet variant, got: {:?}",
+        eval.model
+    );
     assert!(eval.tags.contains(&"evaluation".to_string()));
 }
 

@@ -63,31 +63,16 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if let Some(ref agent) = config.agency.evaluator_agent {
             println!("  evaluator_agent = \"{}\"", agent);
         }
-        if let Some(ref model) = config.agency.assigner_model {
-            println!("  assigner_model = \"{}\"", model);
-        }
-        if let Some(ref model) = config.agency.evaluator_model {
-            println!("  evaluator_model = \"{}\"", model);
-        }
-        if let Some(ref model) = config.agency.evolver_model {
-            println!("  evolver_model = \"{}\"", model);
-        }
         if let Some(ref agent) = config.agency.evolver_agent {
             println!("  evolver_agent = \"{}\"", agent);
         }
         if let Some(ref agent) = config.agency.creator_agent {
             println!("  creator_agent = \"{}\"", agent);
         }
-        if let Some(ref model) = config.agency.creator_model {
-            println!("  creator_model = \"{}\"", model);
-        }
         if let Some(ref heuristics) = config.agency.retention_heuristics {
             println!("  retention_heuristics = \"{}\"", heuristics);
         }
         println!("  auto_triage = {}", config.agency.auto_triage);
-        if let Some(ref model) = config.agency.triage_model {
-            println!("  triage_model = \"{}\"", model);
-        }
         if let Some(timeout) = config.agency.triage_timeout {
             println!("  triage_timeout = {}", timeout);
         }
@@ -103,29 +88,8 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if config.agency.flip_enabled {
             println!("  flip_enabled = {}", config.agency.flip_enabled);
         }
-        if let Some(ref model) = config.agency.flip_inference_model {
-            println!("  flip_inference_model = \"{}\"", model);
-        }
-        if let Some(ref model) = config.agency.flip_comparison_model {
-            println!("  flip_comparison_model = \"{}\"", model);
-        }
         if let Some(threshold) = config.agency.flip_verification_threshold {
             println!("  flip_verification_threshold = {}", threshold);
-        }
-        {
-            // Display flip_verification_model in provider:model format
-            let resolved =
-                config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
-            let display = if let Some(ref entry) = resolved.registry_entry {
-                let prefix = workgraph::config::native_provider_to_prefix(&entry.provider);
-                format!("{}:{}", prefix, entry.id)
-            } else if let Some(ref provider) = resolved.provider {
-                let prefix = workgraph::config::native_provider_to_prefix(provider);
-                format!("{}:{}", prefix, resolved.model)
-            } else {
-                resolved.model.clone()
-            };
-            println!("  flip_verification_model = \"{}\"", display);
         }
         println!("  auto_place = {}", config.agency.auto_place);
         if config.agency.auto_evolve {
@@ -334,19 +298,14 @@ pub fn update(
     coordinator_provider: Option<&str>,
     auto_evaluate: Option<bool>,
     auto_assign: Option<bool>,
-    assigner_model: Option<&str>,
-    evaluator_model: Option<&str>,
-    evolver_model: Option<&str>,
     assigner_agent: Option<&str>,
     evaluator_agent: Option<&str>,
     evolver_agent: Option<&str>,
     creator_agent: Option<&str>,
-    creator_model: Option<&str>,
     retention_heuristics: Option<&str>,
     auto_triage: Option<bool>,
     auto_place: Option<bool>,
     auto_create: Option<bool>,
-    triage_model: Option<&str>,
     triage_timeout: Option<u64>,
     triage_max_log_bytes: Option<usize>,
     max_child_tasks: Option<u32>,
@@ -355,10 +314,7 @@ pub fn update(
     eval_gate_threshold: Option<f64>,
     eval_gate_all: Option<bool>,
     flip_enabled: Option<bool>,
-    flip_inference_model: Option<&str>,
-    flip_comparison_model: Option<&str>,
     flip_verification_threshold: Option<f64>,
-    flip_verification_model: Option<&str>,
     chat_history: Option<bool>,
     chat_history_max: Option<usize>,
     tui_counters: Option<&str>,
@@ -473,36 +429,6 @@ pub fn update(
         changed = true;
     }
 
-    if let Some(m) = assigner_model {
-        config.agency.assigner_model = Some(m.to_string());
-        println!("Set agency.assigner_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --assigner-model is deprecated. Use --role-model assigner={} or --set-model assigner {} instead.",
-            m, m
-        );
-        changed = true;
-    }
-
-    if let Some(m) = evaluator_model {
-        config.agency.evaluator_model = Some(m.to_string());
-        println!("Set agency.evaluator_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --evaluator-model is deprecated. Use --role-model evaluator={} or --set-model evaluator {} instead.",
-            m, m
-        );
-        changed = true;
-    }
-
-    if let Some(m) = evolver_model {
-        config.agency.evolver_model = Some(m.to_string());
-        println!("Set agency.evolver_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --evolver-model is deprecated. Use --role-model evolver={} or --set-model evolver {} instead.",
-            m, m
-        );
-        changed = true;
-    }
-
     if let Some(v) = assigner_agent {
         config.agency.assigner_agent = Some(v.to_string());
         println!("Set agency.assigner_agent = \"{}\"", v);
@@ -527,16 +453,6 @@ pub fn update(
         changed = true;
     }
 
-    if let Some(v) = creator_model {
-        config.agency.creator_model = Some(v.to_string());
-        println!("Set agency.creator_model = \"{}\"", v);
-        eprintln!(
-            "Warning: --creator-model is deprecated. Use --role-model creator={} or --set-model creator {} instead.",
-            v, v
-        );
-        changed = true;
-    }
-
     if let Some(v) = retention_heuristics {
         config.agency.retention_heuristics = Some(v.to_string());
         println!("Set agency.retention_heuristics = \"{}\"", v);
@@ -558,16 +474,6 @@ pub fn update(
     if let Some(v) = auto_create {
         config.agency.auto_create = v;
         println!("Set agency.auto_create = {}", v);
-        changed = true;
-    }
-
-    if let Some(m) = triage_model {
-        config.agency.triage_model = Some(m.to_string());
-        println!("Set agency.triage_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --triage-model is deprecated. Use --role-model triage={} or --set-model triage {} instead.",
-            m, m
-        );
         changed = true;
     }
 
@@ -622,39 +528,9 @@ pub fn update(
         changed = true;
     }
 
-    if let Some(m) = flip_inference_model {
-        config.agency.flip_inference_model = Some(m.to_string());
-        println!("Set agency.flip_inference_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --flip-inference-model is deprecated. Use --role-model flip_inference={} or --set-model flip_inference {} instead.",
-            m, m
-        );
-        changed = true;
-    }
-
-    if let Some(m) = flip_comparison_model {
-        config.agency.flip_comparison_model = Some(m.to_string());
-        println!("Set agency.flip_comparison_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --flip-comparison-model is deprecated. Use --role-model flip_comparison={} or --set-model flip_comparison {} instead.",
-            m, m
-        );
-        changed = true;
-    }
-
     if let Some(v) = flip_verification_threshold {
         config.agency.flip_verification_threshold = Some(v);
         println!("Set agency.flip_verification_threshold = {}", v);
-        changed = true;
-    }
-
-    if let Some(m) = flip_verification_model {
-        config.agency.flip_verification_model = m.to_string();
-        println!("Set agency.flip_verification_model = \"{}\"", m);
-        eprintln!(
-            "Warning: --flip-verification-model is deprecated. Use --role-model verification={} or --set-model verification {} instead.",
-            m, m
-        );
         changed = true;
     }
 
@@ -1818,17 +1694,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
             None, // auto_triage
             None, // auto_place
             None, // auto_create
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -1876,17 +1744,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
             None, // auto_triage
             None, // auto_place
             None, // auto_create
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -1934,17 +1794,9 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
             None, // auto_triage
             None, // auto_place
             None, // auto_create
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -1985,44 +1837,33 @@ mod tests {
             None, // coordinator_provider
             Some(true),
             Some(true),
-            Some("sonnet"),
-            Some("haiku"),
-            Some("opus-4-5"),
             Some("assigner-hash"),
             Some("evaluator-hash"),
             Some("evolver-hash"),
             Some("creator-hash"),
-            Some("haiku"),
             Some("Retire below 0.3 after 10 evals"),
             None, // auto_triage
             None, // auto_place
             None, // auto_create
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // triage_timeout
+            None, // triage_max_log_bytes
+            None, // max_child_tasks
+            None, // max_task_depth
+            None, // viz_edge_color
+            None, // eval_gate_threshold
+            None, // eval_gate_all
+            None, // flip_enabled
+            None, // flip_verification_threshold
+            None, // chat_history
+            None, // chat_history_max
+            None, // tui_counters
+            None, // retry_context_tokens
         );
         assert!(result.is_ok());
 
         let config = Config::load(temp_dir.path()).unwrap();
         assert!(config.agency.auto_evaluate);
         assert!(config.agency.auto_assign);
-        assert_eq!(config.agency.assigner_model, Some("sonnet".to_string()));
-        assert_eq!(config.agency.evaluator_model, Some("haiku".to_string()));
-        assert_eq!(config.agency.evolver_model, Some("opus-4-5".to_string()));
         assert_eq!(
             config.agency.assigner_agent,
             Some("assigner-hash".to_string())
@@ -2039,7 +1880,6 @@ mod tests {
             config.agency.creator_agent,
             Some("creator-hash".to_string())
         );
-        assert_eq!(config.agency.creator_model, Some("haiku".to_string()));
         assert_eq!(
             config.agency.retention_heuristics,
             Some("Retire below 0.3 after 10 evals".to_string())

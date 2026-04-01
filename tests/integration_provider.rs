@@ -601,41 +601,15 @@ fn test_fallback_tier_defaults() {
 }
 
 #[test]
-fn test_fallback_legacy_overrides_tier() {
-    // Legacy config fields should override tier defaults
+fn test_models_section_overrides_tier() {
+    // [models.triage] should override tier defaults
     let mut config = Config::default();
-    config.agency.triage_model = Some("legacy-triage-model".to_string());
-
-    let resolved = config.resolve_model_for_role(DispatchRole::Triage);
-    assert_eq!(resolved.model, "legacy-triage-model");
-}
-
-#[test]
-fn test_fallback_models_section_overrides_legacy() {
-    // [models.triage] should override legacy agency.triage_model
-    let mut config = Config::default();
-    config.agency.triage_model = Some("legacy-model".to_string());
     config.models.set_model(DispatchRole::Triage, "new-model");
     config.models.set_provider(DispatchRole::Triage, "openai");
 
     let resolved = config.resolve_model_for_role(DispatchRole::Triage);
     assert_eq!(resolved.model, "new-model");
     assert_eq!(resolved.provider, Some("openai".to_string()));
-}
-
-#[test]
-fn test_fallback_provider_only_from_models_section() {
-    // Provider is only set via [models] section, not legacy fields
-    let mut config = Config::default();
-    config.agency.triage_model = Some("legacy-model".to_string());
-
-    // Legacy config has no provider mechanism
-    let resolved = config.resolve_model_for_role(DispatchRole::Triage);
-    assert_eq!(resolved.model, "legacy-model");
-    assert!(
-        resolved.provider.is_none(),
-        "Legacy config should not set a provider"
-    );
 }
 
 // ── Model registry lookup ───────────────────────────────────────────────

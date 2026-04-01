@@ -11203,61 +11203,6 @@ impl VizApp {
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
-            key: "agency.assigner_model".into(),
-            label: "Assigner model".into(),
-            value: config
-                .agency
-                .assigner_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.evaluator_model".into(),
-            label: "Evaluator model".into(),
-            value: config
-                .agency
-                .evaluator_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.evolver_model".into(),
-            label: "Evolver model".into(),
-            value: config
-                .agency
-                .evolver_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.creator_model".into(),
-            label: "Creator model".into(),
-            value: config
-                .agency
-                .creator_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.triage_model".into(),
-            label: "Triage model".into(),
-            value: config
-                .agency
-                .triage_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
             key: "agency.assigner_agent".into(),
             label: "Assigner agent".into(),
             value: config
@@ -11361,35 +11306,6 @@ impl VizApp {
                 .map(|t| format!("{:.2}", t))
                 .unwrap_or_else(|| "(disabled)".into()),
             edit_kind: ConfigEditKind::TextInput,
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.flip_verification_model".into(),
-            label: "FLIP verify model".into(),
-            value: config.agency.flip_verification_model.clone(),
-            edit_kind: ConfigEditKind::Choice(model_choices.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.flip_inference_model".into(),
-            label: "FLIP inference model".into(),
-            value: config
-                .agency
-                .flip_inference_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
-            section: ConfigSection::Agency,
-        });
-        entries.push(ConfigEntry {
-            key: "agency.flip_comparison_model".into(),
-            label: "FLIP comparison model".into(),
-            value: config
-                .agency
-                .flip_comparison_model
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-            edit_kind: ConfigEditKind::Choice(model_choices_with_default.clone()),
             section: ConfigSection::Agency,
         });
         entries.push(ConfigEntry {
@@ -11656,41 +11572,6 @@ impl VizApp {
             "agency.auto_assign" => config.agency.auto_assign = new_value == "on",
             "agency.auto_triage" => config.agency.auto_triage = new_value == "on",
             "agency.auto_create" => config.agency.auto_create = new_value == "on",
-            "agency.assigner_model" => {
-                config.agency.assigner_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
-            "agency.evaluator_model" => {
-                config.agency.evaluator_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
-            "agency.evolver_model" => {
-                config.agency.evolver_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
-            "agency.creator_model" => {
-                config.agency.creator_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
-            "agency.triage_model" => {
-                config.agency.triage_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
             "agency.assigner_agent" => {
                 config.agency.assigner_agent = if new_value == "(none)" || new_value.is_empty() {
                     None
@@ -11813,23 +11694,6 @@ impl VizApp {
                     } else {
                         new_value.parse::<f64>().ok()
                     };
-            }
-            "agency.flip_verification_model" => {
-                config.agency.flip_verification_model = new_value;
-            }
-            "agency.flip_inference_model" => {
-                config.agency.flip_inference_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
-            }
-            "agency.flip_comparison_model" => {
-                config.agency.flip_comparison_model = if new_value == "(default)" {
-                    None
-                } else {
-                    Some(new_value)
-                };
             }
             "agency.eval_gate_threshold" => {
                 config.agency.eval_gate_threshold =
@@ -14871,11 +14735,6 @@ mod tui_config_panel_tests {
             "agency.auto_evaluate",
             "agency.auto_triage",
             "agency.auto_create",
-            "agency.assigner_model",
-            "agency.evaluator_model",
-            "agency.evolver_model",
-            "agency.creator_model",
-            "agency.triage_model",
             "agency.assigner_agent",
             "agency.evaluator_agent",
             "agency.evolver_agent",
@@ -14886,9 +14745,6 @@ mod tui_config_panel_tests {
             "agency.retention_heuristics",
             "agency.flip_enabled",
             "agency.flip_verification_threshold",
-            "agency.flip_verification_model",
-            "agency.flip_inference_model",
-            "agency.flip_comparison_model",
             "agency.eval_gate_threshold",
             "agency.eval_gate_all",
             "checkpoint.retry_context_tokens",

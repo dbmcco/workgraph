@@ -1193,17 +1193,6 @@ pub enum Commands {
         #[arg(long)]
         auto_assign: Option<bool>,
 
-        /// Set model for assigner agents
-        #[arg(long)]
-        assigner_model: Option<String>,
-
-        /// Set model for evaluator agents
-        #[arg(long)]
-        evaluator_model: Option<String>,
-
-        /// Set model for evolver agents
-        #[arg(long)]
-        evolver_model: Option<String>,
 
         /// Set assigner agent (content-hash)
         #[arg(long)]
@@ -1221,9 +1210,6 @@ pub enum Commands {
         #[arg(long)]
         creator_agent: Option<String>,
 
-        /// Set model for creator agents
-        #[arg(long)]
-        creator_model: Option<String>,
 
         /// Set retention heuristics (prose policy for evolver)
         #[arg(long)]
@@ -1241,9 +1227,6 @@ pub enum Commands {
         #[arg(long)]
         auto_create: Option<bool>,
 
-        /// Set model for triage (default: haiku)
-        #[arg(long)]
-        triage_model: Option<String>,
 
         /// Set timeout in seconds for triage calls (default: 30)
         #[arg(long)]
@@ -1279,21 +1262,11 @@ pub enum Commands {
         #[arg(long, name = "flip-enabled")]
         flip_enabled: Option<bool>,
 
-        /// Model for FLIP inference phase (reconstructing prompt from output)
-        #[arg(long, name = "flip-inference-model")]
-        flip_inference_model: Option<String>,
-
-        /// Model for FLIP comparison phase (scoring similarity)
-        #[arg(long, name = "flip-comparison-model")]
-        flip_comparison_model: Option<String>,
 
         /// FLIP score threshold for triggering Opus verification (default: 0.7)
         #[arg(long, name = "flip-verification-threshold")]
         flip_verification_threshold: Option<f64>,
 
-        /// Model for FLIP-triggered verification agents (default: opus)
-        #[arg(long, name = "flip-verification-model")]
-        flip_verification_model: Option<String>,
 
         /// Enable/disable chat history persistence across TUI restarts
         #[arg(long, name = "chat-history")]

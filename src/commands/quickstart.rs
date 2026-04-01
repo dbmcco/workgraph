@@ -766,8 +766,7 @@ fn json_output() -> serde_json::Value {
             "list": "wg config --list (merged config with source annotations)",
             "global": "wg config --global (target ~/.workgraph/config.toml)",
             "local": "wg config --local (target .workgraph/config.toml)",
-            "creator_agent": "wg config --creator-agent <hash>",
-            "creator_model": "wg config --creator-model <model>"
+            "creator_agent": "wg config --creator-agent <hash>"
         },
         "context_scopes": {
             "description": "Control how much context the coordinator injects into agent prompts.",

@@ -1312,8 +1312,8 @@ Begin working on the task now.
         }];
         setup_workgraph(&wg_dir, vec![task]);
 
-        // Write config so wg evaluate uses our test model
-        let config_content = format!("[agency]\nevaluator_model = \"{}\"\n", model);
+        // Write config with models section for evaluator
+        let config_content = format!("[models.evaluator]\nmodel = \"{}\"\n", model);
         fs::write(wg_dir.join("config.toml"), &config_content).unwrap();
 
         // Run wg evaluate directly (it spawns its own claude process internally)
