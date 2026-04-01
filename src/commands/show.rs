@@ -270,6 +270,44 @@ fn print_human_readable(details: &TaskDetails) {
         println!("Agent: {}", agent);
     }
 
+    // Verify status
+    if details.verify.is_some() || details.verify_failures > 0 {
+        println!();
+        println!("Verify:");
+        if let Some(ref cmd) = details.verify {
+            println!("  Command: {}", cmd);
+        }
+        if details.verify_failures > 0 {
+            let breaker_tripped = details.status == Status::Failed
+                && details
+                    .log
+                    .iter()
+                    .any(|e| e.actor.as_deref() == Some("verify-circuit-breaker"));
+            println!("  Failures: {}", details.verify_failures);
+            if breaker_tripped {
+                println!("  Circuit breaker: \x1b[31mTRIPPED\x1b[0m");
+            }
+            // Show last verify error from log
+            if let Some(last_err) = details
+                .log
+                .iter()
+                .rev()
+                .find(|e| e.actor.as_deref() == Some("verify"))
+            {
+                // Extract stderr from the log message
+                if let Some(stderr_pos) = last_err.message.find("\nstderr: ") {
+                    let stderr = &last_err.message[stderr_pos + 9..];
+                    // Trim at next section or end
+                    let stderr = stderr
+                        .find("\nstdout: ")
+                        .map(|p| &stderr[..p])
+                        .unwrap_or(stderr);
+                    println!("  Last error: {}", stderr.trim());
+                }
+            }
+        }
+    }
+
     // Failure info
     if (details.status == Status::Failed || details.status == Status::Abandoned)
         && let Some(ref reason) = details.failure_reason
@@ -712,5 +750,83 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let result = run(temp_dir.path(), "t1", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_show_verify_status_in_json() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+        let mut graph = WorkGraph::new();
+
+        let mut task = make_task("t1", "Verify task");
+        task.verify = Some("cargo test".to_string());
+        task.verify_failures = 2;
+        task.status = Status::InProgress;
+        task.log.push(workgraph::graph::LogEntry {
+            timestamp: "2026-01-01T00:00:00+00:00".to_string(),
+            actor: Some("verify".to_string()),
+            user: None,
+            message: "Verify FAILED (exit code 1, attempt 2/3). Command: cargo test\nstderr: test failed".to_string(),
+        });
+        graph.add_node(Node::Task(task));
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        let result = run(temp_dir.path(), "t1", true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_show_verify_failures_display() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+        let mut graph = WorkGraph::new();
+
+        let mut task = make_task("t1", "Verify task");
+        task.verify = Some("cargo test".to_string());
+        task.verify_failures = 2;
+        task.status = Status::InProgress;
+        graph.add_node(Node::Task(task));
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        // Should not panic and should succeed
+        let result = run(temp_dir.path(), "t1", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_show_verify_circuit_breaker_tripped() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+        let mut graph = WorkGraph::new();
+
+        let mut task = make_task("t1", "CB task");
+        task.verify = Some("cargo test".to_string());
+        task.verify_failures = 3;
+        task.status = Status::Failed;
+        task.failure_reason = Some("Circuit breaker tripped".to_string());
+        task.log.push(workgraph::graph::LogEntry {
+            timestamp: "2026-01-01T00:00:00+00:00".to_string(),
+            actor: Some("verify-circuit-breaker".to_string()),
+            user: None,
+            message: "Circuit breaker tripped: verify command failed 3 times".to_string(),
+        });
+        graph.add_node(Node::Task(task));
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        let result = run(temp_dir.path(), "t1", false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_show_no_verify_section_when_no_verify() {
+        // A task without verify should not display verify section
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "No verify task")));
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        let result = run(temp_dir.path(), "t1", false);
+        assert!(result.is_ok());
     }
 }
