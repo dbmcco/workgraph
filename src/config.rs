@@ -2781,7 +2781,7 @@ impl Config {
             // Model has provider:model format — check the provider
             !is_anthropic_provider(p)
         } else {
-            // Bare model — use '/' heuristic as fallback (e.g. "deepseek/deepseek-v3")
+            // Bare model — use '/' heuristic as fallback (e.g. "deepseek/deepseek-chat")
             spec.model_id.contains('/') && !spec.model_id.starts_with("anthropic/")
         };
         if executor == "claude" && model_looks_non_anthropic {
@@ -4386,23 +4386,23 @@ model = "claude:haiku"
 
     #[test]
     fn test_registry_resolve_step1_custom_registry_entry() {
-        // Step 1: custom registry entry "deepseek-chat-v3" resolves to full path
+        // Step 1: custom registry entry "deepseek-chat" resolves to full path
         let mut config = Config::default();
         config.model_registry = vec![ModelRegistryEntry {
-            id: "deepseek-chat-v3".into(),
+            id: "deepseek-chat".into(),
             provider: "deepseek".into(),
-            model: "deepseek/deepseek-chat-v3".into(),
+            model: "deepseek/deepseek-chat".into(),
             tier: Tier::Standard,
             ..Default::default()
         }];
         config.models.evaluator = Some(RoleModelConfig {
-            model: Some("deepseek-chat-v3".to_string()),
+            model: Some("deepseek-chat".to_string()),
             provider: None,
             tier: None,
             endpoint: None,
         });
         let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
-        assert_eq!(resolved.model, "deepseek/deepseek-chat-v3");
+        assert_eq!(resolved.model, "deepseek/deepseek-chat");
         assert_eq!(resolved.provider, Some("deepseek".to_string()));
         assert!(resolved.registry_entry.is_some());
     }

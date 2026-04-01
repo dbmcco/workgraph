@@ -219,7 +219,7 @@ impl ModelRegistry {
                 tier: ModelTier::Budget,
             },
             ModelEntry {
-                id: "deepseek/deepseek-chat-v3".into(),
+                id: "deepseek/deepseek-chat".into(),
                 provider: "openrouter".into(),
                 cost_per_1m_input: 0.30,
                 cost_per_1m_output: 0.88,
@@ -444,7 +444,7 @@ mod tests {
         assert!(reg.models.len() >= 10);
         assert!(reg.models.contains_key("anthropic/claude-opus-4-6"));
         assert!(reg.models.contains_key("openai/gpt-4o"));
-        assert!(reg.models.contains_key("deepseek/deepseek-chat-v3"));
+        assert!(reg.models.contains_key("deepseek/deepseek-chat"));
     }
 
     #[test]
@@ -555,7 +555,7 @@ mod tests {
         assert!(reg.supports_tool_use("anthropic/claude-opus-4-6"));
         assert!(reg.supports_tool_use("openai/gpt-4o"));
         assert!(reg.supports_tool_use("google/gemini-2.5-pro"));
-        assert!(reg.supports_tool_use("deepseek/deepseek-chat-v3"));
+        assert!(reg.supports_tool_use("deepseek/deepseek-chat"));
 
         // DeepSeek R1 reasoning model does NOT support tools
         assert!(!reg.supports_tool_use("deepseek/deepseek-r1"));
