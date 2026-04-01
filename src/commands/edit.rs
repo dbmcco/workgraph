@@ -48,6 +48,16 @@ pub fn run(
         }
     }
 
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg update {} --model {}:MODEL",
+            task_id, suggested_provider,
+        );
+    }
+
     // Validate model uses provider:model format
     if let Some(m) = model {
         if let Err(e) = workgraph::config::parse_model_spec_strict(m) {

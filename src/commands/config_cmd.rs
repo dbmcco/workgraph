@@ -442,16 +442,22 @@ pub fn update(
     }
 
     if let Some(p) = coordinator_provider {
-        anyhow::bail!(
-            "--coordinator-provider is deprecated. Use provider:model format in --coordinator-model instead.\n\
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        let current_model_raw = config
+            .coordinator
+            .model
+            .as_deref()
+            .unwrap_or(&config.agent.model);
+        // Extract just the model ID (strip any existing provider prefix)
+        let current_model_id = workgraph::config::parse_model_spec(current_model_raw).model_id;
+        eprintln!(
+            "Warning: --coordinator-provider is deprecated. Use provider:model format in --coordinator-model instead.\n\
              Example: wg config --coordinator-model {}:{}",
-            if p == "anthropic" { "claude" } else { p },
-            config
-                .coordinator
-                .model
-                .as_deref()
-                .unwrap_or(&config.agent.model),
+            suggested_provider, current_model_id,
         );
+        config.coordinator.provider = Some(p.to_string());
+        println!("Set coordinator.provider = \"{}\"", p);
+        changed = true;
     }
 
     // Agency settings
@@ -1083,6 +1089,13 @@ pub fn update_model_routing(
         config.models.set_model(role, model);
         println!("Set models.{}.model = \"{}\"", role, model);
 
+        // Auto-populate provider from provider:model spec
+        let spec = workgraph::config::parse_model_spec(model);
+        if let Some(ref provider) = spec.provider {
+            config.models.set_provider(role, provider);
+            println!("Set models.{}.provider = \"{}\" (from provider:model)", role, provider);
+        }
+
         // Validate: warn if model ID is not in the registry
         let spec = workgraph::config::parse_model_spec(model);
         let lookup_id = &spec.model_id;
@@ -1116,16 +1129,20 @@ pub fn update_model_routing(
         }
         let role_name = &args[0];
         let provider = &args[1];
-        anyhow::bail!(
-            "--set-provider is deprecated. Use provider:model format in --set-model instead.\n\
+        let suggested_provider = if provider == "anthropic" {
+            "claude"
+        } else {
+            provider
+        };
+        eprintln!(
+            "Warning: --set-provider is deprecated. Use provider:model format in --set-model instead.\n\
              Example: wg config --set-model {} {}:MODEL",
-            role_name,
-            if provider == "anthropic" {
-                "claude"
-            } else {
-                provider
-            },
+            role_name, suggested_provider,
         );
+        let role: DispatchRole = role_name.parse()?;
+        config.models.set_provider(role, provider);
+        println!("Set models.{}.provider = \"{}\"", role, provider);
+        changed = true;
     }
 
     if let Some(args) = set_endpoint {

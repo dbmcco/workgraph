@@ -99,7 +99,7 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Provider for this task (anthropic, openai, openrouter, local)
+        /// [DEPRECATED] Provider for this task — use provider:model format in --model instead
         #[arg(long)]
         provider: Option<String>,
 
@@ -206,7 +206,7 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Update provider for this task
+        /// [DEPRECATED] Update provider — use provider:model format in --model instead
         #[arg(long)]
         provider: Option<String>,
 
@@ -1157,7 +1157,7 @@ pub enum Commands {
         #[arg(long)]
         coordinator_model: Option<String>,
 
-        /// Set coordinator provider (e.g., openrouter, anthropic)
+        /// [DEPRECATED] Set coordinator provider — use provider:model in --coordinator-model instead
         #[arg(long)]
         coordinator_provider: Option<String>,
 
@@ -1369,7 +1369,7 @@ pub enum Commands {
         #[arg(long = "set-model", num_args = 2, value_names = ["ROLE", "MODEL"])]
         set_model: Option<Vec<String>>,
 
-        /// Set provider for a dispatch role: --set-provider <role> <provider>
+        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
         #[arg(long = "set-provider", num_args = 2, value_names = ["ROLE", "PROVIDER"])]
         set_provider: Option<Vec<String>>,
 
@@ -1383,7 +1383,7 @@ pub enum Commands {
         #[arg(long = "role-model", value_name = "ROLE=MODEL")]
         role_model: Option<String>,
 
-        /// Set provider for a dispatch role: --role-provider <role>=<provider>
+        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
         /// Equivalent to --set-provider but uses key=value syntax.
         #[arg(long = "role-provider", value_name = "ROLE=PROVIDER")]
         role_provider: Option<String>,

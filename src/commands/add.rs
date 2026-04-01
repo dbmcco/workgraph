@@ -101,6 +101,16 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg add \"...\" --model {}:MODEL",
+            suggested_provider,
+        );
+    }
+
     // Validate model uses provider:model format
     if let Some(m) = model {
         if let Err(e) = workgraph::config::parse_model_spec_strict(m) {
@@ -438,6 +448,16 @@ pub fn run_remote(
 
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
+    }
+
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg add \"...\" --model {}:MODEL",
+            suggested_provider,
+        );
     }
 
     // Validate model uses provider:model format
