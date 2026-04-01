@@ -2332,6 +2332,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     let in_coordinator_bar =
         app.last_coordinator_bar_area.height > 0 && app.last_coordinator_bar_area.contains(pos);
     let in_divider = app.last_divider_area.width > 0 && app.last_divider_area.contains(pos);
+    let in_horizontal_divider = app.last_horizontal_divider_area.height > 0
+        && app.last_horizontal_divider_area.contains(pos);
     let in_minimized_strip =
         app.last_minimized_strip_area.width > 0 && app.last_minimized_strip_area.contains(pos);
     let in_fullscreen_restore = app.last_fullscreen_restore_area.width > 0
@@ -2343,8 +2345,10 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     let in_fullscreen_bottom = app.last_fullscreen_bottom_border_area.height > 0
         && app.last_fullscreen_bottom_border_area.contains(pos);
 
-    // Track hover state for the divider (visual indicator).
+    // Track hover state for the dividers (visual indicator).
     app.divider_hover = in_divider || app.scrollbar_drag == Some(ScrollbarDragTarget::Divider);
+    app.horizontal_divider_hover = in_horizontal_divider
+        || app.scrollbar_drag == Some(ScrollbarDragTarget::HorizontalDivider);
     // Track hover state for tri-state strips.
     app.minimized_strip_hover = in_minimized_strip;
     app.fullscreen_restore_hover = in_fullscreen_restore;
@@ -2553,8 +2557,42 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.divider_drag_start_pct = pct;
                 app.divider_drag_start_col = column;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
-            } else if in_fullscreen_right || in_fullscreen_top || in_fullscreen_bottom {
-                // Click on any fullscreen border: restore to normal split.
+            } else if in_fullscreen_top {
+                // Click on full-screen top border: transition to stacked split
+                // and start horizontal divider drag so user can fine-tune position.
+                app.right_panel_visible = true;
+                let total_height = {
+                    let top_h = app.last_fullscreen_top_border_area.height;
+                    let bottom_h = app.last_fullscreen_bottom_border_area.height;
+                    app.last_right_panel_area.height + top_h + bottom_h
+                }
+                .max(1);
+                let border_row =
+                    app.last_fullscreen_top_border_area.y + app.last_fullscreen_top_border_area.height;
+                let panel_height = (app.last_fullscreen_top_border_area.y + total_height)
+                    .saturating_sub(border_row);
+                let pct =
+                    ((panel_height as u32 * 100) / total_height as u32).clamp(1, 99) as u16;
+                app.right_panel_percent = pct;
+                app.layout_mode = super::state::VizApp::layout_mode_for_percent(pct);
+                if pct > 0 && pct < 100 {
+                    app.last_split_percent = pct;
+                    app.last_split_mode = app.layout_mode;
+                }
+                // Pre-update layout areas so drag handler has consistent total_height.
+                let panel_h = (total_height as u32 * pct as u32 / 100) as u16;
+                let graph_h = total_height.saturating_sub(panel_h);
+                app.last_graph_area.y = app.last_fullscreen_top_border_area.y;
+                app.last_graph_area.height = graph_h;
+                app.last_right_panel_area.y =
+                    app.last_fullscreen_top_border_area.y + graph_h;
+                app.last_right_panel_area.height = panel_h;
+                app.inspector_is_beside = false;
+                app.divider_drag_start_pct = pct;
+                app.divider_drag_start_row = row;
+                app.scrollbar_drag = Some(ScrollbarDragTarget::HorizontalDivider);
+            } else if in_fullscreen_right || in_fullscreen_bottom {
+                // Click on other fullscreen borders: restore to normal split.
                 app.restore_from_extreme();
             } else if in_graph_vscrollbar {
                 // Click on graph vertical scrollbar: start drag and jump.
@@ -2579,6 +2617,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.divider_drag_start_pct = app.right_panel_percent;
                 app.divider_drag_start_col = column;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Divider);
+            } else if in_horizontal_divider {
+                // Click on horizontal divider (stacked mode): start resize drag.
+                app.divider_drag_start_pct = app.right_panel_percent;
+                app.divider_drag_start_row = row;
+                app.scrollbar_drag = Some(ScrollbarDragTarget::HorizontalDivider);
             } else if in_graph_hscrollbar {
                 app.focused_panel = FocusedPanel::Graph;
                 app.scrollbar_drag = Some(ScrollbarDragTarget::GraphHorizontal);
@@ -2873,6 +2916,33 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         super::state::VizApp::layout_mode_for_percent(pct)
                     };
                 }
+            } else if app.scrollbar_drag == Some(ScrollbarDragTarget::HorizontalDivider) {
+                // Dragging the horizontal divider (stacked mode): compute new
+                // right_panel_percent from mouse row.
+                let total_height =
+                    if app.last_graph_area.height > 0 && app.last_right_panel_area.height > 0 {
+                        app.last_graph_area.height + app.last_right_panel_area.height
+                    } else {
+                        0
+                    };
+                if total_height > 0 {
+                    // Delta-based percent: dragging DOWN (positive delta) shrinks
+                    // the inspector (bottom panel), dragging UP grows it.
+                    let delta = row as i32 - app.divider_drag_start_row as i32;
+                    let delta_pct = delta * 100 / total_height as i32;
+                    let pct = (app.divider_drag_start_pct as i32 - delta_pct).clamp(0, 100) as u16;
+                    app.right_panel_percent = pct;
+                    app.right_panel_visible = true;
+                    if pct > 0 && pct < 100 {
+                        app.last_split_percent = pct;
+                        app.last_split_mode = app.layout_mode;
+                    }
+                    app.layout_mode = if pct >= 100 {
+                        super::state::LayoutMode::TwoThirdsInspector
+                    } else {
+                        super::state::VizApp::layout_mode_for_percent(pct)
+                    };
+                }
             } else if app.scrollbar_drag == Some(ScrollbarDragTarget::Graph) {
                 app.record_graph_scroll_activity();
                 vscrollbar_jump_graph(app, row);
@@ -2906,7 +2976,9 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
         }
         MouseEventKind::Up(MouseButton::Left) => {
             // Finalize layout mode when divider drag ends at an extreme.
-            if app.scrollbar_drag == Some(ScrollbarDragTarget::Divider) {
+            if app.scrollbar_drag == Some(ScrollbarDragTarget::Divider)
+                || app.scrollbar_drag == Some(ScrollbarDragTarget::HorizontalDivider)
+            {
                 if app.right_panel_percent >= 100 {
                     app.layout_mode = super::state::LayoutMode::FullInspector;
                     app.right_panel_visible = true;
@@ -2922,6 +2994,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.divider_drag_offset = 0;
                 app.divider_drag_start_pct = 0;
                 app.divider_drag_start_col = 0;
+                app.divider_drag_start_row = 0;
             }
             app.graph_pan_last = None;
         }
@@ -5157,6 +5230,7 @@ mod scrollbar_tests {
         app.last_graph_area = Rect::default();
         // Clear any areas that shouldn't be active in FullInspector.
         app.last_divider_area = Rect::default();
+        app.last_horizontal_divider_area = Rect::default();
         app.last_graph_scrollbar_area = Rect::default();
         app.last_panel_scrollbar_area = Rect::default();
         app.last_graph_hscrollbar_area = Rect::default();
@@ -5284,6 +5358,418 @@ mod scrollbar_tests {
                 click_col,
             );
         }
+    }
+
+    // ── Horizontal divider drag tests (stacked mode) ──
+
+    #[test]
+    fn horizontal_divider_click_starts_drag() {
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70; // Narrow — will be stacked
+
+        let start_pct: u16 = 35;
+        let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+        let graph_height = total_height - panel_height;
+
+        app.right_panel_percent = start_pct;
+        app.right_panel_visible = true;
+        app.inspector_is_beside = false;
+        app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: total_width,
+            height: graph_height,
+        };
+        app.last_right_panel_area = Rect {
+            x: 0,
+            y: graph_height,
+            width: total_width,
+            height: panel_height,
+        };
+        // Horizontal divider: 3 rows centered on the inspector top border.
+        app.last_horizontal_divider_area = Rect {
+            x: 0,
+            y: graph_height.saturating_sub(1),
+            width: total_width,
+            height: 3,
+        };
+        // Clear vertical divider and other irrelevant areas.
+        app.last_divider_area = Rect::default();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.scrollbar_drag = None;
+
+        // Click on the horizontal divider.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            graph_height,
+            10,
+        );
+        assert_eq!(
+            app.scrollbar_drag,
+            Some(ScrollbarDragTarget::HorizontalDivider),
+            "clicking horizontal divider should start horizontal drag"
+        );
+        assert_eq!(app.divider_drag_start_pct, start_pct);
+        assert_eq!(app.divider_drag_start_row, graph_height);
+    }
+
+    #[test]
+    fn horizontal_divider_drag_up_grows_inspector() {
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70;
+
+        let start_pct: u16 = 35;
+        let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+        let graph_height = total_height - panel_height;
+
+        app.right_panel_percent = start_pct;
+        app.right_panel_visible = true;
+        app.inspector_is_beside = false;
+        app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: total_width,
+            height: graph_height,
+        };
+        app.last_right_panel_area = Rect {
+            x: 0,
+            y: graph_height,
+            width: total_width,
+            height: panel_height,
+        };
+        app.last_horizontal_divider_area = Rect {
+            x: 0,
+            y: graph_height.saturating_sub(1),
+            width: total_width,
+            height: 3,
+        };
+        app.last_divider_area = Rect::default();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.scrollbar_drag = None;
+
+        let click_row = graph_height;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            click_row,
+            10,
+        );
+
+        // Drag UP by 4 rows: inspector should grow.
+        let drag_row = click_row - 4;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_row,
+            10,
+        );
+        // delta = drag_row - click_row = -4, delta_pct = -4 * 100 / 40 = -10
+        // pct = 35 - (-10) = 45
+        assert!(
+            app.right_panel_percent > start_pct,
+            "dragging UP should grow inspector: got {} (expected > {start_pct})",
+            app.right_panel_percent
+        );
+        assert_eq!(app.right_panel_percent, 45);
+    }
+
+    #[test]
+    fn horizontal_divider_drag_down_shrinks_inspector() {
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70;
+
+        let start_pct: u16 = 50;
+        let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+        let graph_height = total_height - panel_height;
+
+        app.right_panel_percent = start_pct;
+        app.right_panel_visible = true;
+        app.inspector_is_beside = false;
+        app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: total_width,
+            height: graph_height,
+        };
+        app.last_right_panel_area = Rect {
+            x: 0,
+            y: graph_height,
+            width: total_width,
+            height: panel_height,
+        };
+        app.last_horizontal_divider_area = Rect {
+            x: 0,
+            y: graph_height.saturating_sub(1),
+            width: total_width,
+            height: 3,
+        };
+        app.last_divider_area = Rect::default();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.scrollbar_drag = None;
+
+        let click_row = graph_height;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            click_row,
+            10,
+        );
+
+        // Drag DOWN by 4 rows: inspector should shrink.
+        let drag_row = click_row + 4;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_row,
+            10,
+        );
+        // delta = 4, delta_pct = 4 * 100 / 40 = 10
+        // pct = 50 - 10 = 40
+        assert!(
+            app.right_panel_percent < start_pct,
+            "dragging DOWN should shrink inspector: got {} (expected < {start_pct})",
+            app.right_panel_percent
+        );
+        assert_eq!(app.right_panel_percent, 40);
+    }
+
+    #[test]
+    fn horizontal_divider_percent_clamped_at_extremes() {
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70;
+
+        let start_pct: u16 = 10;
+        let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+        let graph_height = total_height - panel_height;
+
+        app.right_panel_percent = start_pct;
+        app.right_panel_visible = true;
+        app.inspector_is_beside = false;
+        app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: total_width,
+            height: graph_height,
+        };
+        app.last_right_panel_area = Rect {
+            x: 0,
+            y: graph_height,
+            width: total_width,
+            height: panel_height,
+        };
+        app.last_horizontal_divider_area = Rect {
+            x: 0,
+            y: graph_height.saturating_sub(1),
+            width: total_width,
+            height: 3,
+        };
+        app.last_divider_area = Rect::default();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.scrollbar_drag = None;
+
+        let click_row = graph_height;
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            click_row,
+            10,
+        );
+
+        // Drag far DOWN past the bottom: percent should clamp at 0.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            click_row + 50,
+            10,
+        );
+        assert_eq!(
+            app.right_panel_percent, 0,
+            "percent should clamp at 0 when dragged far down"
+        );
+
+        // Release and check finalization.
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            click_row + 50,
+            10,
+        );
+        assert_eq!(
+            app.layout_mode,
+            super::super::state::LayoutMode::Off,
+            "should finalize to Off when percent is 0"
+        );
+    }
+
+    #[test]
+    fn horizontal_divider_drag_no_snap_on_same_row() {
+        // Like the vertical divider no-snap test: first drag at same row should
+        // not change percent.
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70;
+
+        for start_pct in [33u16, 50, 67, 25, 80] {
+            let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+            let graph_height = total_height - panel_height;
+
+            app.right_panel_percent = start_pct;
+            app.right_panel_visible = true;
+            app.inspector_is_beside = false;
+            app.layout_mode = super::super::state::VizApp::layout_mode_for_percent(start_pct);
+            app.last_graph_area = Rect {
+                x: 0,
+                y: 0,
+                width: total_width,
+                height: graph_height,
+            };
+            app.last_right_panel_area = Rect {
+                x: 0,
+                y: graph_height,
+                width: total_width,
+                height: panel_height,
+            };
+            app.last_horizontal_divider_area = Rect {
+                x: 0,
+                y: graph_height.saturating_sub(1),
+                width: total_width,
+                height: 3,
+            };
+            app.last_divider_area = Rect::default();
+            app.last_graph_scrollbar_area = Rect::default();
+            app.last_panel_scrollbar_area = Rect::default();
+            app.last_graph_hscrollbar_area = Rect::default();
+            app.last_minimized_strip_area = Rect::default();
+            app.last_fullscreen_restore_area = Rect::default();
+            app.last_fullscreen_right_border_area = Rect::default();
+            app.last_fullscreen_top_border_area = Rect::default();
+            app.last_fullscreen_bottom_border_area = Rect::default();
+            app.scrollbar_drag = None;
+
+            let click_row = graph_height;
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                click_row,
+                10,
+            );
+            let pct_before = app.right_panel_percent;
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                click_row,
+                10,
+            );
+            assert_eq!(
+                app.right_panel_percent, pct_before,
+                "pct={start_pct}: drag at same row should not change percent"
+            );
+
+            handle_mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                click_row,
+                10,
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_divider_mouseup_clears_state() {
+        let (mut app, _tmp) = build_test_app();
+        let total_height: u16 = 40;
+        let total_width: u16 = 70;
+
+        let start_pct: u16 = 50;
+        let panel_height = (total_height as u32 * start_pct as u32 / 100) as u16;
+        let graph_height = total_height - panel_height;
+
+        app.right_panel_percent = start_pct;
+        app.right_panel_visible = true;
+        app.inspector_is_beside = false;
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: total_width,
+            height: graph_height,
+        };
+        app.last_right_panel_area = Rect {
+            x: 0,
+            y: graph_height,
+            width: total_width,
+            height: panel_height,
+        };
+        app.last_horizontal_divider_area = Rect {
+            x: 0,
+            y: graph_height.saturating_sub(1),
+            width: total_width,
+            height: 3,
+        };
+        app.last_divider_area = Rect::default();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.scrollbar_drag = None;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            graph_height,
+            10,
+        );
+        assert!(app.scrollbar_drag.is_some());
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            graph_height,
+            10,
+        );
+        assert_eq!(app.scrollbar_drag, None, "scrollbar_drag should be cleared");
+        assert_eq!(app.divider_drag_start_row, 0, "drag_start_row should be reset");
+        assert_eq!(app.divider_drag_start_pct, 0, "drag_start_pct should be reset");
     }
 }
 

@@ -2162,19 +2162,36 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let is_full_panel = app.layout_mode == LayoutMode::FullInspector;
 
-    // Store divider hit area: the left border column of the panel (± 1 col for easier grab).
-    // Only meaningful in split mode where both panels are visible.
-    if !is_full_panel && area.width > 0 && app.last_graph_area.width > 0 {
+    // Store divider hit areas for mouse-based resize.
+    // Vertical divider: only in side-by-side mode (inspector beside graph).
+    // Horizontal divider: only in stacked mode (inspector below graph).
+    if !is_full_panel && area.width > 0 && app.last_graph_area.width > 0 && app.inspector_is_beside
+    {
         // Hit area: 3 columns centered on the left border for easier grabbing.
         let div_x = area.x.saturating_sub(1);
         let div_w = 3.min(area.x.saturating_sub(app.last_graph_area.x) + 1);
         app.last_divider_area = Rect::new(div_x, area.y, div_w, area.height);
+        app.last_horizontal_divider_area = Rect::default();
+    } else if !is_full_panel
+        && area.height > 0
+        && app.last_graph_area.height > 0
+        && !app.inspector_is_beside
+    {
+        // Hit area: 3 rows centered on the top border for easier grabbing.
+        let div_y = area.y.saturating_sub(1);
+        let div_h = 3.min(area.y.saturating_sub(app.last_graph_area.y) + 1);
+        app.last_horizontal_divider_area =
+            Rect::new(area.x, div_y, area.width, div_h);
+        app.last_divider_area = Rect::default();
     } else {
         app.last_divider_area = Rect::default();
+        app.last_horizontal_divider_area = Rect::default();
     }
 
-    let divider_active =
-        app.divider_hover || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::Divider);
+    let divider_active = app.divider_hover
+        || app.horizontal_divider_hover
+        || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::Divider)
+        || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::HorizontalDivider);
 
     // In full-panel mode: no borders (edge-to-edge content for clean copy-paste).
     // In split mode: minimal single-line border, dim when unfocused.

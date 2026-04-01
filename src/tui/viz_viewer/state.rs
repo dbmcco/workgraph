@@ -550,6 +550,8 @@ pub enum ScrollbarDragTarget {
     PanelHorizontal,
     /// Dragging the vertical divider between graph and inspector panels.
     Divider,
+    /// Dragging the horizontal divider between graph (top) and inspector (bottom) in stacked mode.
+    HorizontalDivider,
 }
 
 /// Sort mode for task ordering in the graph view.
@@ -3212,6 +3214,10 @@ pub struct VizApp {
     pub last_divider_area: Rect,
     /// Whether the mouse is hovering over the divider.
     pub divider_hover: bool,
+    /// The horizontal divider row between graph (top) and inspector (bottom) in stacked mode.
+    pub last_horizontal_divider_area: Rect,
+    /// Whether the mouse is hovering over the horizontal divider.
+    pub horizontal_divider_hover: bool,
     /// The last "normal" split mode. Used to restore from FullInspector or Off.
     pub last_split_mode: LayoutMode,
     /// The last "normal" split percentage. Used to restore from FullInspector or Off.
@@ -3508,6 +3514,8 @@ pub struct VizApp {
     pub divider_drag_start_pct: u16,
     /// The column where the divider drag started.
     pub divider_drag_start_col: u16,
+    /// The row where a horizontal divider drag started.
+    pub divider_drag_start_row: u16,
     /// Last mouse position during a graph-body drag-to-pan gesture (col, row).
     pub graph_pan_last: Option<(u16, u16)>,
 
@@ -3660,6 +3668,8 @@ impl VizApp {
             last_right_panel_area: Rect::default(),
             last_divider_area: Rect::default(),
             divider_hover: false,
+            last_horizontal_divider_area: Rect::default(),
+            horizontal_divider_hover: false,
             last_split_mode: LayoutMode::TwoThirdsInspector,
             last_split_percent: 67,
             last_minimized_strip_area: Rect::default(),
@@ -3777,6 +3787,7 @@ impl VizApp {
             divider_drag_offset: 0,
             divider_drag_start_pct: 0,
             divider_drag_start_col: 0,
+            divider_drag_start_row: 0,
             graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
@@ -7420,6 +7431,8 @@ impl VizApp {
             last_right_panel_area: Rect::default(),
             last_divider_area: Rect::default(),
             divider_hover: false,
+            last_horizontal_divider_area: Rect::default(),
+            horizontal_divider_hover: false,
             last_split_mode: LayoutMode::TwoThirdsInspector,
             last_split_percent: 67,
             last_minimized_strip_area: Rect::default(),
@@ -7529,6 +7542,7 @@ impl VizApp {
             divider_drag_offset: 0,
             divider_drag_start_pct: 0,
             divider_drag_start_col: 0,
+            divider_drag_start_row: 0,
             graph_pan_last: None,
             last_graph_scrollbar_area: Rect::default(),
             last_panel_scrollbar_area: Rect::default(),
