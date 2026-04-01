@@ -5,7 +5,10 @@
 //! benchmark registry. Explicit `[tiers]` entries and per-role `[models]` overrides
 //! always take precedence over profile defaults.
 
-use crate::config::TierConfig;
+use crate::config::{Tier, TierConfig};
+use crate::model_benchmarks::RankedTiers;
+use anyhow::{Context, Result};
+use std::path::Path;
 
 /// A provider profile: a named configuration that maps quality tiers to models.
 #[derive(Debug, Clone)]
@@ -102,6 +105,150 @@ pub fn get_profile(name: &str) -> Option<Profile> {
     builtin_profiles().into_iter().find(|p| p.name == name)
 }
 
+/// File name for the cached ranked tiers (inside .workgraph/).
+const RANKED_TIERS_FILE: &str = "profile_ranked_tiers.json";
+
+/// Load ranked tiers from `.workgraph/profile_ranked_tiers.json`.
+pub fn load_ranked_tiers(dir: &Path) -> Result<Option<RankedTiers>> {
+    let path = dir.join(RANKED_TIERS_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let ranked: RankedTiers = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(Some(ranked))
+}
+
+/// Result of a model escalation attempt.
+#[derive(Debug, Clone)]
+pub struct EscalationResult {
+    /// The next model to try (with provider prefix, e.g. "openrouter:google/gemini-2.0-flash-001").
+    pub model: String,
+    /// Human-readable reason for the escalation.
+    pub reason: String,
+}
+
+/// Tier escalation order: fast → standard → premium.
+fn tier_escalation_order() -> Vec<Tier> {
+    vec![Tier::Fast, Tier::Standard, Tier::Premium]
+}
+
+/// Get the tier name string for a `Tier` variant.
+fn tier_name(tier: &Tier) -> &'static str {
+    match tier {
+        Tier::Fast => "fast",
+        Tier::Standard => "standard",
+        Tier::Premium => "premium",
+    }
+}
+
+/// Get the ranked list for a given tier from `RankedTiers`.
+fn ranked_for_tier<'a>(ranked: &'a RankedTiers, tier: &Tier) -> &'a [crate::model_benchmarks::RankedModel] {
+    match tier {
+        Tier::Fast => &ranked.fast,
+        Tier::Standard => &ranked.standard,
+        Tier::Premium => &ranked.premium,
+    }
+}
+
+/// Attempt to escalate to the next model in the ranked tier list.
+///
+/// Given a list of already-tried models, finds the next untried model in the
+/// current tier's ranked list. If the current tier is exhausted, escalates to the
+/// next tier up (fast → standard → premium), up to `max_escalation_depth` tiers.
+///
+/// Returns `None` if:
+/// - The profile is static (no ranked lists)
+/// - No ranked tiers file exists
+/// - All models in all tiers up to max_escalation_depth have been tried
+pub fn escalate_model(
+    dir: &Path,
+    profile_name: Option<&str>,
+    current_model: Option<&str>,
+    tried_models: &[String],
+    max_escalation_depth: u32,
+) -> Option<EscalationResult> {
+    // Only escalate for dynamic profiles
+    let profile = profile_name.and_then(get_profile)?;
+    if profile.is_static() {
+        return None;
+    }
+
+    let ranked = load_ranked_tiers(dir).ok()??;
+
+    // Determine the starting tier from the current model
+    let starting_tier = current_model
+        .and_then(|m| find_model_tier(&ranked, m))
+        .unwrap_or(Tier::Fast);
+
+    let escalation_order = tier_escalation_order();
+    let start_idx = escalation_order
+        .iter()
+        .position(|t| *t == starting_tier)
+        .unwrap_or(0);
+
+    // Walk tiers from starting tier upward, limited by max_escalation_depth
+    let max_tiers = if max_escalation_depth == 0 {
+        1 // Only within current tier
+    } else {
+        max_escalation_depth as usize
+    };
+
+    for tier_offset in 0..max_tiers.min(escalation_order.len()) {
+        let tier_idx = start_idx + tier_offset;
+        if tier_idx >= escalation_order.len() {
+            break;
+        }
+        let tier = &escalation_order[tier_idx];
+        let candidates = ranked_for_tier(&ranked, tier);
+
+        for (rank, candidate) in candidates.iter().enumerate() {
+            let prefixed_id = format!("openrouter:{}", candidate.id);
+            // Skip models already tried (check both raw and prefixed forms)
+            if tried_models.iter().any(|t| t == &candidate.id || t == &prefixed_id) {
+                continue;
+            }
+            let is_same_tier = tier_offset == 0;
+            let reason = if is_same_tier {
+                format!(
+                    "rank {} in {}-class",
+                    rank + 1,
+                    tier_name(tier),
+                )
+            } else {
+                format!(
+                    "escalated to {}-class rank {} (exhausted {}-class)",
+                    tier_name(tier),
+                    rank + 1,
+                    tier_name(&escalation_order[start_idx]),
+                )
+            };
+            return Some(EscalationResult {
+                model: prefixed_id,
+                reason,
+            });
+        }
+    }
+
+    None
+}
+
+/// Find which tier a model belongs to in the ranked lists.
+fn find_model_tier(ranked: &RankedTiers, model: &str) -> Option<Tier> {
+    // Strip "openrouter:" prefix if present for matching
+    let bare = model.strip_prefix("openrouter:").unwrap_or(model);
+
+    for tier in tier_escalation_order() {
+        let candidates = ranked_for_tier(ranked, &tier);
+        if candidates.iter().any(|c| c.id == bare || c.id == model) {
+            return Some(tier);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +300,324 @@ mod tests {
         assert_eq!(anthropic.strategy_label(), "static");
         let openrouter = get_profile("openrouter").unwrap();
         assert_eq!(openrouter.strategy_label(), "dynamic");
+    }
+
+    // ── Escalation tests ───────────────────────────────────────────────
+
+    use crate::model_benchmarks::{RankedModel, RankedTiers};
+    use tempfile::TempDir;
+
+    /// Write a RankedTiers fixture to the temp dir so escalate_model can load it.
+    fn write_ranked_tiers(dir: &std::path::Path, ranked: &RankedTiers) {
+        let path = dir.join(RANKED_TIERS_FILE);
+        let json = serde_json::to_string(ranked).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn make_ranked_model(id: &str, tier: &str) -> RankedModel {
+        RankedModel {
+            id: id.to_string(),
+            name: id.to_string(),
+            popularity_score: 80.0,
+            benchmark_score: 70.0,
+            composite_score: 75.0,
+            tier: tier.to_string(),
+        }
+    }
+
+    fn sample_ranked_tiers() -> RankedTiers {
+        RankedTiers {
+            fast: vec![
+                make_ranked_model("vendor/fast-a", "fast"),
+                make_ranked_model("vendor/fast-b", "fast"),
+            ],
+            standard: vec![
+                make_ranked_model("vendor/std-a", "standard"),
+                make_ranked_model("vendor/std-b", "standard"),
+                make_ranked_model("vendor/std-c", "standard"),
+            ],
+            premium: vec![
+                make_ranked_model("vendor/prem-a", "premium"),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_escalate_static_profile_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+        // Static profiles should never escalate
+        let result = escalate_model(
+            tmp.path(),
+            Some("anthropic"),
+            Some("claude:sonnet"),
+            &[],
+            3,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_no_profile_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+        let result = escalate_model(tmp.path(), None, Some("openrouter:vendor/std-a"), &[], 3);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_no_ranked_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        // Don't write the file
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &[],
+            3,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_picks_first_untried_in_same_tier() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // Current model is std-a, no models tried yet → should get std-a (rank 1)
+        // because std-a hasn't been recorded as tried
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &[],
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/std-a");
+        assert!(r.reason.contains("rank 1"));
+        assert!(r.reason.contains("standard-class"));
+    }
+
+    #[test]
+    fn test_escalate_skips_tried_model() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // std-a already tried → should get std-b
+        let tried = vec!["openrouter:vendor/std-a".to_string()];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/std-b");
+        assert!(r.reason.contains("rank 2"));
+        assert!(r.reason.contains("standard-class"));
+    }
+
+    #[test]
+    fn test_escalate_rotates_through_full_tier() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // std-a and std-b tried → should get std-c
+        let tried = vec![
+            "openrouter:vendor/std-a".to_string(),
+            "openrouter:vendor/std-b".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/std-c");
+        assert!(r.reason.contains("rank 3"));
+    }
+
+    #[test]
+    fn test_escalate_to_next_tier_when_current_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // All standard models tried → should escalate to premium
+        let tried = vec![
+            "openrouter:vendor/std-a".to_string(),
+            "openrouter:vendor/std-b".to_string(),
+            "openrouter:vendor/std-c".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/prem-a");
+        assert!(r.reason.contains("escalated to premium-class"));
+        assert!(r.reason.contains("exhausted standard-class"));
+    }
+
+    #[test]
+    fn test_escalate_returns_none_when_all_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // All standard and premium models tried
+        let tried = vec![
+            "openrouter:vendor/std-a".to_string(),
+            "openrouter:vendor/std-b".to_string(),
+            "openrouter:vendor/std-c".to_string(),
+            "openrouter:vendor/prem-a".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            3,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_depth_zero_stays_in_same_tier() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // All standard models tried, depth=0 → no tier escalation
+        let tried = vec![
+            "openrouter:vendor/std-a".to_string(),
+            "openrouter:vendor/std-b".to_string(),
+            "openrouter:vendor/std-c".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            0, // no escalation
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_depth_one_allows_one_tier_only() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // Starting from fast tier, depth=1 → only fast tier, no escalation to standard
+        let tried = vec![
+            "openrouter:vendor/fast-a".to_string(),
+            "openrouter:vendor/fast-b".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/fast-a"),
+            &tried,
+            1,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_escalate_depth_two_allows_one_tier_up() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // Starting from fast, depth=2 → fast + standard
+        let tried = vec![
+            "openrouter:vendor/fast-a".to_string(),
+            "openrouter:vendor/fast-b".to_string(),
+        ];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/fast-a"),
+            &tried,
+            2,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/std-a");
+        assert!(r.reason.contains("escalated to standard-class"));
+    }
+
+    #[test]
+    fn test_escalate_bare_model_id_matches_tried() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // tried_models uses bare IDs (without "openrouter:" prefix)
+        let tried = vec!["vendor/std-a".to_string()];
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:vendor/std-a"),
+            &tried,
+            3,
+        );
+        let r = result.unwrap();
+        // Should skip std-a (matched by bare ID) and return std-b
+        assert_eq!(r.model, "openrouter:vendor/std-b");
+    }
+
+    #[test]
+    fn test_escalate_unknown_current_model_starts_from_fast() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        // Unknown model → defaults to fast tier
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            Some("openrouter:unknown/model"),
+            &[],
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/fast-a");
+        assert!(r.reason.contains("fast-class"));
+    }
+
+    #[test]
+    fn test_escalate_no_current_model_starts_from_fast() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
+
+        let result = escalate_model(
+            tmp.path(),
+            Some("openrouter"),
+            None, // no current model
+            &[],
+            3,
+        );
+        let r = result.unwrap();
+        assert_eq!(r.model, "openrouter:vendor/fast-a");
+    }
+
+    #[test]
+    fn test_find_model_tier_with_prefix() {
+        let ranked = sample_ranked_tiers();
+        assert_eq!(find_model_tier(&ranked, "openrouter:vendor/std-a"), Some(Tier::Standard));
+    }
+
+    #[test]
+    fn test_find_model_tier_without_prefix() {
+        let ranked = sample_ranked_tiers();
+        assert_eq!(find_model_tier(&ranked, "vendor/fast-a"), Some(Tier::Fast));
+    }
+
+    #[test]
+    fn test_find_model_tier_unknown() {
+        let ranked = sample_ranked_tiers();
+        assert_eq!(find_model_tier(&ranked, "unknown/model"), None);
     }
 }

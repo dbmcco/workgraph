@@ -123,6 +123,29 @@ wg service start
 wg add "Implement feature X" --skill rust
 ```
 
+### Syncing primitives from Agency
+
+The primitive pool lives at `agency/starter.csv` in this repo and is compiled into
+the binary via `include_bytes!()`. Every `wg init` seeds a new project with the full
+pool (currently 637 primitives).
+
+To update when Agency releases new primitives:
+
+```bash
+cp ~/agency/primitives/starter.csv agency/starter.csv
+cargo install --path .   # rebuild with new pool embedded
+git add agency/starter.csv
+git commit -m "primitives: sync from Agency vX.Y.Z (637→N)"
+```
+
+Existing projects pick up new primitives with:
+
+```bash
+wg agency import agency/starter.csv   # content-hash dedup, only adds new ones
+```
+
+The CSV is a vendored dependency — no auto-sync. Update it on your schedule.
+
 ### FLIP pipeline
 
 FLIP (Fidelity via Latent Intent Probing) validates task output by reconstructing the prompt from the output and comparing it to the original. It runs as part of the evaluation pipeline.

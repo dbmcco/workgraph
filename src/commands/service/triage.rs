@@ -11,6 +11,7 @@ use workgraph::config::Config;
 use workgraph::graph::{
     LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens,
 };
+use workgraph::profile;
 use workgraph::parser::{load_graph, modify_graph};
 use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 use workgraph::stream_event::{self, StreamEvent};
@@ -215,7 +216,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     match run_triage(&config, task, output_file) {
                         Ok(verdict) => {
                             let is_done = verdict.verdict == "done";
-                            apply_triage_verdict(task, &verdict, agent_id, *pid);
+                            apply_triage_verdict(task, &verdict, agent_id, *pid, dir, &config);
                             eprintln!(
                                 "[coordinator] Triage for '{}': verdict={}, reason={}",
                                 task_id, verdict.verdict, verdict.reason
@@ -232,6 +233,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                             );
                             task.status = Status::Open;
                             task.assigned = None;
+                            task.retry_count += 1;
+                            try_escalate_model(task, dir, &config);
                             task.log.push(LogEntry {
                                 timestamp: Utc::now().to_rfc3339(),
                                 actor: Some("triage".to_string()),
@@ -247,6 +250,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     // Existing behavior: simple unclaim
                     task.status = Status::Open;
                     task.assigned = None;
+                    task.retry_count += 1;
+                    try_escalate_model(task, dir, &config);
                     let reason_msg = match reason {
                         DeadReason::ProcessExited => format!(
                             "Task unclaimed: agent '{}' (PID {}) process exited",
@@ -325,6 +330,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     fresh.log = local.log.clone();
                     fresh.session_id = local.session_id.clone();
                     fresh.token_usage = local.token_usage.clone();
+                    fresh.model = local.model.clone();
+                    fresh.tried_models = local.tried_models.clone();
                 }
             }
             // Also replay mutations for other dead-agent tasks (unclaim, triage-fail, token/session)
@@ -338,6 +345,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     fresh.log = local.log.clone();
                     fresh.session_id = local.session_id.clone();
                     fresh.token_usage = local.token_usage.clone();
+                    fresh.model = local.model.clone();
+                    fresh.tried_models = local.tried_models.clone();
                 }
             }
             true
@@ -584,8 +593,55 @@ fn extract_triage_json(raw: &str) -> Option<String> {
     None
 }
 
+/// Try to escalate the task's model to the next candidate in the ranked tier list.
+/// Records the current model in `tried_models` and sets the new model on the task.
+/// For static profiles (or when no profile is active), this is a no-op.
+fn try_escalate_model(task: &mut Task, dir: &Path, config: &Config) {
+    // Build a temporary tried list that includes the current model for lookup,
+    // but only persist it if escalation actually succeeds.
+    let mut tried_with_current = task.tried_models.clone();
+    if let Some(ref current) = task.model {
+        if !tried_with_current.contains(current) {
+            tried_with_current.push(current.clone());
+        }
+    }
+
+    if let Some(result) = profile::escalate_model(
+        dir,
+        config.profile.as_deref(),
+        task.model.as_deref(),
+        &tried_with_current,
+        config.coordinator.max_escalation_depth,
+    ) {
+        // Commit the tried list now that escalation succeeded
+        task.tried_models = tried_with_current;
+        let old_model = task.model.as_deref().unwrap_or("(default)").to_string();
+        task.model = Some(result.model.clone());
+        task.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: Some("escalation".to_string()),
+            user: Some(workgraph::current_user()),
+            message: format!(
+                "Retrying with model {} ({}) after {} failed",
+                result.model, result.reason, old_model,
+            ),
+        });
+        eprintln!(
+            "[coordinator] Model escalation for '{}': {} → {} ({})",
+            task.id, old_model, result.model, result.reason,
+        );
+    }
+}
+
 /// Apply a triage verdict to a task.
-fn apply_triage_verdict(task: &mut Task, verdict: &TriageVerdict, agent_id: &str, pid: u32) {
+fn apply_triage_verdict(
+    task: &mut Task,
+    verdict: &TriageVerdict,
+    agent_id: &str,
+    pid: u32,
+    dir: &Path,
+    config: &Config,
+) {
     match verdict.verdict.as_str() {
         "done" => {
             task.status = Status::Done;
@@ -626,6 +682,9 @@ fn apply_triage_verdict(task: &mut Task, verdict: &TriageVerdict, agent_id: &str
             task.status = Status::Open;
             task.assigned = None;
             task.retry_count += 1;
+
+            // Attempt model escalation (rotate to next model in ranked tier list)
+            try_escalate_model(task, dir, config);
 
             // Replace (not append) recovery context to prevent unbounded description growth
             let recovery_context = format!(
@@ -683,6 +742,10 @@ fn apply_triage_verdict(task: &mut Task, verdict: &TriageVerdict, agent_id: &str
             task.status = Status::Open;
             task.assigned = None;
             task.retry_count += 1;
+
+            // Attempt model escalation (rotate to next model in ranked tier list)
+            try_escalate_model(task, dir, config);
+
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("triage".to_string()),
@@ -701,6 +764,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use workgraph::graph::Task;
+
+    /// Helper: call apply_triage_verdict with a dummy dir and default config
+    /// (no profile set → no escalation).
+    fn apply_verdict_no_escalation(
+        task: &mut Task,
+        verdict: &TriageVerdict,
+        agent_id: &str,
+        pid: u32,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let config = Config::default();
+        apply_triage_verdict(task, verdict, agent_id, pid, tmp.path(), &config);
+    }
 
     #[test]
     fn test_read_truncated_log_missing_file() {
@@ -808,7 +884,7 @@ mod tests {
             reason: "work complete".to_string(),
             summary: "all files written".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Done);
         assert!(task.completed_at.is_some());
         assert!(task.log.last().unwrap().message.contains("work complete"));
@@ -829,7 +905,7 @@ mod tests {
             reason: "tests pass".to_string(),
             summary: "implementation complete".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Done);
     }
 
@@ -848,7 +924,7 @@ mod tests {
             reason: "partial progress".to_string(),
             summary: "Created foo.rs and bar.rs".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Open);
         assert!(task.assigned.is_none());
         assert_eq!(task.retry_count, 1);
@@ -880,7 +956,7 @@ mod tests {
             reason: "no progress".to_string(),
             summary: "".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Open);
         assert!(task.assigned.is_none());
         assert_eq!(task.retry_count, 1);
@@ -905,7 +981,7 @@ mod tests {
             reason: "needs more work".to_string(),
             summary: "partial progress".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Failed);
         assert!(task.assigned.is_none());
         assert_eq!(task.retry_count, 3); // not incremented
@@ -933,7 +1009,7 @@ mod tests {
             reason: "no progress".to_string(),
             summary: "".to_string(),
         };
-        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234);
+        apply_verdict_no_escalation(&mut task, &verdict, "agent-1", 1234);
         assert_eq!(task.status, Status::Failed);
         assert!(task.assigned.is_none());
         assert_eq!(task.retry_count, 2); // not incremented
@@ -1222,6 +1298,188 @@ mod tests {
             task.assigned.as_deref(),
             Some("agent-1"),
             "Task should remain assigned during grace period"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Model escalation integration with triage verdicts
+    // -----------------------------------------------------------------------
+
+    /// Helper: write a ranked tiers file to the temp dir so escalation can find it.
+    fn write_ranked_tiers_for_escalation(dir: &std::path::Path) {
+        use workgraph::model_benchmarks::{RankedModel, RankedTiers};
+        let ranked = RankedTiers {
+            fast: vec![],
+            standard: vec![
+                RankedModel {
+                    id: "vendor/std-a".to_string(),
+                    name: "Std A".to_string(),
+                    popularity_score: 90.0,
+                    benchmark_score: 80.0,
+                    composite_score: 85.0,
+                    tier: "standard".to_string(),
+                },
+                RankedModel {
+                    id: "vendor/std-b".to_string(),
+                    name: "Std B".to_string(),
+                    popularity_score: 70.0,
+                    benchmark_score: 60.0,
+                    composite_score: 65.0,
+                    tier: "standard".to_string(),
+                },
+            ],
+            premium: vec![
+                RankedModel {
+                    id: "vendor/prem-a".to_string(),
+                    name: "Prem A".to_string(),
+                    popularity_score: 95.0,
+                    benchmark_score: 90.0,
+                    composite_score: 92.0,
+                    tier: "premium".to_string(),
+                },
+            ],
+        };
+        let path = dir.join("profile_ranked_tiers.json");
+        let json = serde_json::to_string(&ranked).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    #[test]
+    fn test_triage_restart_escalates_model() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers_for_escalation(tmp.path());
+
+        let mut config = Config::default();
+        config.profile = Some("openrouter".to_string());
+        config.coordinator.max_escalation_depth = 3;
+
+        let mut task = Task {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            status: Status::InProgress,
+            assigned: Some("agent-1".to_string()),
+            model: Some("openrouter:vendor/std-a".to_string()),
+            ..Default::default()
+        };
+
+        let verdict = TriageVerdict {
+            verdict: "restart".to_string(),
+            reason: "no progress".to_string(),
+            summary: "".to_string(),
+        };
+
+        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234, tmp.path(), &config);
+
+        assert_eq!(task.status, Status::Open);
+        assert_eq!(task.retry_count, 1);
+        // Model should have been escalated from std-a to std-b
+        assert_eq!(task.model.as_deref(), Some("openrouter:vendor/std-b"));
+        // std-a should be in tried_models
+        assert!(task.tried_models.contains(&"openrouter:vendor/std-a".to_string()));
+        // Log should mention escalation
+        assert!(
+            task.log.iter().any(|l| l.message.contains("Retrying with model")
+                && l.message.contains("vendor/std-b")),
+            "Log should contain escalation message"
+        );
+    }
+
+    #[test]
+    fn test_triage_continue_escalates_model() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers_for_escalation(tmp.path());
+
+        let mut config = Config::default();
+        config.profile = Some("openrouter".to_string());
+
+        let mut task = Task {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            description: Some("Original".to_string()),
+            status: Status::InProgress,
+            assigned: Some("agent-1".to_string()),
+            model: Some("openrouter:vendor/std-a".to_string()),
+            ..Default::default()
+        };
+
+        let verdict = TriageVerdict {
+            verdict: "continue".to_string(),
+            reason: "partial".to_string(),
+            summary: "half done".to_string(),
+        };
+
+        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234, tmp.path(), &config);
+
+        assert_eq!(task.status, Status::Open);
+        // Model should be escalated
+        assert_eq!(task.model.as_deref(), Some("openrouter:vendor/std-b"));
+    }
+
+    #[test]
+    fn test_triage_no_escalation_for_static_profile() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers_for_escalation(tmp.path());
+
+        let mut config = Config::default();
+        config.profile = Some("anthropic".to_string());
+
+        let mut task = Task {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            status: Status::InProgress,
+            assigned: Some("agent-1".to_string()),
+            model: Some("claude:sonnet".to_string()),
+            ..Default::default()
+        };
+
+        let verdict = TriageVerdict {
+            verdict: "restart".to_string(),
+            reason: "no progress".to_string(),
+            summary: "".to_string(),
+        };
+
+        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234, tmp.path(), &config);
+
+        // Model should NOT change for static profiles
+        assert_eq!(task.model.as_deref(), Some("claude:sonnet"));
+        assert!(task.tried_models.is_empty());
+    }
+
+    #[test]
+    fn test_triage_escalation_across_tiers() {
+        let tmp = TempDir::new().unwrap();
+        write_ranked_tiers_for_escalation(tmp.path());
+
+        let mut config = Config::default();
+        config.profile = Some("openrouter".to_string());
+        config.coordinator.max_escalation_depth = 3;
+
+        let mut task = Task {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            status: Status::InProgress,
+            assigned: Some("agent-1".to_string()),
+            model: Some("openrouter:vendor/std-a".to_string()),
+            tried_models: vec![
+                "openrouter:vendor/std-a".to_string(),
+                "openrouter:vendor/std-b".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let verdict = TriageVerdict {
+            verdict: "restart".to_string(),
+            reason: "still failing".to_string(),
+            summary: "".to_string(),
+        };
+
+        apply_triage_verdict(&mut task, &verdict, "agent-1", 1234, tmp.path(), &config);
+
+        // All standard models exhausted → should escalate to premium
+        assert_eq!(task.model.as_deref(), Some("openrouter:vendor/prem-a"));
+        assert!(
+            task.log.iter().any(|l| l.message.contains("escalated to premium-class")),
+            "Log should mention tier escalation"
         );
     }
 }

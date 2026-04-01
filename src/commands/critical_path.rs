@@ -443,6 +443,7 @@ mod tests {
             max_rejections: None,
             verify_failures: 0,
             spawn_failures: 0,
+            tried_models: vec![],
             superseded_by: vec![],
             supersedes: None,
             unplaced: false,

@@ -2174,6 +2174,15 @@ pub struct CoordinatorConfig {
     /// Set to 0 to disable the circuit breaker (unlimited retries).
     #[serde(default = "default_max_spawn_failures")]
     pub max_spawn_failures: u32,
+
+    /// Maximum tier escalation depth for model fallback on retry.
+    /// When a task fails and the active profile has a ranked model list,
+    /// the coordinator tries the next model in the tier. If the entire tier
+    /// is exhausted, it escalates to the next tier up (fast → standard → premium).
+    /// This limits how many tiers to escalate through. Default: 3 (all tiers).
+    /// Set to 0 to disable tier escalation (only rotate within same tier).
+    #[serde(default = "default_max_escalation_depth")]
+    pub max_escalation_depth: u32,
 }
 
 fn default_max_agents() -> usize {
@@ -2230,6 +2239,10 @@ fn default_max_verify_failures() -> u32 {
 
 fn default_max_spawn_failures() -> u32 {
     5
+}
+
+fn default_max_escalation_depth() -> u32 {
+    3
 }
 
 fn default_registry_refresh_interval() -> u64 {
@@ -2298,6 +2311,7 @@ impl Default for CoordinatorConfig {
             registry_refresh_interval: default_registry_refresh_interval(),
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
+            max_escalation_depth: default_max_escalation_depth(),
         }
     }
 }

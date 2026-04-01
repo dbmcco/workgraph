@@ -356,6 +356,10 @@ pub struct Task {
     /// Number of consecutive spawn failures (spawn circuit breaker counter)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spawn_failures: u32,
+    /// Models already tried for this task (for tier escalation on retry).
+    /// Each entry is the model ID string that was used for a failed attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried_models: Vec<String>,
     /// Tasks that this task was replaced by (set on abandon with --superseded-by)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded_by: Vec<String>,
@@ -919,6 +923,8 @@ struct TaskHelper {
     #[serde(default)]
     spawn_failures: u32,
     #[serde(default)]
+    tried_models: Vec<String>,
+    #[serde(default)]
     superseded_by: Vec<String>,
     #[serde(default)]
     supersedes: Option<String>,
@@ -1002,6 +1008,7 @@ impl<'de> Deserialize<'de> for Task {
             max_rejections: helper.max_rejections,
             verify_failures: helper.verify_failures,
             spawn_failures: helper.spawn_failures,
+            tried_models: helper.tried_models,
             superseded_by: helper.superseded_by,
             supersedes: helper.supersedes,
             unplaced: helper.unplaced,

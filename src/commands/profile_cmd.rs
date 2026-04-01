@@ -7,6 +7,8 @@ use workgraph::model_benchmarks::{self, BenchmarkRegistry, RankedTiers};
 use workgraph::profile;
 
 /// File name for the cached ranked tiers (inside .workgraph/).
+/// Note: `profile::load_ranked_tiers()` provides the public read path;
+/// this constant is kept here only for `save_ranked_tiers`.
 const RANKED_TIERS_FILE: &str = "profile_ranked_tiers.json";
 
 /// Set the active provider profile.
@@ -129,17 +131,9 @@ fn save_ranked_tiers(dir: &Path, ranked: &RankedTiers) -> Result<()> {
     Ok(())
 }
 
-/// Load ranked tiers from `.workgraph/profile_ranked_tiers.json`.
+/// Load ranked tiers — delegates to the shared implementation in profile module.
 fn load_ranked_tiers(dir: &Path) -> Result<Option<RankedTiers>> {
-    let path = dir.join(RANKED_TIERS_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let ranked: RankedTiers = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {}", path.display()))?;
-    Ok(Some(ranked))
+    profile::load_ranked_tiers(dir)
 }
 
 /// Show current profile and resolved model mappings.
