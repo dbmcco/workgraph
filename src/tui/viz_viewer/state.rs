@@ -18015,3 +18015,279 @@ mod chat_ordering_tests {
         assert_eq!(chat.messages[3].text, "M3");
     }
 }
+
+#[cfg(test)]
+mod chat_delivery_tests {
+    use super::*;
+
+    /// Helper: create a minimal ChatMessage with the given role and text.
+    fn make_msg(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            text: text.to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        }
+    }
+
+    /// Simulate the poll_chat_messages reorder+retire logic on a ChatState.
+    /// This avoids needing a full App context with workgraph_dir/outbox.
+    fn simulate_response_arrival(chat: &mut ChatState, response_text: &str) {
+        // Append coordinator response (simulates what poll_chat_messages does).
+        chat.messages
+            .push(make_msg(ChatRole::Coordinator, response_text));
+
+        // Retire one pending request (FIFO), same logic as poll_chat_messages.
+        if !chat.pending_request_ids.is_empty() {
+            if let Some(first) = chat.pending_request_ids.iter().next().cloned() {
+                chat.pending_request_ids.remove(&first);
+            }
+        }
+        if chat.pending_request_ids.is_empty() {
+            chat.awaiting_since = None;
+            chat.streaming_text.clear();
+        }
+
+        // Reorder deferred user messages (P1 fix), same logic as poll_chat_messages.
+        if !chat.deferred_user_indices.is_empty() {
+            let mut deferred: Vec<ChatMessage> = Vec::new();
+            for &idx in chat.deferred_user_indices.iter().rev() {
+                if idx < chat.messages.len() {
+                    deferred.push(chat.messages.remove(idx));
+                }
+            }
+            deferred.reverse();
+            chat.messages.extend(deferred);
+            chat.deferred_user_indices.clear();
+        }
+    }
+
+    /// Simulate sending a user message, mirroring send_chat_message logic.
+    fn simulate_user_send(chat: &mut ChatState, text: &str, request_id: &str) {
+        chat.messages.push(make_msg(ChatRole::User, text));
+
+        // Track deferred if a response is in flight (P1 fix).
+        if !chat.pending_request_ids.is_empty() {
+            let idx = chat.messages.len() - 1;
+            chat.deferred_user_indices.push(idx);
+        }
+
+        // Track pending request (P2 fix: set-based).
+        if chat.pending_request_ids.is_empty() {
+            chat.awaiting_since = Some(std::time::Instant::now());
+        }
+        chat.pending_request_ids.insert(request_id.to_string());
+    }
+
+    #[test]
+    fn user_sends_during_active_response_both_get_responses() {
+        // Core delivery test: M1 is sent, then M2 is sent while R1 is in flight.
+        // Both messages must receive responses — the second must not be lost.
+        let mut chat = ChatState::default();
+
+        // M1 sent — no in-flight requests.
+        simulate_user_send(&mut chat, "M1", "rid1");
+        assert_eq!(chat.pending_request_ids.len(), 1);
+        assert!(chat.awaiting_response());
+
+        // M2 sent while rid1 is still pending.
+        simulate_user_send(&mut chat, "M2", "rid2");
+        assert_eq!(chat.pending_request_ids.len(), 2);
+        assert!(chat.awaiting_response());
+
+        // R1 arrives — system must still track rid2.
+        simulate_response_arrival(&mut chat, "R1");
+        assert_eq!(chat.pending_request_ids.len(), 1, "rid2 must still be tracked");
+        assert!(
+            chat.awaiting_response(),
+            "system must keep polling for R2"
+        );
+
+        // R2 arrives — all requests now satisfied.
+        simulate_response_arrival(&mut chat, "R2");
+        assert_eq!(chat.pending_request_ids.len(), 0);
+        assert!(
+            !chat.awaiting_response(),
+            "no more pending — polling can slow down"
+        );
+        assert!(chat.awaiting_since.is_none(), "spinner timer cleared");
+
+        // Both messages received responses — verify display has all 4 entries.
+        assert_eq!(chat.messages.len(), 4);
+        let roles: Vec<_> = chat.messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ChatRole::User,
+                ChatRole::Coordinator,
+                ChatRole::User,
+                ChatRole::Coordinator
+            ]
+        );
+        // Verify content matches: [M1, R1, M2, R2]
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[1].text, "R1");
+        assert_eq!(chat.messages[2].text, "M2");
+        assert_eq!(chat.messages[3].text, "R2");
+    }
+
+    #[test]
+    fn rapid_fire_three_messages_all_get_responses() {
+        // Delivery test: 3 messages sent in rapid succession while responses are in flight.
+        // All 3 must eventually receive responses — none dropped.
+        let mut chat = ChatState::default();
+
+        // M1 — first message, no pending.
+        simulate_user_send(&mut chat, "M1", "rid1");
+        assert_eq!(chat.pending_request_ids.len(), 1);
+
+        // M2 — sent while rid1 pending.
+        simulate_user_send(&mut chat, "M2", "rid2");
+        assert_eq!(chat.pending_request_ids.len(), 2);
+
+        // M3 — sent while rid1, rid2 pending.
+        simulate_user_send(&mut chat, "M3", "rid3");
+        assert_eq!(chat.pending_request_ids.len(), 3);
+        assert!(chat.awaiting_response());
+
+        // Verify all 3 requests are tracked.
+        assert!(chat.pending_request_ids.contains("rid1"));
+        assert!(chat.pending_request_ids.contains("rid2"));
+        assert!(chat.pending_request_ids.contains("rid3"));
+
+        // R1 arrives — 2 requests still pending.
+        simulate_response_arrival(&mut chat, "R1");
+        assert_eq!(chat.pending_request_ids.len(), 2);
+        assert!(chat.awaiting_response(), "still waiting for R2 and R3");
+        assert!(
+            chat.awaiting_since.is_some(),
+            "spinner should still be active"
+        );
+
+        // R2 arrives — 1 request still pending.
+        simulate_response_arrival(&mut chat, "R2");
+        assert_eq!(chat.pending_request_ids.len(), 1);
+        assert!(chat.awaiting_response(), "still waiting for R3");
+
+        // R3 arrives — all complete.
+        simulate_response_arrival(&mut chat, "R3");
+        assert_eq!(chat.pending_request_ids.len(), 0);
+        assert!(!chat.awaiting_response(), "all responses delivered");
+        assert!(chat.awaiting_since.is_none(), "spinner timer cleared");
+
+        // All 3 messages received responses — 6 entries total.
+        assert_eq!(chat.messages.len(), 6);
+
+        // Verify ordering: [M1, R1, M2, M3, R2, R3]
+        // M2 and M3 were deferred past R1 when R1 arrived.
+        // R2 and R3 arrived after deferred indices were cleared, so they append normally.
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[0].role, ChatRole::User);
+        assert_eq!(chat.messages[1].text, "R1");
+        assert_eq!(chat.messages[1].role, ChatRole::Coordinator);
+        assert_eq!(chat.messages[2].text, "M2");
+        assert_eq!(chat.messages[2].role, ChatRole::User);
+        assert_eq!(chat.messages[3].text, "M3");
+        assert_eq!(chat.messages[3].role, ChatRole::User);
+        assert_eq!(chat.messages[4].text, "R2");
+        assert_eq!(chat.messages[4].role, ChatRole::Coordinator);
+        assert_eq!(chat.messages[5].text, "R3");
+        assert_eq!(chat.messages[5].role, ChatRole::Coordinator);
+    }
+
+    #[test]
+    fn no_duplicate_responses_from_single_arrival() {
+        // Verify that a single coordinator response retires exactly one pending
+        // request — not multiple. This prevents duplicate response delivery.
+        let mut chat = ChatState::default();
+
+        simulate_user_send(&mut chat, "M1", "rid1");
+        simulate_user_send(&mut chat, "M2", "rid2");
+        assert_eq!(chat.pending_request_ids.len(), 2);
+
+        // One response arrives.
+        simulate_response_arrival(&mut chat, "R1");
+
+        // Exactly one request retired, not both.
+        assert_eq!(
+            chat.pending_request_ids.len(),
+            1,
+            "only one request should be retired per response"
+        );
+
+        // No duplicate coordinator messages in the display.
+        let coordinator_msgs: Vec<_> = chat
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::Coordinator)
+            .collect();
+        assert_eq!(
+            coordinator_msgs.len(),
+            1,
+            "exactly one coordinator message from one response"
+        );
+    }
+
+    #[test]
+    fn error_does_not_lose_other_pending_requests() {
+        // When one request errors, other in-flight requests must continue
+        // to be tracked — the system must not stop polling.
+        let mut chat = ChatState::default();
+
+        simulate_user_send(&mut chat, "M1", "rid1");
+        simulate_user_send(&mut chat, "M2", "rid2");
+        simulate_user_send(&mut chat, "M3", "rid3");
+        assert_eq!(chat.pending_request_ids.len(), 3);
+
+        // M1 errors — simulate ChatResponse error handler.
+        chat.pending_request_ids.remove("rid1");
+        assert_eq!(chat.pending_request_ids.len(), 2);
+        assert!(chat.awaiting_response(), "rid2 and rid3 still pending");
+        assert!(
+            chat.awaiting_since.is_some(),
+            "spinner stays active for remaining requests"
+        );
+
+        // R2 arrives normally.
+        simulate_response_arrival(&mut chat, "R2");
+        assert_eq!(chat.pending_request_ids.len(), 1);
+        assert!(chat.awaiting_response(), "rid3 still pending");
+
+        // R3 arrives.
+        simulate_response_arrival(&mut chat, "R3");
+        assert_eq!(chat.pending_request_ids.len(), 0);
+        assert!(!chat.awaiting_response());
+        assert!(chat.awaiting_since.is_none());
+    }
+
+    #[test]
+    fn markdown_formatting_preserved_in_response_messages() {
+        // Verify that coordinator messages with markdown content are stored
+        // and retrievable without any formatting corruption.
+        let mut chat = ChatState::default();
+
+        simulate_user_send(&mut chat, "explain code", "rid1");
+
+        let md_content = "## Analysis\n\n- **Bold** point\n- `code snippet`\n\n```rust\nfn main() {}\n```";
+        simulate_response_arrival(&mut chat, md_content);
+
+        // Find the coordinator message.
+        let coord_msg = chat
+            .messages
+            .iter()
+            .find(|m| m.role == ChatRole::Coordinator)
+            .expect("coordinator message should exist");
+
+        // Markdown content is preserved exactly as delivered.
+        assert_eq!(coord_msg.text, md_content);
+        assert!(coord_msg.text.contains("```rust"));
+        assert!(coord_msg.text.contains("**Bold**"));
+    }
+}
