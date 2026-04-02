@@ -10,6 +10,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use workgraph::config::{Config, EndpointConfig, ModelRegistryEntry, Tier};
 use workgraph::models::ModelRegistry;
+use workgraph::notify::config as notify_config;
 
 /// Marker used to detect whether workgraph directives are already present in CLAUDE.md.
 const CLAUDE_MD_MARKER: &str = "<!-- workgraph-managed -->";
@@ -758,17 +759,24 @@ pub fn run() -> Result<()> {
     let existing = Config::load_global()?.unwrap_or_default();
     let global_path = Config::global_config_path()?;
 
-    println!("Welcome to workgraph setup.");
+    println!("Hey! Welcome to workgraph setup.");
     println!(
-        "This will configure your global defaults at {}",
+        "We'll get you configured at {}",
         global_path.display()
     );
     println!();
 
-    // Show current configuration status
-    println!("Current configuration:");
-    println!("{}", check_existing_config(&existing));
+    // Auto-detection phase — show what's already in place
+    let detection = detect_environment();
+    println!("{}", format_detection_summary(&detection));
     println!();
+
+    // If existing config, show what's there
+    if detection.global_config {
+        println!("Current configuration:");
+        println!("{}", check_existing_config(&existing));
+        println!();
+    }
 
     // 1. Provider selection (primary decision point)
     let provider_options = &[
@@ -780,11 +788,17 @@ pub fn run() -> Result<()> {
     ];
     let provider_keys = &["anthropic", "openrouter", "openai", "local", "custom"];
 
+    // Smart default: use existing config, or infer from detected API keys
     let current_provider = existing
         .coordinator
         .provider
         .as_deref()
-        .unwrap_or("anthropic");
+        .unwrap_or_else(|| {
+            if detection.anthropic_key { "anthropic" }
+            else if detection.openrouter_key { "openrouter" }
+            else if detection.openai_key { "openai" }
+            else { "anthropic" }
+        });
     let current_provider_idx = provider_keys
         .iter()
         .position(|&p| p == current_provider)
@@ -806,15 +820,38 @@ pub fn run() -> Result<()> {
     };
 
     println!();
-    println!(
-        "  Executor auto-set to '{}' for {} provider.",
-        default_executor, provider
-    );
+    let executor_ok = match (default_executor, detection.claude_cli, detection.amplifier) {
+        ("claude", true, _) => {
+            println!("  Using '{}' executor — you've got the claude CLI, perfect.", default_executor);
+            true
+        }
+        ("claude", false, true) => {
+            println!("  Heads up: claude CLI isn't installed, but amplifier is.");
+            println!("  You might want to switch the executor.");
+            false
+        }
+        ("claude", false, false) => {
+            println!("  Note: claude CLI isn't installed yet.");
+            println!("  You'll need it before running agents. Install from: https://docs.anthropic.com/claude-code");
+            true
+        }
+        _ => {
+            println!("  Using '{}' executor for {} provider.", default_executor, provider);
+            true
+        }
+    };
 
-    let override_executor = Confirm::new()
-        .with_prompt("Override executor?")
-        .default(false)
-        .interact()?;
+    let override_executor = if executor_ok {
+        Confirm::new()
+            .with_prompt("Want to change the executor?")
+            .default(false)
+            .interact()?
+    } else {
+        Confirm::new()
+            .with_prompt("Override executor?")
+            .default(true)
+            .interact()?
+    };
 
     let executor = if override_executor {
         let executor_options = &["claude", "native", "amplifier", "custom"];
@@ -905,14 +942,18 @@ pub fn run() -> Result<()> {
 
     // 4. Agency
     println!();
+    println!("Agency lets workgraph automatically match the best agent identity to each task");
+    println!("and evaluate their work when done. It's the evolutionary identity system.");
     let agency_enabled = Confirm::new()
-        .with_prompt("Enable agency (auto-assign agents to tasks, auto-evaluate completed work)?")
+        .with_prompt("Enable agency?")
         .default(existing.agency.auto_assign || existing.agency.auto_evaluate)
         .interact()?;
 
     // 5. Max agents
+    println!();
+    println!("How many agents can work in parallel? More = faster, but uses more resources.");
     let max_agents: usize = Input::new()
-        .with_prompt("Max parallel agents?")
+        .with_prompt("Max parallel agents")
         .default(existing.coordinator.max_agents)
         .interact_text()?;
 
@@ -966,21 +1007,28 @@ pub fn run() -> Result<()> {
         "N/A (non-Claude executor)".to_string()
     };
 
+    // 7. Notification setup (optional)
     println!();
-    println!("Setup complete.");
+    println!("Notifications let workgraph ping you when tasks need attention,");
+    println!("agents get stuck, or work is done.");
+    let notify_status = guide_notification_setup()?;
+
     println!();
-    println!("Summary:");
-    println!("  Provider:  {}", choices.provider);
-    println!("  Executor:  {}", choices.executor);
-    println!("  Model:     {}", choices.model);
-    println!("  Agents:    {} max parallel", choices.max_agents);
+    println!("You're all set! Here's what we configured:");
+    println!();
+    println!("  Provider:       {}", choices.provider);
+    println!("  Executor:       {}", choices.executor);
+    println!("  Model:          {}", choices.model);
+    println!("  Max agents:     {}", choices.max_agents);
     if choices.endpoint.is_some() {
-        println!("  Endpoint:  configured");
+        println!("  Endpoint:       configured");
     }
-    println!("  Skill:     {}", skill_status);
-    println!("  CLAUDE.md: {}", claude_md_status);
+    println!("  Agency:         {}", if choices.agency_enabled { "enabled" } else { "disabled" });
+    println!("  Skill:          {}", skill_status);
+    println!("  CLAUDE.md:      {}", claude_md_status);
+    println!("  Notifications:  {}", notify_status);
     println!();
-    println!("Run `wg init` in a project directory to get started.");
+    println!("Run `wg init` in a project directory to get started, or `wg setup` again to update.");
 
     Ok(())
 }
@@ -1384,6 +1432,165 @@ fn guide_skill_bundle_install(executor: &str) -> Result<String> {
     }
 }
 
+/// Result of auto-detecting what tools and configuration are already in place.
+#[derive(Debug, Clone, Default)]
+pub struct DetectionResult {
+    /// Whether the `claude` CLI was found in PATH.
+    pub claude_cli: bool,
+    /// Version string of the `claude` CLI, if detected.
+    pub claude_cli_version: Option<String>,
+    /// Whether `amplifier` was found in PATH.
+    pub amplifier: bool,
+    /// Whether `git` was found in PATH.
+    pub git: bool,
+    /// Whether `tmux` was found in PATH.
+    pub tmux: bool,
+    /// Whether ANTHROPIC_API_KEY is set.
+    pub anthropic_key: bool,
+    /// Whether OPENROUTER_API_KEY is set.
+    pub openrouter_key: bool,
+    /// Whether OPENAI_API_KEY is set.
+    pub openai_key: bool,
+    /// Whether `.workgraph/config.toml` exists in current directory.
+    pub local_config: bool,
+    /// Whether `~/.workgraph/config.toml` exists.
+    pub global_config: bool,
+}
+
+/// Check if a command is available in PATH by running `which <cmd>`.
+pub fn is_command_available(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Get the version string from `claude --version`.
+pub fn get_claude_version() -> Option<String> {
+    std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+}
+
+/// Run the auto-detection phase, checking for tools, API keys, and config files.
+pub fn detect_environment() -> DetectionResult {
+    let claude_cli = is_command_available("claude");
+    let claude_cli_version = if claude_cli {
+        get_claude_version()
+    } else {
+        None
+    };
+
+    let global_config = Config::global_config_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+
+    DetectionResult {
+        claude_cli,
+        claude_cli_version,
+        amplifier: is_command_available("amplifier"),
+        git: is_command_available("git"),
+        tmux: is_command_available("tmux"),
+        anthropic_key: std::env::var("ANTHROPIC_API_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+        openrouter_key: std::env::var("OPENROUTER_API_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+        openai_key: std::env::var("OPENAI_API_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+        local_config: std::path::Path::new(".workgraph/config.toml").exists(),
+        global_config,
+    }
+}
+
+/// Format a friendly, conversational summary of auto-detection results.
+pub fn format_detection_summary(det: &DetectionResult) -> String {
+    let mut lines = Vec::new();
+
+    lines.push("Let's see what you've got...\n".to_string());
+
+    // Tools
+    if det.claude_cli {
+        if let Some(ref ver) = det.claude_cli_version {
+            lines.push(format!("  ✓ claude CLI — {} — nice!", ver));
+        } else {
+            lines.push("  ✓ claude CLI — installed, good to go!".to_string());
+        }
+    } else {
+        lines.push("  ✗ claude CLI — not found (needed for executor=claude)".to_string());
+    }
+
+    if det.amplifier {
+        lines.push("  ✓ amplifier — installed!".to_string());
+    } else {
+        lines.push("  · amplifier — not installed (optional)".to_string());
+    }
+
+    if det.git {
+        lines.push("  ✓ git — yep!".to_string());
+    } else {
+        lines.push("  ✗ git — not found (required for worktree isolation)".to_string());
+    }
+
+    if det.tmux {
+        lines.push("  ✓ tmux — ready for `wg server`!".to_string());
+    } else {
+        lines.push("  · tmux — not installed (needed for `wg server`)".to_string());
+    }
+
+    // API keys
+    lines.push(String::new());
+    let has_any_key = det.anthropic_key || det.openrouter_key || det.openai_key;
+    if has_any_key {
+        lines.push("  API keys detected:".to_string());
+        if det.anthropic_key {
+            lines.push("    ✓ ANTHROPIC_API_KEY — set!".to_string());
+        }
+        if det.openrouter_key {
+            lines.push("    ✓ OPENROUTER_API_KEY — set!".to_string());
+        }
+        if det.openai_key {
+            lines.push("    ✓ OPENAI_API_KEY — set!".to_string());
+        }
+    } else {
+        lines.push("  No API keys detected in environment.".to_string());
+        lines.push("  (That's fine — we can configure key files or env vars next.)".to_string());
+    }
+
+    // Config
+    lines.push(String::new());
+    if det.global_config {
+        lines.push(
+            "  ✓ Global config exists — we'll update it with your choices.".to_string(),
+        );
+    } else {
+        lines.push(
+            "  · No global config yet — we'll create one for you.".to_string(),
+        );
+    }
+    if det.local_config {
+        lines.push("  ✓ Project config found (.workgraph/config.toml).".to_string());
+    }
+
+    lines.join("\n")
+}
+
 /// Guide the user through configuring ~/.claude/CLAUDE.md.
 /// Returns a status string for the summary.
 fn guide_claude_md_install() -> Result<String> {
@@ -1418,6 +1625,128 @@ fn guide_claude_md_install() -> Result<String> {
         println!("  You can configure it later with: wg setup");
         Ok("NOT configured — Claude may use its own task tools".to_string())
     }
+}
+
+/// Build a default notify.toml content string for a given channel.
+pub fn build_notify_config(channel: &str) -> String {
+    match channel {
+        "telegram" => r#"[routing]
+default = ["telegram"]
+urgent = ["telegram"]
+approval = ["telegram"]
+
+[telegram]
+# Get a bot token from @BotFather on Telegram
+bot_token = ""
+# Your chat or group ID
+chat_id = ""
+"#
+        .to_string(),
+        "slack" => r#"[routing]
+default = ["slack"]
+urgent = ["slack"]
+approval = ["slack"]
+
+[slack]
+# Slack incoming webhook URL
+webhook_url = ""
+# Channel to post to (optional, uses webhook default)
+channel = ""
+"#
+        .to_string(),
+        "email" => r#"[routing]
+default = ["email"]
+digest = ["email"]
+
+[email]
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+from = ""
+to = [""]
+"#
+        .to_string(),
+        "webhook" => r#"[routing]
+default = ["webhook"]
+
+[webhook]
+url = ""
+"#
+        .to_string(),
+        _ => format!(
+            "[routing]\ndefault = [\"{channel}\"]\n\n[{channel}]\n# Configure your {channel} integration here\n"
+        ),
+    }
+}
+
+/// Run the notification setup interactively.
+/// Returns a status string for the summary.
+fn guide_notification_setup() -> Result<String> {
+    let config_path = notify_config::default_config_path();
+
+    // Check if already configured
+    if let Some(ref path) = config_path {
+        if path.exists() {
+            if let Ok(Some(existing)) = notify_config::NotifyConfig::load_default() {
+                let summary = existing.status_summary();
+                println!("  Notifications already configured:");
+                for line in summary.lines() {
+                    println!("    {}", line);
+                }
+
+                let update = Confirm::new()
+                    .with_prompt("Reconfigure notifications?")
+                    .default(false)
+                    .interact()?;
+                if !update {
+                    return Ok("already configured ✓".to_string());
+                }
+            }
+        }
+    }
+
+    let channel_options = &[
+        "Telegram",
+        "Slack",
+        "Email (SMTP)",
+        "Webhook (generic)",
+        "Skip — I'll set this up later",
+    ];
+    let channel_keys = &["telegram", "slack", "email", "webhook", "skip"];
+
+    let idx = Select::new()
+        .with_prompt("How should workgraph notify you?")
+        .items(channel_options)
+        .default(4)
+        .interact()?;
+
+    let channel = channel_keys[idx];
+    if channel == "skip" {
+        return Ok("skipped".to_string());
+    }
+
+    let config_content = build_notify_config(channel);
+
+    let Some(path) = config_path else {
+        println!("  Could not determine config directory. Skipping.");
+        return Ok("skipped (no config dir)".to_string());
+    };
+
+    // Ensure parent dir exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    std::fs::write(&path, &config_content)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+
+    println!("  Wrote template to {}", path.display());
+    println!(
+        "  Edit the file to fill in your {} credentials, then notifications will work automatically.",
+        channel
+    );
+
+    Ok(format!("{} template written ✓", channel))
 }
 
 #[cfg(test)]
@@ -2304,5 +2633,157 @@ mod tests {
         assert_eq!(config.tiers.fast, Some("haiku".to_string()));
         assert_eq!(config.tiers.standard, Some("sonnet".to_string()));
         assert_eq!(config.tiers.premium, Some("opus".to_string()));
+    }
+
+    // ── DetectionResult + format_detection_summary ───────────────────
+
+    #[test]
+    fn test_detection_result_default_all_false() {
+        let det = DetectionResult::default();
+        assert!(!det.claude_cli);
+        assert!(!det.amplifier);
+        assert!(!det.git);
+        assert!(!det.tmux);
+        assert!(!det.anthropic_key);
+        assert!(!det.openrouter_key);
+        assert!(!det.openai_key);
+        assert!(!det.local_config);
+        assert!(!det.global_config);
+        assert!(det.claude_cli_version.is_none());
+    }
+
+    #[test]
+    fn test_format_detection_summary_nothing_detected() {
+        let det = DetectionResult::default();
+        let summary = format_detection_summary(&det);
+        assert!(summary.contains("Let's see what you've got"));
+        assert!(summary.contains("✗ claude CLI"));
+        assert!(summary.contains("not found"));
+        assert!(summary.contains("· amplifier"));
+        assert!(summary.contains("No API keys detected"));
+        assert!(summary.contains("No global config yet"));
+    }
+
+    #[test]
+    fn test_format_detection_summary_everything_detected() {
+        let det = DetectionResult {
+            claude_cli: true,
+            claude_cli_version: Some("1.2.3".to_string()),
+            amplifier: true,
+            git: true,
+            tmux: true,
+            anthropic_key: true,
+            openrouter_key: true,
+            openai_key: true,
+            local_config: true,
+            global_config: true,
+        };
+        let summary = format_detection_summary(&det);
+        assert!(summary.contains("claude CLI — 1.2.3 — nice!"));
+        assert!(summary.contains("✓ amplifier"));
+        assert!(summary.contains("✓ git"));
+        assert!(summary.contains("✓ tmux"));
+        assert!(summary.contains("ANTHROPIC_API_KEY — set!"));
+        assert!(summary.contains("OPENROUTER_API_KEY — set!"));
+        assert!(summary.contains("OPENAI_API_KEY — set!"));
+        assert!(summary.contains("Global config exists"));
+        assert!(summary.contains("Project config found"));
+    }
+
+    #[test]
+    fn test_format_detection_summary_claude_without_version() {
+        let det = DetectionResult {
+            claude_cli: true,
+            claude_cli_version: None,
+            ..Default::default()
+        };
+        let summary = format_detection_summary(&det);
+        assert!(summary.contains("claude CLI — installed, good to go!"));
+    }
+
+    #[test]
+    fn test_format_detection_summary_partial_keys() {
+        let det = DetectionResult {
+            anthropic_key: true,
+            ..Default::default()
+        };
+        let summary = format_detection_summary(&det);
+        assert!(summary.contains("API keys detected:"));
+        assert!(summary.contains("ANTHROPIC_API_KEY — set!"));
+        // Should not mention keys that aren't set
+        assert!(!summary.contains("OPENROUTER_API_KEY"));
+        assert!(!summary.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn test_format_detection_git_missing_warning() {
+        let det = DetectionResult::default();
+        let summary = format_detection_summary(&det);
+        assert!(summary.contains("✗ git — not found"));
+    }
+
+    #[test]
+    fn test_is_command_available_returns_bool() {
+        // `ls` should always be available on Unix
+        assert!(is_command_available("ls"));
+        // A garbage command should not
+        assert!(!is_command_available("this_command_definitely_does_not_exist_xyz_123"));
+    }
+
+    // ── detect_environment (smoke test) ──────────────────────────────
+
+    #[test]
+    fn test_detect_environment_returns_something() {
+        // Just verify it doesn't panic; actual values depend on environment
+        let det = detect_environment();
+        // git should be available in this repo's CI/dev environment
+        assert!(det.git);
+    }
+
+    // ── build_notify_config ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_notify_config_telegram() {
+        let config = build_notify_config("telegram");
+        assert!(config.contains("[routing]"));
+        assert!(config.contains("[telegram]"));
+        assert!(config.contains("bot_token"));
+        assert!(config.contains("chat_id"));
+        // Should be parseable
+        let parsed: toml::Value = toml::from_str(&config).unwrap();
+        let routing = parsed.get("routing").unwrap();
+        assert!(routing.get("default").is_some());
+    }
+
+    #[test]
+    fn test_build_notify_config_slack() {
+        let config = build_notify_config("slack");
+        assert!(config.contains("[slack]"));
+        assert!(config.contains("webhook_url"));
+        let _parsed: toml::Value = toml::from_str(&config).unwrap();
+    }
+
+    #[test]
+    fn test_build_notify_config_email() {
+        let config = build_notify_config("email");
+        assert!(config.contains("[email]"));
+        assert!(config.contains("smtp_host"));
+        let _parsed: toml::Value = toml::from_str(&config).unwrap();
+    }
+
+    #[test]
+    fn test_build_notify_config_webhook() {
+        let config = build_notify_config("webhook");
+        assert!(config.contains("[webhook]"));
+        assert!(config.contains("url"));
+        let _parsed: toml::Value = toml::from_str(&config).unwrap();
+    }
+
+    #[test]
+    fn test_build_notify_config_unknown_channel() {
+        let config = build_notify_config("mychannel");
+        assert!(config.contains("[mychannel]"));
+        assert!(config.contains("mychannel"));
+        let _parsed: toml::Value = toml::from_str(&config).unwrap();
     }
 }
