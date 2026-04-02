@@ -902,7 +902,7 @@ fn handle_chat_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             return;
         }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.chat.awaiting_response {
+            if app.chat.awaiting_response() {
                 // Interrupt the running coordinator instead of clearing input
                 app.interrupt_coordinator();
             } else if in_edit_mode {
@@ -1079,7 +1079,7 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         // Ctrl+C: interrupt coordinator if awaiting response in chat tab,
         // otherwise kill the agent on the focused task.
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.chat.awaiting_response && app.right_panel_tab == RightPanelTab::Chat {
+            if app.chat.awaiting_response() && app.right_panel_tab == RightPanelTab::Chat {
                 app.interrupt_coordinator();
             } else {
                 app.kill_focused_agent();
@@ -1603,7 +1603,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         KeyCode::Char('q') => app.should_quit = true,
         // Ctrl+C: interrupt coordinator if awaiting response, else kill focused agent
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.chat.awaiting_response && app.right_panel_tab == RightPanelTab::Chat {
+            if app.chat.awaiting_response() && app.right_panel_tab == RightPanelTab::Chat {
                 app.interrupt_coordinator();
             } else {
                 app.kill_focused_agent();

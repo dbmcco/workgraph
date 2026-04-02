@@ -989,12 +989,15 @@ pub struct ChatState {
     pub editor: EditorState,
     /// Scroll offset in message history (lines from bottom; 0 = fully scrolled down).
     pub scroll: usize,
-    /// Whether we're waiting for a coordinator response.
-    pub awaiting_response: bool,
+    /// Set of request IDs for in-flight chat requests.
+    /// `awaiting_response()` is derived: `!pending_request_ids.is_empty()`.
+    pub pending_request_ids: std::collections::HashSet<String>,
     /// Outbox cursor: last-read outbox message ID (for polling new messages).
     pub outbox_cursor: u64,
-    /// Request ID of the last sent message (for correlating responses).
-    pub last_request_id: Option<String>,
+    /// Indices of user messages that were sent while a response was in flight.
+    /// These messages are displayed immediately but reordered after the coordinator
+    /// response arrives so they appear in correct chronological position.
+    pub deferred_user_indices: Vec<usize>,
     /// Whether the service coordinator is currently active.
     pub coordinator_active: bool,
     /// Pending attachments for the next message (file paths, already stored in .workgraph/attachments/).
@@ -1023,7 +1026,8 @@ pub struct ChatState {
     pub chat_input_dismissed: bool,
     /// Partial streaming text from the coordinator (displayed progressively).
     pub streaming_text: String,
-    /// When `awaiting_response` was set to true (for spinner elapsed time).
+    /// When the first pending request was added (for spinner elapsed time).
+    /// Cleared when the set empties.
     pub awaiting_since: Option<std::time::Instant>,
     /// Whether there are older messages in the history file that haven't been loaded yet.
     pub has_more_history: bool,
@@ -1038,6 +1042,13 @@ pub struct ChatState {
     pub archives_loaded: bool,
     /// Whether there are archive files available to load.
     pub has_archives: bool,
+}
+
+impl ChatState {
+    /// Whether any chat request is in flight.
+    pub fn awaiting_response(&self) -> bool {
+        !self.pending_request_ids.is_empty()
+    }
 }
 
 /// State for in-chat search (/ key when chat tab is focused).
@@ -1080,9 +1091,9 @@ impl Default for ChatState {
             messages: Vec::new(),
             editor: new_emacs_editor(),
             scroll: 0,
-            awaiting_response: false,
+            pending_request_ids: std::collections::HashSet::new(),
             outbox_cursor: 0,
-            last_request_id: None,
+            deferred_user_indices: Vec::new(),
             coordinator_active: false,
             pending_attachments: Vec::new(),
             total_rendered_lines: 0,
@@ -1144,7 +1155,7 @@ pub struct ChatMessage {
     pub msg_queue_id: Option<u64>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRole {
     User,
     Coordinator,
@@ -5386,7 +5397,7 @@ impl VizApp {
 
         // Fast-path: when the streaming file changes (via fs watcher or polling),
         // immediately read it so chat text appears token-by-token.
-        if self.chat.awaiting_response {
+        if self.chat.awaiting_response() {
             let prev = self.chat.streaming_text.clone();
             let streaming =
                 workgraph::chat::read_streaming(&self.workgraph_dir, self.active_coordinator_id);
@@ -5508,7 +5519,7 @@ impl VizApp {
             }
 
             // Chat outbox: check for new coordinator responses.
-            if self.right_panel_tab == RightPanelTab::Chat || self.chat.awaiting_response {
+            if self.right_panel_tab == RightPanelTab::Chat || self.chat.awaiting_response() {
                 let outbox_path = self
                     .workgraph_dir
                     .join("chat")
@@ -5593,7 +5604,7 @@ impl VizApp {
         self.last_refresh_display = chrono::Local::now().format("%H:%M:%S").to_string();
 
         // Update coordinator status and poll for new chat messages on every refresh tick.
-        if self.chat.awaiting_response || self.right_panel_tab == RightPanelTab::Chat {
+        if self.chat.awaiting_response() || self.right_panel_tab == RightPanelTab::Chat {
             self.check_coordinator_status();
             self.poll_chat_messages();
         }
@@ -5751,7 +5762,7 @@ impl VizApp {
             return true;
         }
         // Chat streaming: keep poll interval short for progressive display.
-        if self.chat.awaiting_response {
+        if self.chat.awaiting_response() {
             return true;
         }
         // Active splash animations (flash-and-fade on tasks)
@@ -5828,7 +5839,7 @@ impl VizApp {
         }
 
         // Spinner animation while awaiting coordinator response
-        if self.chat.awaiting_response {
+        if self.chat.awaiting_response() {
             return std::time::Duration::from_millis(100);
         }
 
@@ -7962,11 +7973,10 @@ impl VizApp {
                             &self.chat.messages,
                             self.chat.skipped_history_count,
                         );
-                        // Clear awaiting on error — no response will come.
-                        if self.chat.last_request_id.as_deref() == Some(&request_id) {
-                            self.chat.awaiting_response = false;
+                        // Clear this request from the pending set — no response will come.
+                        self.chat.pending_request_ids.remove(&request_id);
+                        if self.chat.pending_request_ids.is_empty() {
                             self.chat.awaiting_since = None;
-                            self.chat.last_request_id = None;
                         }
                     } else {
                         // wg chat succeeded — response should be in the outbox.
@@ -9755,7 +9765,7 @@ impl VizApp {
     /// Called during refresh ticks.
     pub fn poll_chat_messages(&mut self) {
         // Poll the streaming file for partial text while awaiting a response.
-        if self.chat.awaiting_response {
+        if self.chat.awaiting_response() {
             let streaming =
                 workgraph::chat::read_streaming(&self.workgraph_dir, self.active_coordinator_id);
             self.chat.streaming_text = streaming;
@@ -9829,14 +9839,34 @@ impl VizApp {
             .map(|m| m.id)
             .unwrap_or(self.chat.outbox_cursor);
 
-        // Any new coordinator response clears the awaiting state and streaming text.
+        // Retire one pending request per batch of new outbox messages (P2 fix).
         // The TUI request_id ("tui-...") differs from wg chat's ("chat-..."),
-        // so we clear on any new outbox message rather than matching by ID.
-        if self.chat.awaiting_response {
-            self.chat.awaiting_response = false;
+        // so we retire by count rather than matching by ID. Coordinator processes
+        // requests in FIFO order, so one response batch retires one request.
+        if !self.chat.pending_request_ids.is_empty() {
+            if let Some(first) = self.chat.pending_request_ids.iter().next().cloned() {
+                self.chat.pending_request_ids.remove(&first);
+            }
+        }
+        // If all requests are now answered, clear streaming state.
+        if self.chat.pending_request_ids.is_empty() {
             self.chat.awaiting_since = None;
-            self.chat.last_request_id = None;
             self.chat.streaming_text.clear();
+        }
+
+        // Reorder deferred user messages to after the newly arrived coordinator
+        // messages (P1 fix). Extract them in reverse index order to avoid shifting,
+        // then append in original order.
+        if !self.chat.deferred_user_indices.is_empty() {
+            let mut deferred: Vec<ChatMessage> = Vec::new();
+            for &idx in self.chat.deferred_user_indices.iter().rev() {
+                if idx < self.chat.messages.len() {
+                    deferred.push(self.chat.messages.remove(idx));
+                }
+            }
+            deferred.reverse();
+            self.chat.messages.extend(deferred);
+            self.chat.deferred_user_indices.clear();
         }
 
         // Auto-scroll to bottom when new messages arrive (if user hasn't scrolled up).
@@ -10000,10 +10030,17 @@ impl VizApp {
         // Reset scroll to bottom.
         self.chat.scroll = 0;
 
-        // Mark as awaiting response.
-        self.chat.awaiting_response = true;
-        self.chat.awaiting_since = Some(std::time::Instant::now());
-        self.chat.last_request_id = Some(request_id.clone());
+        // Track deferred user message if a response is already in flight (P1 fix).
+        if !self.chat.pending_request_ids.is_empty() {
+            let idx = self.chat.messages.len() - 1;
+            self.chat.deferred_user_indices.push(idx);
+        }
+
+        // Mark as awaiting response (P2 fix: set-based tracking).
+        if self.chat.pending_request_ids.is_empty() {
+            self.chat.awaiting_since = Some(std::time::Instant::now());
+        }
+        self.chat.pending_request_ids.insert(request_id.clone());
 
         // Build `wg chat` command args, including --attachment and --coordinator flags.
         let mut args = vec!["chat".to_string(), text];
@@ -10750,8 +10787,12 @@ impl VizApp {
         );
         // Optimistically clear awaiting state — the response collector
         // will write whatever partial text it has to the outbox.
-        self.chat.awaiting_response = false;
+        self.chat.pending_request_ids.clear();
+        self.chat.awaiting_since = None;
         self.chat.streaming_text.clear();
+        // Flush deferred message tracking on interrupt — messages are already
+        // in self.chat.messages, so just clear the index tracking.
+        self.chat.deferred_user_indices.clear();
     }
 
     // ── Config panel ──
@@ -17763,5 +17804,214 @@ mod tui_chat_tests {
             !(gap2 > threshold),
             "Second gap (5min) should NOT produce a boundary"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_ordering_tests {
+    use super::*;
+
+    /// Helper: create a minimal ChatMessage with the given role and text.
+    fn make_msg(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            text: text.to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_user_send_during_agent_response_produces_correct_ordering() {
+        // Simulate: user sends M1, then sends M2 while M1's response is in flight.
+        // After coordinator response R1 arrives, display should be [M1, R1, M2].
+        let mut chat = ChatState::default();
+
+        // --- User sends M1 (no in-flight requests) ---
+        chat.messages.push(make_msg(ChatRole::User, "M1"));
+        // No pending requests → not deferred
+        assert!(chat.pending_request_ids.is_empty());
+        chat.awaiting_since = Some(std::time::Instant::now());
+        chat.pending_request_ids.insert("rid1".to_string());
+
+        // --- User sends M2 while rid1 is still pending ---
+        chat.messages.push(make_msg(ChatRole::User, "M2"));
+        // A response is in flight → defer M2
+        assert!(!chat.pending_request_ids.is_empty());
+        let idx = chat.messages.len() - 1;
+        chat.deferred_user_indices.push(idx);
+        chat.pending_request_ids.insert("rid2".to_string());
+
+        // At this point: messages = [M1, M2], deferred = [1], pending = {rid1, rid2}
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[1].text, "M2");
+
+        // --- Coordinator response R1 arrives ---
+        chat.messages.push(make_msg(ChatRole::Coordinator, "R1"));
+
+        // Retire one pending request (FIFO)
+        if let Some(first) = chat.pending_request_ids.iter().next().cloned() {
+            chat.pending_request_ids.remove(&first);
+        }
+
+        // Reorder deferred user messages to after newly arrived coordinator messages
+        if !chat.deferred_user_indices.is_empty() {
+            let mut deferred: Vec<ChatMessage> = Vec::new();
+            for &idx in chat.deferred_user_indices.iter().rev() {
+                if idx < chat.messages.len() {
+                    deferred.push(chat.messages.remove(idx));
+                }
+            }
+            deferred.reverse();
+            chat.messages.extend(deferred);
+            chat.deferred_user_indices.clear();
+        }
+
+        // Display should be [M1, R1, M2]
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[0].role, ChatRole::User);
+        assert_eq!(chat.messages[1].text, "R1");
+        assert_eq!(chat.messages[1].role, ChatRole::Coordinator);
+        assert_eq!(chat.messages[2].text, "M2");
+        assert_eq!(chat.messages[2].role, ChatRole::User);
+
+        // One pending request remains (rid2)
+        assert_eq!(chat.pending_request_ids.len(), 1);
+        assert!(chat.awaiting_response());
+
+        // --- Coordinator response R2 arrives ---
+        chat.messages.push(make_msg(ChatRole::Coordinator, "R2"));
+        if let Some(first) = chat.pending_request_ids.iter().next().cloned() {
+            chat.pending_request_ids.remove(&first);
+        }
+        // No deferred messages this time
+        assert!(chat.deferred_user_indices.is_empty());
+
+        // Final display: [M1, R1, M2, R2]
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[1].text, "R1");
+        assert_eq!(chat.messages[2].text, "M2");
+        assert_eq!(chat.messages[3].text, "R2");
+        assert!(!chat.awaiting_response());
+    }
+
+    #[test]
+    fn no_deferral_when_no_request_in_flight() {
+        // When no request is in flight, user message should display immediately
+        // without any deferral tracking.
+        let mut chat = ChatState::default();
+
+        // Send message with no pending requests
+        chat.messages.push(make_msg(ChatRole::User, "hello"));
+        assert!(chat.pending_request_ids.is_empty());
+        // Should NOT be tracked as deferred
+        assert!(chat.deferred_user_indices.is_empty());
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].text, "hello");
+    }
+
+    #[test]
+    fn error_on_first_request_preserves_second_tracking() {
+        // Send M1, then M2. M1 errors. M2's response should still be tracked.
+        let mut chat = ChatState::default();
+
+        // M1 sent
+        chat.messages.push(make_msg(ChatRole::User, "M1"));
+        chat.awaiting_since = Some(std::time::Instant::now());
+        chat.pending_request_ids.insert("rid1".to_string());
+
+        // M2 sent while rid1 is pending
+        chat.messages.push(make_msg(ChatRole::User, "M2"));
+        let idx = chat.messages.len() - 1;
+        chat.deferred_user_indices.push(idx);
+        chat.pending_request_ids.insert("rid2".to_string());
+
+        // M1 errors — remove specific request ID
+        chat.pending_request_ids.remove("rid1");
+        assert!(chat.awaiting_response(), "rid2 is still pending");
+        assert_eq!(chat.pending_request_ids.len(), 1);
+        assert!(chat.pending_request_ids.contains("rid2"));
+    }
+
+    #[test]
+    fn interrupt_clears_all_pending_and_deferred() {
+        let mut chat = ChatState::default();
+
+        // Simulate two pending requests with deferred messages
+        chat.messages.push(make_msg(ChatRole::User, "M1"));
+        chat.awaiting_since = Some(std::time::Instant::now());
+        chat.pending_request_ids.insert("rid1".to_string());
+
+        chat.messages.push(make_msg(ChatRole::User, "M2"));
+        chat.deferred_user_indices.push(1);
+        chat.pending_request_ids.insert("rid2".to_string());
+
+        // Interrupt clears everything
+        chat.pending_request_ids.clear();
+        chat.awaiting_since = None;
+        chat.deferred_user_indices.clear();
+
+        assert!(!chat.awaiting_response());
+        assert!(chat.deferred_user_indices.is_empty());
+        assert!(chat.awaiting_since.is_none());
+        // Messages are still present (not deleted)
+        assert_eq!(chat.messages.len(), 2);
+    }
+
+    #[test]
+    fn rapid_fire_three_messages_correct_ordering() {
+        // Send M1, M2, M3 rapidly. Then R1 arrives.
+        // Expected order after R1: [M1, R1, M2, M3]
+        let mut chat = ChatState::default();
+
+        // M1 — no pending
+        chat.messages.push(make_msg(ChatRole::User, "M1"));
+        chat.awaiting_since = Some(std::time::Instant::now());
+        chat.pending_request_ids.insert("rid1".to_string());
+
+        // M2 — rid1 pending
+        chat.messages.push(make_msg(ChatRole::User, "M2"));
+        chat.deferred_user_indices.push(chat.messages.len() - 1);
+        chat.pending_request_ids.insert("rid2".to_string());
+
+        // M3 — rid1, rid2 pending
+        chat.messages.push(make_msg(ChatRole::User, "M3"));
+        chat.deferred_user_indices.push(chat.messages.len() - 1);
+        chat.pending_request_ids.insert("rid3".to_string());
+
+        // R1 arrives
+        chat.messages.push(make_msg(ChatRole::Coordinator, "R1"));
+        if let Some(first) = chat.pending_request_ids.iter().next().cloned() {
+            chat.pending_request_ids.remove(&first);
+        }
+
+        // Reorder deferred messages
+        let mut deferred: Vec<ChatMessage> = Vec::new();
+        for &idx in chat.deferred_user_indices.iter().rev() {
+            if idx < chat.messages.len() {
+                deferred.push(chat.messages.remove(idx));
+            }
+        }
+        deferred.reverse();
+        chat.messages.extend(deferred);
+        chat.deferred_user_indices.clear();
+
+        // Expected: [M1, R1, M2, M3]
+        assert_eq!(chat.messages.len(), 4);
+        assert_eq!(chat.messages[0].text, "M1");
+        assert_eq!(chat.messages[1].text, "R1");
+        assert_eq!(chat.messages[2].text, "M2");
+        assert_eq!(chat.messages[3].text, "M3");
     }
 }

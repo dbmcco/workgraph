@@ -2747,7 +2747,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             if is_active {
                 let (state_icon, state_style) = if !app.chat.coordinator_active {
                     (" ○", Style::default().fg(Color::DarkGray))
-                } else if app.chat.awaiting_response {
+                } else if app.chat.awaiting_response() {
                     (" ⟳", Style::default().fg(Color::Yellow))
                 } else {
                     (" ●", Style::default().fg(Color::Green))
@@ -2895,7 +2895,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.last_chat_message_area = msg_area;
 
     // Empty state.
-    if app.chat.messages.is_empty() && !app.chat.awaiting_response {
+    if app.chat.messages.is_empty() && !app.chat.awaiting_response() {
         let lines = if app.chat.coordinator_active {
             vec![
                 Line::from(Span::styled(
@@ -3209,7 +3209,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                         .unwrap_or(false);
                     let status_span = if has_response {
                         Span::styled("  ✓✓", Style::default().fg(Color::DarkGray))
-                    } else if app.chat.awaiting_response {
+                    } else if app.chat.awaiting_response() {
                         // Only the last user message shows processing indicator.
                         let is_last_user = app.chat.messages[msg_idx + 1..]
                             .iter()
@@ -3268,7 +3268,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     // Streaming indicator / progressive text when awaiting response.
-    if app.chat.awaiting_response {
+    if app.chat.awaiting_response() {
         if app.chat.streaming_text.is_empty() {
             // No streaming text yet — show animated lightning-wave with elapsed time.
             let elapsed = app
