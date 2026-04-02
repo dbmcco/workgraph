@@ -10360,27 +10360,52 @@ impl VizApp {
             return;
         }
 
-        let expected_label = format!("Coordinator: {}", user);
-        let coordinators = self.list_coordinator_ids_and_labels();
+        let expected_title = format!("Coordinator: {}", user);
 
-        // Check if a coordinator already exists for this user
-        let user_has_coordinator = coordinators
-            .iter()
-            .any(|(_, label)| *label == expected_label);
+        // Load the graph to check coordinator task titles directly.
+        // list_coordinator_ids_and_labels() returns display labels like "coord:N"
+        // which don't match the "Coordinator: {user}" title format.
+        let graph_path = self.workgraph_dir.join("graph.jsonl");
+        let graph = workgraph::parser::load_graph(&graph_path).ok();
 
-        if !user_has_coordinator {
-            // Auto-create a coordinator for this user via IPC
-            self.create_coordinator(Some(user.clone()));
+        // Find a non-archived coordinator task whose title matches
+        let existing_coord: Option<u32> = graph.as_ref().and_then(|g| {
+            g.tasks()
+                .filter(|t| t.tags.iter().any(|tag| tag == "coordinator-loop"))
+                .filter(|t| !matches!(t.status, workgraph::graph::Status::Abandoned))
+                .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
+                .filter(|t| t.title == expected_title)
+                .filter_map(|t| {
+                    t.id.strip_prefix(".coordinator-")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .or_else(|| if t.id == ".coordinator" { Some(0) } else { None })
+                })
+                .next()
+        });
+
+        if existing_coord.is_none() {
+            // No coordinator for this user — check if ANY coordinators exist
+            let any_exist = graph.as_ref().map_or(false, |g| {
+                g.tasks()
+                    .any(|t| {
+                        t.tags.iter().any(|tag| tag == "coordinator-loop")
+                            && !matches!(t.status, workgraph::graph::Status::Abandoned)
+                            && !t.tags.iter().any(|tag| tag == "archived")
+                    })
+            });
+            if !any_exist {
+                // No coordinators at all — create one for first-use experience
+                self.create_coordinator(Some(user.clone()));
+            }
+            // If other coordinators exist but none for this user, don't auto-create.
+            // The user can use the plus (+) key to add one manually.
         }
 
         // Only switch to the user's coordinator if no valid focus was restored
         // from tui-state.json (i.e., still on the default coordinator 0).
         if self.active_coordinator_id == 0 {
-            if let Some((cid, _)) = coordinators
-                .iter()
-                .find(|(_, label)| *label == expected_label)
-            {
-                self.active_coordinator_id = *cid;
+            if let Some(cid) = existing_coord {
+                self.active_coordinator_id = cid;
             }
         }
     }
