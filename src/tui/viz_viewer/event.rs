@@ -2616,6 +2616,15 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.scrollbar_drag = Some(ScrollbarDragTarget::Panel);
                 app.record_panel_scroll_activity();
                 vscrollbar_jump_panel(app, row);
+            } else if in_tab_bar {
+                // Click on tab header: always focus right panel, switch tab if hit.
+                // Checked before divider handlers because the horizontal divider's
+                // 3-row grab zone can overlap the tab bar row in stacked mode.
+                app.focused_panel = FocusedPanel::RightPanel;
+                let col_in_tabs = column.saturating_sub(app.last_tab_bar_area.x);
+                if let Some(tab) = tab_at_column(col_in_tabs) {
+                    app.right_panel_tab = tab;
+                }
             } else if in_divider {
                 // Click on divider between graph and inspector: start resize drag.
                 // Record the starting percent and column so the drag handler can
@@ -2637,13 +2646,6 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             } else if in_text_prompt {
                 // Click inside text prompt overlay: position cursor via edtui.
                 route_mouse_to_editor(app, row, column, EditorTarget::TextPrompt);
-            } else if in_tab_bar {
-                // Click on tab header: always focus right panel, switch tab if hit.
-                app.focused_panel = FocusedPanel::RightPanel;
-                let col_in_tabs = column.saturating_sub(app.last_tab_bar_area.x);
-                if let Some(tab) = tab_at_column(col_in_tabs) {
-                    app.right_panel_tab = tab;
-                }
             } else if app.last_chat_input_area.height > 0
                 && app.last_chat_input_area.contains(pos)
                 && (app.right_panel_tab == RightPanelTab::Chat)
@@ -5782,6 +5784,133 @@ mod scrollbar_tests {
         assert_eq!(app.divider_drag_start_row, 0, "drag_start_row should be reset");
         assert_eq!(app.divider_drag_start_pct, 0, "drag_start_pct should be reset");
     }
+
+    // ── Inspector tab bar mouse click regression tests ──
+
+    /// Helper: set up a test app for tab bar click tests with all conflicting
+    /// hit areas cleared, so only the tab bar and horizontal divider matter.
+    fn setup_tab_bar_test_app() -> (VizApp, tempfile::TempDir) {
+        let (mut app, tmp) = build_test_app();
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_coordinator_bar_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_fullscreen_right_border_area = Rect::default();
+        app.last_fullscreen_top_border_area = Rect::default();
+        app.last_fullscreen_bottom_border_area = Rect::default();
+        app.last_service_badge_area = Rect::default();
+        app.last_chat_input_area = Rect::default();
+        app.last_message_input_area = Rect::default();
+        app.last_chat_message_area = Rect::default();
+        (app, tmp)
+    }
+
+    /// Regression test: clicking on the inspector tab bar should switch tabs,
+    /// even in stacked (below) mode where the horizontal divider grab zone
+    /// can overlap. Bug introduced in commit 77afe93.
+    #[test]
+    fn mouse_click_on_tab_bar_switches_tab_stacked_mode() {
+        let (mut app, _tmp) = setup_tab_bar_test_app();
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::Graph;
+        app.inspector_is_beside = false;
+
+        // Simulate stacked layout: graph on top, panel below.
+        // Panel area starts at row 15, with border the inner area starts at row 16.
+        app.last_graph_area = Rect::new(0, 0, 120, 15);
+        app.last_right_panel_area = Rect::new(0, 15, 120, 15);
+        app.last_tab_bar_area = Rect::new(1, 16, 118, 1);
+        app.last_right_content_area = Rect::new(1, 17, 118, 13);
+        app.last_divider_area = Rect::default();
+
+        // Horizontal divider: 3 rows centered on the panel top border.
+        // This overlaps with the tab bar at row 16!
+        app.last_horizontal_divider_area = Rect::new(0, 14, 120, 3);
+
+        // Click on "1:Detail" tab. In the Tabs widget with default padding,
+        // "0:Chat" occupies cols 1..8 (padding + 6-char label + padding),
+        // divider at col 9, then "1:Detail" starts at col 10.
+        // Click at col 12 (within "1:Detail" label), row 16 (tab bar row).
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 16, 12);
+
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Detail,
+            "Clicking on the Detail tab in the tab bar should switch to Detail, \
+             but the click was likely consumed by the horizontal divider handler"
+        );
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Clicking on tab bar should focus the right panel"
+        );
+    }
+
+    /// Verify that clicking each tab in the tab bar selects the correct tab.
+    #[test]
+    fn mouse_click_on_each_tab_in_bar() {
+        let (mut app, _tmp) = setup_tab_bar_test_app();
+        app.inspector_is_beside = false;
+
+        // Layout: tab bar at row 16, inside panel starting at row 15.
+        app.last_graph_area = Rect::new(0, 0, 120, 15);
+        app.last_right_panel_area = Rect::new(0, 15, 120, 15);
+        app.last_tab_bar_area = Rect::new(1, 16, 118, 1);
+        app.last_right_content_area = Rect::new(1, 17, 118, 13);
+        app.last_divider_area = Rect::default();
+        app.last_horizontal_divider_area = Rect::new(0, 14, 120, 3);
+
+        // Tab positions (relative to tab_bar_area.x = 1):
+        // " 0:Chat " (8 cols) | " 1:Detail " (10 cols) | " 2:Log " (7 cols) | ...
+        // Absolute columns:
+        //   0:Chat => cols 1..8 (tab_bar.x + 0..7)
+        //   divider at col 9
+        //   1:Detail => cols 10..19
+        //   divider at col 20
+        //   2:Log => cols 21..27
+
+        // Click on "0:Chat" (col 4, row 16)
+        app.right_panel_tab = RightPanelTab::Log; // start on a different tab
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 16, 4);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Chat, "Click on Chat tab");
+
+        // Click on "1:Detail" (col 14, row 16)
+        app.right_panel_tab = RightPanelTab::Chat;
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 16, 14);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Detail, "Click on Detail tab");
+
+        // Click on "2:Log" (col 24, row 16)
+        app.right_panel_tab = RightPanelTab::Chat;
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 16, 24);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Log, "Click on Log tab");
+    }
+
+    /// Verify tab bar clicks still work in side-by-side mode (no horizontal divider).
+    #[test]
+    fn mouse_click_on_tab_bar_side_by_side_mode() {
+        let (mut app, _tmp) = setup_tab_bar_test_app();
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::Graph;
+        app.inspector_is_beside = true;
+
+        // Side-by-side: graph on left, panel on right.
+        app.last_graph_area = Rect::new(0, 0, 60, 30);
+        app.last_right_panel_area = Rect::new(60, 0, 60, 30);
+        app.last_tab_bar_area = Rect::new(61, 1, 58, 1);
+        app.last_right_content_area = Rect::new(61, 2, 58, 27);
+        app.last_divider_area = Rect::new(59, 0, 3, 30);
+        app.last_horizontal_divider_area = Rect::default();
+
+        // Click on "1:Detail" tab area (col 72 relative to screen, row 1).
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 72);
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Detail,
+            "Side-by-side: clicking Detail tab should switch tab"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5911,4 +6040,5 @@ mod drilldown_tests {
         app.right_panel_tab = RightPanelTab::Chat;
         assert!(app.nav_stack.is_empty());
     }
+
 }
