@@ -1088,7 +1088,17 @@ fn draw_back_edge_arcs(
 
     for line_idx in self_loops {
         if line_idx < lines.len() {
-            lines[line_idx].push_str(" ↺");
+            // If the node label already contains ↺ (from cycle_config/loop_iteration
+            // in format_node), skip appending — avoids duplicate indicators.
+            // Otherwise, append ⟳ as a distinct self-loop indicator.
+            if !lines[line_idx].contains('↺') {
+                if use_color {
+                    lines[line_idx]
+                        .push_str(&format!(" {}⟳{}", arc_color_code, "\x1b[0m"));
+                } else {
+                    lines[line_idx].push_str(" ⟳");
+                }
+            }
         }
     }
 
@@ -2111,6 +2121,160 @@ mod tests {
         assert!(
             !result.text.contains("↻"),
             "Should NOT contain ↻ on normal task:\n{}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("⟳"),
+            "Should NOT contain ⟳ on normal task:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_self_loop_without_cycle_config_shows_gapped_arrow() {
+        // A task with itself in its `after` list but no cycle_config should show ⟳
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("self-loop", "Self Loop Task");
+        task.after = vec!["self-loop".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(
+            result.text.contains("⟳"),
+            "Self-loop without cycle_config should show ⟳:\n{}",
+            result.text
+        );
+        // Should NOT have double loop symbols
+        assert!(
+            !result.text.contains("↺"),
+            "Self-loop without cycle_config should not show ↺:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_self_loop_with_cycle_config_no_duplicate() {
+        // A task with cycle_config AND a self-loop edge should NOT get double ↺
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("cycler", "Cycling task");
+        task.after = vec!["cycler".to_string()];
+        task.cycle_config = Some(CycleConfig {
+            max_iterations: 10,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        task.loop_iteration = 3;
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Should show the cycle_config ↺ with iteration info
+        assert!(
+            result.text.contains("↺ (iter 3/10)"),
+            "Should show iteration info:\n{}",
+            result.text
+        );
+        // Count occurrences of ↺ — should be exactly one
+        let loop_count = result.text.matches('↺').count();
+        assert_eq!(
+            loop_count, 1,
+            "Self-loop with cycle_config should have exactly one ↺, got {}:\n{}",
+            loop_count, result.text
+        );
+        // Should NOT also show ⟳ since ↺ is already present
+        assert!(
+            !result.text.contains("⟳"),
+            "Should not show ⟳ when ↺ already present:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_non_self_loop_cycle_unchanged() {
+        // A two-task cycle (A→B→A) should NOT show ⟳ — only standard back-edge arcs
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("task-a", "Task A");
+        a.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("task-b", "Task B");
+        b.after = vec!["task-a".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        a.after = vec!["task-b".to_string()]; // back-edge
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Multi-member cycle should NOT show ⟳
+        assert!(
+            !result.text.contains("⟳"),
+            "Multi-member cycle should not show ⟳:\n{}",
+            result.text
+        );
+        // Should have back-edge arcs (← and ┘)
+        assert!(
+            result.text.contains("←"),
+            "Multi-member cycle should have back-edge arcs:\n{}",
             result.text
         );
     }
