@@ -14199,6 +14199,221 @@ mod hud_tests {
         assert!(has_attempts, "Retry task should show Attempts section, not Iterations");
         assert_eq!(app.iteration_archives.len(), 2);
     }
+
+    // ── INTEGRATION: viz self-loop indicator + TUI iteration history ──
+
+    #[test]
+    fn integration_self_loop_viz_and_tui_iteration_browsing() {
+        // End-to-end: a self-looping task with cycle_config and archives should:
+        // 1. Show ↺ (iter N/M) in viz output (not ⟳, since cycle_config is set)
+        // 2. Have browsable iterations in TUI detail view
+        let (viz, _, _tmp) = build_cyclic_task_with_archives(3);
+
+        // --- Viz verification ---
+        // Self-loop with cycle_config should show ↺ with iteration info
+        assert!(
+            viz.text.contains("↺"),
+            "Self-loop with cycle_config should show ↺ in viz:\n{}",
+            viz.text
+        );
+        assert!(
+            viz.text.contains("iter 3/10"),
+            "Viz should show iteration progress:\n{}",
+            viz.text
+        );
+        // Should NOT also show ⟳ (that's for self-loops without cycle_config)
+        assert!(
+            !viz.text.contains("⟳"),
+            "Should not show ⟳ when ↺ is already present:\n{}",
+            viz.text
+        );
+
+        // --- TUI iteration browsing verification ---
+        let mut app = build_app(&viz, "cycle-task", _tmp.path());
+        app.load_hud_detail();
+
+        // Should have 3 archived iterations
+        assert_eq!(app.iteration_archives.len(), 3);
+        assert!(app.viewing_iteration.is_none(), "Should start at current view");
+
+        // Detail should show Iterations section
+        let detail = app.hud_detail.as_ref().unwrap();
+        assert!(
+            detail.rendered_lines.iter().any(|l| l.contains("── Iterations ──")),
+            "TUI detail should show Iterations section for cyclic task"
+        );
+
+        // Browse backward through all 3 iterations
+        assert!(app.iteration_prev()); // -> archive 2
+        assert_eq!(app.viewing_iteration, Some(2));
+        assert!(app.iteration_prev()); // -> archive 1
+        assert_eq!(app.viewing_iteration, Some(1));
+        assert!(app.iteration_prev()); // -> archive 0
+        assert_eq!(app.viewing_iteration, Some(0));
+        assert!(!app.iteration_prev()); // can't go further
+
+        // Browse forward back to current
+        assert!(app.iteration_next()); // -> archive 1
+        assert!(app.iteration_next()); // -> archive 2
+        assert!(app.iteration_next()); // -> current
+        assert!(app.viewing_iteration.is_none());
+        assert!(!app.iteration_next()); // can't go further
+
+        // Verify archived iteration content is accessible
+        app.viewing_iteration = Some(0);
+        app.hud_detail = None;
+        app.load_hud_detail();
+        let detail = app.hud_detail.as_ref().unwrap();
+        let has_iter_header = detail
+            .rendered_lines
+            .iter()
+            .any(|l| l.contains("Output (iteration 1)"));
+        assert!(
+            has_iter_header,
+            "Archived iteration should show labeled output section"
+        );
+    }
+
+    #[test]
+    fn integration_non_cycling_task_no_loop_indicator_no_iterations() {
+        // Non-cycling tasks should have neither loop indicator in viz nor iterations in TUI
+        let (viz, _, _tmp) = build_chain_plus_isolated();
+
+        // --- Viz: no loop symbols ---
+        assert!(
+            !viz.text.contains("↺"),
+            "Non-cycling tasks should not show ↺:\n{}",
+            viz.text
+        );
+        assert!(
+            !viz.text.contains("⟳"),
+            "Non-cycling tasks should not show ⟳:\n{}",
+            viz.text
+        );
+
+        // --- TUI: no iterations section, browsing is no-op ---
+        let mut app = build_app(&viz, "a", _tmp.path());
+        app.load_hud_detail();
+
+        let detail = app.hud_detail.as_ref().unwrap();
+        let has_iterations = detail
+            .rendered_lines
+            .iter()
+            .any(|l| l.contains("Iterations") || l.contains("Attempts"));
+        assert!(!has_iterations, "Non-cycling task should not show iteration section");
+        assert!(app.iteration_archives.is_empty());
+
+        // Browsing should be no-op
+        assert!(!app.iteration_prev());
+        assert!(!app.iteration_next());
+        assert!(app.viewing_iteration.is_none());
+    }
+
+    #[test]
+    fn integration_self_loop_no_cycle_config_shows_distinct_indicator() {
+        // Self-loop WITHOUT cycle_config: should show ⟳ (not ↺) and no TUI iterations
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status("bare-loop", "Bare Self-Loop", Status::Open);
+        task.after = vec!["bare-loop".to_string()];
+        // No cycle_config, no archives
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Viz: ⟳ present, ↺ absent
+        assert!(
+            viz.text.contains("⟳"),
+            "Self-loop without cycle_config should show ⟳:\n{}",
+            viz.text
+        );
+        assert!(
+            !viz.text.contains("↺"),
+            "Self-loop without cycle_config should not show ↺:\n{}",
+            viz.text
+        );
+
+        // TUI: no iterations to browse
+        let mut app = build_app(&viz, "bare-loop", tmp.path());
+        app.load_hud_detail();
+        assert!(app.iteration_archives.is_empty());
+        assert!(!app.iteration_prev());
+        assert!(!app.iteration_next());
+    }
+
+    #[test]
+    fn integration_zero_iteration_task_no_tui_crash() {
+        // A cyclic task with 0 completed iterations should not crash TUI
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status("zero-iter", "Zero Iteration", Status::Open);
+        task.cycle_config = Some(workgraph::graph::CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: false,
+            max_failure_restarts: None,
+        });
+        task.loop_iteration = 0;
+        task.after = vec!["zero-iter".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Viz should show ↺ (has cycle_config)
+        assert!(
+            viz.text.contains("↺"),
+            "Cyclic task with 0 iterations should show ↺:\n{}",
+            viz.text
+        );
+
+        // TUI should not crash — no archives, browsing is no-op
+        let mut app = build_app(&viz, "zero-iter", tmp.path());
+        app.load_hud_detail();
+        assert!(app.iteration_archives.is_empty());
+        assert!(!app.iteration_prev());
+        assert!(!app.iteration_next());
+        assert!(app.viewing_iteration.is_none());
+
+        // Detail should load without panic
+        let detail = app.hud_detail.as_ref().unwrap();
+        assert!(detail.rendered_lines.iter().any(|l| l.contains("zero-iter")));
+    }
 }
 
 #[cfg(test)]
