@@ -344,7 +344,7 @@ async fn test_session_summary_resume() {
     let tools = ToolRegistry::new();
     let output_log = temp_dir.path().join("output.jsonl");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         provider,
         tools,
         "You are a test agent.".to_string(),
@@ -406,7 +406,7 @@ async fn test_session_summary_stored_after_run() {
     let tools = ToolRegistry::new();
     let output_log = temp_dir.path().join("output.jsonl");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         provider,
         tools,
         "You are a test agent.".to_string(),

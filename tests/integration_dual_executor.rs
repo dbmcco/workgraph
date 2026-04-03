@@ -339,7 +339,7 @@ async fn scenario_1_openrouter_end_to_end() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("openrouter-e2e.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -411,7 +411,7 @@ async fn scenario_2_anthropic_end_to_end() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("anthropic-e2e.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -481,7 +481,7 @@ async fn scenario_3_journal_format_identical_across_providers() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("compare-or.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -502,7 +502,7 @@ async fn scenario_3_journal_format_identical_across_providers() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("compare-an.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -609,7 +609,7 @@ async fn scenario_4_kill_and_resume_openrouter() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("kill-or-s1.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -655,7 +655,7 @@ async fn scenario_4_kill_and_resume_openrouter() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("kill-or-s2.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -726,7 +726,7 @@ async fn scenario_5_kill_and_resume_anthropic() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("kill-an-s1.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -766,7 +766,7 @@ async fn scenario_5_kill_and_resume_anthropic() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("kill-an-s2.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -963,7 +963,7 @@ async fn scenario_6_compaction_on_resume() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("compact-e2e.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -1024,7 +1024,7 @@ async fn cross_provider_resume_openrouter_to_anthropic() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("cross-s1.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -1047,7 +1047,7 @@ async fn cross_provider_resume_openrouter_to_anthropic() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("cross-s2.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -1112,7 +1112,7 @@ async fn cross_provider_resume_anthropic_to_openrouter() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("cross2-s1.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -1135,7 +1135,7 @@ async fn cross_provider_resume_anthropic_to_openrouter() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("cross2-s2.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),

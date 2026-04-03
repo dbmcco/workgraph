@@ -17,6 +17,7 @@ use super::client::{
 use super::journal::{EndReason, Journal, JournalEntryKind};
 use super::provider::Provider;
 use super::resume::{self, ContextBudget, ContextPressureAction, ResumeConfig};
+use super::state_injection::StateInjector;
 use super::tools::ToolRegistry;
 use crate::stream_event::{self, StreamWriter, TotalUsage, TurnUsage};
 
@@ -69,6 +70,8 @@ pub struct AgentLoop {
     heartbeat_interval: Duration,
     /// Context pressure budget derived from the provider's context window.
     context_budget: ContextBudget,
+    /// Mid-turn state injector for ephemeral context updates.
+    state_injector: Option<StateInjector>,
 }
 
 /// NDJSON log entry types for the output file.
@@ -173,12 +176,28 @@ impl AgentLoop {
             streaming_file_path,
             heartbeat_interval: Duration::from_secs(30),
             context_budget,
+            state_injector: None,
         }
     }
 
     /// Set the heartbeat interval for tool execution (default: 30s).
     pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Enable mid-turn state injection.
+    ///
+    /// When configured, the agent loop will check for new messages, graph state
+    /// changes, and context pressure before each API call, injecting them as
+    /// ephemeral system-reminder blocks that are NOT persisted to the journal.
+    pub fn with_state_injection(
+        mut self,
+        workgraph_dir: PathBuf,
+        task_id: String,
+        agent_id: String,
+    ) -> Self {
+        self.state_injector = Some(StateInjector::new(workgraph_dir, task_id, agent_id));
         self
     }
 
@@ -228,7 +247,7 @@ impl AgentLoop {
     }
 
     /// Run the agent loop to completion.
-    pub async fn run(&self, initial_message: &str) -> Result<AgentResult> {
+    pub async fn run(&mut self, initial_message: &str) -> Result<AgentResult> {
         // Try to load a session summary for faster resume (replaces raw history)
         let session_summary = if self.resume_enabled {
             if let Some(ref path) = self.session_summary_path {
@@ -420,11 +439,48 @@ impl AgentLoop {
                 break;
             }
 
+            // ── Mid-turn state injection (ephemeral) ──────────────────────
+            // Collect dynamic state changes and build request_messages with
+            // any injections appended. These are NOT persisted to the journal
+            // or to the `messages` vec — they appear once in the API request
+            // and then vanish.
+            let request_messages = if let Some(ref mut injector) = self.state_injector {
+                // Get context pressure warning (if at warning threshold)
+                let pressure_warning =
+                    match self.context_budget.check_pressure(&messages) {
+                        ContextPressureAction::Warning => {
+                            Some(self.context_budget.warning_message(&messages))
+                        }
+                        _ => None,
+                    };
+
+                if let Some(injection_text) = injector.collect_injections(pressure_warning) {
+                    eprintln!(
+                        "[native-agent] Injecting ephemeral state update ({} chars)",
+                        injection_text.len()
+                    );
+                    // Clone messages and append injection to the last user message
+                    let mut injected = messages.clone();
+                    if let Some(last) = injected.last_mut() {
+                        if last.role == Role::User {
+                            last.content.push(ContentBlock::Text {
+                                text: injection_text,
+                            });
+                        }
+                    }
+                    injected
+                } else {
+                    messages.clone()
+                }
+            } else {
+                messages.clone()
+            };
+
             let request = MessagesRequest {
                 model: self.client.model().to_string(),
                 max_tokens: self.client.max_tokens(),
                 system: Some(self.system_prompt.clone()),
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: if self.supports_tools {
                     self.tools.definitions()
                 } else {
@@ -875,18 +931,25 @@ impl AgentLoop {
 
             // ── Context pressure check ──────────────────────────────────
             // After processing the turn, check if we're approaching context limits.
+            // When state injection is active, warnings are handled ephemerally in the
+            // pre-turn injection (not permanently appended to messages).
             match self.context_budget.check_pressure(&messages) {
                 ContextPressureAction::Ok => {}
                 ContextPressureAction::Warning => {
-                    // 80%+ capacity: inject an ephemeral warning into the next turn.
-                    // Appended to the last user message to preserve alternation.
-                    // This is NOT persisted to the journal — it's rebuilt each turn.
-                    let warning = self.context_budget.warning_message(&messages);
-                    eprintln!("[native-agent] {}", warning);
-
-                    if let Some(last) = messages.last_mut() {
-                        if last.role == Role::User {
-                            last.content.push(ContentBlock::Text { text: warning });
+                    if self.state_injector.is_some() {
+                        // With state injection: warning is handled ephemerally pre-turn.
+                        // Just log it here — the actual injection happens above.
+                        eprintln!(
+                            "[native-agent] Context pressure at warning level — will inject ephemerally next turn"
+                        );
+                    } else {
+                        // Legacy path: append to messages (non-ephemeral fallback).
+                        let warning = self.context_budget.warning_message(&messages);
+                        eprintln!("[native-agent] {}", warning);
+                        if let Some(last) = messages.last_mut() {
+                            if last.role == Role::User {
+                                last.content.push(ContentBlock::Text { text: warning });
+                            }
                         }
                     }
                 }

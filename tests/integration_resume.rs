@@ -128,7 +128,7 @@ async fn run_first_session(wg_dir: &Path, task_id: &str, provider: MockProvider)
     let registry = ToolRegistry::default_all(wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -215,7 +215,7 @@ async fn test_agent_resumes_from_journal() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("resume-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -355,7 +355,7 @@ async fn test_large_journal_compacted_on_resume() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("compact-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -481,7 +481,7 @@ async fn test_stale_tool_results_detected() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("stale-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -576,7 +576,7 @@ async fn test_no_resume_flag_fresh_start() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("no-resume-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -639,7 +639,7 @@ async fn test_kill_and_resume_integration() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("session1.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -680,7 +680,7 @@ async fn test_kill_and_resume_integration() {
         let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
         let output_log = wg_dir.join("session2.ndjson");
 
-        let agent = AgentLoop::new(
+        let mut agent = AgentLoop::new(
             Box::new(provider),
             registry,
             "You are a test agent.".to_string(),
@@ -759,7 +759,7 @@ async fn test_resume_empty_journal() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("empty-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -830,7 +830,7 @@ async fn test_resume_provider_agnostic() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("agnostic-test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),

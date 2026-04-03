@@ -144,7 +144,17 @@ pub fn run(
     if let Some(path) = session_summary_path {
         agent = agent.with_session_summary_path(path);
     }
-    let agent = agent;
+
+    // Enable mid-turn state injection when we have an agent ID
+    if let Ok(agent_id) = std::env::var("WG_AGENT_ID") {
+        agent = agent.with_state_injection(
+            workgraph_dir.to_path_buf(),
+            task_id.to_string(),
+            agent_id,
+        );
+    }
+
+    let mut agent = agent;
 
     // Run the async agent loop
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;

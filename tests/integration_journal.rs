@@ -142,7 +142,7 @@ async fn test_journal_created_on_agent_run() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -239,7 +239,7 @@ async fn test_journal_entries_provider_agnostic_format() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Test prompt.".to_string(),
@@ -311,7 +311,7 @@ async fn test_journal_with_tool_calls() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Test agent.".to_string(),
@@ -412,7 +412,7 @@ async fn test_journal_survives_crash() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Prompt.".to_string(),
@@ -494,7 +494,7 @@ async fn test_agent_without_journal() {
     let output_log = wg_dir.join("test.ndjson");
 
     // No .with_journal() — should work fine
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Test.".to_string(),
@@ -540,7 +540,7 @@ async fn test_journal_max_turns_end_reason() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("test.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Test.".to_string(),

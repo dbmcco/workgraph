@@ -80,7 +80,7 @@ async fn test_streaming_agent_loop() {
         streaming_called: Arc::clone(&streaming_called),
     };
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         ToolRegistry::new(),
         "Test system prompt".to_string(),
@@ -193,7 +193,7 @@ async fn test_streaming_file_written_during_streaming() {
         captured: Arc::clone(&captured_streaming),
     };
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         ToolRegistry::new(),
         "Test system prompt".to_string(),
@@ -251,7 +251,7 @@ async fn test_streaming_fallback_to_send() {
         // send_streaming not overridden — uses default which calls send()
     }
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(FallbackProvider),
         ToolRegistry::new(),
         "Test system prompt".to_string(),

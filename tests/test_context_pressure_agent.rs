@@ -673,7 +673,7 @@ async fn test_agent_loop_clean_exit_at_95_percent() {
     // Tiny context window — initial message alone will push near limit
     let provider = TinyContextProvider::new(100, responses);
     let call_count = Arc::clone(&provider.call_count);
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     // A large initial message to push context usage above 95%
     let result = agent
@@ -704,7 +704,7 @@ async fn test_agent_loop_recovers_from_413() {
         call_count: Arc::new(AtomicUsize::new(0)),
     };
     let call_count = Arc::clone(&provider.call_count);
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     let result = agent.run("Hello, this is a test").await;
 
@@ -722,7 +722,7 @@ async fn test_agent_loop_fails_when_413_persists() {
     let dir = TempDir::new().unwrap();
 
     let provider = AlwaysContextTooLongProvider;
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     let result = agent.run("Hello").await;
 
@@ -745,7 +745,7 @@ async fn test_agent_loop_recovers_from_400_context() {
         call_count: Arc::new(AtomicUsize::new(0)),
     };
     let call_count = Arc::clone(&provider.call_count);
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     let result = agent.run("Hello").await;
 
@@ -800,7 +800,7 @@ async fn test_agent_loop_injects_warning_at_80_percent() {
 
     let provider = InspectingProvider::new(300, responses);
     let seen_messages = Arc::clone(&provider.seen_messages);
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     // 300 tokens = 1200 chars. 80% = 960 chars.
     // After turn 1: 800 (initial) + 200 (assistant text) + ~40 (tool_use) + ~18 (tool result) = ~1058 chars
@@ -872,7 +872,7 @@ async fn test_agent_loop_compacts_at_90_percent() {
 
     let provider = InspectingProvider::new(150, responses);
     let seen_messages = Arc::clone(&provider.seen_messages);
-    let agent = make_agent(Box::new(provider), dir.path());
+    let mut agent = make_agent(Box::new(provider), dir.path());
 
     // Start with content that will push past 90% after tool result
     let result = agent.run(&"x".repeat(500)).await;

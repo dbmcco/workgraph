@@ -88,7 +88,7 @@ fn smoke_wg_tools_live() {
     let system_prompt = "Call wg_show with task_id=\"smoke-parent\". Then call wg_done with task_id=\"smoke-parent\". Report what happened.".to_string();
 
     let output_log = wg_dir.join("agent.ndjson");
-    let agent = AgentLoop::new(Box::new(client), registry, system_prompt, 15, output_log);
+    let mut agent = AgentLoop::new(Box::new(client), registry, system_prompt, 15, output_log);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt
@@ -125,7 +125,7 @@ fn smoke_wg_list_works() {
         .with_provider_hint("openrouter");
 
     let output_log = wg_dir.join("agent_list.ndjson");
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(client),
         registry,
         "Call wg_list. Report what you see.".to_string(),
@@ -161,7 +161,7 @@ fn smoke_wg_add_creates_task() {
         .with_provider_hint("openrouter");
 
     let output_log = wg_dir.join("agent_add.ndjson");
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(client),
         registry,
         "Call wg_add with title=\"New task from smoke test\". Report the task ID.".to_string(),
@@ -199,7 +199,7 @@ fn smoke_wg_done_simple() {
         .with_provider_hint("openrouter");
 
     let output_log = wg_dir.join("agent_done.ndjson");
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(client),
         registry,
         "Call wg_done with task_id=\"done-test\". Report what happens.".to_string(),

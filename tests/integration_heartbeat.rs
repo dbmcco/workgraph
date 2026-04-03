@@ -106,7 +106,7 @@ async fn test_heartbeat_during_long_bash() {
     let mut registry = ToolRegistry::new();
     register_bash_tool(&mut registry, dir.path().to_path_buf());
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "Test system prompt".to_string(),
@@ -258,7 +258,7 @@ async fn test_no_heartbeat_for_fast_tools() {
     // Drop the unused provider for the test
     drop(provider);
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(fast_provider),
         registry,
         "Test".to_string(),

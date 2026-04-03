@@ -161,7 +161,7 @@ async fn test_server_error_500_recovered_gracefully() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-500.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -222,7 +222,7 @@ async fn test_rate_limit_429_recovered_gracefully() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-429.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -276,7 +276,7 @@ async fn test_auth_error_401_fails_immediately() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-401.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -315,7 +315,7 @@ async fn test_consecutive_server_errors_eventually_fail() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-500-limit.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -352,7 +352,7 @@ async fn test_server_error_counter_resets_on_success() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-reset.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -387,7 +387,7 @@ async fn test_timeout_error_recovered_gracefully() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-timeout.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -440,7 +440,7 @@ async fn test_model_conversation_never_contains_raw_errors() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-clean.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),
@@ -517,7 +517,7 @@ async fn test_json_parse_error_in_tool_args_no_crash() {
     let registry = ToolRegistry::default_all(&wg_dir, wg_dir.parent().unwrap());
     let output_log = wg_dir.join("test-parse.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),

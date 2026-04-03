@@ -551,7 +551,7 @@ async fn native_coordinator_agent_loop_simple_text() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("native-simple.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test coordinator.".to_string(),
@@ -588,7 +588,7 @@ async fn native_coordinator_agent_loop_with_tool_call() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("native-tool.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test coordinator.".to_string(),
@@ -632,7 +632,7 @@ async fn native_coordinator_journal_with_openrouter_model() {
     let registry = ToolRegistry::default_all(&wg_dir, tmp.path());
     let output_log = wg_dir.join("native-journal.ndjson");
 
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         Box::new(provider),
         registry,
         "You are a test agent.".to_string(),

@@ -15,4 +15,5 @@ pub mod journal;
 pub mod openai_client;
 pub mod provider;
 pub mod resume;
+pub mod state_injection;
 pub mod tools;
