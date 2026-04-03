@@ -994,8 +994,8 @@ impl OpenAiClient {
 
     /// Send a request with retry logic.
     async fn send_with_retry(&self, url: &str, request: &OaiRequest) -> Result<MessagesResponse> {
-        let max_retries = 5;
-        let mut retry_count = 0;
+        let network_max_retries: usize = 5;
+        let mut retry_count: usize = 0;
         let mut backoff_ms = 1000u64;
 
         loop {
@@ -1027,12 +1027,13 @@ impl OpenAiClient {
                     let status_code = status.as_u16();
                     let body = response.text().await.unwrap_or_default();
 
-                    if is_retryable(status_code) && retry_count < max_retries {
+                    let allowed_retries = max_retries_for_status(status_code);
+                    if is_retryable(status_code) && retry_count < allowed_retries {
                         retry_count += 1;
                         let wait = parse_retry_after_oai(&body).unwrap_or(backoff_ms);
                         eprintln!(
                             "[openai-client] Retryable error {} (attempt {}/{}), waiting {}ms",
-                            status_code, retry_count, max_retries, wait
+                            status_code, retry_count, allowed_retries, wait
                         );
                         tokio::time::sleep(Duration::from_millis(wait)).await;
                         backoff_ms = (backoff_ms * 2).min(60_000);
@@ -1042,11 +1043,11 @@ impl OpenAiClient {
                     return Err(oai_api_error(status_code, &body));
                 }
                 Err(e) => {
-                    if retry_count < max_retries {
+                    if retry_count < network_max_retries {
                         retry_count += 1;
                         eprintln!(
                             "[openai-client] Network error (attempt {}/{}): {}",
-                            retry_count, max_retries, e
+                            retry_count, network_max_retries, e
                         );
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         backoff_ms = (backoff_ms * 2).min(60_000);
@@ -1158,12 +1159,43 @@ fn is_retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503)
 }
 
-fn oai_api_error(status: u16, body: &str) -> anyhow::Error {
-    if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(body) {
-        anyhow!("OpenAI API error {}: {}", status, err.error.message)
-    } else {
-        anyhow!("OpenAI API error {}: {}", status, truncate(body, 500))
+pub fn is_retryable_status(status: u16) -> bool {
+    is_retryable(status)
+}
+
+pub fn max_retries_for_status(status: u16) -> usize {
+    match status {
+        429 => 5,
+        500 | 502 | 503 => 3,
+        _ => 0,
     }
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            401 => write!(f, "Authentication failed (HTTP 401): {}. Check your API key configuration.", self.message),
+            403 => write!(f, "Access denied (HTTP 403): {}. Check your API key permissions.", self.message),
+            _ => write!(f, "API error {}: {}", self.status, self.message),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+fn oai_api_error(status: u16, body: &str) -> anyhow::Error {
+    let message = if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(body) {
+        err.error.message
+    } else {
+        truncate(body, 500).to_string()
+    };
+    ApiError { status, message }.into()
 }
 
 fn parse_retry_after_oai(body: &str) -> Option<u64> {
@@ -2483,7 +2515,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        };
+        context_window: None,
+};
         let client = OpenAiClient::from_endpoint(&ep, "gpt-4o", None).unwrap();
         assert_eq!(client.model, "gpt-4o");
         assert_eq!(client.base_url, "https://api.openai.com/v1");
@@ -2504,7 +2537,8 @@ mod tests {
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        };
+        context_window: None,
+};
         let client = OpenAiClient::from_endpoint(&ep, "anthropic/claude-sonnet-4-6", None).unwrap();
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(client.provider_hint.as_deref(), Some("openrouter"));
@@ -2525,7 +2559,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        };
+        context_window: None,
+};
         let result = OpenAiClient::from_endpoint(&ep, "some-model", None);
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
@@ -2544,7 +2579,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        };
+        context_window: None,
+};
         let client = OpenAiClient::from_endpoint(&ep, "model", None).unwrap();
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
     }
@@ -3329,5 +3365,50 @@ Done."#;
         let result = validate_openrouter_model("some/model", dir.path());
         assert!(result.was_valid);
         assert_eq!(result.model, "some/model");
+    }
+
+    #[test]
+    fn test_error_recovery_429_backoff() {
+        assert!(is_retryable(429));
+        assert_eq!(max_retries_for_status(429), 5);
+        let mut backoff = 1000u64;
+        for _ in 0..5 { backoff = (backoff * 2).min(60_000); }
+        assert!(backoff <= 60_000);
+        let body = r#"{"error":{"message":"rate limited","metadata":{"retry_after":2.5}}}"#;
+        assert_eq!(parse_retry_after_oai(body), Some(2500));
+        let err = oai_api_error(429, r#"{"error":{"message":"Rate limit exceeded"}}"#);
+        let api_err = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api_err.status, 429);
+    }
+
+    #[test]
+    fn test_error_recovery_500_retry() {
+        assert!(is_retryable(500));
+        assert!(is_retryable(502));
+        assert!(is_retryable(503));
+        assert_eq!(max_retries_for_status(500), 3);
+        assert_eq!(max_retries_for_status(502), 3);
+        assert_eq!(max_retries_for_status(503), 3);
+        let err = oai_api_error(500, r#"{"error":{"message":"Internal server error"}}"#);
+        let api_err = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api_err.status, 500);
+        assert_eq!(max_retries_for_status(400), 0);
+    }
+
+    #[test]
+    fn test_error_recovery_401_immediate_fail() {
+        assert!(!is_retryable(401));
+        assert_eq!(max_retries_for_status(401), 0);
+        let err = oai_api_error(401, r#"{"error":{"message":"Invalid API key"}}"#);
+        let api_err = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api_err.status, 401);
+        let display = format!("{}", api_err);
+        assert!(display.contains("Authentication failed"), "{}", display);
+        assert!(display.contains("API key"), "{}", display);
+        assert!(!is_retryable(403));
+        let err403 = oai_api_error(403, r#"{"error":{"message":"Forbidden"}}"#);
+        let api403 = err403.downcast_ref::<ApiError>().expect("ApiError");
+        let d403 = format!("{}", api403);
+        assert!(d403.contains("Access denied"), "{}", d403);
     }
 }

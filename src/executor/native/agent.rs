@@ -380,11 +380,25 @@ impl AgentLoop {
                 }
             };
 
-            let response = self
-                .client
-                .send_streaming(&request, &on_text)
-                .await
-                .context("API request failed")?;
+            let response = match self.client.send_streaming(&request, &on_text).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if let Some(api_err) = e.downcast_ref::<super::openai_client::ApiError>() {
+                        match api_err.status {
+                            401 | 403 => {
+                                eprintln!("[native-agent] Fatal auth error: {}", api_err);
+                                return Err(e);
+                            }
+                            status if super::openai_client::is_retryable_status(status) => {
+                                eprintln!("[native-agent] API error {} after retries exhausted", status);
+                                return Err(e).context(format!("API error {} — retries exhausted", status));
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Err(e).context("API request failed");
+                }
+            };
 
             // Clean up .streaming file after each turn
             if let Some(ref path) = self.streaming_file_path {
