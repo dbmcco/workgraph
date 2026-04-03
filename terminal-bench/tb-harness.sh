@@ -21,7 +21,7 @@ MODEL="minimax/minimax-m2.7"
 TASK_TEXT=""
 TASK_FILE=""
 TASK_ID=""
-MAX_TURNS=100
+MAX_TURNS=50
 TIMEOUT=1800
 RESULTS_DIR=""
 QUIET=false
@@ -153,35 +153,25 @@ elif [[ "$CONDITION" == "B" ]]; then
     # Create the root task in workgraph
     HOME="$FAKE_HOME" "$WG_BIN" --dir "$WG_DIR" add "$TASK_TEXT" --id "$TASK_ID" --context-scope task 2>/dev/null
 
-    # Build the Condition B system prompt (scope-based with wg integration)
+    # Build the Condition B system prompt (trimmed for token efficiency)
     cat > "$WORK_DIR/prompt.txt" <<PROMPT
 # Task Assignment
 
-You are an AI agent working on a task in a workgraph project.
-You have access to bash, file tools, AND workgraph tools for task management.
+You are an AI agent working on a task. You have bash, file tools, and workgraph tools.
 
-## Your Task
-- **ID:** ${TASK_ID}
-- **Title:** Terminal Bench Task
+## Your Task ID: ${TASK_ID}
 
-## Workgraph Integration
+## Workgraph Tools
+- wg_log("${TASK_ID}", "msg") — log progress (persists across context limits)
+- wg_add("title") — create subtask for complex work
+- wg_artifact("${TASK_ID}", "path") — record output files
+- wg_done("${TASK_ID}") — mark task complete
+- wg_fail("${TASK_ID}", "reason") — mark task failed
 
-You can use workgraph tools to:
-- Log progress: wg_log("${TASK_ID}", "message")
-- Create subtasks: wg_add("subtask title")
-- Record artifacts: wg_artifact("${TASK_ID}", "path/to/file")
-- Mark complete: wg_done("${TASK_ID}")
+Use wg_log to checkpoint progress. Use wg_add to decompose complex tasks.
+When finished, call wg_done.
 
-This is your key advantage: you can decompose complex tasks, log progress that survives
-context limits, and coordinate with other agents through the graph.
-
-## Guidelines
-- For complex tasks, decompose into subtasks with wg_add
-- Log progress regularly with wg_log — this enables crash recovery
-- When done, call wg_done with task_id "${TASK_ID}"
-- If you cannot complete, call wg_fail with a reason
-
-## Task Instruction
+## Task
 
 ${TASK_TEXT}
 PROMPT
