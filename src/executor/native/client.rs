@@ -30,6 +30,13 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        /// Opaque reasoning_details from the API, passed back verbatim in
+        /// subsequent requests to preserve reasoning context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<Vec<serde_json::Value>>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -79,6 +86,9 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
+    /// Reasoning/thinking tokens consumed (subset of output_tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl Usage {
@@ -91,6 +101,9 @@ impl Usage {
         }
         if let Some(v) = other.cache_read_input_tokens {
             *self.cache_read_input_tokens.get_or_insert(0) += v;
+        }
+        if let Some(v) = other.reasoning_tokens {
+            *self.reasoning_tokens.get_or_insert(0) += v;
         }
     }
 }
@@ -530,11 +543,9 @@ pub fn resolve_api_key_from_dir(workgraph_dir: &Path) -> Result<String> {
         return Ok(key);
     }
 
-    // 2. Workgraph config
-    let config_path = workgraph_dir.join("config.toml");
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(val) = toml::from_str::<toml::Value>(&content)
-        && let Some(key) = val
+    // 2. Workgraph config (merged: global + local)
+    if let Ok(merged_val) = crate::config::Config::load_merged_toml_value(workgraph_dir)
+        && let Some(key) = merged_val
             .get("native_executor")
             .and_then(|v| v.get("api_key"))
             .and_then(|v| v.as_str())

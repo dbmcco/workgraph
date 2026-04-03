@@ -834,6 +834,7 @@ async fn test_agent_loop_injects_warning_at_80_percent() {
                 ContentBlock::Text { text } => Some(format!("Text({}b)", text.len())),
                 ContentBlock::ToolUse { name, .. } => Some(format!("ToolUse({})", name)),
                 ContentBlock::ToolResult { content, .. } => Some(format!("ToolResult({}b)", content.len())),
+                ContentBlock::Thinking { .. } => Some("Thinking".to_string()),
             }))
             .collect::<Vec<_>>()
     );
@@ -888,6 +889,7 @@ async fn test_agent_loop_compacts_at_90_percent() {
                 ContentBlock::Text { text } => text.len(),
                 ContentBlock::ToolUse { input, name, .. } => name.len() + input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => content.len(),
+                ContentBlock::Thinking { thinking, .. } => thinking.len(),
             })
             .sum();
 
@@ -898,6 +900,7 @@ async fn test_agent_loop_compacts_at_90_percent() {
                 ContentBlock::Text { text } => text.len(),
                 ContentBlock::ToolUse { input, name, .. } => name.len() + input.to_string().len(),
                 ContentBlock::ToolResult { content, .. } => content.len(),
+                ContentBlock::Thinking { thinking, .. } => thinking.len(),
             })
             .sum();
 

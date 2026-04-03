@@ -442,7 +442,7 @@ async fn test_context_pressure_injection_in_api_request() {
                 input: serde_json::json!({"command": "echo hello"}),
             }],
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage { input_tokens: 150_000, output_tokens: 1000, cache_read_input_tokens: None, cache_creation_input_tokens: None },
+            usage: Usage { input_tokens: 150_000, output_tokens: 1000, cache_read_input_tokens: None, cache_creation_input_tokens: None, reasoning_tokens: None },
         },
         // Turn 2: end
         MessagesResponse {
@@ -451,7 +451,7 @@ async fn test_context_pressure_injection_in_api_request() {
                 text: "Done.".to_string(),
             }],
             stop_reason: Some(StopReason::EndTurn),
-            usage: Usage { input_tokens: 160_000, output_tokens: 500, cache_read_input_tokens: None, cache_creation_input_tokens: None },
+            usage: Usage { input_tokens: 160_000, output_tokens: 500, cache_read_input_tokens: None, cache_creation_input_tokens: None, reasoning_tokens: None },
         },
     ]);
 

@@ -169,6 +169,7 @@ fn estimate_tokens(messages: &[Message]) -> usize {
                 .iter()
                 .map(|b| match b {
                     ContentBlock::Text { text } => text.len(),
+                    ContentBlock::Thinking { thinking, .. } => thinking.len(),
                     ContentBlock::ToolUse { input, name, .. } => {
                         name.len() + input.to_string().len()
                     }
@@ -269,6 +270,9 @@ fn summarize_messages(messages: &[Message]) -> String {
                         };
                         parts.push(format!("Tool error: {}", preview));
                     }
+                }
+                ContentBlock::Thinking { .. } => {
+                    // Thinking blocks are not summarized — they are internal reasoning
                 }
             }
         }
@@ -583,6 +587,9 @@ pub fn extract_session_summary(messages: &[Message]) -> String {
                         findings.push(format!("Error: {}", truncate_str(content, 120)));
                     }
                 }
+                ContentBlock::Thinking { .. } => {
+                    // Thinking blocks are not included in session summaries
+                }
             }
         }
     }
@@ -747,6 +754,7 @@ impl ContextBudget {
                     .iter()
                     .map(|b| match b {
                         ContentBlock::Text { text } => text.len(),
+                        ContentBlock::Thinking { thinking, .. } => thinking.len(),
                         ContentBlock::ToolUse { input, name, .. } => {
                             name.len() + input.to_string().len()
                         }

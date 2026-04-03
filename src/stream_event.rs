@@ -45,6 +45,8 @@ pub enum StreamEvent {
     Heartbeat { timestamp_ms: i64 },
     /// A text chunk from real-time streaming output.
     TextChunk { text: String, timestamp_ms: i64 },
+    /// A thinking/reasoning chunk from real-time streaming output.
+    ThinkingChunk { text: String, timestamp_ms: i64 },
     /// Final event — aggregated usage and outcome.
     Result {
         success: bool,
@@ -62,6 +64,9 @@ pub struct TurnUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Reasoning/thinking tokens consumed (subset of output_tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Aggregated token usage for an entire run.
@@ -89,6 +94,7 @@ impl StreamEvent {
             | StreamEvent::ToolEnd { timestamp_ms, .. }
             | StreamEvent::Heartbeat { timestamp_ms }
             | StreamEvent::TextChunk { timestamp_ms, .. }
+            | StreamEvent::ThinkingChunk { timestamp_ms, .. }
             | StreamEvent::Result { timestamp_ms, .. } => *timestamp_ms,
         }
     }
@@ -215,6 +221,14 @@ impl StreamWriter {
         });
     }
 
+    /// Write a ThinkingChunk event for a streaming reasoning/thinking delta.
+    pub fn write_thinking_chunk(&self, text: &str) {
+        self.write_event(&StreamEvent::ThinkingChunk {
+            text: text.to_string(),
+            timestamp_ms: now_ms(),
+        });
+    }
+
     /// Write the final Result event.
     pub fn write_result(&self, success: bool, usage: TotalUsage) {
         self.write_event(&StreamEvent::Result {
@@ -270,6 +284,7 @@ pub fn translate_claude_event(line: &str) -> Option<StreamEvent> {
                     .get("cache_creation_input_tokens")
                     .or_else(|| u.get("cacheCreationInputTokens"))
                     .and_then(|v| v.as_u64()),
+                reasoning_tokens: None,
             });
 
             // Extract tool names from content blocks
@@ -423,7 +438,9 @@ impl AgentStreamState {
                 StreamEvent::ToolEnd { .. } => {
                     self.current_tool = None;
                 }
-                StreamEvent::Heartbeat { .. } | StreamEvent::TextChunk { .. } => {}
+                StreamEvent::Heartbeat { .. }
+                | StreamEvent::TextChunk { .. }
+                | StreamEvent::ThinkingChunk { .. } => {}
                 StreamEvent::Result { usage, .. } => {
                     // Final usage overwrites accumulated
                     self.accumulated_usage = usage.clone();
@@ -484,6 +501,7 @@ mod tests {
                     output_tokens: 200,
                     cache_read_input_tokens: Some(100),
                     cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 timestamp_ms: 2000,
             },
@@ -635,6 +653,7 @@ mod tests {
                     output_tokens: 200,
                     cache_read_input_tokens: Some(100),
                     cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 timestamp_ms: 2000,
             },

@@ -44,6 +44,7 @@ impl MockProvider {
                 output_tokens: 50,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                reasoning_tokens: None,
             },
         }])
     }
@@ -65,6 +66,7 @@ impl MockProvider {
                     output_tokens: 30,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             },
             // Second response: final text
@@ -79,6 +81,7 @@ impl MockProvider {
                     output_tokens: 60,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             },
         ])

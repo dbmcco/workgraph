@@ -54,6 +54,7 @@ impl MockOpenRouterProvider {
             usage: Usage {
                 input_tokens: 120,
                 output_tokens: 45,
+                reasoning_tokens: None,
                 cache_read_input_tokens: Some(30),
                 cache_creation_input_tokens: None,
             },
@@ -153,6 +154,7 @@ impl MockAnthropicProvider {
                 output_tokens: 42,
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: Some(50),
+                reasoning_tokens: None,
             },
         }])
     }

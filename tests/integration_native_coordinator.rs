@@ -454,6 +454,7 @@ impl MockNativeProvider {
                     output_tokens: 30,
                     cache_read_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
                 },
             }],
             call_count: Arc::new(AtomicUsize::new(0)),

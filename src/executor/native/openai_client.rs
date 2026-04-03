@@ -45,6 +45,10 @@ struct OaiMessage {
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Pass reasoning_details back verbatim for models that require it
+    /// (e.g., DeepSeek R1 returns 400 without reasoning context between tool calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 /// OpenAI-format request body.
@@ -69,6 +73,14 @@ struct OaiRequest {
     /// When set, OpenRouter applies cache_control to the last cacheable content block.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<serde_json::Value>,
+    /// OpenRouter reasoning parameter — enables reasoning/thinking token capture.
+    /// When set, models that support reasoning will return thinking tokens in the
+    /// `reasoning` and `reasoning_details` response fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
+    /// Legacy OpenRouter reasoning toggle — deprecated in favor of `reasoning`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_reasoning: Option<bool>,
 }
 
 /// Options for streaming mode.
@@ -100,6 +112,13 @@ struct OaiResponseMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiToolCall>>,
+    /// Plaintext reasoning/thinking content (OpenRouter unified field).
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// Structured reasoning details (OpenRouter unified field).
+    /// Passed back verbatim in subsequent requests to preserve reasoning context.
+    #[serde(default)]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +148,12 @@ struct OaiPromptTokenDetails {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct OaiOutputTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OaiUsage {
     #[serde(default)]
     prompt_tokens: u32,
@@ -136,6 +161,9 @@ struct OaiUsage {
     completion_tokens: u32,
     #[serde(default)]
     prompt_tokens_details: Option<OaiPromptTokenDetails>,
+    /// Output token breakdown — includes reasoning token count.
+    #[serde(default)]
+    completion_tokens_details: Option<OaiOutputTokenDetails>,
 }
 
 /// OpenAI-format error response.
@@ -181,6 +209,12 @@ struct OaiStreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiStreamToolCall>>,
+    /// Reasoning/thinking content delta (OpenRouter streaming).
+    #[serde(default)]
+    reasoning: Option<String>,
+    /// Structured reasoning details delta (OpenRouter streaming).
+    #[serde(default)]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 /// Tool call delta in a streaming chunk.
@@ -368,6 +402,7 @@ impl OpenAiClient {
                 content: Some(sys.clone()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_details: None,
             });
         }
 
@@ -394,6 +429,7 @@ impl OpenAiClient {
                                         content: Some(content.clone()),
                                         tool_calls: None,
                                         tool_call_id: Some(tool_use_id.clone()),
+                                        reasoning_details: None,
                                     });
                                 }
                                 ContentBlock::Text { text } => {
@@ -402,6 +438,7 @@ impl OpenAiClient {
                                         content: Some(text.clone()),
                                         tool_calls: None,
                                         tool_call_id: None,
+                                        reasoning_details: None,
                                     });
                                 }
                                 _ => {}
@@ -423,18 +460,26 @@ impl OpenAiClient {
                             content: Some(text),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_details: None,
                         });
                     }
                 }
                 Role::Assistant => {
-                    // Collect text and tool_calls from content blocks
+                    // Collect text, tool_calls, and reasoning from content blocks
                     let mut text_parts = Vec::new();
                     let mut tool_calls = Vec::new();
+                    let mut reasoning_details: Option<Vec<serde_json::Value>> = None;
 
                     for block in &msg.content {
                         match block {
                             ContentBlock::Text { text } => {
                                 text_parts.push(text.clone());
+                            }
+                            ContentBlock::Thinking { reasoning_details: rd, .. } => {
+                                // Pass back reasoning_details verbatim for models that need it
+                                if let Some(rd) = rd {
+                                    reasoning_details = Some(rd.clone());
+                                }
                             }
                             ContentBlock::ToolUse { id, name, input } => {
                                 tool_calls.push(OaiToolCall {
@@ -467,6 +512,7 @@ impl OpenAiClient {
                         content,
                         tool_calls: tc,
                         tool_call_id: None,
+                        reasoning_details,
                     });
                 }
             }
@@ -490,27 +536,69 @@ impl OpenAiClient {
             .as_ref()
             .is_some_and(|tc| !tc.is_empty());
 
+        // Add thinking/reasoning content FIRST (before text/tool blocks)
+        if let Some(ref reasoning) = choice.message.reasoning {
+            if !reasoning.is_empty() {
+                content_blocks.push(ContentBlock::Thinking {
+                    thinking: reasoning.clone(),
+                    reasoning_details: choice.message.reasoning_details.clone(),
+                });
+            }
+        } else if let Some(ref rd) = choice.message.reasoning_details {
+            // Some models only return reasoning_details without the plaintext reasoning field
+            if !rd.is_empty() {
+                let thinking_text = rd.iter()
+                    .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !thinking_text.is_empty() {
+                    content_blocks.push(ContentBlock::Thinking {
+                        thinking: thinking_text,
+                        reasoning_details: Some(rd.clone()),
+                    });
+                }
+            }
+        }
+
         // Add text content if present
         if let Some(text) = choice.message.content
             && !text.is_empty()
         {
-            // If there are no structured tool calls, check for text-based tool calls
-            if !has_structured_tool_calls {
-                let (remaining, extracted) = extract_tool_calls_from_text(&text);
-                if !extracted.is_empty() {
-                    eprintln!(
-                        "[openai-client] Extracted {} tool call(s) from text output (model used text-based format)",
-                        extracted.len()
-                    );
-                    if !remaining.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: remaining });
-                    }
-                    content_blocks.extend(extracted);
-                } else {
-                    content_blocks.push(ContentBlock::Text { text });
+            // Check for inline <think>...</think> tags (MiniMax, DeepSeek, Qwen)
+            let (clean_text, inline_thinking) = extract_inline_thinking(&text);
+
+            let has_inline_thinking = inline_thinking.is_some();
+            if let Some(thinking) = inline_thinking {
+                // Only add if we don't already have a Thinking block from the API fields
+                if !content_blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
+                    content_blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        reasoning_details: None,
+                    });
                 }
-            } else {
-                content_blocks.push(ContentBlock::Text { text });
+            }
+
+            let text_to_process = if has_inline_thinking { clean_text } else { text };
+
+            if !text_to_process.is_empty() {
+                // If there are no structured tool calls, check for text-based tool calls
+                if !has_structured_tool_calls {
+                    let (remaining, extracted) = extract_tool_calls_from_text(&text_to_process);
+                    if !extracted.is_empty() {
+                        eprintln!(
+                            "[openai-client] Extracted {} tool call(s) from text output (model used text-based format)",
+                            extracted.len()
+                        );
+                        if !remaining.is_empty() {
+                            content_blocks.push(ContentBlock::Text { text: remaining });
+                        }
+                        content_blocks.extend(extracted);
+                    } else {
+                        content_blocks.push(ContentBlock::Text { text: text_to_process });
+                    }
+                } else {
+                    content_blocks.push(ContentBlock::Text { text: text_to_process });
+                }
             }
         }
 
@@ -562,11 +650,15 @@ impl OpenAiClient {
                     .prompt_tokens_details
                     .map(|d| (d.cached_tokens, d.cache_write_tokens))
                     .unwrap_or((None, None));
+                let reasoning_tokens = u
+                    .completion_tokens_details
+                    .and_then(|d| d.reasoning_tokens);
                 Usage {
                     input_tokens: u.prompt_tokens,
                     output_tokens: u.completion_tokens,
                     cache_creation_input_tokens: cache_creation,
                     cache_read_input_tokens: cache_read,
+                    reasoning_tokens,
                 }
             })
             .unwrap_or_default();
@@ -579,6 +671,18 @@ impl OpenAiClient {
         })
     }
 
+    /// Returns the reasoning request value for OpenRouter.
+    ///
+    /// When using OpenRouter, sends `{}` (empty object = enable with defaults)
+    /// to capture reasoning/thinking tokens from models that support them.
+    fn reasoning_value(&self) -> Option<serde_json::Value> {
+        if self.provider_hint.as_deref() == Some("openrouter") {
+            Some(serde_json::json!({}))
+        } else {
+            None
+        }
+    }
+
     /// Send a non-streaming request.
     async fn chat_completion(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
         let tools = Self::translate_tools(&request.tools);
@@ -586,6 +690,12 @@ impl OpenAiClient {
             None
         } else {
             Some("auto".to_string())
+        };
+        let reasoning = self.reasoning_value();
+        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+            Some(true)
+        } else {
+            None
         };
         let oai_request = OaiRequest {
             model: request.model.clone(),
@@ -596,6 +706,8 @@ impl OpenAiClient {
             stream: false,
             stream_options: None,
             cache_control: self.cache_control_value(),
+            reasoning,
+            include_reasoning,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -620,6 +732,12 @@ impl OpenAiClient {
         } else {
             Some("auto".to_string())
         };
+        let reasoning = self.reasoning_value();
+        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+            Some(true)
+        } else {
+            None
+        };
         let oai_request = OaiRequest {
             model: request.model.clone(),
             messages: Self::translate_messages(&request.system, &request.messages),
@@ -631,6 +749,8 @@ impl OpenAiClient {
                 include_usage: true,
             }),
             cache_control: self.cache_control_value(),
+            reasoning,
+            include_reasoning,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -695,6 +815,8 @@ impl OpenAiClient {
 
         let mut response_id = String::new();
         let mut text_content = String::new();
+        let mut reasoning_content = String::new();
+        let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
         // Accumulated tool calls: index → (id, name, arguments)
         let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
             std::collections::BTreeMap::new();
@@ -765,6 +887,14 @@ impl OpenAiClient {
                         text_content.push_str(text);
                     }
 
+                    // Accumulate reasoning content
+                    if let Some(ref reasoning) = choice.delta.reasoning {
+                        reasoning_content.push_str(reasoning);
+                    }
+                    if let Some(ref rd) = choice.delta.reasoning_details {
+                        reasoning_details.extend(rd.iter().cloned());
+                    }
+
                     // Accumulate tool calls
                     if let Some(ref tcs) = choice.delta.tool_calls {
                         for tc in tcs {
@@ -794,15 +924,21 @@ impl OpenAiClient {
         }
 
         // Log streaming completion summary
+        let reasoning_info = if !reasoning_content.is_empty() {
+            format!(", {} reasoning chars", reasoning_content.len())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[openai-client] Stream complete: {} chunks, {} text chars, {} tool calls",
+            "[openai-client] Stream complete: {} chunks, {} text chars, {} tool calls{}",
             chunk_count,
             text_content.len(),
-            tool_calls.len()
+            tool_calls.len(),
+            reasoning_info,
         );
 
         // Assemble the response
-        assemble_oai_stream_response(response_id, text_content, tool_calls, finish_reason, usage)
+        assemble_oai_stream_response(response_id, text_content, reasoning_content, reasoning_details, tool_calls, finish_reason, usage)
     }
 
     /// Execute a single streaming attempt with a text callback for progressive display.
@@ -839,6 +975,8 @@ impl OpenAiClient {
         let mut buffer = String::new();
         let mut response_id = String::new();
         let mut text_content = String::new();
+        let mut reasoning_content = String::new();
+        let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
         let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
             std::collections::BTreeMap::new();
         let mut finish_reason: Option<String> = None;
@@ -904,6 +1042,14 @@ impl OpenAiClient {
                         on_text(text.clone());
                     }
 
+                    // Accumulate reasoning content
+                    if let Some(ref reasoning) = choice.delta.reasoning {
+                        reasoning_content.push_str(reasoning);
+                    }
+                    if let Some(ref rd) = choice.delta.reasoning_details {
+                        reasoning_details.extend(rd.iter().cloned());
+                    }
+
                     if let Some(ref tcs) = choice.delta.tool_calls {
                         for tc in tcs {
                             let entry = tool_calls
@@ -930,14 +1076,20 @@ impl OpenAiClient {
             }
         }
 
+        let reasoning_info = if !reasoning_content.is_empty() {
+            format!(", {} reasoning chars", reasoning_content.len())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[openai-client] Stream complete: {} chunks, {} text chars, {} tool calls",
+            "[openai-client] Stream complete: {} chunks, {} text chars, {} tool calls{}",
             chunk_count,
             text_content.len(),
-            tool_calls.len()
+            tool_calls.len(),
+            reasoning_info,
         );
 
-        assemble_oai_stream_response(response_id, text_content, tool_calls, finish_reason, usage)
+        assemble_oai_stream_response(response_id, text_content, reasoning_content, reasoning_details, tool_calls, finish_reason, usage)
     }
 
     /// Streaming completion with text callback and retry logic.
@@ -952,6 +1104,12 @@ impl OpenAiClient {
         } else {
             Some("auto".to_string())
         };
+        let reasoning = self.reasoning_value();
+        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+            Some(true)
+        } else {
+            None
+        };
         let oai_request = OaiRequest {
             model: request.model.clone(),
             messages: Self::translate_messages(&request.system, &request.messages),
@@ -963,6 +1121,8 @@ impl OpenAiClient {
                 include_usage: true,
             }),
             cache_control: self.cache_control_value(),
+            reasoning,
+            include_reasoning,
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -1265,6 +1425,55 @@ fn truncate(s: &str, max: usize) -> &str {
         s
     } else {
         &s[..s.floor_char_boundary(max)]
+    }
+}
+
+// ── Inline thinking token extraction ────────────────────────────────
+//
+// Models like MiniMax M2.7, DeepSeek R1, and Qwen QwQ may embed thinking
+// content as <think>...</think> tags inline in the content field (especially
+// via the "content-string" return mechanism). This extracts them into a
+// separate thinking block.
+
+/// Extract inline `<think>...</think>` tags from text content.
+///
+/// Returns `(remaining_text, Option<thinking_content>)`. If no thinking tags
+/// are found, the original text is returned unchanged and thinking is None.
+fn extract_inline_thinking(text: &str) -> (String, Option<String>) {
+    let mut thinking_parts = Vec::new();
+    let mut remaining = text.to_string();
+
+    loop {
+        let Some(start) = remaining.find("<think>") else {
+            break;
+        };
+        let search_from = start + "<think>".len();
+        let Some(end_offset) = remaining[search_from..].find("</think>") else {
+            // Unclosed <think> tag — treat the rest as thinking content
+            let thinking = remaining[search_from..].trim().to_string();
+            if !thinking.is_empty() {
+                thinking_parts.push(thinking);
+            }
+            remaining = remaining[..start].trim_end().to_string();
+            break;
+        };
+        let end = search_from + end_offset;
+        let thinking = remaining[search_from..end].trim().to_string();
+        if !thinking.is_empty() {
+            thinking_parts.push(thinking);
+        }
+        remaining = format!(
+            "{}{}",
+            remaining[..start].trim_end(),
+            remaining[end + "</think>".len()..].trim_start()
+        );
+    }
+
+    if thinking_parts.is_empty() {
+        (remaining, None)
+    } else {
+        let combined = thinking_parts.join("\n\n");
+        (remaining.trim().to_string(), Some(combined))
     }
 }
 
@@ -1959,6 +2168,8 @@ fn parse_next_oai_sse_data(buffer: &mut String) -> Option<String> {
 fn assemble_oai_stream_response(
     response_id: String,
     text_content: String,
+    reasoning_content: String,
+    reasoning_details: Vec<serde_json::Value>,
     tool_calls: std::collections::BTreeMap<usize, (String, String, String)>,
     finish_reason: Option<String>,
     usage: Option<OaiUsage>,
@@ -1966,24 +2177,62 @@ fn assemble_oai_stream_response(
     let mut content_blocks = Vec::new();
     let has_structured_tool_calls = !tool_calls.is_empty();
 
+    // Add thinking/reasoning block FIRST if we accumulated reasoning content
+    if !reasoning_content.is_empty() {
+        let rd = if reasoning_details.is_empty() { None } else { Some(reasoning_details.clone()) };
+        content_blocks.push(ContentBlock::Thinking {
+            thinking: reasoning_content,
+            reasoning_details: rd,
+        });
+    } else if !reasoning_details.is_empty() {
+        // Only reasoning_details without plaintext — extract text from entries
+        let thinking_text = reasoning_details.iter()
+            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !thinking_text.is_empty() {
+            content_blocks.push(ContentBlock::Thinking {
+                thinking: thinking_text,
+                reasoning_details: Some(reasoning_details.clone()),
+            });
+        }
+    }
+
     if !text_content.is_empty() {
-        // If no structured tool calls came through the stream, check for text-based ones
-        if !has_structured_tool_calls {
-            let (remaining, extracted) = extract_tool_calls_from_text(&text_content);
-            if !extracted.is_empty() {
-                eprintln!(
-                    "[openai-client] Extracted {} tool call(s) from streamed text output",
-                    extracted.len()
-                );
-                if !remaining.is_empty() {
-                    content_blocks.push(ContentBlock::Text { text: remaining });
-                }
-                content_blocks.extend(extracted);
-            } else {
-                content_blocks.push(ContentBlock::Text { text: text_content });
+        // Check for inline <think>...</think> tags
+        let (clean_text, inline_thinking) = extract_inline_thinking(&text_content);
+
+        let has_inline_thinking = inline_thinking.is_some();
+        if let Some(thinking) = inline_thinking {
+            if !content_blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
+                content_blocks.push(ContentBlock::Thinking {
+                    thinking,
+                    reasoning_details: None,
+                });
             }
-        } else {
-            content_blocks.push(ContentBlock::Text { text: text_content });
+        }
+
+        let text_to_process = if has_inline_thinking { clean_text } else { text_content };
+
+        if !text_to_process.is_empty() {
+            // If no structured tool calls came through the stream, check for text-based ones
+            if !has_structured_tool_calls {
+                let (remaining, extracted) = extract_tool_calls_from_text(&text_to_process);
+                if !extracted.is_empty() {
+                    eprintln!(
+                        "[openai-client] Extracted {} tool call(s) from streamed text output",
+                        extracted.len()
+                    );
+                    if !remaining.is_empty() {
+                        content_blocks.push(ContentBlock::Text { text: remaining });
+                    }
+                    content_blocks.extend(extracted);
+                } else {
+                    content_blocks.push(ContentBlock::Text { text: text_to_process });
+                }
+            } else {
+                content_blocks.push(ContentBlock::Text { text: text_to_process });
+            }
         }
     }
 
@@ -2024,11 +2273,15 @@ fn assemble_oai_stream_response(
                 .prompt_tokens_details
                 .map(|d| (d.cached_tokens, d.cache_write_tokens))
                 .unwrap_or((None, None));
+            let reasoning_tokens = u
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens);
             Usage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cache_creation_input_tokens: cache_creation,
                 cache_read_input_tokens: cache_read,
+                reasoning_tokens,
             }
         })
         .unwrap_or_default();
@@ -2141,6 +2394,8 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("Hello!".to_string()),
                     tool_calls: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
@@ -2148,6 +2403,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
 
@@ -2167,6 +2423,8 @@ mod tests {
                 message: OaiResponseMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning: None,
+                    reasoning_details: None,
                     tool_calls: Some(vec![OaiToolCall {
                         id: "call_789".to_string(),
                         call_type: "function".to_string(),
@@ -2182,6 +2440,7 @@ mod tests {
                 prompt_tokens: 20,
                 completion_tokens: 15,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
 
@@ -2204,6 +2463,8 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("partial...".to_string()),
                     tool_calls: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 },
                 finish_reason: Some("length".to_string()),
             }],
@@ -2351,6 +2612,8 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-parse-err".to_string(),
             String::new(),
+            String::new(),
+            vec![],
             tool_calls,
             Some("tool_calls".to_string()),
             None,
@@ -2392,12 +2655,15 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-abc".to_string(),
             "Hello world".to_string(),
+            String::new(),
+            vec![],
             std::collections::BTreeMap::new(),
             Some("stop".to_string()),
             Some(OaiUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         )
         .unwrap();
@@ -2425,6 +2691,8 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-xyz".to_string(),
             String::new(),
+            String::new(),
+            vec![],
             tool_calls,
             Some("tool_calls".to_string()),
             None,
@@ -2463,12 +2731,15 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-multi".to_string(),
             "Let me check.".to_string(),
+            String::new(),
+            vec![],
             tool_calls,
             Some("tool_calls".to_string()),
             Some(OaiUsage {
                 prompt_tokens: 50,
                 completion_tokens: 30,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         )
         .unwrap();
@@ -2486,6 +2757,8 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-empty".to_string(),
             String::new(),
+            String::new(),
+            vec![],
             std::collections::BTreeMap::new(),
             None,
             None,
@@ -2597,12 +2870,15 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("cached response".to_string()),
                     tool_calls: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
             usage: Some(OaiUsage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
+                completion_tokens_details: None,
                 prompt_tokens_details: Some(OaiPromptTokenDetails {
                     cached_tokens: Some(80),
                     cache_write_tokens: Some(15),
@@ -2623,11 +2899,14 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-cache".to_string(),
             "streamed cached".to_string(),
+            String::new(),
+            vec![],
             std::collections::BTreeMap::new(),
             Some("stop".to_string()),
             Some(OaiUsage {
                 prompt_tokens: 200,
                 completion_tokens: 40,
+                completion_tokens_details: None,
                 prompt_tokens_details: Some(OaiPromptTokenDetails {
                     cached_tokens: Some(150),
                     cache_write_tokens: Some(30),
@@ -2703,6 +2982,8 @@ mod tests {
             stream: false,
             stream_options: None,
             cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("cache_control"));
@@ -2720,6 +3001,8 @@ mod tests {
             stream: false,
             stream_options: None,
             cache_control: None,
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("cache_control"));
@@ -2823,6 +3106,8 @@ mod tests {
                 include_usage: true,
             }),
             cache_control: None,
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"stream\":true"));
@@ -2841,6 +3126,8 @@ mod tests {
             stream: false,
             stream_options: None,
             cache_control: None,
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"stream\":false"));
@@ -2888,7 +3175,7 @@ mod tests {
         }
 
         let resp =
-            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
         assert_eq!(resp.id, "gen-1");
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
@@ -2954,7 +3241,7 @@ mod tests {
         }
 
         let resp =
-            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
         assert_eq!(resp.id, "gen-2");
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(
@@ -3028,7 +3315,7 @@ mod tests {
         }
 
         let resp =
-            assemble_oai_stream_response(response_id, text, tool_calls, finish, usage).unwrap();
+            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
         assert_eq!(resp.content.len(), 3); // text + 2 tool calls
         assert!(
             matches!(&resp.content[0], ContentBlock::Text { text } if text == "Running checks.")
@@ -3087,6 +3374,8 @@ mod tests {
         let resp = assemble_oai_stream_response(
             "gen-nousage".to_string(),
             "Hello".to_string(),
+            String::new(),
+            vec![],
             std::collections::BTreeMap::new(),
             Some("stop".to_string()),
             None,
@@ -3117,6 +3406,8 @@ mod tests {
             stream: false,
             stream_options: None,
             cache_control: None,
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""tool_choice":"auto""#));
@@ -3133,6 +3424,8 @@ mod tests {
             stream: false,
             stream_options: None,
             cache_control: None,
+            reasoning: None,
+            include_reasoning: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(!json.contains("tool_choice"));
@@ -3276,6 +3569,8 @@ Done."#;
                             .to_string(),
                     ),
                     tool_calls: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
@@ -3283,6 +3578,7 @@ Done."#;
                 prompt_tokens: 50,
                 completion_tokens: 30,
                 prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         };
 
@@ -3305,6 +3601,8 @@ Done."#;
                 message: OaiResponseMessage {
                     role: "assistant".to_string(),
                     content: Some("Running command.".to_string()),
+                    reasoning: None,
+                    reasoning_details: None,
                     tool_calls: Some(vec![OaiToolCall {
                         id: "call_real".to_string(),
                         call_type: "function".to_string(),
@@ -3334,6 +3632,8 @@ Done."#;
         let resp = assemble_oai_stream_response(
             "gen-text-tools".to_string(),
             "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"wg status\"}}\n</tool_call>".to_string(),
+            String::new(),
+            vec![],
             std::collections::BTreeMap::new(), // no structured tool calls
             Some("stop".to_string()),
             None,
@@ -3362,6 +3662,8 @@ Done."#;
                             .to_string(),
                     ),
                     tool_calls: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],

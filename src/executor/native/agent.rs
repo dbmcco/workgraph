@@ -102,6 +102,7 @@ enum LogEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlockLog {
     Text { text: String },
+    Thinking { chars: usize },
     ToolUse { id: String, name: String },
     ToolResult { tool_use_id: String, is_error: bool },
 }
@@ -110,6 +111,9 @@ impl From<&ContentBlock> for ContentBlockLog {
     fn from(block: &ContentBlock) -> Self {
         match block {
             ContentBlock::Text { text } => ContentBlockLog::Text { text: text.clone() },
+            ContentBlock::Thinking { thinking, .. } => ContentBlockLog::Thinking {
+                chars: thinking.len(),
+            },
             ContentBlock::ToolUse { id, name, .. } => ContentBlockLog::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
@@ -719,6 +723,10 @@ impl AgentLoop {
                         cache_creation_input_tokens: response
                             .usage
                             .cache_creation_input_tokens
+                            .map(u64::from),
+                        reasoning_tokens: response
+                            .usage
+                            .reasoning_tokens
                             .map(u64::from),
                     }),
                 );

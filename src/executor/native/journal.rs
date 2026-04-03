@@ -634,6 +634,7 @@ mod tests {
                     output_tokens: 5,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 response_id: Some("msg-123".to_string()),
                 stop_reason: Some(StopReason::EndTurn),
