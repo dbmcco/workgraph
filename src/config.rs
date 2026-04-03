@@ -2641,6 +2641,17 @@ impl Config {
         Ok(val)
     }
 
+    /// Load the merged TOML value (global + local) without deserializing.
+    /// Useful for legacy code that needs raw TOML access to sections like
+    /// `[native_executor]` while respecting the global → local merge chain.
+    pub fn load_merged_toml_value(workgraph_dir: &Path) -> anyhow::Result<toml::Value> {
+        let global_path = Self::global_config_path()?;
+        let local_path = workgraph_dir.join("config.toml");
+        let global_val = Self::load_toml_value(&global_path)?;
+        let local_val = Self::load_toml_value(&local_path)?;
+        Ok(merge_toml(global_val, local_val))
+    }
+
     /// Load merged configuration: global config deep-merged with local config.
     /// Local keys override global keys. Missing files are treated as empty.
     pub fn load_merged(workgraph_dir: &Path) -> anyhow::Result<Self> {
@@ -2708,11 +2719,9 @@ impl Config {
             }
         }
 
-        // 3. Legacy fallback: [native_executor] api_key in config.toml
-        let config_path = workgraph_dir.join("config.toml");
-        if let Ok(content) = fs::read_to_string(&config_path)
-            && let Ok(val) = toml::from_str::<toml::Value>(&content)
-            && let Some(key) = val
+        // 3. Legacy fallback: [native_executor] api_key in merged config (global + local)
+        if let Ok(merged_val) = Self::load_merged_toml_value(workgraph_dir)
+            && let Some(key) = merged_val
                 .get("native_executor")
                 .and_then(|v| v.get("api_key"))
                 .and_then(|v| v.as_str())
@@ -5704,5 +5713,308 @@ model = "claude:haiku"
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
         assert_eq!(config.llm_endpoints.endpoints[0].name, "openrouter");
+    }
+
+    // ---- Global config propagation tests ----
+
+    #[test]
+    fn test_load_merged_toml_value_merges_global_and_local() {
+        // Set up fake global config via temp dir
+        let global_dir = tempfile::tempdir().unwrap();
+        let local_dir = tempfile::tempdir().unwrap();
+
+        // We can't easily override global_dir(), so test via load_toml_value + merge_toml directly
+        let global_path = global_dir.path().join("config.toml");
+        let local_path = local_dir.path().join("config.toml");
+
+        std::fs::write(
+            &global_path,
+            r#"
+[native_executor]
+provider = "openrouter"
+api_key = "sk-or-global-key"
+api_base = "https://openrouter.ai/api/v1"
+
+[coordinator]
+executor = "native"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &local_path,
+            r#"
+[agent]
+model = "claude:haiku"
+"#,
+        )
+        .unwrap();
+
+        let global_val = Config::load_toml_value(&global_path).unwrap();
+        let local_val = Config::load_toml_value(&local_path).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        // Global native_executor should be present
+        let ne = merged.get("native_executor").unwrap().as_table().unwrap();
+        assert_eq!(ne["api_key"].as_str().unwrap(), "sk-or-global-key");
+        assert_eq!(ne["provider"].as_str().unwrap(), "openrouter");
+
+        // Local agent model should be present
+        let agent = merged.get("agent").unwrap().as_table().unwrap();
+        assert_eq!(agent["model"].as_str().unwrap(), "claude:haiku");
+
+        // Global coordinator should be present
+        let coord = merged.get("coordinator").unwrap().as_table().unwrap();
+        assert_eq!(coord["executor"].as_str().unwrap(), "native");
+    }
+
+    #[test]
+    fn test_local_config_overrides_global_api_key() {
+        let global_path = tempfile::NamedTempFile::new().unwrap();
+        let local_path = tempfile::NamedTempFile::new().unwrap();
+
+        std::fs::write(
+            global_path.path(),
+            r#"
+[native_executor]
+api_key = "sk-global-key"
+provider = "openrouter"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            local_path.path(),
+            r#"
+[native_executor]
+api_key = "sk-local-key"
+"#,
+        )
+        .unwrap();
+
+        let global_val = Config::load_toml_value(global_path.path()).unwrap();
+        let local_val = Config::load_toml_value(local_path.path()).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        let ne = merged.get("native_executor").unwrap().as_table().unwrap();
+        // Local api_key should override global
+        assert_eq!(ne["api_key"].as_str().unwrap(), "sk-local-key");
+        // Global provider should be preserved (not overridden)
+        assert_eq!(ne["provider"].as_str().unwrap(), "openrouter");
+    }
+
+    #[test]
+    fn test_missing_global_config_falls_back_gracefully() {
+        let local_dir = tempfile::tempdir().unwrap();
+
+        // No global config exists at all (using load_toml_value with non-existent path)
+        let nonexistent_global = PathBuf::from("/tmp/wg_test_nonexistent_global_config.toml");
+        let local_path = local_dir.path().join("config.toml");
+
+        std::fs::write(
+            &local_path,
+            r#"
+[agent]
+model = "claude:sonnet"
+"#,
+        )
+        .unwrap();
+
+        let global_val = Config::load_toml_value(&nonexistent_global).unwrap();
+        let local_val = Config::load_toml_value(&local_path).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        // Should have just the local config
+        let agent = merged.get("agent").unwrap().as_table().unwrap();
+        assert_eq!(agent["model"].as_str().unwrap(), "claude:sonnet");
+    }
+
+    #[test]
+    fn test_missing_local_config_uses_global() {
+        let global_path = tempfile::NamedTempFile::new().unwrap();
+
+        std::fs::write(
+            global_path.path(),
+            r#"
+[coordinator]
+executor = "native"
+max_agents = 2
+
+[native_executor]
+provider = "openrouter"
+api_key = "sk-or-global"
+"#,
+        )
+        .unwrap();
+
+        let nonexistent_local = PathBuf::from("/tmp/wg_test_nonexistent_local_config.toml");
+
+        let global_val = Config::load_toml_value(global_path.path()).unwrap();
+        let local_val = Config::load_toml_value(&nonexistent_local).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        // Global config should be used entirely
+        let coord = merged.get("coordinator").unwrap().as_table().unwrap();
+        assert_eq!(coord["executor"].as_str().unwrap(), "native");
+        assert_eq!(coord["max_agents"].as_integer().unwrap(), 2);
+
+        let ne = merged.get("native_executor").unwrap().as_table().unwrap();
+        assert_eq!(ne["api_key"].as_str().unwrap(), "sk-or-global");
+    }
+
+    #[test]
+    fn test_global_endpoints_propagate_to_merged_config() {
+        let global_path = tempfile::NamedTempFile::new().unwrap();
+
+        std::fs::write(
+            global_path.path(),
+            r#"
+[llm_endpoints]
+[[llm_endpoints.endpoints]]
+name = "openrouter"
+provider = "openrouter"
+url = "https://openrouter.ai/api/v1"
+api_key = "sk-or-test-global"
+is_default = true
+"#,
+        )
+        .unwrap();
+
+        // Empty local config
+        let local_path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(local_path.path(), "").unwrap();
+
+        let global_val = Config::load_toml_value(global_path.path()).unwrap();
+        let local_val = Config::load_toml_value(local_path.path()).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        let config: Config = merged.try_into().unwrap();
+        assert_eq!(config.llm_endpoints.endpoints.len(), 1);
+        assert_eq!(config.llm_endpoints.endpoints[0].api_key, Some("sk-or-test-global".to_string()));
+        assert_eq!(config.llm_endpoints.endpoints[0].provider, "openrouter");
+    }
+
+    #[test]
+    fn test_resolve_api_key_from_merged_endpoints() {
+        // Build a config with endpoints (as if loaded from global)
+        let mut config = Config::default();
+        config.llm_endpoints.endpoints.push(EndpointConfig {
+            name: "openrouter".to_string(),
+            provider: "openrouter".to_string(),
+            url: Some("https://openrouter.ai/api/v1".to_string()),
+            api_key: Some("sk-or-from-endpoint".to_string()),
+            api_key_file: None,
+            api_key_env: None,
+            model: None,
+            is_default: true,
+            context_window: None,
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        // No local config.toml exists — key should come from the endpoint config
+        let result = config.resolve_api_key_for_provider("openrouter", tmp.path());
+        assert!(result.is_ok(), "Should resolve key from endpoint config");
+        assert_eq!(result.unwrap(), "sk-or-from-endpoint");
+    }
+
+    #[test]
+    fn test_resolve_api_key_legacy_native_executor_from_merged() {
+        // Simulate: global config has [native_executor] api_key, local has nothing
+        let global_dir = tempfile::tempdir().unwrap();
+        let global_path = global_dir.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            r#"
+[native_executor]
+api_key = "sk-legacy-global"
+"#,
+        )
+        .unwrap();
+
+        let local_dir = tempfile::tempdir().unwrap();
+        // No local config.toml
+
+        let global_val = Config::load_toml_value(&global_path).unwrap();
+        let nonexistent_local = local_dir.path().join("config.toml");
+        let local_val = Config::load_toml_value(&nonexistent_local).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        // Verify the native_executor key is present in merged
+        let key = merged
+            .get("native_executor")
+            .and_then(|v| v.get("api_key"))
+            .and_then(|v| v.as_str());
+        assert_eq!(key, Some("sk-legacy-global"));
+    }
+
+    #[test]
+    fn test_config_lookup_chain_project_overrides_global_overrides_default() {
+        // Build global config with specific values
+        let global: toml::Value = toml::from_str(
+            r#"
+[coordinator]
+executor = "native"
+max_agents = 2
+poll_interval = 30
+
+[agent]
+model = "openrouter:meta-llama/llama-3-70b"
+"#,
+        )
+        .unwrap();
+
+        // Build local config overriding only some values
+        let local: toml::Value = toml::from_str(
+            r#"
+[coordinator]
+max_agents = 8
+"#,
+        )
+        .unwrap();
+
+        let merged = merge_toml(global, local);
+        let config: Config = merged.try_into().unwrap();
+
+        // Local override: max_agents
+        assert_eq!(config.coordinator.max_agents, 8);
+        // Global preserved: executor, poll_interval
+        assert_eq!(config.coordinator.effective_executor(), "native");
+        assert_eq!(config.coordinator.poll_interval, 30);
+        // Global preserved: agent model
+        assert_eq!(config.agent.model, "openrouter:meta-llama/llama-3-70b");
+    }
+
+    #[test]
+    fn test_both_configs_missing_returns_default() {
+        let nonexistent1 = PathBuf::from("/tmp/wg_test_ne_global.toml");
+        let nonexistent2 = PathBuf::from("/tmp/wg_test_ne_local.toml");
+
+        let global_val = Config::load_toml_value(&nonexistent1).unwrap();
+        let local_val = Config::load_toml_value(&nonexistent2).unwrap();
+        let merged = merge_toml(global_val, local_val);
+
+        // Should produce valid default config
+        let config: Config = merged.try_into().unwrap();
+        assert_eq!(config.coordinator.max_agents, 8); // default
+        assert_eq!(config.coordinator.effective_executor(), "claude"); // default
+    }
+
+    #[test]
+    fn test_global_profile_propagates_to_new_project() {
+        // Global config with a profile set
+        let global: toml::Value = toml::from_str(
+            r#"
+profile = "openrouter"
+"#,
+        )
+        .unwrap();
+
+        // Empty local config (fresh wg init)
+        let local = toml::Value::Table(toml::map::Map::new());
+
+        let merged = merge_toml(global, local);
+        let config: Config = merged.try_into().unwrap();
+
+        assert_eq!(config.profile, Some("openrouter".to_string()));
     }
 }

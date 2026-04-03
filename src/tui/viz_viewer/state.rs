@@ -9514,7 +9514,7 @@ impl VizApp {
         // Compaction progress
         if self.time_counters.show_compact {
             use crate::commands::service::CoordinatorState;
-            let config = Config::load(&self.workgraph_dir).unwrap_or_default();
+            let config = Config::load_or_default(&self.workgraph_dir);
             self.time_counters.compact_accumulated =
                 CoordinatorState::total_accumulated_tokens(&self.workgraph_dir);
             self.time_counters.compact_threshold = config.effective_compaction_threshold();

@@ -638,7 +638,7 @@ pub fn run_tick(
     executor: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    let config = Config::load(dir)?;
+    let config = Config::load_merged(dir)?;
     let max_agents = max_agents.unwrap_or(config.coordinator.max_agents);
     let executor = executor
         .map(std::string::ToString::to_string)

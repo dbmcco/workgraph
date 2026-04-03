@@ -558,7 +558,7 @@ impl TemplateVars {
 
         // Load guardrails config for autopoietic limits
         let guardrails = workgraph_dir
-            .and_then(|dir| crate::config::Config::load(dir).ok())
+            .and_then(|dir| crate::config::Config::load_merged(dir).ok())
             .map(|cfg| cfg.guardrails)
             .unwrap_or_default();
 

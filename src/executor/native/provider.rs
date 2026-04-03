@@ -81,12 +81,10 @@ pub fn create_provider_ext(
     endpoint_name: Option<&str>,
     api_key_override: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
-    let config = crate::config::Config::load(workgraph_dir).unwrap_or_default();
+    let config = crate::config::Config::load_or_default(workgraph_dir);
 
-    let config_path = workgraph_dir.join("config.toml");
-    let config_val: Option<toml::Value> = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|c| toml::from_str(&c).ok());
+    // Load merged TOML value (global + local) for legacy [native_executor] access
+    let config_val: Option<toml::Value> = crate::config::Config::load_merged_toml_value(workgraph_dir).ok();
 
     let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
 

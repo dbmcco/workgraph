@@ -585,7 +585,7 @@ pub fn generate_viz_output_from_graph(
             .unwrap_or(Status::Open);
         let total_tokens =
             crate::commands::service::CoordinatorState::total_accumulated_tokens(dir);
-        let config = workgraph::config::Config::load(dir).unwrap_or_default();
+        let config = workgraph::config::Config::load_or_default(dir);
         let threshold = config.effective_compaction_threshold();
         let compactor_state = workgraph::service::compactor::CompactorState::load(dir);
         let annotation_text = compact_node_annotation(
