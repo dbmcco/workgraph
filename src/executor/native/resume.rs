@@ -497,6 +497,156 @@ fn content_differs(journal_output: &str, current_content: &str) -> bool {
     journal_stripped != current_stripped
 }
 
+/// The action the agent loop should take based on context pressure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextPressureAction {
+    /// Context usage is within safe limits — no action needed.
+    Ok,
+    /// At 80%+ capacity — inject a warning into the next turn.
+    Warning,
+    /// At 90%+ capacity — emergency compaction needed (drop old tool results).
+    EmergencyCompaction,
+    /// At 95%+ capacity — clean exit (log progress, create continuation, exit).
+    CleanExit,
+}
+
+/// Budget thresholds for tiered context pressure management.
+///
+/// The agent loop checks this after each turn to decide whether to warn,
+/// compact, or exit gracefully before hitting the API's hard limit.
+#[derive(Debug, Clone)]
+pub struct ContextBudget {
+    /// Total context window size in tokens (from provider config).
+    pub window_size: usize,
+    /// Rough chars-per-token estimate (default 4.0).
+    pub chars_per_token: f64,
+    /// Fraction at which to inject a warning (default 0.80).
+    pub warning_threshold: f64,
+    /// Fraction at which to trigger emergency compaction (default 0.90).
+    pub compact_threshold: f64,
+    /// Fraction at which to trigger a clean exit (default 0.95).
+    pub hard_limit: f64,
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            window_size: 200_000,
+            chars_per_token: 4.0,
+            warning_threshold: 0.80,
+            compact_threshold: 0.90,
+            hard_limit: 0.95,
+        }
+    }
+}
+
+impl ContextBudget {
+    /// Create a ContextBudget with a specific window size, using default thresholds.
+    pub fn with_window_size(window_size: usize) -> Self {
+        Self {
+            window_size,
+            ..Default::default()
+        }
+    }
+
+    /// Estimate the current token count from a list of messages.
+    pub fn estimate_tokens(&self, messages: &[Message]) -> usize {
+        let total_chars: usize = messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { text } => text.len(),
+                        ContentBlock::ToolUse { input, name, .. } => {
+                            name.len() + input.to_string().len()
+                        }
+                        ContentBlock::ToolResult { content, .. } => content.len(),
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        (total_chars as f64 / self.chars_per_token) as usize
+    }
+
+    /// Check context pressure and return the appropriate action.
+    pub fn check_pressure(&self, messages: &[Message]) -> ContextPressureAction {
+        let tokens = self.estimate_tokens(messages);
+        let ratio = tokens as f64 / self.window_size as f64;
+
+        if ratio >= self.hard_limit {
+            ContextPressureAction::CleanExit
+        } else if ratio >= self.compact_threshold {
+            ContextPressureAction::EmergencyCompaction
+        } else if ratio >= self.warning_threshold {
+            ContextPressureAction::Warning
+        } else {
+            ContextPressureAction::Ok
+        }
+    }
+
+    /// Build the warning message injected at 80% threshold.
+    pub fn warning_message(&self, messages: &[Message]) -> String {
+        let tokens = self.estimate_tokens(messages);
+        let pct = (tokens as f64 / self.window_size as f64) * 100.0;
+        format!(
+            "⚠️ CONTEXT PRESSURE WARNING: You're at {:.0}% context capacity ({} / {} estimated tokens). \
+             Consider logging progress via `wg log` and completing the current subtask.",
+            pct, tokens, self.window_size
+        )
+    }
+
+    /// Perform emergency compaction: drop tool results from turns older than
+    /// the last `keep_recent` messages, replacing them with summaries.
+    pub fn emergency_compact(messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
+        if messages.len() <= keep_recent {
+            return messages;
+        }
+        let split = messages.len().saturating_sub(keep_recent);
+
+        let mut compacted = Vec::new();
+
+        // Compact older messages: strip large tool results
+        for msg in &messages[..split] {
+            let mut new_content = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => {
+                        // Replace large tool results with a short summary
+                        let summary = if content.len() > 200 {
+                            format!(
+                                "[Tool result removed. Size: {} bytes. Preview: {}...]",
+                                content.len(),
+                                &content[..content.floor_char_boundary(100)]
+                            )
+                        } else {
+                            content.clone()
+                        };
+                        new_content.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: summary,
+                            is_error: *is_error,
+                        });
+                    }
+                    other => new_content.push(other.clone()),
+                }
+            }
+            compacted.push(Message {
+                role: msg.role,
+                content: new_content,
+            });
+        }
+
+        // Keep recent messages verbatim
+        compacted.extend_from_slice(&messages[split..]);
+        compacted
+    }
+}
+
 /// Build the resume context injection message.
 ///
 /// This message is prepended to the conversation to inform the agent
