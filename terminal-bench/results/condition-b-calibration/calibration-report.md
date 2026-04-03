@@ -6,6 +6,8 @@
 **Trials**: 1 per task per condition (calibration)
 **Harness**: tb-harness.sh (native executor, no Docker)
 
+> **Note**: This calibration was performed with Qwen3-32B. The primary experiment model was subsequently changed to **Minimax M2.7**.
+
 ## Results Summary
 
 | Task | Category | Difficulty | A Exit | B Exit | A Turns | B Turns | A Duration | B Duration | A Tokens (in/out) | B Tokens (in/out) |

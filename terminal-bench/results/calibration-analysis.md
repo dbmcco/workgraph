@@ -6,6 +6,8 @@
 **Tasks**: 8 custom calibration tasks (2 easy, 3 medium, 3 hard)
 **Trials**: 1 per task per condition
 
+> **Note**: This calibration was performed with Qwen3-32B. The primary experiment model was subsequently changed to **Minimax M2.7** because Qwen3-32B was expected to score near 0% on real Terminal Bench tasks. This data remains valid as a harness validation and baseline reference.
+
 ---
 
 ## 1. Pass Rate Comparison
@@ -240,7 +242,9 @@ This reduces the prompt from ~1900 chars to ~500 chars -- a 63% reduction. Fewer
 
 ### Model
 
-**qwen/qwen3-32b** via OpenRouter. Rationale:
+> **Update**: The primary experiment model has been changed to **Minimax M2.7**. The rationale below was written for the calibration model (Qwen3-32B).
+
+**qwen/qwen3-32b** via OpenRouter (calibration model). Rationale:
 1. Calibration showed it can complete all task types (file ops through sysadmin)
 2. Cheap enough for repeated trials
 3. 32K context window creates the context pressure that makes the workgraph thesis relevant
@@ -259,14 +263,14 @@ This reduces the prompt from ~1900 chars to ~500 chars -- a 63% reduction. Fewer
 # Condition A (control)
 ./tb-harness.sh \
   --condition A \
-  --model "qwen/qwen3-32b" \
+  --model "minimax/minimax-m2.7" \
   --max-turns 50 \
   --timeout 1800
 
 # Condition B (treatment)
 ./tb-harness.sh \
   --condition B \
-  --model "qwen/qwen3-32b" \
+  --model "minimax/minimax-m2.7" \
   --max-turns 50 \
   --timeout 1800
 ```
@@ -274,7 +278,7 @@ This reduces the prompt from ~1900 chars to ~500 chars -- a 63% reduction. Fewer
 **Full run configuration:**
 - Tasks: All 89 Terminal Bench tasks
 - Trials: 3 per condition (6 total per task)
-- Model: qwen/qwen3-32b via OpenRouter
+- Model: minimax/minimax-m2.7 via OpenRouter
 - Concurrency: 4
 - Max turns: 50
 - Timeout: 1800s (30 min)

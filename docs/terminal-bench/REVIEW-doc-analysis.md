@@ -3,6 +3,8 @@
 **Task:** research-review-new
 **Date:** 2026-04-03
 
+> **Model update note**: This review was written when the experiment planned to use Qwen3-32B. The primary model was subsequently changed to **Minimax M2.7** because Qwen3-32B was expected to score near 0%, giving no useful signal. References to "Ollama → OpenRouter" changes and Qwen3-specific content below are historical.
+
 ---
 
 ## Group 1: Terminal-Bench Docs (To Be Committed)

@@ -75,7 +75,7 @@ Rough estimate: `total_chars / 4`. This is imprecise but sufficient for threshol
 
 ### Critical detail
 
-The context window size must come from the provider/model configuration, NOT be hardcoded. Qwen3-32B has 32K. Claude Sonnet has 200K. The compaction budget in `resume.rs` currently assumes 200K -- this must be configurable.
+The context window size must come from the provider/model configuration, NOT be hardcoded. Different models have different context windows (e.g., 32K, 128K, 200K). The compaction budget in `resume.rs` currently assumes 200K -- this must be configurable.
 
 ```rust
 struct ContextBudget {

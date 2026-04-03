@@ -448,24 +448,41 @@ async def _exec_grep(env: BaseEnvironment, args: dict) -> str:
     return result.stdout or "(no matches)"
 
 
-async def _exec_wg_cmd(env: BaseEnvironment, subcmd: list[str]) -> str:
-    """Execute a wg command inside the container."""
-    cmd = "wg " + " ".join(shlex.quote(s) for s in subcmd)
-    result = await env.exec(command=cmd, timeout_sec=60)
-    output_parts = []
-    if result.stdout:
-        output_parts.append(result.stdout)
-    if result.stderr:
-        output_parts.append(result.stderr)
-    if result.return_code != 0:
-        output_parts.append(f"[exit code: {result.return_code}]")
-    return "\n".join(output_parts) if output_parts else "(no output)"
+async def _exec_wg_cmd_host(wg_dir: str, wg_bin: str, subcmd: list[str]) -> str:
+    """Execute a wg command on the HOST (not in the container).
+
+    This avoids injecting the wg binary into Docker containers, which
+    can break Harbor's verifier. The workgraph state lives on the host
+    in a temp directory.
+    """
+    cmd = [wg_bin, "--dir", wg_dir] + subcmd
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        output_parts = []
+        if stdout:
+            output_parts.append(stdout.decode(errors="replace"))
+        if stderr:
+            output_parts.append(stderr.decode(errors="replace"))
+        if proc.returncode != 0:
+            output_parts.append(f"[exit code: {proc.returncode}]")
+        return "\n".join(output_parts) if output_parts else "(no output)"
+    except asyncio.TimeoutError:
+        return "[wg command timed out after 60s]"
+    except Exception as e:
+        return f"[wg command error: {e}]"
 
 
 async def execute_tool(
     env: BaseEnvironment,
     tool_name: str,
     args: dict,
+    wg_dir: str | None = None,
+    wg_bin: str | None = None,
 ) -> str:
     """Dispatch a tool call to the appropriate handler."""
     if tool_name == "bash":
@@ -481,34 +498,34 @@ async def execute_tool(
     elif tool_name == "grep":
         return await _exec_grep(env, args)
     elif tool_name == "wg_show":
-        return await _exec_wg_cmd(env, ["show", args["task_id"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["show", args["task_id"]])
     elif tool_name == "wg_list":
         cmd = ["list"]
         if args.get("status"):
             cmd += ["--status", args["status"]]
-        return await _exec_wg_cmd(env, cmd)
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, cmd)
     elif tool_name == "wg_add":
         cmd = ["add", args["title"]]
         if args.get("after"):
             cmd += ["--after", args["after"]]
         if args.get("description"):
             cmd += ["-d", args["description"]]
-        return await _exec_wg_cmd(env, cmd)
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, cmd)
     elif tool_name == "wg_done":
         cmd = ["done", args["task_id"]]
         if args.get("converged"):
             cmd.append("--converged")
-        return await _exec_wg_cmd(env, cmd)
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, cmd)
     elif tool_name == "wg_fail":
-        return await _exec_wg_cmd(env, ["fail", args["task_id"], "--reason", args["reason"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["fail", args["task_id"], "--reason", args["reason"]])
     elif tool_name == "wg_log":
-        return await _exec_wg_cmd(env, ["log", args["task_id"], args["message"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["log", args["task_id"], args["message"]])
     elif tool_name == "wg_artifact":
-        return await _exec_wg_cmd(env, ["artifact", args["task_id"], args["path"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["artifact", args["task_id"], args["path"]])
     elif tool_name == "wg_msg_send":
-        return await _exec_wg_cmd(env, ["msg", "send", args["task_id"], args["message"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["msg", "send", args["task_id"], args["message"]])
     elif tool_name == "wg_msg_read":
-        return await _exec_wg_cmd(env, ["msg", "read", args["task_id"]])
+        return await _exec_wg_cmd_host(wg_dir, wg_bin, ["msg", "read", args["task_id"]])
     else:
         return f"Unknown tool: {tool_name}"
 
@@ -575,7 +592,7 @@ class WorkgraphAgent(BaseAgent):
     Usage:
         harbor run \\
             --agent-import-path wg.adapter:WorkgraphAgent \\
-            -m openrouter/qwen/qwen3-32b \\
+            -m minimax/minimax-m2.7 \\
             --task-ids task-1 -k 1
     """
 
@@ -609,6 +626,8 @@ class WorkgraphAgent(BaseAgent):
     def _find_wg_binary(self) -> str:
         """Locate the wg binary on the host for injection into containers."""
         candidates = [
+            # Prefer statically-linked binary for Docker container compatibility
+            "/home/erik/workgraph/target/x86_64-unknown-linux-gnu/release/wg",
             os.path.expanduser("~/.cargo/bin/wg"),
             "/home/erik/workgraph/target/release/wg",
             "/home/erik/workgraph/target/debug/wg",
@@ -619,18 +638,21 @@ class WorkgraphAgent(BaseAgent):
         return shutil.which("wg") or "wg"
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Inject wg binary for Condition B."""
+        """Set up host-side workgraph for Condition B (no container injection)."""
         if self.condition == "B":
-            wg_path = self._wg_binary_host_path
-            if not os.path.isfile(wg_path):
-                logger.warning(f"wg binary not found at {wg_path}, skipping injection")
-                return
-            await environment.upload_file(
-                source_path=wg_path, target_path="/usr/local/bin/wg"
+            import tempfile
+            self._wg_temp_dir = tempfile.mkdtemp(prefix="tb-wg-")
+            self._wg_graph_dir = os.path.join(self._wg_temp_dir, ".workgraph")
+            wg_bin = self._wg_binary_host_path
+            # Initialize workgraph on host
+            proc = await asyncio.create_subprocess_exec(
+                wg_bin, "--dir", self._wg_graph_dir, "init",
+                env={"HOME": self._wg_temp_dir, **os.environ},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await environment.exec(command="chmod +x /usr/local/bin/wg")
-            await environment.exec(command="wg init", cwd="/root")
-            logger.info("Injected wg binary and initialized workgraph in container")
+            await proc.communicate()
+            logger.info(f"Initialized host-side workgraph at {self._wg_graph_dir}")
 
     async def run(
         self,
@@ -642,14 +664,16 @@ class WorkgraphAgent(BaseAgent):
 
         # Determine tools and prompt based on condition
         root_task_id = None
+        wg_dir = getattr(self, "_wg_graph_dir", None)
+        wg_bin = self._wg_binary_host_path if self.condition == "B" else None
         if self.condition == "B":
             tools = CONDITION_B_TOOLS
-            # Create root task in container's workgraph
+            # Create root task in host-side workgraph
             root_task_id = f"tb-{uuid.uuid4().hex[:8]}"
             title = instruction[:100] + ("..." if len(instruction) > 100 else "")
-            await environment.exec(
-                command=f"wg add {shlex.quote(title)} --id {shlex.quote(root_task_id)}",
-                cwd="/root",
+            await _exec_wg_cmd_host(
+                wg_dir, wg_bin,
+                ["add", title, "--id", root_task_id],
             )
             system_prompt = build_condition_b_prompt(instruction, root_task_id)
         else:
@@ -662,7 +686,7 @@ class WorkgraphAgent(BaseAgent):
             {"role": "user", "content": f"## Task\n\n{instruction}"},
         ]
 
-        model = self.model_name or "openrouter/qwen/qwen3-32b"
+        model = self.model_name or "minimax/minimax-m2.7"
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost = 0.0
@@ -677,7 +701,7 @@ class WorkgraphAgent(BaseAgent):
                     tools=tools,
                     tool_choice="auto",
                     temperature=self.temperature,
-                    max_tokens=4096,
+                    max_tokens=16384,
                 )
             except Exception as e:
                 logger.error(f"LLM call failed on turn {turn}: {e}")
@@ -734,7 +758,10 @@ class WorkgraphAgent(BaseAgent):
                     )
 
                 try:
-                    result = await execute_tool(environment, fn_name, fn_args)
+                    result = await execute_tool(
+                        environment, fn_name, fn_args,
+                        wg_dir=wg_dir, wg_bin=wg_bin,
+                    )
                 except Exception as e:
                     result = f"Tool execution error: {e}"
                     logger.error(f"Tool {fn_name} failed: {e}")
@@ -776,6 +803,19 @@ class WorkgraphAgent(BaseAgent):
             "turns": context.metadata["turns"],
             "condition": self.condition,
         })
+
+        # Save workgraph state for analysis (Condition B)
+        if self.condition == "B" and wg_dir:
+            wg_state_dst = self.logs_dir / "workgraph_state"
+            try:
+                shutil.copytree(wg_dir, str(wg_state_dst))
+                logger.info(f"Saved workgraph state to {wg_state_dst}")
+            except Exception as e:
+                logger.warning(f"Failed to save workgraph state: {e}")
+            # Cleanup temp dir
+            wg_temp = getattr(self, "_wg_temp_dir", None)
+            if wg_temp:
+                shutil.rmtree(wg_temp, ignore_errors=True)
 
     def _log_event(self, path: Path, event: dict) -> None:
         """Append an NDJSON event to the log file."""

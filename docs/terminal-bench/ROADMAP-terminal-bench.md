@@ -1,10 +1,12 @@
 # Roadmap: Native Executor to Terminal Bench Validation
 
+> **Model update (2026-04-03)**: The primary experiment model has been changed from Qwen3-32B to **Minimax M2.7** (`minimax/minimax-m2.7` via OpenRouter). Qwen3-32B was expected to score near 0%, giving no useful signal. Calibration results (in `terminal-bench/results/`) still reference the original model.
+
 ## Goal
 
 Run Terminal Bench two ways:
-- **Condition A**: Bare open model agent (no workgraph) -- the baseline everyone else has
-- **Condition B**: Same open model agent with workgraph as external memory -- the thesis
+- **Condition A**: Bare agent (no workgraph) -- the baseline everyone else has
+- **Condition B**: Same agent with workgraph as external memory -- the thesis
 
 Show that B dramatically outperforms A. Prove that memory makes computation universal.
 
@@ -12,13 +14,13 @@ Show that B dramatically outperforms A. Prove that memory makes computation univ
 
 ## Current State (Honest Assessment)
 
-The native executor **works for simple tasks with Claude**. It has not been stress-tested with open models. There are specific bugs that will bite hard with Qwen3/Ollama:
+The native executor **works for simple tasks with Claude**. It has not been stress-tested with open models. There are specific bugs that will bite hard with Minimax M2.7 via OpenRouter:
 
 | Issue | Severity | Impact |
 |-------|----------|--------|
 | Silent JSON parse failure (`unwrap_or_default`) on malformed tool args | **Critical** | Tools called with null arguments, agent loops forever |
-| Context budget assumes 200K window, hardcoded | **Critical** | Qwen3-32B has 32K -- resume compaction won't trigger in time |
-| Tool call format extraction may miss Qwen's format | **High** | Tool calls silently lost, agent can't act |
+| Context budget assumes 200K window, hardcoded | **Critical** | Models have varying context windows -- resume compaction may not trigger in time |
+| Tool call format extraction may miss model-specific formats | **High** | Tool calls silently lost, agent can't act |
 | No streaming in agent loop | **Medium** | Can't observe agent progress, hard to debug |
 | No heartbeat/liveness signal | **Medium** | Coordinator can't detect hung agents |
 | No context pressure signaling | **Medium** | Agent doesn't know it's running out of context |
@@ -42,19 +44,20 @@ The native executor **works for simple tasks with Claude**. It has not been stre
    ```
    Watch the agent complete. Check `.workgraph/agents/*/output.log` for clean execution.
 
-2. **Smoke test with Ollama + Qwen3-32B**
+2. **Smoke test with Minimax M2.7 via OpenRouter**
    ```bash
-   ollama pull qwen3:32b
    # Test raw API works
-   curl http://localhost:11434/v1/chat/completions \
-     -d '{"model":"qwen3:32b","messages":[{"role":"user","content":"Say hello"}]}'
+   curl https://openrouter.ai/api/v1/chat/completions \
+     -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"minimax/minimax-m2.7","messages":[{"role":"user","content":"Say hello"}]}'
    ```
-   Then run same smoke test task through native executor with Qwen3.
+   Then run same smoke test task through native executor with Minimax M2.7.
 
-3. **Capture what breaks**. The smoke test will likely fail with Qwen3. Document the exact failure mode. This tells you which Phase 1 fix to prioritize.
+3. **Capture what breaks**. The smoke test may reveal issues with the open model. Document the exact failure mode. This tells you which Phase 1 fix to prioritize.
 
 **Effort**: 2-3 hours
-**Deliverable**: Bug report documenting exactly what breaks with Qwen3
+**Deliverable**: Bug report documenting exactly what breaks with Minimax M2.7
 
 ---
 
@@ -105,7 +108,7 @@ pub struct ResumeConfig {
 }
 ```
 
-Wire this through from the provider, which should expose `fn context_window(&self) -> usize`. For Ollama, query the model metadata endpoint (`/api/show`) to get the actual context size.
+Wire this through from the provider, which should expose `fn context_window(&self) -> usize`. For OpenRouter, the context window can be looked up from model metadata or configured per-model in `.workgraph/config.toml`.
 
 Also add **in-loop context monitoring**: after each turn, estimate total context usage and inject a warning message to the agent when approaching 80%:
 
@@ -114,35 +117,22 @@ Also add **in-loop context monitoring**: after each turn, estimate total context
 Consider completing the current task or logging progress via wg log.]
 ```
 
-### 1c. Add Qwen3 tool call format support (High, 3-4 hours)
+### 1c. Validate tool call format support (High, 3-4 hours)
 
 **File**: `src/executor/native/openai_client.rs`, function `extract_tool_calls_from_text()`
 
-Qwen3 uses Hermes-style tool calls when not using native tool_calls:
-```
-<tool_call>
-{"name": "read_file", "arguments": {"path": "src/main.rs"}}
-</tool_call>
-```
+MiniMax models use XML-style tool calls (`</minimax:tool_call>` variants). The OpenAI client already has parsing support for these. Verify it works end-to-end:
 
-And sometimes:
-```
-<|plugin|>
-{"name": "bash", "parameters": {"command": "ls -la"}}
-<|/plugin|>
-```
-
-Add these patterns to the extraction function. Test with actual Qwen3 output by:
 1. Running a manual completion with tools defined
 2. Capturing the raw response format
-3. Adding a matching pattern
+3. Confirming extraction handles the response correctly
 
-**Important**: Also check if Ollama's `/v1/chat/completions` endpoint returns native `tool_calls` for Qwen3 when tools are provided in the request. If it does, the text extraction is a fallback only. Test this first -- it may already work.
+**Important**: Check if OpenRouter's `/v1/chat/completions` endpoint returns native `tool_calls` for Minimax M2.7 when tools are provided in the request. If it does, the text extraction is a fallback only. Test this first -- it may already work.
 
 ### 1d. Validate with integration test (2-3 hours)
 
 Write a real integration test that:
-1. Starts Ollama with Qwen3-32B
+1. Connects to Minimax M2.7 via OpenRouter
 2. Creates a native executor agent with file tools + bash
 3. Asks it to: read a file, edit it, run a test, report results
 4. Verifies: all tool calls executed, final text is coherent, journal is complete
@@ -150,7 +140,7 @@ Write a real integration test that:
 This becomes the regression test for all future changes.
 
 **Phase 1 Total Effort**: 8-12 hours (1.5-2 days)
-**Deliverable**: Native executor reliably completes 10-20 turn tasks with Qwen3-32B
+**Deliverable**: Native executor reliably completes 10-20 turn tasks with Minimax M2.7
 
 ---
 
@@ -262,18 +252,18 @@ Define:
 
 **Goal**: Run the experiment and get numbers.
 
-### 4a. Qwen3-32B via Ollama (primary)
+### 4a. Minimax M2.7 (primary)
 
-Run both conditions on Qwen3-32B:
+Run both conditions on Minimax M2.7:
 - Condition A: 3 runs, all tasks
 - Condition B: 3 runs, all tasks
 - Capture: scores, tokens, time, logs
 
-This is the main result. If Qwen3-32B + workgraph meaningfully outperforms bare Qwen3-32B, that's the headline.
+This is the main result. If Minimax M2.7 + workgraph meaningfully outperforms bare Minimax M2.7, that's the headline.
 
-### 4b. Qwen3-8B via Ollama (stretch)
+### 4b. Smaller open model via OpenRouter (stretch)
 
-Repeat with a smaller model. The hypothesis is that workgraph helps smaller models even more, because they hit context limits sooner and benefit more from externalized memory.
+Repeat with a smaller/cheaper model. The hypothesis is that workgraph helps smaller models even more, because they hit context limits sooner and benefit more from externalized memory.
 
 ### 4c. Claude Sonnet via native executor (calibration)
 
@@ -305,7 +295,7 @@ For each model x condition:
 1. **The thesis**: Memory makes computation universal (link to your paper)
 2. **The construction**: Workgraph as external stigmergic memory for LLMs
 3. **The experiment**: Terminal Bench, two conditions, same model
-4. **The result**: [X]% improvement with workgraph on Qwen3-32B
+4. **The result**: [X]% improvement with workgraph on Minimax M2.7
 5. **The implication**: The bottleneck isn't the model. It's the memory architecture. You can make a $0 open model outperform a $200/month subscription by giving it the right external memory system.
 
 ### Artifacts
@@ -324,7 +314,7 @@ For each model x condition:
 | Phase | What | Days | Cumulative |
 |-------|------|:----:|:----------:|
 | 0 | Smoke test, find what breaks | 0.5 | 0.5 |
-| 1 | Fix critical bugs (JSON, context, Qwen format) | 1.5-2 | 2-2.5 |
+| 1 | Fix critical bugs (JSON, context, tool format) | 1.5-2 | 2-2.5 |
 | 2 | Observability & reliability (streaming, heartbeat, graceful failure) | 1-1.5 | 3-4 |
 | 3 | Terminal Bench harness (both conditions) | 2 | 5-6 |
 | 4 | Run experiments, collect numbers | 2-3 | 7-9 |
@@ -340,17 +330,17 @@ With workgraph orchestrating the work (eating your own dogfood), phases 1-3 can 
 
 | Risk | Probability | Mitigation |
 |------|:-----------:|------------|
-| Qwen3-32B tool calling is unreliable | 30% | Fall back to Qwen3-235B-A22B (MoE, better tool calling) or DeepSeek-V3 via OpenRouter |
+| Primary model tool calling is unreliable | 30% | Fall back to alternative model via OpenRouter |
 | Terminal Bench tasks exceed 32K context in single session | 40% | This is actually GOOD -- it proves the need for external memory. Condition A fails, Condition B (with resume/journal) succeeds. |
 | Workgraph overhead costs more tokens than it saves | 15% | Measure and report honestly. Even if token count is higher, pass rate improvement is the primary metric. |
 | Results are marginal (< 5% improvement) | 20% | Focus on hard tasks only (where context limits matter). Report by difficulty tier. The improvement should be largest on the hardest tasks. |
-| Ollama is too slow for full benchmark | 50% | Use vLLM for throughput, or run a subset of tasks. Or use OpenRouter for Qwen3 at API speed. |
+| OpenRouter rate limits or downtime | 20% | Run during off-peak hours, or fall back to alternative model on OpenRouter. |
 
 ---
 
 ## The Nuclear Option (If Open Models Struggle)
 
-If Qwen3-32B can't reliably do tool calling through the native executor, there's a fallback:
+If the primary model can't reliably do tool calling through the native executor, there's a fallback:
 
 **Run Terminal Bench with Claude Haiku via native executor.**
 
@@ -360,7 +350,7 @@ If Qwen3-32B can't reliably do tool calling through the native executor, there's
 - If Haiku + workgraph beats bare Haiku, that still proves the thesis
 - And the native executor already works with Anthropic's API
 
-This gives you a publishable result while you fix the open model integration. Then you can follow up with the open model results once the Qwen issues are resolved.
+This gives you a publishable result while you fix any model integration issues.
 
 ---
 
@@ -372,7 +362,7 @@ If the experiment works:
 
 Or even better:
 
-**"Qwen3-32B with workgraph solves [X]% of Terminal Bench. Bare Qwen3-32B solves [Y]%. The graph is worth [X-Y] percentage points of performance -- equivalent to a [N]x model size increase."**
+**"Minimax M2.7 with workgraph solves [X]% of Terminal Bench. Bare Minimax M2.7 solves [Y]%. The graph is worth [X-Y] percentage points of performance -- equivalent to a [N]x model size increase."**
 
 That's the number that changes everything. That's the constructive proof of your theorem. That's what turns 5 stars into 5,000.
 

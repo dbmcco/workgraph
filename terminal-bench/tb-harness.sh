@@ -4,7 +4,7 @@
 # Usage:
 #   ./tb-harness.sh --condition A --model "minimax/minimax-m2.7" --task "Create hello.txt with 'hello world', verify it contains the text"
 #   ./tb-harness.sh --condition B --model "minimax/minimax-m2.7" --task "Create hello.txt with 'hello world', verify it contains the text"
-#   ./tb-harness.sh --condition A --model "qwen/qwen3-32b" --task-file tasks/task-42.txt
+#   ./tb-harness.sh --condition A --model "minimax/minimax-m2.7" --task-file tasks/task-42.txt
 #   ./tb-harness.sh --condition A --task "..." --results-dir ./results/run-001
 #
 # Environment:

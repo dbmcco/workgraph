@@ -6,6 +6,8 @@
 **Harness**: tb-harness.sh (native executor, Condition A bundle)
 **Tasks**: 8 diverse tasks spanning 3 difficulty levels and 8 categories
 
+> **Note**: This calibration was performed with Qwen3-32B. The primary experiment model was subsequently changed to **Minimax M2.7**.
+
 ## Results
 
 | # | Task ID | Category | Difficulty | Result | Duration | Turns | Input Tok | Output Tok | Notes |

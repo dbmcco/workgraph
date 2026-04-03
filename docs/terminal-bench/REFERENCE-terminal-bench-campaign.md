@@ -141,8 +141,8 @@ Philosophy: "Analytical reasoning about *what to do* must not be conflated with 
 | Bug | File | Line(s) | Impact | Fix |
 |-----|------|---------|--------|-----|
 | Silent JSON parse failure | `openai_client.rs` | ~514, ~1714 | `unwrap_or_default()` replaces malformed tool args with null. Agent loops forever with empty tool calls. | Return parse error to model so it can self-correct. |
-| Hardcoded 200K context budget | `resume.rs` | ~61 | Compaction budget assumes 200K window. Qwen3-32B has 32K. Compaction never triggers, agent hits API 400. | Make context window configurable per provider/model. Query Ollama `/api/show` for actual context size. |
-| Tool call format extraction | `openai_client.rs` | `extract_tool_calls_from_text()` | May miss Qwen3's Hermes-style tool call format. Calls silently lost. | Add Qwen3 patterns. Test with actual Qwen3 output. First check if Ollama returns native `tool_calls` (may already work). |
+| Hardcoded 200K context budget | `resume.rs` | ~61 | Compaction budget assumes 200K window. Models with smaller context windows never trigger compaction, hitting API 400. | Make context window configurable per provider/model. Look up from OpenRouter model metadata or config. |
+| Tool call format extraction | `openai_client.rs` | `extract_tool_calls_from_text()` | May miss non-standard tool call formats from open models. Calls silently lost. | Test with actual model output. First check if OpenRouter returns native `tool_calls` (may already work). |
 | No streaming in agent loop | `agent.rs` | 325 | Uses `.send()` not `.send_streaming()`. No real-time observability. | Switch to `send_streaming()` with text callback writing to stream.jsonl. |
 | No heartbeat during tool execution | `agent.rs` | tool execution block | Coordinator can't detect hung agents during long bash commands. | Write Heartbeat event every 30s during tool execution. |
 | No context pressure signaling | `agent.rs` | main loop | Agent doesn't know it's running out of context. | Estimate token usage per turn, inject warning at 80% capacity. |
@@ -195,21 +195,22 @@ Philosophy: "Analytical reasoning about *what to do* must not be conflated with 
 
 ### Models
 
-Primary: **Qwen3-32B** via Ollama (or vLLM for throughput)
-- Free, local, no API costs
-- 32K context (constrained -- forces the memory question)
-- Good tool calling (needs validation)
+Primary: **Minimax M2.7** via OpenRouter
+- Cost-effective inference
+- Good tool calling
+- No local GPU needed
 
-Calibration: **Claude Haiku** via native executor
+> **Note**: Calibration runs (documented in `terminal-bench/results/`) were performed with Qwen3-32B. The primary experiment model was subsequently changed to Minimax M2.7.
+
+Calibration (historical): **Qwen3-32B** via OpenRouter
+- Used for initial calibration runs
+- 32K context (constrained -- forces the memory question)
+
+Calibration: **Claude Haiku** via native executor (Anthropic API)
 - Cheap ($0.25/MTok input)
 - Weak enough to be a fair comparison to open models
 - Known-good tool calling
 - Native executor already works with Anthropic API
-
-Stretch: **Qwen3-235B-A22B** (MoE) via OpenRouter
-- Much more capable than 32B
-- Relatively cheap on OpenRouter
-- Tests whether graph benefits scale with model capability
 
 ### Metrics
 
@@ -263,7 +264,7 @@ The native executor (agent loop) runs on the **host machine**. It calls OpenRout
   └─ Results collected by Harbor → submission directory
 ```
 
-**Model inference**: Via OpenRouter API. No local GPU needed. Cost ~$10-30 for full 89-task x 5-trial run.
+**Model inference**: Via API. No local GPU needed. Cost ~$10-30 for full 89-task x 5-trial run.
 
 **Host requirements**: Docker, Harbor, `wg` binary. CPU/RAM are not the bottleneck -- API latency is.
 
@@ -295,7 +296,7 @@ For Condition A, no injection needed -- just bash and file tools.
 
 **Pre-building the binary:**
 ```bash
-cd /home/erik/executors/workgraph
+cd <workgraph-repo-root>
 cargo build --release
 # Binary at: target/release/wg
 ```
@@ -322,7 +323,7 @@ def run_task(task_instruction, condition, model, container_id):
     run_native_exec(
         prompt=task_instruction if condition == "A" else build_prompt(task_instruction, scope="full"),
         exec_mode="full",
-        model=f"openrouter/{model}",  # e.g., "openrouter/qwen/qwen3-32b"
+        model=model,  # e.g., "minimax/minimax-m2.7"
         tools=["bash", "read_file", "write_file", "edit_file", "glob", "grep"]
               + (["wg_show", "wg_list", "wg_add", "wg_done", "wg_fail", "wg_log", "wg_artifact"] if condition == "B" else []),
         journal=condition == "B",
@@ -375,10 +376,10 @@ agent_display_name: "Workgraph Native"
 agent_org_display_name: "Erik Garrison"
 
 models:
-  - model_name: qwen3-32b
-    model_provider: ollama
-    model_display_name: "Qwen3-32B"
-    model_org_display_name: "Alibaba/Qwen"
+  - model_name: minimax-m2.7
+    model_provider: minimax
+    model_display_name: "Minimax M2.7"
+    model_org_display_name: "Minimax"
 ```
 
 **Step 4: Submit via HuggingFace PR**
@@ -409,7 +410,7 @@ models:
 # Run ONE task, ONE trial
 harbor run -d terminal-bench/terminal-bench-2 \
   --agent-import-path wg.adapter:WorkgraphAgent \
-  -m qwen3-32b \
+  -m minimax/minimax-m2.7 \
   --task-ids task-42 \
   -k 1
 
@@ -417,7 +418,7 @@ harbor run -d terminal-bench/terminal-bench-2 \
 # Run 5-10 tasks spanning easy/medium/hard, 1 trial each
 harbor run -d terminal-bench/terminal-bench-2 \
   --agent-import-path wg.adapter:WorkgraphAgent \
-  -m qwen3-32b \
+  -m minimax/minimax-m2.7 \
   --task-ids task-1,task-15,task-30,task-50,task-70 \
   -k 1
 
@@ -429,14 +430,14 @@ harbor run -d terminal-bench/terminal-bench-2 \
 # All 89 tasks, 1 trial — get rough numbers
 harbor run -d terminal-bench/terminal-bench-2 \
   --agent-import-path wg.adapter:WorkgraphAgent \
-  -m qwen3-32b \
+  -m minimax/minimax-m2.7 \
   -k 1
 
 # Phase 5: Submission-quality run
 # All 89 tasks, 5 trials — statistical rigor
 harbor run -d terminal-bench/terminal-bench-2 \
   --agent-import-path wg.adapter:WorkgraphAgent \
-  -m qwen3-32b \
+  -m minimax/minimax-m2.7 \
   -k 5
 ```
 
@@ -446,7 +447,7 @@ harbor run -d terminal-bench/terminal-bench-2 \
 - 1 task, 1 trial: ~5-30 minutes (depending on task complexity and model speed)
 - 89 tasks, 1 trial: ~4-12 hours (with `--n-concurrent 4-8`)
 - 89 tasks, 5 trials: ~20-60 hours (run overnight / over weekend)
-- With Ollama local: slower (single GPU inference)
+- With smaller/slower models: proportionally longer
 - With OpenRouter: faster but costs money
 - With vLLM: fastest local option (continuous batching, tensor parallelism)
 
@@ -476,9 +477,9 @@ Current top entries on Terminal Bench 2.0:
 | 39 | Claude Code | Claude Opus 4.6 | 58.0% |
 | Last | (worst) | -- | 3.1% |
 
-**Our target**: Beat Claude Code's 58% with an open model. If Workgraph + Qwen3-32B scores above 58%, we've shown that an open model with the right memory architecture beats a frontier model with a basic scaffold. That alone is newsworthy.
+**Our target**: Beat Claude Code's 58% with an open model. If Workgraph + Minimax M2.7 scores above 58%, we've shown that a model with the right memory architecture beats a frontier model with a basic scaffold. That alone is newsworthy.
 
-**Dream target**: Approach or beat ForgeCode's 78-82% range. If we do that with Qwen3-32B, it's paradigm-shifting.
+**Dream target**: Approach or beat ForgeCode's 78-82% range. If we do that with Minimax M2.7, it's paradigm-shifting.
 
 ---
 
@@ -486,7 +487,7 @@ Current top entries on Terminal Bench 2.0:
 
 | Day | Focus | Deliverable |
 |-----|-------|-------------|
-| 1 | Smoke test + fix critical native executor bugs | Native executor completes 15-turn task with Qwen3-32B |
+| 1 | Smoke test + fix critical native executor bugs | Native executor completes 15-turn task with Minimax M2.7 |
 | 2 | Streaming + Terminal Bench setup + adapter | Agent observable; TB runs single task |
 | 3 | Build Condition A + Condition B harnesses | Both conditions run on 3-5 tasks |
 | 4 | Full experiment run (89 tasks x 2 conditions) | Raw results |
@@ -502,8 +503,8 @@ Before running Terminal Bench, the native executor must pass these tests:
 ### Smoke Tests (Day 1)
 
 1. **Claude via native executor**: Simple file create + read + edit cycle. Validates happy path.
-2. **Qwen3-32B via Ollama**: Same test. Find what breaks.
-3. **OpenRouter endpoint**: Same test via OpenRouter API. Validates remote model access.
+2. **Minimax M2.7**: Same test. Find what breaks.
+3. **API endpoint**: Same test via model API. Validates remote model access.
 
 ### Integration Tests (Day 1-2)
 
@@ -535,7 +536,7 @@ pip install harbor-framework
 # or: uv tool install harbor-framework
 
 # 3. Build workgraph binary
-cd /home/erik/executors/workgraph
+cd <workgraph-repo-root>
 cargo build --release
 # Binary at: target/release/wg
 
@@ -551,9 +552,9 @@ curl -s https://openrouter.ai/api/v1/models \
 ### Environment Configuration
 
 ```bash
-# Primary model: Qwen3-32B via OpenRouter
+# Primary model: Minimax M2.7
 export OPENROUTER_API_KEY=<key>
-# Model string for native executor: "openrouter/qwen/qwen3-32b"
+# Model string for native executor: "minimax/minimax-m2.7"
 
 # Calibration model: Claude Haiku via Anthropic (optional)
 export ANTHROPIC_API_KEY=<key>
@@ -566,8 +567,7 @@ export ANTHROPIC_API_KEY=<key>
 # openai_base_url = "https://openrouter.ai/api/v1"
 ```
 
-**Cost estimates (OpenRouter)**:
-- Qwen3-32B: ~$0.20/MTok input, ~$0.60/MTok output
+**Cost estimates**:
 - Per task (est. 50K tokens): ~$0.02-0.04
 - Full 89 tasks x 5 trials: ~$10-30 total
 
@@ -579,7 +579,7 @@ Mark tests that require external endpoints:
 mod tests {
     #[test]
     #[ignore = "requires OPENROUTER_API_KEY"]
-    fn test_openrouter_qwen3_tool_calling() { ... }
+    fn test_minimax_m2_7_tool_calling() { ... }
     
     #[test]
     #[ignore = "requires ANTHROPIC_API_KEY"]
@@ -667,17 +667,14 @@ Workgraph was built by workgraph. 216K lines of Rust, 103K lines of design docs,
 
 ### Claude Code (Reference Implementation)
 - Claude Code scores 58% on Terminal Bench 2.0 (rank ~39)
-- Architecture analyzed in /home/erik/executors/REPORT.md
+- Architecture analyzed in separate comparative report (not included in this repo)
 
 ### Models
-- Qwen3-32B: https://huggingface.co/Qwen/Qwen3-32B
-- Ollama: https://ollama.com/
+- Minimax M2.7 (primary experiment model)
+- Qwen3-32B: https://huggingface.co/Qwen/Qwen3-32B (used for calibration)
 - OpenRouter: https://openrouter.ai/
-- vLLM: https://docs.vllm.ai/
 
-### Reports (This Campaign)
-- Architecture comparison (CC vs WG): /home/erik/executors/REPORT-claude-code-vs-workgraph-architecture.md
-- Effort and valuation: /home/erik/executors/REPORT-effort-and-valuation.md
-- Roadmap (6-day plan): /home/erik/executors/ROADMAP-terminal-bench.md
-- Campaign briefing (this file): /home/erik/executors/REFERENCE-terminal-bench-campaign.md
-- Executor lessons from Claude Code: /home/erik/executors/REFERENCE-executor-lessons.md
+### Campaign Documents (This Repo)
+- Roadmap (6-day plan): `docs/terminal-bench/ROADMAP-terminal-bench.md`
+- Campaign briefing (this file): `docs/terminal-bench/REFERENCE-terminal-bench-campaign.md`
+- Executor design requirements: `docs/terminal-bench/DESIGN-native-executor-improvements.md`
