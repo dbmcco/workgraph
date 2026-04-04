@@ -159,7 +159,10 @@ GREP_TOOL = {
     "type": "function",
     "function": {
         "name": "grep",
-        "description": "Search file contents using regex.",
+        "description": (
+            "Search file contents using regex. Supports context lines, "
+            "file type filtering, and multiple output modes."
+        ),
         "parameters": {
             "type": "object",
             "required": ["pattern"],
@@ -171,6 +174,34 @@ GREP_TOOL = {
                 "path": {
                     "type": "string",
                     "description": "File or directory to search in.",
+                },
+                "before_context": {
+                    "type": "integer",
+                    "description": "Lines of context before each match (-B).",
+                },
+                "after_context": {
+                    "type": "integer",
+                    "description": "Lines of context after each match (-A).",
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "Lines of context before and after each match (-C).",
+                },
+                "type": {
+                    "type": "string",
+                    "description": (
+                        "File extension filter (e.g., 'py', 'js', 'rs'). "
+                        "Only searches files with this extension."
+                    ),
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": (
+                        "Output mode: 'content' (default) shows matching lines, "
+                        "'files_with_matches' shows only file paths, "
+                        "'count' shows match counts per file."
+                    ),
                 },
             },
         },
@@ -557,24 +588,78 @@ async def _exec_edit_file(env: BaseEnvironment, args: dict) -> str:
 
 
 async def _exec_glob(env: BaseEnvironment, args: dict) -> str:
-    """Find files matching a glob pattern."""
-    pattern = shlex.quote(args["pattern"])
-    base = shlex.quote(args.get("path", "."))
-    cmd = f"find {base} -path {pattern} -type f 2>/dev/null | head -200"
+    """Find files matching a glob pattern, sorted by modification time."""
+    pattern = args["pattern"]
+    base = args.get("path", ".")
+    base_q = shlex.quote(base)
+    pattern_q = shlex.quote(pattern)
+
+    # Strategy 1: python3 glob (handles ** patterns correctly, sorts by mtime)
+    cmd = (
+        f"python3 -c \""
+        f"import glob, os;"
+        f"files = glob.glob({repr(pattern)}, root_dir={repr(base)}, recursive=True);"
+        f"paths = [os.path.join({repr(base)}, f) for f in files if os.path.isfile(os.path.join({repr(base)}, f))];"
+        f"paths.sort(key=lambda p: os.path.getmtime(p), reverse=True);"
+        f"print('\\n'.join(paths[:200]))"
+        f"\""
+    )
     result = await env.exec(command=cmd, timeout_sec=30)
-    if not result.stdout or not result.stdout.strip():
-        # Try with shell glob via bash
-        cmd2 = f"ls -1 {base}/{args['pattern']} 2>/dev/null | head -200"
-        result = await env.exec(command=cmd2, timeout_sec=30)
+    if result.return_code == 0 and result.stdout and result.stdout.strip():
+        return result.stdout
+
+    # Strategy 2: find fallback (for environments without python3 glob)
+    cmd2 = f"find {base_q} -path {pattern_q} -type f 2>/dev/null | head -200"
+    result = await env.exec(command=cmd2, timeout_sec=30)
+    if result.stdout and result.stdout.strip():
+        return result.stdout
+
+    # Strategy 3: shell glob via bash
+    cmd3 = f"ls -1t {base_q}/{pattern} 2>/dev/null | head -200"
+    result = await env.exec(command=cmd3, timeout_sec=30)
     return result.stdout or "(no matches)"
 
 
 async def _exec_grep(env: BaseEnvironment, args: dict) -> str:
-    """Search file contents using regex."""
+    """Search file contents using regex with context, type filter, and output modes."""
     pattern = shlex.quote(args["pattern"])
     path = shlex.quote(args.get("path", "."))
-    cmd = f"grep -rn {pattern} {path} 2>/dev/null | head -200"
+
+    # Build grep flags
+    flags = ["-rn"]
+
+    # Context lines
+    ctx = args.get("context")
+    before = args.get("before_context")
+    after = args.get("after_context")
+    if ctx is not None:
+        flags.append(f"-C {int(ctx)}")
+    else:
+        if before is not None:
+            flags.append(f"-B {int(before)}")
+        if after is not None:
+            flags.append(f"-A {int(after)}")
+
+    # Output mode
+    mode = args.get("output_mode", "content")
+    if mode == "files_with_matches":
+        flags = ["-rl"]  # override: just file paths
+    elif mode == "count":
+        flags = ["-rc"]  # override: counts per file
+
+    # File type filter
+    file_type = args.get("type")
+    include = ""
+    if file_type:
+        include = f"--include='*.{file_type}'"
+
+    flag_str = " ".join(flags)
+    cmd = f"grep {flag_str} {include} {pattern} {path} 2>/dev/null | head -200"
     result = await env.exec(command=cmd, timeout_sec=30)
+    if mode == "count" and result.stdout:
+        # Filter out zero-count lines for cleaner output
+        lines = [l for l in result.stdout.strip().split("\n") if not l.endswith(":0")]
+        return "\n".join(lines) if lines else "(no matches)"
     return result.stdout or "(no matches)"
 
 
