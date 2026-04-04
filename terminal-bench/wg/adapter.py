@@ -1161,15 +1161,16 @@ def build_condition_f_prompt(instruction: str, root_task_id: str) -> str:
         # --- Core Protocol ---
         "## Strategy: Discover → Plan → Implement → Verify → Iterate\n\n"
 
-        "### Step 1: Discover Tests\n"
-        "Before writing ANY code, find the task's existing test suite:\n"
+        "### Step 1: Read the Test File\n"
+        "Before writing ANY code, read the test suite directly:\n"
         "```\n"
-        "bash(\"find /tests -name 'test_*.py' -o -name '*_test.py' 2>/dev/null\")\n"
-        "bash(\"ls /tests/ 2>/dev/null\")\n"
+        "bash(\"cat /tests/test_outputs.py 2>/dev/null || echo 'No test file found'\")\n"
+        "bash(\"ls -la /tests/ 2>/dev/null\")\n"
         "```\n"
-        "Read any test files you find. They define what 'correct' means.\n"
+        "If `/tests/test_outputs.py` exists, READ IT — do not just list files. "
+        "It defines exactly what the verifier will check.\n"
         "The external verifier runs exactly these tests to score you.\n"
-        "Understanding them FIRST tells you exactly what to build.\n\n"
+        "Understanding the test assertions FIRST tells you exactly what to build.\n\n"
 
         "### Step 2: Classify & Plan\n"
         "- **ATOMIC** (single file, single function, single config): "
@@ -1183,13 +1184,13 @@ def build_condition_f_prompt(instruction: str, root_task_id: str) -> str:
         "in dependency order, marking each done with `wg_done`.\n\n"
 
         "### Step 4: Verify Empirically\n"
-        "Run the discovered test files:\n"
+        "After implementing, run the tests:\n"
         "```\n"
         "bash(\"cd /tests && python -m pytest test_outputs.py -v 2>&1 | tail -80\")\n"
         "```\n"
         "If no test files were found, verify by running the code and checking outputs.\n\n"
-        "**CRITICAL**: Existing test results are AUTHORITATIVE.\n"
-        "If an existing test FAILS, that is ground truth — do NOT declare success.\n"
+        "**CRITICAL**: If ANY test in `test_outputs.py` fails, that is your ground truth. "
+        "Fix your implementation, NOT the test. Do NOT declare success while tests fail.\n"
         "Your own ad-hoc tests supplement existing tests, never override them.\n"
         f'Log the result: `wg_log("{root_task_id}", "VERIFY: <PASS|FAIL> — <evidence>")`\n\n'
 
