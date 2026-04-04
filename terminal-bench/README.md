@@ -120,6 +120,19 @@ Once pulled, images stay in Docker's local cache and won't be pulled again.
 Harbor's `docker compose up` uses `pull_policy: missing` for prebuilt images,
 so cached images are used directly.
 
+**Important:** Harbor's default `--delete` flag runs `docker compose down --rmi all`
+after each trial, which removes images. For full runs, use `--no-delete` to
+preserve the image cache:
+
+```bash
+harbor run -d terminal-bench@2.0 --no-delete ...
+```
+
+After the run completes, clean up with `harbor cache clean` or:
+```bash
+docker container prune -f  # remove stopped containers
+```
+
 ## Files
 
 - `wg/adapter.py` - Main adapter implementation
