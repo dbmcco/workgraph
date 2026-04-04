@@ -1,0 +1,95 @@
+{
+  "selection_criteria": {
+    "pass_rate_range": [0.33, 0.67],
+    "min_valid_trials": 3,
+    "max_error_trials": 0,
+    "source": "terminal-bench/results/rerun-condition-a/summary.json"
+  },
+  "candidate_pool": {
+    "total_candidates": 23,
+    "at_33_pct": 9,
+    "at_67_pct": 14
+  },
+  "tasks": [
+    {
+      "id": "build-cython-ext",
+      "a_pass_rate": 0.33,
+      "description": "Build a Cython extension for pyknotid library; tests numpy version, repo clone, and importability",
+      "trials": 3,
+      "category": "building",
+      "statuses": ["pass", "fail", "fail"]
+    },
+    {
+      "id": "cancel-async-tasks",
+      "a_pass_rate": 0.33,
+      "description": "Implement async task runner with cancellation and max-concurrency constraints",
+      "trials": 3,
+      "category": "async-programming",
+      "statuses": ["pass", "fail", "fail"]
+    },
+    {
+      "id": "nginx-request-logging",
+      "a_pass_rate": 0.33,
+      "description": "Install and configure nginx with request logging and custom index page",
+      "trials": 3,
+      "category": "server-config",
+      "statuses": ["pass", "fail", "fail"]
+    },
+    {
+      "id": "overfull-hbox",
+      "a_pass_rate": 0.33,
+      "description": "Fix LaTeX overfull hbox warnings without modifying synonym definitions; compilation must succeed clean",
+      "trials": 3,
+      "category": "debugging",
+      "statuses": ["pass", "fail", "fail"]
+    },
+    {
+      "id": "regex-log",
+      "a_pass_rate": 0.33,
+      "description": "Parse log files using regex to extract structured data",
+      "trials": 3,
+      "category": "text-processing",
+      "statuses": ["fail", "fail", "pass"]
+    },
+    {
+      "id": "count-dataset-tokens",
+      "a_pass_rate": 0.67,
+      "description": "Count tokens in a dataset and produce specific command output format",
+      "trials": 3,
+      "category": "data-processing",
+      "statuses": ["fail", "pass", "pass"]
+    },
+    {
+      "id": "custom-memory-heap-crash",
+      "a_pass_rate": 0.67,
+      "description": "Debug a custom memory heap crash without modifying protected files; must compile in debug and release modes",
+      "trials": 3,
+      "category": "debugging",
+      "statuses": ["pass", "pass", "fail"]
+    },
+    {
+      "id": "merge-diff-arc-agi-task",
+      "a_pass_rate": 0.67,
+      "description": "Initialize git repo, fetch two ARC-AGI bundles, and write an algorithm to solve merge-diff tasks",
+      "trials": 3,
+      "category": "reasoning",
+      "statuses": ["pass", "pass", "fail"]
+    },
+    {
+      "id": "qemu-startup",
+      "a_pass_rate": 0.67,
+      "description": "Set up and boot a QEMU virtual machine; verifier checks version output",
+      "trials": 3,
+      "category": "system-emulation",
+      "statuses": ["pass", "pass", "fail"]
+    },
+    {
+      "id": "sparql-university",
+      "a_pass_rate": 0.67,
+      "description": "Write SPARQL queries against a university dataset; must produce correct query results",
+      "trials": 3,
+      "category": "query-language",
+      "statuses": ["fail", "pass", "pass"]
+    }
+  ]
+}
