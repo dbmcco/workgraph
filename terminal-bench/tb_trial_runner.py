@@ -131,6 +131,11 @@ CONDITION_CONFIGS = {
         "context_scope": "clean",
         "tags": ["tb-trial", "condition-A"],
     },
+    "B": {
+        "description": "Full wg tools, journal/resume",
+        "context_scope": "task",
+        "tags": ["tb-trial", "condition-B"],
+    },
     "C": {
         "description": "Skill injection, planning phase",
         "context_scope": "task",
@@ -145,6 +150,11 @@ CONDITION_CONFIGS = {
         "description": "Organization decomposition",
         "context_scope": "graph",
         "tags": ["tb-trial", "condition-E"],
+    },
+    "F": {
+        "description": "Distilled context injection, empirical verification",
+        "context_scope": "graph",
+        "tags": ["tb-trial", "condition-F"],
     },
 }
 
