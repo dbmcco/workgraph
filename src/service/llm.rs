@@ -20,6 +20,13 @@ pub struct LlmCallResult {
     pub token_usage: Option<TokenUsage>,
 }
 
+/// Maximum output tokens for lightweight LLM calls.
+///
+/// Triage calls produce short text (~200 tokens) but evaluation and FLIP calls
+/// produce structured JSON with multiple dimensions, notes, and reasoning that
+/// can easily exceed 1024 tokens. 4096 provides comfortable headroom.
+const LIGHTWEIGHT_MAX_TOKENS: u32 = 4096;
+
 /// Run a lightweight (no tool-use) LLM call for an internal dispatch role.
 ///
 /// Resolves the model and provider for the given role, then dispatches via:
@@ -98,7 +105,13 @@ fn estimate_cost(entry: &ModelRegistryEntry, usage: &TokenUsage) -> f64 {
 }
 
 fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
-    let output = process::Command::new("timeout")
+    use std::io::Write as _;
+
+    // Pipe the prompt via stdin instead of passing it as a CLI argument.
+    // Eval prompts can be very large (30KB+ with diffs, logs, artifacts) and
+    // passing them as arguments can hit OS arg-length limits or cause the
+    // `timeout` wrapper to fail with exit 124 before the API call even starts.
+    let mut child = process::Command::new("timeout")
         .arg(format!("{}s", timeout_secs))
         .arg("claude")
         .arg("--model")
@@ -107,21 +120,34 @@ fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCa
         .arg("--output-format")
         .arg("json")
         .arg("--dangerously-skip-permissions")
-        .arg(prompt)
         // Strip CLAUDECODE env var so the CLI doesn't refuse to run
         // when invoked from within a Claude Code session (e.g. daemon
         // spawned by a coordinator agent). This is a headless --print
         // call, not an interactive nested session.
         .env_remove("CLAUDECODE")
-        .output()
-        .context("Failed to run claude CLI for lightweight LLM call")?;
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn claude CLI for lightweight LLM call")?;
+
+    // Write prompt to stdin and close the pipe to signal EOF.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .context("Failed to write prompt to claude CLI stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("Failed to wait for claude CLI output")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
             "Claude CLI call failed (exit {:?}): {}",
             output.status.code(),
-            stderr.chars().take(200).collect::<String>()
+            stderr.chars().take(500).collect::<String>()
         );
     }
 
@@ -307,7 +333,7 @@ fn call_anthropic_native(
 
     let request = MessagesRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: LIGHTWEIGHT_MAX_TOKENS,
         system: None,
         messages: vec![Message {
             role: Role::User,
@@ -411,7 +437,7 @@ fn call_openai_native(
 
     let request = MessagesRequest {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: LIGHTWEIGHT_MAX_TOKENS,
         system: None,
         messages: vec![Message {
             role: Role::User,
