@@ -229,6 +229,65 @@ fn run_inner(
                 );
             }
             eprintln!("Warning: skipping verify command: {}", verify_cmd);
+        } else if Config::load_or_default(dir).coordinator.verify_mode == "separate" {
+            // Separate verification mode: transition to PendingValidation and let
+            // the coordinator spawn a separate agent to run the verify command.
+            // This prevents false-PASS rates where the implementation agent
+            // rubber-stamps its own work.
+            let id_sep = id.to_string();
+            let mut assigned_agent = None;
+            let _graph = modify_graph(&path, |graph| {
+                let task = match graph.get_task_mut(&id_sep) {
+                    Some(t) => t,
+                    None => return false,
+                };
+                if task.status.is_terminal() {
+                    return false;
+                }
+                assigned_agent = task.assigned.clone();
+                task.status = Status::PendingValidation;
+                task.completed_at = Some(Utc::now().to_rfc3339());
+                task.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: task.assigned.clone(),
+                    user: Some(workgraph::current_user()),
+                    message: "Pending separate verification (verify_mode=separate)".to_string(),
+                });
+                true
+            })
+            .context("Failed to save graph for separate verification")?;
+
+            super::notify_graph_changed(dir);
+
+            // Update agent registry
+            if let Ok(mut locked_registry) = AgentRegistry::load_locked(dir) {
+                if let Some(agent) = locked_registry.get_agent_by_task_mut(id) {
+                    agent.status = workgraph::service::registry::AgentStatus::Done;
+                    if agent.completed_at.is_none() {
+                        agent.completed_at = Some(Utc::now().to_rfc3339());
+                    }
+                }
+                let _ = locked_registry.save_ref();
+            }
+
+            println!(
+                "Task '{}' is pending separate verification (verify command: {})",
+                id, verify_cmd
+            );
+
+            // Archive agent conversation for provenance
+            if let Some(ref agent_id) = assigned_agent {
+                match super::log::archive_agent(dir, id, agent_id) {
+                    Ok(archive_dir) => {
+                        eprintln!("Agent archived to {}", archive_dir.display());
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: agent archive failed: {}", e);
+                    }
+                }
+            }
+
+            return Ok(());
         } else {
             let project_root = dir.parent().unwrap_or(dir);
             eprintln!("Running verify command: {}", verify_cmd);
@@ -1874,5 +1933,61 @@ mod tests {
         let task = graph.get_task("t1").unwrap();
         assert_eq!(task.status, Status::Failed);
         assert_eq!(task.verify_failures, 2);
+    }
+
+    #[test]
+    fn test_done_separate_verify_transitions_to_pending_validation() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("t1", "Task with verify", Status::InProgress);
+        task.verify = Some("cargo test".to_string());
+        setup_workgraph(dir_path, vec![task]);
+
+        // Write config with verify_mode = "separate"
+        std::fs::write(
+            dir_path.join("config.toml"),
+            "[coordinator]\nverify_mode = \"separate\"\n",
+        )
+        .unwrap();
+
+        let result = run(dir_path, "t1", false, false);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(
+            task.status,
+            Status::PendingValidation,
+            "should be pending validation, not done"
+        );
+        assert!(task.completed_at.is_some());
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("verify_mode=separate")),
+            "should have separate verify log entry"
+        );
+    }
+
+    #[test]
+    fn test_done_inline_verify_still_works() {
+        // Ensure backward compatibility: verify_mode=inline (default) runs verify inline
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("t1", "Task with passing verify", Status::InProgress);
+        task.verify = Some("true".to_string()); // always passes
+        setup_workgraph(dir_path, vec![task]);
+
+        // No config file = defaults to inline
+        let result = run(dir_path, "t1", false, false);
+        assert!(result.is_ok());
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Done, "inline verify should complete to Done");
     }
 }

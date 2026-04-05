@@ -214,6 +214,13 @@ pub struct GuardrailsConfig {
     /// Prevents infinite triage loops. Default: 3.
     #[serde(default = "default_max_triage_attempts")]
     pub max_triage_attempts: u32,
+
+    /// Whether to inject adaptive decomposition guidance into agent prompts.
+    /// When true (default), the executor analyzes task descriptions and provides
+    /// task-specific decomposition hints (atomic vs multi-step classification
+    /// plus decomposition templates). Set to false to use the generic guidance.
+    #[serde(default = "default_decomp_guidance")]
+    pub decomp_guidance: bool,
 }
 
 fn default_max_child_tasks_per_agent() -> u32 {
@@ -228,12 +235,17 @@ fn default_max_triage_attempts() -> u32 {
     3
 }
 
+fn default_decomp_guidance() -> bool {
+    true
+}
+
 impl Default for GuardrailsConfig {
     fn default() -> Self {
         Self {
             max_child_tasks_per_agent: default_max_child_tasks_per_agent(),
             max_task_depth: default_max_task_depth(),
             max_triage_attempts: default_max_triage_attempts(),
+            decomp_guidance: default_decomp_guidance(),
         }
     }
 }
@@ -2177,6 +2189,13 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_registry_refresh_interval")]
     pub registry_refresh_interval: u64,
 
+    /// Verification mode for tasks with `--verify` commands.
+    /// - "inline" (default): verify command runs in the same agent process that did the work
+    /// - "separate": verify runs in a separate agent context (different conversation/context window)
+    ///   This prevents false-PASS rates where the implementation agent rubber-stamps its own work.
+    #[serde(default = "default_verify_mode")]
+    pub verify_mode: String,
+
     /// Maximum consecutive verify command failures before a task is auto-failed.
     /// When a task's verify command fails this many times in a row, the task
     /// transitions to Failed with a descriptive error. Default: 3.
@@ -2200,6 +2219,17 @@ pub struct CoordinatorConfig {
     /// Set to 0 to disable tier escalation (only rotate within same tier).
     #[serde(default = "default_max_escalation_depth")]
     pub max_escalation_depth: u32,
+
+    /// Whether to scan for test files before spawning agents and inject
+    /// discovered tests into agent context. When enabled, the executor also
+    /// auto-populates `--verify` gates for tasks that have no explicit verify
+    /// command but have discoverable test files. Default: true.
+    #[serde(default = "default_auto_test_discovery")]
+    pub auto_test_discovery: bool,
+}
+
+fn default_auto_test_discovery() -> bool {
+    true
 }
 
 fn default_max_agents() -> usize {
@@ -2248,6 +2278,10 @@ fn default_max_coordinators() -> usize {
 
 fn default_archive_retention_days() -> u64 {
     7
+}
+
+fn default_verify_mode() -> String {
+    "inline".to_string()
 }
 
 fn default_max_verify_failures() -> u32 {
@@ -2326,9 +2360,11 @@ impl Default for CoordinatorConfig {
             max_coordinators: default_max_coordinators(),
             archive_retention_days: default_archive_retention_days(),
             registry_refresh_interval: default_registry_refresh_interval(),
+            verify_mode: default_verify_mode(),
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
             max_escalation_depth: default_max_escalation_depth(),
+            auto_test_discovery: default_auto_test_discovery(),
         }
     }
 }
