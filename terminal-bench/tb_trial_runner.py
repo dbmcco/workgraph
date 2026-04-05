@@ -182,10 +182,14 @@ def create_trial_task(
     instruction: str,
     model: str | None,
     wg_dir: str | None,
+    run_id: str | None = None,
 ) -> str:
     """Create a single trial task in the workgraph. Returns the task ID."""
     cond_cfg = CONDITION_CONFIGS[condition]
-    task_id = f"tb-{condition.lower()}-{task_def['id']}-r{replica}"
+    if run_id:
+        task_id = f"tb-{run_id}-{condition.lower()}-{task_def['id']}-r{replica}"
+    else:
+        task_id = f"tb-{condition.lower()}-{task_def['id']}-r{replica}"
     title = f"TB-{condition}: {task_def['title']} (rep {replica})"
 
     # Build task description
@@ -305,10 +309,15 @@ def cmd_create(args):
     replicas = config.get("replicas", 3)
     model = config.get("model")
     model_overrides = config.get("model_overrides", {})
+    run_id = config.get("run_id")
+    task_filter = config.get("task_filter", {})
 
     print(f"Creating TB trial tasks:")
+    print(f"  Run ID: {run_id or '(none)'}")
     print(f"  Conditions: {conditions}")
     print(f"  Tasks: {task_ids_list}")
+    if task_filter:
+        print(f"  Task filter: {task_filter}")
     print(f"  Replicas: {replicas}")
     print(f"  Model: {model or '(default)'}")
     if model_overrides:
@@ -322,8 +331,11 @@ def cmd_create(args):
             print(f"  WARNING: Unknown condition '{condition}', skipping")
             continue
 
+        # Apply per-condition task filter if present
+        cond_tasks = task_filter.get(condition, task_ids_list)
+
         print(f"Condition {condition}: {CONDITION_CONFIGS[condition]['description']}")
-        for task_name in task_ids_list:
+        for task_name in cond_tasks:
             if task_name not in TB_TASKS:
                 print(f"  WARNING: Unknown task '{task_name}', skipping")
                 continue
@@ -337,6 +349,7 @@ def cmd_create(args):
                 task_id = create_trial_task(
                     task_def, condition, replica,
                     instruction, task_model, wg_dir,
+                    run_id=run_id,
                 )
                 all_trial_ids.append(task_id)
         print()

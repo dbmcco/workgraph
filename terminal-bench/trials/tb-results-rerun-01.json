@@ -1,0 +1,468 @@
+{
+  "run_id": "rerun-01",
+  "conditions": [
+    "A",
+    "C"
+  ],
+  "tasks": [
+    "ml",
+    "algorithm",
+    "data-processing",
+    "text-processing",
+    "shell-scripting",
+    "file-ops",
+    "debugging"
+  ],
+  "replicas": 3,
+  "model": "claude:claude-sonnet-4-6",
+  "results": [
+    {
+      "task_id": "tb-rerun-01-a-ml-r0",
+      "status": "done",
+      "flip_score": 0.025,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-ml-r1",
+      "status": "done",
+      "flip_score": 0.04,
+      "eval_score": 0.79,
+      "verify_passed": true,
+      "eval_dimensions": {
+        "efficiency": 0.8,
+        "intent_fidelity": 0.04,
+        "correctness": 0.95,
+        "downstream_usability": 0.5,
+        "style_adherence": 0.8,
+        "coordination_overhead": 0.9,
+        "completeness": 0.9,
+        "blocking_impact": 0.8
+      }
+    },
+    {
+      "task_id": "tb-rerun-01-a-ml-r2",
+      "status": "done",
+      "flip_score": 0.0,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-algorithm-r0",
+      "status": "done",
+      "flip_score": 0.03,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-algorithm-r1",
+      "status": "done",
+      "flip_score": null,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-algorithm-r2",
+      "status": "done",
+      "flip_score": null,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-data-processing-r0",
+      "status": "done",
+      "flip_score": 0.0,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-data-processing-r1",
+      "status": "done",
+      "flip_score": 0.0,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-data-processing-r2",
+      "status": "done",
+      "flip_score": 0.14,
+      "eval_score": 0.88,
+      "verify_passed": true,
+      "eval_dimensions": {
+        "style_adherence": 0.8,
+        "efficiency": 0.9,
+        "correctness": 0.95,
+        "intent_fidelity": 0.14,
+        "coordination_overhead": 0.9,
+        "blocking_impact": 0.9,
+        "completeness": 0.9,
+        "downstream_usability": 0.75
+      }
+    },
+    {
+      "task_id": "tb-rerun-01-a-text-processing-r0",
+      "status": "done",
+      "flip_score": 0.63,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-text-processing-r1",
+      "status": "done",
+      "flip_score": null,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-text-processing-r2",
+      "status": "done",
+      "flip_score": null,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-shell-scripting-r0",
+      "status": "done",
+      "flip_score": 0.465,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-shell-scripting-r1",
+      "status": "done",
+      "flip_score": 0.015,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-shell-scripting-r2",
+      "status": "done",
+      "flip_score": 0.1,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-file-ops-r0",
+      "status": "done",
+      "flip_score": null,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-file-ops-r1",
+      "status": "done",
+      "flip_score": 0.0,
+      "eval_score": 0.72,
+      "verify_passed": true,
+      "eval_dimensions": {
+        "blocking_impact": 0.9,
+        "style_adherence": 0.6,
+        "correctness": 0.95,
+        "coordination_overhead": 0.55,
+        "intent_fidelity": 0.0,
+        "downstream_usability": 0.4,
+        "completeness": 0.85,
+        "efficiency": 0.75
+      }
+    },
+    {
+      "task_id": "tb-rerun-01-a-file-ops-r2",
+      "status": "done",
+      "flip_score": 0.1,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-debugging-r0",
+      "status": "done",
+      "flip_score": 0.65,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-debugging-r1",
+      "status": "done",
+      "flip_score": 0.14,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-a-debugging-r2",
+      "status": "done",
+      "flip_score": 0.12,
+      "eval_score": 0.75,
+      "verify_passed": true,
+      "eval_dimensions": {
+        "downstream_usability": 0.6,
+        "intent_fidelity": 0.12,
+        "correctness": 0.9,
+        "style_adherence": 0.7,
+        "completeness": 0.9,
+        "blocking_impact": 0.9,
+        "efficiency": 0.8,
+        "coordination_overhead": 0.8
+      }
+    },
+    {
+      "task_id": "tb-rerun-01-c-file-ops-r0",
+      "status": "done",
+      "flip_score": 0.72,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-c-file-ops-r1",
+      "status": "done",
+      "flip_score": 0.625,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    },
+    {
+      "task_id": "tb-rerun-01-c-file-ops-r2",
+      "status": "done",
+      "flip_score": 0.465,
+      "eval_score": null,
+      "verify_passed": true,
+      "eval_dimensions": null
+    }
+  ],
+  "statistics": {
+    "A": {
+      "total": 21,
+      "passed": 21,
+      "failed": 0,
+      "pass_rate": 1.0,
+      "mean_flip": 0.1534375,
+      "mean_eval": 0.785,
+      "flip_scores": [
+        0.025,
+        0.04,
+        0.0,
+        0.03,
+        0.0,
+        0.0,
+        0.14,
+        0.63,
+        0.465,
+        0.015,
+        0.1,
+        0.0,
+        0.1,
+        0.65,
+        0.14,
+        0.12
+      ],
+      "eval_scores": [
+        0.79,
+        0.88,
+        0.72,
+        0.75
+      ],
+      "flip_pass_mean": 0.1534375,
+      "flip_fail_mean": null
+    },
+    "C": {
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "pass_rate": 1.0,
+      "mean_flip": 0.6033333333333334,
+      "mean_eval": null,
+      "flip_scores": [
+        0.72,
+        0.625,
+        0.465
+      ],
+      "eval_scores": [],
+      "flip_pass_mean": 0.6033333333333334,
+      "flip_fail_mean": null
+    }
+  },
+  "comparison": [
+    {
+      "condition": "A",
+      "task": "algorithm",
+      "original_flip_avg": 0.0317,
+      "rerun_flip_avg": 0.03,
+      "flip_delta": -0.0017,
+      "original_llm_avg": 0.81,
+      "rerun_llm_avg": null,
+      "llm_delta": null,
+      "original_flip_scores": [
+        0.03,
+        0.065,
+        0.0
+      ],
+      "rerun_flip_scores": [
+        0.03
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "data-processing",
+      "original_flip_avg": 0.0417,
+      "rerun_flip_avg": 0.0467,
+      "flip_delta": 0.005,
+      "original_llm_avg": 0.7367,
+      "rerun_llm_avg": 0.88,
+      "llm_delta": 0.1433,
+      "original_flip_scores": [
+        0.125,
+        0.0,
+        0.0
+      ],
+      "rerun_flip_scores": [
+        0.0,
+        0.0,
+        0.14
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "debugging",
+      "original_flip_avg": 0.2267,
+      "rerun_flip_avg": 0.3033,
+      "flip_delta": 0.0767,
+      "original_llm_avg": 0.7667,
+      "rerun_llm_avg": 0.75,
+      "llm_delta": -0.0167,
+      "original_flip_scores": [
+        0.0,
+        0.67,
+        0.01
+      ],
+      "rerun_flip_scores": [
+        0.65,
+        0.14,
+        0.12
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "file-ops",
+      "original_flip_avg": 0.2067,
+      "rerun_flip_avg": 0.05,
+      "flip_delta": -0.1567,
+      "original_llm_avg": 0.8633,
+      "rerun_llm_avg": 0.72,
+      "llm_delta": -0.1433,
+      "original_flip_scores": [
+        0.03,
+        0.095,
+        0.495
+      ],
+      "rerun_flip_scores": [
+        0.0,
+        0.1
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "ml",
+      "original_flip_avg": 0.0083,
+      "rerun_flip_avg": 0.0217,
+      "flip_delta": 0.0133,
+      "original_llm_avg": 0.6533,
+      "rerun_llm_avg": 0.79,
+      "llm_delta": 0.1367,
+      "original_flip_scores": [
+        0.0,
+        0.0,
+        0.025
+      ],
+      "rerun_flip_scores": [
+        0.025,
+        0.04,
+        0.0
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "shell-scripting",
+      "original_flip_avg": 0.1083,
+      "rerun_flip_avg": 0.1933,
+      "flip_delta": 0.085,
+      "original_llm_avg": 0.87,
+      "rerun_llm_avg": null,
+      "llm_delta": null,
+      "original_flip_scores": [
+        0.28,
+        0.0,
+        0.045
+      ],
+      "rerun_flip_scores": [
+        0.465,
+        0.015,
+        0.1
+      ]
+    },
+    {
+      "condition": "A",
+      "task": "text-processing",
+      "original_flip_avg": 0.314,
+      "rerun_flip_avg": 0.63,
+      "flip_delta": 0.316,
+      "original_llm_avg": 0.4967,
+      "rerun_llm_avg": null,
+      "llm_delta": null,
+      "original_flip_scores": [
+        0.24,
+        0.0,
+        0.702
+      ],
+      "rerun_flip_scores": [
+        0.63
+      ]
+    },
+    {
+      "condition": "C",
+      "task": "file-ops",
+      "original_flip_avg": 0.215,
+      "rerun_flip_avg": 0.6033,
+      "flip_delta": 0.3883,
+      "original_llm_avg": 0.725,
+      "rerun_llm_avg": null,
+      "llm_delta": null,
+      "original_flip_scores": [
+        0.505,
+        0.06,
+        0.08
+      ],
+      "rerun_flip_scores": [
+        0.72,
+        0.625,
+        0.465
+      ]
+    }
+  ],
+  "summary": {
+    "description": "Re-run of worst performers from full-sweep-01 after evolution (18 ops applied)",
+    "combos_rerun": 8,
+    "total_trials": 24,
+    "overall_flip_original": 0.144,
+    "overall_flip_rerun": 0.2245,
+    "overall_flip_delta": 0.0804,
+    "biggest_improvement": "C+file-ops: FLIP +0.388 (0.215 -> 0.603)",
+    "biggest_regression": "A+file-ops: FLIP -0.157 (0.207 -> 0.050)",
+    "notable": "A+text-processing FLIP improved +0.316 (0.314 -> 0.630); condition A FLIP still much lower than C/D/E baseline"
+  }
+}
