@@ -1650,7 +1650,7 @@ pub enum Commands {
         #[arg(long)]
         task_id: String,
 
-        /// Model to use (e.g., claude-sonnet-4-5-20250514)
+        /// Model to use (e.g., anthropic/claude-sonnet-4-6)
         #[arg(long)]
         model: Option<String>,
 

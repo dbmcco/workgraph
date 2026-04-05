@@ -7,7 +7,7 @@ use workgraph::config::Config;
 use workgraph::graph::{CycleConfig, Node, Status, Task};
 use workgraph::parser::{load_graph, modify_graph};
 
-use super::partition::{self, AnalyzerSlice, ModelTier};
+use super::partition::{self, AnalyzerSlice};
 use super::prompt::{build_analyzer_prompt, load_evolver_skills};
 use super::strategy::Strategy;
 
@@ -170,11 +170,7 @@ pub fn run_fanout(
             _ => "No skill document available for this strategy.".to_string(),
         };
 
-        let model = match slice.model_tier {
-            ModelTier::Haiku => "haiku",
-            ModelTier::Sonnet => "sonnet",
-            ModelTier::Opus => "opus",
-        };
+        let model = slice.model_tier.label();
 
         let description =
             build_analyzer_prompt(*strategy, &run_id, &skill_doc, &slice.summary, &agency_dir);

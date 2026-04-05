@@ -6,7 +6,7 @@
 //! uniform interface.
 //!
 //! Use `create_provider()` to route a model string to the appropriate backend:
-//! - Bare name (`claude-sonnet-4-5-20250514`) → Anthropic native API
+//! - Bare name (`claude-sonnet-4-6`) → Anthropic native API
 //! - Prefixed (`openai/gpt-4o`, `deepseek/deepseek-chat`) → OpenAI-compatible
 
 use std::path::Path;
