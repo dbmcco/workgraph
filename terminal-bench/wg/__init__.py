@@ -5,6 +5,7 @@ from wg.adapter import (
     ConditionCAgent,
     ConditionDAgent,
     ConditionEAgent,
+    ConditionFAgent,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ConditionCAgent",
     "ConditionDAgent",
     "ConditionEAgent",
+    "ConditionFAgent",
 ]
