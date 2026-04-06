@@ -1572,24 +1572,32 @@ fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ContentBlock>) {
             break;
         };
 
-        // Find the matching closing tag
+        // Find where the opening tag ends (the '>') so we can search for the
+        // closing tag AFTER it. This prevents matching the opening tag's own
+        // ':tool_call>' suffix as the close tag (e.g. <minimax:tool_call>).
+        let open_end = remaining[start..]
+            .find('>')
+            .map(|p| start + p + 1)
+            .unwrap_or(start);
+
+        // Find the matching closing tag — search from after the opening tag.
         let close_patterns = ["</tool_call>", "<|/tool_call|>", "<|tool_call_end|>"];
         let close_match = close_patterns.iter().find_map(|pat| {
-            remaining[start..]
+            remaining[open_end..]
                 .find(pat)
-                .map(|offset| (start + offset, pat.len()))
+                .map(|offset| (open_end + offset, pat.len()))
         });
         // Also check for :tool_call> closing (e.g., </minimax:tool_call>)
         let close_match = close_match.or_else(|| {
-            remaining[start + 1..].find(":tool_call>").map(|offset| {
+            remaining[open_end..].find(":tool_call>").map(|offset| {
                 // Walk back to find '</' or '<'
-                let tag_start = remaining[start + 1..start + 1 + offset]
+                let tag_start = remaining[open_end..open_end + offset]
                     .rfind('<')
-                    .map(|p| start + 1 + p)
-                    .unwrap_or(start + 1 + offset.saturating_sub(1));
+                    .map(|p| open_end + p)
+                    .unwrap_or(open_end + offset.saturating_sub(1));
                 (
                     tag_start,
-                    offset + ":tool_call>".len() - (tag_start - start - 1),
+                    offset + ":tool_call>".len() - (tag_start - open_end),
                 )
             })
         });
@@ -1599,10 +1607,6 @@ fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ContentBlock>) {
         };
 
         // Extract content between open and close tags
-        let open_end = remaining[start..]
-            .find('>')
-            .map(|p| start + p + 1)
-            .unwrap_or(start);
         let inner = remaining[open_end..close_start].trim();
 
         if let Some(tc) = parse_tool_call_json(inner, &mut call_counter) {
@@ -3554,6 +3558,36 @@ Done."#;
                 if name == "bash" && input["command"] == "ls")
         );
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_minimax_tool_call_format() {
+        // Regression test: minimax model uses <minimax:tool_call>...</minimax:tool_call> format.
+        // The ':tool_call>' in the OPENING tag must not be matched as the closing tag,
+        // which previously caused a slice bounds panic (begin > end).
+        let text = r#"<minimax:tool_call>{"name": "bash", "arguments": {"command": "ls"}}</minimax:tool_call>"#;
+        let (remaining, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            matches!(&calls[0], ContentBlock::ToolUse { name, input, .. }
+                if name == "bash" && input["command"] == "ls")
+        );
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_minimax_tool_call_no_panic_on_invoke_text() {
+        // Regression test: text containing <invoke> XML format (used by some models)
+        // with ':tool_call>' absent should not panic. Pattern 3 should not match.
+        let text = r#"<invoke name="wg_msg_read">
+<parameter name="task_id">some-task</parameter>
+</invoke>"#;
+        // This should not panic — extract_tool_calls_from_text must handle
+        // text that does not contain ':tool_call>' gracefully.
+        let (_remaining, calls) = extract_tool_calls_from_text(text);
+        // <invoke> format is not a recognized Pattern 3 variant, so 0 calls is fine.
+        // The important thing is no panic.
+        let _ = calls;
     }
 
     #[test]
