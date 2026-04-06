@@ -1,9 +1,11 @@
 """
 Terminal Bench Agent Adapter for Harbor Framework.
 
-Delegates execution to workgraph's native executor via `wg service start`.
-The adapter is a thin orchestrator: it creates a per-trial graph, starts
-the native service, polls for task completion, and collects metrics.
+Supports two execution modes:
+  1. Docker-aware: LLM agent loop in Python, routes commands through
+     harbor's environment.exec() into Docker containers. (Default for harbor.)
+  2. Host-native: Delegates to wg service start + native-exec.
+     (Only works when verification runs on the host, e.g. run_full_a_prime_vs_f.py.)
 
 Supports six conditions:
   Condition A (control): bash + file tools only, no graph, no resume
@@ -111,11 +113,22 @@ async def _exec_wg_cmd_host(wg_dir: str, wg_bin: str, subcmd: list[str]) -> str:
     The workgraph state lives on the host in a temp directory per trial.
     """
     cmd = [wg_bin, "--dir", wg_dir] + subcmd
+    # Strip env vars from the parent workgraph service that would override
+    # the trial's own model/executor configuration.
+    clean_env = {
+        k: v for k, v in os.environ.items()
+        if k not in (
+            "WG_MODEL", "WG_EXECUTOR_TYPE", "WG_AGENT_ID", "WG_TASK_ID",
+            "WG_LLM_PROVIDER", "WG_ENDPOINT", "WG_ENDPOINT_NAME",
+            "WG_ENDPOINT_URL", "WG_API_KEY",
+        )
+    }
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=clean_env,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
         output_parts = []
@@ -158,8 +171,13 @@ async def _write_trial_wg_config(
         f'worktree_isolation = false',
         "",
         "[agent]",
+        f'model = "{model}"',
         f'context_scope = "{cfg["context_scope"]}"',
         f'exec_mode = "{cfg["exec_mode"]}"',
+        "",
+        "[agency]",
+        "auto_assign = false",
+        "auto_evaluate = false",
         "",
     ]
 
@@ -353,6 +371,258 @@ async def _collect_agent_metrics(wg_dir: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Distilled context guide for Condition F
+# ---------------------------------------------------------------------------
+
+WG_QUICK_GUIDE = """## WG Quick Reference (Distilled)
+
+You are working inside a task environment. Complete the task described below.
+
+### Guidelines
+- Read the task instructions carefully
+- Write code and create files as requested
+- Test your work before considering it done
+- Focus on correctness and completeness
+"""
+
+
+# ---------------------------------------------------------------------------
+# Docker-aware LLM agent loop
+# ---------------------------------------------------------------------------
+
+# Tool definitions for the LLM (OpenAI function-calling format)
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a shell command and return stdout + stderr.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file (creates or overwrites).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to write",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content",
+                    },
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to read",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+
+async def _run_docker_agent_loop(
+    instruction: str,
+    environment: BaseEnvironment,
+    model: str,
+    condition: str,
+    max_turns: int = 9999,
+    timeout_secs: float = DEFAULT_TRIAL_TIMEOUT,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    """Run an LLM agent loop with commands routed through Docker via environment.exec().
+
+    Returns metrics dict with turns, tokens, termination info.
+    """
+    import litellm
+
+    metrics = {
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cost_usd": 0.0,
+        "total_turns": 0,
+        "termination_type": "max_turns",
+        "elapsed_s": 0.0,
+        "tool_calls": [],
+    }
+
+    # Build system prompt
+    cfg = CONDITION_CONFIG[condition]
+    system_parts = ["You are a skilled software engineer. Complete the task below."]
+    if not cfg.get("exclude_wg_tools"):
+        system_parts.append(WG_QUICK_GUIDE)
+    system_prompt = "\n\n".join(system_parts)
+
+    # Resolve litellm model name: "openrouter:minimax/minimax-m2.7" → "openrouter/minimax/minimax-m2.7"
+    litellm_model = model.replace(":", "/", 1) if ":" in model else model
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": instruction},
+    ]
+
+    start = time.monotonic()
+
+    for turn in range(1, max_turns + 1):
+        elapsed = time.monotonic() - start
+        if elapsed > timeout_secs:
+            metrics["termination_type"] = "timeout"
+            break
+
+        metrics["total_turns"] = turn
+
+        try:
+            response = await asyncio.wait_for(
+                litellm.acompletion(
+                    model=litellm_model,
+                    messages=messages,
+                    tools=AGENT_TOOLS,
+                    tool_choice="auto",
+                    temperature=temperature,
+                    max_tokens=4096,
+                ),
+                timeout=min(120, timeout_secs - elapsed),
+            )
+        except asyncio.TimeoutError:
+            metrics["termination_type"] = "timeout"
+            logger.warning(f"LLM call timed out at turn {turn}")
+            break
+        except Exception as e:
+            logger.error(f"LLM call failed at turn {turn}: {e}")
+            metrics["termination_type"] = "llm_error"
+            break
+
+        # Track tokens
+        usage = response.usage
+        if usage:
+            metrics["total_input_tokens"] += getattr(usage, "prompt_tokens", 0)
+            metrics["total_output_tokens"] += getattr(usage, "completion_tokens", 0)
+
+        choice = response.choices[0]
+        message = choice.message
+
+        # Add assistant message to history
+        messages.append(message.model_dump())
+
+        # Check if the model wants to call tools
+        if not message.tool_calls:
+            # No tool calls — model is done
+            if message.content:
+                logger.info(f"Turn {turn}: model finished with text response")
+            metrics["termination_type"] = "natural_stop"
+            break
+
+        # Execute each tool call
+        for tool_call in message.tool_calls:
+            fn = tool_call.function
+            tool_name = fn.name
+            try:
+                args = json.loads(fn.arguments)
+            except json.JSONDecodeError:
+                args = {}
+
+            metrics["tool_calls"].append(tool_name)
+            result_text = ""
+
+            try:
+                if tool_name == "bash":
+                    cmd = args.get("command", "echo 'no command'")
+                    exec_result = await asyncio.wait_for(
+                        environment.exec(
+                            command=cmd,
+                            timeout_sec=120,
+                            env={"DEBIAN_FRONTEND": "noninteractive"},
+                        ),
+                        timeout=130,
+                    )
+                    parts = []
+                    if exec_result.stdout:
+                        parts.append(exec_result.stdout)
+                    if exec_result.stderr:
+                        parts.append(exec_result.stderr)
+                    if exec_result.return_code != 0:
+                        parts.append(f"Exit code: {exec_result.return_code}")
+                    result_text = "\n".join(parts) if parts else "(no output)"
+                    # Truncate large outputs
+                    if len(result_text) > 16000:
+                        result_text = result_text[:8000] + "\n...[truncated]...\n" + result_text[-8000:]
+
+                elif tool_name == "write_file":
+                    path = args.get("path", "/tmp/output.txt")
+                    content = args.get("content", "")
+                    # Use heredoc to avoid escaping issues
+                    eof_marker = f"WGEOF{uuid.uuid4().hex[:6]}"
+                    write_cmd = f"mkdir -p $(dirname '{path}') && cat > '{path}' <<'{eof_marker}'\n{content}\n{eof_marker}"
+                    exec_result = await asyncio.wait_for(
+                        environment.exec(command=write_cmd, timeout_sec=30),
+                        timeout=35,
+                    )
+                    if exec_result.return_code == 0:
+                        result_text = f"Successfully wrote {len(content)} bytes to {path}"
+                    else:
+                        result_text = f"Error writing {path}: {exec_result.stderr or 'unknown error'}"
+
+                elif tool_name == "read_file":
+                    path = args.get("path", "")
+                    exec_result = await asyncio.wait_for(
+                        environment.exec(command=f"cat '{path}'", timeout_sec=30),
+                        timeout=35,
+                    )
+                    if exec_result.return_code == 0:
+                        result_text = exec_result.stdout or "(empty file)"
+                    else:
+                        result_text = f"Error reading {path}: {exec_result.stderr or 'file not found'}"
+                    if len(result_text) > 16000:
+                        result_text = result_text[:8000] + "\n...[truncated]...\n" + result_text[-8000:]
+
+                else:
+                    result_text = f"Unknown tool: {tool_name}"
+
+            except asyncio.TimeoutError:
+                result_text = f"Tool execution timed out"
+            except Exception as e:
+                result_text = f"Tool error: {e}"
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result_text,
+            })
+
+    metrics["elapsed_s"] = time.monotonic() - start
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # WorkgraphAgent — the Harbor BaseAgent implementation
 # ---------------------------------------------------------------------------
 
@@ -360,7 +630,8 @@ class WorkgraphAgent(BaseAgent):
     """
     Harbor agent adapter for Terminal Bench evaluation.
 
-    Delegates execution to workgraph's native executor via `wg service start`.
+    Uses a Docker-aware LLM agent loop: calls the LLM and routes tool
+    executions through harbor's environment.exec() into Docker containers.
 
     Supports six experimental conditions:
       condition="A" — bare agent (bash + file tools, no graph)
@@ -396,6 +667,8 @@ class WorkgraphAgent(BaseAgent):
         pull_primitives: bool = True,
         push_evaluations: bool = True,
         evolve_after_n: int = 0,
+        max_turns: int = 9999,
+        temperature: float = 0.0,
         *args,
         **kwargs,
     ):
@@ -411,6 +684,8 @@ class WorkgraphAgent(BaseAgent):
         self.pull_primitives = pull_primitives
         self.push_evaluations = push_evaluations
         self.evolve_after_n = evolve_after_n
+        self._max_turns = max_turns
+        self._temperature = temperature
 
     def _find_wg_binary(self) -> str:
         """Locate the wg binary on the host."""
@@ -488,26 +763,12 @@ class WorkgraphAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        """Start the native wg service, poll for completion, and collect metrics."""
-        wg_dir = self._wg_graph_dir
-        wg_bin = self._wg_binary_host_path
-
-        # Create root task
+        """Run LLM agent loop with commands routed through Docker."""
         root_task_id = f"tb-{uuid.uuid4().hex[:8]}"
-        title = instruction[:100] + ("..." if len(instruction) > 100 else "")
-        add_cmd = ["add", title, "--id", root_task_id, "-d", instruction]
 
-        # Condition F: add --verify if task has verification criteria
-        if self.condition == "F" and "test" in instruction.lower():
-            add_cmd += ["--verify", "true"]
-
-        await _exec_wg_cmd_host(wg_dir, wg_bin, add_cmd)
-
-        # Assign agent identity for D/E
-        cfg = CONDITION_CONFIG[self.condition]
-        if cfg["agency"]:
-            agent_name = "solver" if self.condition == "D" else "orchestrator"
-            await _exec_wg_cmd_host(wg_dir, wg_bin, ["assign", root_task_id, agent_name])
+        # Resolve max_turns and temperature from kwargs
+        max_turns = getattr(self, "_max_turns", 9999)
+        temperature = getattr(self, "_temperature", 0.0)
 
         # Initialize trial logger
         trial_log = TrialLogger(
@@ -517,87 +778,28 @@ class WorkgraphAgent(BaseAgent):
             model=self._model,
         )
 
-        # Snapshot initial graph state
-        snapshot = await _exec_wg_cmd_host(wg_dir, wg_bin, ["list"])
-        trial_log.record_wg_snapshot("after_init", snapshot)
-
-        # Start the native wg service
-        service_cmd = [
-            "service", "start",
-            "--max-agents", str(cfg["max_agents"]),
-            "--executor", "native",
-            "--model", self._model,
-            "--no-coordinator-agent",
-            "--force",
-        ]
-        service_result = await _exec_wg_cmd_host(wg_dir, wg_bin, service_cmd)
-        logger.info(f"Service started: {service_result.strip()}")
-
         trial_log.begin_turn(0)
 
-        try:
-            # Poll for task completion
-            status, elapsed = await _poll_task_completion(
-                wg_dir, wg_bin, root_task_id,
-                timeout_secs=self.timeout,
-                poll_interval=self.poll_interval,
-            )
-            logger.info(f"Root task {root_task_id} reached status: {status} in {elapsed:.1f}s")
-
-            if status == "done":
-                trial_log.termination_type = "wg_done"
-            elif status == "failed":
-                trial_log.termination_type = "wg_fail"
-            elif status == "timeout":
-                trial_log.termination_type = "timeout"
-            else:
-                trial_log.termination_type = status
-
-        finally:
-            # Stop the service
-            stop_result = await _exec_wg_cmd_host(wg_dir, wg_bin, ["service", "stop", "--kill-agents"])
-            logger.info(f"Service stopped: {stop_result.strip()}")
+        # Run Docker-aware agent loop
+        metrics = await _run_docker_agent_loop(
+            instruction=instruction,
+            environment=environment,
+            model=self._model,
+            condition=self.condition,
+            max_turns=max_turns,
+            timeout_secs=self.timeout,
+            temperature=temperature,
+        )
 
         trial_log.end_turn(had_tool_calls=True)
 
-        # Snapshot final graph state
-        final_snapshot = await _exec_wg_cmd_host(wg_dir, wg_bin, ["list"])
-        trial_log.record_wg_snapshot("before_done", final_snapshot)
-
-        # Collect metrics from native executor stream.jsonl files
-        metrics = await _collect_agent_metrics(wg_dir)
-
         trial_log.total_input_tokens = metrics["total_input_tokens"]
         trial_log.total_output_tokens = metrics["total_output_tokens"]
-        trial_log.total_cost = metrics["total_cost_usd"]
+        trial_log.total_cost = metrics.get("total_cost_usd", 0.0)
         trial_log.total_turns = metrics["total_turns"]
+        trial_log.termination_type = metrics["termination_type"]
 
-        # Federation: evaluate completed tasks and push results to hub
-        federation_pushed = False
-        if (
-            self.federation_hub
-            and self.condition in FEDERATION_CONDITIONS
-            and self.push_evaluations
-        ):
-            # Run evaluation on the root task (generates evaluation JSON)
-            eval_result = await _exec_wg_cmd_host(
-                wg_dir, wg_bin,
-                ["evaluate", "run", root_task_id],
-            )
-            logger.info(f"Evaluation result: {eval_result.strip()}")
-
-            # Push evaluations + performance data to hub
-            push_result = await _federation_push(wg_dir, wg_bin, self.federation_hub)
-            logger.info(f"Federation push to hub: {push_result.strip()}")
-            federation_pushed = True
-
-            # Optionally trigger evolution on the hub
-            if self.evolve_after_n > 0:
-                hub_wg_dir = os.path.join(self.federation_hub, ".workgraph")
-                evolve_result = await _exec_wg_cmd_host(
-                    hub_wg_dir, wg_bin, ["evolve", "run"],
-                )
-                logger.info(f"Hub evolution: {evolve_result.strip()}")
+        elapsed = metrics["elapsed_s"]
 
         # Build metadata
         metadata: dict[str, Any] = {
@@ -605,22 +807,19 @@ class WorkgraphAgent(BaseAgent):
             "turns": metrics["total_turns"],
             "root_task_id": root_task_id,
             "model": self._model,
-            "termination_type": trial_log.termination_type,
+            "termination_type": metrics["termination_type"],
             "elapsed_s": elapsed,
-            "native_executor": True,
+            "docker_agent_loop": True,
         }
 
+        cfg = CONDITION_CONFIG[self.condition]
         if cfg["agency"]:
             metadata["agent_identity"] = getattr(self, "_agent_identity", None)
-
-        if federation_pushed:
-            metadata["federation_hub"] = self.federation_hub
-            metadata["federation_pushed"] = True
 
         # Populate Harbor's AgentContext
         context.n_input_tokens = metrics["total_input_tokens"]
         context.n_output_tokens = metrics["total_output_tokens"]
-        context.cost_usd = metrics["total_cost_usd"]
+        context.cost_usd = metrics.get("total_cost_usd", 0.0)
         context.metadata = metadata
 
         # Write trial summary
@@ -629,15 +828,7 @@ class WorkgraphAgent(BaseAgent):
             if k not in ("condition", "model", "root_task_id")
         })
 
-        # Save workgraph state for analysis
-        wg_state_dst = self.logs_dir / "workgraph_state"
-        try:
-            shutil.copytree(wg_dir, str(wg_state_dst))
-            logger.info(f"Saved workgraph state to {wg_state_dst}")
-        except Exception as e:
-            logger.warning(f"Failed to save workgraph state: {e}")
-
-        # Cleanup temp dir
+        # Cleanup temp dir if it exists
         if hasattr(self, "_wg_temp_dir"):
             shutil.rmtree(self._wg_temp_dir, ignore_errors=True)
 
