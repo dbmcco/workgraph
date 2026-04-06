@@ -482,6 +482,7 @@ pub const RAW_STREAM_FILE_NAME: &str = "raw_stream.jsonl";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CLAUDE_SONNET_MODEL_ID;
     use tempfile::TempDir;
 
     #[test]
@@ -489,7 +490,7 @@ mod tests {
         let events = vec![
             StreamEvent::Init {
                 executor_type: "claude".to_string(),
-                model: Some("claude-sonnet-4-20250514".to_string()),
+                model: Some(CLAUDE_SONNET_MODEL_ID.to_string()),
                 session_id: Some("sess-123".to_string()),
                 timestamp_ms: 1000,
             },
@@ -524,7 +525,7 @@ mod tests {
                     cache_read_input_tokens: Some(200),
                     cache_creation_input_tokens: Some(50),
                     cost_usd: Some(0.05),
-                    model: Some("claude-sonnet-4-20250514".to_string()),
+                    model: Some(CLAUDE_SONNET_MODEL_ID.to_string()),
                 },
                 timestamp_ms: 5000,
             },
@@ -613,8 +614,8 @@ mod tests {
 
     #[test]
     fn test_translate_claude_system_event() {
-        let line = r#"{"type":"system","session_id":"abc123","model":"claude-sonnet-4-20250514"}"#;
-        let event = translate_claude_event(line).unwrap();
+        let line = format!(r#"{{"type":"system","session_id":"abc123","model":"{CLAUDE_SONNET_MODEL_ID}"}}"#);
+        let event = translate_claude_event(&line).unwrap();
         match event {
             StreamEvent::Init {
                 executor_type,
@@ -623,7 +624,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(executor_type, "claude");
-                assert_eq!(model.as_deref(), Some("claude-sonnet-4-20250514"));
+                assert_eq!(model.as_deref(), Some(CLAUDE_SONNET_MODEL_ID));
                 assert_eq!(session_id.as_deref(), Some("abc123"));
             }
             _ => panic!("Expected Init event"),
@@ -735,10 +736,12 @@ not json
         let dir = TempDir::new().unwrap();
         let raw_path = dir.path().join("raw_stream.jsonl");
 
-        let content = r#"{"type":"system","session_id":"s1","model":"claude-sonnet-4-20250514"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":100,"output_tokens":50}}}
-{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":50}}
-"#;
+        let content = format!(
+            r#"{{"type":"system","session_id":"s1","model":"{CLAUDE_SONNET_MODEL_ID}"}}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}
+{{"type":"result","total_cost_usd":0.01,"usage":{{"input_tokens":100,"output_tokens":50}}}}
+"#
+        );
         std::fs::write(&raw_path, content).unwrap();
 
         let (events, offset) = translate_claude_stream(&raw_path, 0).unwrap();
