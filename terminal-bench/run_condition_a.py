@@ -343,6 +343,8 @@ executor = "native"
 model = "{model}"
 worktree_isolation = false
 agent_timeout = "30m"
+max_verify_failures = 0
+max_spawn_failures = 0
 
 [agent]
 model = "{model}"

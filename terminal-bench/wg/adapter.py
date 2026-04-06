@@ -212,6 +212,8 @@ async def _write_trial_wg_config(
         f'executor = "native"',
         f'model = "{model}"',
         f'worktree_isolation = false',
+        "max_verify_failures = 0",
+        "max_spawn_failures = 0",
         "",
         "[agent]",
         f'model = "{model}"',

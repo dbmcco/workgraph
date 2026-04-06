@@ -466,6 +466,8 @@ async def run_trial(
             'executor = "native"',
             f'model = "{model}"',
             "worktree_isolation = false",
+            "max_verify_failures = 0",
+            "max_spawn_failures = 0",
             "",
             "[agent]",
             f'model = "{model}"',
