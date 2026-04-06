@@ -1532,8 +1532,8 @@ fn main() -> Result<()> {
             },
         },
         Commands::Profile { command } => match command {
-            ProfileCommands::Set { name } => {
-                commands::profile_cmd::set(&workgraph_dir, &name)
+            ProfileCommands::Set { name, fast, standard, premium } => {
+                commands::profile_cmd::set(&workgraph_dir, &name, fast.as_deref(), standard.as_deref(), premium.as_deref())
             }
             ProfileCommands::Show => {
                 commands::profile_cmd::show(&workgraph_dir, cli.json)

@@ -12,7 +12,17 @@ use workgraph::profile;
 const RANKED_TIERS_FILE: &str = "profile_ranked_tiers.json";
 
 /// Set the active provider profile.
-pub fn set(dir: &Path, name: &str) -> Result<()> {
+///
+/// If `fast`, `standard`, or `premium` are provided, those tiers are pinned
+/// to the specified model IDs in the `[tiers]` config section. This lets
+/// users override the dynamic or static defaults without editing config.toml.
+pub fn set(
+    dir: &Path,
+    name: &str,
+    fast: Option<&str>,
+    standard: Option<&str>,
+    premium: Option<&str>,
+) -> Result<()> {
     // Validate the profile name
     let prof = profile::get_profile(name).ok_or_else(|| {
         let available: Vec<&str> = profile::builtin_profiles().iter().map(|p| p.name).collect();
@@ -23,12 +33,17 @@ pub fn set(dir: &Path, name: &str) -> Result<()> {
         )
     })?;
 
+    let has_tier_pins = fast.is_some() || standard.is_some() || premium.is_some();
+
     let mut config = Config::load_merged(dir)?;
     config.profile = Some(name.to_string());
 
-    if prof.is_dynamic() {
-        // Dynamic profile: load registry, rank models, auto-configure tiers.
+    if prof.is_dynamic() && !has_tier_pins {
+        // Dynamic profile without manual pins: load registry, rank models, auto-configure.
         let ranked = auto_configure_dynamic(dir, &mut config)?;
+
+        // Apply any explicit tier pins on top of auto-configured tiers
+        apply_tier_pins(&mut config, fast, standard, premium);
         config.save(dir)?;
 
         println!("Profile set: {} (dynamic — auto-configured from registry)", name);
@@ -37,23 +52,38 @@ pub fn set(dir: &Path, name: &str) -> Result<()> {
         print_tier_selection("standard", &ranked.standard, config.tiers.standard.as_deref());
         print_tier_selection("premium", &ranked.premium, config.tiers.premium.as_deref());
     } else {
+        // Static profile, or dynamic with explicit tier pins — apply pins directly.
+        apply_tier_pins(&mut config, fast, standard, premium);
         config.save(dir)?;
 
         println!("Profile set: {}", name);
-        if let Some(tiers) = prof.resolve_tiers() {
-            println!("  Resolved tier mappings:");
-            println!(
-                "    fast     → {}",
-                tiers.fast.as_deref().unwrap_or("(unset)")
-            );
-            println!(
-                "    standard → {}",
-                tiers.standard.as_deref().unwrap_or("(unset)")
-            );
-            println!(
-                "    premium  → {}",
-                tiers.premium.as_deref().unwrap_or("(unset)")
-            );
+        println!("  Tier mappings:");
+        let effective = config.effective_tiers_public();
+        println!(
+            "    fast     → {}",
+            effective.fast.as_deref().unwrap_or("(unset)")
+        );
+        println!(
+            "    standard → {}",
+            effective.standard.as_deref().unwrap_or("(unset)")
+        );
+        println!(
+            "    premium  → {}",
+            effective.premium.as_deref().unwrap_or("(unset)")
+        );
+
+        if has_tier_pins {
+            println!();
+            println!("  Pinned tiers:");
+            if let Some(f) = fast {
+                println!("    fast     = {}", f);
+            }
+            if let Some(s) = standard {
+                println!("    standard = {}", s);
+            }
+            if let Some(p) = premium {
+                println!("    premium  = {}", p);
+            }
         }
     }
 
@@ -62,6 +92,24 @@ pub fn set(dir: &Path, name: &str) -> Result<()> {
     println!("  Run `wg profile show` for full details.");
 
     Ok(())
+}
+
+/// Apply explicit tier pins to config.tiers.
+fn apply_tier_pins(
+    config: &mut Config,
+    fast: Option<&str>,
+    standard: Option<&str>,
+    premium: Option<&str>,
+) {
+    if let Some(f) = fast {
+        config.tiers.fast = Some(f.to_string());
+    }
+    if let Some(s) = standard {
+        config.tiers.standard = Some(s.to_string());
+    }
+    if let Some(p) = premium {
+        config.tiers.premium = Some(p.to_string());
+    }
 }
 
 /// Auto-configure a dynamic profile from the benchmark registry.

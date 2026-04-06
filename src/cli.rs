@@ -2162,6 +2162,18 @@ pub enum ProfileCommands {
     Set {
         /// Profile name (e.g., anthropic, openrouter, openai)
         name: String,
+
+        /// Pin the fast tier to a specific model (e.g., openrouter:qwen/qwen3-coder)
+        #[arg(long)]
+        fast: Option<String>,
+
+        /// Pin the standard tier to a specific model (e.g., openrouter:deepseek/deepseek-r1)
+        #[arg(long)]
+        standard: Option<String>,
+
+        /// Pin the premium tier to a specific model (e.g., openrouter:qwen/qwen3-max)
+        #[arg(long)]
+        premium: Option<String>,
     },
     /// Show current profile and resolved model mappings
     Show,
