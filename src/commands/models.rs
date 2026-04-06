@@ -401,7 +401,10 @@ pub fn run_fetch(workgraph_dir: &Path, no_cache: bool) -> Result<()> {
                 {
                     new_model.benchmarks = existing_model.benchmarks.clone();
                 }
-                if existing_model.popularity.provider_count.is_some() {
+                if existing_model.popularity.provider_count.is_some()
+                    || existing_model.popularity.weekly_rank.is_some()
+                    || existing_model.popularity.request_count.is_some()
+                {
                     new_model.popularity = existing_model.popularity.clone();
                 }
             }
@@ -433,6 +436,21 @@ pub fn run_fetch(workgraph_dir: &Path, no_cache: bool) -> Result<()> {
         "  Saved to: {}/model_benchmarks.json",
         workgraph_dir.display()
     );
+
+    if scored_count == 0 {
+        eprintln!();
+        eprintln!(
+            "Warning: No models have benchmark scores. The dynamic profile (`wg profile set \
+             openrouter`) will not be able to rank models meaningfully."
+        );
+        eprintln!(
+            "  This can happen if no well-known models were found in the API response."
+        );
+        eprintln!(
+            "  Consider using a static profile (`wg profile set anthropic`) or adding \
+             scores manually."
+        );
+    }
 
     Ok(())
 }

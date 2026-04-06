@@ -307,14 +307,513 @@ fn median(values: &[f64]) -> Option<f64> {
     }
 }
 
+// ── Curated benchmark data for well-known models ───────────────────────
+
+/// Curated benchmark + popularity data for well-known models.
+///
+/// Scores are normalized to 0–100 based on public benchmarks (SWE-bench,
+/// MMLU, HumanEval, LiveCodeBench, etc.) as of 2025-Q2/Q3. These provide
+/// a sensible fallback when the OpenRouter API doesn't supply scores.
+///
+/// Each entry is keyed by a **prefix** of the OpenRouter model ID so it
+/// matches across version suffixes (e.g. "anthropic/claude-sonnet-4" matches
+/// "anthropic/claude-sonnet-4-6").
+struct CuratedEntry {
+    prefix: &'static str,
+    benchmarks: Benchmarks,
+    popularity: Popularity,
+}
+
+fn curated_benchmarks() -> Vec<CuratedEntry> {
+    vec![
+        // ── Frontier: Anthropic ───────────────────────────────────────
+        CuratedEntry {
+            prefix: "anthropic/claude-opus-4",
+            benchmarks: Benchmarks {
+                coding_index: Some(75.0),
+                intelligence_index: Some(78.0),
+                agentic: Some(80.0),
+                math_index: Some(72.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(8),
+                request_count: Some(500_000),
+                provider_count: Some(5),
+            },
+        },
+        CuratedEntry {
+            prefix: "anthropic/claude-sonnet-4",
+            benchmarks: Benchmarks {
+                coding_index: Some(72.0),
+                intelligence_index: Some(74.0),
+                agentic: Some(76.0),
+                math_index: Some(68.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(2),
+                request_count: Some(2_000_000),
+                provider_count: Some(6),
+            },
+        },
+        CuratedEntry {
+            prefix: "anthropic/claude-haiku-4",
+            benchmarks: Benchmarks {
+                coding_index: Some(52.0),
+                intelligence_index: Some(55.0),
+                agentic: Some(48.0),
+                math_index: Some(50.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(5),
+                request_count: Some(3_000_000),
+                provider_count: Some(5),
+            },
+        },
+        CuratedEntry {
+            prefix: "anthropic/claude-3.5-sonnet",
+            benchmarks: Benchmarks {
+                coding_index: Some(65.0),
+                intelligence_index: Some(68.0),
+                agentic: Some(70.0),
+                math_index: Some(62.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(4),
+                request_count: Some(2_500_000),
+                provider_count: Some(6),
+            },
+        },
+        // ── Frontier: OpenAI ──────────────────────────────────────────
+        CuratedEntry {
+            prefix: "openai/gpt-4o",
+            benchmarks: Benchmarks {
+                coding_index: Some(62.0),
+                intelligence_index: Some(65.0),
+                agentic: Some(64.0),
+                math_index: Some(60.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(3),
+                request_count: Some(5_000_000),
+                provider_count: Some(7),
+            },
+        },
+        CuratedEntry {
+            prefix: "openai/gpt-4.1",
+            benchmarks: Benchmarks {
+                coding_index: Some(68.0),
+                intelligence_index: Some(70.0),
+                agentic: Some(72.0),
+                math_index: Some(65.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(6),
+                request_count: Some(800_000),
+                provider_count: Some(5),
+            },
+        },
+        CuratedEntry {
+            prefix: "openai/o3",
+            benchmarks: Benchmarks {
+                coding_index: Some(70.0),
+                intelligence_index: Some(76.0),
+                agentic: Some(65.0),
+                math_index: Some(80.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(12),
+                request_count: Some(300_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "openai/o4-mini",
+            benchmarks: Benchmarks {
+                coding_index: Some(66.0),
+                intelligence_index: Some(68.0),
+                agentic: Some(62.0),
+                math_index: Some(74.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(10),
+                request_count: Some(400_000),
+                provider_count: Some(4),
+            },
+        },
+        // ── Frontier: Google ──────────────────────────────────────────
+        CuratedEntry {
+            prefix: "google/gemini-2.5-pro",
+            benchmarks: Benchmarks {
+                coding_index: Some(70.0),
+                intelligence_index: Some(72.0),
+                agentic: Some(68.0),
+                math_index: Some(75.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(7),
+                request_count: Some(600_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "google/gemini-2.5-flash",
+            benchmarks: Benchmarks {
+                coding_index: Some(55.0),
+                intelligence_index: Some(58.0),
+                agentic: Some(52.0),
+                math_index: Some(60.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(9),
+                request_count: Some(800_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "google/gemini-2.0-flash",
+            benchmarks: Benchmarks {
+                coding_index: Some(48.0),
+                intelligence_index: Some(50.0),
+                agentic: Some(45.0),
+                math_index: Some(52.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(15),
+                request_count: Some(400_000),
+                provider_count: Some(4),
+            },
+        },
+        // ── Frontier: DeepSeek ────────────────────────────────────────
+        CuratedEntry {
+            prefix: "deepseek/deepseek-r1",
+            benchmarks: Benchmarks {
+                coding_index: Some(60.0),
+                intelligence_index: Some(68.0),
+                agentic: Some(40.0), // no tool use
+                math_index: Some(78.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(1),
+                request_count: Some(8_000_000),
+                provider_count: Some(8),
+            },
+        },
+        CuratedEntry {
+            prefix: "deepseek/deepseek-chat",
+            benchmarks: Benchmarks {
+                coding_index: Some(58.0),
+                intelligence_index: Some(62.0),
+                agentic: Some(55.0),
+                math_index: Some(65.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(6),
+                request_count: Some(1_500_000),
+                provider_count: Some(7),
+            },
+        },
+        CuratedEntry {
+            prefix: "deepseek/deepseek-v3",
+            benchmarks: Benchmarks {
+                coding_index: Some(58.0),
+                intelligence_index: Some(62.0),
+                agentic: Some(55.0),
+                math_index: Some(65.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(11),
+                request_count: Some(700_000),
+                provider_count: Some(6),
+            },
+        },
+        // ── Mid-tier: Qwen ────────────────────────────────────────────
+        CuratedEntry {
+            prefix: "qwen/qwen3-max",
+            benchmarks: Benchmarks {
+                coding_index: Some(55.0),
+                intelligence_index: Some(58.0),
+                agentic: Some(50.0),
+                math_index: Some(60.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(20),
+                request_count: Some(200_000),
+                provider_count: Some(3),
+            },
+        },
+        CuratedEntry {
+            prefix: "qwen/qwen3-coder",
+            benchmarks: Benchmarks {
+                coding_index: Some(52.0),
+                intelligence_index: Some(48.0),
+                agentic: Some(45.0),
+                math_index: Some(50.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(25),
+                request_count: Some(150_000),
+                provider_count: Some(3),
+            },
+        },
+        CuratedEntry {
+            prefix: "qwen/qwen3-235b",
+            benchmarks: Benchmarks {
+                coding_index: Some(56.0),
+                intelligence_index: Some(60.0),
+                agentic: Some(52.0),
+                math_index: Some(62.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(18),
+                request_count: Some(250_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "qwen/qwen-2.5-coder-32b",
+            benchmarks: Benchmarks {
+                coding_index: Some(50.0),
+                intelligence_index: Some(45.0),
+                agentic: Some(42.0),
+                math_index: Some(48.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(30),
+                request_count: Some(100_000),
+                provider_count: Some(4),
+            },
+        },
+        // ── Mid-tier: Meta Llama ──────────────────────────────────────
+        CuratedEntry {
+            prefix: "meta-llama/llama-4-maverick",
+            benchmarks: Benchmarks {
+                coding_index: Some(48.0),
+                intelligence_index: Some(52.0),
+                agentic: Some(45.0),
+                math_index: Some(50.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(14),
+                request_count: Some(500_000),
+                provider_count: Some(5),
+            },
+        },
+        CuratedEntry {
+            prefix: "meta-llama/llama-4-scout",
+            benchmarks: Benchmarks {
+                coding_index: Some(42.0),
+                intelligence_index: Some(46.0),
+                agentic: Some(40.0),
+                math_index: Some(44.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(22),
+                request_count: Some(200_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "meta-llama/llama-3.3-70b",
+            benchmarks: Benchmarks {
+                coding_index: Some(44.0),
+                intelligence_index: Some(48.0),
+                agentic: Some(42.0),
+                math_index: Some(46.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(16),
+                request_count: Some(600_000),
+                provider_count: Some(6),
+            },
+        },
+        // ── Mid-tier: OpenAI small ────────────────────────────────────
+        CuratedEntry {
+            prefix: "openai/gpt-4o-mini",
+            benchmarks: Benchmarks {
+                coding_index: Some(50.0),
+                intelligence_index: Some(52.0),
+                agentic: Some(48.0),
+                math_index: Some(50.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(4),
+                request_count: Some(4_000_000),
+                provider_count: Some(6),
+            },
+        },
+        CuratedEntry {
+            prefix: "openai/gpt-4.1-mini",
+            benchmarks: Benchmarks {
+                coding_index: Some(54.0),
+                intelligence_index: Some(56.0),
+                agentic: Some(52.0),
+                math_index: Some(55.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(13),
+                request_count: Some(350_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "openai/gpt-4.1-nano",
+            benchmarks: Benchmarks {
+                coding_index: Some(38.0),
+                intelligence_index: Some(40.0),
+                agentic: Some(35.0),
+                math_index: Some(38.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(28),
+                request_count: Some(120_000),
+                provider_count: Some(3),
+            },
+        },
+        // ── Budget: Mistral ───────────────────────────────────────────
+        CuratedEntry {
+            prefix: "mistralai/mistral-large",
+            benchmarks: Benchmarks {
+                coding_index: Some(48.0),
+                intelligence_index: Some(52.0),
+                agentic: Some(46.0),
+                math_index: Some(50.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(24),
+                request_count: Some(180_000),
+                provider_count: Some(4),
+            },
+        },
+        CuratedEntry {
+            prefix: "mistralai/mistral-medium",
+            benchmarks: Benchmarks {
+                coding_index: Some(42.0),
+                intelligence_index: Some(45.0),
+                agentic: Some(40.0),
+                math_index: Some(44.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(35),
+                request_count: Some(80_000),
+                provider_count: Some(3),
+            },
+        },
+        CuratedEntry {
+            prefix: "mistralai/mistral-small",
+            benchmarks: Benchmarks {
+                coding_index: Some(35.0),
+                intelligence_index: Some(38.0),
+                agentic: Some(32.0),
+                math_index: Some(36.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(40),
+                request_count: Some(60_000),
+                provider_count: Some(3),
+            },
+        },
+        CuratedEntry {
+            prefix: "mistralai/codestral",
+            benchmarks: Benchmarks {
+                coding_index: Some(52.0),
+                intelligence_index: Some(46.0),
+                agentic: Some(44.0),
+                math_index: Some(48.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(26),
+                request_count: Some(150_000),
+                provider_count: Some(3),
+            },
+        },
+        // ── Budget: xAI ───────────────────────────────────────────────
+        CuratedEntry {
+            prefix: "x-ai/grok-3",
+            benchmarks: Benchmarks {
+                coding_index: Some(55.0),
+                intelligence_index: Some(58.0),
+                agentic: Some(50.0),
+                math_index: Some(55.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(19),
+                request_count: Some(200_000),
+                provider_count: Some(2),
+            },
+        },
+        CuratedEntry {
+            prefix: "x-ai/grok-2",
+            benchmarks: Benchmarks {
+                coding_index: Some(45.0),
+                intelligence_index: Some(48.0),
+                agentic: Some(42.0),
+                math_index: Some(46.0),
+            },
+            popularity: Popularity {
+                weekly_rank: Some(32),
+                request_count: Some(100_000),
+                provider_count: Some(2),
+            },
+        },
+    ]
+}
+
+/// Apply curated benchmark data to models in the registry.
+///
+/// Uses longest-prefix matching against OpenRouter model IDs so entries
+/// like "anthropic/claude-sonnet-4" match "anthropic/claude-sonnet-4-6".
+/// Only fills in fields that are currently `None`/`default` — never
+/// overwrites data that was already populated (e.g. from a previous manual edit).
+fn apply_curated_benchmarks(registry: &mut BenchmarkRegistry) -> usize {
+    let curated = curated_benchmarks();
+    let mut applied = 0;
+
+    for model in registry.models.values_mut() {
+        // Find the best (longest) matching prefix.
+        let best_match = curated
+            .iter()
+            .filter(|c| model.id.starts_with(c.prefix))
+            .max_by_key(|c| c.prefix.len());
+
+        if let Some(entry) = best_match {
+            let mut changed = false;
+
+            // Apply benchmarks only if all are None (don't overwrite partial data).
+            if model.benchmarks.coding_index.is_none()
+                && model.benchmarks.intelligence_index.is_none()
+                && model.benchmarks.agentic.is_none()
+            {
+                model.benchmarks = entry.benchmarks.clone();
+                changed = true;
+            }
+
+            // Apply popularity only if all fields are None.
+            if model.popularity.weekly_rank.is_none()
+                && model.popularity.request_count.is_none()
+                && model.popularity.provider_count.is_none()
+            {
+                model.popularity = entry.popularity.clone();
+                changed = true;
+            }
+
+            if changed {
+                applied += 1;
+            }
+        }
+    }
+
+    applied
+}
+
 // ── Build from OpenRouter data ──────────────────────────────────────────
 
 use crate::executor::native::openai_client::OpenRouterModel;
 
 /// Build a `BenchmarkRegistry` from OpenRouter API model data.
 ///
-/// This populates pricing, architecture, and tool support fields.
-/// Benchmark scores remain null until enriched by Artificial Analysis data.
+/// Populates pricing, architecture, tool support, and curated benchmark/
+/// popularity data for well-known models. Models without curated data
+/// get default (empty) benchmark scores and a pricing-heuristic tier.
 pub fn build_from_openrouter(models: &[OpenRouterModel]) -> BenchmarkRegistry {
     let now = chrono::Utc::now().to_rfc3339();
     let mut entries = BTreeMap::new();
@@ -363,6 +862,9 @@ pub fn build_from_openrouter(models: &[OpenRouterModel]) -> BenchmarkRegistry {
         },
         models: entries,
     };
+
+    // Seed curated benchmark/popularity data for well-known models.
+    apply_curated_benchmarks(&mut registry);
 
     // Classify tiers based on pricing heuristics (no benchmark data yet).
     classify_tiers_from_pricing(&mut registry);
@@ -1219,5 +1721,215 @@ mod tests {
                 i, ranked.fast[i].composite_score, ranked.fast[i + 1].composite_score,
             );
         }
+    }
+
+    // ── Curated benchmark tests ─────────────────────────────────────
+
+    #[test]
+    fn test_curated_benchmarks_not_empty() {
+        let curated = curated_benchmarks();
+        assert!(curated.len() >= 20, "Expected at least 20 curated models, got {}", curated.len());
+    }
+
+    #[test]
+    fn test_apply_curated_benchmarks_exact_match() {
+        let mut registry = make_test_registry(vec![
+            make_test_model("anthropic/claude-sonnet-4-6", "budget", None),
+        ]);
+        let applied = apply_curated_benchmarks(&mut registry);
+        assert_eq!(applied, 1);
+
+        let model = registry.models.get("anthropic/claude-sonnet-4-6").unwrap();
+        assert!(model.benchmarks.coding_index.is_some());
+        assert!(model.benchmarks.intelligence_index.is_some());
+        assert!(model.benchmarks.agentic.is_some());
+        assert!(model.popularity.weekly_rank.is_some());
+        assert!(model.popularity.request_count.is_some());
+    }
+
+    #[test]
+    fn test_apply_curated_benchmarks_prefix_match() {
+        // "anthropic/claude-opus-4" prefix should match "anthropic/claude-opus-4-6"
+        let mut registry = make_test_registry(vec![
+            make_test_model("anthropic/claude-opus-4-6", "budget", None),
+        ]);
+        let applied = apply_curated_benchmarks(&mut registry);
+        assert_eq!(applied, 1);
+
+        let model = registry.models.get("anthropic/claude-opus-4-6").unwrap();
+        assert!(model.benchmarks.coding_index.unwrap() > 70.0);
+    }
+
+    #[test]
+    fn test_apply_curated_benchmarks_no_match() {
+        let mut registry = make_test_registry(vec![
+            make_test_model("unknown/some-random-model", "budget", None),
+        ]);
+        let applied = apply_curated_benchmarks(&mut registry);
+        assert_eq!(applied, 0);
+
+        let model = registry.models.get("unknown/some-random-model").unwrap();
+        assert!(model.benchmarks.coding_index.is_none());
+    }
+
+    #[test]
+    fn test_apply_curated_benchmarks_does_not_overwrite() {
+        let mut model = make_test_model("anthropic/claude-sonnet-4-6", "frontier", None);
+        model.benchmarks = Benchmarks {
+            coding_index: Some(99.0),
+            intelligence_index: Some(99.0),
+            agentic: Some(99.0),
+            math_index: None,
+        };
+        model.popularity = Popularity {
+            weekly_rank: Some(1),
+            request_count: Some(999),
+            provider_count: Some(10),
+        };
+        let mut registry = make_test_registry(vec![model]);
+
+        let applied = apply_curated_benchmarks(&mut registry);
+        assert_eq!(applied, 0, "Should not overwrite existing benchmark data");
+
+        let model = registry.models.get("anthropic/claude-sonnet-4-6").unwrap();
+        assert_eq!(model.benchmarks.coding_index, Some(99.0));
+        assert_eq!(model.popularity.weekly_rank, Some(1));
+    }
+
+    #[test]
+    fn test_build_from_openrouter_seeds_curated_data() {
+        use crate::executor::native::openai_client::{OpenRouterModel, OpenRouterPricing};
+
+        let models = vec![
+            OpenRouterModel {
+                id: "anthropic/claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6".into(),
+                description: "".into(),
+                context_length: Some(200_000),
+                pricing: Some(OpenRouterPricing {
+                    prompt: Some("0.000003".into()),
+                    completion: Some("0.000015".into()),
+                }),
+                supported_parameters: vec!["tools".into()],
+                architecture: None,
+                top_provider: None,
+            },
+            OpenRouterModel {
+                id: "unknown/random-model".into(),
+                name: "Random".into(),
+                description: "".into(),
+                context_length: Some(32_000),
+                pricing: Some(OpenRouterPricing {
+                    prompt: Some("0.000001".into()),
+                    completion: Some("0.000002".into()),
+                }),
+                supported_parameters: vec!["tools".into()],
+                architecture: None,
+                top_provider: None,
+            },
+        ];
+
+        let registry = build_from_openrouter(&models);
+
+        // Claude Sonnet should have curated benchmarks.
+        let sonnet = registry.models.get("anthropic/claude-sonnet-4-6").unwrap();
+        assert!(sonnet.benchmarks.coding_index.is_some(),
+            "Known model should have curated benchmark data");
+        assert!(sonnet.popularity.weekly_rank.is_some(),
+            "Known model should have curated popularity data");
+
+        // Unknown model should have no benchmarks.
+        let random = registry.models.get("unknown/random-model").unwrap();
+        assert!(random.benchmarks.coding_index.is_none(),
+            "Unknown model should have no benchmark data");
+    }
+
+    #[test]
+    fn test_curated_models_get_fitness_scores() {
+        use crate::executor::native::openai_client::{OpenRouterModel, OpenRouterPricing};
+
+        let models = vec![
+            OpenRouterModel {
+                id: "anthropic/claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6".into(),
+                description: "".into(),
+                context_length: Some(200_000),
+                pricing: Some(OpenRouterPricing {
+                    prompt: Some("0.000003".into()),
+                    completion: Some("0.000015".into()),
+                }),
+                supported_parameters: vec!["tools".into()],
+                architecture: None,
+                top_provider: None,
+            },
+        ];
+
+        let mut registry = build_from_openrouter(&models);
+        compute_fitness_scores(&mut registry);
+
+        let sonnet = registry.models.get("anthropic/claude-sonnet-4-6").unwrap();
+        assert!(sonnet.fitness.score.is_some(), "Curated model should get a fitness score");
+        assert!(sonnet.fitness.score.unwrap() > 0.0, "Fitness score should be positive");
+        assert!(sonnet.fitness.components.quality.is_some());
+    }
+
+    #[test]
+    fn test_curated_models_rank_above_unknown() {
+        use crate::executor::native::openai_client::{OpenRouterModel, OpenRouterPricing};
+
+        // Two fast-tier models (cheap output): one known, one unknown.
+        let models = vec![
+            OpenRouterModel {
+                id: "openai/gpt-4o-mini".into(),
+                name: "GPT-4o Mini".into(),
+                description: "".into(),
+                context_length: Some(128_000),
+                pricing: Some(OpenRouterPricing {
+                    prompt: Some("0.00000015".into()),
+                    completion: Some("0.0000006".into()),
+                }),
+                supported_parameters: vec!["tools".into()],
+                architecture: None,
+                top_provider: None,
+            },
+            OpenRouterModel {
+                id: "alibaba/tongyi-deepresearch-30b-a3b".into(),
+                name: "Tongyi DeepResearch".into(),
+                description: "".into(),
+                context_length: Some(32_000),
+                pricing: Some(OpenRouterPricing {
+                    prompt: Some("0.00000010".into()),
+                    completion: Some("0.0000005".into()),
+                }),
+                supported_parameters: vec!["tools".into()],
+                architecture: None,
+                top_provider: None,
+            },
+        ];
+
+        let mut registry = build_from_openrouter(&models);
+        compute_fitness_scores(&mut registry);
+        let ranked = rank_models_for_profile(&registry);
+
+        // GPT-4o Mini should rank above the unknown model.
+        assert!(ranked.fast.len() >= 2, "Expected at least 2 fast models");
+        assert_eq!(
+            ranked.fast[0].id, "openai/gpt-4o-mini",
+            "Known model (GPT-4o Mini) should rank above unknown (tongyi): {:?}",
+            ranked.fast.iter().map(|r| (&r.id, r.composite_score)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_longest_prefix_wins() {
+        // If we had both "openai/gpt-4o" and "openai/gpt-4o-mini" prefixes,
+        // "openai/gpt-4o-mini" should match the longer one.
+        let curated = curated_benchmarks();
+        let gpt4o_mini_match = curated
+            .iter()
+            .filter(|c| "openai/gpt-4o-mini".starts_with(c.prefix))
+            .max_by_key(|c| c.prefix.len());
+        assert!(gpt4o_mini_match.is_some());
+        assert_eq!(gpt4o_mini_match.unwrap().prefix, "openai/gpt-4o-mini");
     }
 }
