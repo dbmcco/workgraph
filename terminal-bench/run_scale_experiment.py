@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Full-scale parallel experiment runner: Condition A vs F (optionally G).
+Full-scale parallel experiment runner: Condition A vs G (optionally F).
 
-Runs all 18 custom tasks across conditions A, F, and optionally G with
+Runs all 18 custom tasks across conditions A, G, and optionally F with
 configurable replicas and concurrency. Supports resume after interruption,
 adaptive concurrency ramp-up, and automatic retry of operational failures.
 
 Condition A: bare agent (clean context, no wg tools).
-Condition F: full wg context injection (graph context, WG Quick Guide, wg CLI).
-Condition G: identical to F (historical ablation label, kept for compatibility).
+Condition G: context-only — wg context injection (graph context, WG Quick Guide, wg CLI), no surveillance.
+Condition F: full wg-native with surveillance loops (historical; 0 activations in 95 pilot trials).
 
 Design: terminal-bench/docs/scale-experiment-design.md
 
@@ -842,7 +842,7 @@ async def run_trial_condition_f(
     timeout: float = DEFAULT_TIMEOUT,
     condition_label: str = "F",
 ) -> dict:
-    """Run a single Condition F/G trial: wg-native + graph context, no surveillance."""
+    """Run a single Condition G (or F) trial: wg context injection + graph context, no surveillance."""
     task_id = task_def["id"]
     work_task_id = f"work-{task_id}"
 
@@ -1473,10 +1473,10 @@ async def run_experiment(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Full-scale parallel experiment: Condition A vs F (vs G)"
+        description="Full-scale parallel experiment: Condition A vs G (optionally F)"
     )
-    parser.add_argument("--conditions", type=str, default="A,F",
-                        help="Comma-separated conditions to test (default: A,F)")
+    parser.add_argument("--conditions", type=str, default="A,G",
+                        help="Comma-separated conditions to test (default: A,G)")
     parser.add_argument("--replicas", type=int, default=DEFAULT_REPLICAS,
                         help=f"Replicas per task per condition (default: {DEFAULT_REPLICAS})")
     parser.add_argument("--tasks", type=str, default=None,
@@ -1507,7 +1507,7 @@ def main():
 
     # Smoke test overrides
     if args.smoke:
-        conditions = ["A", "F"]
+        conditions = ["A", "G"]
         task_names = ["file-ops", "text-processing", "debugging"]
         replicas = 1
         max_concurrent = 2

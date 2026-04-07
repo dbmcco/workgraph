@@ -9,18 +9,18 @@
 
 ## 1. Experiment Goals
 
-Run a **matched-set comparison** of Conditions A and F across the full Terminal-Bench task suite on a dedicated always-on server, producing statistically adequate data for a treatment-effect claim.
+Run a **matched-set comparison** of Conditions A and G across the full Terminal-Bench task suite on a dedicated always-on server, producing statistically adequate data for a treatment-effect claim.
 
 ### Primary hypothesis
-Workgraph context injection (Condition F) improves pass rates on coding tasks vs. bare agents (Condition A).
+Workgraph context injection (Condition G) improves pass rates on coding tasks vs. bare agents (Condition A).
 
 ### What the pilots proved and what remains open
 
 | Question | Pilot answer | What the full run must resolve |
 |----------|-------------|-------------------------------|
-| Does F outperform A on matched tasks? | Yes (4/8 tasks, 50 pp gap) | Replicate across all 89 TB 2.0 tasks |
+| Does context injection (F/G) outperform A on matched tasks? | Yes (4/8 tasks, 50 pp gap) | Replicate across all 89 TB 2.0 tasks with Condition G |
 | Is surveillance valuable? | No (0 activations in 95 trials) | Resolved: surveillance removed from F (see surveillance-audit.md) |
-| What is F's token overhead? | 3.5x per trial, but 3.6x more cost-effective per pass on matched tasks | Measure at full scale with varied difficulty |
+| What is G's token overhead? | Est. ~3.5x per trial (from F pilot), but 3.6x more cost-effective per pass on matched tasks | Measure at full scale with varied difficulty |
 | Is the effect robust across difficulty levels? | Unknown (only 8-task overlap) | Measure per-difficulty treatment effect |
 
 ---
@@ -32,17 +32,19 @@ Workgraph context injection (Condition F) improves pass rates on coding tasks vs
 | Condition | Label | Context scope | WG tools | Surveillance | Description |
 |-----------|-------|--------------|----------|-------------|-------------|
 | **A** | Bare agent | `clean` | No | No | Baseline: task description + verify command only |
-| **F** | Full wg-native | `graph` | Yes | No | Full treatment: graph context + WG Quick Guide + wg CLI |
+| **G** | Context-only | `graph` | Yes | No | Context injection without surveillance: graph context + WG Quick Guide + wg CLI |
 
-**Note:** Surveillance loops were removed from Condition F after the pilot showed 0 activations across 95 trials. All benefit came from context injection alone. Condition F is now purely about wg context injection. See `terminal-bench/docs/surveillance-audit.md` for the full analysis.
+The primary comparison is **A vs G** — does wg context injection improve pass rates over a bare agent?
 
-### Optional condition (historical)
+### Historical condition (reference)
 
 | Condition | Label | Context scope | WG tools | Surveillance | Description |
 |-----------|-------|--------------|----------|-------------|-------------|
-| **G** | Context-only | `graph` | Yes | **No** | Originally an ablation condition; now identical to F. Kept for label compatibility. |
+| **F** | Full wg-native | `graph` | Yes | Yes (designed) | Original full treatment with surveillance loops (0 activations in 95 pilot trials) |
 
-**Note:** With surveillance removed from F, Condition G is identical to F. The "which component drives the improvement" question from the pilot synthesis is resolved: it's context injection, not surveillance (0 activations in 95 pilot trials).
+**Condition F vs G:** Condition F was the original treatment condition, designed with surveillance loops (companion monitoring tasks, cycle edges, convergence detection). Pilot data showed 0 surveillance activations across 95 trials — all benefit came from context injection alone. Condition G formalizes this finding: it is F with surveillance infrastructure stripped out. The `tb-smoke-no-surv` smoke test confirmed G achieves 4/4 pass on a mixed-difficulty task set (file-ops, debugging, algorithm, build-cython-ext), matching F's pilot performance.
+
+**Prediction (from pilot synthesis):** G ≈ F in pass rate at ~2x lower token cost, since surveillance added 0 value but incurred token overhead. See `terminal-bench/docs/surveillance-audit.md` for the full analysis.
 
 ---
 
@@ -50,7 +52,7 @@ Workgraph context injection (Condition F) improves pass rates on coding tasks vs
 
 ### TB 2.0: 89 tasks (canonical set)
 
-Both A and F run the same 89 tasks from `terminal-bench@2.0`. This eliminates the task-set mismatch that invalidated the pilot aggregate comparison.
+Both A and G run the same 89 tasks from `terminal-bench@2.0`. This eliminates the task-set mismatch that invalidated the pilot aggregate comparison.
 
 **Execution path:** Host-native (`wg service start` + `wg native-exec`), not Harbor/Docker. Rationale:
 - All `run_*.py` scripts use this path and it's proven at pilot scale
@@ -73,9 +75,9 @@ Two approaches:
 | **B: Host-native adaptation** | High — 89 tasks to adapt | Medium — verify commands may differ | Some tasks may not run without Docker (e.g., `install-windows-3.11` needs QEMU in Docker) |
 | **C: Hybrid** — Harbor for container execution, native executor for LLM calls | Medium | High | Needs adapter changes |
 
-**Recommendation:** Use **Harbor path (approach A)** for the 89 TB 2.0 tasks. The `reproduce.sh` infrastructure already handles all 89 tasks with Docker containers and Harbor's built-in verifier. The key adaptation is injecting Condition F's context/tools into the Harbor agent class.
+**Recommendation:** Use **Harbor path (approach A)** for the 89 TB 2.0 tasks. The `reproduce.sh` infrastructure already handles all 89 tasks with Docker containers and Harbor's built-in verifier. The key adaptation is injecting Condition G's context/tools into the Harbor agent class.
 
-The existing `wg/adapter.py` already supports conditions A-F via `ConditionAAgent` through `ConditionFAgent` classes. Condition F needs the `graph` context scope and WG Quick Guide injected into the Harbor agent's system prompt.
+The existing `wg/adapter.py` already supports conditions A-F via `ConditionAAgent` through `ConditionFAgent` classes. A `ConditionGAgent` (or reuse of `ConditionFAgent` since G is F minus surveillance) needs the `graph` context scope and WG Quick Guide injected into the Harbor agent's system prompt.
 
 For the **18 custom tasks** (8 calibration + 10 hard benchmarks), continue using host-native execution as in the pilots — these already have proven verify commands.
 
@@ -139,11 +141,11 @@ Fallback:                     4 concurrent  — if rate-limit errors appear in P
 
 **Why 8, not 16:**
 - The pilot used 4 concurrent with no issues. Doubling to 8 is conservative.
-- Each trial spawns 1 agent (Condition A/F both use single-agent mode for TB tasks). So 8 concurrent trials = 8 concurrent API calls.
+- Each trial spawns 1 agent (Condition A/G both use single-agent mode for TB tasks). So 8 concurrent trials = 8 concurrent API calls.
 - If we add Condition G or increase to 16, we risk hitting undocumented OpenRouter limits.
 - 8 concurrent is sufficient to complete 890 trials in a reasonable time (see Section 8).
 
-**Agents per trial:** 1 for all conditions (A, F, G). The 8-agent condition from `run_condition_a.py` is a different experiment (multi-agent coordination). For A vs F comparison, both conditions use 1 agent per task to isolate the context-injection variable.
+**Agents per trial:** 1 for all conditions (A, G, F). The 8-agent condition from `run_condition_a.py` is a different experiment (multi-agent coordination). For the A vs G comparison, both conditions use 1 agent per task to isolate the context-injection variable.
 
 ### Ramp-up implementation
 
@@ -189,7 +191,7 @@ Build `run_scale_experiment.py` by composing proven components from existing run
 |-----------|--------|---------------------|
 | Trial isolation (temp dir + wg init + config) | `run_condition_a.py` | None — reuse as-is |
 | F condition setup (work task with graph context) | `run_pilot_f_89.py` | Extract as reusable function; surveillance removed |
-| Harbor integration (89 TB 2.0 tasks) | `reproduce.sh` + `wg/adapter.py` | Add condition F agent class to Harbor path |
+| Harbor integration (89 TB 2.0 tasks) | `reproduce.sh` + `wg/adapter.py` | Add condition G agent class to Harbor path (reuse ConditionFAgent) |
 | Metrics collection (`stream.jsonl` parsing) | `run_condition_a.py` | None — reuse as-is |
 | 3-layer verification | `run_condition_a.py` | None — reuse as-is |
 | Retry logic | `rerun_pilot_f_89_dns.py` | Generalize to any failure |
@@ -200,7 +202,7 @@ Build `run_scale_experiment.py` by composing proven components from existing run
 ```
 run_scale_experiment.py
 ├── Config (CLI args, trial manifest)
-│   ├── --conditions A,F [,G]
+│   ├── --conditions A,G [,F]
 │   ├── --replicas 5
 │   ├── --max-concurrent 8
 │   ├── --task-set tb2  (or custom, or both)
@@ -217,7 +219,7 @@ run_scale_experiment.py
 │   │   ├── Acquire semaphore
 │   │   ├── Dispatch to condition-specific runner
 │   │   │   ├── Condition A: bare agent (clean context)
-│   │   │   └── Condition F/G: wg-native (graph context + WG Quick Guide)
+│   │   │   └── Condition G/F: wg-native (graph context + WG Quick Guide)
 │   │   ├── Poll for completion (with timeout)
 │   │   ├── Collect metrics + verification
 │   │   ├── Write per-trial result to disk (crash-safe)
@@ -233,7 +235,7 @@ run_scale_experiment.py
 └── Results Collector
     ├── Per-trial JSON + workgraph state archive
     ├── Aggregate statistics (pass rate, tokens, time by condition/difficulty/task)
-    ├── Comparison report (A vs F, optionally vs G)
+    ├── Comparison report (A vs G, optionally vs F)
     └── Raw data export for external analysis
 ```
 
@@ -426,9 +428,9 @@ def preflight_checks():
 
 ### Per-trial costs (from pilots)
 
-| Metric | Condition A | Condition F | Source |
-|--------|-------------|-------------|--------|
-| Tokens/trial | ~204K | ~710K | pilot-a-89, pilot-f-89 |
+| Metric | Condition A | Condition G (est. from F pilot) | Source |
+|--------|-------------|----------------------------------|--------|
+| Tokens/trial | ~204K | ~710K (likely lower — no surveillance overhead) | pilot-a-89, pilot-f-89 |
 | Time/trial (mean) | ~240s (4 min) | ~304s (5 min) | pilot-a-89, pilot-f-89 |
 | Time/trial (max) | ~1800s (30 min) | ~1805s (30 min) | timeout cap |
 | Dollar cost/trial | $0.00 | $0.00 | M2.7 pricing ($0) |
@@ -444,11 +446,13 @@ def preflight_checks():
 | **Dollar cost (M2.7)** | ~$0 | M2.7 charges nothing on OpenRouter |
 | **Dollar cost (if priced at Sonnet rates, $3/$15 per M tok)** | ~$7.3K | For budget planning if model changes |
 
-### With Condition G (optional, identical to F — for historical comparison only)
+### With Condition F (optional, for historical comparison)
+
+If running Condition F alongside A and G for historical comparison:
 
 | Metric | Additional cost |
 |--------|----------------|
-| Tokens | ~316M (identical to F — no surveillance overhead in either) |
+| Tokens | ~316M (F includes surveillance infrastructure overhead, though it never activates) |
 | Time (8 concurrent) | ~4.2 hours |
 | Dollar cost (M2.7) | ~$0 |
 
@@ -472,7 +476,7 @@ terminal-bench/results/scale-run-{NNN}/
 ├── manifest.json                    # Trial manifest with randomized order + completion status
 ├── config.json                      # Run configuration (conditions, replicas, model, etc.)
 ├── summary.json                     # Aggregate results
-├── comparison.md                    # A vs F (vs G) comparison report
+├── comparison.md                    # A vs G (vs F) comparison report
 │
 ├── condition-A/
 │   ├── summary.json                 # Condition A aggregate
@@ -480,7 +484,7 @@ terminal-bench/results/scale-run-{NNN}/
 │   └── {task-id}-r{N}/
 │       └── workgraph_state/         # Preserved .workgraph for post-hoc analysis
 │
-├── condition-F/
+├── condition-G/
 │   ├── summary.json
 │   ├── {task-id}-r{N}.json
 │   └── {task-id}-r{N}/
@@ -499,10 +503,10 @@ terminal-bench/results/scale-run-{NNN}/
 
 ### Automated analysis (generated by runner)
 
-1. **Per-task Fisher exact test:** For each task, 2×2 table (pass/fail × A/F), compute p-value. Identify tasks with significant treatment effects.
+1. **Per-task Fisher exact test:** For each task, 2×2 table (pass/fail × A/G), compute p-value. Identify tasks with significant treatment effects.
 2. **Aggregate pass rates with Wilson CIs:** Overall, per-difficulty, per-category.
 3. **Token efficiency:** Tokens per pass (total tokens / passes) by condition.
-4. **Context overhead:** Token cost of wg context injection (F tokens vs A tokens per trial).
+4. **Context overhead:** Token cost of wg context injection (G tokens vs A tokens per trial).
 5. **Time distribution:** Per-condition, per-difficulty histograms.
 6. **Failure taxonomy:** Categorize failures as model-capability vs. operational.
 
@@ -510,12 +514,12 @@ terminal-bench/results/scale-run-{NNN}/
 
 | Question | Analysis |
 |----------|----------|
-| Does F improve pass rates overall? | Aggregate pass rate comparison, Fisher exact on pooled data |
-| On which tasks does F help most? | Per-task Fisher exact, rank by effect size |
-| Does F help on hard tasks more than easy ones? | Stratified analysis by difficulty |
-| What is the per-trial token overhead of context injection? | F tokens/trial vs A tokens/trial |
-| What is F's cost per additional pass? | (F_tokens - A_tokens) / (F_passes - A_passes) |
-| Does F ever hurt? | Count tasks where A outperforms F |
+| Does G improve pass rates overall? | Aggregate pass rate comparison, Fisher exact on pooled data |
+| On which tasks does G help most? | Per-task Fisher exact, rank by effect size |
+| Does G help on hard tasks more than easy ones? | Stratified analysis by difficulty |
+| What is the per-trial token overhead of context injection? | G tokens/trial vs A tokens/trial |
+| What is G's cost per additional pass? | (G_tokens - A_tokens) / (G_passes - A_passes) |
+| Does G ever hurt? | Count tasks where A outperforms G |
 
 ---
 
@@ -530,7 +534,7 @@ terminal-bench/results/scale-run-{NNN}/
 6. Smoke test: 3 tasks × 1 replica × 2 conditions = 6 trials
 
 ### Phase 2: TB 2.0 task adaptation
-1. For Harbor path: verify `ConditionFAgent` injects graph context correctly
+1. For Harbor path: verify `ConditionFAgent` (used for G) injects graph context correctly
 2. For host-native path: extract instructions and verify commands from 89 `task.toml` files
 3. Run 5-task smoke test through both paths
 
@@ -548,9 +552,8 @@ terminal-bench/results/scale-run-{NNN}/
 4. Run analysis pipeline
 5. Generate comparison report
 
-### Phase 5: Optional Condition G (historical)
-Note: With surveillance removed from F, Condition G is now identical to F.
-Running G is unnecessary unless comparing against historical pilot data that used the G label.
+### Phase 5: Optional Condition F (historical)
+Note: Condition G is now the primary treatment condition. Running Condition F alongside A and G is only necessary for historical comparison against pilot data that used the F label (with surveillance infrastructure). Since surveillance never activated, F and G produce identical outcomes in practice.
 
 ---
 
@@ -570,7 +573,7 @@ Running G is unnecessary unless comparing against historical pilot data that use
 
 ## 13. Open Decisions for Implementer
 
-1. **Harbor path vs. host-native for TB 2.0 tasks?** This design recommends Harbor, but the implementer should validate that `ConditionFAgent` can inject wg context into the Harbor agent loop. If not, host-native adaptation of all 89 tasks is needed (significant effort).
+1. **Harbor path vs. host-native for TB 2.0 tasks?** This design recommends Harbor, but the implementer should validate that `ConditionFAgent` (used for both F and G) can inject wg context into the Harbor agent loop. If not, host-native adaptation of all 89 tasks is needed (significant effort).
 
 2. **Should the 18 custom tasks be included?** They provide direct pilot-to-scale comparison but add implementation complexity (host-native path + `/tmp` mutex). Recommendation: include them as a separate task set that runs after the TB 2.0 set.
 

@@ -1,4 +1,4 @@
-# Terminal-Bench A vs F Experiment: Full Handoff Document
+# Terminal-Bench A vs G Experiment: Full Handoff Document
 
 **Date:** 2026-04-07
 **Status:** Ready to run
@@ -10,10 +10,10 @@
 
 ### What we're testing
 
-Does **workgraph context injection** (Condition F) improve coding task pass rates compared to a **bare agent** (Condition A)?
+Does **workgraph context injection** (Condition G) improve coding task pass rates compared to a **bare agent** (Condition A)?
 
 - **Condition A (Baseline):** An LLM agent receives only the task description and a verify command. No graph context, no `wg` tools.
-- **Condition F (Full wg-native):** The same LLM agent receives graph-scoped context, access to `wg` CLI tools, and a WG Quick Guide. No surveillance loop — pilot data showed 0 activations across 95 trials, so it was removed to simplify the experimental design.
+- **Condition G (Context-only):** The same LLM agent receives graph-scoped context, access to `wg` CLI tools, and a WG Quick Guide. No surveillance infrastructure — a clean context-injection-only condition formalized after pilot analysis showed surveillance added 0 value.
 
 Both conditions use the same model (`minimax/minimax-m2.7` via OpenRouter) and the same verification commands. The only variable is the scaffolding.
 
@@ -50,10 +50,14 @@ See `terminal-bench/docs/pilot-results-synthesis.md` for the complete pilot anal
 | Condition | Context scope | WG tools | Surveillance | Description |
 |-----------|--------------|----------|-------------|-------------|
 | **A** | `clean` | No | No | Bare agent: task description + verify command only |
-| **F** | `graph` | Yes | No | Full wg-native: graph context + WG Quick Guide + wg CLI |
-| **G** (optional) | `graph` | Yes | **No** | Historical ablation label — now identical to F |
+| **F** | `graph` | Yes | Yes (designed) | Full wg-native with surveillance loops (original design; 0 activations in 95 pilot trials) |
+| **G** | `graph` | Yes | No | Context-only: graph context + WG Quick Guide + wg CLI, no surveillance infrastructure |
 
-Run A and F. Condition G is kept for label compatibility but is functionally identical to F (surveillance was removed from F after 0 activations in 95 pilot trials).
+**Condition F vs G distinction:** Condition F was originally designed with surveillance loops (companion monitoring tasks, cycle edges, convergence logic). Pilot data showed 0 surveillance activations across 95 trials, leading to the hypothesis that context injection alone drives the benefit. Condition G formalizes this: it is Condition F with all surveillance infrastructure removed. The `tb-smoke-no-surv` smoke test confirmed G achieves 4/4 pass rate on a mixed-difficulty task set, matching F's pilot performance.
+
+**Primary comparison:** A vs G (bare agent vs context-only). Condition F is retained for historical reference and potential future surveillance experiments on harder task sets.
+
+**Prediction (from pilot synthesis):** G ≈ F in pass rate at ~2x lower token cost, since surveillance added 0 value but incurred token overhead.
 
 ### Task set
 
@@ -123,7 +127,7 @@ On matched tasks, F is **3.6x more cost-effective per pass** despite higher per-
 
 ### Surveillance value
 
-**Zero activations across 95 trials.** The surveillance loop was never triggered. All benefit came from context injection alone. Based on this evidence, surveillance was removed from Condition F for the full-scale experiment (see `terminal-bench/docs/surveillance-audit.md` for the detailed analysis).
+**Zero activations across 95 trials.** The surveillance loop was never triggered. All benefit came from context injection alone. Based on this evidence, surveillance was removed and the surveillance-free condition was formalized as **Condition G** (see `terminal-bench/docs/surveillance-audit.md` for the full analysis). Condition G is now the primary treatment condition for the full-scale experiment.
 
 ---
 
@@ -239,14 +243,14 @@ cd workgraph
 python3 terminal-bench/run_scale_experiment.py --smoke
 ```
 
-Expected output: 6 trials complete, progress bar, final summary showing pass rates for A and F.
+Expected output: 6 trials complete, progress bar, final summary showing pass rates for A and G.
 
 ### Full experiment
 
 ```bash
 cd workgraph
 
-# Default: 18 tasks x 5 replicas x 2 conditions (A,F) = 180 trials
+# Default: 18 tasks x 5 replicas x 2 conditions (A,G) = 180 trials
 python3 terminal-bench/run_scale_experiment.py
 ```
 
@@ -255,7 +259,7 @@ python3 terminal-bench/run_scale_experiment.py
 ```bash
 # Custom conditions, replicas, concurrency
 python3 terminal-bench/run_scale_experiment.py \
-  --conditions A,F \
+  --conditions A,G \
   --replicas 5 \
   --max-concurrent 8 \
   --initial-concurrent 4 \
@@ -269,9 +273,9 @@ python3 terminal-bench/run_scale_experiment.py \
   --tasks file-ops,debugging,algorithm \
   --replicas 3
 
-# Add Condition G (context-only, no surveillance)
+# Add Condition F (historical, with surveillance design)
 python3 terminal-bench/run_scale_experiment.py \
-  --conditions A,F,G \
+  --conditions A,G,F \
   --replicas 5
 
 # Custom results directory
@@ -286,7 +290,7 @@ python3 terminal-bench/run_scale_experiment.py --skip-preflight
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--conditions` | `A,F` | Comma-separated: A, F, G |
+| `--conditions` | `A,G` | Comma-separated: A, G, F |
 | `--replicas` | `5` | Replicas per task per condition |
 | `--tasks` | all 18 | Comma-separated task IDs to run |
 | `--max-concurrent` | `8` | Max parallel trials (after ramp-up) |
@@ -373,13 +377,13 @@ terminal-bench/results/scale-run-001/
 ├── manifest.json                    # Trial manifest with completion status
 ├── config.json                      # Run configuration
 ├── summary.json                     # Aggregate results (main output)
-├── comparison.md                    # A vs F markdown comparison report
+├── comparison.md                    # A vs G markdown comparison report
 │
 ├── condition-A/
 │   └── summary.json                 # Condition A aggregate stats
 │
-├── condition-F/
-│   └── summary.json                 # Condition F aggregate stats
+├── condition-G/
+│   └── summary.json                 # Condition G aggregate stats
 │
 ├── condA-file-ops-r0.json          # Per-trial result files
 ├── condA-file-ops-r1.json
@@ -401,8 +405,8 @@ terminal-bench/results/scale-run-001/
 | `comparison.md` | Human-readable markdown report: overall table, per-difficulty, per-task |
 | `manifest.json` | Trial manifest with randomized order and completion status (used for resume) |
 | `config.json` | Run configuration for reproducibility |
-| `cond{A,F}-{task}-r{N}.json` | Individual trial result: status, timing, token metrics, verify output |
-| `condition-{A,F}/summary.json` | Per-condition aggregate statistics |
+| `cond{A,G}-{task}-r{N}.json` | Individual trial result: status, timing, token metrics, verify output |
+| `condition-{A,G}/summary.json` | Per-condition aggregate statistics |
 
 ### Generating the comparison report
 
@@ -612,19 +616,23 @@ auto_assign = false
 auto_evaluate = false
 ```
 
-### Condition F (Full wg-native)
+### Condition F (Full wg-native — historical/reference)
+
+**Note:** Condition F is the original treatment design from the pilots. It included surveillance loops that never activated (0/95 trials). Condition G (below) is the formalized replacement for the full-scale experiment.
 
 The agent receives:
 - Task title, description, and the WG Quick Guide
 - Graph-scoped context (sees the dependency graph)
 - Access to `wg` CLI tools (log, artifact, show, list, done, fail, add)
+- Surveillance infrastructure (companion monitoring tasks, cycle edges, convergence logic) — **never activated in pilot data**
 
-Task graph per trial:
+Task graph per trial (original design):
 ```
 WORK (main task with --verify gate)
+└── SURVEILLANCE (companion monitor, cycle with WORK)
 ```
 
-No surveillance loop — pilot data showed 0 activations across 95 trials. All benefit came from context injection alone.
+In practice, since surveillance never fired, the runtime behavior was identical to Condition G. The pilot F data remains valid for comparison purposes — it demonstrates context injection effectiveness.
 
 Config written per trial:
 ```toml
@@ -644,9 +652,42 @@ auto_assign = false
 auto_evaluate = false
 ```
 
-### Condition G (Context-only, historical)
+### Condition G (Context-only)
 
-Identical to F. Originally planned as an ablation (context without surveillance), but surveillance was removed from F after pilot analysis showed it provided no value. Kept as a label for compatibility with any prior references.
+Condition G is wg context injection without surveillance infrastructure. It is the condition that the `tb-smoke-no-surv` smoke test validated (4/4 pass on file-ops, debugging, algorithm, build-cython-ext using M2.7).
+
+The agent receives:
+- Task title, description, and the WG Quick Guide
+- Graph-scoped context (sees the dependency graph)
+- Access to `wg` CLI tools (log, artifact, show, list, done, fail, add)
+- **No surveillance loop, no companion tasks, no cycle edges**
+
+Config is identical to Condition F except no surveillance infrastructure is created:
+```toml
+[coordinator]
+max_agents = 1
+executor = "native"
+model = "openrouter:minimax/minimax-m2.7"
+worktree_isolation = false
+
+[agent]
+model = "openrouter:minimax/minimax-m2.7"
+context_scope = "graph"
+exec_mode = "full"
+
+[agency]
+auto_assign = false
+auto_evaluate = false
+```
+
+Task graph per trial:
+```
+WORK (main task with --verify gate)
+```
+
+**Distinction from F:** Condition F's original design included surveillance tasks (a companion monitor task in a cycle with the work task, convergence detection, self-healing logic). Condition G removes all of this. In practice, since surveillance never activated in F's pilot trials, G produces identical outcomes — but the experimental design is cleaner and the token cost is lower (~2x predicted savings from eliminating surveillance overhead).
+
+**Historical note:** Originally proposed as a hypothetical ablation condition in the pilot synthesis ("Condition G: context without surveillance"). Formalized after `tb-smoke-no-surv` confirmed the stripped runner works correctly.
 
 ---
 
