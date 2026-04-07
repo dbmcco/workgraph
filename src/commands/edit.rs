@@ -34,6 +34,7 @@ pub fn run(
     delay: Option<&str>,
     not_before: Option<&str>,
     verify: Option<&str>,
+    allow_phantom: bool,
 ) -> Result<()> {
     let path = graph_path(dir);
 
@@ -77,6 +78,29 @@ pub fn run(
         return false;
     }
 
+    // Validate add-after dependencies before taking mutable borrow (phantom edge prevention)
+    if !allow_phantom {
+        for dep in add_after {
+            if workgraph::federation::parse_remote_ref(dep).is_some() {
+                continue;
+            }
+            if graph.get_node(dep).is_none() {
+                let mut msg = format!("Dependency '{}' does not exist.", dep);
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(dep, all_ids.iter().copied(), 3)
+                {
+                    msg.push_str(&format!("\n  → Did you mean '{}'?", suggestion));
+                }
+                msg.push_str(
+                    "\n  Hint: Use --allow-phantom to allow forward references.",
+                );
+                error = Some(anyhow::anyhow!("{}", msg));
+                return false;
+            }
+        }
+    }
+
     // Modify the task in a block so the mutable borrow is released afterwards
     {
         let task = match graph.get_task_mut(task_id) {
@@ -107,7 +131,7 @@ pub fn run(
             changed = true;
         }
 
-        // Add after dependencies
+        // Add after dependencies (already validated above)
         for dep in add_after {
             if !task.after.contains(dep) {
                 task.after.push(dep.clone());
@@ -535,6 +559,7 @@ mod tests {
             &[],
             None,
             None,
+            true, // allow_phantom: test graph uses phantom deps
         )?;
 
         Ok(())
@@ -578,6 +603,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )?;
 
         crate::commands::add::run(
@@ -612,6 +638,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )?;
 
         Ok(())
@@ -647,6 +674,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -686,6 +714,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -725,6 +754,7 @@ mod tests {
             None,
             None,
             None,
+            true, // allow_phantom: dep2 doesn't exist in test graph
         );
         assert!(result.is_ok());
 
@@ -765,6 +795,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -804,6 +835,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -844,6 +876,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -883,6 +916,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -922,6 +956,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -962,6 +997,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -1001,6 +1037,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -1036,6 +1073,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -1070,6 +1108,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         assert!(
@@ -1111,6 +1150,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -1156,6 +1196,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1185,6 +1226,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 
@@ -1239,6 +1281,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1301,6 +1344,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1344,6 +1388,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -1382,6 +1427,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
 

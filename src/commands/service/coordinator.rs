@@ -5624,6 +5624,7 @@ mod tests {
             None,  // delay
             None,  // not_before
             None,  // verify
+            false, // allow_phantom
         )
         .unwrap();
 

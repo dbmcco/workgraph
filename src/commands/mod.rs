@@ -258,6 +258,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -302,6 +303,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -330,6 +332,7 @@ mod provenance_coverage_tests {
             None,
             None,
             None, // verify
+            false, // allow_phantom
         )
         .unwrap();
 
@@ -377,6 +380,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -428,6 +432,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -473,6 +478,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -518,6 +524,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -563,6 +570,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -611,6 +619,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -661,6 +670,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -711,6 +721,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
         super::done::run(dir, "prov-archive", false, false).unwrap();
@@ -758,6 +769,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
         super::fail::run(dir, "prov-gc", Some("oops")).unwrap();
@@ -808,6 +820,7 @@ mod provenance_coverage_tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
         // edit
@@ -836,6 +849,7 @@ mod provenance_coverage_tests {
             None,
             None,
             None, // verify
+            false, // allow_phantom
         )
         .unwrap();
         // pause

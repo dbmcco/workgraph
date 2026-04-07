@@ -166,6 +166,10 @@ pub enum Commands {
         /// Absolute timestamp before which task won't be dispatched (ISO 8601)
         #[arg(long = "not-before")]
         not_before: Option<String>,
+
+        /// Allow phantom (forward-reference) dependencies without error
+        #[arg(long = "allow-phantom")]
+        allow_phantom: bool,
     },
 
     /// Edit an existing task
@@ -265,6 +269,10 @@ pub enum Commands {
         /// Set or update the verify command (shell command that must pass before done)
         #[arg(long)]
         verify: Option<String>,
+
+        /// Allow phantom (forward-reference) dependencies without error
+        #[arg(long = "allow-phantom")]
+        allow_phantom: bool,
     },
 
     /// Mark a task as done

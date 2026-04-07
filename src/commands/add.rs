@@ -143,6 +143,7 @@ pub fn run(
     place_before: &[String],
     delay: Option<&str>,
     not_before: Option<&str>,
+    allow_phantom: bool,
 ) -> Result<()> {
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
@@ -347,16 +348,31 @@ pub fn run(
         if workgraph::federation::parse_remote_ref(blocker_id).is_some() {
             // Cross-repo dependency — validated at resolution time, not here
         } else if graph.get_node(blocker_id).is_none() {
-            eprintln!(
-                "Warning: blocker '{}' does not exist yet (will be treated as unresolved until created)",
-                blocker_id
-            );
-            // Suggest fuzzy match if a close task ID exists
-            let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
-            if let Some((suggestion, _)) =
-                workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
-            {
-                eprintln!("  → Did you mean '{}'?", suggestion);
+            if paused || allow_phantom {
+                // Deferred validation: paused tasks validate at publish time,
+                // --allow-phantom is an explicit opt-in for forward references
+                eprintln!(
+                    "Warning: dependency '{}' does not exist yet (will be validated at publish time)",
+                    blocker_id
+                );
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
+                {
+                    eprintln!("  → Did you mean '{}'?", suggestion);
+                }
+            } else {
+                // Strict validation: hard error for non-paused tasks
+                let mut msg = format!("Dependency '{}' does not exist.", blocker_id);
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
+                {
+                    msg.push_str(&format!("\n  → Did you mean '{}'?", suggestion));
+                }
+                msg.push_str("\n  Hint: Use --paused to defer validation, or --allow-phantom to allow forward references.");
+                error = Some(anyhow::anyhow!("{}", msg));
+                return false;
             }
         }
     }
@@ -455,6 +471,24 @@ pub fn run(
                 && !new_task.before.contains(dep_id)
             {
                 new_task.before.push(dep_id.clone());
+            }
+        }
+    }
+
+    // Retroactive backlink repair: if any existing task references the newly
+    // created task in its `after` list (a previously-phantom edge), add the
+    // missing `before` backlink on the new task to restore bidirectional consistency.
+    {
+        let referencing_ids: Vec<String> = graph
+            .tasks()
+            .filter(|t| t.id != task_id && t.after.contains(&task_id))
+            .map(|t| t.id.clone())
+            .collect();
+        for ref_id in referencing_ids {
+            if let Some(new_task) = graph.get_task_mut(&task_id) {
+                if !new_task.before.contains(&ref_id) {
+                    new_task.before.push(ref_id);
+                }
             }
         }
     }
@@ -1176,6 +1210,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -1222,6 +1257,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -1268,6 +1304,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         assert!(
@@ -1280,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn nonexistent_blocker_warns_but_succeeds() {
+    fn nonexistent_blocker_rejected_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
         std::fs::create_dir_all(dir_path).unwrap();
@@ -1288,7 +1325,7 @@ mod tests {
         let graph = WorkGraph::new();
         workgraph::parser::save_graph(&graph, &path).unwrap();
 
-        // Should succeed (with a warning to stderr) — nonexistent blockers are allowed
+        // Should fail by default — strict validation rejects phantom dependencies
         let result = run(
             dir_path,
             "My task",
@@ -1321,6 +1358,108 @@ mod tests {
             &[],
             None,
             None,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist"),
+            "Expected 'does not exist' error for phantom dependency"
+        );
+    }
+
+    #[test]
+    fn nonexistent_blocker_allowed_with_allow_phantom() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+        let graph = WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        // Should succeed with --allow-phantom
+        let result = run(
+            dir_path,
+            "My task",
+            None,
+            None,
+            &["nonexistent".to_string()],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            false,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            true, // allow_phantom
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn nonexistent_blocker_allowed_when_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+        let graph = WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        // Should succeed with paused=true (deferred validation)
+        let result = run(
+            dir_path,
+            "My task",
+            None,
+            None,
+            &["nonexistent".to_string()],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            true, // paused
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            false, // allow_phantom=false, but paused=true defers validation
         );
         assert!(result.is_ok());
     }
@@ -1371,6 +1510,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         );
         assert!(result.is_ok());
 

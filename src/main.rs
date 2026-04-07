@@ -329,6 +329,7 @@ fn main() -> Result<()> {
             place_before,
             delay,
             not_before,
+            allow_phantom,
         } => {
             // Determine effective paused/unplaced state:
             // - --paused always pauses (user-managed draft, skips placement)
@@ -396,6 +397,7 @@ fn main() -> Result<()> {
                     &place_before,
                     delay.as_deref(),
                     not_before.as_deref(),
+                    allow_phantom,
                 )
             }
         }
@@ -423,6 +425,7 @@ fn main() -> Result<()> {
             delay,
             not_before,
             verify,
+            allow_phantom,
         } => commands::edit::run(
             &workgraph_dir,
             &id,
@@ -448,6 +451,7 @@ fn main() -> Result<()> {
             delay.as_deref(),
             not_before.as_deref(),
             verify.as_deref(),
+            allow_phantom,
         ),
         Commands::Done {
             id,

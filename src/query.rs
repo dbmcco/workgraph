@@ -428,6 +428,17 @@ pub fn after<'a>(graph: &'a WorkGraph, task_id: &str) -> Vec<&'a Task> {
         .collect()
 }
 
+/// Return dependency IDs that don't resolve to any task in the graph (phantom edges).
+/// Excludes cross-repo remote references, which are validated at resolution time.
+pub fn phantom_blockers(task: &Task, graph: &WorkGraph) -> Vec<String> {
+    task.after
+        .iter()
+        .filter(|id| graph.get_task(id).is_none())
+        .filter(|id| crate::federation::parse_remote_ref(id).is_none())
+        .cloned()
+        .collect()
+}
+
 /// Calculate total cost of a task and all its transitive dependencies
 pub fn cost_of(graph: &WorkGraph, task_id: &str) -> f64 {
     let mut visited = std::collections::HashSet::new();

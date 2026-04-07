@@ -221,6 +221,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -256,6 +257,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -291,6 +293,7 @@ mod tests {
             &[],
             None,
             None,
+            false,
         )
         .unwrap();
     }
