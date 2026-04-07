@@ -1343,13 +1343,26 @@ fn main() -> Result<()> {
             dry_run,
             set,
             clear,
+            shell,
+            worktree,
+            no_worktree: _,
+            model,
         } => {
             if let Some(cmd) = set {
                 commands::exec::set_exec(&workgraph_dir, &task, &cmd)
             } else if clear {
                 commands::exec::clear_exec(&workgraph_dir, &task)
-            } else {
+            } else if shell {
                 commands::exec::run(&workgraph_dir, &task, actor.as_deref(), dry_run)
+            } else {
+                commands::exec::run_interactive(
+                    &workgraph_dir,
+                    &task,
+                    actor.as_deref(),
+                    dry_run,
+                    worktree,
+                    model.as_deref(),
+                )
             }
         }
         Commands::Agent { command } => match command {

@@ -11,7 +11,7 @@
 //! 5. Prints agent info (ID, PID, output file)
 //! 6. Returns immediately (doesn't wait for completion)
 
-mod context;
+pub(crate) mod context;
 mod execution;
 pub(crate) mod worktree;
 

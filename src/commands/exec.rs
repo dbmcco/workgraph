@@ -1,9 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
+use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::modify_graph;
+use workgraph::parser::{load_graph, modify_graph};
+use workgraph::service::executor::{build_prompt, TemplateVars};
+
+use super::spawn::context::{
+    build_scope_context, build_task_context, discover_test_files, format_test_discovery_context,
+    resolve_task_scope,
+};
+use super::spawn::worktree;
 
 #[cfg(test)]
 use super::graph_path;
@@ -148,6 +157,353 @@ pub fn run(dir: &Path, task_id: &str, actor: Option<&str>, dry_run: bool) -> Res
         println!("Task '{}' completed successfully", task_id);
     } else {
         anyhow::bail!("Task '{}' failed with exit code {}", task_id, exit_code);
+    }
+
+    Ok(())
+}
+
+/// Drop into an interactive agent session for a task.
+///
+/// Replicates the spawned-agent experience: same context, same env vars,
+/// but human-driven via an interactive executor session.
+pub fn run_interactive(
+    dir: &Path,
+    task_id: &str,
+    actor: Option<&str>,
+    dry_run: bool,
+    use_worktree: bool,
+    model: Option<&str>,
+) -> Result<()> {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    let graph = load_graph(&path).context("Failed to load graph")?;
+    let task = graph.get_task_or_err(task_id)?;
+
+    // Validate task status
+    match task.status {
+        Status::Open | Status::Blocked => {}
+        Status::InProgress => {
+            // Allow re-entering an in-progress task (the user might be resuming)
+            eprintln!(
+                "Note: task '{}' is already in-progress (assigned: {})",
+                task_id,
+                task.assigned.as_deref().unwrap_or("none")
+            );
+        }
+        Status::Done => anyhow::bail!("Task '{}' is already done", task_id),
+        Status::Failed => {
+            anyhow::bail!("Task '{}' is failed. Use 'wg retry' first.", task_id)
+        }
+        Status::Abandoned => anyhow::bail!("Task '{}' is abandoned", task_id),
+        Status::Waiting => anyhow::bail!("Task '{}' is waiting", task_id),
+        Status::PendingValidation => {
+            anyhow::bail!("Task '{}' is pending validation", task_id)
+        }
+    }
+
+    // Resolve config + context scope
+    let config = Config::load_or_default(dir);
+    let scope = resolve_task_scope(task, &config, dir);
+
+    // Build context from dependencies
+    let task_context = build_task_context(&graph, task);
+
+    // Build scope context
+    let mut scope_ctx = build_scope_context(&graph, task, scope, &config, dir);
+
+    // Inject test discovery
+    let project_root = dir
+        .canonicalize()
+        .ok()
+        .and_then(|abs| abs.parent().map(|p| p.to_path_buf()));
+    if let Some(ref root) = project_root {
+        let test_files = discover_test_files(root);
+        if !test_files.is_empty() {
+            scope_ctx.discovered_tests = format_test_discovery_context(&test_files);
+        }
+    }
+
+    // Build template vars
+    let mut vars = TemplateVars::from_task(task, Some(&task_context), Some(dir));
+
+    // Detect failed dependencies for triage mode
+    let mut failed_deps_lines = Vec::new();
+    for dep_id in &task.after {
+        if let Some(dep_task) = graph.get_task(dep_id) {
+            if dep_task.status == Status::Failed {
+                let reason = dep_task.failure_reason.as_deref().unwrap_or("unknown");
+                failed_deps_lines.push(format!(
+                    "- {}: \"{}\" — Reason: {}",
+                    dep_id, dep_task.title, reason
+                ));
+            }
+        }
+    }
+    if !failed_deps_lines.is_empty() {
+        vars.has_failed_deps = true;
+        vars.failed_deps_info = failed_deps_lines.join("\n");
+    }
+
+    // Override model if specified
+    if let Some(m) = model {
+        vars.model = m.to_string();
+    }
+
+    // Assemble the prompt
+    let prompt = build_prompt(&vars, scope, &scope_ctx);
+
+    // Build env vars map (same as spawned agents)
+    let user = workgraph::current_user();
+    let agent_label = actor.unwrap_or(&user);
+    let mut env_vars: Vec<(String, String)> = vec![
+        ("WG_TASK_ID".into(), task_id.to_string()),
+        ("WG_AGENT_ID".into(), format!("exec-{}", agent_label)),
+        ("WG_EXECUTOR_TYPE".into(), "claude".into()),
+        ("WG_USER".into(), user.clone()),
+    ];
+    if let Some(m) = model {
+        env_vars.push(("WG_MODEL".into(), m.to_string()));
+    } else if !vars.model.is_empty() {
+        env_vars.push(("WG_MODEL".into(), vars.model.clone()));
+    }
+
+    // --- Dry run: print context and env vars ---
+    if dry_run {
+        println!("=== Environment Variables ===\n");
+        for (key, val) in &env_vars {
+            println!("  {}={}", key, val);
+        }
+        println!("\n=== Assembled Prompt ({} bytes) ===\n", prompt.len());
+        println!("{}", prompt);
+        return Ok(());
+    }
+
+    // --- Claim the task ---
+    let needs_claim = task.status == Status::Open || task.status == Status::Blocked;
+    if needs_claim {
+        let actor_s = actor.map(String::from);
+        modify_graph(&path, |graph| {
+            if let Some(t) = graph.get_task_mut(task_id) {
+                t.status = Status::InProgress;
+                t.started_at = Some(Utc::now().to_rfc3339());
+                if let Some(ref a) = actor_s {
+                    t.assigned = Some(a.clone());
+                } else {
+                    t.assigned = Some(format!("exec-{}", workgraph::current_user()));
+                }
+                t.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: actor_s.clone(),
+                    user: Some(workgraph::current_user()),
+                    message: "Started interactive exec session".to_string(),
+                });
+                true
+            } else {
+                false
+            }
+        })
+        .context("Failed to claim task")?;
+        super::notify_graph_changed(dir);
+        eprintln!("Claimed task '{}' for interactive session", task_id);
+    }
+
+    // --- Optional worktree ---
+    let worktree_info = if use_worktree {
+        let root = project_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine project root for worktree"))?;
+        let wt =
+            worktree::create_worktree(root, dir, &format!("exec-{}", agent_label), task_id)?;
+        eprintln!(
+            "Created worktree at {:?} (branch: {})",
+            wt.path, wt.branch
+        );
+        env_vars.push(("WG_WORKTREE_PATH".into(), wt.path.to_string_lossy().into()));
+        env_vars.push(("WG_BRANCH".into(), wt.branch.clone()));
+        env_vars.push((
+            "WG_PROJECT_ROOT".into(),
+            wt.project_root.to_string_lossy().into(),
+        ));
+        Some(wt)
+    } else {
+        None
+    };
+
+    // --- Write prompt to temp file ---
+    let prompt_dir = dir.join("agents").join(format!("exec-{}", agent_label));
+    std::fs::create_dir_all(&prompt_dir)
+        .context("Failed to create exec agent output directory")?;
+    let prompt_file = prompt_dir.join("prompt.txt");
+    std::fs::write(&prompt_file, &prompt).context("Failed to write prompt file")?;
+
+    // Log the prompt file location
+    let _ = modify_graph(&path, |graph| {
+        if let Some(t) = graph.get_task_mut(task_id) {
+            t.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: actor.map(String::from),
+                user: Some(workgraph::current_user()),
+                message: format!(
+                    "Interactive exec session started. Prompt: {}",
+                    prompt_file.display()
+                ),
+            });
+            true
+        } else {
+            false
+        }
+    });
+
+    // --- Launch executor interactively ---
+    eprintln!("Launching interactive claude session for task '{}'...", task_id);
+    eprintln!("(Prompt written to {})", prompt_file.display());
+
+    let mut cmd = Command::new("claude");
+    // Interactive mode: no --print, no --output-format
+    // Pass prompt via --system-prompt and give task info on stdin
+    cmd.arg("--system-prompt").arg(&prompt);
+
+    // Add model if specified
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    } else if !vars.model.is_empty() {
+        cmd.arg("--model").arg(&vars.model);
+    }
+
+    // Set env vars
+    for (key, val) in &env_vars {
+        cmd.env(key, val);
+    }
+
+    // Remove CLAUDECODE to allow nested sessions
+    cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+
+    // Set working directory
+    if let Some(ref wt) = worktree_info {
+        cmd.current_dir(&wt.path);
+    }
+
+    // Run interactively (inherit stdio)
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd.status().context(
+        "Failed to launch claude CLI. Is it installed? \
+         (Try: npm install -g @anthropic-ai/claude-code)",
+    )?;
+
+    let exit_code = status.code().unwrap_or(-1);
+    eprintln!("\nClaude session ended (exit code: {})", exit_code);
+
+    // --- Log session end ---
+    let _ = modify_graph(&path, |graph| {
+        if let Some(t) = graph.get_task_mut(task_id) {
+            t.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: actor.map(String::from),
+                user: Some(workgraph::current_user()),
+                message: format!("Interactive exec session ended (exit code: {})", exit_code),
+            });
+            true
+        } else {
+            false
+        }
+    });
+
+    // --- Completion handling: prompt user ---
+    if std::io::stdin().is_terminal() {
+        eprintln!("\nTask '{}' is still in-progress.", task_id);
+        eprint!("Mark as: [d]one, [f]ailed, or [l]eave in-progress? ");
+        std::io::stderr().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read input")?;
+        let choice = input.trim().to_lowercase();
+
+        match choice.as_str() {
+            "d" | "done" => {
+                modify_graph(&path, |graph| {
+                    if let Some(t) = graph.get_task_mut(task_id) {
+                        t.status = Status::Done;
+                        t.completed_at = Some(Utc::now().to_rfc3339());
+                        t.log.push(LogEntry {
+                            timestamp: Utc::now().to_rfc3339(),
+                            actor: actor.map(String::from),
+                            user: Some(workgraph::current_user()),
+                            message: "Marked done via interactive exec session".to_string(),
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .context("Failed to mark task done")?;
+                super::notify_graph_changed(dir);
+                eprintln!("Task '{}' marked as done.", task_id);
+            }
+            "f" | "failed" | "fail" => {
+                eprint!("Failure reason (optional): ");
+                std::io::stderr().flush().ok();
+                let mut reason = String::new();
+                std::io::stdin().read_line(&mut reason).ok();
+                let reason = reason.trim().to_string();
+                let reason_opt = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
+
+                modify_graph(&path, |graph| {
+                    if let Some(t) = graph.get_task_mut(task_id) {
+                        t.status = Status::Failed;
+                        t.retry_count += 1;
+                        if let Some(ref r) = reason_opt {
+                            t.failure_reason = Some(r.clone());
+                        }
+                        t.log.push(LogEntry {
+                            timestamp: Utc::now().to_rfc3339(),
+                            actor: actor.map(String::from),
+                            user: Some(workgraph::current_user()),
+                            message: format!(
+                                "Marked failed via interactive exec session{}",
+                                reason_opt
+                                    .as_ref()
+                                    .map(|r| format!(": {}", r))
+                                    .unwrap_or_default()
+                            ),
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .context("Failed to mark task failed")?;
+                super::notify_graph_changed(dir);
+                eprintln!("Task '{}' marked as failed.", task_id);
+            }
+            _ => {
+                eprintln!("Task '{}' left in-progress.", task_id);
+            }
+        }
+    }
+
+    // --- Worktree cleanup ---
+    if let Some(ref wt) = worktree_info {
+        eprintln!("Cleaning up worktree...");
+        if let Err(e) = worktree::remove_worktree(
+            &wt.project_root,
+            &wt.path,
+            &wt.branch,
+        ) {
+            eprintln!("Warning: failed to clean up worktree: {}", e);
+        }
     }
 
     Ok(())

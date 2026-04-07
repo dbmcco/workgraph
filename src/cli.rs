@@ -1038,7 +1038,7 @@ pub enum Commands {
         actor: Option<String>,
     },
 
-    /// Execute a task's shell command (claim + run + done/fail)
+    /// Drop into an interactive agent session for a task (or run its shell command)
     Exec {
         /// Task ID to execute
         task: String,
@@ -1047,7 +1047,7 @@ pub enum Commands {
         #[arg(long)]
         actor: Option<String>,
 
-        /// Show what would be executed without running
+        /// Show assembled context and env vars without launching anything
         #[arg(long)]
         dry_run: bool,
 
@@ -1058,6 +1058,22 @@ pub enum Commands {
         /// Clear the exec command for a task
         #[arg(long)]
         clear: bool,
+
+        /// Run the task's shell exec command (legacy behavior) instead of interactive session
+        #[arg(long)]
+        shell: bool,
+
+        /// Create an isolated git worktree (like real agents get)
+        #[arg(long, conflicts_with = "no_worktree")]
+        worktree: bool,
+
+        /// Work in-place without worktree isolation (default)
+        #[arg(long, conflicts_with = "worktree")]
+        no_worktree: bool,
+
+        /// Model to use for the executor (e.g., opus, sonnet, haiku)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Manage agent definitions (identity: role + tradeoff pairings)
