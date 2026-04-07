@@ -46,6 +46,15 @@ COND_C_SOURCES=(
     "$RESULTS_DIR/full-condition-c/full-condition-c-retry2"
 )
 
+# ── Condition F ─────────────────────────────────────────────────────────────
+# Note: pilot-f-89 uses wg runner format (not Harbor). This section copies
+# available data. For leaderboard submission, F must be re-run through Harbor.
+COND_F_DIR="$SUBMISSION_DIR/workgraph-condition-f__minimax-m2.7"
+COND_F_SOURCES=(
+    "$RESULTS_DIR/full-f-m27/full-f-m27"
+    "$RESULTS_DIR/pilot-f-89"
+)
+
 copy_trials() {
     local dest_dir="$1"
     shift
@@ -124,6 +133,10 @@ copy_trials "$COND_B_DIR" "${COND_B_SOURCES[@]}"
 echo ""
 echo "=== Preparing Condition C ==="
 copy_trials "$COND_C_DIR" "${COND_C_SOURCES[@]}"
+
+echo ""
+echo "=== Preparing Condition F ==="
+copy_trials "$COND_F_DIR" "${COND_F_SOURCES[@]}"
 
 echo ""
 echo "=== Summary ==="
