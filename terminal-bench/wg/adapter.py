@@ -533,7 +533,7 @@ coordinator dispatches worker agents to your tasks automatically.
 # ---------------------------------------------------------------------------
 
 ARCHITECT_BUNDLE_TOML = """\
-name = "architect"
+name = "bare"
 description = "Graph architect agent: reads the problem, designs the workgraph, delegates all implementation."
 tools = ["bash", "read_file", "glob", "grep", "wg_show", "wg_list", "wg_add", "wg_done", "wg_fail", "wg_log", "wg_artifact"]
 context_scope = "clean"
@@ -641,7 +641,7 @@ async def _run_native_executor(
         b64_bundle = base64.b64encode(ARCHITECT_BUNDLE_TOML.encode()).decode()
         await environment.exec(command="mkdir -p .workgraph/bundles")
         await environment.exec(
-            command=f"echo '{b64_bundle}' | base64 -d > .workgraph/bundles/architect.toml"
+            command=f"echo '{b64_bundle}' | base64 -d > .workgraph/bundles/bare.toml"
         )
     else:
         full_instruction = task_instruction
@@ -660,9 +660,10 @@ async def _run_native_executor(
     # Add the task to the graph using the instruction file.
     # --no-place skips the placement pipeline and makes the task immediately
     # available for dispatch (otherwise interactive default is paused/draft).
-    # For autopoietic conditions, the seed task uses exec-mode "architect"
-    # which maps to the architect bundle (clean context, no REQUIRED_WORKFLOW).
-    exec_mode_flag = ' --exec-mode architect' if cfg.get("autopoietic") else ''
+    # For autopoietic conditions, the seed task uses exec-mode "bare"
+    # with a custom bare.toml bundle (clean context, read tools + wg tools,
+    # no REQUIRED_WORKFLOW). Worker tasks use exec-mode "full" (default).
+    exec_mode_flag = ' --exec-mode bare' if cfg.get("autopoietic") else ''
     add_cmd = (
         f'wg add "TB task" --id {task_id} --no-place{exec_mode_flag} '
         f'-d "$(cat /tmp/tb-instruction.txt)"'
