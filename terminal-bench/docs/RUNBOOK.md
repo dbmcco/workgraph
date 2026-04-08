@@ -643,11 +643,21 @@ harbor run \
   -y
 ```
 
-Config: `context_scope=graph`, full wg tools, `max_agents=4`, autopoietic
-meta-prompt. The seed agent builds its own self-correcting workgraph with
-verification cycles, sub-task decomposition, and iterative refinement. This
-emulates what a human does when using workgraph — the agent is both the worker
-and the consciousness that evaluates whether the work is done.
+Config: `context_scope=graph`, full wg tools, `max_agents=8`, autopoietic
+meta-prompt. The agent receives the same tools and context as Condition F,
+plus an autopoietic meta-prompt prepended to the task instruction that
+encourages the agent to:
+
+- Decompose the problem into parallel sub-tasks via `wg add`
+- Build verification cycles using `wg edit --add-after --max-iterations`
+- Check the `tests/` directory and use test results to iterate
+- Signal `wg done --converged` when tests pass
+
+The agent is not forced to follow this — it has full tools and can solve
+problems directly. In practice, some tasks are solved directly (like F),
+while others benefit from the graph-building and iteration guidance.
+This emulates what a human does when using workgraph: the agent is both
+the worker and the consciousness that evaluates whether the work is done.
 
 ### Condition Comparison
 
@@ -655,10 +665,11 @@ and the consciousness that evaluates whether the work is done.
 |--------|------------|---------------|------------------|
 | `context_scope` | `clean` | `graph` | `graph` |
 | WG tools | Excluded | Full | Full |
-| `max_agents` | 1 | 1 | 4 |
+| `max_agents` | 1 | 1 | 8 |
 | Graph structure | Single task | Single task | Agent-designed (cycles, sub-tasks) |
-| Iteration | None | None | Self-correcting via verify/retry cycles |
+| Iteration | None | None | Encouraged via meta-prompt |
 | Coordinator agent | No | No | Yes |
+| Meta-prompt | None | None | Autopoietic graph-building guidance |
 
 ### All Conditions via Script
 

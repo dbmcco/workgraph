@@ -652,42 +652,56 @@ auto_assign = false
 auto_evaluate = false
 ```
 
-### Condition G (Context-only)
+### Condition G (Autopoietic)
 
-Condition G is wg context injection without surveillance infrastructure. It is the condition that the `tb-smoke-no-surv` smoke test validated (4/4 pass on file-ops, debugging, algorithm, build-cython-ext using M2.7).
+Condition G is the autopoietic treatment: the agent receives the same tools and
+context as Condition F, plus an **autopoietic meta-prompt** that encourages it to
+build a self-correcting workgraph with verification cycles.
 
 The agent receives:
-- Task title, description, and the WG Quick Guide
+- Task title and description, prepended with the autopoietic meta-prompt
 - Graph-scoped context (sees the dependency graph)
-- Access to `wg` CLI tools (log, artifact, show, list, done, fail, add)
-- **No surveillance loop, no companion tasks, no cycle edges**
+- Access to ALL tools including `wg` CLI tools (add, edit, done, log, etc.)
+- Up to **8 concurrent agents** (vs 1 for F) for parallel sub-task execution
+- The **coordinator agent** is active (dispatches sub-tasks the agent creates)
 
-Config is identical to Condition F except no surveillance infrastructure is created:
+The autopoietic meta-prompt instructs the agent to:
+1. Read and understand the problem (explore files, check `tests/`)
+2. Decompose into parallel sub-tasks using `wg add`
+3. Build a verification cycle: work → verify → fix → loop back
+4. Use `wg done --converged` when tests pass, plain `wg done` to iterate
+5. Fan out for parallelism where possible
+
+The agent is NOT forced to follow this structure — it has full tools and can
+solve problems directly (like F). The meta-prompt is guidance, not constraint.
+In practice, the agent often does the work directly on simpler tasks while
+benefiting from the richer prompt context (awareness of tests, iteration
+strategy). On harder tasks, the graph-building and retry guidance helps.
+
+Config:
 ```toml
 [coordinator]
-max_agents = 1
+max_agents = 8
 executor = "native"
 model = "openrouter:minimax/minimax-m2.7"
-worktree_isolation = false
 
 [agent]
 model = "openrouter:minimax/minimax-m2.7"
 context_scope = "graph"
 exec_mode = "full"
-
-[agency]
-auto_assign = false
-auto_evaluate = false
 ```
 
-Task graph per trial:
-```
-WORK (main task with --verify gate)
-```
+**Distinction from F:** F uses `max_agents=1` and no meta-prompt — the agent gets
+a single task and works on it. G uses `max_agents=8`, an active coordinator, and
+the autopoietic meta-prompt that encourages graph decomposition and iterative
+verification. G emulates what a human does with workgraph: reading the problem,
+breaking it down, building a plan, checking results, and iterating.
 
-**Distinction from F:** Condition F's original design included surveillance tasks (a companion monitor task in a cycle with the work task, convergence detection, self-healing logic). Condition G removes all of this. In practice, since surveillance never activated in F's pilot trials, G produces identical outcomes — but the experimental design is cleaner and the token cost is lower (~2x predicted savings from eliminating surveillance overhead).
-
-**Historical note:** Originally proposed as a hypothetical ablation condition in the pilot synthesis ("Condition G: context without surveillance"). Formalized after `tb-smoke-no-surv` confirmed the stripped runner works correctly.
+**Historical note:** Originally formalized as "F without surveillance" (context-only).
+Evolved during the TB 2.0 full-scale experiment into the autopoietic design after
+observing that the 89-task benchmark was harder than the 18-task pilots, and that
+iterative self-correction could improve pass rates beyond what single-shot context
+injection provides.
 
 ---
 
