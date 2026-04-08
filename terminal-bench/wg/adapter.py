@@ -479,44 +479,62 @@ async def _download_wg_artifacts(
 
 CONDITION_G_META_PROMPT = """## Autopoietic Workgraph — Seed Task
 
-You are the seed agent in an autopoietic workgraph. Your job is NOT just to
-solve the task below — it is to **build a self-correcting workgraph** that
-solves it iteratively.
+You are the seed agent in an autopoietic workgraph. Your job is to **build a
+self-correcting workgraph** that solves the task below, then **shut down
+cleanly when done**.
 
-### How to structure your work
+### Required graph structure
 
-1. **Break down the problem.** Use `wg add` to create sub-tasks for distinct
-   parts of the work. Use `--after` to declare dependencies between them.
+Build a workgraph with this shape:
 
-2. **Build a verification cycle.** Create a verification task that runs the
-   tests (check the `tests/` directory in the working directory — run
-   `ls tests/` to see what's there, then run them with `bash tests/test.sh`
-   or `python3 tests/test_outputs.py` or whatever is appropriate).
+1. **Work task**: does the actual implementation.
+2. **Verify task** (depends on work): runs the tests in `tests/` to check
+   if the solution is correct. Look at `ls tests/` to find test scripts
+   (typically `bash tests/test.sh` or `python3 tests/test_outputs.py`).
+3. **Cycle back-edge**: the work task depends back on the verify task,
+   creating a loop. Cap it with `--max-iterations 5`.
 
-3. **Create a back-edge for iteration.** Use `wg edit <first-task>
-   --add-after <verify-task> --max-iterations 5` to create a cycle. If
-   verification fails, the cycle iterates — the work agent gets another
-   attempt with full context from previous iterations visible in the graph.
+Example setup (adapt names to the problem):
+```
+wg add "Implement solution" --no-place
+wg add "Run tests and check" --after implement-solution --no-place
+wg edit implement-solution --add-after run-tests-and-check --max-iterations 5
+```
 
-4. **Signal convergence.** When the tests pass, use `wg done --converged`
-   to stop the cycle. Use plain `wg done` (without --converged) if the work
-   is not yet satisfactory and you want another iteration.
+### CRITICAL: How the verify task must behave
 
-5. **Fan out if needed.** If the problem has independent parts, create
-   parallel tasks. The coordinator will dispatch agents to them concurrently.
+The verify task agent MUST do exactly this:
+1. Run the test suite (e.g. `bash tests/test.sh` or the appropriate command)
+2. If tests **pass**: run `wg done <my-task-id> --converged` — this STOPS
+   the cycle and signals success. The system shuts down.
+3. If tests **fail**: log what went wrong with `wg log <my-task-id> "..."`,
+   then run `wg done <my-task-id>` (WITHOUT --converged) — this triggers
+   another iteration of the cycle. The work agent will wake up again with
+   the failure context visible via `wg context`.
 
-6. **React to failures.** Each iteration, check `wg context` and `wg log`
-   to see what previous iterations attempted and why they failed. Adapt your
-   approach based on this history.
+**If you do not signal `--converged`, the system will loop until max
+iterations or timeout. If you never call `wg done` at all, the system
+hangs. Every task MUST eventually call `wg done`.**
+
+### Additional guidance
+
+- **Break down complex problems.** If the work has independent parts, use
+  multiple sub-tasks with `--after` edges. Fan out for parallelism.
+- **React to failures.** On iteration 2+, check `wg context` and `wg log`
+  to see what previous iterations tried and why they failed.
+- **Log your reasoning.** Use `wg log <id> "message"` so future iterations
+  have context about what was attempted.
+- After building the graph, mark THIS seed task as done: `wg done <seed-id>`.
+  The coordinator will dispatch agents to the tasks you created.
 
 ### Key commands
-- `wg add "title" --after dep -d "description"` — create a task
-- `wg add "title" --verify "test command"` — task with a verification gate
+- `wg add "title" --after dep --no-place` — create a task
 - `wg edit <id> --add-after <id> --max-iterations N` — create a cycle
-- `wg done <id> --converged` — signal the cycle should stop (tests pass)
-- `wg done <id>` — signal the cycle should continue (tests fail, retry)
-- `wg log <id> "message"` — log progress for other agents/iterations to see
+- `wg done <id> --converged` — STOP the cycle (tests pass, we're done)
+- `wg done <id>` — continue the cycle (tests fail, try again)
+- `wg log <id> "message"` — log progress for other agents/iterations
 - `wg context <id>` — see context from dependencies and previous iterations
+- `wg show <id>` — check task status and loop_iteration count
 
 ### The task to solve
 
