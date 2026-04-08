@@ -632,17 +632,8 @@ async def _run_native_executor(
     # For Condition G, prepend the autopoietic meta-prompt to the instruction
     # so the agent knows to build a self-correcting workgraph.
     if cfg.get("autopoietic"):
-        # Inject the seed task ID so the architect knows what to wg done
         meta = CONDITION_G_META_PROMPT.replace("{seed_task_id}", task_id)
         full_instruction = meta + task_instruction
-
-        # Write the architect bundle into the container so the seed task
-        # gets clean context (no REQUIRED_WORKFLOW competing with our prompt)
-        b64_bundle = base64.b64encode(ARCHITECT_BUNDLE_TOML.encode()).decode()
-        await environment.exec(command="mkdir -p .workgraph/bundles")
-        await environment.exec(
-            command=f"echo '{b64_bundle}' | base64 -d > .workgraph/bundles/bare.toml"
-        )
     else:
         full_instruction = task_instruction
 
@@ -660,10 +651,7 @@ async def _run_native_executor(
     # Add the task to the graph using the instruction file.
     # --no-place skips the placement pipeline and makes the task immediately
     # available for dispatch (otherwise interactive default is paused/draft).
-    # For autopoietic conditions, the seed task uses exec-mode "bare"
-    # with a custom bare.toml bundle (clean context, read tools + wg tools,
-    # no REQUIRED_WORKFLOW). Worker tasks use exec-mode "full" (default).
-    exec_mode_flag = ' --exec-mode bare' if cfg.get("autopoietic") else ''
+    exec_mode_flag = ''
     add_cmd = (
         f'wg add "TB task" --id {task_id} --no-place{exec_mode_flag} '
         f'-d "$(cat /tmp/tb-instruction.txt)"'
