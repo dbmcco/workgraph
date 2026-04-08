@@ -1164,20 +1164,51 @@ impl CycleAnalysis {
                 .iter()
                 .map(|&nid| named.get_name(nid).to_string())
                 .collect();
-            let header = named.get_name(meta.header).to_string();
+            let havlak_header = named.get_name(meta.header).to_string();
+
+            // Check if any cycle member has user-specified cycle_config.
+            // If so, that task is the user's intended entry point and should
+            // be the effective header for readiness computation. Havlak's
+            // DFS-order header may differ from the user's intent.
+            let user_header = members.iter().find(|m| {
+                graph
+                    .get_task(m)
+                    .and_then(|t| t.cycle_config.as_ref())
+                    .is_some()
+            });
+
+            let effective_header = user_header
+                .cloned()
+                .unwrap_or_else(|| havlak_header.clone());
 
             for member in &members {
                 task_to_cycle.insert(member.clone(), idx);
             }
-            for &(src, tgt) in &meta.back_edges {
-                back_edges.insert((
-                    named.get_name(src).to_string(),
-                    named.get_name(tgt).to_string(),
-                ));
+
+            if user_header.is_some() && effective_header != havlak_header {
+                // Override back-edges: edges from cycle members INTO the
+                // effective header are back-edges (skipped for readiness
+                // on iteration 1, making the header dispatchable).
+                let member_set: HashSet<&String> = members.iter().collect();
+                if let Some(header_task) = graph.get_task(&effective_header) {
+                    for dep_id in &header_task.after {
+                        if member_set.contains(dep_id) {
+                            back_edges.insert((dep_id.clone(), effective_header.clone()));
+                        }
+                    }
+                }
+            } else {
+                // Use Havlak's back-edges as-is.
+                for &(src, tgt) in &meta.back_edges {
+                    back_edges.insert((
+                        named.get_name(src).to_string(),
+                        named.get_name(tgt).to_string(),
+                    ));
+                }
             }
             cycles.push(DetectedCycle {
                 members,
-                header,
+                header: effective_header,
                 reducible: meta.reducible,
             });
         }
