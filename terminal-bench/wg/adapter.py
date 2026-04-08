@@ -124,6 +124,14 @@ CONDITION_CONFIG = {
         "exclude_wg_tools": False,
         "max_agents": 1,
     },
+    "G": {
+        "exec_mode": "full",
+        "context_scope": "graph",
+        "agency": None,
+        "exclude_wg_tools": False,
+        "max_agents": 4,
+        "autopoietic": True,
+    },
 }
 
 
@@ -465,6 +473,56 @@ async def _download_wg_artifacts(
     return artifacts_dir
 
 
+# ---------------------------------------------------------------------------
+# Condition G: autopoietic meta-prompt
+# ---------------------------------------------------------------------------
+
+CONDITION_G_META_PROMPT = """## Autopoietic Workgraph — Seed Task
+
+You are the seed agent in an autopoietic workgraph. Your job is NOT just to
+solve the task below — it is to **build a self-correcting workgraph** that
+solves it iteratively.
+
+### How to structure your work
+
+1. **Break down the problem.** Use `wg add` to create sub-tasks for distinct
+   parts of the work. Use `--after` to declare dependencies between them.
+
+2. **Build a verification cycle.** Create a verification task that runs the
+   tests (check the `tests/` directory in the working directory — run
+   `ls tests/` to see what's there, then run them with `bash tests/test.sh`
+   or `python3 tests/test_outputs.py` or whatever is appropriate).
+
+3. **Create a back-edge for iteration.** Use `wg edit <first-task>
+   --add-after <verify-task> --max-iterations 5` to create a cycle. If
+   verification fails, the cycle iterates — the work agent gets another
+   attempt with full context from previous iterations visible in the graph.
+
+4. **Signal convergence.** When the tests pass, use `wg done --converged`
+   to stop the cycle. Use plain `wg done` (without --converged) if the work
+   is not yet satisfactory and you want another iteration.
+
+5. **Fan out if needed.** If the problem has independent parts, create
+   parallel tasks. The coordinator will dispatch agents to them concurrently.
+
+6. **React to failures.** Each iteration, check `wg context` and `wg log`
+   to see what previous iterations attempted and why they failed. Adapt your
+   approach based on this history.
+
+### Key commands
+- `wg add "title" --after dep -d "description"` — create a task
+- `wg add "title" --verify "test command"` — task with a verification gate
+- `wg edit <id> --add-after <id> --max-iterations N` — create a cycle
+- `wg done <id> --converged` — signal the cycle should stop (tests pass)
+- `wg done <id>` — signal the cycle should continue (tests fail, retry)
+- `wg log <id> "message"` — log progress for other agents/iterations to see
+- `wg context <id>` — see context from dependencies and previous iterations
+
+### The task to solve
+
+"""
+
+
 async def _collect_agent_metrics_from_container(
     environment: BaseEnvironment,
     artifacts_dir: Path | str | None = None,
@@ -551,12 +609,20 @@ async def _run_native_executor(
     data from stream.jsonl).
     """
     task_id = f"tb-{uuid.uuid4().hex[:8]}"
+    cfg = CONDITION_CONFIG[condition]
+
+    # For Condition G, prepend the autopoietic meta-prompt to the instruction
+    # so the agent knows to build a self-correcting workgraph.
+    if cfg.get("autopoietic"):
+        full_instruction = CONDITION_G_META_PROMPT + task_instruction
+    else:
+        full_instruction = task_instruction
 
     # Write the task instruction to a file inside the container using base64
     # encoding to avoid shell quoting and heredoc issues.
     # (Harbor's exec() pipes commands to bash via stdin, which breaks heredocs.)
     b64_instruction = base64.b64encode(
-        task_instruction.encode()
+        full_instruction.encode()
     ).decode()
     write_instruction_cmd = (
         f"echo '{b64_instruction}' | base64 -d > /tmp/tb-instruction.txt"
@@ -585,11 +651,13 @@ async def _run_native_executor(
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     env_exports = f'export OPENROUTER_API_KEY="{api_key}"'
 
-    # Start the service.  --no-coordinator-agent avoids the overhead of a
-    # coordinator agent when we only have a single task.
+    # Start the service.  For Condition G (autopoietic), use the coordinator
+    # to dispatch sub-tasks the seed agent creates.  For other conditions,
+    # --no-coordinator-agent avoids overhead for single-task trials.
+    no_coord = "" if cfg.get("autopoietic") else " --no-coordinator-agent"
     start_cmd = (
         f'{env_exports} && '
-        f'wg service start --model "{model}" --no-coordinator-agent'
+        f'wg service start --model "{model}"{no_coord}'
     )
     start_result = await environment.exec(command=start_cmd, timeout_sec=30)
     if start_result.return_code != 0:
@@ -601,9 +669,14 @@ async def _run_native_executor(
             "error": f"wg service start failed: {start_result.stderr}",
         }
 
-    # Poll for task completion
+    # Poll for task completion.
+    # For autopoietic conditions (G), the seed task finishes quickly after
+    # building sub-tasks.  We poll until the entire graph is quiescent —
+    # no open or in-progress tasks remain.
+    # For other conditions, we just poll the single root task.
     start_time = time.monotonic()
     status = "timeout"
+    is_autopoietic = cfg.get("autopoietic", False)
 
     while True:
         elapsed = time.monotonic() - start_time
@@ -612,17 +685,34 @@ async def _run_native_executor(
             await environment.exec(command="wg service stop")
             break
 
-        show_result = await environment.exec(command=f"wg show {task_id}")
-        if show_result.return_code == 0 and show_result.stdout:
-            for line in show_result.stdout.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("Status:"):
-                    parsed = stripped.split(":", 1)[1].strip().lower()
-                    if parsed in ("done", "failed", "abandoned"):
-                        status = parsed
-                        break
-        if status != "timeout":
-            break
+        if is_autopoietic:
+            # Check if any tasks are still open or in-progress
+            list_result = await environment.exec(command="wg list --status open,in-progress 2>/dev/null")
+            if list_result.return_code == 0:
+                # Count non-header lines (actual tasks)
+                lines = [l for l in (list_result.stdout or "").strip().splitlines()
+                         if l.strip() and not l.strip().startswith("─")
+                         and not l.strip().startswith("ID")]
+                if len(lines) == 0:
+                    # All tasks terminal — check if any succeeded
+                    done_result = await environment.exec(command="wg list --status done 2>/dev/null")
+                    if done_result.return_code == 0 and done_result.stdout and done_result.stdout.strip():
+                        status = "done"
+                    else:
+                        status = "failed"
+                    break
+        else:
+            show_result = await environment.exec(command=f"wg show {task_id}")
+            if show_result.return_code == 0 and show_result.stdout:
+                for line in show_result.stdout.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("Status:"):
+                        parsed = stripped.split(":", 1)[1].strip().lower()
+                        if parsed in ("done", "failed", "abandoned"):
+                            status = parsed
+                            break
+            if status != "timeout":
+                break
 
         await asyncio.sleep(poll_interval)
 
@@ -1032,11 +1122,12 @@ class WorkgraphAgent(BaseAgent):
     Uses a Docker-aware LLM agent loop: calls the LLM and routes tool
     executions through harbor's environment.exec() into Docker containers.
 
-    Supports six experimental conditions:
+    Supports seven experimental conditions:
       condition="A" — bare agent (bash + file tools, no graph)
       condition="B" — agent + workgraph (full tools, journal/resume)
       condition="C" — agent + workgraph + skill injection + planning phase
       condition="D" — agent + workgraph + autopoietic verification + agency identity
+      condition="G" — autopoietic: agent builds its own self-correcting workgraph
       condition="E" — agent + workgraph + organization generation + independent verification
       condition="F" — agent + workgraph + distilled context injection + empirical verification
 
@@ -1380,3 +1471,16 @@ class ConditionFAgent(WorkgraphAgent):
         parts = ["You are a skilled software engineer. Complete the task below."]
         parts.append(CONDITION_F_MEMORY)
         return "\n\n".join(parts)
+
+
+class ConditionGAgent(WorkgraphAgent):
+    """Condition G (treatment): autopoietic — agent builds self-correcting workgraph."""
+
+    @staticmethod
+    def name() -> str:
+        return "workgraph-condition-g"
+
+    def __init__(self, *args, **kwargs):
+        kwargs["condition"] = "G"
+        kwargs.setdefault("model_name", BENCHMARK_MODEL)
+        super().__init__(*args, **kwargs)

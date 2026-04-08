@@ -629,6 +629,37 @@ harbor run \
 
 Config: `context_scope=graph`, full wg tools, distilled context + memory injected.
 
+### Condition G (Autopoietic Treatment)
+
+```bash
+harbor run \
+  --agent-import-path "wg.adapter:ConditionGAgent" \
+  -m "openrouter:minimax/minimax-m2.7" \
+  -d terminal-bench@2.0 \
+  -k 5 \
+  --n-concurrent 4 \
+  --no-delete \
+  --jobs-dir terminal-bench/results/reproduction/condition-G \
+  -y
+```
+
+Config: `context_scope=graph`, full wg tools, `max_agents=4`, autopoietic
+meta-prompt. The seed agent builds its own self-correcting workgraph with
+verification cycles, sub-task decomposition, and iterative refinement. This
+emulates what a human does when using workgraph — the agent is both the worker
+and the consciousness that evaluates whether the work is done.
+
+### Condition Comparison
+
+| Aspect | A (Control) | F (Treatment) | G (Autopoietic) |
+|--------|------------|---------------|------------------|
+| `context_scope` | `clean` | `graph` | `graph` |
+| WG tools | Excluded | Full | Full |
+| `max_agents` | 1 | 1 | 4 |
+| Graph structure | Single task | Single task | Agent-designed (cycles, sub-tasks) |
+| Iteration | None | None | Self-correcting via verify/retry cycles |
+| Coordinator agent | No | No | Yes |
+
 ### All Conditions via Script
 
 ```bash
@@ -637,8 +668,7 @@ bash terminal-bench/reproduce.sh --trials 5
 
 ### Cost Estimate
 
-Minimax M2.7 is free-tier on OpenRouter. The only costs are compute time and
-Docker Hub bandwidth (mitigated by GHCR mirrors and pre-pulling).
+Minimax M2.7 costs $0.30/M input and $1.20/M output on OpenRouter.
 
 | Scenario | Tasks | Trials | Est. Time (4 concurrent) |
 |----------|-------|--------|--------------------------|

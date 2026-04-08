@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --trials N         Number of trials per task (default: 3, leaderboard: 5)"
-            echo "  --condition X      A, B, C, D, E, F, or all (default: all)"
+            echo "  --condition X      A, B, C, D, E, F, G, or all (default: all)"
             echo "  --output-dir DIR   Output directory (default: results/reproduction)"
             echo "  --model MODEL      Model name (default: minimax/minimax-m2.7)"
             echo "  --concurrent N     Concurrent tasks (default: 4)"
@@ -91,6 +91,7 @@ run_condition() {
         D) agent_class="wg.adapter:ConditionDAgent" ;;
         E) agent_class="wg.adapter:ConditionEAgent" ;;
         F) agent_class="wg.adapter:ConditionFAgent" ;;
+        G) agent_class="wg.adapter:ConditionGAgent" ;;
         *) echo "Unknown condition: $cond"; return 1 ;;
     esac
 
@@ -120,7 +121,7 @@ run_condition() {
 }
 
 if [[ "$CONDITION" == "all" ]]; then
-    for c in A B C D E F; do
+    for c in A B C D E F G; do
         run_condition "$c"
     done
 else
