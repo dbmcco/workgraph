@@ -129,7 +129,7 @@ CONDITION_CONFIG = {
         "context_scope": "graph",
         "agency": None,
         "exclude_wg_tools": False,
-        "max_agents": 4,
+        "max_agents": 8,
         "autopoietic": True,
     },
 }
@@ -487,19 +487,31 @@ cleanly when done**.
 
 Build a workgraph with this shape:
 
-1. **Work task**: does the actual implementation.
-2. **Verify task** (depends on work): runs the tests in `tests/` to check
-   if the solution is correct. Look at `ls tests/` to find test scripts
-   (typically `bash tests/test.sh` or `python3 tests/test_outputs.py`).
-3. **Cycle back-edge**: the work task depends back on the verify task,
-   creating a loop. Cap it with `--max-iterations 5`.
+1. **Analyze the problem first.** Read the task, check what's in the
+   working directory, look at `tests/` to understand what success looks like.
+2. **Decompose into parallel sub-tasks.** Break the work into independent
+   pieces that can run simultaneously. Up to 8 agents can work in parallel.
+   Tasks without `--after` edges between them run concurrently.
+3. **Verify task** (depends on ALL work tasks): runs the tests in `tests/`
+   to check if the solution is correct. Look at `ls tests/` to find test
+   scripts (typically `bash tests/test.sh` or `python3 tests/test_outputs.py`).
+4. **Cycle back-edge**: a fix/iterate task depends on verify, and the first
+   work task depends back on it, creating a loop. Cap with `--max-iterations 5`.
 
-Example setup (adapt names to the problem):
+Example setup (adapt to the problem — **parallelize aggressively**):
 ```
-wg add "Implement solution" --no-place
-wg add "Run tests and check" --after implement-solution --no-place
-wg edit implement-solution --add-after run-tests-and-check --max-iterations 5
+wg add "Analyze problem and plan" --no-place
+wg add "Implement part A" --after analyze-problem-and-plan --no-place
+wg add "Implement part B" --after analyze-problem-and-plan --no-place
+wg add "Implement part C" --after analyze-problem-and-plan --no-place
+wg add "Run tests and check" --after implement-part-a --after implement-part-b --after implement-part-c --no-place
+wg add "Fix issues from test failures" --after run-tests-and-check --no-place
+wg edit implement-part-a --add-after fix-issues-from-test-failures --max-iterations 5
 ```
+
+**Speed matters.** The more you parallelize, the faster each iteration
+completes, and the more iterations you can fit in the time budget. A serial
+chain of 5 tasks is slow. Five parallel tasks with a single verify gate is fast.
 
 ### CRITICAL: How the verify task must behave
 
