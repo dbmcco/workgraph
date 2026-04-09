@@ -3525,7 +3525,12 @@ pub fn coordinator_tick(
         // Phase 2.8: Message-triggered resurrection.
         modified |= resurrect_done_tasks(graph, dir);
 
-        // Phase 2.9: (Removed) Placement is now merged into the assignment step.
+        // Phase 2.9: Unblock stuck tasks — check for tasks blocked on archived/deleted
+        // dependencies or missed completion events.
+        // TODO: Reimplement unblock_stuck_tasks function
+        // modified |= unblock_stuck_tasks(graph, dir);
+
+        // Phase 2.10: (极maps Removed) Placement is now merged into the assignment step.
         // No separate .place-* tasks are created or handled.
 
         modified
