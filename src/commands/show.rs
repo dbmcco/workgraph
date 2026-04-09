@@ -516,7 +516,7 @@ fn print_human_readable(details: &TaskDetails) {
     // Token usage
     if let Some(ref usage) = details.token_usage {
         println!();
-        let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+        let novel_in = usage.input_tokens.saturating_sub(usage.cache_read_input_tokens);
         if usage.cache_read_input_tokens > 0 {
             println!(
                 "Tokens: {}/{} (in/out) +{} cached",

@@ -486,16 +486,16 @@ pub struct TokenUsage {
     /// Total cost in USD
     #[serde(default, skip_serializing_if = "is_f64_zero")]
     pub cost_usd: f64,
-    /// Input tokens (non-cached)
+    /// Input tokens sent this turn (non-cached portion; what you pay full price for)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub input_tokens: u64,
     /// Output tokens
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub output_tokens: u64,
-    /// Cache read input tokens
+    /// Tokens served from cache (already paid at discount)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub cache_read_input_tokens: u64,
-    /// Cache creation input tokens
+    /// Tokens newly cached this turn (paid at premium)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub cache_creation_input_tokens: u64,
 }
