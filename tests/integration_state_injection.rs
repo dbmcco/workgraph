@@ -647,6 +647,16 @@ async fn test_combined_injection_in_api_request() {
 
 #[tokio::test]
 async fn test_ephemeral_across_multiple_turns_with_journal() {
+    // Clear time-budget env vars that may leak from a parent agent process,
+    // otherwise every turn gets a Time Budget injection and the "no injection"
+    // assertions fail.
+    // SAFETY: This test is single-threaded (tokio::test default), so no other
+    // thread is reading these env vars concurrently.
+    unsafe {
+        std::env::remove_var("WG_TASK_TIMEOUT_SECS");
+        std::env::remove_var("WG_SPAWN_EPOCH");
+    }
+
     let tmp = TempDir::new().unwrap();
     let wg_dir = tmp.path().join(".workgraph");
     setup_workgraph_with_task(&wg_dir, "multi-ephemeral", &[("dep-a", "in-progress")]);

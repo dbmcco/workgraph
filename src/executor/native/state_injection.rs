@@ -171,6 +171,16 @@ impl StateInjector {
     ///
     /// Reads `WG_TASK_TIMEOUT_SECS` and `WG_SPAWN_EPOCH` set at agent spawn time.
     /// Returns a prompt section when both are set, informing the agent of remaining time.
+    ///
+    /// Disabled under `#[cfg(test)]` because env vars from a parent agent process
+    /// leak into `cargo test`, causing unrelated state-injection tests to fail.
+    #[cfg(test)]
+    fn collect_time_budget() -> Option<String> {
+        None
+    }
+
+    /// Check time budget from environment variables and return a time-awareness section.
+    #[cfg(not(test))]
     fn collect_time_budget() -> Option<String> {
         let timeout_secs: u64 = std::env::var("WG_TASK_TIMEOUT_SECS").ok()?.parse().ok()?;
         let spawn_epoch: u64 = std::env::var("WG_SPAWN_EPOCH").ok()?.parse().ok()?;
