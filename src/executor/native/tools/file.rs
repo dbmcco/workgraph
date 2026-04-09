@@ -350,7 +350,7 @@ impl Tool for EditFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit_file".to_string(),
-            description: "Perform a string replacement in a file. The old_string must appear exactly once in the file.".to_string(),
+            description: "Perform a string replacement in a file. The old_string must appear exactly once in the file. Optional normalization flags can help match strings with whitespace or line ending differences.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -365,6 +365,14 @@ impl Tool for EditFileTool {
                     "new_string": {
                         "type": "string",
                         "description": "The replacement text"
+                    },
+                    "normalize_whitespace": {
+                        "type": "boolean",
+                        "description": "Normalize whitespace (spaces, tabs) before matching. When enabled, sequences of whitespace characters are treated as equivalent. Default: false"
+                    },
+                    "normalize_line_endings": {
+                        "type": "boolean",
+                        "description": "Treat \\n and \\r\\n as equivalent when matching. When enabled, both Windows and Unix line endings are treated as the same. Default: false"
                     }
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -385,92 +393,169 @@ impl Tool for EditFileTool {
             Some(s) => s,
             None => return ToolOutput::error("Missing required parameter: new_string".to_string()),
         };
+        let normalize_whitespace = input.get("normalize_whitespace").and_then(|v| v.as_bool()).unwrap_or(false);
+        let normalize_line_endings = input.get("normalize_line_endings").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => return ToolOutput::error(format!("Failed to read file '{}': {}", path, e)),
         };
 
-        let count = content.matches(old_string).count();
+        // Determine the normalized versions of content and old_string for matching
+        let (normalized_content, normalized_old) = if normalize_whitespace || normalize_line_endings {
+            let content_normalized = if normalize_line_endings {
+                normalize_line_endings_str(&content)
+            } else {
+                content.clone()
+            };
+            let old_normalized = if normalize_line_endings {
+                normalize_line_endings_str(old_string)
+            } else {
+                old_string.to_string()
+            };
+
+            // Apply whitespace normalization if requested
+            let content_normalized = if normalize_whitespace {
+                normalize_whitespace_str(&content_normalized)
+            } else {
+                content_normalized
+            };
+            let old_normalized = if normalize_whitespace {
+                normalize_whitespace_str(&old_normalized)
+            } else {
+                old_normalized
+            };
+
+            (content_normalized, old_normalized)
+        } else {
+            (content.clone(), old_string.to_string())
+        };
+
+        let count = normalized_content.matches(&normalized_old).count();
         if count == 0 {
-            let line_ending = detect_line_endings(&content);
-            let line_ending_suggestion: &str = if old_string.contains('\n') || old_string.contains('\r') {
-                "\n\nTip: If your old_string contains newlines, make sure they match the file's line endings."
-            } else {
-                ""
-            };
-
-            let similar_content = find_similar_region(&content, old_string);
-
-            let error_msg = if let Some((pos, snippet, suggestion)) = similar_content {
-                format!(
-                    "old_string not found in '{}'.\n\n\
-                    File line endings: {}{}\n\n\
-                    Similar content found at position {}:\n\
-                    {}\n\
-                    {}\
-                    \n\
-                    Common issues to check:\n\
-                    - Extra or missing spaces/tabs at line ends\n\
-                    - Different line endings (\\n vs \\r\\n)\n\
-                    - Inclusion or exclusion of trailing newlines\n\
-                    - Whitespace characters that look identical but differ (e.g., space vs tab)",
-                    path, line_ending, line_ending_suggestion, pos, snippet, suggestion
-                )
-            } else {
-                format!(
-                    "old_string not found in '{}'.\n\n\
-                    File line endings: {}{}\n\n\
-                    File preview:\n\
-                    {}\n\n\
-                    Common issues to check:\n\
-                    - Extra or missing spaces/tabs at line ends\n\
-                    - Different line endings (\\n vs \\r\\n)\n\
-                    - Inclusion or exclusion of trailing newlines\n\
-                    - Whitespace characters that look identical but differ (e.g., space vs tab)",
-                    path,
-                    line_ending,
-                    line_ending_suggestion,
-                    context_snippet(&content, 0, 10)
-                )
-            };
-            return ToolOutput::error(error_msg);
+            return ToolOutput::error(format!(
+                "old_string not found in '{}'. Make sure the string matches exactly.",
+                path
+            ));
         }
         if count > 1 {
-            // Find all match positions and show context for each
-            let mut matches = Vec::new();
-            let mut search_start = 0usize;
-            while let Some(pos) = content[search_start..].find(old_string) {
-                let abs_pos = search_start + pos;
-                let line_num = content[..abs_pos].chars().filter(|&c| c == '\n').count() + 1;
-                matches.push((abs_pos, line_num));
-                search_start = abs_pos + 1;
-            }
-
-            let mut error_msg = format!(
-                "old_string found {} times in '{}'. It must be unique.\n\n\
-                Matches occurred at:",
+            return ToolOutput::error(format!(
+                "old_string found {} times in '{}'. It must be unique. Provide more context.",
                 count, path
-            );
-
-            for (pos, line_num) in &matches {
-                let snippet = context_snippet(&content, *pos, 2);
-                error_msg.push_str(&format!(
-                    "\n\n--- Match at line {}, position {} ---\n{}",
-                    line_num, pos, snippet
-                ));
-            }
-
-            error_msg.push_str("\n\nTip: Provide more surrounding context to make the match unique.");
-            return ToolOutput::error(error_msg);
+            ));
         }
 
-        let new_content = content.replacen(old_string, new_string, 1);
+        // Find the actual position in the original (non-normalized) content
+        let start_pos = match normalized_content.find(&normalized_old) {
+            Some(pos) => pos,
+            None => return ToolOutput::error(format!(
+                "old_string not found in '{}'. Make sure the string matches exactly.",
+                path
+            )),
+        };
+
+        // Calculate the end position in the normalized string
+        let end_pos = start_pos + normalized_old.len();
+
+        // Now find the corresponding positions in the original content
+        let original_start = if normalize_whitespace || normalize_line_endings {
+            find_original_position(&content, &normalized_content, start_pos, normalize_whitespace, normalize_line_endings)
+        } else {
+            start_pos
+        };
+        let original_end = if normalize_whitespace || normalize_line_endings {
+            find_original_position(&content, &normalized_content, end_pos, normalize_whitespace, normalize_line_endings)
+        } else {
+            end_pos
+        };
+
+        // Perform the replacement using the original positions
+        let mut new_content = content[..original_start].to_string();
+        new_content.push_str(new_string);
+        new_content.push_str(&content[original_end..]);
+
         match fs::write(path, &new_content) {
             Ok(()) => ToolOutput::success(format!("Successfully edited {}", path)),
             Err(e) => ToolOutput::error(format!("Failed to write file '{}': {}", path, e)),
         }
     }
+}
+
+/// Normalize line endings: convert \r\n to \n
+fn normalize_line_endings_str(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// Normalize whitespace: collapse multiple whitespace to single space
+fn normalize_whitespace_str(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut last_was_whitespace = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_was_whitespace {
+                result.push(' ');
+                last_was_whitespace = true;
+            }
+        } else {
+            result.push(c);
+            last_was_whitespace = false;
+        }
+    }
+    result
+}
+
+/// Find the corresponding position in the original string for a position in the normalized string.
+/// This is needed because normalization can change string length.
+fn find_original_position(original: &str, normalized: &str, normalized_pos: usize, normalize_ws: bool, normalize_le: bool) -> usize {
+    if !normalize_ws && !normalize_le {
+        return normalized_pos;
+    }
+
+    let mut orig_pos = 0;
+    let mut norm_pos = 0;
+    let mut orig_chars = original.chars().peekable();
+    let mut norm_chars = normalized.chars().peekable();
+
+    while norm_pos < normalized_pos {
+        let norm_char = match norm_chars.next() {
+            Some(c) => c,
+            None => break,
+        };
+
+        // Advance through original to find matching position
+        if normalize_le && norm_char == '\n' {
+            // In normalized string, \n represents both \n and \r\n
+            let remaining: String = orig_chars.clone().collect();
+            if remaining.starts_with("\r\n") {
+                orig_chars.next();
+                orig_chars.next();
+                orig_pos += 2;
+            } else if remaining.starts_with('\n') {
+                orig_chars.next();
+                orig_pos += 1;
+            }
+            norm_pos += 1;
+        } else if normalize_ws && norm_char == ' ' {
+            // Skip all whitespace in original
+            while let Some(&c) = orig_chars.peek() {
+                if c.is_whitespace() {
+                    orig_chars.next();
+                    orig_pos += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            norm_pos += 1;
+        } else {
+            // Regular character - consume one from original
+            if let Some(c) = orig_chars.next() {
+                orig_pos += c.len_utf8();
+            }
+            norm_pos += 1;
+        }
+    }
+
+    orig_pos
 }
 
 // ── glob ────────────────────────────────────────────────────────────────
