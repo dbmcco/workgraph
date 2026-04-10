@@ -380,6 +380,22 @@ pub struct Task {
     /// Placement hint: place before these tasks (IDs). Used by the assignment step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub place_before: Vec<String>,
+    /// When true, task was created with --independent and has no implicit dependency
+    /// on the task that created it. Explicit --after deps are still honored.
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub independent: bool,
+    /// Iteration tracking: which iteration round this task is (0 = not an iteration)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub iteration_round: u32,
+    /// Iteration tracking: ID of the original task this iterates from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_anchor: Option<String>,
+    /// Iteration tracking: ID of the immediate prior iteration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_parent: Option<String>,
+    /// Iteration configuration (max_retries, propagation, retry_strategy)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_config: Option<crate::agency::IterationConfig>,
 }
 
 /// Returns `true` if the task ID represents a system-generated task.
@@ -1032,6 +1048,11 @@ impl<'de> Deserialize<'de> for Task {
             unplaced: helper.unplaced,
             place_near: helper.place_near,
             place_before: helper.place_before,
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
         })
     }
 }

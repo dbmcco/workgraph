@@ -332,6 +332,9 @@ fn main() -> Result<()> {
             delay,
             not_before,
             allow_phantom,
+            independent,
+            propagation,
+            retry_strategy,
         } => {
             // Determine effective paused/unplaced state:
             // - --paused always pauses (user-managed draft, skips placement)
@@ -402,6 +405,8 @@ fn main() -> Result<()> {
                     delay.as_deref(),
                     not_before.as_deref(),
                     allow_phantom,
+                    independent,
+                    parse_iteration_config(propagation.as_deref(), retry_strategy.as_deref()),
                 )
             }
         }
@@ -959,6 +964,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Tokens { id, json } => commands::tokens::run(&workgraph_dir, &id, &json),
+        Commands::Spend { today, json } => commands::spend::run(&workgraph_dir, today, json),
         Commands::Msg { command } => {
             let agent_id_from_env = std::env::var("WG_AGENT_ID").ok();
             match command {
@@ -2433,4 +2439,44 @@ fn main() -> Result<()> {
             KeyCommands::List => commands::key::run_list(&workgraph_dir, cli.json),
         },
     }
+}
+
+/// Parse --propagation and --retry-strategy into an IterationConfig.
+fn parse_iteration_config(
+    propagation: Option<&str>,
+    retry_strategy: Option<&str>,
+) -> Option<workgraph::agency::IterationConfig> {
+    use workgraph::agency::{IterationConfig, PropagationPolicy, RetryStrategy};
+
+    let prop = propagation.map(|p| {
+        let p = p.trim().to_lowercase();
+        if p == "conservative" {
+            PropagationPolicy::Conservative
+        } else if p == "aggressive" {
+            PropagationPolicy::Aggressive
+        } else if let Some(threshold) = p.strip_prefix("conditional:") {
+            let val: f32 = threshold.parse().unwrap_or(0.0);
+            PropagationPolicy::Conditional(val)
+        } else {
+            PropagationPolicy::Conservative
+        }
+    });
+
+    let strat = retry_strategy.map(|s| {
+        match s.trim().to_lowercase().as_str() {
+            "same-model" => RetryStrategy::SameModel,
+            "upgrade-model" => RetryStrategy::UpgradeModel,
+            "escalate-to-human" => RetryStrategy::EscalateToHuman,
+            _ => RetryStrategy::SameModel,
+        }
+    });
+
+    if prop.is_none() && strat.is_none() {
+        return None;
+    }
+    Some(IterationConfig {
+        max_retries: None,
+        propagation: prop,
+        retry_strategy: strat,
+    })
 }

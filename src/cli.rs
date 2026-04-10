@@ -178,6 +178,18 @@ pub enum Commands {
         /// Allow phantom (forward-reference) dependencies without error
         #[arg(long = "allow-phantom")]
         allow_phantom: bool,
+
+        /// Suppress implicit --after dependency on the creating task (alias: --no-after)
+        #[arg(long = "independent", alias = "no-after")]
+        independent: bool,
+
+        /// Retry propagation policy: conservative, aggressive, or conditional:<float>
+        #[arg(long = "propagation")]
+        propagation: Option<String>,
+
+        /// Retry strategy: same-model, upgrade-model, or escalate-to-human
+        #[arg(long = "retry-strategy")]
+        retry_strategy: Option<String>,
     },
 
     /// Edit an existing task
@@ -821,6 +833,17 @@ pub enum Commands {
 
         /// Token usage JSON (e.g. '{"cost_usd":0.1,"input_tokens":500,"output_tokens":200}')
         json: String,
+    },
+
+    /// Show token usage and estimated cost summaries
+    Spend {
+        /// Show only today's spend
+        #[arg(long, short = 't')]
+        today: bool,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
     },
 
     /// Send and receive messages to/from tasks and agents
@@ -3530,6 +3553,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Model { .. } => "model",
         Commands::Key { .. } => "key",
         Commands::NativeExec { .. } => "native-exec",
+        Commands::Spend { .. } => "spend",
         Commands::ApplyPlacement { .. } => "apply-placement",
     }
 }

@@ -477,6 +477,57 @@ fn default_eval_source() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Iteration / Retry Types
+// ---------------------------------------------------------------------------
+
+/// How propagation should be applied to dependents when a task retries.
+/// Used in IterationConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationPolicy {
+    /// Conservative: only dependents with changed interface re-run
+    Conservative,
+    /// Aggressive: all dependents re-run
+    Aggressive,
+    /// Conditional: re-run if score delta exceeds threshold
+    Conditional(f32),
+}
+
+impl Default for PropagationPolicy {
+    fn default() -> Self {
+        PropagationPolicy::Conservative
+    }
+}
+
+/// Retry strategy recommended by the evaluator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategy {
+    /// Retry with the same model/executor
+    SameModel,
+    /// Retry with a stronger model
+    UpgradeModel,
+    /// Escalate to a human for review
+    EscalateToHuman,
+}
+
+/// Configuration for task iteration/retry behavior.
+/// Attached to tasks via --max-retries, --propagation, --retry-strategy flags.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct IterationConfig {
+    /// Maximum number of retries allowed (evaluator-triggered)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// How to propagate retries to dependent tasks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propagation: Option<PropagationPolicy>,
+    /// What retry strategy to use
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_strategy: Option<RetryStrategy>,
+}
+
+// ---------------------------------------------------------------------------
 // Evaluation source type conventions
 // ---------------------------------------------------------------------------
 
