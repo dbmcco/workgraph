@@ -50,6 +50,23 @@ fn load_workgraph(dir: &Path) -> Result<(crate::graph::WorkGraph, PathBuf), Stri
     Ok((graph, path))
 }
 
+fn default_parent_after(graph: &crate::graph::WorkGraph, after: &[String]) -> Vec<String> {
+    if !after.is_empty() {
+        return after.to_vec();
+    }
+
+    let Ok(current_task_id) = std::env::var("WG_TASK_ID") else {
+        return vec![];
+    };
+
+    match graph.get_task(&current_task_id) {
+        Some(task) if !task.tags.iter().any(|tag| tag == "coordinator-loop") => {
+            vec![current_task_id]
+        }
+        _ => vec![],
+    }
+}
+
 fn generate_id(title: &str) -> String {
     let slug: String = title
         .to_lowercase()
@@ -307,6 +324,7 @@ impl Tool for WgAddTool {
             Ok(g) => g,
             Err(e) => return ToolOutput::error(e),
         };
+        let effective_after = default_parent_after(&graph, &after);
 
         // Generate a unique task ID from title
         let mut task_id = generate_id(title);
@@ -319,11 +337,11 @@ impl Tool for WgAddTool {
         }
 
         // Determine initial status
-        let initial_status = if after.is_empty() {
+        let initial_status = if effective_after.is_empty() {
             Status::Open
         } else {
             // Check if all dependencies are done
-            let all_done = after.iter().all(|dep_id| {
+            let all_done = effective_after.iter().all(|dep_id| {
                 graph
                     .get_task(dep_id)
                     .map(|t| t.status == Status::Done)
@@ -341,7 +359,7 @@ impl Tool for WgAddTool {
             title: title.to_string(),
             description: description.map(|s| s.to_string()),
             status: initial_status,
-            after: after.clone(),
+            after: effective_after.clone(),
             tags,
             skills,
             created_at: Some(Utc::now().to_rfc3339()),
@@ -352,6 +370,13 @@ impl Tool for WgAddTool {
         let task_clone = task.clone();
         match modify_graph(&path, |graph| {
             graph.add_node(Node::Task(task_clone.clone()));
+            for dep in &task_clone.after {
+                if let Some(blocker) = graph.get_task_mut(dep)
+                    && !blocker.before.contains(&task_id_clone)
+                {
+                    blocker.before.push(task_id_clone.clone());
+                }
+            }
             true
         }) {
             Ok(_) => {}
@@ -676,5 +701,84 @@ impl Tool for WgArtifactTool {
             "Recorded artifact '{}' for task '{}'",
             path, task_id
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    use serde_json::json;
+    use workgraph::graph::{Node, Task, WorkGraph};
+    use workgraph::parser::{load_graph, save_graph};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn stub_task(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            title: id.to_string(),
+            ..Task::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn wg_add_defaults_after_to_current_task() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph_path = dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(stub_task("parent-task")));
+        save_graph(&graph, &graph_path).unwrap();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+
+        let tool = WgAddTool {
+            dir: dir.path().to_path_buf(),
+        };
+        let result = tool.execute(&json!({ "title": "Child task" })).await;
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(!result.is_error, "{}", result.content);
+
+        let graph = load_graph(&graph_path).unwrap();
+        let child = graph.get_task("child-task").unwrap();
+        assert_eq!(child.after, vec!["parent-task".to_string()]);
+
+        let parent = graph.get_task("parent-task").unwrap();
+        assert!(parent.before.contains(&"child-task".to_string()));
+    }
+
+    #[tokio::test]
+    async fn wg_add_skips_default_after_for_coordinator_task() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph_path = dir.path().join("graph.jsonl");
+
+        let mut coordinator = stub_task("coordinator-task");
+        coordinator.tags.push("coordinator-loop".to_string());
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(coordinator));
+        save_graph(&graph, &graph_path).unwrap();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "coordinator-task") };
+
+        let tool = WgAddTool {
+            dir: dir.path().to_path_buf(),
+        };
+        let result = tool.execute(&json!({ "title": "Orphan task" })).await;
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(!result.is_error, "{}", result.content);
+
+        let graph = load_graph(&graph_path).unwrap();
+        let orphan = graph.get_task("orphan-task").unwrap();
+        assert!(orphan.after.is_empty());
     }
 }

@@ -323,10 +323,12 @@ pub fn run(
     let max_depth = guardrails.max_task_depth;
 
     let _graph = modify_graph(&path, |graph| {
+    let effective_after = default_parent_after(graph, after);
+
     // 2. Task depth limit (enforced when --after is specified)
-    if !after.is_empty() {
+    if !effective_after.is_empty() {
         // The new task's depth = max(depth of each parent) + 1
-        let max_parent_depth = after
+        let max_parent_depth = effective_after
             .iter()
             .map(|parent_id| graph.task_depth(parent_id))
             .max()
@@ -356,7 +358,7 @@ pub fn run(
     };
 
     // Validate after references (supports cross-repo peer:task-id syntax)
-    for blocker_id in after {
+    for blocker_id in &effective_after {
         if blocker_id == &task_id {
             error = Some(anyhow::anyhow!("Task '{}' cannot block itself", task_id));
             return false;
@@ -401,7 +403,7 @@ pub fn run(
         assigned: assign.map(String::from),
         estimate: estimate.clone(),
         before: vec![],
-        after: after.to_vec(),
+        after: effective_after.clone(),
         requires: vec![],
         tags: tags.to_vec(),
         skills: skills.to_vec(),
@@ -459,7 +461,7 @@ pub fn run(
 
     // Maintain bidirectional consistency: update `blocks` on referenced blocker tasks
     // (skip cross-repo refs — those live in a different graph)
-    for dep in after {
+    for dep in &effective_after {
         if workgraph::federation::parse_remote_ref(dep).is_some() {
             continue; // Cross-repo dep; can't update remote graph's blocks field
         }
@@ -473,8 +475,8 @@ pub fn run(
     // Auto-create back-edges when --max-iterations is set and --after deps exist.
     // For each --after dep, add the new task's ID to the dep's after list,
     // forming a structural cycle that the SCC detector will find.
-    if max_iterations.is_some() && !after.is_empty() {
-        for dep_id in after {
+    if max_iterations.is_some() && !effective_after.is_empty() {
+        for dep_id in &effective_after {
             if workgraph::federation::parse_remote_ref(dep_id).is_some() {
                 continue; // Skip cross-repo deps
             }
@@ -835,6 +837,23 @@ fn count_agent_created_tasks(dir: &Path, agent_id: &str) -> u32 {
         .count() as u32
 }
 
+fn default_parent_after(graph: &workgraph::WorkGraph, after: &[String]) -> Vec<String> {
+    if !after.is_empty() {
+        return after.to_vec();
+    }
+
+    let Ok(current_task_id) = std::env::var("WG_TASK_ID") else {
+        return vec![];
+    };
+
+    match graph.get_task(&current_task_id) {
+        Some(task) if !task.tags.iter().any(|tag| tag == "coordinator-loop") => {
+            vec![current_task_id]
+        }
+        _ => vec![],
+    }
+}
+
 fn generate_id(title: &str, graph: &workgraph::WorkGraph) -> String {
     // Generate a slug from the title: take up to 3 non-numeric words,
     // plus any trailing numeric tokens (so "task 1" -> "task-1", not "task").
@@ -897,9 +916,15 @@ fn generate_id(title: &str, graph: &workgraph::WorkGraph) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use workgraph::WorkGraph;
     use workgraph::graph::{LoopGuard, Node, Status, Task};
     use workgraph::parser::{load_graph, save_graph};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Helper: create a minimal task with the given ID for inserting into a WorkGraph.
     fn stub_task(id: &str) -> Task {
@@ -1780,5 +1805,46 @@ mod tests {
         let graph = load_graph(&graph_path).unwrap();
         let task = graph.get_task("timed-task").unwrap();
         assert_eq!(task.timeout.as_deref(), Some("4h"));
+    }
+
+    #[test]
+    fn default_parent_after_uses_current_task_for_non_coordinator() {
+        let _guard = env_lock().lock().unwrap();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(stub_task("parent-task")));
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+        let result = default_parent_after(&graph, &[]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert_eq!(result, vec!["parent-task".to_string()]);
+    }
+
+    #[test]
+    fn default_parent_after_skips_coordinator_task() {
+        let _guard = env_lock().lock().unwrap();
+        let mut coordinator = stub_task("coordinator-task");
+        coordinator.tags.push("coordinator-loop".to_string());
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(coordinator));
+
+        unsafe { std::env::set_var("WG_TASK_ID", "coordinator-task") };
+        let result = default_parent_after(&graph, &[]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn default_parent_after_preserves_explicit_after() {
+        let _guard = env_lock().lock().unwrap();
+        let graph = WorkGraph::new();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+        let result = default_parent_after(&graph, &["explicit-parent".to_string()]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert_eq!(result, vec!["explicit-parent".to_string()]);
     }
 }
