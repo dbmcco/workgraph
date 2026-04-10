@@ -1533,8 +1533,33 @@ fn run_pending_chat_compactions(dir: &Path, logger: &DaemonLogger) {
             continue;
         }
 
+        // Capture state before compaction for the event log
+        let state_before =
+            workgraph::service::chat_compactor::ChatCompactorState::load(dir, coordinator_id);
+        let msgs_before = state_before.last_message_count;
+
         match workgraph::service::chat_compactor::run_chat_compaction(dir, coordinator_id) {
             Ok(path) => {
+                // Record compaction event to operations.jsonl so the TUI can show it
+                let state_after =
+                    workgraph::service::chat_compactor::ChatCompactorState::load(dir, coordinator_id);
+                let detail = serde_json::json!({
+                    "coordinator_id": coordinator_id,
+                    "output_path": path.display().to_string(),
+                    "messages_before": msgs_before,
+                    "messages_after": state_after.last_message_count,
+                    "compaction_count_before": state_before.compaction_count,
+                    "compaction_count_after": state_after.compaction_count,
+                });
+                let _ = workgraph::provenance::record(
+                    dir,
+                    "compact",
+                    None,
+                    Some(&format!("coordinator-{}", coordinator_id)),
+                    detail,
+                    u64::MAX, // Use MAX to avoid rotation during daemon tick
+                );
+
                 logger.info(&format!(
                     "Chat compaction complete for coordinator {} → {}",
                     coordinator_id,

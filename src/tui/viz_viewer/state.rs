@@ -2410,6 +2410,9 @@ pub struct LogPaneState {
     pub agent_output: OutputAgentText,
     /// Whether new content arrived while scrolled up (for "new output" indicator).
     pub has_new_content: bool,
+    /// Which iteration archive is currently being viewed (index into VizApp::iteration_archives).
+    /// None means viewing the current (live) iteration.
+    viewing_iteration: Option<usize>,
 }
 
 impl Default for LogPaneState {
@@ -2425,6 +2428,7 @@ impl Default for LogPaneState {
             agent_id: None,
             agent_output: OutputAgentText::default(),
             has_new_content: false,
+            viewing_iteration: None,
         }
     }
 }
@@ -2471,6 +2475,8 @@ pub enum ActivityEventKind {
     CoordinatorTick,
     /// Verification result: approve
     VerificationResult,
+    /// Context compaction (▣, purple): chat compaction events
+    Compact,
     /// User action: gc, archive, link, unlink, publish, trace_export, artifact_add
     UserAction,
 }
@@ -2515,6 +2521,7 @@ impl ActivityEvent {
             }
             "approve" => ActivityEventKind::VerificationResult,
             "replay" | "apply" => ActivityEventKind::CoordinatorTick,
+            "compact" => ActivityEventKind::Compact,
             _ => ActivityEventKind::UserAction,
         };
 
@@ -2542,6 +2549,7 @@ impl ActivityEvent {
             ActivityEventKind::AgentFailed => "✗",
             ActivityEventKind::CoordinatorTick => "⟳",
             ActivityEventKind::VerificationResult => "◆",
+            ActivityEventKind::Compact => "▣",
             ActivityEventKind::UserAction => "●",
         }
     }
@@ -2671,6 +2679,25 @@ fn format_event_summary(
                 .and_then(|v| v.as_str())
                 .unwrap_or("internal");
             format!("Trace export ({})", vis)
+        }
+        "compact" => {
+            let coord = detail
+                .get("coordinator_id")
+                .and_then(|c| c.as_u64())
+                .map(|c| format!("#{}", c))
+                .unwrap_or_else(|| "?".to_string());
+            let msgs_before = detail
+                .get("messages_before")
+                .and_then(|m| m.as_u64())
+                .unwrap_or(0);
+            let msgs_after = detail
+                .get("messages_after")
+                .and_then(|m| m.as_u64())
+                .unwrap_or(0);
+            format!(
+                "Compacted {}: {} → {} msgs (coord {})",
+                coord, msgs_before, msgs_after, coord
+            )
         }
         _ => {
             if tid.is_empty() {
@@ -2817,6 +2844,9 @@ pub struct OutputPaneState {
     pub total_rendered_lines: usize,
     /// Whether new content has arrived while auto_follow is off (for "new output" indicator).
     pub has_new_content: bool,
+    /// Which iteration archive is currently being viewed (index into VizApp::iteration_archives).
+    /// None means viewing the current (live) iteration.
+    viewing_iteration: Option<usize>,
 }
 
 /// Direction of a message relative to the task's assigned agent.
@@ -7131,6 +7161,11 @@ impl VizApp {
                 if total > 0 {
                     self.viewing_iteration = Some(total - 1);
                     self.hud_detail = None; // force reload
+                    // Sync iteration across panels: Log and Output also show
+                    // iteration-specific content and must be invalidated.
+                    self.invalidate_log_pane();
+                    self.output_pane.agent_texts.clear();
+                    self.output_pane.viewing_iteration = self.viewing_iteration;
                     true
                 } else {
                     false
@@ -7140,6 +7175,9 @@ impl VizApp {
                 if idx > 0 {
                     self.viewing_iteration = Some(idx - 1);
                     self.hud_detail = None;
+                    self.invalidate_log_pane();
+                    self.output_pane.agent_texts.clear();
+                    self.output_pane.viewing_iteration = self.viewing_iteration;
                     true
                 } else {
                     false // already at oldest
@@ -7161,11 +7199,17 @@ impl VizApp {
                 if idx + 1 < total {
                     self.viewing_iteration = Some(idx + 1);
                     self.hud_detail = None;
+                    self.invalidate_log_pane();
+                    self.output_pane.agent_texts.clear();
+                    self.output_pane.viewing_iteration = self.viewing_iteration;
                     true
                 } else {
                     // Go back to "current" (live)
                     self.viewing_iteration = None;
                     self.hud_detail = None;
+                    self.invalidate_log_pane();
+                    self.output_pane.agent_texts.clear();
+                    self.output_pane.viewing_iteration = self.viewing_iteration;
                     true
                 }
             }
@@ -7567,6 +7611,7 @@ impl VizApp {
     // ── Activity Feed (operations.jsonl semantic view) ──
 
     /// Load new entries from operations.jsonl into the activity feed (incremental).
+    /// Emits toast notifications for notable events (e.g., compaction).
     pub fn load_activity_feed(&mut self) {
         use std::io::{Seek, SeekFrom};
         let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
@@ -7600,6 +7645,13 @@ impl VizApp {
             if !line.is_empty()
                 && let Some(event) = ActivityEvent::parse(line)
             {
+                // Emit toast notifications for notable events
+                if matches!(event.kind, ActivityEventKind::Compact) {
+                    self.push_toast(
+                        format!("[∎ compact] {}", event.summary),
+                        ToastSeverity::Info,
+                    );
+                }
                 self.activity_feed.events.push_back(event);
                 // Enforce ring buffer max.
                 if self.activity_feed.events.len() > ACTIVITY_FEED_MAX_EVENTS {
@@ -8994,6 +9046,13 @@ impl VizApp {
 
         let agents_dir = self.workgraph_dir.join("agents");
 
+        // Check if iteration changed — if so, invalidate all cached text so we reload
+        // from the new archive (or live output if returning to current).
+        if self.output_pane.viewing_iteration != self.viewing_iteration {
+            self.output_pane.viewing_iteration = self.viewing_iteration;
+            self.output_pane.agent_texts.clear();
+        }
+
         // Collect visible agents: Working + recently completed (Done/Failed).
         let visible_agents: Vec<(String, Option<String>, AgentStatus)> = self
             .agent_monitor
@@ -9034,7 +9093,20 @@ impl VizApp {
         }
 
         for (agent_id, _task_id, status) in &visible_agents {
-            let log_path = agents_dir.join(agent_id).join("output.log");
+            // When viewing a past iteration, read from the archived output instead of live.
+            let log_path = if let Some(iter_idx) = self.viewing_iteration {
+                self.iteration_archives
+                    .get(iter_idx)
+                    .and_then(|(_, dir)| find_archive_file(dir, "output.txt"))
+                    .or_else(|| {
+                        self.iteration_archives
+                            .get(iter_idx)
+                            .and_then(|(_, dir)| find_archive_file(dir, "output.log"))
+                    })
+                    .unwrap_or_else(|| agents_dir.join(agent_id).join("output.log"))
+            } else {
+                agents_dir.join(agent_id).join("output.log")
+            };
             if !log_path.exists() {
                 continue;
             }
@@ -9128,11 +9200,29 @@ impl VizApp {
             None => return,
         };
 
-        let log_path = self
-            .workgraph_dir
-            .join("agents")
-            .join(&agent_id)
-            .join("output.log");
+        // Check if iteration changed — if so, invalidate cached text so we reload
+        // from the new archive (or live output if returning to current).
+        if self.log_pane.viewing_iteration != self.viewing_iteration {
+            self.log_pane.viewing_iteration = self.viewing_iteration;
+            self.log_pane.agent_output = OutputAgentText::default();
+        }
+
+        let agents_dir = self.workgraph_dir.join("agents");
+
+        // When viewing a past iteration, read from the archived output instead of live.
+        let log_path = if let Some(iter_idx) = self.viewing_iteration {
+            self.iteration_archives
+                .get(iter_idx)
+                .and_then(|(_, dir)| find_archive_file(dir, "output.txt"))
+                .or_else(|| {
+                    self.iteration_archives
+                        .get(iter_idx)
+                        .and_then(|(_, dir)| find_archive_file(dir, "output.log"))
+                })
+                .unwrap_or_else(|| agents_dir.join(&agent_id).join("output.log"))
+        } else {
+            agents_dir.join(&agent_id).join("output.log")
+        };
         if !log_path.exists() {
             return;
         }

@@ -4551,6 +4551,9 @@ fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
             (Color::DarkGray, Style::default().fg(Color::DarkGray))
         }
         ActivityEventKind::VerificationResult => (Color::Cyan, Style::default().fg(Color::Cyan)),
+        ActivityEventKind::Compact => {
+            (Color::Magenta, Style::default().fg(Color::Magenta))
+        }
         ActivityEventKind::UserAction => (Color::White, Style::default().fg(Color::White)),
     }
 }
