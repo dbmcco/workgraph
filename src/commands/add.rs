@@ -140,6 +140,8 @@ pub fn run(
     delay: Option<&str>,
     not_before: Option<&str>,
     allow_phantom: bool,
+    independent: bool,
+    iteration_config: Option<workgraph::agency::IterationConfig>,
 ) -> Result<()> {
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
@@ -782,6 +784,11 @@ fn add_task_directly(
             unplaced: false,
             place_near: vec![],
             place_before: vec![],
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
         };
 
         graph.add_node(Node::Task(task));
