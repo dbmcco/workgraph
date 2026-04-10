@@ -315,6 +315,11 @@ impl ModelRegistry {
         self.models.get(id)
     }
 
+    /// Find a model by its ID (alias for get).
+    pub fn find_by_model(&self, model: &str) -> Option<&ModelEntry> {
+        self.models.get(model)
+    }
+
     /// Get the default model entry
     pub fn get_default(&self) -> Option<&ModelEntry> {
         self.default_model

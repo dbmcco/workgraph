@@ -448,6 +448,11 @@ pub fn run(
         unplaced: no_place,
         place_near: place_near.to_vec(),
         place_before: place_before.to_vec(),
+        independent,
+        iteration_round: 0,
+        iteration_anchor: None,
+        iteration_parent: None,
+        iteration_config,
     };
 
     // Add task to graph

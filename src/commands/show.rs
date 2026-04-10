@@ -20,6 +20,10 @@ fn is_zero(val: &u32) -> bool {
     *val == 0
 }
 
+fn is_bool_false(val: &bool) -> bool {
+    !*val
+}
+
 /// JSON output structure for show command
 #[derive(Debug, Serialize)]
 struct TaskDetails {
@@ -112,6 +116,16 @@ struct TaskDetails {
     superseded_by: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    independent: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    iteration_round: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_config: Option<workgraph::agency::IterationConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -352,6 +366,11 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         last_resurrected_at: task.last_resurrected_at.clone(),
         superseded_by: task.superseded_by.clone(),
         supersedes: task.supersedes.clone(),
+        independent: task.independent,
+        iteration_round: task.iteration_round,
+        iteration_anchor: task.iteration_anchor.clone(),
+        iteration_parent: task.iteration_parent.clone(),
+        iteration_config: task.iteration_config.clone(),
     };
 
     if json {
@@ -838,6 +857,11 @@ mod tests {
             last_resurrected_at: None,
             superseded_by: vec![],
             supersedes: None,
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();

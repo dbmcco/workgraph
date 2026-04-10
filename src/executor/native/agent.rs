@@ -24,6 +24,35 @@ use crate::stream_event::{self, StreamWriter, TotalUsage, TurnUsage};
 /// Default number of turns between session summary extractions.
 pub const DEFAULT_SUMMARY_INTERVAL_TURNS: usize = 10;
 
+/// Estimate cost in USD from token counts and registry pricing data.
+fn estimate_usage_cost(
+    entry: &crate::config::ModelRegistryEntry,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+) -> f64 {
+    let input_cost =
+        (input_tokens as f64 / 1_000_000.0) * entry.cost_per_input_mtok;
+    let output_cost =
+        (output_tokens as f64 / 1_000_000.0) * entry.cost_per_output_mtok;
+    let cache_read_cost = if entry.prompt_caching && entry.cache_read_discount > 0.0 {
+        (cache_read_input_tokens as f64 / 1_000_000.0)
+            * entry.cost_per_input_mtok
+            * entry.cache_read_discount
+    } else {
+        0.0
+    };
+    let cache_write_cost = if entry.prompt_caching && entry.cache_write_premium > 0.0 {
+        (cache_creation_input_tokens as f64 / 1_000_000.0)
+            * entry.cost_per_input_mtok
+            * entry.cache_write_premium
+    } else {
+        0.0
+    };
+    input_cost + output_cost + cache_read_cost + cache_write_cost
+}
+
 /// Record of a single tool call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallRecord {
@@ -72,6 +101,8 @@ pub struct AgentLoop {
     context_budget: ContextBudget,
     /// Mid-turn state injector for ephemeral context updates.
     state_injector: Option<StateInjector>,
+    /// Registry entry for cost estimation (populated from spawn path).
+    registry_entry: Option<crate::config::ModelRegistryEntry>,
 }
 
 /// NDJSON log entry types for the output file.
@@ -181,7 +212,14 @@ impl AgentLoop {
             heartbeat_interval: Duration::from_secs(30),
             context_budget,
             state_injector: None,
+            registry_entry: None,
         }
+    }
+
+    /// Set the registry entry for cost estimation.
+    pub fn with_registry_entry(mut self, entry: crate::config::ModelRegistryEntry) -> Self {
+        self.registry_entry = Some(entry);
+        self
     }
 
     /// Set the heartbeat interval for tool execution (default: 30s).
@@ -1159,6 +1197,15 @@ impl AgentLoop {
 
     fn write_stream_result(&self, success: bool, result: &AgentResult) {
         if let Some(ref sw) = self.stream_writer {
+            let cost_usd = self.registry_entry.as_ref().map(|entry| {
+                estimate_usage_cost(
+                    entry,
+                    u64::from(result.total_usage.input_tokens),
+                    u64::from(result.total_usage.output_tokens),
+                    result.total_usage.cache_read_input_tokens.unwrap_or(0) as u64,
+                    result.total_usage.cache_creation_input_tokens.unwrap_or(0) as u64,
+                )
+            });
             sw.write_result(
                 success,
                 TotalUsage {
@@ -1172,7 +1219,7 @@ impl AgentLoop {
                         .total_usage
                         .cache_creation_input_tokens
                         .map(u64::from),
-                    cost_usd: None, // Native executor doesn't track cost (no price table yet)
+                    cost_usd,
                     model: Some(self.client.model().to_string()),
                 },
             );

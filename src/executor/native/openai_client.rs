@@ -17,6 +17,7 @@ use super::client::{
     ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason, ToolDefinition,
     Usage,
 };
+use crate::config::ModelRegistryEntry;
 
 // ── OpenAI wire format types ────────────────────────────────────────────
 
@@ -261,6 +262,8 @@ pub struct OpenAiClient {
     /// Whether to use SSE streaming for requests.
     use_streaming: bool,
     context_window_tokens: usize,
+    /// Optional registry entry for cost estimation.
+    registry_entry: Option<ModelRegistryEntry>,
 }
 
 impl OpenAiClient {
@@ -283,6 +286,7 @@ impl OpenAiClient {
             provider_hint: None,
             use_streaming: false,
             context_window_tokens: 128_000,
+            registry_entry: None,
         })
     }
 
@@ -373,6 +377,15 @@ impl OpenAiClient {
     /// `with_provider_hint("openrouter")`. Call this to override.
     pub fn with_streaming(mut self, enabled: bool) -> Self {
         self.use_streaming = enabled;
+        self
+    }
+
+    /// Set a registry entry for cost estimation.
+    ///
+    /// When set, the client will calculate estimated cost per request
+    /// based on the model's pricing data from the registry.
+    pub fn with_registry_entry(mut self, entry: ModelRegistryEntry) -> Self {
+        self.registry_entry = Some(entry);
         self
     }
 

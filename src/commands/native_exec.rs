@@ -145,6 +145,12 @@ pub fn run(
     .with_resume(!no_resume)
     .with_working_dir(working_dir.clone());
 
+    // Add registry entry for cost tracking if available
+    let config = Config::load_or_default(workgraph_dir);
+    if let Some(entry) = config.registry_lookup(&effective_model) {
+        agent = agent.with_registry_entry(entry);
+    }
+
     if let Some(path) = session_summary_path {
         agent = agent.with_session_summary_path(path);
     }

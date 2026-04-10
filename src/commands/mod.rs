@@ -99,6 +99,7 @@ pub mod status;
 pub mod structure;
 pub mod sweep;
 pub mod telegram;
+pub mod spend;
 pub mod tokens;
 pub mod trace;
 pub mod trace_animate;
@@ -261,6 +262,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -308,6 +311,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -387,6 +392,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -441,6 +448,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -489,6 +498,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -537,6 +548,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -585,6 +598,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -636,6 +651,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -689,6 +706,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
 
@@ -742,6 +761,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
         super::done::run(dir, "prov-archive", false, false).unwrap();
@@ -792,6 +813,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
         super::fail::run(dir, "prov-gc", Some("oops")).unwrap();
@@ -845,6 +868,8 @@ mod provenance_coverage_tests {
             None,
             None,
             false,
+            false,
+            None,
         )
         .unwrap();
         // edit

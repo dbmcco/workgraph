@@ -1500,6 +1500,11 @@ fn build_auto_assign_tasks(
                     unplaced: false,
                     place_before: vec![],
                     place_near: vec![],
+                    independent: false,
+                    iteration_round: 0,
+                    iteration_anchor: None,
+                    iteration_parent: None,
+                    iteration_config: None,
                 };
 
                 graph.add_node(Node::Task(create_task));
@@ -1853,6 +1858,11 @@ fn build_flip_verification_tasks(
             unplaced: false,
             place_before: vec![],
             place_near: vec![],
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2101,6 +2111,11 @@ fn build_separate_verify_tasks(
             unplaced: false,
             place_before: vec![],
             place_near: vec![],
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
         };
 
         graph.add_node(Node::Task(verify_task));
@@ -2281,6 +2296,11 @@ fn build_auto_evolve_task(
         unplaced: false,
         place_before: vec![],
         place_near: vec![],
+        independent: false,
+        iteration_round: 0,
+        iteration_anchor: None,
+        iteration_parent: None,
+        iteration_config: None,
     };
 
     graph.add_node(Node::Task(evolve_task));
@@ -2464,6 +2484,11 @@ fn build_auto_create_task(
         unplaced: false,
         place_before: vec![],
         place_near: vec![],
+        independent: false,
+        iteration_round: 0,
+        iteration_anchor: None,
+        iteration_parent: None,
+        iteration_config: None,
     };
 
     graph.add_node(Node::Task(create_task));

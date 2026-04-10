@@ -297,6 +297,11 @@ pub fn run(
                 unplaced: false,
                 place_near: vec![],
                 place_before: vec![],
+                independent: false,
+                iteration_round: 0,
+                iteration_anchor: None,
+                iteration_parent: None,
+                iteration_config: None,
             };
 
             graph.add_node(Node::Task(task));
