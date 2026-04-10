@@ -82,8 +82,18 @@ pub fn builtin_profiles() -> Vec<Profile> {
             name: "openrouter",
             description: "Auto-select best OpenRouter models by usage and benchmarks",
             strategy: ProfileStrategy::Dynamic {
-                description:
-                    "Queries benchmark registry to rank models by pricing and reliability",
+                description: "Queries benchmark registry to rank models by pricing and reliability",
+            },
+        },
+        Profile {
+            name: "openrouter-open",
+            description: "OpenRouter open-weight models only",
+            strategy: ProfileStrategy::Static {
+                tiers: TierConfig {
+                    fast: Some("openrouter:deepseek/deepseek-v3.2".into()),
+                    standard: Some("openrouter:qwen/qwen3-coder".into()),
+                    premium: Some("openrouter:qwen/qwen3.5-397b-a17b".into()),
+                },
             },
         },
         Profile {
@@ -94,6 +104,17 @@ pub fn builtin_profiles() -> Vec<Profile> {
                     fast: Some("openrouter:openai/gpt-4o-mini".into()),
                     standard: Some("openrouter:openai/gpt-4o".into()),
                     premium: Some("openrouter:openai/o3-pro".into()),
+                },
+            },
+        },
+        Profile {
+            name: "codex",
+            description: "OpenAI Codex CLI models via Codex executor",
+            strategy: ProfileStrategy::Static {
+                tiers: TierConfig {
+                    fast: Some("codex:gpt-5.4-mini".into()),
+                    standard: Some("codex:gpt-5-codex".into()),
+                    premium: Some("codex:gpt-5.4-pro".into()),
                 },
             },
         },
@@ -145,7 +166,10 @@ fn tier_name(tier: &Tier) -> &'static str {
 }
 
 /// Get the ranked list for a given tier from `RankedTiers`.
-fn ranked_for_tier<'a>(ranked: &'a RankedTiers, tier: &Tier) -> &'a [crate::model_benchmarks::RankedModel] {
+fn ranked_for_tier<'a>(
+    ranked: &'a RankedTiers,
+    tier: &Tier,
+) -> &'a [crate::model_benchmarks::RankedModel] {
     match tier {
         Tier::Fast => &ranked.fast,
         Tier::Standard => &ranked.standard,
@@ -207,16 +231,15 @@ pub fn escalate_model(
         for (rank, candidate) in candidates.iter().enumerate() {
             let prefixed_id = format!("openrouter:{}", candidate.id);
             // Skip models already tried (check both raw and prefixed forms)
-            if tried_models.iter().any(|t| t == &candidate.id || t == &prefixed_id) {
+            if tried_models
+                .iter()
+                .any(|t| t == &candidate.id || t == &prefixed_id)
+            {
                 continue;
             }
             let is_same_tier = tier_offset == 0;
             let reason = if is_same_tier {
-                format!(
-                    "rank {} in {}-class",
-                    rank + 1,
-                    tier_name(tier),
-                )
+                format!("rank {} in {}-class", rank + 1, tier_name(tier),)
             } else {
                 format!(
                     "escalated to {}-class rank {} (exhausted {}-class)",
@@ -256,10 +279,12 @@ mod tests {
     #[test]
     fn test_builtin_profiles_exist() {
         let profiles = builtin_profiles();
-        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles.len(), 5);
         assert_eq!(profiles[0].name, "anthropic");
         assert_eq!(profiles[1].name, "openrouter");
-        assert_eq!(profiles[2].name, "openai");
+        assert_eq!(profiles[2].name, "openrouter-open");
+        assert_eq!(profiles[3].name, "openai");
+        assert_eq!(profiles[4].name, "codex");
     }
 
     #[test]
@@ -280,6 +305,25 @@ mod tests {
     }
 
     #[test]
+    fn test_openrouter_open_profile_is_static() {
+        let profile = get_profile("openrouter-open").unwrap();
+        assert!(profile.is_static());
+        let tiers = profile.resolve_tiers().unwrap();
+        assert_eq!(
+            tiers.fast.as_deref(),
+            Some("openrouter:deepseek/deepseek-v3.2")
+        );
+        assert_eq!(
+            tiers.standard.as_deref(),
+            Some("openrouter:qwen/qwen3-coder")
+        );
+        assert_eq!(
+            tiers.premium.as_deref(),
+            Some("openrouter:qwen/qwen3.5-397b-a17b")
+        );
+    }
+
+    #[test]
     fn test_openai_profile_is_static() {
         let profile = get_profile("openai").unwrap();
         assert!(profile.is_static());
@@ -287,6 +331,16 @@ mod tests {
         assert_eq!(tiers.fast.as_deref(), Some("openrouter:openai/gpt-4o-mini"));
         assert_eq!(tiers.standard.as_deref(), Some("openrouter:openai/gpt-4o"));
         assert_eq!(tiers.premium.as_deref(), Some("openrouter:openai/o3-pro"));
+    }
+
+    #[test]
+    fn test_codex_profile_is_static() {
+        let profile = get_profile("codex").unwrap();
+        assert!(profile.is_static());
+        let tiers = profile.resolve_tiers().unwrap();
+        assert_eq!(tiers.fast.as_deref(), Some("codex:gpt-5.4-mini"));
+        assert_eq!(tiers.standard.as_deref(), Some("codex:gpt-5-codex"));
+        assert_eq!(tiers.premium.as_deref(), Some("codex:gpt-5.4-pro"));
     }
 
     #[test]
@@ -341,9 +395,7 @@ mod tests {
                 make_ranked_model("vendor/std-b", "standard"),
                 make_ranked_model("vendor/std-c", "standard"),
             ],
-            premium: vec![
-                make_ranked_model("vendor/prem-a", "premium"),
-            ],
+            premium: vec![make_ranked_model("vendor/prem-a", "premium")],
         }
     }
 
@@ -352,13 +404,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_ranked_tiers(tmp.path(), &sample_ranked_tiers());
         // Static profiles should never escalate
-        let result = escalate_model(
-            tmp.path(),
-            Some("anthropic"),
-            Some("claude:sonnet"),
-            &[],
-            3,
-        );
+        let result = escalate_model(tmp.path(), Some("anthropic"), Some("claude:sonnet"), &[], 3);
         assert!(result.is_none());
     }
 
@@ -611,7 +657,10 @@ mod tests {
     #[test]
     fn test_find_model_tier_with_prefix() {
         let ranked = sample_ranked_tiers();
-        assert_eq!(find_model_tier(&ranked, "openrouter:vendor/std-a"), Some(Tier::Standard));
+        assert_eq!(
+            find_model_tier(&ranked, "openrouter:vendor/std-a"),
+            Some(Tier::Standard)
+        );
     }
 
     #[test]

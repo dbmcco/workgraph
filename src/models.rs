@@ -477,7 +477,11 @@ mod tests {
 
         let loaded = ModelRegistry::load(dir.path()).unwrap();
         assert_eq!(loaded.models.len(), reg.models.len());
-        assert!(loaded.models.contains_key(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")));
+        assert!(
+            loaded
+                .models
+                .contains_key(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
+        );
     }
 
     #[test]
@@ -542,7 +546,8 @@ mod tests {
     #[test]
     fn test_yaml_roundtrip() {
         let mut reg = ModelRegistry::with_defaults();
-        reg.set_default(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")).unwrap();
+        reg.set_default(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
+            .unwrap();
 
         let yaml = serde_yaml::to_string(&reg).unwrap();
         let parsed: ModelRegistry = serde_yaml::from_str(&yaml).unwrap();

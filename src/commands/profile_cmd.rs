@@ -46,10 +46,17 @@ pub fn set(
         apply_tier_pins(&mut config, fast, standard, premium);
         config.save(dir)?;
 
-        println!("Profile set: {} (dynamic — auto-configured from registry)", name);
+        println!(
+            "Profile set: {} (dynamic — auto-configured from registry)",
+            name
+        );
         println!();
         print_tier_selection("fast", &ranked.fast, config.tiers.fast.as_deref());
-        print_tier_selection("standard", &ranked.standard, config.tiers.standard.as_deref());
+        print_tier_selection(
+            "standard",
+            &ranked.standard,
+            config.tiers.standard.as_deref(),
+        );
         print_tier_selection("premium", &ranked.premium, config.tiers.premium.as_deref());
     } else {
         // Static profile, or dynamic with explicit tier pins — apply pins directly.
@@ -151,11 +158,7 @@ fn print_tier_selection(
     }
 
     let top = &ranked[0];
-    println!(
-        "  {:<10} → {}",
-        tier_name,
-        selected_id.unwrap_or(&top.id)
-    );
+    println!("  {:<10} → {}", tier_name, selected_id.unwrap_or(&top.id));
     println!(
         "             {} | popularity: {:.1} | benchmarks: {:.1} | composite: {:.1}",
         top.name, top.popularity_score, top.benchmark_score, top.composite_score
@@ -172,8 +175,8 @@ fn print_tier_selection(
 /// Save ranked tiers to `.workgraph/profile_ranked_tiers.json`.
 fn save_ranked_tiers(dir: &Path, ranked: &RankedTiers) -> Result<()> {
     let path = dir.join(RANKED_TIERS_FILE);
-    let content = serde_json::to_string_pretty(ranked)
-        .context("Failed to serialize ranked tiers")?;
+    let content =
+        serde_json::to_string_pretty(ranked).context("Failed to serialize ranked tiers")?;
     std::fs::write(&path, content)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -205,18 +208,9 @@ pub fn refresh(dir: &Path) -> Result<()> {
         config.save(dir)?;
         println!();
         println!("Rankings updated:");
-        println!(
-            "  fast:     {} candidates",
-            ranked.fast.len()
-        );
-        println!(
-            "  standard: {} candidates",
-            ranked.standard.len()
-        );
-        println!(
-            "  premium:  {} candidates",
-            ranked.premium.len()
-        );
+        println!("  fast:     {} candidates", ranked.fast.len());
+        println!("  standard: {} candidates", ranked.standard.len());
+        println!("  premium:  {} candidates", ranked.premium.len());
     } else {
         println!();
         println!("Registry updated. Set a dynamic profile to auto-rank:");
@@ -325,7 +319,11 @@ pub fn show(dir: &Path, json: bool, verbose: bool) -> Result<()> {
                     total,
                     scored,
                     &registry.fetched_at[..10],
-                    if stale { " (stale — run `wg profile refresh`)" } else { "" },
+                    if stale {
+                        " (stale — run `wg profile refresh`)"
+                    } else {
+                        ""
+                    },
                 );
             }
 
@@ -336,7 +334,9 @@ pub fn show(dir: &Path, json: bool, verbose: bool) -> Result<()> {
             print_ranked_tier("premium", &ranked.premium, verbose);
         } else {
             println!();
-            println!("  No ranked data available. Run `wg profile set openrouter` to auto-configure.");
+            println!(
+                "  No ranked data available. Run `wg profile set openrouter` to auto-configure."
+            );
         }
     }
 
@@ -355,7 +355,10 @@ fn print_ranked_tier(tier_name: &str, ranked: &[model_benchmarks::RankedModel], 
     println!();
     println!(
         "    {} tier ({} candidates, {} curated, {} proxy)",
-        tier_name, ranked.len(), curated_count, proxy_count
+        tier_name,
+        ranked.len(),
+        curated_count,
+        proxy_count
     );
 
     let display_count = if verbose { 20 } else { 10 };
@@ -380,7 +383,11 @@ fn print_ranked_tier(tier_name: &str, ranked: &[model_benchmarks::RankedModel], 
                 .context_window
                 .map(|c| format!("{}k", c / 1000))
                 .unwrap_or_else(|| "?".to_string());
-            let tools = if model.supports_tools { "tools" } else { "no-tools" };
+            let tools = if model.supports_tools {
+                "tools"
+            } else {
+                "no-tools"
+            };
             println!(
                 "          in:${:.2}/MTok  out:${:.2}/MTok  ctx:{}  {}",
                 in_price, out_price, ctx, tools,
@@ -431,7 +438,11 @@ pub fn list(dir: &Path, json: bool) -> Result<()> {
             ""
         };
         println!(
-            "  {:<12} {} ({}){}", p.name, p.description, p.strategy_label(), active_marker
+            "  {:<12} {} ({}){}",
+            p.name,
+            p.description,
+            p.strategy_label(),
+            active_marker
         );
 
         if let Some(tiers) = p.resolve_tiers() {
@@ -454,4 +465,3 @@ pub fn list(dir: &Path, json: bool) -> Result<()> {
 
     Ok(())
 }
-

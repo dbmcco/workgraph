@@ -475,7 +475,10 @@ impl OpenAiClient {
                             ContentBlock::Text { text } => {
                                 text_parts.push(text.clone());
                             }
-                            ContentBlock::Thinking { reasoning_details: rd, .. } => {
+                            ContentBlock::Thinking {
+                                reasoning_details: rd,
+                                ..
+                            } => {
                                 // Pass back reasoning_details verbatim for models that need it
                                 if let Some(rd) = rd {
                                     reasoning_details = Some(rd.clone());
@@ -547,7 +550,8 @@ impl OpenAiClient {
         } else if let Some(ref rd) = choice.message.reasoning_details {
             // Some models only return reasoning_details without the plaintext reasoning field
             if !rd.is_empty() {
-                let thinking_text = rd.iter()
+                let thinking_text = rd
+                    .iter()
                     .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -570,7 +574,10 @@ impl OpenAiClient {
             let has_inline_thinking = inline_thinking.is_some();
             if let Some(thinking) = inline_thinking {
                 // Only add if we don't already have a Thinking block from the API fields
-                if !content_blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
+                if !content_blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+                {
                     content_blocks.push(ContentBlock::Thinking {
                         thinking,
                         reasoning_details: None,
@@ -578,7 +585,11 @@ impl OpenAiClient {
                 }
             }
 
-            let text_to_process = if has_inline_thinking { clean_text } else { text };
+            let text_to_process = if has_inline_thinking {
+                clean_text
+            } else {
+                text
+            };
 
             if !text_to_process.is_empty() {
                 // If there are no structured tool calls, check for text-based tool calls
@@ -594,10 +605,14 @@ impl OpenAiClient {
                         }
                         content_blocks.extend(extracted);
                     } else {
-                        content_blocks.push(ContentBlock::Text { text: text_to_process });
+                        content_blocks.push(ContentBlock::Text {
+                            text: text_to_process,
+                        });
                     }
                 } else {
-                    content_blocks.push(ContentBlock::Text { text: text_to_process });
+                    content_blocks.push(ContentBlock::Text {
+                        text: text_to_process,
+                    });
                 }
             }
         }
@@ -650,9 +665,7 @@ impl OpenAiClient {
                     .prompt_tokens_details
                     .map(|d| (d.cached_tokens, d.cache_write_tokens))
                     .unwrap_or((None, None));
-                let reasoning_tokens = u
-                    .completion_tokens_details
-                    .and_then(|d| d.reasoning_tokens);
+                let reasoning_tokens = u.completion_tokens_details.and_then(|d| d.reasoning_tokens);
                 Usage {
                     input_tokens: u.prompt_tokens,
                     output_tokens: u.completion_tokens,
@@ -692,11 +705,12 @@ impl OpenAiClient {
             Some("auto".to_string())
         };
         let reasoning = self.reasoning_value();
-        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
-            Some(true)
-        } else {
-            None
-        };
+        let include_reasoning =
+            if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+                Some(true)
+            } else {
+                None
+            };
         let oai_request = OaiRequest {
             model: request.model.clone(),
             messages: Self::translate_messages(&request.system, &request.messages),
@@ -733,11 +747,12 @@ impl OpenAiClient {
             Some("auto".to_string())
         };
         let reasoning = self.reasoning_value();
-        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
-            Some(true)
-        } else {
-            None
-        };
+        let include_reasoning =
+            if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+                Some(true)
+            } else {
+                None
+            };
         let oai_request = OaiRequest {
             model: request.model.clone(),
             messages: Self::translate_messages(&request.system, &request.messages),
@@ -938,7 +953,15 @@ impl OpenAiClient {
         );
 
         // Assemble the response
-        assemble_oai_stream_response(response_id, text_content, reasoning_content, reasoning_details, tool_calls, finish_reason, usage)
+        assemble_oai_stream_response(
+            response_id,
+            text_content,
+            reasoning_content,
+            reasoning_details,
+            tool_calls,
+            finish_reason,
+            usage,
+        )
     }
 
     /// Execute a single streaming attempt with a text callback for progressive display.
@@ -1089,7 +1112,15 @@ impl OpenAiClient {
             reasoning_info,
         );
 
-        assemble_oai_stream_response(response_id, text_content, reasoning_content, reasoning_details, tool_calls, finish_reason, usage)
+        assemble_oai_stream_response(
+            response_id,
+            text_content,
+            reasoning_content,
+            reasoning_details,
+            tool_calls,
+            finish_reason,
+            usage,
+        )
     }
 
     /// Streaming completion with text callback and retry logic.
@@ -1105,11 +1136,12 @@ impl OpenAiClient {
             Some("auto".to_string())
         };
         let reasoning = self.reasoning_value();
-        let include_reasoning = if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
-            Some(true)
-        } else {
-            None
-        };
+        let include_reasoning =
+            if reasoning.is_none() && self.provider_hint.as_deref() == Some("openrouter") {
+                Some(true)
+            } else {
+                None
+            };
         let oai_request = OaiRequest {
             model: request.model.clone(),
             messages: Self::translate_messages(&request.system, &request.messages),
@@ -1367,8 +1399,16 @@ pub struct ApiError {
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.status {
-            401 => write!(f, "Authentication failed (HTTP 401): {}. Check your API key configuration.", self.message),
-            403 => write!(f, "Access denied (HTTP 403): {}. Check your API key permissions.", self.message),
+            401 => write!(
+                f,
+                "Authentication failed (HTTP 401): {}. Check your API key configuration.",
+                self.message
+            ),
+            403 => write!(
+                f,
+                "Access denied (HTTP 403): {}. Check your API key permissions.",
+                self.message
+            ),
             _ => write!(f, "API error {}: {}", self.status, self.message),
         }
     }
@@ -1410,7 +1450,9 @@ fn jittered_backoff(base_ms: u64) -> u64 {
         .subsec_nanos() as u64;
     // Mix in thread id for cross-thread variance
     let tid = std::thread::current().id();
-    let hash = nanos.wrapping_mul(6364136223846793005).wrapping_add(format!("{:?}", tid).len() as u64);
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(format!("{:?}", tid).len() as u64);
     // ±25% jitter
     let jitter_range = base_ms / 4;
     if jitter_range == 0 {
@@ -1727,7 +1769,10 @@ fn try_recover_json(raw: &str) -> Result<serde_json::Value, String> {
         }
     }
 
-    Err(format!("all recovery strategies failed for: {}", truncate(raw, 200)))
+    Err(format!(
+        "all recovery strategies failed for: {}",
+        truncate(raw, 200)
+    ))
 }
 
 /// Strip markdown code fences: ```json\n...\n``` or ```\n...\n```
@@ -2323,14 +2368,19 @@ fn assemble_oai_stream_response(
 
     // Add thinking/reasoning block FIRST if we accumulated reasoning content
     if !reasoning_content.is_empty() {
-        let rd = if reasoning_details.is_empty() { None } else { Some(reasoning_details.clone()) };
+        let rd = if reasoning_details.is_empty() {
+            None
+        } else {
+            Some(reasoning_details.clone())
+        };
         content_blocks.push(ContentBlock::Thinking {
             thinking: reasoning_content,
             reasoning_details: rd,
         });
     } else if !reasoning_details.is_empty() {
         // Only reasoning_details without plaintext — extract text from entries
-        let thinking_text = reasoning_details.iter()
+        let thinking_text = reasoning_details
+            .iter()
             .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join("\n");
@@ -2348,7 +2398,10 @@ fn assemble_oai_stream_response(
 
         let has_inline_thinking = inline_thinking.is_some();
         if let Some(thinking) = inline_thinking {
-            if !content_blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { .. })) {
+            if !content_blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Thinking { .. }))
+            {
                 content_blocks.push(ContentBlock::Thinking {
                     thinking,
                     reasoning_details: None,
@@ -2356,7 +2409,11 @@ fn assemble_oai_stream_response(
             }
         }
 
-        let text_to_process = if has_inline_thinking { clean_text } else { text_content };
+        let text_to_process = if has_inline_thinking {
+            clean_text
+        } else {
+            text_content
+        };
 
         if !text_to_process.is_empty() {
             // If no structured tool calls came through the stream, check for text-based ones
@@ -2372,20 +2429,23 @@ fn assemble_oai_stream_response(
                     }
                     content_blocks.extend(extracted);
                 } else {
-                    content_blocks.push(ContentBlock::Text { text: text_to_process });
+                    content_blocks.push(ContentBlock::Text {
+                        text: text_to_process,
+                    });
                 }
             } else {
-                content_blocks.push(ContentBlock::Text { text: text_to_process });
+                content_blocks.push(ContentBlock::Text {
+                    text: text_to_process,
+                });
             }
         }
     }
 
     for (_index, (id, name, arguments)) in tool_calls {
-        let input: serde_json::Value =
-            match serde_json::from_str(&arguments) {
-                Ok(v) => v,
-                Err(e) => make_parse_error_input(&arguments, &e.to_string()),
-            };
+        let input: serde_json::Value = match serde_json::from_str(&arguments) {
+            Ok(v) => v,
+            Err(e) => make_parse_error_input(&arguments, &e.to_string()),
+        };
         content_blocks.push(ContentBlock::ToolUse { id, name, input });
     }
 
@@ -2417,9 +2477,7 @@ fn assemble_oai_stream_response(
                 .prompt_tokens_details
                 .map(|d| (d.cached_tokens, d.cache_write_tokens))
                 .unwrap_or((None, None));
-            let reasoning_tokens = u
-                .completion_tokens_details
-                .and_then(|d| d.reasoning_tokens);
+            let reasoning_tokens = u.completion_tokens_details.and_then(|d| d.reasoning_tokens);
             Usage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
@@ -2738,7 +2796,6 @@ mod tests {
         assert_eq!(data, r#"{"cr":true}"#);
     }
 
-
     // ── Parse error handling tests ────────────────────────────────────────
 
     #[test]
@@ -2781,11 +2838,13 @@ mod tests {
     #[test]
     fn test_make_parse_error_input() {
         // Truncated JSON should be recovered by completing the braces
-        let input =
-            make_parse_error_input(r#"{"broken":true"#, "expected `}` at line 1 column 14");
+        let input = make_parse_error_input(r#"{"broken":true"#, "expected `}` at line 1 column 14");
         // Recovery should succeed: {"broken":true} is valid
         assert_eq!(input.get("broken").and_then(|v| v.as_bool()), Some(true));
-        assert!(input.get("__parse_error").is_none(), "should have recovered");
+        assert!(
+            input.get("__parse_error").is_none(),
+            "should have recovered"
+        );
 
         // Truly unrecoverable input falls back to __parse_error
         let bad_input = make_parse_error_input("not json at all", "expected value at line 1");
@@ -3165,8 +3224,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let client = OpenAiClient::from_endpoint(&ep, "gpt-4o", None).unwrap();
         assert_eq!(client.model, "gpt-4o");
         assert_eq!(client.base_url, "https://api.openai.com/v1");
@@ -3187,8 +3246,8 @@ mod tests {
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let client = OpenAiClient::from_endpoint(&ep, "anthropic/claude-sonnet-4-6", None).unwrap();
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(client.provider_hint.as_deref(), Some("openrouter"));
@@ -3209,8 +3268,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let result = OpenAiClient::from_endpoint(&ep, "some-model", None);
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
@@ -3229,8 +3288,8 @@ mod tests {
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let client = OpenAiClient::from_endpoint(&ep, "model", None).unwrap();
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
     }
@@ -3318,8 +3377,16 @@ mod tests {
             }
         }
 
-        let resp =
-            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
+        let resp = assemble_oai_stream_response(
+            response_id,
+            text,
+            String::new(),
+            Vec::new(),
+            tool_calls,
+            finish,
+            usage,
+        )
+        .unwrap();
         assert_eq!(resp.id, "gen-1");
         assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
         assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
@@ -3384,8 +3451,16 @@ mod tests {
             }
         }
 
-        let resp =
-            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
+        let resp = assemble_oai_stream_response(
+            response_id,
+            text,
+            String::new(),
+            Vec::new(),
+            tool_calls,
+            finish,
+            usage,
+        )
+        .unwrap();
         assert_eq!(resp.id, "gen-2");
         assert_eq!(resp.content.len(), 1);
         assert!(matches!(
@@ -3458,8 +3533,16 @@ mod tests {
             }
         }
 
-        let resp =
-            assemble_oai_stream_response(response_id, text, String::new(), Vec::new(), tool_calls, finish, usage).unwrap();
+        let resp = assemble_oai_stream_response(
+            response_id,
+            text,
+            String::new(),
+            Vec::new(),
+            tool_calls,
+            finish,
+            usage,
+        )
+        .unwrap();
         assert_eq!(resp.content.len(), 3); // text + 2 tool calls
         assert!(
             matches!(&resp.content[0], ContentBlock::Text { text } if text == "Running checks.")
@@ -3641,7 +3724,8 @@ Done."#;
     #[test]
     fn test_extract_tool_calls_plugin_format() {
         // Qwen3/Hermes style <|plugin|> format
-        let text = r#"<|plugin|>{"name": "read_file", "arguments": {"path": "/etc/hosts"}}<|/plugin|>"#;
+        let text =
+            r#"<|plugin|>{"name": "read_file", "arguments": {"path": "/etc/hosts"}}<|/plugin|>"#;
         let (remaining, calls) = extract_tool_calls_from_text(text);
         assert_eq!(calls.len(), 1);
         assert!(
@@ -4009,7 +4093,11 @@ Done."#;
         assert_eq!(result.model, "minimax/minimax-m9.9");
         assert!(!result.suggestions.is_empty());
         assert!(
-            !result.warning.as_deref().unwrap_or("").contains(OPENROUTER_AUTO_MODEL),
+            !result
+                .warning
+                .as_deref()
+                .unwrap_or("")
+                .contains(OPENROUTER_AUTO_MODEL),
             "should not fall back to openrouter/auto"
         );
     }
@@ -4071,7 +4159,9 @@ Done."#;
         assert!(is_retryable(429));
         assert_eq!(max_retries_for_status(429), 5);
         let mut backoff = 1000u64;
-        for _ in 0..5 { backoff = (backoff * 2).min(60_000); }
+        for _ in 0..5 {
+            backoff = (backoff * 2).min(60_000);
+        }
         assert!(backoff <= 60_000);
         let body = r#"{"error":{"message":"rate limited","metadata":{"retry_after":2.5}}}"#;
         assert_eq!(parse_retry_after_oai(body), Some(2500));
@@ -4127,14 +4217,20 @@ Done."#;
         let raw = "```\n{\"key\": \"value\"}\n```";
         let result = try_recover_json(raw);
         assert!(result.is_ok(), "should recover markdown without lang tag");
-        assert_eq!(result.unwrap().get("key").and_then(|v| v.as_str()), Some("value"));
+        assert_eq!(
+            result.unwrap().get("key").and_then(|v| v.as_str()),
+            Some("value")
+        );
     }
 
     #[test]
     fn test_json_recovery_markdown_no_closing_fence() {
         let raw = "```json\n{\"key\": \"value\"}";
         let result = try_recover_json(raw);
-        assert!(result.is_ok(), "should recover markdown without closing fence");
+        assert!(
+            result.is_ok(),
+            "should recover markdown without closing fence"
+        );
     }
 
     #[test]
@@ -4142,7 +4238,10 @@ Done."#;
         let raw = "Here is the tool call: {\"command\": \"echo hello\"} and some trailing text";
         let result = try_recover_json(raw);
         assert!(result.is_ok(), "should extract embedded JSON object");
-        assert_eq!(result.unwrap().get("command").and_then(|v| v.as_str()), Some("echo hello"));
+        assert_eq!(
+            result.unwrap().get("command").and_then(|v| v.as_str()),
+            Some("echo hello")
+        );
     }
 
     #[test]
@@ -4150,8 +4249,15 @@ Done."#;
         // Truncated JSON missing closing brace
         let raw = r#"{"command": "ls""#;
         let result = try_recover_json(raw);
-        assert!(result.is_ok(), "should complete truncated JSON: {:?}", result);
-        assert_eq!(result.unwrap().get("command").and_then(|v| v.as_str()), Some("ls"));
+        assert!(
+            result.is_ok(),
+            "should complete truncated JSON: {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap().get("command").and_then(|v| v.as_str()),
+            Some("ls")
+        );
     }
 
     #[test]
@@ -4246,7 +4352,10 @@ Done."#;
                 assert!(
                     result >= lower && result <= upper,
                     "jittered_backoff({}) = {} not in [{}, {}]",
-                    base, result, lower, upper
+                    base,
+                    result,
+                    lower,
+                    upper
                 );
             }
         }
@@ -4284,14 +4393,21 @@ Done."#;
         ] {
             let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, msg);
             let err = oai_api_error(400, &body);
-            assert!(is_context_too_long(&err), "should detect context-too-long for: {}", msg);
+            assert!(
+                is_context_too_long(&err),
+                "should detect context-too-long for: {}",
+                msg
+            );
         }
     }
 
     #[test]
     fn test_is_context_too_long_400_unrelated() {
         let err = oai_api_error(400, r#"{"error":{"message":"Invalid parameter"}}"#);
-        assert!(!is_context_too_long(&err), "unrelated 400 should not be context-too-long");
+        assert!(
+            !is_context_too_long(&err),
+            "unrelated 400 should not be context-too-long"
+        );
     }
 
     #[test]

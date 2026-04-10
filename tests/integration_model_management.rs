@@ -14,8 +14,8 @@ use std::path::Path;
 use tempfile::TempDir;
 
 use workgraph::config::{
-    Config, DispatchRole, EndpointConfig, EndpointsConfig, ModelRegistryEntry, Tier,
-    CLAUDE_HAIKU_MODEL_ID, CLAUDE_SONNET_MODEL_ID,
+    CLAUDE_HAIKU_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole, EndpointConfig,
+    EndpointsConfig, ModelRegistryEntry, Tier,
 };
 use workgraph::graph::WorkGraph;
 use workgraph::parser::save_graph;
@@ -275,7 +275,10 @@ mod model_management_per_task_override {
             Tier::new(agent_preferred_model, agent_preferred_provider),
             Tier::new(executor_model, None),
             Tier::new(role_model, role_provider),
-            Tier::new(coordinator_model.map(|s| s.to_string()), coordinator_provider),
+            Tier::new(
+                coordinator_model.map(|s| s.to_string()),
+                coordinator_provider,
+            ),
         ];
         ResolvedModelProvider {
             model: tiers.iter().find_map(|t| t.model.clone()),
@@ -314,7 +317,15 @@ mod model_management_per_task_override {
         // Simulate task with --model my-custom
         let task_model = Some("my-custom".to_string());
         let resolved = resolve_model_and_provider(
-            task_model, None, None, None, None, None, None, Some("claude:sonnet"), None,
+            task_model,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude:sonnet"),
+            None,
         );
         assert_eq!(resolved.model, Some("my-custom".to_string()));
 
@@ -334,7 +345,15 @@ mod model_management_per_task_override {
 
         // No task model → falls through to coordinator model
         let resolved = resolve_model_and_provider(
-            None, None, None, None, None, None, None, Some("claude:sonnet"), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude:sonnet"),
+            None,
         );
         assert_eq!(resolved.model, Some("claude:sonnet".to_string()));
 
@@ -347,11 +366,15 @@ mod model_management_per_task_override {
     #[test]
     fn task_model_overrides_all_levels() {
         let resolved = resolve_model_and_provider(
-            Some("task-override".to_string()), None,
-            Some("agent-preferred".to_string()), None,
+            Some("task-override".to_string()),
+            None,
+            Some("agent-preferred".to_string()),
+            None,
             Some("executor-default".to_string()),
-            None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(resolved.model, Some("task-override".to_string()));
     }
@@ -359,11 +382,15 @@ mod model_management_per_task_override {
     #[test]
     fn agent_preferred_when_no_task() {
         let resolved = resolve_model_and_provider(
-            None, None,
-            Some("agent-preferred".to_string()), None,
+            None,
+            None,
+            Some("agent-preferred".to_string()),
+            None,
             Some("executor-default".to_string()),
-            None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(resolved.model, Some("agent-preferred".to_string()));
     }
@@ -371,10 +398,15 @@ mod model_management_per_task_override {
     #[test]
     fn executor_when_no_agent() {
         let resolved = resolve_model_and_provider(
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
             Some("executor-default".to_string()),
-            None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(resolved.model, Some("executor-default".to_string()));
     }
@@ -382,17 +414,23 @@ mod model_management_per_task_override {
     #[test]
     fn coordinator_fallback() {
         let resolved = resolve_model_and_provider(
-            None, None, None, None, None, None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(resolved.model, Some("coordinator-fallback".to_string()));
     }
 
     #[test]
     fn all_none_returns_none() {
-        let resolved = resolve_model_and_provider(
-            None, None, None, None, None, None, None, None, None,
-        );
+        let resolved =
+            resolve_model_and_provider(None, None, None, None, None, None, None, None, None);
         assert_eq!(resolved.model, None);
         assert_eq!(resolved.provider, None);
     }
@@ -400,11 +438,15 @@ mod model_management_per_task_override {
     #[test]
     fn task_provider_overrides_all() {
         let resolved = resolve_model_and_provider(
-            None, Some("openai".to_string()),
-            None, Some("openrouter".to_string()),
             None,
-            None, Some("anthropic".to_string()),
-            None, None,
+            Some("openai".to_string()),
+            None,
+            Some("openrouter".to_string()),
+            None,
+            None,
+            Some("anthropic".to_string()),
+            None,
+            None,
         );
         assert_eq!(resolved.provider, Some("openai".to_string()));
     }
@@ -1604,7 +1646,9 @@ mod unified_key_resolution {
         unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
         let config = Config::load_merged(dir).unwrap();
-        let key = config.resolve_api_key_for_provider("openrouter", dir).unwrap();
+        let key = config
+            .resolve_api_key_for_provider("openrouter", dir)
+            .unwrap();
         assert_eq!(key, "sk-or-e2e-test");
 
         // Restore env

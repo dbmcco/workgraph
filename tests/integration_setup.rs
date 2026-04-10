@@ -81,9 +81,8 @@ fn load_global_config(fake_home: &Path) -> Config {
     let path = fake_home.join(".workgraph/config.toml");
     let content = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read config at {:?}: {}", path, e));
-    toml::from_str(&content).unwrap_or_else(|e| {
-        panic!("Failed to parse config.toml:\n{}\nError: {}", content, e)
-    })
+    toml::from_str(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse config.toml:\n{}\nError: {}", content, e))
 }
 
 // ===========================================================================
@@ -98,7 +97,13 @@ fn fresh_setup_creates_valid_config() {
     let output = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "sonnet", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "sonnet",
+            "--skip-validation",
+        ],
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -149,7 +154,9 @@ fn fresh_setup_default_anthropic() {
 
     // Should print summary info
     assert!(
-        stdout.contains("Provider") || stdout.contains("Configuration") || stdout.contains("Summary"),
+        stdout.contains("Provider")
+            || stdout.contains("Configuration")
+            || stdout.contains("Summary"),
         "stdout should contain summary output, got: {}",
         stdout
     );
@@ -177,7 +184,13 @@ fn fresh_setup_config_roundtrips_through_toml() {
     let output = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "opus", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "opus",
+            "--skip-validation",
+        ],
     );
     assert!(output.status.success());
 
@@ -190,7 +203,10 @@ fn fresh_setup_config_roundtrips_through_toml() {
 
     assert_eq!(reloaded.coordinator.executor, config.coordinator.executor);
     assert_eq!(reloaded.agent.model, config.agent.model);
-    assert_eq!(reloaded.coordinator.max_agents, config.coordinator.max_agents);
+    assert_eq!(
+        reloaded.coordinator.max_agents,
+        config.coordinator.max_agents
+    );
 }
 
 // ===========================================================================
@@ -223,7 +239,13 @@ model = "claude:haiku"
     let output = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "opus", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "opus",
+            "--skip-validation",
+        ],
     );
     assert!(
         output.status.success(),
@@ -272,7 +294,13 @@ rotation_threshold = 9999999
     let output = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "haiku", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "haiku",
+            "--skip-validation",
+        ],
     );
     assert!(output.status.success());
 
@@ -301,7 +329,13 @@ fn setup_twice_produces_valid_config_each_time() {
     let out1 = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "sonnet", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "sonnet",
+            "--skip-validation",
+        ],
     );
     assert!(
         out1.status.success(),
@@ -316,7 +350,13 @@ fn setup_twice_produces_valid_config_each_time() {
     let out2 = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "opus", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "opus",
+            "--skip-validation",
+        ],
     );
     assert!(
         out2.status.success(),
@@ -350,7 +390,13 @@ fn anthropic_setup_produces_expected_spawn_values() {
     let output = wg_setup_cmd(
         &fake_home,
         &wg_dir,
-        &["--provider", "anthropic", "--model", "opus", "--skip-validation"],
+        &[
+            "--provider",
+            "anthropic",
+            "--model",
+            "opus",
+            "--skip-validation",
+        ],
     );
     assert!(output.status.success());
 
@@ -392,8 +438,10 @@ fn openrouter_setup_produces_expected_spawn_values() {
         &fake_home,
         &wg_dir,
         &[
-            "--provider", "openrouter",
-            "--model", "anthropic/claude-sonnet-4",
+            "--provider",
+            "openrouter",
+            "--model",
+            "anthropic/claude-sonnet-4",
             "--skip-validation",
         ],
     );
@@ -433,9 +481,12 @@ fn local_setup_produces_expected_spawn_values() {
         &fake_home,
         &wg_dir,
         &[
-            "--provider", "local",
-            "--model", "llama3",
-            "--url", "http://localhost:11434/v1",
+            "--provider",
+            "local",
+            "--model",
+            "llama3",
+            "--url",
+            "http://localhost:11434/v1",
             "--skip-validation",
         ],
     );
@@ -474,8 +525,10 @@ fn setup_with_custom_model_id() {
         &fake_home,
         &wg_dir,
         &[
-            "--provider", "openai",
-            "--model", "gpt-4o",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
             "--skip-validation",
         ],
     );

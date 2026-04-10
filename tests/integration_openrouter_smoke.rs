@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use workgraph::config::{
-    Config, DispatchRole, EndpointConfig, EndpointsConfig, CLAUDE_OPUS_MODEL_ID,
-    CLAUDE_SONNET_MODEL_ID,
+    CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole, EndpointConfig,
+    EndpointsConfig,
 };
 use workgraph::graph::WorkGraph;
 use workgraph::parser::save_graph;
@@ -165,10 +165,9 @@ fn openrouter_endpoint_bound_to_evaluator_resolves_correctly() {
 
     // Bind the endpoint to the evaluator role
     let sonnet_model = format!("anthropic/{CLAUDE_SONNET_MODEL_ID}");
-    config.models.set_model(
-        DispatchRole::Evaluator,
-        &sonnet_model,
-    );
+    config
+        .models
+        .set_model(DispatchRole::Evaluator, &sonnet_model);
     config
         .models
         .set_provider(DispatchRole::Evaluator, "openrouter");
@@ -217,10 +216,9 @@ fn openrouter_client_creation_from_resolved_config() {
     };
 
     let sonnet_model = format!("anthropic/{CLAUDE_SONNET_MODEL_ID}");
-    config.models.set_model(
-        DispatchRole::Evaluator,
-        &sonnet_model,
-    );
+    config
+        .models
+        .set_model(DispatchRole::Evaluator, &sonnet_model);
     config
         .models
         .set_provider(DispatchRole::Evaluator, "openrouter");
@@ -307,10 +305,9 @@ fn mixed_endpoints_different_roles_different_providers() {
         .set_endpoint(DispatchRole::TaskAgent, "anthropic-direct");
 
     // Evaluator uses OpenRouter
-    config.models.set_model(
-        DispatchRole::Evaluator,
-        &sonnet_model,
-    );
+    config
+        .models
+        .set_model(DispatchRole::Evaluator, &sonnet_model);
     config
         .models
         .set_provider(DispatchRole::Evaluator, "openrouter");

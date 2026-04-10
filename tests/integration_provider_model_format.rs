@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use workgraph::config::{
-    Config, CLAUDE_OPUS_MODEL_ID, KNOWN_PROVIDERS, RoleModelConfig, parse_model_spec,
+    CLAUDE_OPUS_MODEL_ID, Config, KNOWN_PROVIDERS, RoleModelConfig, parse_model_spec,
     parse_model_spec_strict,
 };
 use workgraph::graph::WorkGraph;
@@ -196,7 +196,10 @@ fn config_spec_anthropic_maps_to_claude_prefix() {
         capabilities: vec!["tool_use".into()],
         tier: ModelTier::Frontier,
     };
-    assert_eq!(entry.config_spec(), format!("claude:{CLAUDE_OPUS_MODEL_ID}"));
+    assert_eq!(
+        entry.config_spec(),
+        format!("claude:{CLAUDE_OPUS_MODEL_ID}")
+    );
 }
 
 #[test]

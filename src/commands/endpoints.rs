@@ -235,7 +235,9 @@ pub fn run_update(
     }
 
     if changed.is_empty() {
-        bail!("No fields specified to update. Use --provider, --url, --model, --api-key, --api-key-file, --key-env, or --default.");
+        bail!(
+            "No fields specified to update. Use --provider, --url, --model, --api-key, --api-key-file, --key-env, or --default."
+        );
     }
 
     if global {
@@ -244,11 +246,7 @@ pub fn run_update(
         config.save(workgraph_dir)?;
     }
 
-    println!(
-        "Updated endpoint '{}': {}",
-        name,
-        changed.join(", ")
-    );
+    println!("Updated endpoint '{}': {}", name, changed.join(", "));
     Ok(())
 }
 
@@ -729,24 +727,49 @@ mod tests {
     fn cli_endpoint_update_patches_api_key_file() {
         let tmp = setup_dir();
         run_add(
-            tmp.path(), "ep1", Some("openai"), Some("https://api.openai.com/v1"),
-            Some("gpt-4o"), Some("sk-old"), None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("openai"),
+            Some("https://api.openai.com/v1"),
+            Some("gpt-4o"),
+            Some("sk-old"),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         let kf = tmp.path().join("newkey.txt");
         std::fs::write(&kf, "sk-new-from-file\n").unwrap();
 
         run_update(
-            tmp.path(), "ep1", None, None, None, None,
-            Some(kf.to_str().unwrap()), None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            None,
+            None,
+            None,
+            None,
+            Some(kf.to_str().unwrap()),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         let config = Config::load(tmp.path()).unwrap();
         let ep = &config.llm_endpoints.endpoints[0];
         assert_eq!(ep.provider, "openai", "provider unchanged");
-        assert_eq!(ep.url.as_deref(), Some("https://api.openai.com/v1"), "url unchanged");
+        assert_eq!(
+            ep.url.as_deref(),
+            Some("https://api.openai.com/v1"),
+            "url unchanged"
+        );
         assert_eq!(ep.model.as_deref(), Some("gpt-4o"), "model unchanged");
-        assert!(ep.api_key.is_none(), "inline key cleared when api_key_file set");
+        assert!(
+            ep.api_key.is_none(),
+            "inline key cleared when api_key_file set"
+        );
         assert!(ep.api_key_file.is_some(), "api_key_file set");
         let key = ep.resolve_api_key(Some(tmp.path())).unwrap();
         assert_eq!(key.as_deref(), Some("sk-new-from-file"));
@@ -756,12 +779,32 @@ mod tests {
     fn cli_endpoint_update_patches_provider() {
         let tmp = setup_dir();
         run_add(
-            tmp.path(), "ep1", Some("openai"), None, None, None, None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         run_update(
-            tmp.path(), "ep1", Some("anthropic"), None, None, None, None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("anthropic"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         let config = Config::load(tmp.path()).unwrap();
         assert_eq!(config.llm_endpoints.endpoints[0].provider, "anthropic");
@@ -771,8 +814,18 @@ mod tests {
     fn cli_endpoint_update_nonexistent_errors() {
         let tmp = setup_dir();
         let err = run_update(
-            tmp.path(), "nope", Some("openai"), None, None, None, None, None, false, false,
-        ).unwrap_err();
+            tmp.path(),
+            "nope",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -780,12 +833,32 @@ mod tests {
     fn cli_endpoint_update_no_fields_errors() {
         let tmp = setup_dir();
         run_add(
-            tmp.path(), "ep1", Some("openai"), None, None, None, None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         let err = run_update(
-            tmp.path(), "ep1", None, None, None, None, None, None, false, false,
-        ).unwrap_err();
+            tmp.path(),
+            "ep1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("No fields specified"));
     }
 
@@ -793,36 +866,91 @@ mod tests {
     fn cli_endpoint_update_set_default() {
         let tmp = setup_dir();
         run_add(
-            tmp.path(), "a", Some("openai"), None, None, None, None, None, true, false,
-        ).unwrap();
+            tmp.path(),
+            "a",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
         run_add(
-            tmp.path(), "b", Some("anthropic"), None, None, None, None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "b",
+            Some("anthropic"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         // "b" is not default
         let config = Config::load(tmp.path()).unwrap();
         assert!(!config.llm_endpoints.endpoints[1].is_default);
 
         run_update(
-            tmp.path(), "b", None, None, None, None, None, None, true, false,
-        ).unwrap();
+            tmp.path(),
+            "b",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
 
         let config = Config::load(tmp.path()).unwrap();
-        assert!(!config.llm_endpoints.endpoints[0].is_default, "a no longer default");
-        assert!(config.llm_endpoints.endpoints[1].is_default, "b is now default");
+        assert!(
+            !config.llm_endpoints.endpoints[0].is_default,
+            "a no longer default"
+        );
+        assert!(
+            config.llm_endpoints.endpoints[1].is_default,
+            "b is now default"
+        );
     }
 
     #[test]
     fn cli_endpoint_update_multiple_fields() {
         let tmp = setup_dir();
         run_add(
-            tmp.path(), "ep1", Some("openai"), None, None, None, None, None, false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         run_update(
-            tmp.path(), "ep1", Some("anthropic"), Some("https://custom.url/v1"),
-            Some("claude-4"), None, None, Some("MY_KEY_ENV"), false, false,
-        ).unwrap();
+            tmp.path(),
+            "ep1",
+            Some("anthropic"),
+            Some("https://custom.url/v1"),
+            Some("claude-4"),
+            None,
+            None,
+            Some("MY_KEY_ENV"),
+            false,
+            false,
+        )
+        .unwrap();
 
         let config = Config::load(tmp.path()).unwrap();
         let ep = &config.llm_endpoints.endpoints[0];

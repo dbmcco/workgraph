@@ -11,7 +11,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use workgraph::config::{Config, EndpointConfig, EndpointsConfig, CLAUDE_SONNET_MODEL_ID};
+use workgraph::config::{CLAUDE_SONNET_MODEL_ID, Config, EndpointConfig, EndpointsConfig};
 
 // ===========================================================================
 // Helpers
@@ -242,8 +242,8 @@ fn integration_openrouter_default_url() {
 /// the resolution functions that drive those env vars.
 mod provider_env_var_tests {
     use workgraph::config::{
-        Config, DispatchRole, EndpointConfig, EndpointsConfig, CLAUDE_OPUS_MODEL_ID,
-        CLAUDE_SONNET_MODEL_ID,
+        CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole, EndpointConfig,
+        EndpointsConfig,
     };
 
     #[test]
@@ -364,8 +364,8 @@ mod provider_env_var_tests {
 /// logic here to validate the precedence chain end-to-end.
 mod agent_model_preference_tests {
     use workgraph::config::{
-        Config, DispatchRole, EndpointConfig, EndpointsConfig, CLAUDE_OPUS_MODEL_ID,
-        CLAUDE_SONNET_MODEL_ID,
+        CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole, EndpointConfig,
+        EndpointsConfig,
     };
 
     /// Replicate resolve_model_and_provider from spawn/execution.rs:
@@ -414,7 +414,10 @@ mod agent_model_preference_tests {
             Tier::new(agent_preferred_model, agent_preferred_provider),
             Tier::new(executor_model, None),
             Tier::new(role_model, role_provider),
-            Tier::new(coordinator_model.map(|s| s.to_string()), coordinator_provider),
+            Tier::new(
+                coordinator_model.map(|s| s.to_string()),
+                coordinator_provider,
+            ),
         ];
         ResolvedModelProvider {
             model: tiers.iter().find_map(|t| t.model.clone()),
@@ -425,11 +428,15 @@ mod agent_model_preference_tests {
     #[test]
     fn integration_openrouter_agent_preferred_model_used_when_no_task_model() {
         let r = resolve_model_and_provider(
-            None, None,
-            Some(format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")), None,
+            None,
+            None,
+            Some(format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")),
+            None,
             Some("executor-default".to_string()),
-            None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(r.model, Some(format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")));
     }
@@ -437,11 +444,15 @@ mod agent_model_preference_tests {
     #[test]
     fn integration_openrouter_task_model_overrides_agent() {
         let r = resolve_model_and_provider(
-            Some("task-specific-model".to_string()), None,
-            Some("agent-preferred-model".to_string()), None,
+            Some("task-specific-model".to_string()),
+            None,
+            Some("agent-preferred-model".to_string()),
+            None,
             Some("executor-model".to_string()),
-            None, None,
-            Some("coordinator-model"), None,
+            None,
+            None,
+            Some("coordinator-model"),
+            None,
         );
         assert_eq!(r.model, Some("task-specific-model".to_string()));
     }
@@ -449,11 +460,15 @@ mod agent_model_preference_tests {
     #[test]
     fn integration_openrouter_agent_preferred_provider() {
         let r = resolve_model_and_provider(
-            None, None,
-            None, Some("openrouter".to_string()),
             None,
-            None, Some("anthropic".to_string()),
-            None, None,
+            None,
+            None,
+            Some("openrouter".to_string()),
+            None,
+            None,
+            Some("anthropic".to_string()),
+            None,
+            None,
         );
         assert_eq!(r.provider, Some("openrouter".to_string()));
     }
@@ -461,11 +476,15 @@ mod agent_model_preference_tests {
     #[test]
     fn integration_openrouter_task_provider_overrides_agent_provider() {
         let r = resolve_model_and_provider(
-            None, Some("openai".to_string()),
-            None, Some("openrouter".to_string()),
             None,
-            None, Some("anthropic".to_string()),
-            None, None,
+            Some("openai".to_string()),
+            None,
+            Some("openrouter".to_string()),
+            None,
+            None,
+            Some("anthropic".to_string()),
+            None,
+            None,
         );
         assert_eq!(r.provider, Some("openai".to_string()));
     }
@@ -473,20 +492,22 @@ mod agent_model_preference_tests {
     #[test]
     fn integration_openrouter_no_agent_falls_through_to_executor() {
         let r = resolve_model_and_provider(
-            None, None,
-            None, None,
+            None,
+            None,
+            None,
+            None,
             Some("executor-default".to_string()),
-            None, None,
-            Some("coordinator-fallback"), None,
+            None,
+            None,
+            Some("coordinator-fallback"),
+            None,
         );
         assert_eq!(r.model, Some("executor-default".to_string()));
     }
 
     #[test]
     fn integration_openrouter_all_none_returns_none() {
-        let r = resolve_model_and_provider(
-            None, None, None, None, None, None, None, None, None,
-        );
+        let r = resolve_model_and_provider(None, None, None, None, None, None, None, None, None);
         assert_eq!(r.model, None);
         assert_eq!(r.provider, None);
     }
@@ -629,10 +650,9 @@ mod agent_model_preference_tests {
         };
 
         let sonnet_model = format!("anthropic/{CLAUDE_SONNET_MODEL_ID}");
-        config.models.set_model(
-            DispatchRole::Evaluator,
-            &sonnet_model,
-        );
+        config
+            .models
+            .set_model(DispatchRole::Evaluator, &sonnet_model);
         config
             .models
             .set_provider(DispatchRole::Evaluator, "openrouter");
@@ -1221,7 +1241,11 @@ mod auto_routing_tests {
         );
         assert!(result.warning.is_some());
         assert!(
-            !result.warning.as_ref().unwrap().contains(OPENROUTER_AUTO_MODEL),
+            !result
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains(OPENROUTER_AUTO_MODEL),
             "Should not mention openrouter/auto in warning"
         );
     }

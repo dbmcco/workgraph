@@ -12,8 +12,8 @@ use std::thread;
 use tempfile::TempDir;
 
 use workgraph::config::{
-    Config, DispatchRole, EndpointConfig, EndpointsConfig, ModelRoutingConfig, RoleModelConfig,
-    CLAUDE_HAIKU_MODEL_ID, CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID,
+    CLAUDE_HAIKU_MODEL_ID, CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole,
+    EndpointConfig, EndpointsConfig, ModelRoutingConfig, RoleModelConfig,
 };
 use workgraph::executor::native::client::AnthropicClient;
 use workgraph::executor::native::openai_client::OpenAiClient;
@@ -407,9 +407,10 @@ fn test_per_role_different_providers() {
         .set_provider(DispatchRole::Evaluator, "anthropic");
 
     // TaskAgent → OpenRouter (frontier model)
-    config
-        .models
-        .set_model(DispatchRole::TaskAgent, &format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"));
+    config.models.set_model(
+        DispatchRole::TaskAgent,
+        &format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"),
+    );
     config
         .models
         .set_provider(DispatchRole::TaskAgent, "openrouter");
@@ -424,7 +425,10 @@ fn test_per_role_different_providers() {
     assert_eq!(evaluator.provider, Some("anthropic".to_string()));
 
     let task_agent = config.resolve_model_for_role(DispatchRole::TaskAgent);
-    assert_eq!(task_agent.model, format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"));
+    assert_eq!(
+        task_agent.model,
+        format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")
+    );
     assert_eq!(task_agent.provider, Some("openrouter".to_string()));
 }
 
@@ -629,7 +633,11 @@ fn test_model_registry_default_models() {
     let registry = ModelRegistry::with_defaults();
 
     // Should contain models from multiple providers
-    assert!(registry.get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")).is_some());
+    assert!(
+        registry
+            .get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
+            .is_some()
+    );
     assert!(registry.get("openai/gpt-4o").is_some());
     assert!(registry.get("deepseek/deepseek-chat").is_some());
     assert!(registry.get("google/gemini-2.5-pro").is_some());
@@ -639,7 +647,9 @@ fn test_model_registry_default_models() {
 fn test_model_registry_tier_classification() {
     let registry = ModelRegistry::with_defaults();
 
-    let opus = registry.get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}")).unwrap();
+    let opus = registry
+        .get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
+        .unwrap();
     assert_eq!(opus.tier, ModelTier::Frontier);
 
     let haiku = registry.get("anthropic/claude-haiku-4-5").unwrap();
@@ -795,11 +805,7 @@ fn test_all_dispatch_roles_with_full_config() {
     // Registry IDs get resolved to full API model names; non-registry models pass through
     let expected: &[(DispatchRole, &str, &str)] = &[
         (DispatchRole::TaskAgent, CLAUDE_OPUS_MODEL_ID, "anthropic"),
-        (
-            DispatchRole::Evaluator,
-            CLAUDE_SONNET_MODEL_ID,
-            "anthropic",
-        ),
+        (DispatchRole::Evaluator, CLAUDE_SONNET_MODEL_ID, "anthropic"),
         (DispatchRole::FlipInference, "gpt-4o", "openai"),
         (
             DispatchRole::FlipComparison,
@@ -808,17 +814,13 @@ fn test_all_dispatch_roles_with_full_config() {
         ),
         (DispatchRole::Assigner, "gpt-4o-mini", "openai"),
         (DispatchRole::Evolver, "deepseek-r1", "openrouter"),
-        (DispatchRole::Verification, CLAUDE_OPUS_MODEL_ID, "anthropic"),
         (
-            DispatchRole::Triage,
-            CLAUDE_HAIKU_MODEL_ID,
+            DispatchRole::Verification,
+            CLAUDE_OPUS_MODEL_ID,
             "anthropic",
         ),
-        (
-            DispatchRole::Creator,
-            CLAUDE_SONNET_MODEL_ID,
-            "anthropic",
-        ),
+        (DispatchRole::Triage, CLAUDE_HAIKU_MODEL_ID, "anthropic"),
+        (DispatchRole::Creator, CLAUDE_SONNET_MODEL_ID, "anthropic"),
         (DispatchRole::Compactor, "gpt-4o-mini", "openai"),
     ];
 

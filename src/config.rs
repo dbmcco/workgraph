@@ -1356,6 +1356,7 @@ pub fn provider_to_executor(provider: &str) -> &'static str {
 pub fn provider_to_native_provider(provider: &str) -> &'static str {
     match provider {
         "claude" => "anthropic",
+        "codex" => "openai",
         "openrouter" => "openrouter",
         "openai" => "openai",
         "gemini" => "openai", // Gemini uses OpenAI-compatible endpoint
@@ -1656,15 +1657,11 @@ impl Config {
         // `coordinator.model = "openrouter:anthropic/claude-sonnet-4-6"`
         // the OpenRouter provider cascades to ALL roles (eval, FLIP, verification)
         // without needing explicit `[models.default].provider` config.
-        let coordinator_model_provider = self
-            .coordinator
-            .model
-            .as_deref()
-            .and_then(|m| {
-                parse_model_spec(m)
-                    .provider
-                    .map(|p| provider_to_native_provider(&p).to_string())
-            });
+        let coordinator_model_provider = self.coordinator.model.as_deref().and_then(|m| {
+            parse_model_spec(m)
+                .provider
+                .map(|p| provider_to_native_provider(&p).to_string())
+        });
         let agent_model_provider = parse_model_spec(&self.agent.model)
             .provider
             .map(|p| provider_to_native_provider(&p).to_string());
@@ -1831,7 +1828,6 @@ impl Config {
         // 4/5. Fallback
         "fallback"
     }
-
 }
 
 fn default_auto_create_threshold() -> u32 {
@@ -3480,8 +3476,14 @@ flip_comparison_model = "openrouter:model-b"
             config.agency.retention_heuristics,
             Some("Retire roles scoring below 0.3 after 10 evaluations".to_string())
         );
-        assert_eq!(config.agency.flip_inference_model, Some("openrouter:model-a".to_string()));
-        assert_eq!(config.agency.flip_comparison_model, Some("openrouter:model-b".to_string()));
+        assert_eq!(
+            config.agency.flip_inference_model,
+            Some("openrouter:model-a".to_string())
+        );
+        assert_eq!(
+            config.agency.flip_comparison_model,
+            Some("openrouter:model-b".to_string())
+        );
     }
 
     #[test]
@@ -3662,102 +3664,170 @@ model = "haiku"
 
     #[test]
     fn test_strip_global_only_model_roles_basic() {
-        let global: toml::Value = toml::from_str(r#"
+        let global: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "claude:opus"
 [models.task_agent]
 model = "claude:opus"
-"#).unwrap();
-        let local: toml::Value = toml::from_str(r#"
+"#,
+        )
+        .unwrap();
+        let local: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "openrouter:minimax/minimax-m2.7"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let mut merged = merge_toml(global.clone(), local.clone());
         strip_global_only_model_roles(&mut merged, &global, &local);
-        let has_task_agent_model = merged.get("models").and_then(|m| m.get("task_agent")).and_then(|t| t.get("model")).is_some();
-        assert!(!has_task_agent_model, "global models.task_agent.model should be stripped when local sets agent.model");
-        assert_eq!(merged.get("agent").unwrap().get("model").unwrap().as_str().unwrap(), "openrouter:minimax/minimax-m2.7");
+        let has_task_agent_model = merged
+            .get("models")
+            .and_then(|m| m.get("task_agent"))
+            .and_then(|t| t.get("model"))
+            .is_some();
+        assert!(
+            !has_task_agent_model,
+            "global models.task_agent.model should be stripped when local sets agent.model"
+        );
+        assert_eq!(
+            merged
+                .get("agent")
+                .unwrap()
+                .get("model")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "openrouter:minimax/minimax-m2.7"
+        );
     }
 
     #[test]
     fn test_strip_global_model_roles_preserves_local_override() {
-        let global: toml::Value = toml::from_str(r#"
+        let global: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "claude:opus"
 [models.task_agent]
 model = "claude:opus"
-"#).unwrap();
-        let local: toml::Value = toml::from_str(r#"
+"#,
+        )
+        .unwrap();
+        let local: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "openrouter:minimax/minimax-m2.7"
 [models.task_agent]
 model = "openrouter:minimax/minimax-m2.7"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let mut merged = merge_toml(global.clone(), local.clone());
         strip_global_only_model_roles(&mut merged, &global, &local);
-        let task_model = merged.get("models").unwrap().get("task_agent").unwrap().get("model").unwrap().as_str().unwrap();
+        let task_model = merged
+            .get("models")
+            .unwrap()
+            .get("task_agent")
+            .unwrap()
+            .get("model")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(task_model, "openrouter:minimax/minimax-m2.7");
     }
 
     #[test]
     fn test_strip_global_model_roles_no_local_agent_model() {
-        let global: toml::Value = toml::from_str(r#"
+        let global: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "claude:opus"
 [models.task_agent]
 model = "claude:sonnet"
-"#).unwrap();
-        let local: toml::Value = toml::from_str(r#"
+"#,
+        )
+        .unwrap();
+        let local: toml::Value = toml::from_str(
+            r#"
 [coordinator]
 max_agents = 2
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let mut merged = merge_toml(global.clone(), local.clone());
         strip_global_only_model_roles(&mut merged, &global, &local);
-        let task_model = merged.get("models").unwrap().get("task_agent").unwrap().get("model").unwrap().as_str().unwrap();
+        let task_model = merged
+            .get("models")
+            .unwrap()
+            .get("task_agent")
+            .unwrap()
+            .get("model")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(task_model, "claude:sonnet");
     }
 
     #[test]
     fn test_local_agent_model_overrides_global_task_agent_in_resolution() {
-        let global: toml::Value = toml::from_str(r#"
+        let global: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "claude:opus"
 [models.task_agent]
 model = "claude:opus"
-"#).unwrap();
-        let local: toml::Value = toml::from_str(r#"
+"#,
+        )
+        .unwrap();
+        let local: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "openrouter:minimax/minimax-m2.7"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let mut merged = merge_toml(global.clone(), local.clone());
         strip_global_only_model_roles(&mut merged, &global, &local);
         let mut config: Config = merged.try_into().unwrap();
         config.agent_model_is_local = true;
         let resolved = config.resolve_model_for_role(DispatchRole::TaskAgent);
-        assert_eq!(resolved.model, "minimax/minimax-m2.7", "TaskAgent should resolve to local agent.model");
+        assert_eq!(
+            resolved.model, "minimax/minimax-m2.7",
+            "TaskAgent should resolve to local agent.model"
+        );
         assert_eq!(resolved.provider, Some("openrouter".to_string()));
     }
 
     #[test]
     fn test_local_models_task_agent_preserved_in_resolution() {
-        let global: toml::Value = toml::from_str(r#"
+        let global: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "claude:opus"
 [models.task_agent]
 model = "claude:opus"
-"#).unwrap();
-        let local: toml::Value = toml::from_str(r#"
+"#,
+        )
+        .unwrap();
+        let local: toml::Value = toml::from_str(
+            r#"
 [agent]
 model = "openrouter:minimax/minimax-m2.7"
 [models.task_agent]
 model = "openrouter:qwen/qwen3-235b"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let mut merged = merge_toml(global.clone(), local.clone());
         strip_global_only_model_roles(&mut merged, &global, &local);
         let mut config: Config = merged.try_into().unwrap();
         config.agent_model_is_local = true;
         let resolved = config.resolve_model_for_role(DispatchRole::TaskAgent);
-        assert_eq!(resolved.model, "qwen/qwen3-235b", "Local models.task_agent.model should be preserved");
+        assert_eq!(
+            resolved.model, "qwen/qwen3-235b",
+            "Local models.task_agent.model should be preserved"
+        );
     }
 
     #[test]
@@ -4180,8 +4250,8 @@ model = "claude:haiku"
                 api_key_file: None,
                 api_key_env: None,
                 is_default: false,
-            context_window: None,
-}],
+                context_window: None,
+            }],
         };
         let ep = endpoints.find_for_provider("openai").unwrap();
         assert_eq!(ep.name, "my-openai");
@@ -4200,8 +4270,8 @@ model = "claude:haiku"
                 api_key_file: None,
                 api_key_env: None,
                 is_default: false,
-            context_window: None,
-}],
+                context_window: None,
+            }],
         };
         assert!(endpoints.find_for_provider("anthropic").is_none());
     }
@@ -4219,8 +4289,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "default-openai".to_string(),
                     provider: "openai".to_string(),
@@ -4230,8 +4300,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: true,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "third-openai".to_string(),
                     provider: "openai".to_string(),
@@ -4241,8 +4311,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
             ],
         };
         let ep = endpoints.find_for_provider("openai").unwrap();
@@ -4263,8 +4333,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "first-openai".to_string(),
                     provider: "openai".to_string(),
@@ -4274,8 +4344,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "second-openai".to_string(),
                     provider: "openai".to_string(),
@@ -4285,8 +4355,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
             ],
         };
         // Without a default, returns the first matching provider
@@ -4306,8 +4376,8 @@ model = "claude:haiku"
                 api_key_file: None,
                 api_key_env: None,
                 is_default: true,
-            context_window: None,
-}],
+                context_window: None,
+            }],
         };
         let expected_model = format!("anthropic/{CLAUDE_SONNET_MODEL_ID}");
         let ep = endpoints.find_for_provider("openrouter").unwrap();
@@ -4337,8 +4407,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "openrouter".to_string(),
                     provider: "openrouter".to_string(),
@@ -4348,8 +4418,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: true,
-                context_window: None,
-},
+                    context_window: None,
+                },
             ],
         };
         let ep = endpoints.find_default().unwrap();
@@ -4368,8 +4438,8 @@ model = "claude:haiku"
                 api_key_file: None,
                 api_key_env: None,
                 is_default: false,
-            context_window: None,
-}],
+                context_window: None,
+            }],
         };
         let ep = endpoints.find_default().unwrap();
         assert_eq!(ep.name, "only");
@@ -4390,8 +4460,8 @@ model = "claude:haiku"
                 api_key_file: None,
                 api_key_env: None,
                 is_default: true,
-            context_window: None,
-}],
+                context_window: None,
+            }],
         };
         // Provider-based lookup misses
         assert!(endpoints.find_for_provider("openai").is_none());
@@ -4418,8 +4488,8 @@ model = "claude:haiku"
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-inline"));
     }
@@ -4435,8 +4505,8 @@ model = "claude:haiku"
             api_key_file: Some("/nonexistent/file".to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         // Inline key should win even if api_key_file is also set
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-inline"));
@@ -4456,8 +4526,8 @@ model = "claude:haiku"
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-from-file"));
     }
@@ -4476,8 +4546,8 @@ model = "claude:haiku"
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-trimmed"));
     }
@@ -4493,8 +4563,8 @@ model = "claude:haiku"
             api_key_file: Some("/nonexistent/path/key.txt".to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let err = ep.resolve_api_key(None).unwrap_err();
         let msg = format!("{}", err);
         assert!(msg.contains("Failed to read API key from"));
@@ -4515,8 +4585,8 @@ model = "claude:haiku"
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let err = ep.resolve_api_key(None).unwrap_err();
         assert!(format!("{}", err).contains("empty"));
     }
@@ -4536,8 +4606,8 @@ model = "claude:haiku"
             api_key_file: Some("keys/test.key".to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(Some(dir.path())).unwrap();
         assert_eq!(key.as_deref(), Some("sk-relative"));
     }
@@ -4554,8 +4624,8 @@ model = "claude:haiku"
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert!(key.is_none());
     }
@@ -4575,8 +4645,8 @@ model = "claude:haiku"
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-env-test"));
         // Restore env
@@ -4600,8 +4670,8 @@ model = "claude:haiku"
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-inline-wins"));
         match saved {
@@ -4627,8 +4697,8 @@ model = "claude:haiku"
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-file-wins"));
         match saved {
@@ -4654,8 +4724,8 @@ model = "claude:haiku"
             api_key_file: None,
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         let key = ep.resolve_api_key(None).unwrap();
         assert_eq!(key.as_deref(), Some("sk-oai-fallback"));
         // Restore
@@ -4698,8 +4768,8 @@ model = "claude:haiku"
             api_key_file: Some("~/.config/workgraph/openai.key".to_string()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-};
+            context_window: None,
+        };
         assert_eq!(ep.masked_key(), "(from file)");
     }
 
@@ -4718,8 +4788,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: false,
-                context_window: None,
-},
+                    context_window: None,
+                },
                 EndpointConfig {
                     name: "anthropic-direct".to_string(),
                     provider: "anthropic".to_string(),
@@ -4729,8 +4799,8 @@ model = "claude:haiku"
                     api_key_file: None,
                     api_key_env: None,
                     is_default: true,
-                context_window: None,
-},
+                    context_window: None,
+                },
             ],
         };
         let ep = endpoints.find_by_name("openrouter").unwrap();
@@ -5131,8 +5201,8 @@ model = "claude:haiku"
             api_key_file: Some("/nonexistent/path/to/api-key.txt".into()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-});
+            context_window: None,
+        });
         let v = config.validate_config();
         assert!(!v.is_ok());
         assert!(v.errors.iter().any(|e| e.rule == "missing-api-key-file"));
@@ -5154,8 +5224,8 @@ model = "claude:haiku"
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-});
+            context_window: None,
+        });
         let v = config.validate_config();
         assert!(!v.is_ok());
         assert!(v.errors.iter().any(|e| e.rule == "empty-api-key-file"));
@@ -5177,8 +5247,8 @@ model = "claude:haiku"
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-});
+            context_window: None,
+        });
         let v = config.validate_config();
         assert!(
             v.errors
@@ -5211,8 +5281,8 @@ model = "claude:haiku"
             api_key_file: Some("/nonexistent/path/to/key.txt".into()),
             api_key_env: None,
             is_default: false,
-        context_window: None,
-});
+            context_window: None,
+        });
         let v = config.validate_config();
         let display = v.display();
         assert!(display.contains("ERROR:"));
@@ -5402,6 +5472,7 @@ provider = "openrouter"
         assert_eq!(provider_to_native_provider("openrouter"), "openrouter");
         assert_eq!(provider_to_native_provider("openai"), "openai");
         assert_eq!(provider_to_native_provider("claude"), "anthropic");
+        assert_eq!(provider_to_native_provider("codex"), "openai");
         assert_eq!(provider_to_native_provider("gemini"), "openai");
         assert_eq!(provider_to_native_provider("ollama"), "local");
         assert_eq!(provider_to_native_provider("local"), "local");
@@ -5668,8 +5739,8 @@ provider = "openrouter"
             api_key_file: None,
             api_key_env: None,
             is_default: true,
-        context_window: None,
-});
+            context_window: None,
+        });
         let key = config
             .resolve_api_key_for_provider("openrouter", dir.path())
             .unwrap();
@@ -5691,8 +5762,8 @@ provider = "openrouter"
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
             is_default: true,
-        context_window: None,
-});
+            context_window: None,
+        });
         let key = config
             .resolve_api_key_for_provider("openrouter", dir.path())
             .unwrap();
@@ -5736,8 +5807,8 @@ provider = "openrouter"
             api_key_file: None,
             api_key_env: None,
             is_default: true,
-        context_window: None,
-});
+            context_window: None,
+        });
         // Even if env var is set, endpoint should win
         let key = config
             .resolve_api_key_for_provider("openrouter", dir.path())
@@ -5997,7 +6068,10 @@ is_default = true
 
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
-        assert_eq!(config.llm_endpoints.endpoints[0].api_key, Some("sk-or-test-global".to_string()));
+        assert_eq!(
+            config.llm_endpoints.endpoints[0].api_key,
+            Some("sk-or-test-global".to_string())
+        );
         assert_eq!(config.llm_endpoints.endpoints[0].provider, "openrouter");
     }
 

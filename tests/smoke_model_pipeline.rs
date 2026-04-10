@@ -156,7 +156,10 @@ fn init_fresh_wg() -> (TempDir, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let wg_dir = tmp.path().join(".workgraph");
     wg_ok(&wg_dir, &["init"]);
-    assert!(wg_dir.exists(), ".workgraph directory should exist after init");
+    assert!(
+        wg_dir.exists(),
+        ".workgraph directory should exist after init"
+    );
     (tmp, wg_dir)
 }
 
@@ -359,7 +362,10 @@ fn smoke_fresh_repo_default_model_from_config() {
     let (_tmp, wg_dir) = init_fresh_wg();
 
     // Configure a default model.
-    wg_ok(&wg_dir, &["config", "--model", "openrouter:minimax/minimax-m2.7"]);
+    wg_ok(
+        &wg_dir,
+        &["config", "--model", "openrouter:minimax/minimax-m2.7"],
+    );
 
     // Add a task without specifying --model.
     wg_ok(&wg_dir, &["add", "hello world 2", "--immediate"]);
@@ -386,16 +392,18 @@ fn smoke_no_silent_claude_fallback_on_add() {
 
     write_model_cache(
         &wg_dir,
-        &[
-            "minimax/minimax-m2.7",
-            "anthropic/claude-sonnet-4-6",
-        ],
+        &["minimax/minimax-m2.7", "anthropic/claude-sonnet-4-6"],
     );
 
     // Add task with explicit non-Claude model.
     wg_ok(
         &wg_dir,
-        &["add", "non-claude task", "--model", "openrouter:minimax/minimax-m2.7"],
+        &[
+            "add",
+            "non-claude task",
+            "--model",
+            "openrouter:minimax/minimax-m2.7",
+        ],
     );
 
     let graph = workgraph::parser::load_graph(wg_dir.join("graph.jsonl")).unwrap();
@@ -888,7 +896,11 @@ fn smoke_profile_show_cli_ranked_alternatives() {
         output
     );
     // Should show tier names.
-    assert!(output.contains("fast tier"), "Should show fast tier heading, got:\n{}", output);
+    assert!(
+        output.contains("fast tier"),
+        "Should show fast tier heading, got:\n{}",
+        output
+    );
     // First model in fast tier should be Alpha (highest score in cheap bucket).
     assert!(
         output.contains("vendor-a/model-alpha"),
@@ -902,20 +914,18 @@ fn smoke_profile_show_cli_ranked_alternatives() {
 fn smoke_profile_show_json_output() {
     let (_tmp, wg_dir) = init_fresh_wg();
 
-    let registry = make_registry(vec![
-        make_model(
-            "vendor/fast-model",
-            "Fast",
-            1.0,
-            true,
-            Some(50.0),
-            Popularity {
-                weekly_rank: Some(5),
-                request_count: Some(500_000),
-                provider_count: Some(4),
-            },
-        ),
-    ]);
+    let registry = make_registry(vec![make_model(
+        "vendor/fast-model",
+        "Fast",
+        1.0,
+        true,
+        Some(50.0),
+        Popularity {
+            weekly_rank: Some(5),
+            request_count: Some(500_000),
+            provider_count: Some(4),
+        },
+    )]);
     registry.save(&wg_dir).unwrap();
 
     wg_ok(&wg_dir, &["profile", "set", "openrouter"]);
@@ -993,20 +1003,18 @@ fn smoke_ranking_excludes_no_tools() {
 fn smoke_registry_round_trip_preserves_scores() {
     let tmp = TempDir::new().unwrap();
 
-    let mut registry = make_registry(vec![
-        make_model(
-            "test/model-a",
-            "Model A",
-            5.0,
-            true,
-            Some(60.0),
-            Popularity {
-                weekly_rank: Some(10),
-                request_count: Some(100_000),
-                provider_count: Some(3),
-            },
-        ),
-    ]);
+    let mut registry = make_registry(vec![make_model(
+        "test/model-a",
+        "Model A",
+        5.0,
+        true,
+        Some(60.0),
+        Popularity {
+            weekly_rank: Some(10),
+            request_count: Some(100_000),
+            provider_count: Some(3),
+        },
+    )]);
 
     // Compute fitness and save.
     model_benchmarks::compute_fitness_scores(&mut registry);

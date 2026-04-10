@@ -974,7 +974,9 @@ pub fn update_flip_models(
         println!("Set models.flip_inference.model = \"{}\"", model);
         let spec = workgraph::config::parse_model_spec(model);
         if let Some(ref provider) = spec.provider {
-            config.models.set_provider(DispatchRole::FlipInference, provider);
+            config
+                .models
+                .set_provider(DispatchRole::FlipInference, provider);
         }
         changed = true;
     }
@@ -990,7 +992,9 @@ pub fn update_flip_models(
         println!("Set models.flip_comparison.model = \"{}\"", model);
         let spec = workgraph::config::parse_model_spec(model);
         if let Some(ref provider) = spec.provider {
-            config.models.set_provider(DispatchRole::FlipComparison, provider);
+            config
+                .models
+                .set_provider(DispatchRole::FlipComparison, provider);
         }
         changed = true;
     }
@@ -1044,7 +1048,10 @@ pub fn update_model_routing(
         let spec = workgraph::config::parse_model_spec(model);
         if let Some(ref provider) = spec.provider {
             config.models.set_provider(role, provider);
-            println!("Set models.{}.provider = \"{}\" (from provider:model)", role, provider);
+            println!(
+                "Set models.{}.provider = \"{}\" (from provider:model)",
+                role, provider
+            );
         }
 
         // Validate: warn if model ID is not in the registry

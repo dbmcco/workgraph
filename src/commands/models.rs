@@ -386,7 +386,10 @@ use workgraph::model_benchmarks::{self, BenchmarkRegistry};
 /// Fetch model data from OpenRouter and write the benchmark registry.
 pub fn run_fetch(workgraph_dir: &Path, no_cache: bool) -> Result<()> {
     let or_models = get_remote_models(workgraph_dir, no_cache)?;
-    eprintln!("Building benchmark registry from {} models...", or_models.len());
+    eprintln!(
+        "Building benchmark registry from {} models...",
+        or_models.len()
+    );
 
     let mut registry = model_benchmarks::build_from_openrouter(&or_models);
 
@@ -443,9 +446,7 @@ pub fn run_fetch(workgraph_dir: &Path, no_cache: bool) -> Result<()> {
             "Warning: No models have benchmark scores. The dynamic profile (`wg profile set \
              openrouter`) will not be able to rank models meaningfully."
         );
-        eprintln!(
-            "  This can happen if no well-known models were found in the API response."
-        );
+        eprintln!("  This can happen if no well-known models were found in the API response.");
         eprintln!(
             "  Consider using a static profile (`wg profile set anthropic`) or adding \
              scores manually."
@@ -466,7 +467,11 @@ pub fn run_benchmarks(
         .context("No benchmark registry found. Run `wg models fetch` first.")?;
 
     let models: Vec<_> = if let Some(tier_filter) = tier {
-        registry.ranked_by_tier(tier_filter).into_iter().take(limit).collect()
+        registry
+            .ranked_by_tier(tier_filter)
+            .into_iter()
+            .take(limit)
+            .collect()
     } else {
         registry.ranked().into_iter().take(limit).collect()
     };

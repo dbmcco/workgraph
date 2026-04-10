@@ -36,10 +36,7 @@ fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
     // Use a fake HOME derived from the wg_dir path so that the user's real
     // ~/.workgraph/config.toml does not bleed into the test (the fake home
     // has no .workgraph/ subdir, so global config is empty).
-    let fake_home = wg_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(wg_dir);
+    let fake_home = wg_dir.parent().and_then(|p| p.parent()).unwrap_or(wg_dir);
     Command::new(wg_binary())
         .arg("--dir")
         .arg(wg_dir)
@@ -580,10 +577,15 @@ fn cli_endpoints_update_patches_api_key_file() {
     wg_ok(
         &wg_dir,
         &[
-            "endpoints", "add", "upd-ep",
-            "--provider", "openai",
-            "--api-key", "sk-old",
-            "--model", "gpt-4o",
+            "endpoints",
+            "add",
+            "upd-ep",
+            "--provider",
+            "openai",
+            "--api-key",
+            "sk-old",
+            "--model",
+            "gpt-4o",
         ],
     );
 
@@ -593,8 +595,11 @@ fn cli_endpoints_update_patches_api_key_file() {
     let output = wg_ok(
         &wg_dir,
         &[
-            "endpoints", "update", "upd-ep",
-            "--api-key-file", &key_file.to_string_lossy(),
+            "endpoints",
+            "update",
+            "upd-ep",
+            "--api-key-file",
+            &key_file.to_string_lossy(),
         ],
     );
     assert!(output.contains("Updated endpoint 'upd-ep'"));
@@ -622,9 +627,13 @@ fn cli_endpoints_update_patches_provider() {
     wg_ok(
         &wg_dir,
         &[
-            "endpoints", "add", "upd-ep2",
-            "--provider", "openai",
-            "--api-key", "sk-test",
+            "endpoints",
+            "add",
+            "upd-ep2",
+            "--provider",
+            "openai",
+            "--api-key",
+            "sk-test",
         ],
     );
 
@@ -665,9 +674,13 @@ fn cli_endpoints_update_no_fields_errors() {
     wg_ok(
         &wg_dir,
         &[
-            "endpoints", "add", "upd-ep3",
-            "--provider", "openai",
-            "--api-key", "sk-test",
+            "endpoints",
+            "add",
+            "upd-ep3",
+            "--provider",
+            "openai",
+            "--api-key",
+            "sk-test",
         ],
     );
 

@@ -17,9 +17,9 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use workgraph::config::parse_model_spec;
-use workgraph::executor::native::openai_client::OpenAiClient;
-use workgraph::executor::native::provider::{create_provider_ext, Provider};
 use workgraph::executor::native::client::{ContentBlock, Message, MessagesRequest, Role};
+use workgraph::executor::native::openai_client::OpenAiClient;
+use workgraph::executor::native::provider::{Provider, create_provider_ext};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,21 +112,29 @@ fn create_provider_selects_openrouter_for_openrouter_prefix() {
     let wg_dir = setup_workgraph(&tmp);
 
     let config_path = wg_dir.join("config.toml");
-    fs::write(&config_path, r#"
+    fs::write(
+        &config_path,
+        r#"
 [native_executor]
 api_key = "sk-test-key-for-routing"
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
-    let provider = create_provider_ext(
-        &wg_dir,
-        "openrouter:minimax/minimax-m2.7",
-        None,
-        None,
-        None,
-    ).expect("Provider creation should succeed");
+    let provider =
+        create_provider_ext(&wg_dir, "openrouter:minimax/minimax-m2.7", None, None, None)
+            .expect("Provider creation should succeed");
 
-    assert_eq!(provider.name(), "openrouter", "Provider name should be 'openrouter'");
-    assert_eq!(provider.model(), "minimax/minimax-m2.7", "Model should be 'minimax/minimax-m2.7'");
+    assert_eq!(
+        provider.name(),
+        "openrouter",
+        "Provider name should be 'openrouter'"
+    );
+    assert_eq!(
+        provider.model(),
+        "minimax/minimax-m2.7",
+        "Model should be 'minimax/minimax-m2.7'"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -142,17 +150,15 @@ fn api_key_resolution_from_env_var() {
     unsafe {
         std::env::set_var("OPENROUTER_API_KEY", "sk-or-test-env-key-12345");
 
-        let provider = create_provider_ext(
-            &wg_dir,
-            "openrouter:minimax/minimax-m2.7",
-            None,
-            None,
-            None,
-        );
+        let provider =
+            create_provider_ext(&wg_dir, "openrouter:minimax/minimax-m2.7", None, None, None);
 
         std::env::remove_var("OPENROUTER_API_KEY");
 
-        assert!(provider.is_ok(), "Provider creation should succeed with OPENROUTER_API_KEY");
+        assert!(
+            provider.is_ok(),
+            "Provider creation should succeed with OPENROUTER_API_KEY"
+        );
         assert_eq!(provider.unwrap().name(), "openrouter");
     }
 }
@@ -181,7 +187,8 @@ fn openrouter_provider_base_url_via_mock() {
                 *url_clone.lock().unwrap() = line.to_string();
             }
 
-            let body = r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+            let body =
+                r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -239,12 +246,14 @@ fn openrouter_streaming_enabled_by_default() {
                 // Look for "stream":true or "stream": false
                 if body.contains(r#""stream":true"#) || body.contains(r#""stream": true"#) {
                     *stream_flag_clone.lock().unwrap() = Some(true);
-                } else if body.contains(r#""stream":false"#) || body.contains(r#""stream": false"#) {
+                } else if body.contains(r#""stream":false"#) || body.contains(r#""stream": false"#)
+                {
                     *stream_flag_clone.lock().unwrap() = Some(false);
                 }
             }
 
-            let body = r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+            let body =
+                r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -298,12 +307,14 @@ fn non_openrouter_no_streaming_by_default() {
                 let body = &request[body_start + 4..];
                 if body.contains(r#""stream":true"#) || body.contains(r#""stream": true"#) {
                     *stream_flag_clone.lock().unwrap() = Some(true);
-                } else if body.contains(r#""stream":false"#) || body.contains(r#""stream": false"#) {
+                } else if body.contains(r#""stream":false"#) || body.contains(r#""stream": false"#)
+                {
                     *stream_flag_clone.lock().unwrap() = Some(false);
                 }
             }
 
-            let body = r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+            let body =
+                r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -343,7 +354,10 @@ fn cli_model_search_with_openrouter_prefix() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp);
 
-    let output = wg_cmd(&wg_dir, &["model", "search", "openrouter:minimax/minimax-m2.7"]);
+    let output = wg_cmd(
+        &wg_dir,
+        &["model", "search", "openrouter:minimax/minimax-m2.7"],
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
@@ -368,7 +382,9 @@ fn openrouter_endpoint_in_config_is_used() {
     let wg_dir = setup_workgraph(&tmp);
 
     let config_path = wg_dir.join("config.toml");
-    fs::write(&config_path, r#"
+    fs::write(
+        &config_path,
+        r#"
 [llm_endpoints]
 [[llm_endpoints.endpoints]]
 name = "my-openrouter"
@@ -377,7 +393,9 @@ url = "https://openrouter.ai/api/v1"
 model = "minimax/minimax-m2.7"
 api_key = "sk-or-config-key-12345"
 is_default = true
-"#).unwrap();
+"#,
+    )
+    .unwrap();
 
     let provider = create_provider_ext(
         &wg_dir,
@@ -385,7 +403,8 @@ is_default = true
         Some("openrouter"),
         None,
         None,
-    ).expect("Provider creation should succeed with config endpoint");
+    )
+    .expect("Provider creation should succeed with config endpoint");
 
     assert_eq!(provider.name(), "openrouter");
     assert_eq!(provider.model(), "minimax/minimax-m2.7");
@@ -422,7 +441,8 @@ fn openrouter_provider_headers_included() {
             }
             *headers_clone.lock().unwrap() = captured;
 
-            let body = r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+            let body =
+                r#"{"id":"mock-1","choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
@@ -446,10 +466,22 @@ fn openrouter_provider_headers_included() {
 
     assert!(result.is_ok(), "Request should succeed: {:?}", result.err());
     let captured = headers_received.lock().unwrap();
-    let has_referer = captured.iter().any(|h| h.to_lowercase().starts_with("http-referer:"));
-    let has_title = captured.iter().any(|h| h.to_lowercase().starts_with("x-title:"));
-    assert!(has_referer, "OpenRouter requests should include HTTP-Referer header. Got: {:?}", captured);
-    assert!(has_title, "OpenRouter requests should include X-Title header. Got: {:?}", captured);
+    let has_referer = captured
+        .iter()
+        .any(|h| h.to_lowercase().starts_with("http-referer:"));
+    let has_title = captured
+        .iter()
+        .any(|h| h.to_lowercase().starts_with("x-title:"));
+    assert!(
+        has_referer,
+        "OpenRouter requests should include HTTP-Referer header. Got: {:?}",
+        captured
+    );
+    assert!(
+        has_title,
+        "OpenRouter requests should include X-Title header. Got: {:?}",
+        captured
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -480,9 +512,7 @@ fn smoke_live_openrouter_routing() {
                 !resp.content.is_empty(),
                 "Response should have at least one content block"
             );
-            eprintln!(
-                "Live smoke test passed: received response from minimax-m2.7 via OpenRouter"
-            );
+            eprintln!("Live smoke test passed: received response from minimax-m2.7 via OpenRouter");
         }
         Err(e) => {
             let err_str = e.to_string();

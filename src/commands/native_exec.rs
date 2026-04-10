@@ -14,10 +14,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use workgraph::config::{Config, DispatchRole};
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
 use workgraph::executor::native::journal;
-use workgraph::config::{Config, DispatchRole};
 use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
 use workgraph::models::ModelRegistry;
@@ -151,11 +151,8 @@ pub fn run(
 
     // Enable mid-turn state injection when we have an agent ID
     if let Ok(agent_id) = std::env::var("WG_AGENT_ID") {
-        agent = agent.with_state_injection(
-            workgraph_dir.to_path_buf(),
-            task_id.to_string(),
-            agent_id,
-        );
+        agent =
+            agent.with_state_injection(workgraph_dir.to_path_buf(), task_id.to_string(), agent_id);
     }
 
     let mut agent = agent;

@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use workgraph::config::parse_model_spec;
-use workgraph::executor::native::openai_client::{validate_openrouter_model, OpenAiClient};
 use workgraph::executor::native::client::{ContentBlock, Message, MessagesRequest, Role};
+use workgraph::executor::native::openai_client::{OpenAiClient, validate_openrouter_model};
 use workgraph::executor::native::provider::Provider;
 
 // ---------------------------------------------------------------------------
@@ -90,16 +90,25 @@ fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
 fn parse_model_spec_handles_strings_gracefully() {
     // Valid format: "provider:model"
     let valid = parse_model_spec("openrouter:minimax/minimax-m2.7");
-    assert!(valid.provider.is_some(), "Valid model spec should parse provider");
+    assert!(
+        valid.provider.is_some(),
+        "Valid model spec should parse provider"
+    );
     assert_eq!(valid.model_id, "minimax/minimax-m2.7");
 
     // Bare model should work
     let bare = parse_model_spec("some-model");
-    assert!(bare.provider.is_none(), "Bare model should have no provider");
+    assert!(
+        bare.provider.is_none(),
+        "Bare model should have no provider"
+    );
 
     // Empty string should not panic
     let empty = parse_model_spec("");
-    assert_eq!(empty.model_id, "", "Empty model spec should return empty model_id");
+    assert_eq!(
+        empty.model_id, "",
+        "Empty model spec should return empty model_id"
+    );
 
     // Provider prefix with slash format (e.g., openai/gpt-4o-mini)
     // parse_model_spec checks for a known provider prefix, not bare slash
@@ -184,7 +193,10 @@ fn nonexistent_endpoint_fails_quickly() {
     let result = block_on(client.send(&request));
     let elapsed = start.elapsed();
 
-    assert!(result.is_err(), "Should get an error for non-existent endpoint");
+    assert!(
+        result.is_err(),
+        "Should get an error for non-existent endpoint"
+    );
     let err_msg = result.unwrap_err().to_string();
 
     // Error should be clean (no panic traces)
@@ -193,10 +205,7 @@ fn nonexistent_endpoint_fails_quickly() {
         "Error should not contain thread names: {}",
         err_msg
     );
-    assert!(
-        err_msg.len() < 500,
-        "Error message should be concise"
-    );
+    assert!(err_msg.len() < 500, "Error message should be concise");
 
     // Should fail relatively quickly (not hang)
     assert!(
@@ -205,7 +214,10 @@ fn nonexistent_endpoint_fails_quickly() {
         elapsed
     );
 
-    eprintln!("Connection error (expected): {} (took {:?})", err_msg, elapsed);
+    eprintln!(
+        "Connection error (expected): {} (took {:?})",
+        err_msg, elapsed
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -239,10 +251,7 @@ fn model_validation_error_is_user_friendly() {
             !warning.contains("thread '"),
             "Warning should not contain thread names"
         );
-        assert!(
-            warning.len() < 500,
-            "Warning should be concise"
-        );
+        assert!(warning.len() < 500, "Warning should be concise");
         assert!(
             warning.contains("nonexistent-model"),
             "Warning should mention the invalid model name"
@@ -307,9 +316,13 @@ fn smoke_live_openrouter_error_handling() {
 
     // --- Test 1: Invalid API key (401) ---
     eprintln!("Testing invalid API key...");
-    let bad_client = OpenAiClient::new("sk-or-invalid-key-000000".into(), "minimax/minimax-m2.7", None)
-        .unwrap()
-        .with_provider_hint("openrouter");
+    let bad_client = OpenAiClient::new(
+        "sk-or-invalid-key-000000".into(),
+        "minimax/minimax-m2.7",
+        None,
+    )
+    .unwrap()
+    .with_provider_hint("openrouter");
     let request = make_request("minimax/minimax-m2.7");
     let result = block_on(bad_client.send(&request));
     match result {
@@ -470,9 +483,6 @@ fn rate_limit_429_produces_clean_error() {
         "Error should not contain thread names: {}",
         err_msg
     );
-    assert!(
-        err_msg.len() < 500,
-        "Error message should be concise"
-    );
+    assert!(err_msg.len() < 500, "Error message should be concise");
     eprintln!("HTTP 429 error (expected): {}", err_msg);
 }

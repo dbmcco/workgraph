@@ -417,11 +417,7 @@ pub fn build_registry_from_discovered(
         .map(|id| {
             let tier = infer_tier_from_model_id(id);
             // Use a short alias: last segment of the model ID
-            let alias = id
-                .rsplit('/')
-                .next()
-                .unwrap_or(id)
-                .to_string();
+            let alias = id.rsplit('/').next().unwrap_or(id).to_string();
             ModelRegistryEntry {
                 id: alias,
                 provider: provider.to_string(),
@@ -438,10 +434,7 @@ pub fn infer_tier_from_model_id(model_id: &str) -> Tier {
     let lower = model_id.to_lowercase();
 
     // Premium tier: opus, large reasoning models
-    if lower.contains("opus")
-        || lower.contains("o1-pro")
-        || lower.contains("o3-pro")
-    {
+    if lower.contains("opus") || lower.contains("o1-pro") || lower.contains("o3-pro") {
         return Tier::Premium;
     }
 
@@ -537,7 +530,10 @@ pub fn check_existing_config(config: &Config) -> String {
     if config.model_registry.is_empty() {
         lines.push("  Registry: (empty)".to_string());
     } else {
-        lines.push(format!("  Registry: {} model(s)", config.model_registry.len()));
+        lines.push(format!(
+            "  Registry: {} model(s)",
+            config.model_registry.len()
+        ));
     }
 
     // Agency
@@ -574,7 +570,11 @@ pub fn run_non_interactive(args: &SetupArgs) -> Result<()> {
             match validate_api_key(provider, key, Some(url)) {
                 Ok(result) => {
                     if result.success {
-                        eprintln!("  \u{2713} {} (found {} models)", result.message, result.model_ids.len());
+                        eprintln!(
+                            "  \u{2713} {} (found {} models)",
+                            result.message,
+                            result.model_ids.len()
+                        );
                         discovered_model_ids = result.model_ids;
                     } else {
                         bail!(
@@ -599,13 +599,11 @@ pub fn run_non_interactive(args: &SetupArgs) -> Result<()> {
     };
 
     // Determine default model
-    let model = args.model.as_deref().unwrap_or_else(|| {
-        match provider {
-            "anthropic" => "sonnet",
-            "openrouter" => "anthropic/claude-sonnet-4",
-            "openai" => "gpt-4o",
-            _ => "default",
-        }
+    let model = args.model.as_deref().unwrap_or_else(|| match provider {
+        "anthropic" => "sonnet",
+        "openrouter" => "anthropic/claude-sonnet-4",
+        "openai" => "gpt-4o",
+        _ => "default",
     });
 
     // Determine executor
@@ -653,9 +651,15 @@ pub fn run_non_interactive(args: &SetupArgs) -> Result<()> {
     println!("  Executor: {}", executor);
     println!("  Model:    {}", model);
     if !model_registry_entries.is_empty() {
-        println!("  Registry: {} model(s) discovered", model_registry_entries.len());
+        println!(
+            "  Registry: {} model(s) discovered",
+            model_registry_entries.len()
+        );
     }
-    if config.tiers.fast.is_some() || config.tiers.standard.is_some() || config.tiers.premium.is_some() {
+    if config.tiers.fast.is_some()
+        || config.tiers.standard.is_some()
+        || config.tiers.premium.is_some()
+    {
         println!(
             "  Tiers:    fast={}, standard={}, premium={}",
             config.tiers.fast.as_deref().unwrap_or("(unset)"),
@@ -753,7 +757,9 @@ pub fn run_with_args(args: &SetupArgs) -> Result<()> {
 /// Run the interactive setup wizard.
 pub fn run() -> Result<()> {
     if !std::io::stdin().is_terminal() {
-        bail!("wg setup requires an interactive terminal. Use --provider for non-interactive mode.");
+        bail!(
+            "wg setup requires an interactive terminal. Use --provider for non-interactive mode."
+        );
     }
 
     // Load existing global config for defaults
@@ -761,10 +767,7 @@ pub fn run() -> Result<()> {
     let global_path = Config::global_config_path()?;
 
     println!("Hey! Welcome to workgraph setup.");
-    println!(
-        "We'll get you configured at {}",
-        global_path.display()
-    );
+    println!("We'll get you configured at {}", global_path.display());
     println!();
 
     // Auto-detection phase — show what's already in place
@@ -790,16 +793,17 @@ pub fn run() -> Result<()> {
     let provider_keys = &["anthropic", "openrouter", "openai", "local", "custom"];
 
     // Smart default: use existing config, or infer from detected API keys
-    let current_provider = existing
-        .coordinator
-        .provider
-        .as_deref()
-        .unwrap_or_else(|| {
-            if detection.anthropic_key { "anthropic" }
-            else if detection.openrouter_key { "openrouter" }
-            else if detection.openai_key { "openai" }
-            else { "anthropic" }
-        });
+    let current_provider = existing.coordinator.provider.as_deref().unwrap_or_else(|| {
+        if detection.anthropic_key {
+            "anthropic"
+        } else if detection.openrouter_key {
+            "openrouter"
+        } else if detection.openai_key {
+            "openai"
+        } else {
+            "anthropic"
+        }
+    });
     let current_provider_idx = provider_keys
         .iter()
         .position(|&p| p == current_provider)
@@ -823,7 +827,10 @@ pub fn run() -> Result<()> {
     println!();
     let executor_ok = match (default_executor, detection.claude_cli, detection.amplifier) {
         ("claude", true, _) => {
-            println!("  Using '{}' executor — you've got the claude CLI, perfect.", default_executor);
+            println!(
+                "  Using '{}' executor — you've got the claude CLI, perfect.",
+                default_executor
+            );
             true
         }
         ("claude", false, true) => {
@@ -833,11 +840,16 @@ pub fn run() -> Result<()> {
         }
         ("claude", false, false) => {
             println!("  Note: claude CLI isn't installed yet.");
-            println!("  You'll need it before running agents. Install from: https://docs.anthropic.com/claude-code");
+            println!(
+                "  You'll need it before running agents. Install from: https://docs.anthropic.com/claude-code"
+            );
             true
         }
         _ => {
-            println!("  Using '{}' executor for {} provider.", default_executor, provider);
+            println!(
+                "  Using '{}' executor for {} provider.",
+                default_executor, provider
+            );
             true
         }
     };
@@ -894,7 +906,11 @@ pub fn run() -> Result<()> {
             println!("Validating API key...");
             match validate_api_key(&ep.provider, key, Some(&ep.url)) {
                 Ok(result) if result.success => {
-                    println!("  \u{2713} {} (found {} models)", result.message, result.model_ids.len());
+                    println!(
+                        "  \u{2713} {} (found {} models)",
+                        result.message,
+                        result.model_ids.len()
+                    );
 
                     // Offer to auto-discover models if we got a response
                     if !result.model_ids.is_empty() && model_registry_entries.is_empty() {
@@ -916,7 +932,10 @@ pub fn run() -> Result<()> {
                     }
                 }
                 Ok(result) => {
-                    println!("  \u{2717} {} (status {})", result.message, result.status_code);
+                    println!(
+                        "  \u{2717} {} (status {})",
+                        result.message, result.status_code
+                    );
                     let cont = Confirm::new()
                         .with_prompt("Continue anyway?")
                         .default(false)
@@ -1024,7 +1043,14 @@ pub fn run() -> Result<()> {
     if choices.endpoint.is_some() {
         println!("  Endpoint:       configured");
     }
-    println!("  Agency:         {}", if choices.agency_enabled { "enabled" } else { "disabled" });
+    println!(
+        "  Agency:         {}",
+        if choices.agency_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("  Skill:          {}", skill_status);
     println!("  CLAUDE.md:      {}", claude_md_status);
     println!("  Notifications:  {}", notify_status);
@@ -1577,13 +1603,9 @@ pub fn format_detection_summary(det: &DetectionResult) -> String {
     // Config
     lines.push(String::new());
     if det.global_config {
-        lines.push(
-            "  ✓ Global config exists — we'll update it with your choices.".to_string(),
-        );
+        lines.push("  ✓ Global config exists — we'll update it with your choices.".to_string());
     } else {
-        lines.push(
-            "  · No global config yet — we'll create one for you.".to_string(),
-        );
+        lines.push("  · No global config yet — we'll create one for you.".to_string());
     }
     if det.local_config {
         lines.push("  ✓ Project config found (.workgraph/config.toml).".to_string());
@@ -1753,7 +1775,7 @@ fn guide_notification_setup() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workgraph::config::{Config, CLAUDE_SONNET_MODEL_ID};
+    use workgraph::config::{CLAUDE_SONNET_MODEL_ID, Config};
 
     #[test]
     fn test_build_config_defaults() {
@@ -2311,10 +2333,7 @@ mod tests {
     fn test_infer_tier_haiku_is_fast() {
         assert_eq!(infer_tier_from_model_id("claude-haiku-4"), Tier::Fast);
         assert_eq!(infer_tier_from_model_id("gpt-4o-mini"), Tier::Fast);
-        assert_eq!(
-            infer_tier_from_model_id("gemini-2.0-flash"),
-            Tier::Fast
-        );
+        assert_eq!(infer_tier_from_model_id("gemini-2.0-flash"), Tier::Fast);
     }
 
     #[test]
@@ -2443,7 +2462,7 @@ mod tests {
                 api_key_file: None,
                 api_key_env: None,
                 is_default: true,
-            context_window: None,
+                context_window: None,
             });
         let status = check_existing_config(&config);
         assert!(status.contains("my-ep"));
@@ -2729,7 +2748,9 @@ mod tests {
         // `ls` should always be available on Unix
         assert!(is_command_available("ls"));
         // A garbage command should not
-        assert!(!is_command_available("this_command_definitely_does_not_exist_xyz_123"));
+        assert!(!is_command_available(
+            "this_command_definitely_does_not_exist_xyz_123"
+        ));
     }
 
     // ── detect_environment (smoke test) ──────────────────────────────
