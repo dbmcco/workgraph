@@ -1130,6 +1130,35 @@ fn append_chat_inbox(
     }
 }
 
+/// Check if a coordinator slot (e.g., ".coordinator-0") is available for new assignment.
+///
+/// Returns true if:
+/// - The slot is empty (no task exists)
+/// - The existing task is not an active coordinator (no "coordinator-loop" tag)
+/// - The existing coordinator is abandoned or archived
+///
+/// Returns false only if an active coordinator occupies the slot.
+fn is_coordinator_slot_available(graph: &workgraph::graph::WorkGraph, task_id: &str) -> bool {
+    match graph.get_task(task_id) {
+        None => true, // Slot is empty — available
+        Some(task) => {
+            // If task has coordinator-loop tag, check if it's still active
+            if task.tags.iter().any(|t| t == "coordinator-loop") {
+                // Skip abandoned or archived coordinators — slot is available
+                if matches!(task.status, workgraph::graph::Status::Abandoned) {
+                    return true;
+                }
+                if task.tags.iter().any(|t| t == "archived") {
+                    return true;
+                }
+                return false; // Active coordinator — not available
+            }
+            // No coordinator-loop tag — not a coordinator, slot is available
+            true
+        }
+    }
+}
+
 /// Handle CreateCoordinator IPC request.
 fn handle_create_coordinator(dir: &Path, name: Option<&str>) -> IpcResponse {
     let graph_path = crate::commands::graph_path(dir);
@@ -1142,7 +1171,7 @@ fn handle_create_coordinator(dir: &Path, name: Option<&str>) -> IpcResponse {
     let mut next_id = 0u32;
     loop {
         let task_id = format!(".coordinator-{}", next_id);
-        if graph.get_task(&task_id).is_none() {
+        if is_coordinator_slot_available(&graph, &task_id) {
             break;
         }
         next_id += 1;
