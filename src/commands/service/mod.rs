@@ -49,6 +49,79 @@ use workgraph::service::registry::AgentRegistry;
 
 use super::{graph_path, is_process_alive, kill_process_force, kill_process_graceful};
 
+fn resolve_service_coordinator_settings(
+    dir: &Path,
+    config: &Config,
+    cli_executor: Option<&str>,
+    cli_model: Option<&str>,
+    no_coordinator_agent: bool,
+) -> Result<(String, Option<String>)> {
+    let effective_executor = cli_executor
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| config.coordinator.effective_executor());
+    let explicit_model = cli_model
+        .map(std::string::ToString::to_string)
+        .or_else(|| config.coordinator.model.clone());
+
+    if no_coordinator_agent || !config.coordinator.coordinator_agent {
+        return Ok((effective_executor, explicit_model));
+    }
+
+    let has_explicit_coordinator_config = cli_executor.is_some()
+        || cli_model.is_some()
+        || config.coordinator.executor.is_some()
+        || config.coordinator.model.is_some();
+
+    if !has_explicit_coordinator_config {
+        anyhow::bail!(
+            "Coordinator agent startup requires explicit coordinator configuration. \
+             Refusing implicit fallback to default Claude settings.\n\
+             Configure it with e.g. `wg config --local --coordinator-executor native \
+             --coordinator-model openrouter:minimax/minimax-m2.7`, or use \
+             `wg service start --no-coordinator-agent`."
+        );
+    }
+
+    if effective_executor == "native" {
+        let resolved = if let Some(raw_model) = explicit_model.clone() {
+            let spec = workgraph::config::parse_model_spec(&raw_model);
+            let provider = spec
+                .provider
+                .as_deref()
+                .map(workgraph::config::provider_to_native_provider)
+                .map(String::from)
+                .or_else(|| config.coordinator.provider.clone());
+            let endpoint = config
+                .registry_lookup(&spec.model_id)
+                .and_then(|entry| entry.endpoint.clone());
+            (spec.model_id, provider, endpoint)
+        } else {
+            let resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Default);
+            let provider = resolved.provider.or_else(|| config.coordinator.provider.clone());
+            let endpoint = resolved
+                .endpoint
+                .or_else(|| resolved.registry_entry.and_then(|entry| entry.endpoint.clone()));
+            (resolved.model, provider, endpoint)
+        };
+
+        workgraph::executor::native::provider::create_provider_ext(
+            dir,
+            &resolved.0,
+            resolved.1.as_deref(),
+            resolved.2.as_deref(),
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "Coordinator native provider preflight failed for model '{}'",
+                resolved.0
+            )
+        })?;
+    }
+
+    Ok((effective_executor, explicit_model))
+}
+
 // ---------------------------------------------------------------------------
 // Persistent daemon logger
 // ---------------------------------------------------------------------------
@@ -742,6 +815,15 @@ pub fn run_start(
     force: bool,
     no_coordinator_agent: bool,
 ) -> Result<()> {
+    let config = Config::load_merged(dir)?;
+    let (preflight_executor, preflight_model) = resolve_service_coordinator_settings(
+        dir,
+        &config,
+        executor,
+        model,
+        no_coordinator_agent,
+    )?;
+
     // Check if service is already running
     if let Some(state) = ServiceState::load(dir)? {
         if is_process_alive(state.pid) {
@@ -986,15 +1068,10 @@ pub fn run_start(
     }
 
     // Resolve effective config for display (CLI flags override config.toml)
-    let config = Config::load_or_default(dir);
     let eff_max_agents = max_agents.unwrap_or(config.coordinator.max_agents);
     let eff_poll_interval = interval.unwrap_or(config.coordinator.poll_interval);
-    let eff_executor = executor
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| config.coordinator.effective_executor());
-    let eff_model: Option<String> = model
-        .map(std::string::ToString::to_string)
-        .or_else(|| config.coordinator.model.clone());
+    let eff_executor = preflight_executor;
+    let eff_model: Option<String> = preflight_model;
 
     let log_path_str = log_path.to_string_lossy().to_string();
 
@@ -1397,458 +1474,68 @@ fn try_dispatch_notifications(dir: &Path, logger: &DaemonLogger) {
     }
 }
 
-/// Ensure the `.coordinator` and `.compact` cycle tasks exist in the graph.
+/// Mark legacy daemon-managed graph tasks as abandoned.
 ///
-/// Creates them if missing (Phase 2 of coordinator-as-graph-citizen).
-/// The coordinator task has unlimited iterations and is tagged `coordinator-loop`.
-/// The compact task forms a visible cycle with the coordinator:
-///   .coordinator-0 → .compact-0 → .coordinator-0
-fn ensure_coordinator_task(dir: &Path) {
-    use workgraph::graph::{CycleConfig, LogEntry, Node, Task};
-
+/// Older coordinator implementations represented daemon control flow as
+/// graph tasks (`.archive-*`, `.registry-refresh-*`, `.coordinator-*`,
+/// `.user-*`). The current coordinator keeps that control plane out of
+/// the graph so `wg service start` does not pollute a bare repo.
+///
+/// Note: `.compact-*` tasks are no longer managed here — compaction is
+/// now handled natively via the journal/compactor without graph control.
+fn cleanup_legacy_daemon_tasks(dir: &Path, logger: &DaemonLogger) {
     let gp = graph_path(dir);
-    let mut graph = match load_graph(&gp) {
-        Ok(g) => g,
-        Err(_) => return, // No graph yet — nothing to do
+    let Ok(graph) = load_graph(&gp) else {
+        return;
     };
 
-    let mut modified = false;
-
-    // Migrate legacy .coordinator to .coordinator-0
-    if graph.get_task(".coordinator").is_some()
-        && graph.get_task(".coordinator-0").is_none()
-        && let Some(task) = graph.get_task_mut(".coordinator")
-    {
-        task.id = ".coordinator-0".to_string();
-        task.title = "Coordinator 0".to_string();
-        modified = true;
-    }
-
-    // Ensure .coordinator-0 exists
-    if graph.get_task(".coordinator-0").is_none() {
-        let task = Task {
-            id: ".coordinator-0".to_string(),
-            title: "Coordinator 0".to_string(),
-            description: Some(
-                "Persistent coordinator agent — each turn is a cycle iteration.".to_string(),
-            ),
-            status: workgraph::graph::Status::InProgress,
-            tags: vec!["coordinator-loop".to_string()],
-            after: vec![".compact-0".to_string()],
-            cycle_config: Some(CycleConfig {
-                max_iterations: 0, // unlimited
-                guard: None,
-                delay: None,
-                no_converge: true,
-                restart_on_failure: true,
-                max_failure_restarts: None,
-            }),
-            created_at: Some(Utc::now().to_rfc3339()),
-            started_at: Some(Utc::now().to_rfc3339()),
-            log: vec![LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                actor: Some("daemon".to_string()),
-                user: Some(workgraph::current_user()),
-                message: "Coordinator 0 task created by daemon".to_string(),
-            }],
-            ..Default::default()
-        };
-
-        graph.add_node(Node::Task(task));
-        modified = true;
-    } else if let Some(coord) = graph.get_task_mut(".coordinator-0") {
-        // Ensure back-edge to .compact-0 exists on pre-existing coordinator tasks
-        if !coord.after.contains(&".compact-0".to_string()) {
-            coord.after.push(".compact-0".to_string());
-            modified = true;
+    let mut stale_ids = Vec::new();
+    for task in graph.tasks() {
+        let is_legacy = task.id == ".coordinator"
+            || task.id.starts_with(".coordinator-")
+            || task.id.starts_with(".archive-")
+            || task.id.starts_with(".registry-refresh-")
+            || task.id.starts_with(".user-");
+        if is_legacy && task.status != workgraph::graph::Status::Abandoned {
+            stale_ids.push(task.id.clone());
         }
     }
 
-    // Ensure .compact-0 exists — forms a cycle with .coordinator-0
-    if graph.get_task(".compact-0").is_none() {
-        let task = Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            description: Some(
-                "Compaction task — distills graph state into context.md. \
-                 Forms a cycle with the coordinator: coordinator → compact → coordinator."
-                    .to_string(),
-            ),
-            status: workgraph::graph::Status::Open,
-            tags: vec!["compact-loop".to_string()],
-            after: vec![".coordinator-0".to_string()],
-            created_at: Some(Utc::now().to_rfc3339()),
-            log: vec![LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                actor: Some("daemon".to_string()),
-                user: Some(workgraph::current_user()),
-                message: "Compact 0 task created by daemon".to_string(),
-            }],
-            ..Default::default()
-        };
-
-        graph.add_node(Node::Task(task));
-        modified = true;
+    if stale_ids.is_empty() {
+        return;
     }
 
-    // Ensure .archive-0 exists — forms a cycle with .coordinator-0
-    // Archives done/abandoned tasks older than the configured retention period.
-    if graph.get_task(".archive-0").is_none() {
-        let task = Task {
-            id: ".archive-0".to_string(),
-            title: "Archive 0".to_string(),
-            description: Some(
-                "Archive task — moves old done/abandoned tasks to archive.jsonl. \
-                 Forms a cycle with the coordinator: coordinator → archive → coordinator."
-                    .to_string(),
-            ),
-            status: workgraph::graph::Status::Open,
-            tags: vec!["archive-loop".to_string()],
-            after: vec![".coordinator-0".to_string()],
-            created_at: Some(Utc::now().to_rfc3339()),
-            log: vec![LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                actor: Some("daemon".to_string()),
-                user: Some(workgraph::current_user()),
-                message: "Archive 0 task created by daemon".to_string(),
-            }],
-            ..Default::default()
-        };
-
-        graph.add_node(Node::Task(task));
-        modified = true;
-    }
-
-    // Ensure .coordinator-0 has back-edge to .archive-0
-    if let Some(coord) = graph.get_task_mut(".coordinator-0")
-        && !coord.after.contains(&".archive-0".to_string())
-    {
-        coord.after.push(".archive-0".to_string());
-        modified = true;
-    }
-
-    // Ensure .registry-refresh-0 exists — daemon-managed cycle for model registry updates.
-    // Fetches fresh model data from OpenRouter, computes fitness scores, and diffs changes.
-    if graph.get_task(".registry-refresh-0").is_none() {
-        let task = Task {
-            id: ".registry-refresh-0".to_string(),
-            title: "Registry Refresh 0".to_string(),
-            description: Some(
-                "Model registry refresh — fetches model data from OpenRouter, \
-                 computes fitness scores, and diffs against previous registry. \
-                 Daemon-managed cycle task."
-                    .to_string(),
-            ),
-            status: workgraph::graph::Status::Open,
-            tags: vec!["registry-refresh-loop".to_string()],
-            after: vec![".coordinator-0".to_string()],
-            created_at: Some(Utc::now().to_rfc3339()),
-            log: vec![LogEntry {
-                timestamp: Utc::now().to_rfc3339(),
-                actor: Some("daemon".to_string()),
-                user: Some(workgraph::current_user()),
-                message: "Registry Refresh 0 task created by daemon".to_string(),
-            }],
-            ..Default::default()
-        };
-
-        graph.add_node(Node::Task(task));
-        modified = true;
-    }
-
-    // Ensure .coordinator-0 has back-edge to .registry-refresh-0
-    if let Some(coord) = graph.get_task_mut(".coordinator-0")
-        && !coord.after.contains(&".registry-refresh-0".to_string())
-    {
-        coord.after.push(".registry-refresh-0".to_string());
-        modified = true;
-    }
-
-    if modified
-        && let Err(e) = workgraph::parser::modify_graph(&gp, |fresh| {
-            // Re-apply all mutations
-            for node in graph.nodes() {
-                if let workgraph::graph::Node::Task(t) = node {
-                    if let Some(ft) = fresh.get_task_mut(&t.id) {
-                        *ft = t.clone();
-                    } else {
-                        fresh.add_node(workgraph::graph::Node::Task(t.clone()));
-                    }
-                }
-            }
-            true
-        })
-    {
-        eprintln!(
-            "[daemon] Failed to save graph after creating coordinator/compact tasks: {}",
-            e
-        );
-    }
-}
-
-/// Ensure a user board exists for the current user on coordinator startup.
-///
-/// Auto-creates `.user-{NAME}-0` if no active board exists for the user.
-/// The user board persists across coordinator restarts since it's a regular
-/// graph task stored in `graph.jsonl`.
-fn ensure_user_board(dir: &Path) {
-    use workgraph::graph::{Node, create_user_board_task, is_user_board, next_user_board_seq};
-
-    let gp = graph_path(dir);
-    let graph = match load_graph(&gp) {
-        Ok(g) => g,
-        Err(_) => return, // No graph yet — nothing to do
-    };
-
-    let handle = workgraph::current_user();
-
-    // Check if an active (non-terminal) user board already exists
-    let prefix = format!(".user-{}-", handle);
-    let has_active = graph
-        .tasks()
-        .any(|t| is_user_board(&t.id) && t.id.starts_with(&prefix) && !t.status.is_terminal());
-
-    if has_active {
-        return; // Already have an active user board
-    }
-
-    let seq = next_user_board_seq(&graph, &handle);
-    let task = create_user_board_task(&handle, seq);
-    let task_id = task.id.clone();
-
-    if let Err(e) = workgraph::parser::modify_graph(&gp, |fresh| {
-        // Double-check inside the lock that it doesn't already exist
-        let still_needs = !fresh
-            .tasks()
-            .any(|t| is_user_board(&t.id) && t.id.starts_with(&prefix) && !t.status.is_terminal());
-        if still_needs {
-            fresh.add_node(Node::Task(task.clone()));
-            true
-        } else {
-            false
-        }
-    }) {
-        eprintln!("[daemon] Failed to create user board '{}': {}", task_id, e);
-    } else {
-        eprintln!("[daemon] Auto-created user board '{}'", task_id);
-    }
-}
-
-/// Run compaction as a visible graph task (`.compact-N`).
-///
-/// Compaction is cycle-driven but includes a threshold-based re-open mechanism:
-/// when `.compact-0` is stuck in Done (because the coordinator never marks
-/// itself done and the cycle can't iterate), it is force-reset to Open once
-/// accumulated tokens exceed the compaction threshold.
-fn run_graph_compaction(dir: &Path, compaction_error_count: &mut u64, logger: &DaemonLogger) {
-    let gp = graph_path(dir);
-
-    // If .compact-0 is Done and accumulated tokens exceed the threshold,
-    // force-reset it to Open. Normal cycle iteration requires ALL members to
-    // be Done, but the coordinator is a persistent task that never completes,
-    // so the cycle can never iterate on its own.
-    {
-        let graph = match load_graph(&gp) {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let is_done = graph
-            .get_task(".compact-0")
-            .is_some_and(|t| t.status == workgraph::graph::Status::Done);
-        if is_done {
-            let config = workgraph::config::Config::load_or_default(dir);
-            let threshold = config.effective_compaction_threshold();
-            if threshold > 0 {
-                // Use total_accumulated_tokens to sum across ALL coordinator state files.
-                // Token accumulation is per-coordinator (via save_for), but compaction
-                // is a shared graph-level concern — any coordinator's growth should trigger.
-                let total_accumulated = CoordinatorState::total_accumulated_tokens(dir);
-                if total_accumulated >= threshold {
-                    let acc_tokens = total_accumulated;
-                    if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-                        if let Some(task) = graph.get_task_mut(".compact-0") {
-                            task.status = workgraph::graph::Status::Open;
-                            task.started_at = None;
-                            task.completed_at = None;
-                            task.log.push(workgraph::graph::LogEntry {
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                actor: Some("daemon".to_string()),
-                                user: Some(workgraph::current_user()),
-                                message: format!(
-                                    "Re-opened: tokens {} >= threshold {} (coordinator cycle bypass)",
-                                    acc_tokens, threshold
-                                ),
-                            });
-                            if task.log.len() > 50 {
-                                let drain_count = task.log.len() - 50;
-                                task.log.drain(..drain_count);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    }) {
-                        logger.error(&format!(
-                            "Failed to save graph after resetting .compact-0: {}",
-                            e
-                        ));
-                        return;
-                    }
-                    logger.info(&format!(
-                        "Re-opened .compact-0: tokens {} >= threshold {}",
-                        total_accumulated, threshold
-                    ));
-                }
-            }
-        }
-    }
-
-    // Check if .compact-0 is cycle-ready (uses cycle-aware readiness, not terminal check)
-    {
-        let graph = match load_graph(&gp) {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if graph.get_task(".compact-0").is_none() {
-            return; // No compact task in graph
-        }
-        let cycle_analysis = graph.compute_cycle_analysis();
-        let cycle_ready =
-            workgraph::query::ready_tasks_with_peers_cycle_aware(&graph, dir, &cycle_analysis);
-        if !cycle_ready.iter().any(|t| t.id == ".compact-0") {
-            return; // .compact-0 is not cycle-ready
-        }
-
-        // Gate on token threshold: defer compaction until enough tokens have accumulated
-        let config = workgraph::config::Config::load_or_default(dir);
-        let threshold = config.effective_compaction_threshold();
-        if threshold > 0 {
-            // Use total_accumulated_tokens to sum across ALL coordinator state files.
-            let total_accumulated = CoordinatorState::total_accumulated_tokens(dir);
-            if total_accumulated < threshold {
-                logger.info(&format!(
-                    "Compaction deferred: accumulated_tokens={} < threshold={}",
-                    total_accumulated, threshold
-                ));
-                return;
-            }
-        }
-    }
-
-    // Mark .compact-0 as InProgress
-    {
-        if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-            if let Some(task) = graph.get_task_mut(".compact-0") {
-                task.status = workgraph::graph::Status::InProgress;
-                task.started_at = Some(chrono::Utc::now().to_rfc3339());
+    let ids_for_log = stale_ids.clone();
+    match workgraph::parser::modify_graph(&gp, |graph| {
+        let mut changed = false;
+        for task_id in &stale_ids {
+            if let Some(task) = graph.get_task_mut(task_id)
+            {
+                task.status = workgraph::graph::Status::Abandoned;
+                task.completed_at.get_or_insert_with(|| Utc::now().to_rfc3339());
+                task.cycle_config = None;
                 task.log.push(workgraph::graph::LogEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    timestamp: Utc::now().to_rfc3339(),
                     actor: Some("daemon".to_string()),
                     user: Some(workgraph::current_user()),
-                    message: "Compaction started (cycle-driven)".to_string(),
+                    message:
+                        "Superseded by native coordinator control plane; no longer graph-managed"
+                            .to_string(),
                 });
-                true
-            } else {
-                false
-            }
-        }) {
-            eprintln!(
-                "[daemon] Failed to save graph after marking .compact-0 InProgress: {}",
-                e
-            );
-            return;
-        }
-    }
-
-    // Run compaction
-    match workgraph::service::compactor::run_compaction(dir) {
-        Ok(path) => {
-            if *compaction_error_count > 0 {
-                logger.info(&format!(
-                    "Compaction recovered after {} consecutive error(s)",
-                    *compaction_error_count
-                ));
-            }
-            *compaction_error_count = 0;
-            logger.info(&format!("Compaction complete → {}", path.display()));
-
-            // Reset accumulated token counter after successful compaction
-            let prev_total = CoordinatorState::total_accumulated_tokens(dir);
-            CoordinatorState::reset_all_accumulated_tokens(dir);
-            logger.info(&format!(
-                "Compaction: reset accumulated_tokens across all coordinators from {} to 0",
-                prev_total
-            ));
-
-            // Mark .compact-0 as Done and increment iteration
-            let path_display = path.display().to_string();
-            if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".compact-0") {
-                    task.status = workgraph::graph::Status::Done;
-                    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    task.loop_iteration = task.loop_iteration.saturating_add(1);
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: format!(
-                            "Compaction iteration {} complete → {}",
-                            task.loop_iteration, path_display
-                        ),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                eprintln!(
-                    "[daemon] Failed to save graph after marking .compact-0 Done: {}",
-                    e
-                );
+                changed = true;
             }
         }
-        Err(e) => {
-            *compaction_error_count += 1;
-            if *compaction_error_count == 1 || (*compaction_error_count).is_multiple_of(5) {
-                logger.error(&format!(
-                    "Compaction error (#{} consecutive): {:#}",
-                    *compaction_error_count, e
-                ));
-            }
-
-            // Persist error count to CompactorState so it survives daemon restarts
-            {
-                let mut cs = workgraph::service::compactor::CompactorState::load(dir);
-                cs.error_count = *compaction_error_count;
-                let _ = cs.save(dir);
-            }
-
-            // Mark .compact-0 as failed for this iteration, then reopen for retry
-            let err_msg = format!("Compaction error: {:#}", e);
-            let _ = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".compact-0") {
-                    task.status = workgraph::graph::Status::Open;
-                    task.started_at = None;
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: err_msg.clone(),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
-        }
+        changed
+    }) {
+        Ok(_) => logger.info(&format!(
+            "Abandoned {} legacy daemon task(s): {}",
+            ids_for_log.len(),
+            ids_for_log.join(", ")
+        )),
+        Err(e) => logger.warn(&format!(
+            "Failed to abandon legacy daemon-managed tasks: {}",
+            e
+        )),
     }
 }
 
@@ -1877,57 +1564,8 @@ fn run_pending_chat_compactions(dir: &Path, logger: &DaemonLogger) {
     }
 }
 
-/// Run archival as a visible graph task (`.archive-0`).
-///
-/// Archival is cycle-driven: fires only when `.archive-0` is graph-ready
-/// (status=Open and coordinator dep is terminal). Follows the same pattern
-/// as `run_graph_compaction` for `.compact-0`.
-fn run_graph_archival(dir: &Path, archival_error_count: &mut u64, logger: &DaemonLogger) {
-    let gp = graph_path(dir);
-
-    // Check if .archive-0 is cycle-ready
-    {
-        let graph = match load_graph(&gp) {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if graph.get_task(".archive-0").is_none() {
-            return; // No archive task in graph
-        }
-        let cycle_analysis = graph.compute_cycle_analysis();
-        let cycle_ready =
-            workgraph::query::ready_tasks_with_peers_cycle_aware(&graph, dir, &cycle_analysis);
-        if !cycle_ready.iter().any(|t| t.id == ".archive-0") {
-            return; // .archive-0 is not cycle-ready
-        }
-    }
-
-    // Mark .archive-0 as InProgress
-    {
-        if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-            if let Some(task) = graph.get_task_mut(".archive-0") {
-                task.status = workgraph::graph::Status::InProgress;
-                task.started_at = Some(chrono::Utc::now().to_rfc3339());
-                task.log.push(workgraph::graph::LogEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    actor: Some("daemon".to_string()),
-                    user: Some(workgraph::current_user()),
-                    message: "Archival started (cycle-driven)".to_string(),
-                });
-                true
-            } else {
-                false
-            }
-        }) {
-            eprintln!(
-                "[daemon] Failed to save graph after marking .archive-0 InProgress: {}",
-                e
-            );
-            return;
-        }
-    }
-
-    // Run archival
+/// Run automatic archival directly from the daemon without graph control tasks.
+fn run_automatic_archival(dir: &Path, archival_error_count: &mut u64, logger: &DaemonLogger) {
     let config = workgraph::config::Config::load_or_default(dir);
     let retention_days = config.coordinator.archive_retention_days;
 
@@ -1945,35 +1583,6 @@ fn run_graph_archival(dir: &Path, archival_error_count: &mut u64, logger: &Daemo
                 count, retention_days
             ));
 
-            // Mark .archive-0 as Done and increment iteration
-            if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".archive-0") {
-                    task.status = workgraph::graph::Status::Done;
-                    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    task.loop_iteration = task.loop_iteration.saturating_add(1);
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: format!(
-                            "Archival iteration {} complete: {} tasks archived",
-                            task.loop_iteration, count
-                        ),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                eprintln!(
-                    "[daemon] Failed to save graph after marking .archive-0 Done: {}",
-                    e
-                );
-            }
         }
         Err(e) => {
             *archival_error_count += 1;
@@ -1984,32 +1593,11 @@ fn run_graph_archival(dir: &Path, archival_error_count: &mut u64, logger: &Daemo
                 ));
             }
 
-            // Revert .archive-0 to Open for retry
-            let arch_err_msg = format!("Archival error: {:#}", e);
-            let _ = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".archive-0") {
-                    task.status = workgraph::graph::Status::Open;
-                    task.started_at = None;
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: arch_err_msg.clone(),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
         }
     }
 }
 
-/// Run model registry refresh as a visible graph task (`.registry-refresh-0`).
+/// Run model registry refresh directly from the daemon without graph control tasks.
 ///
 /// Time-gated: only fires when at least `registry_refresh_interval` seconds
 /// have elapsed since the last successful refresh (stored in
@@ -2019,25 +1607,6 @@ fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &Daem
     let interval = config.coordinator.registry_refresh_interval;
     if interval == 0 {
         return; // Disabled
-    }
-
-    let gp = graph_path(dir);
-
-    // Check if .registry-refresh-0 is cycle-ready
-    {
-        let graph = match load_graph(&gp) {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if graph.get_task(".registry-refresh-0").is_none() {
-            return;
-        }
-        let cycle_analysis = graph.compute_cycle_analysis();
-        let cycle_ready =
-            workgraph::query::ready_tasks_with_peers_cycle_aware(&graph, dir, &cycle_analysis);
-        if !cycle_ready.iter().any(|t| t.id == ".registry-refresh-0") {
-            return;
-        }
     }
 
     // Time gate: check if enough time has elapsed since the last fetch.
@@ -2053,31 +1622,6 @@ fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &Daem
         // If no existing registry or unparseable date, proceed (initial population).
     }
 
-    // Mark .registry-refresh-0 as InProgress
-    {
-        if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-            if let Some(task) = graph.get_task_mut(".registry-refresh-0") {
-                task.status = workgraph::graph::Status::InProgress;
-                task.started_at = Some(chrono::Utc::now().to_rfc3339());
-                task.log.push(workgraph::graph::LogEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    actor: Some("daemon".to_string()),
-                    user: Some(workgraph::current_user()),
-                    message: "Registry refresh started".to_string(),
-                });
-                true
-            } else {
-                false
-            }
-        }) {
-            eprintln!(
-                "[daemon] Failed to mark .registry-refresh-0 InProgress: {}",
-                e
-            );
-            return;
-        }
-    }
-
     // Run the actual refresh
     match do_registry_refresh(dir) {
         Ok(summary) => {
@@ -2090,33 +1634,6 @@ fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &Daem
             *refresh_error_count = 0;
             logger.info(&format!("Registry refresh complete: {}", summary));
 
-            // Mark .registry-refresh-0 as Done and increment iteration
-            let summary_clone = summary.clone();
-            if let Err(e) = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".registry-refresh-0") {
-                    task.status = workgraph::graph::Status::Done;
-                    task.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                    task.loop_iteration = task.loop_iteration.saturating_add(1);
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: format!(
-                            "Registry refresh iteration {} complete: {}",
-                            task.loop_iteration, summary_clone
-                        ),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            }) {
-                eprintln!("[daemon] Failed to mark .registry-refresh-0 Done: {}", e);
-            }
         }
         Err(e) => {
             *refresh_error_count += 1;
@@ -2127,27 +1644,6 @@ fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &Daem
                 ));
             }
 
-            // Revert .registry-refresh-0 to Open for retry
-            let err_msg = format!("Registry refresh error: {:#}", e);
-            let _ = workgraph::parser::modify_graph(&gp, |graph| {
-                if let Some(task) = graph.get_task_mut(".registry-refresh-0") {
-                    task.status = workgraph::graph::Status::Open;
-                    task.started_at = None;
-                    task.log.push(workgraph::graph::LogEntry {
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        actor: Some("daemon".to_string()),
-                        user: Some(workgraph::current_user()),
-                        message: err_msg.clone(),
-                    });
-                    if task.log.len() > 50 {
-                        let drain_count = task.log.len() - 50;
-                        task.log.drain(..drain_count);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
         }
     }
 }
@@ -2294,8 +1790,8 @@ pub fn run_daemon(
     let dir = dir.to_path_buf();
     let mut running = true;
 
-    // Load coordinator config, CLI args override config values
-    let config = Config::load_or_default(&dir);
+    // Load coordinator config strictly: invalid config must abort startup.
+    let config = Config::load_merged(&dir)?;
 
     // Validate configuration before starting
     let validation = config.validate_config();
@@ -2318,19 +1814,23 @@ pub fn run_daemon(
         );
     }
 
+    let (resolved_executor, resolved_model) = resolve_service_coordinator_settings(
+        &dir,
+        &config,
+        cli_executor,
+        cli_model,
+        no_coordinator_agent,
+    )?;
+
     let mut daemon_cfg = DaemonConfig {
         max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
-        executor: cli_executor
-            .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| config.coordinator.effective_executor()),
+        executor: resolved_executor,
         // The poll_interval is the slow background safety-net timer.
         // CLI --interval overrides it; otherwise use config.coordinator.poll_interval.
         poll_interval: Duration::from_secs(
             cli_interval.unwrap_or(config.coordinator.poll_interval),
         ),
-        model: cli_model
-            .map(std::string::ToString::to_string)
-            .or_else(|| config.coordinator.model.clone()),
+        model: resolved_model,
         provider: config.coordinator.provider.clone(),
         paused: false,
         settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
@@ -2393,11 +1893,8 @@ pub fn run_daemon(
     };
     coord_state.save(&dir);
 
-    // Ensure the .coordinator cycle task exists in the graph (Phase 2).
-    ensure_coordinator_task(&dir);
-
-    // Ensure a user board exists for the current user (Phase 2.1).
-    ensure_user_board(&dir);
+    // Clean up legacy daemon-managed graph tasks from older coordinator models.
+    cleanup_legacy_daemon_tasks(&dir, &logger);
 
     // Auto-bootstrap agency when auto_evolve is enabled and agency isn't initialized.
     if config.agency.auto_evolve {
@@ -2496,8 +1993,6 @@ pub fn run_daemon(
     let daemon_start_time = Instant::now();
 
     // Restore error counts from persisted state so they survive daemon restarts
-    let mut compaction_error_count: u64 =
-        workgraph::service::compactor::CompactorState::load(&dir).error_count;
     let mut archival_error_count: u64 = 0;
     let mut refresh_error_count: u64 = 0;
 
@@ -2800,13 +2295,13 @@ pub fn run_daemon(
                     // Dispatch notifications for task state changes (failures, blocks)
                     try_dispatch_notifications(&dir, &logger);
 
-                    // Compaction: run when .compact-0 is graph-ready (cycle-driven)
-                    run_graph_compaction(&dir, &mut compaction_error_count, &logger);
+                    // Keep per-coordinator chat history compact without polluting the graph.
+                    run_pending_chat_compactions(&dir, &logger);
 
-                    // Archival: run when .archive-0 is graph-ready (cycle-driven)
-                    run_graph_archival(&dir, &mut archival_error_count, &logger);
+                    // Automatic archival runs directly in the daemon.
+                    run_automatic_archival(&dir, &mut archival_error_count, &logger);
 
-                    // Registry refresh: run when .registry-refresh-0 is graph-ready and interval elapsed
+                    // Registry refresh runs directly in the daemon and is time-gated.
                     run_registry_refresh(&dir, &mut refresh_error_count, &logger);
                 }
                 Err(e) => {
@@ -4218,74 +3713,62 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_cycle() {
-        use workgraph::graph::Status;
+    fn test_cleanup_legacy_daemon_tasks_abandons_open_legacy_tasks() {
+        use workgraph::graph::{Node, Status, Task};
 
         let temp_dir = TempDir::new().unwrap();
         let dir = temp_dir.path();
         let gp = dir.join("graph.jsonl");
 
-        // Initialize an empty graph
-        let graph = workgraph::graph::WorkGraph::new();
+        let mut graph = workgraph::graph::WorkGraph::new();
+        // Note: .compact-* is no longer cleaned up — compaction is now native/journal-based
+        for id in [
+            ".coordinator-0",
+            ".archive-0",
+            ".registry-refresh-0",
+            ".user-erik-0",
+        ] {
+            graph.add_node(Node::Task(Task {
+                id: id.to_string(),
+                title: id.to_string(),
+                status: Status::Open,
+                ..Default::default()
+            }));
+        }
+        // Add a .compact-0 task that should NOT be abandoned (native compaction handles it)
+        graph.add_node(Node::Task(Task {
+            id: ".compact-0".to_string(),
+            title: "Compact 0".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        }));
+        graph.add_node(Node::Task(Task {
+            id: "real-task".to_string(),
+            title: "real-task".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        }));
         workgraph::parser::save_graph(&graph, &gp).unwrap();
 
-        // Run ensure_coordinator_task — should create both .coordinator-0 and .compact-0
-        ensure_coordinator_task(dir);
+        let logger = DaemonLogger::open(dir).unwrap();
+        cleanup_legacy_daemon_tasks(dir, &logger);
 
         let graph = load_graph(&gp).unwrap();
-
-        // .coordinator-0 should exist with cycle_config
-        let coord = graph
-            .get_task(".coordinator-0")
-            .expect(".coordinator-0 should exist");
-        assert_eq!(coord.status, Status::InProgress);
-        assert!(
-            coord.cycle_config.is_some(),
-            "coordinator should have cycle_config"
-        );
-        assert!(
-            coord.after.contains(&".compact-0".to_string()),
-            "coordinator should have back-edge to .compact-0"
-        );
-        assert!(
-            coord.tags.contains(&"coordinator-loop".to_string()),
-            "coordinator should have coordinator-loop tag"
-        );
-
-        // .compact-0 should exist with proper edges
-        let compact = graph
-            .get_task(".compact-0")
-            .expect(".compact-0 should exist");
-        assert_eq!(compact.status, Status::Open);
-        assert!(
-            compact.after.contains(&".coordinator-0".to_string()),
-            "compact should depend on .coordinator-0"
-        );
-        assert!(
-            compact.tags.contains(&"compact-loop".to_string()),
-            "compact should have compact-loop tag"
-        );
-
-        // The two tasks should form a cycle (SCC)
-        let cycle_analysis = graph.compute_cycle_analysis();
-        assert!(
-            cycle_analysis.task_to_cycle.contains_key(".coordinator-0"),
-            "coordinator should be part of a detected cycle"
-        );
-        assert!(
-            cycle_analysis.task_to_cycle.contains_key(".compact-0"),
-            "compact should be part of a detected cycle"
-        );
-        // Both should be in the same cycle
-        assert_eq!(
-            cycle_analysis.task_to_cycle.get(".coordinator-0"),
-            cycle_analysis.task_to_cycle.get(".compact-0"),
-            "coordinator and compact should be in the same cycle"
-        );
+        for id in [
+            ".coordinator-0",
+            ".archive-0",
+            ".registry-refresh-0",
+            ".user-erik-0",
+        ] {
+            assert_eq!(graph.get_task(id).unwrap().status, Status::Abandoned);
+        }
+        // .compact-0 should NOT be abandoned — it's now handled by native compaction
+        assert_eq!(graph.get_task(".compact-0").unwrap().status, Status::Open);
+        assert_eq!(graph.get_task("real-task").unwrap().status, Status::Open);
     }
 
     #[test]
-    fn test_compaction_cycle_idempotent() {
+    fn test_cleanup_legacy_daemon_tasks_noop_on_bare_graph() {
         let temp_dir = TempDir::new().unwrap();
         let dir = temp_dir.path();
         let gp = dir.join("graph.jsonl");
@@ -4293,277 +3776,11 @@ mod tests {
         let graph = workgraph::graph::WorkGraph::new();
         workgraph::parser::save_graph(&graph, &gp).unwrap();
 
-        // Run twice — should be idempotent
-        ensure_coordinator_task(dir);
-        ensure_coordinator_task(dir);
-
-        let graph = load_graph(&gp).unwrap();
-        assert!(graph.get_task(".coordinator-0").is_some());
-        assert!(graph.get_task(".compact-0").is_some());
-
-        // Only one back-edge, not duplicated
-        let coord = graph.get_task(".coordinator-0").unwrap();
-        let compact_refs: Vec<_> = coord.after.iter().filter(|a| *a == ".compact-0").collect();
-        assert_eq!(compact_refs.len(), 1, "back-edge should not be duplicated");
-    }
-
-    #[test]
-    fn test_run_graph_compaction_updates_task() {
-        use workgraph::graph::{Node, Status, Task};
-
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        let gp = dir.join("graph.jsonl");
-
-        // Create a graph with .compact-0 (no deps → immediately ready)
-        let mut graph = workgraph::graph::WorkGraph::new();
-        graph.add_node(Node::Task(Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            status: Status::Open,
-            tags: vec!["compact-loop".to_string()],
-            ..Default::default()
-        }));
-        workgraph::parser::save_graph(&graph, &gp).unwrap();
-
-        // Create a logger for the test
         let logger = DaemonLogger::open(dir).unwrap();
-
-        // Pre-seed accumulated tokens above threshold so compaction isn't deferred
-        let mut cs = CoordinatorState::load_or_default_for(dir, 0);
-        cs.accumulated_tokens = 200_000;
-        cs.save_for(dir, 0);
-
-        let mut error_count = 0u64;
-        // .compact-0 is Open with no deps → graph-ready → compaction fires
-        // It will fail (no LLM) but we verify the task status gets updated
-        run_graph_compaction(dir, &mut error_count, &logger);
-
-        // After the call, .compact-0 should be Open (failed, reverted to Open)
-        let graph = load_graph(&gp).unwrap();
-        let compact = graph.get_task(".compact-0").unwrap();
-        // The task should have log entries from the compaction attempt
-        assert!(
-            compact.log.len() > 0,
-            "compact task should have log entries after compaction attempt"
-        );
-    }
-
-    #[test]
-    fn test_compaction_fires_when_compact_ready() {
-        use workgraph::graph::{Node, Status, Task};
-
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        let gp = dir.join("graph.jsonl");
-
-        // Create a graph: .coordinator-0 (Done) → .compact-0 (Open, after .coordinator-0)
-        let mut graph = workgraph::graph::WorkGraph::new();
-        graph.add_node(Node::Task(Task {
-            id: ".coordinator-0".to_string(),
-            title: "Coordinator 0".to_string(),
-            status: Status::Done,
-            ..Default::default()
-        }));
-        graph.add_node(Node::Task(Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            status: Status::Open,
-            after: vec![".coordinator-0".to_string()],
-            tags: vec!["compact-loop".to_string()],
-            ..Default::default()
-        }));
-        workgraph::parser::save_graph(&graph, &gp).unwrap();
-
-        let logger = DaemonLogger::open(dir).unwrap();
-        let mut error_count = 0u64;
-
-        // Pre-seed accumulated tokens above threshold so compaction isn't deferred
-        let mut cs = CoordinatorState::load_or_default_for(dir, 0);
-        cs.accumulated_tokens = 200_000;
-        cs.save_for(dir, 0);
-
-        // .compact-0 is Open and dep (.coordinator-0) is Done → should fire
-        run_graph_compaction(dir, &mut error_count, &logger);
+        cleanup_legacy_daemon_tasks(dir, &logger);
 
         let graph = load_graph(&gp).unwrap();
-        let compact = graph.get_task(".compact-0").unwrap();
-        // Compaction attempted (will fail due to no LLM, but log entries prove it fired)
-        assert!(
-            !compact.log.is_empty(),
-            "compaction should fire when .compact-0 is graph-ready"
-        );
-    }
-
-    #[test]
-    fn test_compaction_blocked_when_dep_not_done() {
-        use workgraph::graph::{Node, Status, Task};
-
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        let gp = dir.join("graph.jsonl");
-
-        // Create a graph: .coordinator-0 (InProgress) → .compact-0 (Open, after .coordinator-0)
-        let mut graph = workgraph::graph::WorkGraph::new();
-        graph.add_node(Node::Task(Task {
-            id: ".coordinator-0".to_string(),
-            title: "Coordinator 0".to_string(),
-            status: Status::InProgress,
-            ..Default::default()
-        }));
-        graph.add_node(Node::Task(Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            status: Status::Open,
-            after: vec![".coordinator-0".to_string()],
-            tags: vec!["compact-loop".to_string()],
-            ..Default::default()
-        }));
-        workgraph::parser::save_graph(&graph, &gp).unwrap();
-
-        let logger = DaemonLogger::open(dir).unwrap();
-        let mut error_count = 0u64;
-
-        // .compact-0 is Open but dep (.coordinator-0) is InProgress → should NOT fire
-        run_graph_compaction(dir, &mut error_count, &logger);
-
-        let graph = load_graph(&gp).unwrap();
-        let compact = graph.get_task(".compact-0").unwrap();
-        assert!(
-            compact.log.is_empty(),
-            "compaction should NOT fire when .compact-0 deps are not terminal"
-        );
-        assert_eq!(
-            compact.status,
-            Status::Open,
-            ".compact-0 should remain Open when blocked"
-        );
-    }
-
-    #[test]
-    fn test_compaction_reopens_done_compact_when_over_threshold() {
-        use workgraph::graph::{CycleConfig, Node, Status, Task};
-
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        let gp = dir.join("graph.jsonl");
-
-        // Realistic setup: .coordinator-0 is InProgress (persistent) with cycle_config,
-        // .compact-0 is Done (completed a previous iteration) in the same cycle.
-        let mut graph = workgraph::graph::WorkGraph::new();
-        graph.add_node(Node::Task(Task {
-            id: ".coordinator-0".to_string(),
-            title: "Coordinator 0".to_string(),
-            status: Status::InProgress,
-            after: vec![".compact-0".to_string()],
-            cycle_config: Some(CycleConfig {
-                max_iterations: 0,
-                guard: None,
-                delay: None,
-                no_converge: true,
-                restart_on_failure: true,
-                max_failure_restarts: None,
-            }),
-            ..Default::default()
-        }));
-        graph.add_node(Node::Task(Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            status: Status::Done,
-            after: vec![".coordinator-0".to_string()],
-            tags: vec!["compact-loop".to_string()],
-            loop_iteration: 5, // has run before
-            ..Default::default()
-        }));
-        workgraph::parser::save_graph(&graph, &gp).unwrap();
-
-        let logger = DaemonLogger::open(dir).unwrap();
-        let mut error_count = 0u64;
-
-        // Pre-seed accumulated tokens above threshold
-        let mut cs = CoordinatorState::load_or_default_for(dir, 0);
-        cs.accumulated_tokens = 200_000;
-        cs.save_for(dir, 0);
-
-        // Before fix: .compact-0 is Done, cycle can't iterate because
-        // .coordinator-0 is InProgress — compaction would never fire.
-        // After fix: .compact-0 should be reset to Open, then fire.
-        run_graph_compaction(dir, &mut error_count, &logger);
-
-        let graph = load_graph(&gp).unwrap();
-        let compact = graph.get_task(".compact-0").unwrap();
-
-        // Compaction should have been attempted (will fail due to no LLM,
-        // but log entries prove .compact-0 was re-opened and compaction fired)
-        assert!(
-            !compact.log.is_empty(),
-            "compaction should fire after re-opening .compact-0 when tokens exceed threshold"
-        );
-        // The re-open log entry should be present
-        assert!(
-            compact.log.iter().any(|e| e.message.contains("Re-opened")),
-            "should have a Re-opened log entry"
-        );
-    }
-
-    #[test]
-    fn test_compaction_does_not_reopen_below_threshold() {
-        use workgraph::graph::{CycleConfig, Node, Status, Task};
-
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        let gp = dir.join("graph.jsonl");
-
-        // Same setup but tokens are BELOW threshold
-        let mut graph = workgraph::graph::WorkGraph::new();
-        graph.add_node(Node::Task(Task {
-            id: ".coordinator-0".to_string(),
-            title: "Coordinator 0".to_string(),
-            status: Status::InProgress,
-            after: vec![".compact-0".to_string()],
-            cycle_config: Some(CycleConfig {
-                max_iterations: 0,
-                guard: None,
-                delay: None,
-                no_converge: true,
-                restart_on_failure: true,
-                max_failure_restarts: None,
-            }),
-            ..Default::default()
-        }));
-        graph.add_node(Node::Task(Task {
-            id: ".compact-0".to_string(),
-            title: "Compact 0".to_string(),
-            status: Status::Done,
-            after: vec![".coordinator-0".to_string()],
-            tags: vec!["compact-loop".to_string()],
-            loop_iteration: 5,
-            ..Default::default()
-        }));
-        workgraph::parser::save_graph(&graph, &gp).unwrap();
-
-        let logger = DaemonLogger::open(dir).unwrap();
-        let mut error_count = 0u64;
-
-        // Tokens below default threshold — should NOT re-open
-        let mut cs = CoordinatorState::load_or_default_for(dir, 0);
-        cs.accumulated_tokens = 1000;
-        cs.save_for(dir, 0);
-
-        run_graph_compaction(dir, &mut error_count, &logger);
-
-        let graph = load_graph(&gp).unwrap();
-        let compact = graph.get_task(".compact-0").unwrap();
-
-        assert_eq!(
-            compact.status,
-            Status::Done,
-            ".compact-0 should remain Done when tokens are below threshold"
-        );
-        assert!(
-            compact.log.is_empty(),
-            "no log entries should be added when not re-opening"
-        );
+        assert_eq!(graph.tasks().count(), 0);
     }
 
     #[test]
