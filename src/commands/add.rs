@@ -1263,7 +1263,7 @@ mod tests {
             None,
             false,
             false,
-            false,
+            None,
             None,
         );
         assert!(result.is_err());
@@ -1313,7 +1313,6 @@ mod tests {
             &[],
             None,
             None,
-            false,
             false,
             false,
             None,
