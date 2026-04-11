@@ -561,7 +561,9 @@ mod tests {
             &[],
             None,
             None,
-            true, // allow_phantom: test graph uses phantom deps
+            true,                   // allow_phantom: test graph uses phantom deps
+            false,                  // independent
+            None,                   // iteration_config
         )?;
 
         Ok(())
@@ -609,9 +611,7 @@ mod tests {
             None,
             false,
             false,
-            None,
-            false,
-            None,
+            None,  // iteration_config
         )?;
 
         crate::commands::add::run(
@@ -649,10 +649,6 @@ mod tests {
             None,
             None,
             false,
-            false,
-            None,
-            false,
-            None,
             false,
             None,
         )?;
