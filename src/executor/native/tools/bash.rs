@@ -10,8 +10,8 @@ use tokio::process::Command;
 use super::{Tool, ToolOutput, truncate_for_tool};
 use crate::executor::native::client::ToolDefinition;
 
-const DEFAULT_TIMEOUT_MS: u64 = 120_000; // 2 minutes
-const MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
+const MAX_TIMEOUT_MS: u64 = 900_000; // 15 minutes
 
 /// Register the bash tool.
 pub fn register_bash_tool(registry: &mut super::ToolRegistry, working_dir: PathBuf) {
@@ -42,7 +42,7 @@ impl Tool for BashTool {
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in milliseconds (default: 120000, max: 600000)"
+                        "description": "Timeout in milliseconds (default: 300000, max: 900000)"
                     }
                 },
                 "required": ["command"]
