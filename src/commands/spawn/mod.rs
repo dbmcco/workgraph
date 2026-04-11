@@ -290,15 +290,20 @@ mod tests {
 
         run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
 
-        // Small wait for the spawned process to create output file
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Poll for the spawned process to create output file (up to 5s)
+        let agent_dir = temp_dir.path().join("agents").join("agent-1");
+        for _ in 0..50 {
+            if agent_dir.join("output.log").exists() && agent_dir.join("metadata.json").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         // Check output directory was created
         let agents_dir = temp_dir.path().join("agents");
         assert!(agents_dir.exists());
 
         // Should have agent-1 directory
-        let agent_dir = agents_dir.join("agent-1");
         assert!(agent_dir.exists());
 
         // Should have output.log and metadata.json
