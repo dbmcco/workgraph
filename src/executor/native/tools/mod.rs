@@ -7,6 +7,7 @@ pub mod bash;
 pub mod file;
 pub mod file_cache;
 pub mod wg;
+pub mod web_search;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -227,6 +228,9 @@ impl ToolRegistry {
         // Workgraph tools
         wg::register_wg_tools(&mut registry, workgraph_dir.to_path_buf());
 
+        // Web search tool
+        web_search::register_web_search_tool(&mut registry);
+
         registry
     }
 }
@@ -265,6 +269,7 @@ impl ToolTruncationConfig {
             "glob" => 4_000,
             "wg_show" => 2_000,
             "wg_list" => 4_000,
+            "web_search" => 16_000,
             _ => MAX_TOOL_OUTPUT_SIZE,
         };
         Self { max_chars }
