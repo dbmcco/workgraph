@@ -161,7 +161,7 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::Utc;
     use tempfile::TempDir;
     use workgraph::graph::{Node, Task, WorkGraph};
     use workgraph::parser::save_graph;

@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
-use workgraph::graph::{Node, Status, Task, WorkGraph};
+use workgraph::graph::{Node, Task, WorkGraph};
 use workgraph::parser::{load_graph, save_graph};
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::client::{
-    ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason, Usage,
+    ContentBlock, Message, MessagesRequest, MessagesResponse, StopReason, Usage,
 };
 use workgraph::executor::native::openai_client::ApiError;
 use workgraph::executor::native::provider::Provider;
