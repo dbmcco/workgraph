@@ -1264,7 +1264,6 @@ mod tests {
             false,
             false,
             None,
-            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -1366,6 +1365,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
         assert!(result.is_err());
         assert!(
@@ -1526,6 +1526,8 @@ mod tests {
             None,
             None,
             false, // allow_phantom=false, but paused=true defers validation
+            false,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1579,6 +1581,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         assert!(result.is_ok());
 
@@ -1758,6 +1762,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         assert!(result.is_ok());
 
@@ -1814,6 +1820,8 @@ mod tests {
             None,
             None,
             false,
+            false,
+            None,
         );
         assert!(result.is_ok());
 
