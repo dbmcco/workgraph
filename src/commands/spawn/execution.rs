@@ -311,9 +311,11 @@ pub(crate) fn spawn_agent_inner(
 
     // Inject wg usage guide for non-Claude models.
     // Claude agents get this context from CLAUDE.md; native executor models need it
-    // explicitly injected into the prompt.
-    if settings.executor_type == "native" {
-        scope_ctx.wg_guide_content = super::context::read_wg_guide(dir);
+    // explicitly injected into the prompt with model-appropriate knowledge tier.
+    if settings.executor_type != "claude" {
+        let model_str = settings.model.as_deref().unwrap_or("");
+        let model_tier = super::context::classify_model_tier(model_str);
+        scope_ctx.wg_guide_content = super::context::build_tiered_guide(dir, model_tier, model_str);
     }
 
     // Scope-based prompt assembly for built-in executors.
@@ -549,6 +551,8 @@ pub(crate) fn spawn_agent_inner(
         cmd.env("WG_WORKTREE_PATH", &wt.path);
         cmd.env("WG_BRANCH", &wt.branch);
         cmd.env("WG_PROJECT_ROOT", &wt.project_root);
+        // Isolate cargo target directory to prevent file lock contention between agents
+        cmd.env("CARGO_TARGET_DIR", wt.path.join("target"));
     } else if let Some(ref wd) = settings.working_dir {
         cmd.current_dir(wd);
     }

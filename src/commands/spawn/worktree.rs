@@ -80,6 +80,12 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path, branch: &str) 
         let _ = std::fs::remove_file(&symlink_path);
     }
 
+    // Remove isolated cargo target directory
+    let target_dir = worktree_path.join("target");
+    if target_dir.exists() {
+        let _ = std::fs::remove_dir_all(&target_dir);
+    }
+
     // Force-remove the worktree
     let _ = Command::new("git")
         .args(["worktree", "remove", "--force"])

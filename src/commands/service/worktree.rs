@@ -21,6 +21,12 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path, branch: &str) 
         let _ = fs::remove_file(&symlink_path);
     }
 
+    // Remove isolated cargo target directory
+    let target_dir = worktree_path.join("target");
+    if target_dir.exists() {
+        let _ = fs::remove_dir_all(&target_dir);
+    }
+
     // Force-remove the worktree
     let _ = Command::new("git")
         .args(["worktree", "remove", "--force"])
@@ -179,6 +185,11 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
                 if symlink_path.exists() {
                     let _ = fs::remove_file(&symlink_path);
                 }
+                // Remove isolated cargo target directory
+                let target_dir = wt_path.join("target");
+                if target_dir.exists() {
+                    let _ = fs::remove_dir_all(&target_dir);
+                }
                 let _ = Command::new("git")
                     .args(["worktree", "remove", "--force"])
                     .arg(&wt_path)
@@ -268,6 +279,11 @@ pub fn prune_stale_worktrees(dir: &Path, max_age_secs: u64) -> Result<usize> {
                 let symlink_path = wt_path.join(".workgraph");
                 if symlink_path.exists() {
                     let _ = fs::remove_file(&symlink_path);
+                }
+                // Remove isolated cargo target directory
+                let target_dir = wt_path.join("target");
+                if target_dir.exists() {
+                    let _ = fs::remove_dir_all(&target_dir);
                 }
                 let _ = Command::new("git")
                     .args(["worktree", "remove", "--force"])

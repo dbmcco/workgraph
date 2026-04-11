@@ -2265,6 +2265,22 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_max_verify_failures")]
     pub max_verify_failures: u32,
 
+    /// Default verify timeout for tasks without specific override
+    #[serde(default = "default_verify_default_timeout")]
+    pub verify_default_timeout: Option<String>,
+
+    /// Maximum number of concurrent verify processes to prevent cascade failures
+    #[serde(default = "default_max_concurrent_verifies")]
+    pub max_concurrent_verifies: u32,
+
+    /// Enable intelligent triage instead of hard timeout failure
+    #[serde(default = "default_verify_triage_enabled")]
+    pub verify_triage_enabled: bool,
+
+    /// Time without output before considering process potentially stuck
+    #[serde(default = "default_verify_progress_timeout")]
+    pub verify_progress_timeout: Option<String>,
+
     /// Maximum consecutive spawn failures before a task is auto-failed.
     /// When the coordinator fails to spawn an agent for a task this many times
     /// in a row, the task transitions to Failed with a descriptive error
@@ -2350,6 +2366,22 @@ fn default_max_verify_failures() -> u32 {
     3
 }
 
+fn default_verify_default_timeout() -> Option<String> {
+    Some("900s".to_string())
+}
+
+fn default_max_concurrent_verifies() -> u32 {
+    2
+}
+
+fn default_verify_triage_enabled() -> bool {
+    false // Start disabled, enable gradually
+}
+
+fn default_verify_progress_timeout() -> Option<String> {
+    Some("300s".to_string())
+}
+
 fn default_max_spawn_failures() -> u32 {
     5
 }
@@ -2429,6 +2461,10 @@ impl Default for CoordinatorConfig {
             max_spawn_failures: default_max_spawn_failures(),
             max_escalation_depth: default_max_escalation_depth(),
             auto_test_discovery: default_auto_test_discovery(),
+            verify_default_timeout: default_verify_default_timeout(),
+            max_concurrent_verifies: default_max_concurrent_verifies(),
+            verify_triage_enabled: default_verify_triage_enabled(),
+            verify_progress_timeout: default_verify_progress_timeout(),
         }
     }
 }
