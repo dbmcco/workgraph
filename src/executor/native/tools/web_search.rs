@@ -17,6 +17,7 @@ pub fn register_web_search_tool(registry: &mut super::ToolRegistry) {
 
 struct WebSearchTool;
 
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct DuckDuckGoResponse {
     #[serde(default)]
@@ -29,6 +30,7 @@ struct DuckDuckGoResponse {
     AbstractURL: String,
 }
 
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct RelatedTopic {
     #[serde(default)]
