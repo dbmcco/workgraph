@@ -111,6 +111,11 @@ fn get_modified_files(project_root: &Path) -> Result<Vec<String>> {
 
 /// Detect common lock files that might indicate waiting processes
 fn detect_cargo_locks() -> Result<Vec<String>> {
+    detect_cargo_locks_with_stderr("")
+}
+
+/// Detect lock contention from both lock files and stderr patterns
+fn detect_cargo_locks_with_stderr(stderr_content: &str) -> Result<Vec<String>> {
     let mut locks = Vec::new();
 
     // Common cargo lock files
@@ -123,6 +128,21 @@ fn detect_cargo_locks() -> Result<Vec<String>> {
     for pattern in &lock_patterns {
         if std::path::Path::new(pattern).exists() {
             locks.push(pattern.to_string());
+        }
+    }
+
+    // Check stderr for cargo lock contention messages
+    let lock_messages = [
+        "Blocking waiting for file lock on artifact directory",
+        "Blocking waiting for file lock on package cache",
+        "Blocking waiting for file lock on",
+        "waiting for file lock on build directory",
+        "waiting for file lock on the registry cache",
+    ];
+
+    for message in &lock_messages {
+        if stderr_content.contains(message) {
+            locks.push(format!("stderr_pattern: {}", message));
         }
     }
 
@@ -155,6 +175,71 @@ fn triage_timeout_process(
         reason: format!("no_activity_{}s_no_locks",
                        monitor.last_activity().elapsed().as_secs()),
     })
+}
+
+/// Check if an error output indicates file lock contention
+fn is_lock_contention_error(stderr: &str) -> bool {
+    let lock_patterns = [
+        "Blocking waiting for file lock on artifact directory",
+        "Blocking waiting for file lock on package cache",
+        "Blocking waiting for file lock on",
+        "waiting for file lock on build directory",
+        "waiting for file lock on the registry cache",
+    ];
+
+    lock_patterns.iter().any(|pattern| stderr.contains(pattern))
+}
+
+/// Run a verify command with retry logic for file lock contention
+fn run_verify_command_with_retry(
+    verify_cmd: &str,
+    project_root: &Path,
+    task: &Task,
+    coordinator_config: &CoordinatorConfig,
+) -> std::result::Result<VerifyOutput, VerifyOutput> {
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_SECS: u64 = 5;
+
+    let mut last_error: Option<VerifyOutput> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match run_verify_command(verify_cmd, project_root, task, coordinator_config) {
+            Ok(output) => return Ok(output),
+            Err(error) => {
+                // Check if this is a lock contention issue
+                if is_lock_contention_error(&error.stderr) {
+                    eprintln!("Verify attempt {}/{} failed due to file lock contention: {}",
+                             attempt, MAX_RETRIES, error.stderr.lines().next().unwrap_or(""));
+
+                    if attempt < MAX_RETRIES {
+                        let delay_secs = BASE_DELAY_SECS * (2_u64.pow(attempt - 1)); // Exponential backoff
+                        eprintln!("Retrying in {} seconds...", delay_secs);
+                        std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+                        last_error = Some(error);
+                        continue;
+                    }
+                } else if error.exit_code == "timeout" {
+                    // For timeouts, check if stderr suggests lock contention
+                    if is_lock_contention_error(&error.stderr) {
+                        eprintln!("Verify timeout appears to be due to file lock contention");
+                        if attempt < MAX_RETRIES {
+                            let delay_secs = BASE_DELAY_SECS * (2_u64.pow(attempt - 1));
+                            eprintln!("Retrying in {} seconds with extended timeout...", delay_secs);
+                            std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+                            last_error = Some(error);
+                            continue;
+                        }
+                    }
+                }
+
+                // Not a retryable error or max retries reached
+                return Err(error);
+            }
+        }
+    }
+
+    // Return the last error if all retries failed
+    Err(last_error.unwrap())
 }
 
 /// Map modified files to relevant test modules/files.
@@ -591,7 +676,7 @@ fn run_inner(
             let task = graph.get_task(id).ok_or_else(|| anyhow::anyhow!("Task {} not found", id))?;
             let config = Config::load_or_default(dir);
 
-            match run_verify_command(&verify_cmd, project_root, task, &config.coordinator) {
+            match run_verify_command_with_retry(&verify_cmd, project_root, task, &config.coordinator) {
                 Ok(output) => {
                     // Log verify success with captured output
                     let id_for_log = id.to_string();
@@ -771,7 +856,7 @@ fn run_inner(
             let config = Config::load_or_default(dir);
             for cmd in &commands {
                 eprintln!("Running validation command: {}", cmd);
-                match run_verify_command(cmd, project_root, task_ref, &config.coordinator) {
+                match run_verify_command_with_retry(cmd, project_root, task_ref, &config.coordinator) {
                     Ok(_) => {}
                     Err(output) => {
                         let stderr: String = output.stderr.chars().take(500).collect();
