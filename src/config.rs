@@ -2304,9 +2304,21 @@ pub struct CoordinatorConfig {
     /// command but have discoverable test files. Default: true.
     #[serde(default = "default_auto_test_discovery")]
     pub auto_test_discovery: bool,
+
+    /// Enable scoped verify: automatically scope 'cargo test' to only run tests
+    /// relevant to modified files, reducing verify time from minutes to seconds.
+    /// When enabled, detects modified files and maps them to relevant test modules.
+    /// Falls back to full test suite for ambiguous mappings or core file changes.
+    /// Default: true.
+    #[serde(default = "default_scoped_verify_enabled")]
+    pub scoped_verify_enabled: bool,
 }
 
 fn default_auto_test_discovery() -> bool {
+    true
+}
+
+fn default_scoped_verify_enabled() -> bool {
     true
 }
 
@@ -2461,6 +2473,7 @@ impl Default for CoordinatorConfig {
             max_spawn_failures: default_max_spawn_failures(),
             max_escalation_depth: default_max_escalation_depth(),
             auto_test_discovery: default_auto_test_discovery(),
+            scoped_verify_enabled: default_scoped_verify_enabled(),
             verify_default_timeout: default_verify_default_timeout(),
             max_concurrent_verifies: default_max_concurrent_verifies(),
             verify_triage_enabled: default_verify_triage_enabled(),
