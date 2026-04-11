@@ -505,11 +505,10 @@ pub fn run(
             .map(|t| t.id.clone())
             .collect();
         for ref_id in referencing_ids {
-            if let Some(new_task) = graph.get_task_mut(&task_id) {
-                if !new_task.before.contains(&ref_id) {
+            if let Some(new_task) = graph.get_task_mut(&task_id)
+                && !new_task.before.contains(&ref_id) {
                     new_task.before.push(ref_id);
                 }
-            }
         }
     }
 
@@ -1423,6 +1422,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
         assert!(result.is_err());
         assert!(
@@ -1475,8 +1475,9 @@ mod tests {
             &[],
             None,
             None,
+            true,
             false,
-            false,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -1705,7 +1706,9 @@ mod tests {
             &[],
             None,
             None,
-            false,
+            false, // allow_phantom
+            false, // independent
+            None,  // iteration_config
         );
         assert!(result.is_ok(), "wg add --exec should succeed: {:?}", result);
 
