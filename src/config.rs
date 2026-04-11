@@ -2049,8 +2049,8 @@ pub struct AgencyConfig {
 impl Default for AgencyConfig {
     fn default() -> Self {
         Self {
-            auto_evaluate: false,
-            auto_assign: false,
+            auto_evaluate: true,
+            auto_assign: true,
             assigner_agent: None,
             evaluator_agent: None,
             evolver_agent: None,
@@ -3406,8 +3406,8 @@ name = "My Project"
     #[test]
     fn test_default_agency_config() {
         let config = Config::default();
-        assert!(!config.agency.auto_evaluate);
-        assert!(!config.agency.auto_assign);
+        assert!(config.agency.auto_evaluate);
+        assert!(config.agency.auto_assign);
         assert!(config.agency.assigner_agent.is_none());
         assert!(config.agency.evaluator_agent.is_none());
         assert!(config.agency.evolver_agent.is_none());
