@@ -42,6 +42,10 @@ impl ToolOutput {
     }
 }
 
+/// Callback type for streaming tool output chunks.
+pub type ToolStreamCallback =
+    Box<dyn Fn(String) + Send + Sync>;
+
 /// Trait that all tools must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -59,6 +63,21 @@ pub trait Tool: Send + Sync {
     /// Default: false (conservative — unknown tools are treated as mutating).
     fn is_read_only(&self) -> bool {
         false
+    }
+
+    /// Execute the tool with streaming output support.
+    ///
+    /// The callback is invoked for each chunk of output as it arrives
+    /// (e.g., each line for bash). Default implementation just calls
+    /// `execute()` and streams nothing.
+    async fn execute_streaming(
+        &self,
+        input: &serde_json::Value,
+        on_chunk: ToolStreamCallback,
+    ) -> ToolOutput {
+        // Default: fall back to non-streaming
+        let _ = on_chunk;
+        self.execute(input).await
     }
 }
 
@@ -113,6 +132,19 @@ impl ToolRegistry {
     pub async fn execute(&self, name: &str, input: &serde_json::Value) -> ToolOutput {
         match self.tools.get(name) {
             Some(tool) => tool.execute(input).await,
+            None => ToolOutput::error(format!("Unknown tool: {}", name)),
+        }
+    }
+
+    /// Execute a tool by name with streaming output support.
+    pub async fn execute_streaming(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        on_chunk: ToolStreamCallback,
+    ) -> ToolOutput {
+        match self.tools.get(name) {
+            Some(tool) => tool.execute_streaming(input, on_chunk).await,
             None => ToolOutput::error(format!("Unknown tool: {}", name)),
         }
     }
@@ -199,6 +231,85 @@ impl ToolRegistry {
         for (idx, call) in &mutating {
             let start = std::time::Instant::now();
             let output = self.execute(&call.name, &call.input).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+            results.push((
+                *idx,
+                ToolCallResult {
+                    name: call.name.clone(),
+                    output,
+                    duration_ms,
+                },
+            ));
+        }
+
+        // Sort by original index to maintain call order
+        results.sort_by_key(|(idx, _)| *idx);
+        results.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// Execute a batch of tool calls with streaming output for each tool.
+    ///
+    /// Each tool's output is streamed via its own callback. This is used for
+    /// bash tools where we want to see incremental output.
+    pub async fn execute_batch_streaming(
+        &self,
+        calls: &[ToolCall],
+        max_concurrent: usize,
+        make_stream_callback: impl Fn(usize) -> ToolStreamCallback + Clone,
+    ) -> Vec<ToolCallResult> {
+        use std::sync::Arc;
+
+        // Separate into (index, call) pairs by type
+        let mut read_only: Vec<(usize, &ToolCall)> = Vec::new();
+        let mut mutating: Vec<(usize, &ToolCall)> = Vec::new();
+
+        for (i, call) in calls.iter().enumerate() {
+            if self.is_read_only(&call.name) {
+                read_only.push((i, call));
+            } else {
+                mutating.push((i, call));
+            }
+        }
+
+        let mut results: Vec<(usize, ToolCallResult)> = Vec::with_capacity(calls.len());
+
+        // Execute read-only calls concurrently with semaphore-based cap.
+        if !read_only.is_empty() {
+            let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            let tools = Arc::new(&self.tools);
+
+            let futures: Vec<_> = read_only
+                .iter()
+                .map(|(idx, call)| {
+                    let sem = Arc::clone(&semaphore);
+                    let tools = Arc::clone(&tools);
+                    let cb = make_stream_callback(*idx);
+                    async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        let start = std::time::Instant::now();
+                        let output = match tools.get(&call.name) {
+                            Some(tool) => tool.execute_streaming(&call.input, cb).await,
+                            None => ToolOutput::error(format!("Unknown tool: {}", call.name)),
+                        };
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        (*idx, ToolCallResult {
+                            name: call.name.clone(),
+                            output,
+                            duration_ms,
+                        })
+                    }
+                })
+                .collect();
+
+            let read_results = join_all(futures).await;
+            results.extend(read_results);
+        }
+
+        // Execute mutating calls serially
+        for (idx, call) in &mutating {
+            let start = std::time::Instant::now();
+            let cb = make_stream_callback(*idx);
+            let output = self.execute_streaming(&call.name, &call.input, cb).await;
             let duration_ms = start.elapsed().as_millis() as u64;
             results.push((
                 *idx,

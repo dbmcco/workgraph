@@ -41,6 +41,12 @@ pub enum StreamEvent {
         duration_ms: u64,
         timestamp_ms: i64,
     },
+    /// A chunk of streaming output from a tool (e.g., bash stdout/stderr line).
+    ToolOutputChunk {
+        tool: String,
+        text: String,
+        timestamp_ms: i64,
+    },
     /// Periodic heartbeat.
     Heartbeat { timestamp_ms: i64 },
     /// A text chunk from real-time streaming output.
@@ -92,6 +98,7 @@ impl StreamEvent {
             | StreamEvent::Turn { timestamp_ms, .. }
             | StreamEvent::ToolStart { timestamp_ms, .. }
             | StreamEvent::ToolEnd { timestamp_ms, .. }
+            | StreamEvent::ToolOutputChunk { timestamp_ms, .. }
             | StreamEvent::Heartbeat { timestamp_ms }
             | StreamEvent::TextChunk { timestamp_ms, .. }
             | StreamEvent::ThinkingChunk { timestamp_ms, .. }
@@ -202,6 +209,15 @@ impl StreamWriter {
             name: name.to_string(),
             is_error,
             duration_ms,
+            timestamp_ms: now_ms(),
+        });
+    }
+
+    /// Write a ToolOutputChunk event for streaming tool output (e.g., bash lines).
+    pub fn write_tool_output_chunk(&self, tool: &str, text: &str) {
+        self.write_event(&StreamEvent::ToolOutputChunk {
+            tool: tool.to_string(),
+            text: text.to_string(),
             timestamp_ms: now_ms(),
         });
     }
@@ -438,6 +454,7 @@ impl AgentStreamState {
                 StreamEvent::ToolEnd { .. } => {
                     self.current_tool = None;
                 }
+                StreamEvent::ToolOutputChunk { .. } => {}
                 StreamEvent::Heartbeat { .. }
                 | StreamEvent::TextChunk { .. }
                 | StreamEvent::ThinkingChunk { .. } => {}

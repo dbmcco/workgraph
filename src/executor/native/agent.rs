@@ -899,11 +899,39 @@ impl AgentLoop {
                     };
 
                     // Execute batch (read-only in parallel, mutating serially)
+                    // For bash tool, use streaming execution to stream output to TUI.
                     let calls_only: Vec<_> =
                         batch_calls.iter().map(|(_, _, c)| c.clone()).collect();
+
+                    // Create streaming callback factory for bash tool output
+                    let streaming_file = self.streaming_file_path.clone();
+                    let stream_writer_clone = self.stream_writer.clone();
+
+                    let make_callback = move |_idx: usize| {
+                        let sw = stream_writer_clone.clone();
+                        let sf = streaming_file.clone();
+                        Box::new(move |text: String| {
+                            // Write ToolOutputChunk to stream.jsonl
+                            if let Some(ref writer) = sw {
+                                writer.write_tool_output_chunk("bash", &text);
+                            }
+                            // Append to .streaming file for TUI live display
+                            if let Some(ref path) = sf {
+                                let mut acc = std::fs::read_to_string(path).unwrap_or_default();
+                                acc.push_str(&text);
+                                acc.push('\n');
+                                let _ = std::fs::write(path, &acc);
+                            }
+                        }) as super::tools::ToolStreamCallback
+                    };
+
                     let batch_results = self
                         .tools
-                        .execute_batch(&calls_only, super::tools::DEFAULT_MAX_CONCURRENT_TOOLS)
+                        .execute_batch_streaming(
+                            &calls_only,
+                            super::tools::DEFAULT_MAX_CONCURRENT_TOOLS,
+                            make_callback,
+                        )
                         .await;
 
                     // Stop heartbeat ticker
