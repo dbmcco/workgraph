@@ -1135,38 +1135,40 @@ fn append_chat_inbox(
     }
 }
 
-/// Check if a coordinator slot (e.g., ".coordinator-0") is available for new assignment.
-///
-/// Returns true if:
-/// - The slot is empty (no task exists)
-/// - The existing task is not an active coordinator (no "coordinator-loop" tag)
-///
-/// Archived and abandoned coordinators are NOT considered available — they exist
-/// with their old state and must NOT be resurrected by re-using their ID.
-fn is_coordinator_slot_available(graph: &workgraph::graph::WorkGraph, task_id: &str) -> bool {
-    match graph.get_task(task_id) {
-        None => true, // Slot is empty — available
-        Some(task) => {
-            // If task has archived tag, it's explicitly archived — NOT available.
-            // Archived coordinators remain at their original IDs and must NOT be reused.
-            if task.tags.iter().any(|t| t == "archived") {
-                return false;
+
+/// Find the next fresh coordinator ID by scanning both existing coordinator tasks
+/// and existing chat history files. Returns max(existing_ids) + 1 to ensure
+/// the new coordinator has never existed before and has no chat history files.
+fn find_next_fresh_coordinator_id(graph: &workgraph::graph::WorkGraph, dir: &Path) -> u32 {
+    let mut max_id = None::<u32>;
+
+    // Scan all existing coordinator tasks
+    for task in graph.tasks() {
+        if task.id.starts_with(".coordinator-") {
+            if let Ok(id) = task.id[13..].parse::<u32>() {
+                max_id = Some(max_id.map_or(id, |current_max| current_max.max(id)));
             }
-            // If task has coordinator-loop tag, check if it's still active
-            if task.tags.iter().any(|t| t == "coordinator-loop") {
-                // Only return false for truly active coordinators.
-                // Archived and abandoned coordinators exist with their old state
-                // and must NOT be resurrected by re-using their ID.
-                if task.status == workgraph::graph::Status::InProgress {
-                    return false; // Active coordinator — not available
-                }
-                // Archived or abandoned — skip this slot, treat as occupied
-                return false;
-            }
-            // No coordinator-loop tag and not archived — not a coordinator slot, available
-            true
         }
     }
+
+    // Scan all existing chat history files
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+
+            // Look for chat-history-{id}.jsonl files
+            if name_str.starts_with("chat-history-") && name_str.ends_with(".jsonl") {
+                let id_part = &name_str[13..name_str.len()-6]; // Remove "chat-history-" and ".jsonl"
+                if let Ok(id) = id_part.parse::<u32>() {
+                    max_id = Some(max_id.map_or(id, |current_max| current_max.max(id)));
+                }
+            }
+        }
+    }
+
+    // Return max_id + 1, or 0 if no coordinators exist yet
+    max_id.map_or(0, |id| id + 1)
 }
 
 /// Handle CreateCoordinator IPC request.
@@ -1177,15 +1179,9 @@ fn handle_create_coordinator(dir: &Path, name: Option<&str>) -> IpcResponse {
         Err(e) => return IpcResponse::error(&format!("Failed to load graph: {}", e)),
     };
 
-    // Find the next available coordinator ID
-    let mut next_id = 0u32;
-    loop {
-        let task_id = format!(".coordinator-{}", next_id);
-        if is_coordinator_slot_available(&graph, &task_id) {
-            break;
-        }
-        next_id += 1;
-    }
+    // Find the next available coordinator ID by scanning both existing tasks
+    // and existing chat history files to ensure truly fresh coordinators.
+    let next_id = find_next_fresh_coordinator_id(&graph, dir);
 
     // Create the coordinator task
     let title = name
