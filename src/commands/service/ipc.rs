@@ -1147,6 +1147,11 @@ fn is_coordinator_slot_available(graph: &workgraph::graph::WorkGraph, task_id: &
     match graph.get_task(task_id) {
         None => true, // Slot is empty — available
         Some(task) => {
+            // If task has archived tag, it's explicitly archived — NOT available.
+            // Archived coordinators remain at their original IDs and must NOT be reused.
+            if task.tags.iter().any(|t| t == "archived") {
+                return false;
+            }
             // If task has coordinator-loop tag, check if it's still active
             if task.tags.iter().any(|t| t == "coordinator-loop") {
                 // Only return false for truly active coordinators.
@@ -1158,7 +1163,7 @@ fn is_coordinator_slot_available(graph: &workgraph::graph::WorkGraph, task_id: &
                 // Archived or abandoned — skip this slot, treat as occupied
                 return false;
             }
-            // No coordinator-loop tag — not a coordinator slot, available
+            // No coordinator-loop tag and not archived — not a coordinator slot, available
             true
         }
     }
