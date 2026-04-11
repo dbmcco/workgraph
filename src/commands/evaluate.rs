@@ -570,7 +570,6 @@ pub fn run(
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 model: None,
                 source: eval_source::LLM.to_string(),
-                decision: None,
             };
 
             if let Err(e) = record_evaluation(&eval_of_evaluator, &agency_dir) {
@@ -880,7 +879,6 @@ pub fn run_flip(
         timestamp,
         model: task_model.clone(),
         source: eval_source::FLIP.to_string(),
-        decision: None,
     };
 
     // Save evaluation
