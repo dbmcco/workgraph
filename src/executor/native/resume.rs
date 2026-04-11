@@ -719,9 +719,9 @@ pub struct ContextBudget {
     pub window_size: usize,
     /// Rough chars-per-token estimate (default 4.0).
     pub chars_per_token: f64,
-    /// Fraction at which to inject a warning (default 0.80).
+    /// Fraction at which to inject a warning (default 0.70).
     pub warning_threshold: f64,
-    /// Fraction at which to trigger emergency compaction (default 0.90).
+    /// Fraction at which to trigger emergency compaction (default 0.75).
     pub compact_threshold: f64,
     /// Fraction at which to trigger a clean exit (default 0.95).
     pub hard_limit: f64,
@@ -732,8 +732,8 @@ impl Default for ContextBudget {
         Self {
             window_size: 200_000,
             chars_per_token: 4.0,
-            warning_threshold: 0.80,
-            compact_threshold: 0.90,
+            warning_threshold: 0.70,
+            compact_threshold: 0.75,
             hard_limit: 0.95,
         }
     }

@@ -1,8 +1,8 @@
 //! Tests for context pressure management in the agent loop.
 //!
 //! Verifies that the AgentLoop correctly:
-//! - Injects warnings at 80% capacity
-//! - Performs emergency compaction at 90% capacity
+//! - Injects warnings at 70% capacity
+//! - Performs emergency compaction at 75% capacity
 //! - Performs clean exit at 95% capacity
 //! - Recovers from 413 (context too long) errors by compacting and retrying
 //!
@@ -308,8 +308,8 @@ fn test_context_budget_from_provider_context_window() {
     // ContextBudget should be constructible from provider's context window
     let budget = ContextBudget::with_window_size(32_000);
     assert_eq!(budget.window_size, 32_000);
-    assert!((budget.warning_threshold - 0.80).abs() < f64::EPSILON);
-    assert!((budget.compact_threshold - 0.90).abs() < f64::EPSILON);
+    assert!((budget.warning_threshold - 0.70).abs() < f64::EPSILON);
+    assert!((budget.compact_threshold - 0.75).abs() < f64::EPSILON);
     assert!((budget.hard_limit - 0.95).abs() < f64::EPSILON);
 }
 
@@ -322,6 +322,7 @@ fn test_context_budget_default_uses_200k() {
 #[test]
 fn test_context_pressure_exactly_at_80_percent() {
     // Window: 1000 tokens. 80% = 800 tokens = 3200 chars (at 4 chars/token).
+    // This is above 75% (emergency compaction), so it triggers EmergencyCompaction.
     let budget = ContextBudget::with_window_size(1000);
     let msgs = vec![workgraph::executor::native::client::Message {
         role: workgraph::executor::native::client::Role::User,
@@ -329,12 +330,12 @@ fn test_context_pressure_exactly_at_80_percent() {
             text: "x".repeat(3200), // exactly 800 tokens = 80%
         }],
     }];
-    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::Warning);
+    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::EmergencyCompaction);
 }
 
 #[test]
 fn test_context_pressure_at_79_9_percent() {
-    // 79.9% should be Ok (below 80%)
+    // 79.9% should be EmergencyCompaction (above 75%)
     let budget = ContextBudget::with_window_size(1000);
     // 79.9% of 1000 = 799 tokens = 3196 chars
     let msgs = vec![workgraph::executor::native::client::Message {
@@ -343,7 +344,7 @@ fn test_context_pressure_at_79_9_percent() {
             text: "x".repeat(3196),
         }],
     }];
-    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::Ok);
+    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::EmergencyCompaction);
 }
 
 #[test]
@@ -364,7 +365,7 @@ fn test_context_pressure_at_90_percent() {
 
 #[test]
 fn test_context_pressure_at_89_9_percent() {
-    // 89.9% should be Warning (below 90%)
+    // 89.9% should be EmergencyCompaction (above 75%)
     let budget = ContextBudget::with_window_size(1000);
     // 89.9% of 1000 = 899 tokens = 3596 chars
     let msgs = vec![workgraph::executor::native::client::Message {
@@ -373,7 +374,7 @@ fn test_context_pressure_at_89_9_percent() {
             text: "x".repeat(3596),
         }],
     }];
-    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::Warning);
+    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::EmergencyCompaction);
 }
 
 #[test]
@@ -440,14 +441,14 @@ fn test_context_pressure_well_below_thresholds() {
 fn test_context_budget_small_window_32k() {
     // Simulate Qwen3-32B with 32K context window
     let budget = ContextBudget::with_window_size(32_000);
-    // 80% of 32000 = 25600 tokens = 102400 chars
+    // 80% of 32000 = 25600 tokens = 102400 chars (now triggers EmergencyCompaction, above 75%)
     let msgs = vec![workgraph::executor::native::client::Message {
         role: workgraph::executor::native::client::Role::User,
         content: vec![ContentBlock::Text {
             text: "x".repeat(102_400),
         }],
     }];
-    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::Warning);
+    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::EmergencyCompaction);
 }
 
 #[test]
@@ -752,29 +753,29 @@ async fn test_agent_loop_recovers_from_400_context() {
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
 }
 
-/// When context is at warning level (80-90%), the agent should inject
+/// When context is at warning level (70-75%), the agent should inject
 /// a warning into the conversation that the model can see.
 #[tokio::test]
-async fn test_agent_loop_injects_warning_at_80_percent() {
+async fn test_agent_loop_injects_warning_at_72_percent() {
     let dir = TempDir::new().unwrap();
 
-    // Context window: 300 tokens = 1200 chars.
-    // 80% = 240 tokens = 960 chars.
+    // Context window: 400 tokens = 1600 chars.
+    // 72% = 1152 chars (within warning range 70-75%).
     //
     // Flow:
-    // 1. Initial user message: 600 chars = 150 tokens (50%)
+    // 1. Initial user message: 600 chars = 150 tokens (37.5%)
     // 2. Turn 1: model returns ToolUse → tool executes → tool result added
-    //    After turn 1: 600 (initial) + ~200 (assistant tool_use + tool result) = ~800 chars = 200 tokens (67%)
-    // 3. Turn 1 response also includes text of 200 chars → total ~1000 chars = 250 tokens (83%) → Warning!
+    //    After turn 1: 600 (initial) + ~108 (assistant tool_use + tool result) = ~708 chars = 177 tokens (44%)
+    // 3. Turn 1 response text of 450 chars → total ~1158 chars = 289 tokens = 72.25% → Warning!
     //    Warning injected into last user message (tool result message)
     // 4. Turn 2 API call should see the warning
     let responses = vec![
-        // Turn 1: tool use + text that pushes us past 80%
+        // Turn 1: tool use + text that pushes us into warning range (70-75%)
         MessagesResponse {
             id: "msg_1".to_string(),
             content: vec![
                 ContentBlock::Text {
-                    text: "y".repeat(200),
+                    text: "y".repeat(500), // 500 chars - together with initial 600+40+18 = 1158 chars = 72.4%
                 },
                 ContentBlock::ToolUse {
                     id: "tu-1".to_string(),
@@ -796,14 +797,15 @@ async fn test_agent_loop_injects_warning_at_80_percent() {
         },
     ];
 
-    let provider = InspectingProvider::new(300, responses);
+    let provider = InspectingProvider::new(400, responses);
     let seen_messages = Arc::clone(&provider.seen_messages);
     let mut agent = make_agent(Box::new(provider), dir.path());
 
-    // 300 tokens = 1200 chars. 80% = 960 chars.
-    // After turn 1: 800 (initial) + 200 (assistant text) + ~40 (tool_use) + ~18 (tool result) = ~1058 chars
-    // = ~264 tokens = 88% → Warning!
-    let result = agent.run(&"x".repeat(800)).await;
+    // 400 tokens = 1600 chars. 72% = 1152 chars.
+    // After turn 1: 600 (initial) + 450 (assistant text) + ~40 (tool_use) + ~18 (tool result) = ~1108 chars
+    // = ~277 tokens = 69.25% → still below warning
+    // But the Turn 1 response has 450 chars of text which brings it to ~1158 chars = ~289 tokens = 72.25% → Warning!
+    let result = agent.run(&"x".repeat(600)).await;
     assert!(result.is_ok(), "Agent should complete: {:?}", result);
 
     // Check the messages the provider saw on the second call (after warning injection)
@@ -1011,7 +1013,7 @@ fn test_estimate_tokens_empty_content() {
 fn test_pressure_with_multiple_small_messages() {
     // Verify that many small messages accumulate correctly
     let budget = ContextBudget::with_window_size(1000);
-    // 20 messages of 160 chars each = 3200 chars = 800 tokens = 80%
+    // 20 messages of 160 chars each = 3200 chars = 800 tokens = 80% (now EmergencyCompaction, above 75%)
     let msgs: Vec<_> = (0..20)
         .map(|i| workgraph::executor::native::client::Message {
             role: if i % 2 == 0 {
@@ -1024,7 +1026,7 @@ fn test_pressure_with_multiple_small_messages() {
             }],
         })
         .collect();
-    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::Warning);
+    assert_eq!(budget.check_pressure(&msgs), ContextPressureAction::EmergencyCompaction);
 }
 
 #[test]

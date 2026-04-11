@@ -228,17 +228,17 @@ fn build_chat_compactor_prompt(previous_summary: &str, new_messages: &[ChatMessa
          Produce a markdown document with EXACTLY these four sections. \
          The document should be self-contained — a coordinator reading only this \
          document should be able to resume the conversation without losing context.\n\n\
-         ### 1. Key Decisions (~500 tokens)\n\
+         ### 1. Key Decisions (~750 tokens)\n\
          Bullet list of decisions made during the conversation: what was agreed, \
          what approach was chosen, what was rejected and why. Include task IDs and \
          specific details where relevant.\n\n\
-         ### 2. Open Threads (~300 tokens)\n\
+         ### 2. Open Threads (~450 tokens)\n\
          Items that are still in progress or unresolved: pending questions, \
          tasks that were discussed but not completed, topics that need follow-up.\n\n\
-         ### 3. User Preferences (~200 tokens)\n\
+         ### 3. User Preferences (~300 tokens)\n\
          Communication style, tool preferences, workflow habits, or explicit \
          instructions the user has given about how they want to work.\n\n\
-         ### 4. Recurring Topics (~200 tokens)\n\
+         ### 4. Recurring Topics (~300 tokens)\n\
          Themes, goals, or concerns that come up repeatedly. Patterns in what \
          the user asks about or works on.\n\n\
          IMPORTANT: Output ONLY the context summary document. No preamble, no explanation. \
