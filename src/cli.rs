@@ -3478,6 +3478,45 @@ pub enum TelegramCommands {
 
     /// Show Telegram configuration status
     Status,
+
+    /// Poll for replies from the configured Telegram chat
+    ///
+    /// Calls the Telegram Bot API getUpdates endpoint and filters for messages
+    /// from the configured chat_id. Returns the reply text or empty/timeout.
+    Poll {
+        /// Maximum time to wait for a reply in seconds (default: 120)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+
+        /// Target chat ID (uses configured chat_id if not specified)
+        #[arg(long)]
+        chat_id: Option<String>,
+    },
+
+    /// Send a message and wait for reply
+    ///
+    /// Sends the message and polls for reply at intervals. Times out after
+    /// configurable max wait. Includes task ID context in sent messages.
+    Ask {
+        /// Message to send and wait for reply to
+        message: String,
+
+        /// Maximum time to wait for a reply in seconds (default: 600)
+        #[arg(long, default_value = "600")]
+        timeout: u64,
+
+        /// Polling interval in seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        interval: u64,
+
+        /// Target chat ID (uses configured chat_id if not specified)
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Task ID to include in message context (optional)
+        #[arg(long)]
+        task_id: Option<String>,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
