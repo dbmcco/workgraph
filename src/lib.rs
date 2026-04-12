@@ -3,6 +3,7 @@ pub mod chat;
 pub mod check;
 pub mod config;
 pub mod context_scope;
+pub mod cron;
 pub mod cycle;
 pub mod executor;
 pub mod federation;
