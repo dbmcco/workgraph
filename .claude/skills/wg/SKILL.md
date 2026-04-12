@@ -235,7 +235,7 @@ wg service resume           # Resume dispatching
 | `wg add "X" --after a,b,c` | Multiple dependencies (comma-separated) |
 | `wg add "X" --skill rust --input src/foo.rs --deliverable docs/out.md` | Task with skills, inputs, deliverables |
 | `wg add "X" --model haiku` | Task with preferred model |
-| `wg add "X" --provider openrouter` | Task with preferred provider |
+| `wg add "X" --model openai:gpt-4o` | Task with provider:model format |
 | `wg add "X" --context-scope clean` | Set prompt context scope (clean/task/graph/full) |
 | `wg add "X" --exec-mode light` | Set execution weight (full/light/bare/shell) |
 | `wg add "X" --verify "Tests pass"` | Task requiring review before completion |
@@ -258,7 +258,7 @@ wg service resume           # Resume dispatching
 | `wg edit <id> --add-tag T --remove-tag T` | Modify tags |
 | `wg edit <id> --add-skill S --remove-skill S` | Modify skills |
 | `wg edit <id> --model sonnet` | Change preferred model |
-| `wg edit <id> --provider anthropic` | Change preferred provider |
+| `wg edit <id> --model openai:gpt-4o` | Change model (use provider:model format) |
 | `wg edit <id> --context-scope graph` | Change context scope |
 | `wg edit <id> --exec-mode bare` | Change execution weight |
 | `wg edit <id> --verify "cargo test passes"` | Set or update verification criteria |
@@ -532,6 +532,7 @@ wg service resume           # Resume dispatching
 | `wg agency init` | Bootstrap agency with starter roles, tradeoffs, and agents |
 | `wg agency stats` | Performance analytics |
 | `wg agency stats --by-model` | Per-model score breakdown |
+| `wg agency stats --by-task-type` | Per-task-type score breakdown |
 | `wg role add <id>` | Create a role |
 | `wg role list` | List roles |
 | `wg role show <id>` | Show role details |
@@ -549,12 +550,14 @@ wg service resume           # Resume dispatching
 | `wg agent lineage <hash>` | Show agent ancestry |
 | `wg agent performance <hash>` | Show agent performance |
 | `wg assign <task> <agent-hash>` | Assign agent to task |
+| `wg assign <task> --auto` | Auto-select agent via LLM |
 | `wg assign <task> --clear` | Clear assignment |
 | `wg evaluate run <task>` | Trigger LLM-based evaluation of a completed task |
 | `wg evaluate record --task <id> --score <n> --source <tag>` | Record evaluation from external source |
 | `wg evaluate show` | Show evaluation history (filter by `--task`, `--agent`, `--source`) |
 | `wg evolve` | Trigger evolution cycle |
 | `wg evolve --strategy mutation --budget 3` | Targeted evolution |
+| `wg evolve apply <synthesis-file>` | Apply a synthesis-result.json from a fan-out run |
 
 ### Federation (cross-repo agency sharing)
 
@@ -771,7 +774,7 @@ If a task feels beyond your model's capability, use `wg fail` with a clear reaso
 
 ### Provider awareness
 
-Tasks can specify a `--provider` (anthropic, openai, openrouter, local) to route to a specific LLM provider. The provider resolves at dispatch time: task.provider > config default.
+Tasks can specify a provider using the `provider:model` format in `--model` (e.g., `--model openai:gpt-4o`). Supported providers: anthropic, openai, openrouter, local. The provider resolves at dispatch time: task.provider > config default. The standalone `--provider` flag is deprecated.
 
 ### Execution modes
 

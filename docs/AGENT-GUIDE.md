@@ -701,14 +701,14 @@ wg add "Complex design" --model opus   # strong model for hard work
 
 ### Provider selection
 
-Control which AI provider is used for a task with `--provider`:
+Use the `provider:model` format in `--model` to route tasks to a specific provider:
 
 ```bash
-wg add "My task" --provider openrouter --model haiku
-wg edit my-task --provider anthropic
+wg add "My task" --model openrouter:haiku
+wg edit my-task --model anthropic:opus
 ```
 
-Supported providers: `anthropic`, `openai`, `openrouter`, `local`.
+Supported providers: `anthropic`, `openai`, `openrouter`, `local`. The legacy `--provider` flag still works but is deprecated.
 
 ### Execution modes
 

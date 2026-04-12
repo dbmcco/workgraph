@@ -191,8 +191,8 @@ wg edit my-task --exec-mode bare
 # Set or update verification criteria
 wg edit my-task --verify "cargo test test_feature passes"
 
-# Set a provider
-wg edit my-task --provider openrouter
+# Set a provider (use provider:model format — --provider is deprecated)
+wg edit my-task --model openrouter:gpt-4o
 
 # Schedule a delay
 wg edit my-task --delay 1h
