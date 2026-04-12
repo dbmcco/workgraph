@@ -380,21 +380,27 @@ mod tests {
     #[test]
     fn test_spawn_shell_with_exec() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+
         // This will actually spawn a process
-        let result = run(temp_dir.path(), "t1", "shell", None, None, false);
+        let result = run(&workgraph_dir, &task_id, "shell", None, None, false);
         assert!(result.is_ok());
 
         // Verify task was claimed
-        let graph = workgraph::parser::load_graph(graph_path(temp_dir.path())).unwrap();
-        let task = graph.get_task("t1").unwrap();
+        let graph = workgraph::parser::load_graph(graph_path(&workgraph_dir)).unwrap();
+        let task = graph.get_task(&task_id).unwrap();
         assert_eq!(task.status, Status::InProgress);
 
         // Verify agent was registered
-        let registry = AgentRegistry::load(temp_dir.path()).unwrap();
+        let registry = AgentRegistry::load(&workgraph_dir).unwrap();
         assert_eq!(registry.agents.len(), 1);
     }
 
@@ -408,10 +414,12 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), &task_id, "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Poll for the spawned process to create output file (up to 5s)
-        let agent_dir = temp_dir.path().join("agents").join("agent-1");
+        let agent_dir = workgraph_dir.join("agents").join("agent-1");
         for _ in 0..50 {
             if agent_dir.join("output.log").exists() && agent_dir.join("metadata.json").exists() {
                 break;
@@ -420,7 +428,7 @@ mod tests {
         }
 
         // Check output directory was created
-        let agents_dir = temp_dir.path().join("agents");
+        let agents_dir = workgraph_dir.join("agents");
         assert!(agents_dir.exists());
 
         // Should have agent-1 directory
@@ -434,15 +442,20 @@ mod tests {
     #[test]
     fn test_wrapper_script_generation_success() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         task.verify = None; // Not verified, should use wg done
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         assert!(
             wrapper_path.exists(),
             "Wrapper script not found at {:?}",
@@ -452,7 +465,7 @@ mod tests {
         // Read wrapper script and verify it contains the expected auto-complete logic
         let script = fs::read_to_string(&wrapper_path).unwrap();
         assert!(
-            script.contains("TASK_ID='t1'"),
+            script.contains(&format!("TASK_ID='{}'", task_id)),
             "Task ID should be shell-escaped with single quotes"
         );
         assert!(script.contains("wg done \"$TASK_ID\""));
@@ -464,15 +477,20 @@ mod tests {
     #[test]
     fn test_wrapper_script_for_verified_task() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         task.verify = Some("manual".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         assert!(
             wrapper_path.exists(),
             "Wrapper script not found at {:?}",
@@ -488,14 +506,19 @@ mod tests {
     #[test]
     fn test_wrapper_handles_agent_failure() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("exit 1".to_string()); // Will fail
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         assert!(
             wrapper_path.exists(),
             "Wrapper script not found at {:?}",
@@ -511,14 +534,19 @@ mod tests {
     #[test]
     fn test_wrapper_detects_task_status() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
-        task.exec = Some("wg done t1".to_string()); // Agent marks it done
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
+        task.exec = Some(format!("wg done {}", task_id)); // Agent marks it done
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script detects if task already done by agent
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Should check task status with wg show
@@ -531,14 +559,19 @@ mod tests {
     #[test]
     fn test_wrapper_script_preserves_exit_code() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("exit 42".to_string()); // Specific exit code
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script preserves exit code
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Should capture and preserve EXIT_CODE
@@ -549,14 +582,19 @@ mod tests {
     #[test]
     fn test_wrapper_appends_output_to_log() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo 'Agent output'".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script appends to output file
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Should redirect agent output to output file
@@ -570,14 +608,19 @@ mod tests {
     #[test]
     fn test_wrapper_suppresses_wg_command_errors() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("true".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script suppresses wg command errors
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Should redirect errors and log failures instead of silencing
@@ -612,14 +655,19 @@ mod tests {
     #[test]
     fn test_wrapper_script_includes_timeout() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
         // Spawn with explicit timeout
-        run(temp_dir.path(), "t1", "shell", Some("5m"), None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", Some("5m"), None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Verify the timeout command wraps the inner command
@@ -642,14 +690,19 @@ mod tests {
     #[test]
     fn test_wrapper_script_default_timeout_from_config() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
         // Default config has agent_timeout = "30m", no explicit timeout
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Default timeout is 30m = 1800s
@@ -663,13 +716,18 @@ mod tests {
     #[test]
     fn test_metadata_records_effective_timeout() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", Some("10m"), None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", Some("10m"), None, false).unwrap();
 
-        let metadata_path = agent_output_dir(temp_dir.path(), "agent-1").join("metadata.json");
+        let metadata_path = agent_output_dir(&workgraph_dir, "agent-1").join("metadata.json");
         let metadata: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
         assert_eq!(
@@ -681,13 +739,18 @@ mod tests {
     #[test]
     fn test_wrapper_script_contains_merge_back_section() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         // Merge-back section is always present but gated by env var check
@@ -704,13 +767,18 @@ mod tests {
     #[test]
     fn test_wrapper_merge_back_uses_squash_merge() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
@@ -722,13 +790,18 @@ mod tests {
     #[test]
     fn test_wrapper_merge_back_handles_conflicts() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
@@ -752,9 +825,11 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,"t1", "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(script.contains(".merge-lock"), "Should use merge lock file");
@@ -765,13 +840,18 @@ mod tests {
     #[test]
     fn test_wrapper_merge_back_cleans_up_worktree() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
@@ -801,9 +881,11 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,"t1", "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
@@ -815,13 +897,18 @@ mod tests {
     #[test]
     fn test_wrapper_merge_back_commit_convention() {
         let temp_dir = TempDir::new().unwrap();
-        let mut task = make_task("t1", "Test Task");
+        // Use a unique task ID to avoid branch collisions with parallel tests
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        run(temp_dir.path(), "t1", "shell", None, None, false).unwrap();
+        // Pass the .workgraph subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir,&task_id, "shell", None, None, false).unwrap();
 
-        let wrapper_path = agent_output_dir(temp_dir.path(), "agent-1").join("run.sh");
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
         assert!(
