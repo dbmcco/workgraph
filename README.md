@@ -75,9 +75,9 @@ wg add "Implement auth" \
   --skill security \
   --deliverable src/auth.rs
 
-# Task with per-task model override and provider selection
+# Task with per-task model override (use provider:model for non-default providers)
 wg add "Quick formatting fix" --model haiku
-wg add "Use GPT for this" --provider openai --model gpt-4o
+wg add "Use GPT for this" --model openai:gpt-4o
 
 # Execution weight controls what the agent can do
 wg add "Quick lint fix" --exec-mode shell       # no LLM, just runs shell command
@@ -111,7 +111,7 @@ wg add "Complex refactor" --context-scope full  # everything: full graph + logs
 wg edit my-task --title "Better title"
 wg edit my-task --add-after other-task
 wg edit my-task --remove-tag stale --add-tag urgent
-wg edit my-task --model opus --provider anthropic
+wg edit my-task --model opus
 wg edit my-task --exec-mode light
 wg edit my-task --verify "cargo test passes"
 wg edit my-task --delay 30m --not-before 2026-03-20T09:00:00Z
