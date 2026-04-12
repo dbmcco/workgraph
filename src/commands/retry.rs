@@ -3,7 +3,6 @@ use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
 use workgraph::parser::modify_graph;
-use workgraph::query;
 
 #[cfg(test)]
 use super::graph_path;
@@ -21,7 +20,6 @@ pub fn run(dir: &Path, id: &str) -> Result<()> {
     let mut attempt: u32 = 0;
     let mut retry_count: u32 = 0;
     let mut max_retries: Option<u32> = None;
-    let mut task_after_deps: Vec<String> = Vec::new();
 
     modify_graph(&path, |graph| {
         let task = match graph.get_task_mut(id) {
@@ -57,13 +55,11 @@ pub fn run(dir: &Path, id: &str) -> Result<()> {
         prev_failure_reason = task.failure_reason.clone();
         attempt = task.retry_count + 1;
 
-        // Clear failure state
+        // Clear failure state and set to Open status
+        task.status = Status::Open;
         task.failure_reason = None;
         task.assigned = None;
         task.tags.retain(|t| t != "converged");
-
-        // Store dependencies to check readiness after the graph modification
-        task_after_deps = task.after.clone();
 
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
@@ -83,19 +79,13 @@ pub fn run(dir: &Path, id: &str) -> Result<()> {
         return Err(e);
     }
 
-    // Now check if task is ready to run and update status accordingly
-    let graph = workgraph::parser::load_graph(&path).context("Failed to load graph for readiness check")?;
-    let is_ready = task_after_deps.iter().all(|blocker_id| {
-        query::is_blocker_satisfied(blocker_id, &graph, Some(dir))
-    });
-
+    // Set task status to Open after retry (dependency checking is done by ready/service logic)
     modify_graph(&path, |graph| {
-        // Now get mutable reference and update status
         let task = graph.get_task_mut(id).unwrap(); // We know it exists from above
-        task.status = if is_ready { Status::Open } else { Status::Blocked };
+        task.status = Status::Open;
         true
     })
-    .context("Failed to update task status based on readiness")?;
+    .context("Failed to update task status after retry")?;
 
     super::notify_graph_changed(dir);
 
@@ -359,57 +349,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_retry_with_unsatisfied_dependencies_sets_blocked_status() {
-        let dir = tempdir().unwrap();
-        let dir_path = dir.path();
-
-        // Create a failed task with a dependency on an open task (not satisfied)
-        let mut failed_task = make_task("failed-task", "Failed task", Status::Failed);
-        failed_task.after = vec!["fix-task".to_string()];
-        failed_task.failure_reason = Some("compilation error".to_string());
-
-        let fix_task = make_task("fix-task", "Fix task", Status::Open);
-
-        setup_workgraph(dir_path, vec![failed_task, fix_task]);
-
-        // Retry the failed task
-        run(dir_path, "failed-task").unwrap();
-
-        let path = graph_path(dir_path);
-        let graph = load_graph(&path).unwrap();
-        let task = graph.get_task("failed-task").unwrap();
-
-        // Task should be set to Blocked, not Open, because fix-task is still Open
-        assert_eq!(task.status, Status::Blocked);
-        assert_eq!(task.failure_reason, None);
-        assert_eq!(task.assigned, None);
-    }
-
-    #[test]
-    fn test_retry_with_satisfied_dependencies_sets_open_status() {
-        let dir = tempdir().unwrap();
-        let dir_path = dir.path();
-
-        // Create a failed task with a dependency on a done task (satisfied)
-        let mut failed_task = make_task("failed-task", "Failed task", Status::Failed);
-        failed_task.after = vec!["fix-task".to_string()];
-        failed_task.failure_reason = Some("compilation error".to_string());
-
-        let fix_task = make_task("fix-task", "Fix task", Status::Done);
-
-        setup_workgraph(dir_path, vec![failed_task, fix_task]);
-
-        // Retry the failed task
-        run(dir_path, "failed-task").unwrap();
-
-        let path = graph_path(dir_path);
-        let graph = load_graph(&path).unwrap();
-        let task = graph.get_task("failed-task").unwrap();
-
-        // Task should be set to Open because all dependencies are satisfied
-        assert_eq!(task.status, Status::Open);
-        assert_eq!(task.failure_reason, None);
-        assert_eq!(task.assigned, None);
-    }
 }
