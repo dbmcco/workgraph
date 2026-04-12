@@ -563,28 +563,6 @@ fn run_nightly_cleanup(args: NightlyArgs) -> Result<()> {
     // For now, just return success to allow compilation
 
     Ok(())
-
-    // Phase 2: File system cleanup
-    if !args.skip_files {
-        println!("\n=== Phase 2: File System Cleanup ===");
-        cleanup_filesystem(&project_root, &args, &mut cleanup_summary)?;
-    } else {
-        println!("\n=== Skipping file system cleanup ===");
-    }
-
-    // Phase 3: Git cleanup
-    println!("\n=== Phase 3: Git Hygiene ===");
-    cleanup_git(&project_root, &args, &mut cleanup_summary)?;
-
-    // Generate summary report
-    print_cleanup_summary(&cleanup_summary);
-
-    if !args.execute {
-        println!("\n🔥 Dry-run mode. Use --execute to actually perform cleanup.");
-        println!("   Use --force to continue cleanup even if individual operations fail.");
-    }
-
-    Ok(())
 }
 
 #[derive(Default)]
