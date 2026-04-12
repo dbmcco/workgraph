@@ -15,5 +15,23 @@ agency_session_id.txt
 # Notification configuration with secrets
 notify.toml
 
+# Common files that may contain secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+credentials.yaml
+secrets.json
+secrets.yaml
+config/secrets.toml
+**/secrets/
+.secrets/
+auth.toml
+tokens.txt
+api-keys.txt
+
 # Terminal Bench trial results (large, per-run artifacts)
 terminal-bench/results/
