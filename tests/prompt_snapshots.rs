@@ -103,6 +103,7 @@ fn test_scope_context() -> ScopeContext {
         wg_guide_content: String::new(),
         discovered_tests: String::new(),
         decomp_guidance: true,
+        telegram_available: false,
     }
 }
 

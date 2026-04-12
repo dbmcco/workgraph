@@ -9,6 +9,8 @@ use std::path::Path;
 use workgraph::config::Config;
 use workgraph::context_scope::ContextScope;
 use workgraph::graph::{LogEntry, Status};
+use workgraph::notify::config::NotifyConfig;
+use workgraph::notify::telegram::TelegramConfig;
 
 /// Knowledge tiers for model-specific context injection
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +168,11 @@ pub(crate) fn build_scope_context(
 
     // Adaptive decomposition guidance toggle (from config)
     ctx.decomp_guidance = config.guardrails.decomp_guidance;
+
+    // Task+ scope: Telegram escalation availability
+    if scope >= ContextScope::Task {
+        ctx.telegram_available = is_telegram_configured(workgraph_dir);
+    }
 
     ctx
 }
@@ -603,6 +610,33 @@ pub(crate) fn classify_model_tier(model: &str) -> KnowledgeTier {
     else {
         KnowledgeTier::Essential
     }
+}
+
+/// Check if Telegram escalation is configured and available.
+///
+/// Looks for a valid Telegram configuration in either the project-local
+/// `.workgraph/notify.toml` or global `~/.config/workgraph/notify.toml`.
+/// Returns true if Telegram bot token and chat ID are configured.
+fn is_telegram_configured(workgraph_dir: &Path) -> bool {
+    // Try project-local config first
+    let project_config_path = workgraph_dir.join("notify.toml");
+    if let Ok(config) = NotifyConfig::load_from(&project_config_path) {
+        if TelegramConfig::from_notify_config(&config).is_ok() {
+            return true;
+        }
+    }
+
+    // Try global config
+    if let Some(global_config_path) = dirs::config_dir() {
+        let global_config_path = global_config_path.join("workgraph").join("notify.toml");
+        if let Ok(config) = NotifyConfig::load_from(&global_config_path) {
+            if TelegramConfig::from_notify_config(&config).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Build tiered workgraph knowledge guide based on model capabilities

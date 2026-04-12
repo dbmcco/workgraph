@@ -520,6 +520,42 @@ If there are messages, reply to each one:
 wg msg send {{task_id}} \"Acknowledged — adjusting approach per your feedback\"
 ```\n";
 
+/// Telegram escalation instructions for agents when Telegram is configured.
+pub const TELEGRAM_ESCALATION_SECTION: &str = "\
+## Human Escalation via Telegram
+
+When you need human input, guidance, or approval, you can contact the user directly via Telegram:
+
+### Send a Message
+```bash
+wg telegram send \"Your message here\"
+```
+
+### When to Escalate
+**DO escalate for:**
+- Blocking questions where you cannot proceed without clarification
+- Ambiguous or contradictory requirements
+- Permission needed for potentially destructive operations
+- Critical decisions that could significantly impact the project
+
+**DON'T escalate for:**
+- Implementation details you can research or figure out
+- Minor style/preference choices
+- Standard development practices
+- Routine errors you can debug and fix
+
+### Conversation Protocol
+1. **Send your message** clearly explaining what you need
+2. **Continue with your task** if possible while waiting for a response
+3. **Check for replies** periodically during your work (every 2-3 minutes for urgent matters)
+4. **Wait up to 10 minutes** total for time-sensitive decisions
+5. **Proceed with best judgment** if no response after 10 minutes, and log your decision:
+   ```bash
+   wg log {{task_id}} \"No response after 10min, proceeding with approach X - can be adjusted if needed\"
+   ```
+
+**Note**: The current implementation supports sending messages. Reply detection is planned for a future update.\n";
+
 /// Hint for task+ scopes about using wg context/show to get more info (R2).
 const WG_CONTEXT_HINT: &str = "\
 ## Additional Context
@@ -697,6 +733,8 @@ pub struct ScopeContext {
     pub discovered_tests: String,
     /// Whether adaptive decomposition guidance is enabled (from config)
     pub decomp_guidance: bool,
+    /// Whether Telegram escalation is configured and available (task+ scope)
+    pub telegram_available: bool,
 }
 
 /// Build a scope-aware prompt for built-in executors.
@@ -809,6 +847,12 @@ pub fn build_prompt(vars: &TemplateVars, scope: ContextScope, ctx: &ScopeContext
         parts.push(vars.apply(REQUIRED_WORKFLOW_SECTION));
         parts.push(GIT_HYGIENE_SECTION.to_string());
         parts.push(vars.apply(MESSAGE_POLLING_SECTION));
+
+        // Task+ scope: Telegram escalation (when configured)
+        if ctx.telegram_available {
+            parts.push(vars.apply(TELEGRAM_ESCALATION_SECTION));
+        }
+
         parts.push(vars.apply(ETHOS_SECTION));
         if ctx.decomp_guidance {
             parts.push(build_decomposition_guidance(
