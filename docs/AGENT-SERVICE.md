@@ -319,7 +319,7 @@ When the coordinator spawns an agent for a task:
 1. **Claim**: The task is claimed (status → `in-progress`)
 2. **Model resolution**: task.model > executor.model > coordinator.model/CLI --model
 3. **Identity injection**: If the task has an `agent` field, the agent's role and tradeoff are loaded from `.workgraph/agency/` and rendered into an identity prompt section
-4. **Provider resolution**: If the task has a `provider` field (set via the `provider:model` format in `--model`, e.g., `--model openrouter:gpt-4o`), the executor uses that provider. Supported providers: `anthropic`, `openai`, `openrouter`, `local`. The standalone `--provider` flag on `wg add`/`wg edit` still works but is deprecated.
+4. **Provider resolution**: If the task has a `provider` field (set via the `provider:model` format in `--model`, e.g., `--model openai:gpt-4o`), the executor uses that provider. Supported providers: `anthropic`, `openai`, `openrouter`, `local`. The standalone `--provider` flag on `wg add`/`wg edit` still works but is deprecated.
 5. **Exec-mode resolution**: The task's `exec_mode` determines the agent's toolset:
    - `full` — all tools (default)
    - `light` — read-only tools (research, review)
