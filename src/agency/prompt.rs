@@ -341,6 +341,10 @@ pub struct EvaluatorInput<'a> {
     /// Resolved outcome name for the evaluated agent's role (avoids showing raw hash).
     /// When `None`, falls back to `role.outcome_id` (which may be a content hash).
     pub resolved_outcome_name: Option<&'a str>,
+    /// Child task context for decomposition detection.
+    /// Each entry: (task_title, status_str, description_snippet).
+    /// When populated, indicates the task decomposed work into subtasks.
+    pub child_tasks: &'a [(String, String, Option<String>)],
 }
 
 /// Render the evaluator prompt that an LLM evaluator will receive.
@@ -489,6 +493,43 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
         out.push('\n');
     }
 
+    // -- Task Decomposition Detection --
+    if !input.child_tasks.is_empty() {
+        out.push_str("## Task Decomposition Detected\n\n");
+        out.push_str(
+            "This task created subtasks, indicating intentional work decomposition rather than\n\
+             direct implementation. Subtasks created:\n\n",
+        );
+        for (title, status, desc) in input.child_tasks {
+            let _ = write!(out, "- **{}** ({})", title, status);
+            if let Some(d) = desc {
+                // Truncate long descriptions to save tokens (char-boundary safe)
+                let snippet = if d.len() > 120 {
+                    let mut end = 120;
+                    while !d.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    &d[..end]
+                } else {
+                    d.as_str()
+                };
+                let _ = write!(out, " — {}", snippet);
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(
+            "IMPORTANT: When a task decomposes into subtasks, evaluate the DECOMPOSITION QUALITY\n\
+             rather than direct verify criteria fulfillment. Consider:\n\
+             - Was the decomposition appropriate for the task complexity?\n\
+             - Do subtasks adequately cover the parent task's requirements?\n\
+             - Is there clear handoff and verify criteria inheritance?\n\
+             - Does the decomposition structure enable effective parallel work?\n\n\
+             Do NOT penalize correctness/completeness dimensions for verification failures\n\
+             when work was properly delegated to subtasks.\n\n",
+        );
+    }
+
     // -- FLIP Verification Results (when available) --
     if input.flip_score.is_some() || input.verify_status.is_some() {
         out.push_str("## FLIP Verification Results\n\n");
@@ -514,11 +555,22 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
             out.push('\n');
         }
         out.push('\n');
-        out.push_str(
-            "NOTE: Verification is a strong signal. If verification failed, significantly\n\
-             reduce the overall score. If verification passed despite low FLIP, the FLIP\n\
-             may have been a false alarm.\n\n",
-        );
+        let decomposed = !input.child_tasks.is_empty();
+        if decomposed {
+            out.push_str(
+                "NOTE: This task was decomposed into subtasks. If verification failed,\n\
+                 this likely indicates proper work delegation rather than task failure.\n\
+                 Score the decomposition quality instead of penalizing for verify criteria\n\
+                 not met directly. If verification passed despite low FLIP, the FLIP\n\
+                 may have been a false alarm.\n\n",
+            );
+        } else {
+            out.push_str(
+                "NOTE: Verification is a strong signal. If verification failed, significantly\n\
+                 reduce the overall score. If verification passed despite low FLIP, the FLIP\n\
+                 may have been a false alarm.\n\n",
+            );
+        }
     }
 
     // -- Evaluation rubric & output format --
@@ -1224,6 +1276,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1319,6 +1372,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1362,6 +1416,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1418,6 +1473,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1465,6 +1521,7 @@ mod tests {
                 "[2025-01-01] (agent-1): Tests pass\n[2025-01-01] (agent-1): Artifacts verified",
             ),
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1500,6 +1557,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1509,6 +1567,52 @@ mod tests {
         assert!(!output.contains("FLIP Score"));
         assert!(!output.contains("Verification Status"));
         assert!(!output.contains("NOTE: Verification is a strong signal"));
+    }
+
+    #[test]
+    fn test_render_evaluator_prompt_with_decomposition() {
+        let child_tasks = vec![
+            ("Subtask 1: Parse input".to_string(), "Done".to_string(), Some("Parse input data".to_string())),
+            ("Subtask 2: Process data".to_string(), "In-progress".to_string(), None),
+        ];
+
+        let input = EvaluatorInput {
+            task_title: "Decomposed task",
+            task_description: Some("A task that was decomposed into subtasks."),
+            task_skills: &[],
+            verify: Some("cargo test passes"),
+            agent: None,
+            role: None,
+            tradeoff: None,
+            artifacts: &[],
+            log_entries: &[],
+            started_at: None,
+            completed_at: None,
+            artifact_diff: None,
+            evaluator_identity: None,
+            downstream_tasks: &[],
+            flip_score: None,
+            verify_status: Some("failed"),
+            verify_findings: Some("Verification failed - verify criteria not met directly"),
+            resolved_outcome_name: None,
+            child_tasks: &child_tasks,
+        };
+
+        let output = render_evaluator_prompt(&input);
+
+        // Should contain decomposition detection section
+        assert!(output.contains("## Task Decomposition Detected"));
+        assert!(output.contains("This task created subtasks, indicating intentional work decomposition"));
+        assert!(output.contains("Subtask 1: Parse input"));
+        assert!(output.contains("Subtask 2: Process data"));
+
+        // Should contain adjusted verification note for decomposition
+        assert!(output.contains("This task was decomposed into subtasks"));
+        assert!(output.contains("this likely indicates proper work delegation rather than task failure"));
+        assert!(output.contains("Score the decomposition quality instead of penalizing for verify criteria"));
+
+        // Should NOT contain the standard verification note that penalizes failures
+        assert!(!output.contains("If verification failed, significantly\n             reduce the overall score"));
     }
 
     #[test]
@@ -1532,6 +1636,7 @@ mod tests {
             verify_status: None,
             verify_findings: None,
             resolved_outcome_name: None,
+            child_tasks: &[],
         };
 
         let output = render_evaluator_prompt(&input);

@@ -238,6 +238,18 @@ pub fn run(
         })
         .collect();
 
+    // Step 3.75: Collect child task context for decomposition detection.
+    // Find tasks that have this task as a dependency (tasks where `task.after` contains current task_id).
+    let child_tasks: Vec<(String, String, Option<String>)> = graph
+        .tasks()
+        .filter(|t| t.after.contains(&task_id.to_string()))
+        .map(|child| {
+            let status_str = format!("{:?}", child.status);
+            let desc = child.description.clone();
+            (child.title.clone(), status_str, desc)
+        })
+        .collect();
+
     // Step 3.8: Load FLIP score and verify findings (if available)
     let flip_score = {
         let evals_dir = agency_dir.join("evaluations");
@@ -295,6 +307,7 @@ pub fn run(
         verify_status: verify_status_owned.as_deref(),
         verify_findings: verify_findings_owned.as_deref(),
         resolved_outcome_name: evaluated_outcome_name,
+        child_tasks: &child_tasks,
     };
 
     let prompt = render_evaluator_prompt(&evaluator_input);
