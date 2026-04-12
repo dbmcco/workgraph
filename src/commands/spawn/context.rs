@@ -673,9 +673,9 @@ fn build_essential_guide(workgraph_dir: &Path) -> String {
 
 **You are an AI agent working on one task in a workgraph project.** Other agents work on other tasks concurrently.
 
-## CRITICAL: Autopoietic Decomposition
+## CRITICAL: Attempt Work Before Failing or Decomposing
 
-**Core Principle:** If you cannot complete a task in 30 seconds of thinking, decompose it.
+**Core Principle:** Always attempt the work before concluding it cannot be done. Difficulty is not impossibility.
 
 **The Graph is Alive.** You are one node in a living system. Your job is not just to complete your task, but to grow the graph where it needs growing:
 
@@ -684,20 +684,20 @@ fn build_essential_guide(workgraph_dir: &Path) -> String {
 - **Follow-up needed?** → `wg add "Verify: ..." --after $WG_TASK_ID`
 - **Found a bug/missing doc?** → `wg add "Fix: ..." --after $WG_TASK_ID`
 
-**Time budget:** From task assignment to `wg add` should be under 30 seconds. Uncertainty is a signal to delegate, not to explore.
+**Anti-pattern — Explain-and-Bail:** DO NOT read a task, write a long explanation of why it's hard, and then fail. Attempt the work first. A failed attempt with partial progress is more valuable than an explanation of why you didn't try.
 
 ## Decision Framework: When to Decompose vs Implement
 
 ### Implement Directly If:
-- Task is small and well-scoped (≤30 seconds thinking)
+- Task is small and well-scoped
 - Touches ≤2-3 files
 - Single logical unit of work
 - No external dependencies or unknowns
+- Task seems hard but is single-scope — difficulty alone is NOT a reason to decompose
 
 ### Decompose (create subtasks) If:
-- Task has 3+ independent parts
+- Task has 3+ genuinely independent parts that benefit from parallel work
 - Involves multiple modules/components
-- Requires research or understanding unfamiliar code
 - Would take multiple distinct phases
 - Discovers bugs or missing prereqs outside scope
 
@@ -753,7 +753,7 @@ Use `--verify "command"` for machine-checkable criteria.
 | `wg show <id>` | View task details, status, deps, logs |
 | `wg log <id> "msg"` | Log progress (recoverable breadcrumbs) |
 | `wg done <id>` | Mark your task complete |
-| `wg fail <id> --reason "..."` | Mark your task failed |
+| `wg fail <id> --reason "..."` | Mark failed (only after genuine attempt) |
 | `wg list` | List all tasks |
 | `wg ready` | List tasks ready to be worked on |
 

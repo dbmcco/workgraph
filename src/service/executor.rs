@@ -82,10 +82,22 @@ You MUST use these commands to track your work:
    wg done {{task_id}} --converged  # Use this if task has loop edges and work is complete
    ```
 
-7. **Mark as failed** if you cannot complete:
+7. **Mark as failed** ONLY after genuine attempt:
+   You MUST attempt the actual work before calling `wg fail`. Explaining why something \
+is hard is NOT the same as attempting it. If the task involves fixing code — try fixing it. \
+If it involves writing code — write the code. Only use `wg fail` when you have tried and \
+hit a genuine blocker (missing API access, circular dependency, external system down). \
+'The verification seems hard to satisfy' is NOT a valid failure reason — attempt the work \
+and let verification tell you if it succeeded.
    ```bash
-   wg fail {{task_id}} --reason \"Specific reason why\"
+   wg fail {{task_id}} --reason \"What I tried and what specifically blocked me\"
    ```
+
+## Anti-Pattern: Explain-and-Bail
+DO NOT: Read the task → write an explanation of why it's hard → `wg fail`
+DO: Read the task → attempt the work → if genuinely stuck after trying, `wg fail` with what you tried
+The system has retry logic and model escalation. A failed attempt with partial progress \
+is more valuable than a lengthy explanation of why you didn't try.
 
 ## Important
 - Run `wg log` commands BEFORE doing work to track progress
@@ -188,25 +200,28 @@ pub const AUTOPOIETIC_GUIDANCE: &str = "\
 You are encouraged to create new tasks as you discover work. \
 The coordinator will dispatch them automatically.
 
-### When you cannot complete directly
+### When to decompose vs implement directly
 
-If you face a task you **cannot complete immediately** (missing prerequisites, too large, 
-requires work in multiple files/phases), do NOT try to do everything yourself. Instead:
+**Difficulty is not the same as decomposability.** If a task is hard but single-scope, \
+attempt it directly — do not decompose just because it seems challenging.
+
+Decompose when the task has **genuinely independent parts** that benefit from parallel work:
 
 1. **Decompose** the task into sub-tasks that would produce the same output
 2. **Create** those sub-tasks using `wg add` with `--after {{task_id}}` dependencies
 3. **Let** those sub-tasks run and complete (the coordinator dispatches them)
 4. **Complete** your parent task based on the sub-task results
 
-This is the core autonomy pattern: agents should self-organize by creating dependent work \
-rather than getting stuck trying to do everything themselves.
-
-### When to decompose
+### Good reasons to decompose
 - Your task has 3+ independent parts that could run in parallel
 - You discover a bug, missing doc, or needed refactor outside your scope
 - A prerequisite doesn't exist yet and needs to be created first
 - Your task is too large for a single agent session
-- **You cannot complete the task directly** — decompose instead of getting stuck
+
+### Bad reasons to decompose (implement directly instead)
+- The task seems hard or unfamiliar — attempt it first
+- You're unsure if you can satisfy verification — try and let verification judge
+- The constraints seem conflicting — try your best interpretation
 
 ### How to decompose
 - **Fan out parallel work**: \
@@ -430,16 +445,16 @@ pub fn build_decomposition_guidance(
             parts.push(
                 "This appears to be a **multi-step task**. Consider decomposing with dependencies.\n\
                  \n\
-                 ### When you cannot complete directly\n\
-                 If you face a task you **cannot complete immediately**, do NOT try to do everything \
-                 yourself. Instead:\n\
+                 ### When to decompose\n\
+                 Decompose when the task has **genuinely independent parts** that benefit from \
+                 parallel work. Difficulty alone is NOT a reason to decompose — if a task is \
+                 hard but single-scope, attempt it directly first.\n\
+                 \n\
+                 If you do decompose:\n\
                  1. **Decompose** the task into sub-tasks that would produce the same output\n\
                  2. **Create** those sub-tasks using `wg add` with `--after {task_id}` dependencies\n\
                  3. **Let** those sub-tasks run and complete (the coordinator dispatches them)\n\
                  4. **Complete** your parent task based on the sub-task results\n\
-                 \n\
-                 This is the core autonomy pattern: agents should self-organize by creating \
-                 dependent work rather than getting stuck trying to do everything themselves.\n\
                  \n\
                  When creating subtasks, ALWAYS use `--after` to express dependencies. \
                  Flat task lists without dependency edges are an anti-pattern — they run \
@@ -691,7 +706,7 @@ If ANY dependency has status=Failed:
 3. Assess whether you can create fix tasks:
    a. If the failure is clear and scoped → create fix task(s) via `wg add`
    b. If the failure is ambiguous or cascading → create a research/investigate task
-   c. If you cannot determine a fix → `wg fail` with reason explaining the blocker
+   c. If you cannot determine a fix after investigating → `wg fail` with what you investigated and what specifically blocks progress
 4. Create fix tasks that block the failed dep (so it re-runs after the fix):
    ```
    wg add \"Fix: <description>\" --before <failed-dep-id> \\

@@ -168,7 +168,9 @@ pub fn run(
     let result = rt.block_on(agent.run(&format!(
         "You are working on task '{}'. Complete the task as described in your system prompt. \
          When done, use the wg_done tool with task_id '{}'. \
-         If you cannot complete the task, use the wg_fail tool with a reason.",
+         If you cannot complete the task after genuinely attempting the work, \
+         use the wg_fail tool with what you tried and what specifically blocked you. \
+         Do not fail without attempting — difficulty is not impossibility.",
         task_id, task_id
     )))?;
 
