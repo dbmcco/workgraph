@@ -18,7 +18,7 @@ use workgraph::service::{ProviderHealth, ProviderErrorKind, classify_error, extr
 use workgraph::stream_event::{self, StreamEvent};
 
 use crate::commands::is_process_alive;
-use workgraph::metrics::{log_metrics_summary, get_metrics_snapshot};
+use workgraph::metrics::log_metrics_summary;
 
 /// Extract session_id from an agent's stream files (stream.jsonl or raw_stream.jsonl).
 fn extract_session_id(agent: &AgentEntry) -> Option<String> {

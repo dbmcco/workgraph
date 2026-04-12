@@ -6,7 +6,7 @@ use std::path::Path;
 use workgraph::metrics::get_metrics_snapshot;
 
 /// Run the metrics command to display cleanup monitoring statistics.
-pub fn run(dir: &Path, json: bool) -> Result<()> {
+pub fn run(_dir: &Path, json: bool) -> Result<()> {
     let metrics = get_metrics_snapshot();
 
     if json {
