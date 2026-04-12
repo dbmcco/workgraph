@@ -338,7 +338,7 @@ pub fn ready_tasks_cycle_aware<'a>(
     graph: &'a WorkGraph,
     cycle_analysis: &CycleAnalysis,
 ) -> Vec<&'a Task> {
-    graph
+    let mut ready_tasks: Vec<&'a Task> = graph
         .tasks()
         .filter(|task| {
             if task.status != Status::Open {
@@ -374,7 +374,60 @@ pub fn ready_tasks_cycle_aware<'a>(
                 false
             })
         })
-        .collect()
+        .collect();
+
+    // Auto-break-in for unconfigured cycles
+    for cycle in &cycle_analysis.cycles {
+        // Check if this cycle has any configured tasks
+        let has_cycle_config = cycle.members.iter().any(|member_id| {
+            graph
+                .get_task(member_id)
+                .map(|t| t.cycle_config.is_some())
+                .unwrap_or(false)
+        });
+
+        // Skip if cycle is configured (existing logic handles it)
+        if has_cycle_config {
+            continue;
+        }
+
+        // Check if any cycle member is already ready (existing logic handles it)
+        let has_ready_member = cycle.members.iter().any(|member_id| {
+            ready_tasks.iter().any(|t| &t.id == member_id)
+        });
+
+        if has_ready_member {
+            continue;
+        }
+
+        // Check if all cycle members are open and time-ready
+        let viable_members: Vec<&Task> = cycle
+            .members
+            .iter()
+            .filter_map(|member_id| graph.get_task(member_id))
+            .filter(|task| task.status == Status::Open && !task.paused && is_time_ready(task))
+            .collect();
+
+        if viable_members.is_empty() {
+            continue; // No viable members to break in
+        }
+
+        // Pick the break-in point: alphabetically first task
+        let break_in_task = viable_members
+            .iter()
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .expect("viable_members is not empty");
+
+        eprintln!(
+            "Auto-break-in: selecting task '{}' to break cycle deadlock in unconfigured cycle [{}]",
+            break_in_task.id,
+            cycle.members.join(" → ")
+        );
+
+        ready_tasks.push(break_in_task);
+    }
+
+    ready_tasks
 }
 
 /// Find all tasks that are ready to work on, resolving cross-repo dependencies,
@@ -2161,5 +2214,108 @@ mod tests {
             vec!["a", "blocker"],
             "Non-cycle tasks and cc tasks without actual cycles should not get false exemptions"
         );
+    }
+
+    #[test]
+    fn test_auto_breakin_unconfigured_cycle() {
+        use crate::graph::{CycleAnalysis, Node, Status, Task, WorkGraph};
+
+        // Helper to create a task
+        fn make_task(id: &str, title: &str) -> Task {
+            Task {
+                id: id.to_string(),
+                title: title.to_string(),
+                ..Task::default()
+            }
+        }
+
+        // Create a 3-task cycle without any CycleConfig: A → B → C → A
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = make_task("a", "Task A");
+        task_a.after = vec!["c".to_string()]; // A depends on C (cycle edge)
+        task_a.status = Status::Open;
+
+        let mut task_b = make_task("b", "Task B");
+        task_b.after = vec!["a".to_string()]; // B depends on A
+        task_b.status = Status::Open;
+
+        let mut task_c = make_task("c", "Task C");
+        task_c.after = vec!["b".to_string()]; // C depends on B
+        task_c.status = Status::Open;
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(task_c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+
+        // Verify that a cycle was detected
+        assert!(!cycle_analysis.cycles.is_empty(), "Should detect the cycle");
+        assert_eq!(cycle_analysis.cycles.len(), 1, "Should be exactly one cycle");
+
+        // Get ready tasks - with auto-break-in, at least one should be ready despite the cycle
+        let ready_tasks = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        assert!(!ready_tasks.is_empty(), "Auto-break-in should make at least one task ready");
+        assert_eq!(ready_tasks.len(), 1, "Exactly one task should be selected for auto-break-in");
+
+        // The break-in task should be deterministic (alphabetically first)
+        let break_in_task = &ready_tasks[0];
+        assert_eq!(break_in_task.id, "a", "Task 'a' should be selected for break-in (alphabetically first)");
+    }
+
+    #[test]
+    fn test_configured_cycle_not_affected_by_auto_breakin() {
+        use crate::graph::{CycleAnalysis, CycleConfig, Node, Status, Task, WorkGraph};
+
+        // Helper to create a task
+        fn make_task(id: &str, title: &str) -> Task {
+            Task {
+                id: id.to_string(),
+                title: title.to_string(),
+                ..Task::default()
+            }
+        }
+
+        // Create the same 3-task cycle but with CycleConfig on one member
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = make_task("a", "Task A");
+        task_a.after = vec!["c".to_string()];
+        task_a.status = Status::Open;
+        // Add cycle config to make this a configured cycle
+        task_a.cycle_config = Some(CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+
+        let mut task_b = make_task("b", "Task B");
+        task_b.after = vec!["a".to_string()];
+        task_b.status = Status::Open;
+
+        let mut task_c = make_task("c", "Task C");
+        task_c.after = vec!["b".to_string()];
+        task_c.status = Status::Open;
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(task_c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready_tasks = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        // With proper CycleConfig, the existing logic should handle it normally
+        // The cycle header (task with cycle_config) should be ready via back-edge exemption
+        assert!(!ready_tasks.is_empty(), "Cycle header should be ready");
+
+        // Find the ready task - should be the cycle header
+        let ready_task = ready_tasks.iter().find(|t| t.cycle_config.is_some());
+        assert!(ready_task.is_some(), "The task with cycle_config should be ready");
+        assert_eq!(ready_task.unwrap().id, "a", "Task 'a' (with cycle_config) should be ready");
     }
 }
