@@ -15,7 +15,7 @@ use chrono::Utc;
 use std::path::Path;
 
 use workgraph::config::Config;
-use workgraph::graph::{Node, Status, Task, WorkGraph};
+use workgraph::graph::{Node, Priority, Status, Task, WorkGraph};
 
 /// Tags that mark tasks as part of the evaluation/assignment infrastructure.
 /// Tasks with these tags do not get their own eval tasks (no meta-evaluation).
@@ -44,6 +44,42 @@ pub fn is_pipeline_eligible_system_task(task_id: &str) -> bool {
         .any(|prefix| task_id.starts_with(prefix))
 }
 
+/// Calculate the automatic priority for a scaffolded task based on its parent.
+///
+/// Rules:
+/// - .assign-* tasks: inherit parent priority (they gate the parent)
+/// - .evaluate-* and .flip-* tasks: parent priority minus one level
+/// - Defaults to Normal if parent priority cannot be determined
+fn calculate_auto_priority(graph: &WorkGraph, parent_task_id: &str, scaffolding_type: &str) -> Priority {
+    let parent_task = match graph.get_task(parent_task_id) {
+        Some(task) => task,
+        None => return Priority::Normal, // Default fallback
+    };
+
+    let parent_priority = parent_task.priority;
+
+    match scaffolding_type {
+        "assign" => {
+            // .assign-* tasks inherit parent priority (they gate the parent)
+            parent_priority
+        }
+        "evaluate" | "flip" => {
+            // .evaluate-* and .flip-* tasks get parent priority minus one level
+            match parent_priority {
+                Priority::Critical => Priority::High,
+                Priority::High => Priority::Normal,
+                Priority::Normal => Priority::Low,
+                Priority::Low => Priority::Idle,
+                Priority::Idle => Priority::Idle, // Can't go lower than Idle
+            }
+        }
+        _ => {
+            // Unknown scaffolding type, default to Normal
+            Priority::Normal
+        }
+    }
+}
+
 /// Returns true if FLIP should run for a given task, based on global config
 /// and the task's `flip-eval` tag.
 fn should_run_flip(graph: &WorkGraph, task_id: &str, config: &Config) -> bool {
@@ -68,6 +104,9 @@ pub fn scaffold_flip_task(graph: &mut WorkGraph, task_id: &str, config: &Config)
 
     let flip_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
 
+    // Calculate auto-priority for flip task
+    let priority = calculate_auto_priority(graph, task_id, "flip");
+
     let flip_task = Task {
         id: flip_task_id.clone(),
         title: format!("FLIP: {}", task_id),
@@ -76,6 +115,7 @@ pub fn scaffold_flip_task(graph: &mut WorkGraph, task_id: &str, config: &Config)
             task_id,
         )),
         status: Status::Open,
+        priority,
         after: vec![task_id.to_string()],
         tags: vec!["flip".to_string(), "agency".to_string()],
         exec: Some(format!("wg evaluate run {} --flip", task_id)),
@@ -327,10 +367,14 @@ pub fn scaffold_assign_task(graph: &mut WorkGraph, task_id: &str, task_title: &s
         return false;
     }
 
+    // Calculate auto-priority for assign task
+    let priority = calculate_auto_priority(graph, task_id, "assign");
+
     let assign_task = Task {
         id: assign_task_id.clone(),
         title: format!("Assign agent for: {}", task_title),
         status: Status::Open,
+        priority,
         after: vec![],
         before: vec![task_id.to_string()],
         tags: vec!["assignment".to_string(), "agency".to_string()],
@@ -440,11 +484,15 @@ pub fn scaffold_eval_task(
 
     let eval_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
 
+    // Calculate auto-priority for eval task
+    let priority = calculate_auto_priority(graph, task_id, "evaluate");
+
     let eval_task = Task {
         id: eval_task_id.clone(),
         title: format!("Evaluate: {}", task_title),
         description: Some(desc),
         status: Status::Open,
+        priority,
         after: eval_after,
         tags: vec!["evaluation".to_string(), "agency".to_string()],
         exec: Some(format!("wg evaluate run {}", task_id)),
