@@ -1,0 +1,12 @@
+[routing]
+default = ["telegram"]
+urgent = ["telegram"]
+approval = ["telegram"]
+
+[escalation]
+approval_timeout = 1800
+urgent_timeout = 3600
+
+[telegram]
+bot_token = "NEW_TOKEN_PLACEHOLDER"
+chat_id = "107103998"
