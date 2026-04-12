@@ -108,7 +108,7 @@ pub struct NightlyArgs {
     pub mode: CleanupMode,
 }
 
-#[derive(clap::ValueEnum, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub enum CleanupMode {
     Conservative,
     Aggressive,
@@ -554,18 +554,40 @@ fn fix_directory_permissions_and_retry(dir_path: &Path) -> Result<()> {
 fn run_nightly_cleanup(args: NightlyArgs) -> Result<()> {
     println!("Nightly cleanup requested (mode: {:?})", args.mode);
 
+    let project_root = std::env::current_dir().context("Failed to get current directory")?;
+
+    // Load workgraph for task cleanup
+    let (graph, _graph_path) = load_workgraph(&project_root)?;
+
+    // Initialize cleanup summary
+    let mut summary = CleanupSummary::new();
+
     if !args.execute {
-        println!("Dry-run mode - nightly cleanup would run here");
-    } else {
-        println!("Nightly cleanup would execute here");
+        println!("Dry-run mode - showing what would be cleaned:");
     }
 
-    // TODO: Implement full nightly cleanup functionality
-    // For now, just return success to allow compilation
+    // Task cleanup (unless skipped)
+    if !args.skip_tasks {
+        cleanup_tasks(&graph, &args, &mut summary)?;
+    }
+
+    // File system cleanup (unless skipped)
+    if !args.skip_files {
+        cleanup_filesystem(&project_root, &args, &mut summary)?;
+    }
+
+    // Git cleanup (always run unless conservative mode and not execute)
+    if args.mode == CleanupMode::Aggressive || args.execute {
+        cleanup_git(&project_root, &args, &mut summary)?;
+    }
+
+    // Print summary of operations
+    print_cleanup_summary(&summary);
 
     Ok(())
 }
 
+#[allow(dead_code)]
 #[derive(Default)]
 struct CleanupSummary {
     tasks_analyzed: usize,
@@ -578,6 +600,7 @@ struct CleanupSummary {
 }
 
 impl CleanupSummary {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self::default()
     }
