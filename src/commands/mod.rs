@@ -77,7 +77,7 @@ pub mod profile_cmd;
 pub mod quickstart;
 pub mod ready;
 pub mod reclaim;
-pub mod reprioritize;
+// pub mod reprioritize;  // TODO: Module file missing
 pub mod reject;
 pub mod replay;
 pub mod requeue;
