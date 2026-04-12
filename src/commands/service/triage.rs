@@ -173,7 +173,10 @@ fn detect_dead_reason(
         return Some(DeadReason::PidReused);
     }
 
-    // Check for heartbeat timeout
+    // Check for heartbeat timeout, but first check stream activity as a positive
+    // liveness signal. If the agent's stream has recent events, it's actively working
+    // even if the registry heartbeat is stale (e.g., wrapper heartbeat loop hasn't
+    // kicked in yet).
     if let Ok(last_hb) = agent
         .last_heartbeat
         .parse::<chrono::DateTime<chrono::Utc>>()
@@ -181,6 +184,21 @@ fn detect_dead_reason(
         let now = chrono::Utc::now();
         let since_heartbeat = (now - last_hb).num_seconds();
         if since_heartbeat > heartbeat_timeout_secs {
+            // Before declaring timeout, check stream file for recent activity.
+            // If the stream has events newer than the last heartbeat AND those
+            // events are within the timeout window, the agent is actively working.
+            // We require events to be newer than the heartbeat to avoid Init
+            // bookend events (written once at spawn) from indefinitely extending
+            // the timeout window.
+            if let Some(last_event_ms) = check_stream_liveness(agent) {
+                let hb_ms = last_hb.timestamp_millis();
+                let now_ms = now.timestamp_millis();
+                let since_event_secs = (now_ms - last_event_ms) / 1000;
+                if last_event_ms > hb_ms && since_event_secs <= heartbeat_timeout_secs {
+                    // Stream has activity newer than last heartbeat — agent is alive
+                    return None;
+                }
+            }
             return Some(DeadReason::HeartbeatTimeout);
         }
     }

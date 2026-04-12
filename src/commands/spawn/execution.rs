@@ -1161,9 +1161,20 @@ unset CLAUDE_CODE_ENTRYPOINT
 {timeout_note}
 {debug_env_vars}
 {stream_init}
+# Background heartbeat loop — keeps registry heartbeat fresh while agent runs.
+# Without this, agents running longer than heartbeat_timeout get reaped as dead.
+(while kill -0 $$ 2>/dev/null; do
+    sleep 120
+    wg heartbeat "$WG_AGENT_ID" 2>/dev/null || true
+done) &
+HEARTBEAT_PID=$!
+
 # Run the agent command
 {run_command}
 EXIT_CODE=$?
+
+# Stop the heartbeat loop
+kill $HEARTBEAT_PID 2>/dev/null; wait $HEARTBEAT_PID 2>/dev/null
 {stream_result}
 
 # Check if task is still in progress (agent didn't mark it done/failed)
