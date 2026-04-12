@@ -1392,8 +1392,13 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         KeyCode::Char(d @ '0'..='9') => {
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
-                app.right_panel_visible = true;
-                app.right_panel_tab = tab;
+                // Special behavior for '2' key (Log tab): toggle view mode if already active
+                if d == '2' && app.right_panel_visible && app.right_panel_tab == RightPanelTab::Log {
+                    app.toggle_log_view();
+                } else {
+                    app.right_panel_visible = true;
+                    app.right_panel_tab = tab;
+                }
             }
         }
 
@@ -1602,7 +1607,12 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
                 KeyCode::Char(d @ '0'..='9') => {
                     let idx = (d as u8 - b'0') as usize;
                     if let Some(tab) = RightPanelTab::from_index(idx) {
-                        app.right_panel_tab = tab;
+                        // Special behavior for '2' key (Log tab): toggle view mode if already active
+                        if d == '2' && app.right_panel_tab == RightPanelTab::Log {
+                            app.toggle_log_view();
+                        } else {
+                            app.right_panel_tab = tab;
+                        }
                     }
                 }
                 _ => handle_files_key(app, code),
@@ -1672,7 +1682,12 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.nav_stack.clear();
             let idx = (d as u8 - b'0') as usize;
             if let Some(tab) = RightPanelTab::from_index(idx) {
-                app.right_panel_tab = tab;
+                // Special behavior for '2' key (Log tab): toggle view mode if already active
+                if d == '2' && app.right_panel_tab == RightPanelTab::Log {
+                    app.toggle_log_view();
+                } else {
+                    app.right_panel_tab = tab;
+                }
             }
         }
 
@@ -2660,7 +2675,12 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 app.focused_panel = FocusedPanel::RightPanel;
                 let col_in_tabs = column.saturating_sub(app.last_tab_bar_area.x);
                 if let Some(tab) = tab_at_column(col_in_tabs) {
-                    app.right_panel_tab = tab;
+                    // Special behavior for Log tab: toggle view mode if already active
+                    if tab == RightPanelTab::Log && app.right_panel_tab == RightPanelTab::Log {
+                        app.toggle_log_view();
+                    } else {
+                        app.right_panel_tab = tab;
+                    }
                 }
             } else if in_divider {
                 // Click on divider between graph and inspector: start resize drag.

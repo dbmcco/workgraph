@@ -2244,7 +2244,7 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         .selected_task_id()
         .and_then(|id| app.task_message_statuses.get(id))
         .cloned();
-    draw_tab_bar(frame, app.right_panel_tab, tab_area, msg_status);
+    draw_tab_bar(frame, app, app.right_panel_tab, tab_area, msg_status);
 
     // Apply slide animation offset to the content area.
     let content_area = if let Some(ref anim) = app.slide_animation {
@@ -2321,6 +2321,7 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 /// `msg_status` colors the Messages tab icon to reflect TUI read state.
 fn draw_tab_bar(
     frame: &mut Frame,
+    app: &VizApp,
     active: RightPanelTab,
     area: Rect,
     msg_status: Option<workgraph::messages::CoordinatorMessageStatus>,
@@ -2339,6 +2340,13 @@ fn draw_tab_bar(
                     ),
                 ]);
             }
+
+            // Special handling for Log tab: add visual indicator
+            if *t == RightPanelTab::Log {
+                let indicator = if app.log_pane.view_top { "▲" } else { "▼" };
+                return Line::from(format!("{}:{} {}", t.index(), t.label(), indicator));
+            }
+
             Line::from(format!("{}:{}", t.index(), t.label()))
         })
         .collect();

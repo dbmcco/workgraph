@@ -2385,6 +2385,9 @@ pub struct LogPaneState {
     pub auto_tail: bool,
     /// Whether to show raw JSON format (toggled by `J`).
     pub json_mode: bool,
+    /// Whether to view the top (true) or bottom (false) of the log.
+    /// Top view shows structured summaries/events, bottom view shows latest activity.
+    pub view_top: bool,
     /// Cached rendered log lines for the currently selected task.
     pub rendered_lines: Vec<String>,
     /// Task ID these lines were rendered for (to detect staleness).
@@ -2410,6 +2413,7 @@ impl Default for LogPaneState {
             scroll: 0,
             auto_tail: true,
             json_mode: false,
+            view_top: false, // Default to bottom view (latest activity)
             rendered_lines: Vec::new(),
             task_id: None,
             viewport_height: 0,
@@ -7463,6 +7467,11 @@ impl VizApp {
         self.log_pane.scroll = self.log_pane.scroll.saturating_sub(amount);
         // User scrolled up — disable auto-tail.
         self.log_pane.auto_tail = false;
+
+        // Smart default switch: if scrolled all the way to top, switch to top view
+        if self.log_pane.scroll == 0 && !self.log_pane.view_top {
+            self.log_pane.view_top = true;
+        }
     }
 
     /// Scroll log pane down.
@@ -7476,6 +7485,11 @@ impl VizApp {
         if self.log_pane.scroll >= max_scroll {
             self.log_pane.auto_tail = true;
             self.log_pane.has_new_content = false;
+
+            // Smart default switch: if scrolled all the way to bottom, switch to bottom view
+            if self.log_pane.view_top {
+                self.log_pane.view_top = false;
+            }
         }
     }
 
@@ -7500,6 +7514,19 @@ impl VizApp {
     pub fn toggle_log_json(&mut self) {
         self.log_pane.json_mode = !self.log_pane.json_mode;
         self.invalidate_log_pane();
+    }
+
+    /// Toggle log pane top/bottom view mode.
+    pub fn toggle_log_view(&mut self) {
+        self.log_pane.view_top = !self.log_pane.view_top;
+
+        // When switching to top view, scroll to the top and disable auto-tail
+        if self.log_pane.view_top {
+            self.log_scroll_to_top();
+        } else {
+            // When switching to bottom view, scroll to bottom and enable auto-tail
+            self.log_scroll_to_bottom();
+        }
     }
 
     // ── Coordinator log (panel 7) ──
