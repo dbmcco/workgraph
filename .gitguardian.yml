@@ -1,2 +1,27 @@
-instance: https://dashboard.gitguardian.com
+# GitGuardian configuration for secret detection
 version: 2
+
+# Paths to ignore during scanning
+secret:
+  ignored_paths:
+    - ".workgraph/"
+    - "target/"
+    - "*.pdf"
+    - "test-workgraph/"
+    - ".git/"
+    - "screencast/"
+
+  # Specific secrets to ignore (use with caution)
+  ignored_matches:
+    # Example for test patterns
+    - name: "Test API Keys"
+      match: "test_api_key_[a-zA-Z0-9]+"
+    # Test email addresses in test files
+    - name: "Test Email Addresses"
+      match: "test@example\\.com"
+
+  # Show secrets context in output (false for security)
+  show_secrets: false
+
+# Exit with code 1 if secrets are found
+exit_zero: false
