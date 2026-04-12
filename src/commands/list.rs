@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::Path;
-use workgraph::graph::Status;
+use workgraph::graph::{Priority, Status};
 
 pub fn run(
     dir: &Path,
@@ -41,6 +41,7 @@ pub fn run(
                     "id": t.id,
                     "title": t.title,
                     "status": t.status,
+                    "priority": t.priority,
                     "assigned": t.assigned,
                     "after": t.after,
                 });
@@ -84,16 +85,21 @@ pub fn run(
             };
             let not_before_str = format_not_before_hint(task.not_before.as_deref());
             let delay_str = format_ready_after_hint(task.ready_after.as_deref());
+            let priority_str = match task.priority {
+                Priority::Normal => String::new(),
+                priority => format!(" \x1b[35m[{}]\x1b[0m", priority),
+            };
             let tag_str = if task.tags.is_empty() {
                 String::new()
             } else {
                 format!(" [{}]", task.tags.join(", "))
             };
             println!(
-                "{} {} - {}{}{}{}{}{}",
+                "{} {} - {}{}{}{}{}{}{}",
                 status,
                 task.id,
                 task.title,
+                priority_str,
                 pause_str,
                 verify_str,
                 not_before_str,

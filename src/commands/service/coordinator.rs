@@ -17,7 +17,7 @@ use workgraph::agency::{
 use workgraph::chat;
 use workgraph::config::Config;
 use workgraph::graph::{
-    LogEntry, Node, Status, Task, WaitCondition, WaitSpec, evaluate_all_cycle_failure_restarts,
+    LogEntry, Node, Priority, Status, Task, WaitCondition, WaitSpec, evaluate_all_cycle_failure_restarts,
     evaluate_all_cycle_iterations,
 };
 use workgraph::messages;
@@ -1444,6 +1444,7 @@ fn build_auto_assign_tasks(
                     title: format!("Create agents: poor match for '{}'", source_id),
                     description: Some(desc),
                     status: Status::Open,
+                    priority: Priority::default(),
                     assigned: None,
                     estimate: None,
                     before: vec![],
@@ -1821,6 +1822,7 @@ fn build_flip_verification_tasks(
             title: format!("Verify (FLIP {:.2}): {}", eval.score, source_title),
             description: Some(desc),
             status: Status::Open,
+            priority: Priority::default(),
             assigned: None,
             estimate: None,
             before: vec![],
@@ -2077,6 +2079,7 @@ fn build_separate_verify_tasks(
             title: format!("Verify: {}", source_title),
             description: Some(desc),
             status: Status::Open,
+            priority: Priority::default(),
             assigned: None,
             estimate: None,
             before: vec![],
@@ -2263,6 +2266,7 @@ fn build_auto_evolve_task(
         title: format!("Auto-evolve: {}", trigger_reason),
         description: Some(desc),
         status: Status::Open,
+        priority: Priority::default(),
         assigned: None,
         estimate: None,
         before: vec![],
@@ -2452,6 +2456,7 @@ fn build_auto_create_task(
         title: format!("Auto-create: {} tasks since last creation", since_last),
         description: Some(desc),
         status: Status::Open,
+        priority: Priority::default(),
         assigned: None,
         estimate: None,
         before: vec![],

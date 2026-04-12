@@ -193,6 +193,30 @@ impl Status {
     }
 }
 
+/// Task priority levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Priority {
+    Critical,
+    High,
+    #[default]
+    Normal,
+    Low,
+    Idle,
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Priority::Critical => write!(f, "critical"),
+            Priority::High => write!(f, "high"),
+            Priority::Normal => write!(f, "normal"),
+            Priority::Low => write!(f, "low"),
+            Priority::Idle => write!(f, "idle"),
+        }
+    }
+}
+
 /// A task node.
 ///
 /// A task in the workgraph with dependencies, status, and execution metadata.
@@ -209,6 +233,9 @@ pub struct Task {
     pub description: Option<String>,
     #[serde(default)]
     pub status: Status,
+    /// Task priority level (critical, high, normal, low, idle)
+    #[serde(default)]
+    pub priority: Priority,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -859,6 +886,8 @@ struct TaskHelper {
     #[serde(default)]
     status: Status,
     #[serde(default)]
+    priority: Option<Priority>,
+    #[serde(default)]
     assigned: Option<String>,
     #[serde(default)]
     estimate: Option<Estimate>,
@@ -1000,6 +1029,7 @@ impl<'de> Deserialize<'de> for Task {
             title: helper.title,
             description: helper.description,
             status: helper.status,
+            priority: helper.priority.unwrap_or_default(),
             assigned: helper.assigned,
             estimate: helper.estimate,
             before: helper.before,
@@ -3006,5 +3036,63 @@ mod tests {
         assert!(analysis.task_to_cycle.get(".assign-task-b").is_none());
         assert!(analysis.task_to_cycle.get(".assign-task-c").is_none());
         assert!(analysis.task_to_cycle.get(".flip-task-a").is_none());
+    }
+
+    #[test]
+    fn test_priority() {
+        // Test Priority enum default values
+        assert_eq!(Priority::default(), Priority::Normal);
+
+        // Test Priority ordering (PartialOrd implementation)
+        assert!(Priority::Critical < Priority::High);
+        assert!(Priority::High < Priority::Normal);
+        assert!(Priority::Normal < Priority::Low);
+        assert!(Priority::Low < Priority::Idle);
+
+        // Test Priority display
+        assert_eq!(format!("{}", Priority::Critical), "critical");
+        assert_eq!(format!("{}", Priority::High), "high");
+        assert_eq!(format!("{}", Priority::Normal), "normal");
+        assert_eq!(format!("{}", Priority::Low), "low");
+        assert_eq!(format!("{}", Priority::Idle), "idle");
+
+        // Test Task with priority field
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Test Task".to_string(),
+            priority: Priority::High,
+            ..Task::default()
+        };
+        assert_eq!(task.priority, Priority::High);
+
+        // Test Task default priority is Normal
+        let default_task = Task::default();
+        assert_eq!(default_task.priority, Priority::Normal);
+
+        // Test serialization/deserialization compatibility
+        use serde_json;
+
+        // Test serialization
+        let json_str = serde_json::to_string(&Priority::Critical).unwrap();
+        assert_eq!(json_str, "\"critical\"");
+
+        // Test deserialization
+        let priority: Priority = serde_json::from_str("\"high\"").unwrap();
+        assert_eq!(priority, Priority::High);
+
+        // Test backward compatibility - missing priority field should default to Normal
+        let json_without_priority = r#"{"id": "test", "title": "Test", "status": "open"}"#;
+
+        // This should deserialize successfully with default priority
+        #[derive(serde::Deserialize)]
+        struct TestTask {
+            id: String,
+            title: String,
+            #[serde(default)]
+            priority: Priority,
+        }
+
+        let parsed: TestTask = serde_json::from_str(json_without_priority).unwrap();
+        assert_eq!(parsed.priority, Priority::Normal);
     }
 }

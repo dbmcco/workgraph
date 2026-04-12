@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
-use workgraph::graph::{CycleConfig, Estimate, Node, Status, Task, parse_delay};
+use workgraph::graph::{CycleConfig, Estimate, Node, Priority, Status, Task, parse_delay};
 use workgraph::parser::modify_graph;
 
 use super::graph_path;
@@ -397,6 +397,7 @@ pub fn run(
         title: title.to_string(),
         description: description.map(String::from),
         status: Status::Open,
+        priority: Priority::default(),
         assigned: assign.map(String::from),
         estimate: estimate.clone(),
         before: vec![],
@@ -735,6 +736,7 @@ fn add_task_directly(
             title: title.to_string(),
             description: description.map(String::from),
             status: Status::Open,
+            priority: Priority::default(),
             assigned: None,
             estimate: None,
             before: vec![],

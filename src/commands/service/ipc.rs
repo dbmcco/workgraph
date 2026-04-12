@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::os::unix::net::UnixStream;
 
 use workgraph::config::Config;
-use workgraph::graph::{Node, Status, Task};
+use workgraph::graph::{Node, Priority, Status, Task};
 use workgraph::parser::{load_graph, modify_graph};
 use workgraph::service::registry::AgentRegistry;
 
@@ -965,6 +965,7 @@ fn handle_add_task(
         title: title.to_string(),
         description: description.map(String::from),
         status: Status::Open,
+        priority: Priority::default(),
         assigned: None,
         estimate: None,
         before: vec![],

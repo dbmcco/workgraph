@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use workgraph::agency;
-use workgraph::graph::{Node, Status, Task};
+use workgraph::graph::{Node, Priority, Status, Task};
 use workgraph::modify_graph;
 
 use super::operations::apply_operation;
@@ -92,6 +92,7 @@ pub(crate) fn defer_self_mutation(
         ),
         description: Some(desc),
         status: Status::Open,
+        priority: Priority::default(),
         assigned: None,
         estimate: None,
         before: vec![],
