@@ -1081,6 +1081,13 @@ fn write_wrapper_script(
         String::new()
     };
 
+    // Pass debug environment variables to spawned subprocesses
+    let debug_env_vars = if std::env::var("WG_DEBUG_PROMPTS").is_ok() {
+        "export WG_DEBUG_PROMPTS=1\n".to_string()
+    } else {
+        String::new()
+    };
+
     let stream_file = output_dir.join("stream.jsonl");
     let stream_file_str = stream_file.to_string_lossy().to_string();
 
@@ -1150,6 +1157,7 @@ OUTPUT_FILE={escaped_output_file}
 unset CLAUDECODE
 unset CLAUDE_CODE_ENTRYPOINT
 {timeout_note}
+{debug_env_vars}
 {stream_init}
 # Run the agent command
 {run_command}
@@ -1234,6 +1242,7 @@ exit $EXIT_CODE
         escaped_output_file = shell_escape(output_file_str),
         run_command = run_command,
         timeout_note = timeout_note,
+        debug_env_vars = debug_env_vars,
         stream_init = stream_init,
         stream_result = stream_result,
         complete_cmd = complete_cmd,
