@@ -291,7 +291,7 @@ fn simulate_uncommitted_work(worktree_path: &Path) -> Result<(), String> {
 }
 
 #[test]
-fn test_recovery_branch_creation() {
+fn test_recovery_verification_branch_creation() {
     // Test basic recovery branch creation when agent dies with committed work
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
@@ -330,7 +330,7 @@ fn test_recovery_branch_creation() {
 }
 
 #[test]
-fn test_recovery_branch_naming_pattern() {
+fn test_recovery_verification_naming_pattern() {
     // Test that recovery branch naming follows expected patterns for various agent/task combinations
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
@@ -376,7 +376,7 @@ fn test_recovery_branch_naming_pattern() {
 }
 
 #[test]
-fn test_recovery_commit_content_preservation() {
+fn test_recovery_verification_content_preservation() {
     // Test that recovery branches preserve complete commit content and metadata
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
@@ -426,7 +426,7 @@ fn test_recovery_commit_content_preservation() {
 }
 
 #[test]
-fn test_multiple_recovery_branches_per_agent() {
+fn test_recovery_verification_multiple_branches() {
     // Test that an agent can have multiple recovery branches from different tasks
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
@@ -491,7 +491,7 @@ fn test_multiple_recovery_branches_per_agent() {
 }
 
 #[test]
-fn test_recovery_with_uncommitted_changes_scenario() {
+fn test_recovery_verification_uncommitted_scenario() {
     // Test that recovery branches are created for committed work even when uncommitted changes exist
     // (Note: Uncommitted changes are expected to be lost, but committed work should be preserved)
     let temp = TempDir::new().unwrap();
@@ -539,7 +539,7 @@ fn test_recovery_with_uncommitted_changes_scenario() {
 }
 
 #[test]
-fn test_no_recovery_branch_for_no_commits() {
+fn test_recovery_verification_no_commits() {
     // Test that no recovery branch is created when an agent has no commits
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
@@ -565,7 +565,7 @@ fn test_no_recovery_branch_for_no_commits() {
 }
 
 #[test]
-fn test_recovery_branch_cleanup_integration() {
+fn test_recovery_verification_cleanup_integration() {
     // Test that recovery branch creation works correctly with worktree cleanup
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("project");
