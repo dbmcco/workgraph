@@ -1512,9 +1512,11 @@ fn try_dispatch_notifications(dir: &Path, logger: &DaemonLogger) {
 /// Mark legacy daemon-managed graph tasks as abandoned.
 ///
 /// Older coordinator implementations represented daemon control flow as
-/// graph tasks (`.archive-*`, `.registry-refresh-*`, `.coordinator-*`,
-/// `.user-*`). The current coordinator keeps that control plane out of
-/// the graph so `wg service start` does not pollute a bare repo.
+/// graph tasks (`.archive-*`, `.registry-refresh-*`, `.user-*`). These
+/// are abandoned to keep the control plane out of the graph.
+///
+/// Coordinator tasks (`.coordinator-*`) are preserved because the TUI
+/// depends on them for coordinator discovery and tab restoration.
 ///
 /// Note: `.compact-*` tasks are no longer managed here — compaction is
 /// now handled natively via the journal/compactor without graph control.
@@ -1526,9 +1528,8 @@ fn cleanup_legacy_daemon_tasks(dir: &Path, logger: &DaemonLogger) {
 
     let mut stale_ids = Vec::new();
     for task in graph.tasks() {
-        let is_legacy = task.id == ".coordinator"
-            || task.id.starts_with(".coordinator-")
-            || task.id.starts_with(".archive-")
+        // Don't abandon coordinator tasks - TUI depends on them for coordinator discovery
+        let is_legacy = task.id.starts_with(".archive-")
             || task.id.starts_with(".registry-refresh-")
             || task.id.starts_with(".user-");
         if is_legacy && task.status != workgraph::graph::Status::Abandoned {
@@ -3801,7 +3802,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_legacy_daemon_tasks_abandons_open_legacy_tasks() {
+    fn test_cleanup_legacy_daemon_tasks_preserves_coordinator_tasks() {
         use workgraph::graph::{Node, Status, Task};
 
         let temp_dir = TempDir::new().unwrap();
@@ -3842,8 +3843,11 @@ mod tests {
         cleanup_legacy_daemon_tasks(dir, &logger);
 
         let graph = load_graph(&gp).unwrap();
+        // Coordinator tasks should NOT be abandoned (TUI needs them for discovery)
+        assert_eq!(graph.get_task(".coordinator-0").unwrap().status, Status::Open);
+
+        // Other legacy tasks should still be abandoned
         for id in [
-            ".coordinator-0",
             ".archive-0",
             ".registry-refresh-0",
             ".user-erik-0",
