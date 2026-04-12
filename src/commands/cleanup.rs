@@ -608,6 +608,7 @@ impl CleanupSummary {
 
 
 /// Clean up old and abandoned tasks
+#[allow(dead_code)]
 fn cleanup_tasks(graph: &WorkGraph, args: &NightlyArgs, summary: &mut CleanupSummary) -> Result<()> {
     println!("Scanning tasks for cleanup opportunities...");
 
