@@ -407,6 +407,7 @@ fn test_eval_prompt_includes_verify_findings() {
             "[2025-01-01] (agent-v): Tests pass\n[2025-01-01] (agent-v): Artifacts verified",
         ),
         resolved_outcome_name: None,
+        child_tasks: &[],
     };
 
     let prompt = render_evaluator_prompt(&input);
@@ -471,6 +472,7 @@ fn test_eval_prompt_no_verify_section_when_absent() {
         verify_status: None,
         verify_findings: None,
         resolved_outcome_name: None,
+        child_tasks: &[],
     };
 
     let prompt = render_evaluator_prompt(&input);

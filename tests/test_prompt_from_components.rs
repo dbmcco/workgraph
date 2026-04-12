@@ -343,6 +343,7 @@ fn evaluator_prompt_no_hardcoded_text_when_agent_configured() {
         verify_status: None,
         verify_findings: None,
         resolved_outcome_name: None,
+        child_tasks: &[],
     };
     let full_prompt = render_evaluator_prompt(&input);
 
@@ -383,6 +384,7 @@ fn evaluator_prompt_falls_back_to_hardcoded_when_no_agent() {
         verify_status: None,
         verify_findings: None,
         resolved_outcome_name: None,
+        child_tasks: &[],
     };
     let prompt = render_evaluator_prompt(&input);
 
