@@ -2440,6 +2440,49 @@ pub struct CoordinatorConfig {
     /// Default: empty (manual resume only).
     #[serde(default)]
     pub provider_failure_cooldown: String,
+
+    /// Resource management configuration for worktree cleanup and recovery.
+    #[serde(default)]
+    pub resource_management: ResourceManagementConfig,
+}
+
+/// Resource management configuration for cleanup operations and recovery branches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceManagementConfig {
+    /// Enable cleanup verification to ensure worktrees are actually removed.
+    /// When true, cleanup operations verify that worktree directories are
+    /// fully removed and report any remaining artifacts. Default: true.
+    #[serde(default = "default_cleanup_verification")]
+    pub cleanup_verification: bool,
+
+    /// Maximum age in seconds for recovery branches before they are pruned.
+    /// Recovery branches older than this will be automatically deleted.
+    /// Set to 0 to disable age-based pruning. Default: 7 days (604800 seconds).
+    #[serde(default = "default_recovery_branch_max_age")]
+    pub recovery_branch_max_age: u64,
+
+    /// Maximum number of recovery branches to keep per agent.
+    /// When this limit is exceeded, oldest recovery branches are pruned first.
+    /// Set to 0 to disable count-based pruning. Default: 10.
+    #[serde(default = "default_recovery_branch_max_count")]
+    pub recovery_branch_max_count: u32,
+
+    /// Enable cleanup job queuing for high-frequency cleanup scenarios.
+    /// When true, cleanup operations are queued and processed sequentially
+    /// to prevent resource contention during burst cleanup periods. Default: true.
+    #[serde(default = "default_cleanup_job_queue")]
+    pub cleanup_job_queue: bool,
+
+    /// Maximum number of cleanup jobs to queue before blocking.
+    /// When the queue is full, new cleanup requests will block until
+    /// space becomes available. Default: 50.
+    #[serde(default = "default_cleanup_queue_size")]
+    pub cleanup_queue_size: usize,
+
+    /// Interval in seconds between recovery branch pruning cycles.
+    /// Set to 0 to disable automatic pruning. Default: 3600 (1 hour).
+    #[serde(default = "default_recovery_prune_interval")]
+    pub recovery_prune_interval: u64,
 }
 
 fn default_auto_test_discovery() -> bool {
@@ -2580,6 +2623,45 @@ impl CoordinatorConfig {
     }
 }
 
+// Default functions for ResourceManagementConfig
+
+fn default_cleanup_verification() -> bool {
+    true
+}
+
+fn default_recovery_branch_max_age() -> u64 {
+    604800 // 7 days in seconds
+}
+
+fn default_recovery_branch_max_count() -> u32 {
+    10
+}
+
+fn default_cleanup_job_queue() -> bool {
+    true
+}
+
+fn default_cleanup_queue_size() -> usize {
+    50
+}
+
+fn default_recovery_prune_interval() -> u64 {
+    3600 // 1 hour in seconds
+}
+
+impl Default for ResourceManagementConfig {
+    fn default() -> Self {
+        Self {
+            cleanup_verification: default_cleanup_verification(),
+            recovery_branch_max_age: default_recovery_branch_max_age(),
+            recovery_branch_max_count: default_recovery_branch_max_count(),
+            cleanup_job_queue: default_cleanup_job_queue(),
+            cleanup_queue_size: default_cleanup_queue_size(),
+            recovery_prune_interval: default_recovery_prune_interval(),
+        }
+    }
+}
+
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
@@ -2617,6 +2699,7 @@ impl Default for CoordinatorConfig {
             max_concurrent_verifies: default_max_concurrent_verifies(),
             verify_triage_enabled: default_verify_triage_enabled(),
             verify_progress_timeout: default_verify_progress_timeout(),
+            resource_management: ResourceManagementConfig::default(),
         }
     }
 }
