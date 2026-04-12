@@ -2719,6 +2719,35 @@ wg stats
 # Displays agent time counters, task throughput, and resource usage
 ```
 
+### `wg metrics`
+
+Display detailed cleanup and monitoring metrics for troubleshooting and observability.
+
+```bash
+wg metrics [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output metrics as JSON for machine consumption |
+
+Shows detailed statistics including:
+- Cleanup operation success/failure rates
+- Recovery branch management metrics
+- Dead agent cleanup statistics
+- Timing statistics for cleanup operations
+- Resource recovery statistics
+
+**Examples:**
+```bash
+# Show metrics in human-readable format
+wg metrics
+
+# Output metrics as JSON
+wg metrics --json
+```
+
 ---
 
 ## Communication Commands
@@ -3161,6 +3190,61 @@ Creates `.workgraph/` directory with `graph.jsonl`.
 ```bash
 cd my-project && wg init
 # Creates .workgraph/ directory ready for task management
+```
+
+### `wg cleanup`
+
+Manual cleanup commands for edge case recovery. Provides commands to manually clean up orphaned worktrees, recovery branches, and other edge cases that may not be handled by automatic cleanup operations.
+
+```bash
+wg cleanup <SUBCOMMAND>
+```
+
+#### `wg cleanup orphaned`
+
+Clean up orphaned worktrees that have no corresponding agent metadata.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--execute` | Actually perform the cleanup (dry-run by default) |
+| `--force` | Force cleanup even if errors occur |
+| `--dir <PATH>` | Directory to search for orphaned worktrees (defaults to current directory) |
+
+**Examples:**
+```bash
+# Dry-run to see what would be cleaned up
+wg cleanup orphaned
+
+# Actually perform the cleanup
+wg cleanup orphaned --execute
+
+# Force cleanup even if some operations fail
+wg cleanup orphaned --execute --force
+```
+
+#### `wg cleanup recovery-branches`
+
+Clean up old recovery branches based on age.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--max-age-days <N>` | Maximum age of recovery branches to keep (default: 30) |
+| `--execute` | Actually perform the cleanup (dry-run by default) |
+| `--force` | Force cleanup even if errors occur |
+| `--dir <PATH>` | Directory containing git repository (defaults to current directory) |
+
+**Examples:**
+```bash
+# See what recovery branches older than 30 days exist
+wg cleanup recovery-branches
+
+# Clean up recovery branches older than 7 days
+wg cleanup recovery-branches --max-age-days 7 --execute
+
+# Force cleanup of old branches even if some deletions fail
+wg cleanup recovery-branches --execute --force
 ```
 
 ---
