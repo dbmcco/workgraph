@@ -614,7 +614,7 @@ fn test_large_scale_orphaned_cleanup() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Integration tests for orphaned cleanup functionality
 
     /// Integration test verifying all orphaned cleanup scenarios pass
     #[test]

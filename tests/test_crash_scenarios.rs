@@ -906,7 +906,7 @@ fn test_crash_scenarios_infrastructure() {
 
     // Verify we can check task status
     let status_output = wg_cmd(&wg_dir, &["show", "test", "--json"]);
-    assert!(output.status.success(), "Should be able to query task status");
+    assert!(status_output.status.success(), "Should be able to query task status");
 
     // This confirms that the crash scenario test infrastructure is working
     // and the individual crash scenario tests can be run when needed
