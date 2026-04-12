@@ -622,19 +622,19 @@ pub(crate) fn classify_model_tier(model: &str) -> KnowledgeTier {
 fn is_telegram_configured(workgraph_dir: &Path) -> bool {
     // Try project-local config first
     let project_config_path = workgraph_dir.join("notify.toml");
-    if let Ok(config) = NotifyConfig::load_from(&project_config_path) {
-        if TelegramConfig::from_notify_config(&config).is_ok() {
-            return true;
-        }
+    if let Ok(config) = NotifyConfig::load_from(&project_config_path)
+        && TelegramConfig::from_notify_config(&config).is_ok()
+    {
+        return true;
     }
 
     // Try global config
     if let Some(global_config_path) = dirs::config_dir() {
         let global_config_path = global_config_path.join("workgraph").join("notify.toml");
-        if let Ok(config) = NotifyConfig::load_from(&global_config_path) {
-            if TelegramConfig::from_notify_config(&config).is_ok() {
-                return true;
-            }
+        if let Ok(config) = NotifyConfig::load_from(&global_config_path)
+            && TelegramConfig::from_notify_config(&config).is_ok()
+        {
+            return true;
         }
     }
 
@@ -649,12 +649,11 @@ pub(crate) fn build_tiered_guide(
 ) -> String {
     // Check for custom override first
     let custom_path = workgraph_dir.join("wg-guide.md");
-    if custom_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&custom_path) {
-            if !content.trim().is_empty() {
-                return content;
-            }
-        }
+    if custom_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&custom_path)
+        && !content.trim().is_empty()
+    {
+        return content;
     }
 
     match tier {

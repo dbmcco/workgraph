@@ -10924,13 +10924,15 @@ impl VizApp {
                     if result.messages.is_empty() {
                         ChatState::default()
                     } else {
-                        let mut state = ChatState::default();
-                        state.has_more_history = result.has_more;
-                        state.total_history_count = result.total_count;
-                        state.skipped_history_count =
-                            result.total_count.saturating_sub(result.messages.len());
-                        state.messages = result.messages;
-                        state
+                        ChatState {
+                            has_more_history: result.has_more,
+                            total_history_count: result.total_count,
+                            skipped_history_count: result
+                                .total_count
+                                .saturating_sub(result.messages.len()),
+                            messages: result.messages,
+                            ..Default::default()
+                        }
                     }
                 })
         };

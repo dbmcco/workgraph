@@ -5,6 +5,14 @@ use std::path::Path;
 use workgraph::agency::{self, Evaluation, Role, TradeoffConfig};
 use workgraph::parser::load_graph;
 
+#[derive(Clone)]
+#[allow(dead_code)]
+struct OutputConfig {
+    min_evals: u32,
+    by_model: bool,
+    by_task_type: bool,
+}
+
 /// A (role_id, tradeoff_id) pair used as a key in the synergy matrix.
 type Pair = (String, String);
 
@@ -446,6 +454,7 @@ fn find_underexplored(
 // Text output
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn output_text(
     roles: &[Role],
     tradeoffs: &[TradeoffConfig],
@@ -733,6 +742,7 @@ fn output_text(
 // JSON output
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn output_json(
     roles: &[Role],
     tradeoffs: &[TradeoffConfig],

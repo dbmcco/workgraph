@@ -2989,28 +2989,28 @@ fn sort_tasks_by_priority_with_features<'a>(
             let mut effective_priority = task.priority;
 
             // Starvation prevention: bump priority for old tasks
-            if let Some(ref created_at_str) = task.created_at {
-                if let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(created_at_str) {
-                    let age = now.signed_duration_since(created_at.with_timezone(&Utc));
-                    let age_hours = age.num_hours();
+            if let Some(ref created_at_str) = task.created_at
+                && let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(created_at_str)
+            {
+                let age = now.signed_duration_since(created_at.with_timezone(&Utc));
+                let age_hours = age.num_hours();
 
-                    if age_hours > starvation_threshold_hours {
-                        // Bump priority by one level for every 24 hours of waiting
-                        let bumps = (age_hours / starvation_threshold_hours) as usize;
-                        for _ in 0..bumps {
-                            effective_priority = match effective_priority {
-                                Priority::Idle => Priority::Low,
-                                Priority::Low => Priority::Normal,
-                                Priority::Normal => Priority::High,
-                                Priority::High => Priority::Critical,
-                                Priority::Critical => Priority::Critical, // Can't go higher
-                            };
-                        }
-                        eprintln!(
-                            "[coordinator] Priority bump: {} (age: {}h) -> {}",
-                            task.id, age_hours, effective_priority
-                        );
+                if age_hours > starvation_threshold_hours {
+                    // Bump priority by one level for every 24 hours of waiting
+                    let bumps = (age_hours / starvation_threshold_hours) as usize;
+                    for _ in 0..bumps {
+                        effective_priority = match effective_priority {
+                            Priority::Idle => Priority::Low,
+                            Priority::Low => Priority::Normal,
+                            Priority::Normal => Priority::High,
+                            Priority::High => Priority::Critical,
+                            Priority::Critical => Priority::Critical, // Can't go higher
+                        };
                     }
+                    eprintln!(
+                        "[coordinator] Priority bump: {} (age: {}h) -> {}",
+                        task.id, age_hours, effective_priority
+                    );
                 }
             }
 

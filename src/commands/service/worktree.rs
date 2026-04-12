@@ -81,10 +81,8 @@ fn calculate_directory_size(dir: &Path) -> Result<u64> {
 
             if path.is_dir() {
                 visit_dir(&path, total_size)?;
-            } else {
-                if let Ok(metadata) = entry.metadata() {
-                    *total_size += metadata.len();
-                }
+            } else if let Ok(metadata) = entry.metadata() {
+                *total_size += metadata.len();
             }
         }
         Ok(())
@@ -282,12 +280,11 @@ pub fn verify_worktree_cleanup(
         let worktree_str = worktree_path.to_string_lossy();
 
         for line in text.lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                if path == worktree_str.as_ref() {
-                    verification_errors
-                        .push(format!("Stale worktree entry found in git: {}", path));
-                    break;
-                }
+            if let Some(path) = line.strip_prefix("worktree ")
+                && path == worktree_str.as_ref()
+            {
+                verification_errors.push(format!("Stale worktree entry found in git: {}", path));
+                break;
             }
         }
     }
@@ -624,18 +621,18 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
 
                 // Remove .workgraph symlink
                 let symlink_path = wt_path.join(".workgraph");
-                if symlink_path.exists() {
-                    if let Err(e) = fs::remove_file(&symlink_path) {
-                        cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
-                    }
+                if symlink_path.exists()
+                    && let Err(e) = fs::remove_file(&symlink_path)
+                {
+                    cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
                 }
 
                 // Remove isolated cargo target directory
                 let target_dir = wt_path.join("target");
-                if target_dir.exists() {
-                    if let Err(e) = fs::remove_dir_all(&target_dir) {
-                        cleanup_errors.push(format!("Failed to remove target directory: {}", e));
-                    }
+                if target_dir.exists()
+                    && let Err(e) = fs::remove_dir_all(&target_dir)
+                {
+                    cleanup_errors.push(format!("Failed to remove target directory: {}", e));
                 }
 
                 // Try git worktree remove
@@ -762,17 +759,17 @@ pub fn prune_stale_worktrees(dir: &Path, max_age_secs: u64) -> Result<usize> {
                 let mut cleanup_errors = Vec::new();
 
                 let symlink_path = wt_path.join(".workgraph");
-                if symlink_path.exists() {
-                    if let Err(e) = fs::remove_file(&symlink_path) {
-                        cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
-                    }
+                if symlink_path.exists()
+                    && let Err(e) = fs::remove_file(&symlink_path)
+                {
+                    cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
                 }
 
                 let target_dir = wt_path.join("target");
-                if target_dir.exists() {
-                    if let Err(e) = fs::remove_dir_all(&target_dir) {
-                        cleanup_errors.push(format!("Failed to remove target directory: {}", e));
-                    }
+                if target_dir.exists()
+                    && let Err(e) = fs::remove_dir_all(&target_dir)
+                {
+                    cleanup_errors.push(format!("Failed to remove target directory: {}", e));
                 }
 
                 let output = Command::new("git")
@@ -846,10 +843,10 @@ fn get_recovery_branches(project_root: &Path) -> Result<Vec<(String, u64)>> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let branch = parts[0];
-            if let Some(branch_name) = branch.strip_prefix("origin/recover/") {
-                if let Ok(timestamp) = parts[1].parse::<u64>() {
-                    recovery_branches.push((format!("recover/{}", branch_name), timestamp));
-                }
+            if let Some(branch_name) = branch.strip_prefix("origin/recover/")
+                && let Ok(timestamp) = parts[1].parse::<u64>()
+            {
+                recovery_branches.push((format!("recover/{}", branch_name), timestamp));
             }
         }
     }
@@ -875,12 +872,12 @@ fn get_recovery_branches(project_root: &Path) -> Result<Vec<(String, u64)>> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 let branch = parts[0];
-                if branch.starts_with("recover/") {
-                    if let Ok(timestamp) = parts[1].parse::<u64>() {
-                        // Avoid duplicates - only add if not already present
-                        if !recovery_branches.iter().any(|(b, _)| b == branch) {
-                            recovery_branches.push((branch.to_string(), timestamp));
-                        }
+                if branch.starts_with("recover/")
+                    && let Ok(timestamp) = parts[1].parse::<u64>()
+                {
+                    // Avoid duplicates - only add if not already present
+                    if !recovery_branches.iter().any(|(b, _)| b == branch) {
+                        recovery_branches.push((branch.to_string(), timestamp));
                     }
                 }
             }
@@ -992,17 +989,17 @@ fn delete_recovery_branch(project_root: &Path, branch: &str) -> Result<()> {
         .current_dir(project_root)
         .output();
 
-    if let Ok(output) = output {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Only log as warning for actual errors, not "branch not found"
-            if !stderr.contains("not found") && !stderr.contains("does not exist") {
-                eprintln!(
-                    "[recovery] Warning: Failed to delete remote recovery branch {}: {}",
-                    branch,
-                    stderr.trim()
-                );
-            }
+    if let Ok(output) = output
+        && !output.status.success()
+    {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Only log as warning for actual errors, not "branch not found"
+        if !stderr.contains("not found") && !stderr.contains("does not exist") {
+            eprintln!(
+                "[recovery] Warning: Failed to delete remote recovery branch {}: {}",
+                branch,
+                stderr.trim()
+            );
         }
     }
 

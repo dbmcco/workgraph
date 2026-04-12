@@ -47,6 +47,7 @@ fn detect_asciinema() -> bool {
 /// sequences incompatible with asciinema recording/playback.
 ///
 /// `trace_path`: when `Some`, record all input events to the given JSONL file.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     workgraph_dir: PathBuf,
     viz_options: VizOptions,

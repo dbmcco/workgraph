@@ -1812,9 +1812,9 @@ fn draw_history_browser(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
         // Content lines
         let end = (scroll + viewport_h).min(total);
-        for i in scroll..end {
+        for line in content_lines.iter().take(end).skip(scroll) {
             lines.push(Line::from(Span::styled(
-                format!("  {}", content_lines[i]),
+                format!("  {}", line),
                 Style::default().fg(Color::Rgb(200, 200, 200)),
             )));
         }
@@ -2204,9 +2204,7 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .selected_task_idx
                 .and_then(|idx| app.task_order.get(idx))
                 .is_some_and(|id| workgraph::graph::is_user_board(id));
-        let border_color = if divider_active {
-            Color::Yellow
-        } else if is_user_board_active {
+        let border_color = if divider_active || is_user_board_active {
             Color::Yellow
         } else if is_chat_tab && app.chat.coordinator_active {
             Color::Cyan

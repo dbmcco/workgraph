@@ -1182,10 +1182,10 @@ fn find_next_fresh_coordinator_id(graph: &workgraph::graph::WorkGraph, dir: &Pat
 
     // Scan all existing coordinator tasks
     for task in graph.tasks() {
-        if task.id.starts_with(".coordinator-") {
-            if let Ok(id) = task.id[13..].parse::<u32>() {
-                max_id = Some(max_id.map_or(id, |current_max| current_max.max(id)));
-            }
+        if task.id.starts_with(".coordinator-")
+            && let Ok(id) = task.id[13..].parse::<u32>()
+        {
+            max_id = Some(max_id.map_or(id, |current_max| current_max.max(id)));
         }
     }
 

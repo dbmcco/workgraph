@@ -160,12 +160,11 @@ fn run_orphaned_cleanup(args: OrphanedArgs) -> Result<()> {
 
                 // Check if agent has valid metadata
                 let metadata_path = entry.path().join("metadata.json");
-                if metadata_path.exists() {
-                    if let Ok(metadata_content) = fs::read_to_string(&metadata_path) {
-                        if serde_json::from_str::<serde_json::Value>(&metadata_content).is_ok() {
-                            active_agents.insert(agent_id);
-                        }
-                    }
+                if metadata_path.exists()
+                    && let Ok(metadata_content) = fs::read_to_string(&metadata_path)
+                    && serde_json::from_str::<serde_json::Value>(&metadata_content).is_ok()
+                {
+                    active_agents.insert(agent_id);
                 }
             }
         }
@@ -307,24 +306,24 @@ fn run_recovery_branches_cleanup(args: RecoveryBranchesArgs) -> Result<()> {
             .current_dir(&project_root)
             .output();
 
-        if let Ok(output) = output {
-            if output.status.success() {
-                let timestamp_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if let Ok(timestamp) = timestamp_str.parse::<i64>() {
-                    let age_seconds = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                        - timestamp;
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let timestamp_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
+                let age_seconds = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+                    - timestamp;
 
-                    if age_seconds > max_age_seconds {
-                        let age_days = age_seconds / (24 * 3600);
-                        old_branches.push((branch.to_string(), age_days));
-                        println!(
-                            "Found old recovery branch: {} (age: {} days)",
-                            branch, age_days
-                        );
-                    }
+                if age_seconds > max_age_seconds {
+                    let age_days = age_seconds / (24 * 3600);
+                    old_branches.push((branch.to_string(), age_days));
+                    println!(
+                        "Found old recovery branch: {} (age: {} days)",
+                        branch, age_days
+                    );
                 }
             }
         }

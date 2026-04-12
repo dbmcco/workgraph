@@ -133,8 +133,9 @@ pub fn run(
         let task_id_string = task_id.to_string();
         if let Some(&task_idx) = task_id_to_index.get(&task_id_string) {
             for dep in add_after {
-                if !current_after.contains(dep) {
-                    if let Some(&dep_idx) = task_id_to_index.get(dep) {
+                if !current_after.contains(dep)
+                    && let Some(&dep_idx) = task_id_to_index.get(dep)
+                {
                         match check_edge_addition(task_ids.len(), &adjacency_list, dep_idx, task_idx) {
                             EdgeAddResult::CreatesCycle { cycle_members } => {
                                 // Check if the cycle would have CycleConfig
@@ -168,7 +169,6 @@ pub fn run(
                             }
                         }
                     }
-                }
             }
         }
     }

@@ -26,17 +26,17 @@ fn resolve_verify_timeout(
     coordinator_config: &CoordinatorConfig,
 ) -> std::time::Duration {
     // 1. Task-specific timeout (highest priority)
-    if let Some(task_timeout) = &task.verify_timeout {
-        if let Some(secs) = parse_delay(task_timeout) {
-            return std::time::Duration::from_secs(secs);
-        }
+    if let Some(task_timeout) = &task.verify_timeout
+        && let Some(secs) = parse_delay(task_timeout)
+    {
+        return std::time::Duration::from_secs(secs);
     }
 
     // 2. Global environment variable
-    if let Ok(env_timeout) = std::env::var("WG_VERIFY_TIMEOUT") {
-        if let Ok(secs) = env_timeout.parse::<u64>() {
-            return std::time::Duration::from_secs(secs);
-        }
+    if let Ok(env_timeout) = std::env::var("WG_VERIFY_TIMEOUT")
+        && let Ok(secs) = env_timeout.parse::<u64>()
+    {
+        return std::time::Duration::from_secs(secs);
     }
 
     // 3. Coordinator configuration default
@@ -267,10 +267,10 @@ fn map_files_to_tests(modified_files: &[String]) -> Option<Vec<String>> {
         }
 
         // Map source files to test modules
-        if let Some(test_cmd) = map_file_to_test_command(file) {
-            if !test_commands.contains(&test_cmd) {
-                test_commands.push(test_cmd);
-            }
+        if let Some(test_cmd) = map_file_to_test_command(file)
+            && !test_commands.contains(&test_cmd)
+        {
+            test_commands.push(test_cmd);
         }
     }
 
@@ -321,7 +321,7 @@ fn map_file_to_test_command(file: &str) -> Option<String> {
             };
 
             // Extract the final component for testing
-            let test_module = module_name.split('/').last().unwrap_or(module_name);
+            let test_module = module_name.split('/').next_back().unwrap_or(module_name);
 
             return Some(format!("cargo test {}", test_module));
         }

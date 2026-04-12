@@ -546,7 +546,7 @@ fn track_provider_health(
     let mut provider_health = ProviderHealth::load(dir)?;
 
     // Load graph to get task failure information
-    let graph = load_graph(&super::super::graph_path(dir))?;
+    let graph = load_graph(super::super::graph_path(dir))?;
 
     // Track failures for each dead agent
     for (agent_id, task_id, _pid, output_file, _reason) in dead {
@@ -650,10 +650,10 @@ fn extract_error_info(failure_reason: &Option<String>, output_file: &str) -> (Op
     // Try to parse exit code from failure reason
     if let Some(reason) = failure_reason {
         // Pattern: "Agent exited with code 124"
-        if let Some(code_str) = reason.strip_prefix("Agent exited with code ") {
-            if let Ok(code) = code_str.trim().parse::<i32>() {
-                exit_code = Some(code);
-            }
+        if let Some(code_str) = reason.strip_prefix("Agent exited with code ")
+            && let Ok(code) = code_str.trim().parse::<i32>()
+        {
+            exit_code = Some(code);
         }
         stderr = reason.clone();
     }
@@ -1138,18 +1138,18 @@ fn attempt_fallback_worktree_cleanup(project_root: &Path, agent_id: &str) -> Res
 
                 // Remove .workgraph symlink
                 let symlink_path = wt_path.join(".workgraph");
-                if symlink_path.exists() {
-                    if let Err(e) = fs::remove_file(&symlink_path) {
-                        cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
-                    }
+                if symlink_path.exists()
+                    && let Err(e) = fs::remove_file(&symlink_path)
+                {
+                    cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
                 }
 
                 // Remove target directory
                 let target_dir = wt_path.join("target");
-                if target_dir.exists() {
-                    if let Err(e) = fs::remove_dir_all(&target_dir) {
-                        cleanup_errors.push(format!("Failed to remove target directory: {}", e));
-                    }
+                if target_dir.exists()
+                    && let Err(e) = fs::remove_dir_all(&target_dir)
+                {
+                    cleanup_errors.push(format!("Failed to remove target directory: {}", e));
                 }
 
                 // Remove the worktree directory itself
