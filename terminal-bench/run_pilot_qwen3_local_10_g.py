@@ -177,28 +177,22 @@ def cleanup_tmp_paths(paths: list[str]) -> None:
 def _parse_task_ids_from_wg_list(output: str) -> list[str]:
     """Extract task IDs from `wg list` output, skipping internal tasks.
 
-    Output format is: [x] task-id - title [tags]
-    or: [ ] task-id - title [tags]
-    Lines like "No tasks found" are skipped (no checkbox prefix).
+    Output format uses status markers: [x] done, [ ] open, [~] in-progress,
+    [!] blocked/failed, etc.  Pattern: [<marker>] task-id - title [tags]
+    Lines like "No tasks found" are skipped.
     """
+    import re
+    # Match any single-char bracket marker: [x], [ ], [~], [!], etc.
+    marker_re = re.compile(r'^\[.\]\s+(\S+)')
     task_ids = []
     for line in output.strip().splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        # Only parse lines with checkbox prefix [x] or [ ]
-        if not stripped.startswith("["):
+        m = marker_re.match(stripped)
+        if not m:
             continue
-        parts = stripped.split()
-        if len(parts) < 3:
-            continue
-        # Format: [x] task-id ... or [ ] task-id ...
-        if parts[0] == "[x]":
-            task_id = parts[1]
-        elif parts[0] == "[" and len(parts) >= 3 and parts[1] == "]":
-            task_id = parts[2]
-        else:
-            continue
+        task_id = m.group(1)
         # Skip header/border lines
         if task_id.startswith("─") or task_id == "ID":
             continue
@@ -213,7 +207,7 @@ async def poll_graph_quiescence(
     wg_dir: str,
     timeout_secs: float,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
-    min_wait_secs: float = 30.0,
+    min_wait_secs: float = 60.0,
 ) -> tuple[str, float]:
     """Poll until all non-internal tasks reach terminal status.
 
@@ -225,30 +219,49 @@ async def poll_graph_quiescence(
     passed, giving the service time to dispatch the first agent.
     """
     start = time.monotonic()
-    saw_active = False  # Track if we ever saw an active task
+    consecutive_quiet = 0  # consecutive polls with no active tasks
 
     while True:
         elapsed = time.monotonic() - start
         if elapsed > timeout_secs:
             return "timeout", elapsed
 
+        # Don't check for quiescence until min_wait_secs elapsed
+        # (gives the service time to dispatch the first agent)
+        if elapsed < min_wait_secs:
+            await asyncio.sleep(poll_interval)
+            continue
+
         # Check for any active (non-terminal) non-internal tasks
         has_active = False
+        active_detail = []
         for check_status in ("open", "in-progress", "blocked"):
             result = await exec_wg(wg_dir, ["list", "--status", check_status])
             if "[exit code:" in result:
+                active_detail.append(f"{check_status}: [error] {result[:200]}")
                 continue
             active_ids = _parse_task_ids_from_wg_list(result)
             if active_ids:
                 has_active = True
-                saw_active = True
+                active_detail.append(f"{check_status}: {active_ids}")
                 break
+            else:
+                # Log raw output for debugging when no tasks parsed
+                raw = result.strip()[:200] if result.strip() else "(empty)"
+                active_detail.append(f"{check_status}: (none) raw={raw}")
 
-        if not has_active:
-            # Don't declare quiescence until we've waited at least min_wait_secs
-            # (gives the service time to dispatch the first agent) AND we've seen
-            # at least one active task before (prevents instant false completion).
-            if elapsed < min_wait_secs or not saw_active:
+        if has_active:
+            consecutive_quiet = 0
+            if int(elapsed) % 60 < poll_interval:  # log ~once per minute
+                print(f"    [poll] {elapsed:.0f}s active: {active_detail}",
+                      flush=True)
+        else:
+            consecutive_quiet += 1
+            # Require 3 consecutive quiet polls to prevent race conditions
+            # (e.g., task transitions between status checks)
+            if consecutive_quiet < 3:
+                print(f"    [poll] {elapsed:.0f}s quiet #{consecutive_quiet}/3, "
+                      f"detail: {active_detail}", flush=True)
                 await asyncio.sleep(poll_interval)
                 continue
 
@@ -257,7 +270,11 @@ async def poll_graph_quiescence(
             if "[exit code:" not in done_result:
                 done_ids = _parse_task_ids_from_wg_list(done_result)
                 if done_ids:
+                    print(f"    [poll] {elapsed:.0f}s quiescent — "
+                          f"{len(done_ids)} done tasks", flush=True)
                     return "done", elapsed
+            print(f"    [poll] {elapsed:.0f}s quiescent — no done tasks "
+                  f"(returning failed)", flush=True)
             return "failed", elapsed
 
         await asyncio.sleep(poll_interval)
