@@ -351,8 +351,28 @@ impl OpenAiClient {
     }
 
     /// Override context window size in tokens.
+    ///
+    /// When the window is small enough that `max_tokens` would consume more than
+    /// half the window (leaving too little room for input), `max_tokens` is
+    /// automatically capped to `context_window / 4`. This prevents servers like
+    /// SGLang from rejecting requests with HTTP 400 because
+    /// `input_tokens + max_tokens > context_window`.
     pub fn with_context_window(mut self, tokens: usize) -> Self {
         self.context_window_tokens = tokens;
+        // Cap max_tokens so it doesn't crowd out input.  SGLang (and other
+        // OpenAI-compatible servers) enforce input + max_tokens ≤ context_window
+        // *before* inference.  With the default 16 384 max_tokens and a 32 k
+        // window, any input above ~16 k triggers a 400.  Capping at window/4
+        // leaves 75 % of the window for input while still allowing generous
+        // output (8 192 tokens for a 32 k window, 32 768 for 128 k).
+        let cap = (tokens / 4) as u32;
+        if cap > 0 && self.max_tokens > cap {
+            eprintln!(
+                "[openai-client] Capping max_tokens from {} to {} (context_window={})",
+                self.max_tokens, cap, tokens
+            );
+            self.max_tokens = cap;
+        }
         self
     }
 
@@ -788,7 +808,12 @@ impl OpenAiClient {
             match self.streaming_attempt(&url, &oai_request).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    if retry_count < max_retries {
+                    // Don't retry deterministic client errors (400, 401, 403, 404, etc.)
+                    // — only retry transient/network errors.
+                    let is_client_error = e
+                        .downcast_ref::<ApiError>()
+                        .is_some_and(|ae| ae.status >= 400 && ae.status < 500 && !is_retryable(ae.status));
+                    if !is_client_error && retry_count < max_retries {
                         retry_count += 1;
                         let wait = jittered_backoff(backoff_ms);
                         eprintln!(
@@ -1180,7 +1205,12 @@ impl OpenAiClient {
             {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    if retry_count < max_retries {
+                    // Don't retry deterministic client errors (400, 401, 403, 404, etc.)
+                    // — only retry transient/network errors.
+                    let is_client_error = e
+                        .downcast_ref::<ApiError>()
+                        .is_some_and(|ae| ae.status >= 400 && ae.status < 500 && !is_retryable(ae.status));
+                    if !is_client_error && retry_count < max_retries {
                         retry_count += 1;
                         let wait = jittered_backoff(backoff_ms);
                         eprintln!(
@@ -4621,5 +4651,45 @@ Done."#;
         assert!(result.resolved.is_none());
         // Should have suggestions
         assert!(!result.suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_with_context_window_caps_max_tokens() {
+        // Default max_tokens is 16384.  A 32k window should cap it to 32768/4 = 8192.
+        let client = OpenAiClient::new("key".into(), "model", None)
+            .unwrap()
+            .with_context_window(32768);
+        assert_eq!(client.max_tokens, 8192);
+        assert_eq!(client.context_window_tokens, 32768);
+    }
+
+    #[test]
+    fn test_with_context_window_no_cap_for_large_window() {
+        // A 128k window → cap = 32768, which is larger than default 16384 → no cap.
+        let client = OpenAiClient::new("key".into(), "model", None)
+            .unwrap()
+            .with_context_window(128_000);
+        assert_eq!(client.max_tokens, DEFAULT_MAX_TOKENS); // unchanged
+        assert_eq!(client.context_window_tokens, 128_000);
+    }
+
+    #[test]
+    fn test_with_context_window_explicit_max_tokens_then_window() {
+        // Explicit max_tokens=4096 then a 32k window → cap = 8192, but 4096 < 8192 → no change.
+        let client = OpenAiClient::new("key".into(), "model", None)
+            .unwrap()
+            .with_max_tokens(4096)
+            .with_context_window(32768);
+        assert_eq!(client.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_with_context_window_explicit_max_tokens_capped() {
+        // Explicit max_tokens=20000 then a 32k window → cap = 8192, 20000 > 8192 → capped.
+        let client = OpenAiClient::new("key".into(), "model", None)
+            .unwrap()
+            .with_max_tokens(20000)
+            .with_context_window(32768);
+        assert_eq!(client.max_tokens, 8192);
     }
 }
