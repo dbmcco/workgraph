@@ -833,7 +833,7 @@ fn build_inner_command(
             cmd_parts.push("stream-json".to_string());
             cmd_parts.push("--dangerously-skip-permissions".to_string());
             cmd_parts.push("--disallowedTools".to_string());
-            cmd_parts.push(shell_escape("Agent"));
+            cmd_parts.push(shell_escape("Agent,EnterWorktree,ExitWorktree"));
             cmd_parts.push("--disable-slash-commands".to_string());
             if let Some(m) = effective_model {
                 cmd_parts.push("--model".to_string());
@@ -905,7 +905,7 @@ fn build_inner_command(
             cmd_parts.push("--allowedTools".to_string());
             cmd_parts.push(shell_escape("Bash(wg:*),Read,Glob,Grep,WebFetch,WebSearch"));
             cmd_parts.push("--disallowedTools".to_string());
-            cmd_parts.push(shell_escape("Edit,Write,NotebookEdit,Agent"));
+            cmd_parts.push(shell_escape("Edit,Write,NotebookEdit,Agent,EnterWorktree,ExitWorktree"));
 
             cmd_parts.push("--disable-slash-commands".to_string());
             // Add model flag if specified
@@ -934,7 +934,7 @@ fn build_inner_command(
             }
             // Prevent agents from spawning sub-agents outside workgraph
             cmd_parts.push("--disallowedTools".to_string());
-            cmd_parts.push(shell_escape("Agent"));
+            cmd_parts.push(shell_escape("Agent,EnterWorktree,ExitWorktree"));
 
             cmd_parts.push("--disable-slash-commands".to_string());
             // Add model flag if specified
