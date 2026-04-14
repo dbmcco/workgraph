@@ -5,13 +5,17 @@
 //! is NOT persisted to the journal — it appears once, informs the current
 //! turn, then vanishes.
 //!
-//! Three injection sources:
+//! Four injection sources:
 //! 1. **Pending messages**: `wg msg` messages from other agents/coordinator/humans
 //! 2. **Graph state changes**: Dependency completions, new tasks, blocker changes
-//! 3. **Context pressure**: Warnings when approaching context limits
+//! 3. **Background job completions**: Completed bg jobs since last check
+//! 4. **Context pressure**: Warnings when approaching context limits
 
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use crate::executor::native::background::{Job, JobStatus};
 use crate::graph::Status;
 use crate::messages;
 use crate::parser;
@@ -80,6 +84,8 @@ pub struct StateInjector {
     agent_id: String,
     /// Last-seen dependency snapshot (for detecting changes).
     last_dep_snapshot: Option<DependencySnapshot>,
+    /// Set of background job IDs whose completions have already been reported.
+    reported_bg_jobs: HashSet<String>,
 }
 
 impl StateInjector {
@@ -94,6 +100,7 @@ impl StateInjector {
             task_id,
             agent_id,
             last_dep_snapshot: initial_snapshot,
+            reported_bg_jobs: HashSet::new(),
         }
     }
 
@@ -117,12 +124,17 @@ impl StateInjector {
             sections.push(graph_section);
         }
 
-        // 3. Context pressure warning
+        // 3. Background job completions
+        if let Some(bg_section) = self.collect_bg_completions() {
+            sections.push(bg_section);
+        }
+
+        // 4. Context pressure warning
         if let Some(warning) = context_pressure_warning {
             sections.push(format!("### Context Pressure\n{}", warning));
         }
 
-        // 4. Time budget awareness
+        // 5. Time budget awareness
         if let Some(time_section) = Self::collect_time_budget() {
             sections.push(time_section);
         }
@@ -221,6 +233,111 @@ impl StateInjector {
         Some(section)
     }
 
+    /// Check for completed background jobs that haven't been reported yet.
+    ///
+    /// Scans the jobs directory (`workgraph_dir/jobs/`) for `.json` job files,
+    /// identifies jobs in a terminal state that haven't been reported, and
+    /// formats a `<context-update>` block with job ID, exit code, duration,
+    /// and the last 20 lines of output.
+    fn collect_bg_completions(&mut self) -> Option<String> {
+        let jobs_dir = self.workgraph_dir.join("jobs");
+        if !jobs_dir.exists() {
+            return None;
+        }
+
+        let entries = std::fs::read_dir(&jobs_dir).ok()?;
+        let mut updates = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let job: Job = match serde_json::from_str(&content) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+
+            // Only report terminal jobs that haven't been reported yet
+            if !job.status.is_terminal() || self.reported_bg_jobs.contains(&job.id) {
+                continue;
+            }
+
+            // Mark as reported
+            self.reported_bg_jobs.insert(job.id.clone());
+
+            // Compute duration
+            let duration_str = if let Some(finished) = job.finished_at {
+                let dur = finished.signed_duration_since(job.created_at);
+                format!("{}s", dur.num_seconds())
+            } else {
+                "unknown".to_string()
+            };
+
+            // Read last 20 lines of output
+            let output_tail = Self::read_tail_lines(&job.log_path, 20);
+
+            let status_str = match job.status {
+                JobStatus::Completed => "completed",
+                JobStatus::Failed => "failed",
+                JobStatus::Cancelled => "cancelled",
+                JobStatus::Orphaned => "orphaned",
+                JobStatus::Running => unreachable!(),
+            };
+
+            let exit_code_str = match job.exit_code {
+                Some(code) => code.to_string(),
+                None => "unknown".to_string(),
+            };
+
+            let mut update = format!(
+                "<context-update source=\"bg-job\">\n\
+                 Job: {} ({})\n\
+                 Command: {}\n\
+                 Status: {}\n\
+                 Exit code: {}\n\
+                 Duration: {}",
+                job.id, job.name, job.command, status_str, exit_code_str, duration_str,
+            );
+
+            if !output_tail.is_empty() {
+                update.push_str(&format!("\nOutput (last 20 lines):\n```\n{}\n```", output_tail));
+            }
+
+            update.push_str("\n</context-update>");
+            updates.push(update);
+        }
+
+        if updates.is_empty() {
+            return None;
+        }
+
+        let mut section = "### Background Job Completions\n".to_string();
+        section.push_str(&updates.join("\n\n"));
+        Some(section)
+    }
+
+    /// Read the last N lines from a file, returning them as a single string.
+    fn read_tail_lines(path: &Path, n: usize) -> String {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return String::new(),
+        };
+        let reader = BufReader::new(file);
+        let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+        if all_lines.len() <= n {
+            all_lines.join("\n")
+        } else {
+            all_lines[all_lines.len() - n..].join("\n")
+        }
+    }
+
     /// Check for graph state changes (dependency status changes).
     fn collect_graph_changes(&mut self) -> Option<String> {
         let graph_path = self.workgraph_dir.join("graph.jsonl");
@@ -301,6 +418,60 @@ mod tests {
         content.push_str(&serde_json::to_string(&msg).unwrap());
         content.push('\n');
         fs::write(&msg_file, content).unwrap();
+    }
+
+    /// Create a completed background job JSON file in the jobs directory.
+    fn create_bg_job(
+        dir: &Path,
+        job_id: &str,
+        name: &str,
+        command: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        log_content: Option<&str>,
+    ) {
+        let jobs_dir = dir.join("jobs");
+        fs::create_dir_all(&jobs_dir).unwrap();
+
+        let log_path = jobs_dir.join(format!("{}.log", job_id));
+        if let Some(content) = log_content {
+            fs::write(&log_path, content).unwrap();
+        }
+
+        let finished_at = if status != "running" {
+            "\"2026-04-13T12:01:00Z\""
+        } else {
+            "null"
+        };
+        let exit_code_json = match exit_code {
+            Some(c) => c.to_string(),
+            None => "null".to_string(),
+        };
+
+        let job_json = format!(
+            r#"{{
+  "id": "{}",
+  "name": "{}",
+  "command": "{}",
+  "status": "{}",
+  "pid": 12345,
+  "exit_code": {},
+  "created_at": "2026-04-13T12:00:00Z",
+  "updated_at": "2026-04-13T12:01:00Z",
+  "finished_at": {},
+  "log_path": "{}",
+  "working_dir": "/tmp"
+}}"#,
+            job_id,
+            name,
+            command,
+            status,
+            exit_code_json,
+            finished_at,
+            log_path.display(),
+        );
+
+        fs::write(jobs_dir.join(format!("job-{}.json", job_id)), job_json).unwrap();
     }
 
     #[test]
@@ -638,6 +809,190 @@ mod tests {
         // Call a third time for good measure
         let r3 = injector.collect_injections(None);
         assert!(r3.is_none(), "Still no report when nothing changed");
+    }
+
+    // ── Background job completion tests ─────────────────────────────────────
+
+    #[test]
+    fn test_bg_no_completions_no_injection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        // No jobs directory at all → no injection
+        let result = injector.collect_injections(None);
+        assert!(result.is_none(), "No bg jobs dir → no injection");
+    }
+
+    #[test]
+    fn test_bg_no_completions_only_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        // Create a running (non-terminal) job
+        create_bg_job(wg_dir, "job-1", "build", "cargo build", "running", None, None);
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        let result = injector.collect_injections(None);
+        assert!(result.is_none(), "Running jobs should not be injected");
+    }
+
+    #[test]
+    fn test_bg_completion_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        let log_output = (1..=25)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        create_bg_job(
+            wg_dir,
+            "job-abc",
+            "test-run",
+            "cargo test",
+            "completed",
+            Some(0),
+            Some(&log_output),
+        );
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        let result = injector.collect_injections(None);
+        assert!(result.is_some(), "Completed job should produce injection");
+        let text = result.unwrap();
+        assert!(text.contains("Background Job Completions"));
+        assert!(text.contains("context-update"));
+        assert!(text.contains("job-abc"));
+        assert!(text.contains("test-run"));
+        assert!(text.contains("cargo test"));
+        assert!(text.contains("Exit code: 0"));
+        assert!(text.contains("completed"));
+        // Should contain only last 20 lines (lines 6-25)
+        assert!(text.contains("line 25"));
+        assert!(text.contains("line 6"));
+        assert!(!text.contains("line 5\n"), "line 5 should be trimmed (only last 20 lines)");
+    }
+
+    #[test]
+    fn test_bg_completion_not_re_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        create_bg_job(
+            wg_dir,
+            "job-xyz",
+            "build",
+            "cargo build",
+            "completed",
+            Some(0),
+            Some("all good\n"),
+        );
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        // First call: should report the completion
+        let r1 = injector.collect_injections(None);
+        assert!(r1.is_some(), "First call should report completion");
+        assert!(r1.unwrap().contains("job-xyz"));
+
+        // Second call: same job, already reported → no injection
+        let r2 = injector.collect_injections(None);
+        assert!(
+            r2.is_none(),
+            "Already-reported completion should not be re-injected"
+        );
+    }
+
+    #[test]
+    fn test_bg_failed_job_injected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        create_bg_job(
+            wg_dir,
+            "job-fail",
+            "broken-test",
+            "cargo test --broken",
+            "failed",
+            Some(1),
+            Some("test failed: assertion error\n"),
+        );
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        let result = injector.collect_injections(None);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("failed"));
+        assert!(text.contains("Exit code: 1"));
+        assert!(text.contains("assertion error"));
+    }
+
+    #[test]
+    fn test_bg_multiple_completions_one_already_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        create_bg_job(
+            wg_dir, "job-a", "first", "echo a", "completed", Some(0), Some("output a\n"),
+        );
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        // Report first job
+        let r1 = injector.collect_injections(None);
+        assert!(r1.is_some());
+        assert!(r1.unwrap().contains("job-a"));
+
+        // Now a second job completes
+        create_bg_job(
+            wg_dir, "job-b", "second", "echo b", "completed", Some(0), Some("output b\n"),
+        );
+
+        // Should only report the new one
+        let r2 = injector.collect_injections(None);
+        assert!(r2.is_some());
+        let text = r2.unwrap();
+        assert!(text.contains("job-b"), "New job should be reported");
+        assert!(!text.contains("job-a"), "Old job should not be re-reported");
+    }
+
+    #[test]
+    fn test_bg_completion_no_log_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path();
+        setup_workgraph(wg_dir, "my-task", &[]);
+
+        // Job with no log content (log file doesn't exist)
+        create_bg_job(
+            wg_dir, "job-nolog", "no-output", "true", "completed", Some(0), None,
+        );
+
+        let mut injector =
+            StateInjector::new(wg_dir.to_path_buf(), "my-task".into(), "agent-1".into());
+
+        let result = injector.collect_injections(None);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("job-nolog"));
+        assert!(text.contains("Exit code: 0"));
+        // No output section since log file doesn't exist
+        assert!(!text.contains("Output (last 20 lines)"));
     }
 
     #[test]
