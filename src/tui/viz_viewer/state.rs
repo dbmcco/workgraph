@@ -6266,25 +6266,78 @@ impl VizApp {
         lines.push(String::new());
 
         // ── Runtime ──
-        if registry_entry.is_some() || task.model.is_some() || task.session_id.is_some() {
-            lines.push("── Runtime ──".to_string());
-            if let Some(ref entry) = registry_entry {
-                lines.push(format!("  Executor: {}", entry.executor));
+        // For coordinator tasks, resolve model/executor from CoordinatorState
+        // (coordinators don't use the agent registry).
+        let (coord_executor, coord_model) = if task.id.starts_with(".coordinator-") {
+            use crate::commands::service::CoordinatorState;
+            let coord_id = task
+                .id
+                .strip_prefix(".coordinator-")
+                .and_then(|s| s.parse::<u32>().ok());
+            if let Some(cid) = coord_id {
+                let coord_state = CoordinatorState::load_for(&self.workgraph_dir, cid);
+                let config = Config::load_or_default(&self.workgraph_dir);
+                let executor = coord_state
+                    .as_ref()
+                    .and_then(|s| s.executor_override.clone())
+                    .or_else(|| Some(config.coordinator.effective_executor()));
+                let model = coord_state
+                    .as_ref()
+                    .and_then(|s| s.model_override.clone())
+                    .or_else(|| {
+                        coord_state
+                            .as_ref()
+                            .and_then(|s| s.model.clone())
+                    })
+                    .or_else(|| config.coordinator.model.clone())
+                    .or_else(|| {
+                        Some(
+                            config
+                                .resolve_model_for_role(workgraph::config::DispatchRole::Default)
+                                .model,
+                        )
+                    });
+                (executor, model)
+            } else {
+                (None, None)
             }
-            match (
-                task.model.as_deref(),
-                registry_entry.as_ref().and_then(|e| e.model.as_deref()),
-            ) {
-                (Some(cfg), Some(actual)) if cfg != actual => {
-                    lines.push(format!("  Model: {} (configured: {})", actual, cfg));
+        } else {
+            (None, None)
+        };
+
+        let is_coordinator = coord_executor.is_some() || coord_model.is_some();
+        if is_coordinator
+            || registry_entry.is_some()
+            || task.model.is_some()
+            || task.session_id.is_some()
+        {
+            lines.push("── Runtime ──".to_string());
+            if is_coordinator {
+                if let Some(ref executor) = coord_executor {
+                    lines.push(format!("  Executor: {}", executor));
                 }
-                (_, Some(actual)) => {
-                    lines.push(format!("  Model: {}", actual));
+                if let Some(ref model) = coord_model {
+                    lines.push(format!("  Model: {}", model));
                 }
-                (Some(cfg), None) => {
-                    lines.push(format!("  Model: {} (configured)", cfg));
+            } else {
+                if let Some(ref entry) = registry_entry {
+                    lines.push(format!("  Executor: {}", entry.executor));
                 }
-                (None, None) => {}
+                match (
+                    task.model.as_deref(),
+                    registry_entry.as_ref().and_then(|e| e.model.as_deref()),
+                ) {
+                    (Some(cfg), Some(actual)) if cfg != actual => {
+                        lines.push(format!("  Model: {} (configured: {})", actual, cfg));
+                    }
+                    (_, Some(actual)) => {
+                        lines.push(format!("  Model: {}", actual));
+                    }
+                    (Some(cfg), None) => {
+                        lines.push(format!("  Model: {} (configured)", cfg));
+                    }
+                    (None, None) => {}
+                }
             }
             if let Some(ref session_id) = task.session_id {
                 lines.push(format!("  Session: {}", session_id));

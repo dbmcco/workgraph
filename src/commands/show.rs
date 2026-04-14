@@ -6,8 +6,11 @@ use workgraph::graph::{
     CycleConfig, LogEntry, LoopGuard, Priority, Status, Task, TokenUsage, format_tokens,
     parse_token_usage_live,
 };
+use workgraph::config::Config;
 use workgraph::query::build_reverse_index;
 use workgraph::service::AgentRegistry;
+
+use super::service::CoordinatorState;
 
 /// Blocker info with status
 #[derive(Debug, Serialize)]
@@ -166,6 +169,47 @@ fn gather_task_runtime_info(
 
     let actual_executor = registry_entry.as_ref().map(|e| e.executor.clone());
     let actual_model = registry_entry.as_ref().and_then(|e| e.model.clone());
+
+    // For coordinator tasks, resolve model/executor from CoordinatorState
+    // (coordinators don't use the agent registry — their runtime info is in
+    // per-coordinator state files).
+    let (actual_executor, actual_model) = if task.id.starts_with(".coordinator-") {
+        let coord_id = task
+            .id
+            .strip_prefix(".coordinator-")
+            .and_then(|s| s.parse::<u32>().ok());
+        if let Some(cid) = coord_id {
+            let coord_state = CoordinatorState::load_for(dir, cid);
+            let config = Config::load_or_default(dir);
+            let coord_executor = coord_state
+                .as_ref()
+                .and_then(|s| s.executor_override.clone())
+                .or(actual_executor)
+                .or_else(|| Some(config.coordinator.effective_executor()));
+            let coord_model = coord_state
+                .as_ref()
+                .and_then(|s| s.model_override.clone())
+                .or(actual_model)
+                .or_else(|| {
+                    coord_state
+                        .as_ref()
+                        .and_then(|s| s.model.clone())
+                })
+                .or_else(|| config.coordinator.model.clone())
+                .or_else(|| {
+                    Some(
+                        config
+                            .resolve_model_for_role(workgraph::config::DispatchRole::Default)
+                            .model,
+                    )
+                });
+            (coord_executor, coord_model)
+        } else {
+            (actual_executor, actual_model)
+        }
+    } else {
+        (actual_executor, actual_model)
+    };
 
     let session_summary_path = task
         .assigned
