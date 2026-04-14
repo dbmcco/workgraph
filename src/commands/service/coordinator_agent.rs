@@ -1566,6 +1566,7 @@ fn native_coordinator_loop(
         ContentBlock, Message, MessagesRequest, MessagesResponse, Role, StopReason,
     };
     use workgraph::executor::native::provider::create_provider_ext;
+    use workgraph::executor::native::resume::{ContextBudget, ContextPressureAction};
     use workgraph::executor::native::tools::ToolRegistry;
     use workgraph::executor::native::tools::bash::register_bash_tool;
     use workgraph::models::ModelRegistry;
@@ -1658,6 +1659,17 @@ fn native_coordinator_loop(
             return;
         }
     };
+
+    // Build context budget from the provider's context window so compaction
+    // respects the model's actual limit (e.g. 32k for qwen3-coder-30b) instead
+    // of only the global compaction_token_threshold.
+    let context_budget = ContextBudget::with_window_size(client.context_window());
+    logger.info(&format!(
+        "Native coordinator: context budget window_size={}, compact_threshold={:.0}%, hard_limit={:.0}%",
+        context_budget.window_size,
+        context_budget.compact_threshold * 100.0,
+        context_budget.hard_limit * 100.0,
+    ));
 
     // Check tool support
     let model_registry = ModelRegistry::load(dir).unwrap_or_default();
@@ -1780,6 +1792,41 @@ fn native_coordinator_loop(
                     max_turns_per_message, request.request_id
                 ));
                 break;
+            }
+
+            // ── Context pressure check ──────────────────────────────
+            // Mirror the native agent loop: check estimated token usage
+            // against the model's context window and compact or warn
+            // before each API call so we never exceed the limit.
+            match context_budget.check_pressure(&conversation) {
+                ContextPressureAction::CleanExit => {
+                    // At 95%+ — aggressively compact and warn the model
+                    let pre = conversation.len();
+                    conversation = ContextBudget::emergency_compact(conversation, 4);
+                    logger.warn(&format!(
+                        "Native coordinator: context at hard limit — emergency compact {} → {} messages",
+                        pre,
+                        conversation.len()
+                    ));
+                }
+                ContextPressureAction::EmergencyCompaction => {
+                    let pre = conversation.len();
+                    conversation = ContextBudget::emergency_compact(conversation, 8);
+                    logger.info(&format!(
+                        "Native coordinator: context pressure — compact {} → {} messages",
+                        pre,
+                        conversation.len()
+                    ));
+                }
+                ContextPressureAction::Warning => {
+                    let tokens = context_budget.estimate_tokens(&conversation);
+                    let pct = (tokens as f64 / context_budget.window_size as f64) * 100.0;
+                    logger.info(&format!(
+                        "Native coordinator: context at {:.0}% ({}/{} est tokens)",
+                        pct, tokens, context_budget.window_size
+                    ));
+                }
+                ContextPressureAction::Ok => {}
             }
 
             let tool_defs = if supports_tools {
@@ -2057,11 +2104,27 @@ fn native_coordinator_loop(
 
         last_interaction = chrono::Utc::now().to_rfc3339();
 
-        // Trim conversation history to prevent unbounded growth.
-        // Keep the last 100 messages to maintain context while bounding memory.
-        if conversation.len() > 100 {
-            let drain_count = conversation.len() - 100;
-            conversation.drain(..drain_count);
+        // Budget-aware conversation trim: compact if we're above the warning
+        // threshold, otherwise apply a generous ceiling to prevent unbounded
+        // memory growth between user messages.
+        match context_budget.check_pressure(&conversation) {
+            ContextPressureAction::EmergencyCompaction | ContextPressureAction::CleanExit => {
+                let pre = conversation.len();
+                conversation = ContextBudget::emergency_compact(conversation, 6);
+                logger.info(&format!(
+                    "Native coordinator: post-turn compact {} → {} messages",
+                    pre,
+                    conversation.len()
+                ));
+            }
+            _ => {
+                // Hard ceiling at 200 messages (generous fallback for very large
+                // context windows where the budget never fires).
+                if conversation.len() > 200 {
+                    let drain_count = conversation.len() - 200;
+                    conversation.drain(..drain_count);
+                }
+            }
         }
     }
 }
