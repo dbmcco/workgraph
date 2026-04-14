@@ -57,8 +57,15 @@ pub fn run(
         .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    // Build the tool registry
-    let mut registry = ToolRegistry::default_all(workgraph_dir, &working_dir);
+    // Load config for native executor settings
+    let config = Config::load(workgraph_dir).unwrap_or_default();
+
+    // Build the tool registry with config
+    let mut registry = ToolRegistry::default_all_with_config(
+        workgraph_dir,
+        &working_dir,
+        &config.native_executor,
+    );
 
     // Resolve bundle and filter tools
     let system_suffix = if let Some(bundle) = resolve_bundle(exec_mode, workgraph_dir) {

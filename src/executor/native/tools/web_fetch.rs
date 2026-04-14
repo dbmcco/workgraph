@@ -10,18 +10,36 @@ use url::Url;
 use super::{Tool, ToolOutput, truncate_tool_output};
 use crate::executor::native::client::ToolDefinition;
 
-/// Maximum content length before truncation (chars).
-const MAX_CONTENT_CHARS: usize = 16_000;
+/// Default maximum content length before truncation (chars).
+const DEFAULT_MAX_CONTENT_CHARS: usize = 16_000;
 
-/// HTTP request timeout.
-const FETCH_TIMEOUT_SECS: u64 = 30;
+/// Default HTTP request timeout.
+const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 30;
 
-/// Register the web_fetch tool.
+/// Register the web_fetch tool with default config.
 pub fn register_web_fetch_tool(registry: &mut super::ToolRegistry) {
-    registry.register(Box::new(WebFetchTool));
+    registry.register(Box::new(WebFetchTool {
+        max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
+        fetch_timeout_secs: DEFAULT_FETCH_TIMEOUT_SECS,
+    }));
 }
 
-struct WebFetchTool;
+/// Register the web_fetch tool with custom config values.
+pub fn register_web_fetch_tool_with_config(
+    registry: &mut super::ToolRegistry,
+    max_content_chars: usize,
+    fetch_timeout_secs: u64,
+) {
+    registry.register(Box::new(WebFetchTool {
+        max_content_chars,
+        fetch_timeout_secs,
+    }));
+}
+
+struct WebFetchTool {
+    max_content_chars: usize,
+    fetch_timeout_secs: u64,
+}
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -67,7 +85,7 @@ impl Tool for WebFetchTool {
 
         // Fetch the page
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(self.fetch_timeout_secs))
             .user_agent("workgraph-agent/0.1")
             .build()
         {
@@ -97,7 +115,7 @@ impl Tool for WebFetchTool {
         let markdown = extract_to_markdown(&html, &parsed_url);
 
         // Truncate to limit
-        let truncated = truncate_tool_output(&markdown, MAX_CONTENT_CHARS);
+        let truncated = truncate_tool_output(&markdown, self.max_content_chars);
 
         ToolOutput::success(truncated)
     }
@@ -153,9 +171,16 @@ fn clean_markdown(md: &str) -> String {
 mod tests {
     use super::*;
 
+    fn default_tool() -> WebFetchTool {
+        WebFetchTool {
+            max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
+            fetch_timeout_secs: DEFAULT_FETCH_TIMEOUT_SECS,
+        }
+    }
+
     #[tokio::test]
     async fn test_web_fetch_empty_url() {
-        let tool = WebFetchTool;
+        let tool = default_tool();
         let input = json!({"url": ""});
         let output = tool.execute(&input).await;
         assert!(output.is_error);
@@ -164,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_missing_url() {
-        let tool = WebFetchTool;
+        let tool = default_tool();
         let input = json!({});
         let output = tool.execute(&input).await;
         assert!(output.is_error);
@@ -173,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_invalid_url() {
-        let tool = WebFetchTool;
+        let tool = default_tool();
         let input = json!({"url": "not a url"});
         let output = tool.execute(&input).await;
         assert!(output.is_error);
@@ -182,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_read_only() {
-        let tool = WebFetchTool;
+        let tool = default_tool();
         assert!(tool.is_read_only());
     }
 
@@ -211,9 +236,9 @@ mod tests {
 
     #[test]
     fn test_truncation_behavior() {
-        // Generate content longer than MAX_CONTENT_CHARS
-        let long_content = "x".repeat(MAX_CONTENT_CHARS + 5000);
-        let truncated = truncate_tool_output(&long_content, MAX_CONTENT_CHARS);
+        // Generate content longer than DEFAULT_MAX_CONTENT_CHARS
+        let long_content = "x".repeat(DEFAULT_MAX_CONTENT_CHARS + 5000);
+        let truncated = truncate_tool_output(&long_content, DEFAULT_MAX_CONTENT_CHARS);
         assert!(truncated.len() < long_content.len());
         assert!(truncated.contains("chars omitted"));
     }

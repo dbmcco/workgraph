@@ -21,6 +21,7 @@ use serde_json;
 use tokio::sync::Semaphore;
 
 use super::client::ToolDefinition;
+use crate::config::NativeExecutorConfig;
 
 /// Output from executing a tool.
 #[derive(Debug, Clone)]
@@ -332,7 +333,19 @@ impl ToolRegistry {
     }
 
     /// Create the full default registry with all tools.
+    ///
+    /// Uses default config values. Prefer `default_all_with_config` when a
+    /// `NativeExecutorConfig` is available.
     pub fn default_all(workgraph_dir: &Path, working_dir: &Path) -> Self {
+        Self::default_all_with_config(workgraph_dir, working_dir, &NativeExecutorConfig::default())
+    }
+
+    /// Create the full default registry with all tools, using the given config.
+    pub fn default_all_with_config(
+        workgraph_dir: &Path,
+        working_dir: &Path,
+        config: &NativeExecutorConfig,
+    ) -> Self {
         let mut registry = Self::new();
 
         // File tools
@@ -348,16 +361,22 @@ impl ToolRegistry {
         web_search::register_web_search_tool(&mut registry);
 
         // Web fetch tool
-        web_fetch::register_web_fetch_tool(&mut registry);
+        web_fetch::register_web_fetch_tool_with_config(
+            &mut registry,
+            config.web.fetch_max_chars,
+            config.web.fetch_timeout_secs,
+        );
 
         // Background job tool
         bg::register_bg_tool(&mut registry, workgraph_dir.to_path_buf());
 
         // Delegate tool (in-process subtask delegation)
-        delegate::register_delegate_tool(
+        delegate::register_delegate_tool_with_config(
             &mut registry,
             workgraph_dir.to_path_buf(),
             working_dir.to_path_buf(),
+            config.delegate.delegate_max_turns,
+            &config.delegate.delegate_model,
         );
 
         registry

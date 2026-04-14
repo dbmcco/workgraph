@@ -94,6 +94,10 @@ pub struct Config {
     #[serde(default)]
     pub openrouter: OpenRouterConfig,
 
+    /// Native executor settings (web, background, delegate)
+    #[serde(default)]
+    pub native_executor: NativeExecutorConfig,
+
     /// True when `agent.model` was explicitly set in local config.
     /// Used by `resolve_model_for_role` to skip tier defaults in favor of agent.model.
     #[serde(skip)]
@@ -137,6 +141,116 @@ impl Default for ChatConfig {
             max_messages: default_chat_max_messages(),
             retention_days: default_chat_retention_days(),
             compact_threshold: default_chat_compact_threshold(),
+        }
+    }
+}
+
+/// Native executor configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NativeExecutorConfig {
+    /// Web access settings (search + fetch).
+    #[serde(default)]
+    pub web: NativeWebConfig,
+
+    /// Background task settings.
+    #[serde(default)]
+    pub background: NativeBackgroundConfig,
+
+    /// Delegate (in-process subtask) settings.
+    #[serde(default)]
+    pub delegate: NativeDelegateConfig,
+}
+
+/// Web access configuration for the native executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeWebConfig {
+    /// Search backend: "duckduckgo" (default), "serper", "brave", "searxng".
+    #[serde(default = "default_search_backend")]
+    pub search_backend: String,
+
+    /// API key for search backend (Serper, Brave, etc.). Supports env var syntax: "${VAR}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_api_key: Option<String>,
+
+    /// Maximum content chars for web_fetch before truncation.
+    #[serde(default = "default_fetch_max_chars")]
+    pub fetch_max_chars: usize,
+
+    /// HTTP request timeout for web_fetch in seconds.
+    #[serde(default = "default_fetch_timeout_secs")]
+    pub fetch_timeout_secs: u64,
+}
+
+fn default_search_backend() -> String {
+    "duckduckgo".to_string()
+}
+fn default_fetch_max_chars() -> usize {
+    16_000
+}
+fn default_fetch_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for NativeWebConfig {
+    fn default() -> Self {
+        Self {
+            search_backend: default_search_backend(),
+            search_api_key: None,
+            fetch_max_chars: default_fetch_max_chars(),
+            fetch_timeout_secs: default_fetch_timeout_secs(),
+        }
+    }
+}
+
+/// Background task configuration for the native executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeBackgroundConfig {
+    /// Maximum concurrent background tasks per agent.
+    #[serde(default = "default_max_background_tasks")]
+    pub max_background_tasks: usize,
+
+    /// Default timeout for background tasks in seconds.
+    #[serde(default = "default_background_timeout_secs")]
+    pub background_timeout_secs: u64,
+}
+
+fn default_max_background_tasks() -> usize {
+    5
+}
+fn default_background_timeout_secs() -> u64 {
+    600
+}
+
+impl Default for NativeBackgroundConfig {
+    fn default() -> Self {
+        Self {
+            max_background_tasks: default_max_background_tasks(),
+            background_timeout_secs: default_background_timeout_secs(),
+        }
+    }
+}
+
+/// Delegate (in-process subtask) configuration for the native executor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeDelegateConfig {
+    /// Maximum turns for delegated sub-agents.
+    #[serde(default = "default_delegate_max_turns")]
+    pub delegate_max_turns: usize,
+
+    /// Model for delegate sub-agents. Empty string = same as parent agent.
+    #[serde(default)]
+    pub delegate_model: String,
+}
+
+fn default_delegate_max_turns() -> usize {
+    10
+}
+
+impl Default for NativeDelegateConfig {
+    fn default() -> Self {
+        Self {
+            delegate_max_turns: default_delegate_max_turns(),
+            delegate_model: String::new(),
         }
     }
 }
@@ -6448,5 +6562,62 @@ profile = "openrouter"
         let config: Config = merged.try_into().unwrap();
 
         assert_eq!(config.profile, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_native_executor_config_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.native_executor.web.search_backend, "duckduckgo");
+        assert_eq!(config.native_executor.web.fetch_max_chars, 16_000);
+        assert_eq!(config.native_executor.web.fetch_timeout_secs, 30);
+        assert!(config.native_executor.web.search_api_key.is_none());
+        assert_eq!(config.native_executor.background.max_background_tasks, 5);
+        assert_eq!(config.native_executor.background.background_timeout_secs, 600);
+        assert_eq!(config.native_executor.delegate.delegate_max_turns, 10);
+        assert_eq!(config.native_executor.delegate.delegate_model, "");
+    }
+
+    #[test]
+    fn test_native_executor_config_custom_values() {
+        let toml_str = r#"
+[native_executor.web]
+search_backend = "serper"
+search_api_key = "sk-test-123"
+fetch_max_chars = 32000
+fetch_timeout_secs = 60
+
+[native_executor.background]
+max_background_tasks = 10
+background_timeout_secs = 1200
+
+[native_executor.delegate]
+delegate_max_turns = 15
+delegate_model = "claude-haiku-4-5-20251001"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.native_executor.web.search_backend, "serper");
+        assert_eq!(config.native_executor.web.search_api_key, Some("sk-test-123".to_string()));
+        assert_eq!(config.native_executor.web.fetch_max_chars, 32_000);
+        assert_eq!(config.native_executor.web.fetch_timeout_secs, 60);
+        assert_eq!(config.native_executor.background.max_background_tasks, 10);
+        assert_eq!(config.native_executor.background.background_timeout_secs, 1200);
+        assert_eq!(config.native_executor.delegate.delegate_max_turns, 15);
+        assert_eq!(config.native_executor.delegate.delegate_model, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_native_executor_config_partial_override() {
+        let toml_str = r#"
+[native_executor.web]
+fetch_max_chars = 8000
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // Overridden value
+        assert_eq!(config.native_executor.web.fetch_max_chars, 8_000);
+        // Defaults preserved
+        assert_eq!(config.native_executor.web.search_backend, "duckduckgo");
+        assert_eq!(config.native_executor.web.fetch_timeout_secs, 30);
+        assert_eq!(config.native_executor.background.max_background_tasks, 5);
+        assert_eq!(config.native_executor.delegate.delegate_max_turns, 10);
     }
 }

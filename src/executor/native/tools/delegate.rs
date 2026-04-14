@@ -39,6 +39,10 @@ Be direct and factual. Do not ask follow-up questions.";
 pub struct DelegateTool {
     workgraph_dir: PathBuf,
     working_dir: PathBuf,
+    /// Configured default max turns (from config or DEFAULT_MAX_TURNS).
+    config_max_turns: usize,
+    /// Configured delegate model override. Empty = use parent model.
+    config_model: String,
 }
 
 impl DelegateTool {
@@ -46,6 +50,22 @@ impl DelegateTool {
         Self {
             workgraph_dir,
             working_dir,
+            config_max_turns: DEFAULT_MAX_TURNS,
+            config_model: String::new(),
+        }
+    }
+
+    pub fn with_config(
+        workgraph_dir: PathBuf,
+        working_dir: PathBuf,
+        max_turns: usize,
+        model: &str,
+    ) -> Self {
+        Self {
+            workgraph_dir,
+            working_dir,
+            config_max_turns: max_turns.min(MAX_ALLOWED_TURNS).max(1),
+            config_model: model.to_string(),
         }
     }
 }
@@ -111,13 +131,17 @@ impl Tool for DelegateTool {
             .get("max_turns")
             .and_then(|v| v.as_u64())
             .map(|n| (n as usize).min(MAX_ALLOWED_TURNS).max(1))
-            .unwrap_or(DEFAULT_MAX_TURNS);
+            .unwrap_or(self.config_max_turns);
 
-        // Resolve model: WG_MODEL env var > default
-        let model = std::env::var("WG_MODEL")
-            .ok()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+        // Resolve model: config delegate_model > WG_MODEL env var > default
+        let model = if !self.config_model.is_empty() {
+            self.config_model.clone()
+        } else {
+            std::env::var("WG_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string())
+        };
 
         // Create provider for the child conversation
         let provider =
@@ -306,13 +330,29 @@ fn extract_text_from_content(content: &[ContentBlock]) -> String {
         .join("\n")
 }
 
-/// Register the delegate tool.
+/// Register the delegate tool with default config.
 pub fn register_delegate_tool(
     registry: &mut super::ToolRegistry,
     workgraph_dir: PathBuf,
     working_dir: PathBuf,
 ) {
     registry.register(Box::new(DelegateTool::new(workgraph_dir, working_dir)));
+}
+
+/// Register the delegate tool with custom config values.
+pub fn register_delegate_tool_with_config(
+    registry: &mut super::ToolRegistry,
+    workgraph_dir: PathBuf,
+    working_dir: PathBuf,
+    max_turns: usize,
+    model: &str,
+) {
+    registry.register(Box::new(DelegateTool::with_config(
+        workgraph_dir,
+        working_dir,
+        max_turns,
+        model,
+    )));
 }
 
 #[cfg(test)]
