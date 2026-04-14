@@ -441,6 +441,7 @@ fn main() -> Result<()> {
             delay,
             not_before,
             verify,
+            cron,
             allow_phantom,
             allow_cycle,
         } => commands::edit::run(
@@ -468,6 +469,7 @@ fn main() -> Result<()> {
             delay.as_deref(),
             not_before.as_deref(),
             verify.as_deref(),
+            cron.as_deref(),
             allow_phantom,
             allow_cycle,
         ),
@@ -537,12 +539,14 @@ fn main() -> Result<()> {
             status,
             paused,
             tags,
+            cron,
         } => commands::list::run(
             &workgraph_dir,
             status.as_deref(),
             paused,
             &tags,
             None,
+            cron,
             cli.json,
         ),
         Commands::Viz {

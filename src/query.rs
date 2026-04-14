@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Check if a task is past its not_before and ready_after timestamps (or has no timestamps)
+/// Check if a task is past its not_before and ready_after timestamps (or has no timestamps),
+/// and if cron-enabled, whether it is due to fire.
 pub fn is_time_ready(task: &Task) -> bool {
     let now = Utc::now();
 
@@ -25,6 +26,13 @@ pub fn is_time_ready(task: &Task) -> bool {
         return false;
     }
     // Invalid timestamp = treat as ready (don't block)
+
+    // Cron gate: if cron-enabled, only ready when due
+    if task.cron_enabled {
+        if !crate::cron::is_cron_due(task, now) {
+            return false;
+        }
+    }
 
     true
 }

@@ -35,6 +35,7 @@ pub fn run(
     delay: Option<&str>,
     not_before: Option<&str>,
     verify: Option<&str>,
+    cron: Option<&str>,
     allow_phantom: bool,
     allow_cycle: bool,
 ) -> Result<()> {
@@ -489,6 +490,47 @@ pub fn run(
             println!("Set not_before: {}", ts);
             changed = true;
         }
+        // Update cron schedule
+        if let Some(cron_expr) = cron {
+            if cron_expr.is_empty() {
+                // Clear cron scheduling
+                task.cron_schedule = None;
+                task.cron_enabled = false;
+                task.next_cron_fire = None;
+                task.last_cron_fire = None;
+                println!("Cleared cron schedule");
+                changed = true;
+            } else {
+                // Set or update cron schedule
+                match workgraph::cron::parse_cron_expression(cron_expr) {
+                    Ok(schedule) => {
+                        task.cron_schedule = Some(cron_expr.to_string());
+                        task.cron_enabled = true;
+                        task.next_cron_fire = workgraph::cron::calculate_next_fire_with_jitter(
+                            &task.id,
+                            &schedule,
+                            chrono::Utc::now(),
+                        )
+                        .map(|dt| dt.to_rfc3339());
+                        println!(
+                            "Set cron schedule: {} (next fire: {})",
+                            cron_expr,
+                            task.next_cron_fire.as_deref().unwrap_or("unknown")
+                        );
+                        changed = true;
+                    }
+                    Err(e) => {
+                        error = Some(anyhow::anyhow!(
+                            "Invalid cron expression '{}': {}",
+                            cron_expr,
+                            e
+                        ));
+                        return false;
+                    }
+                }
+            }
+        }
+
         // Reset spawn failure counter on any edit — the user may have fixed
         // the root cause (e.g., exec_mode mismatch), so the circuit breaker
         // should give the task a fresh set of attempts.
@@ -767,6 +809,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -808,6 +851,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -849,6 +893,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             true,  // allow_phantom: dep2 doesn't exist in test graph
             false, // allow_cycle: tests should not allow cycles by default
         );
@@ -891,6 +936,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -932,6 +978,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -974,6 +1021,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1015,6 +1063,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1056,6 +1105,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1098,6 +1148,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1139,6 +1190,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1176,6 +1228,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1212,6 +1265,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1255,6 +1309,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1302,6 +1357,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         )
@@ -1333,6 +1389,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         );
@@ -1389,6 +1446,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         )
@@ -1453,6 +1511,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         )
@@ -1498,6 +1557,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         )
@@ -1538,6 +1598,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false,
         )
@@ -1606,6 +1667,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             false, // allow_cycle = false
         );
@@ -1671,6 +1733,7 @@ mod tests {
             None,
             None,
             None,
+            None,  // cron
             false,
             true, // allow_cycle = true
         );

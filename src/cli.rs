@@ -298,6 +298,10 @@ pub enum Commands {
         #[arg(long)]
         verify: Option<String>,
 
+        /// Set or clear cron schedule (empty string "" clears; 6-field: "sec min hour day month dow")
+        #[arg(long)]
+        cron: Option<String>,
+
         /// Allow phantom (forward-reference) dependencies without error
         #[arg(long = "allow-phantom")]
         allow_phantom: bool,
@@ -543,6 +547,10 @@ pub enum Commands {
         /// Filter by tag (multiple --tag flags use AND semantics)
         #[arg(long = "tag")]
         tags: Vec<String>,
+
+        /// Only show cron-scheduled tasks
+        #[arg(long)]
+        cron: bool,
     },
 
     /// Visualize the dependency graph (ASCII tree by default)

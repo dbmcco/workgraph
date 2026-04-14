@@ -352,6 +352,7 @@ mod provenance_coverage_tests {
             None,
             None,
             None,  // verify
+            None,  // cron
             false, // allow_phantom
             false, // allow_cycle
         )
@@ -940,6 +941,7 @@ mod provenance_coverage_tests {
             None,
             None,
             None,  // verify
+            None,  // cron
             false, // allow_phantom
             false, // allow_cycle
         )

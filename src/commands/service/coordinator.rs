@@ -3808,6 +3808,28 @@ pub fn coordinator_tick(
         // dependencies or missed completion events.
         modified |= unblock_stuck_tasks(graph, dir);
 
+        // Phase 2.95: Cron task reset — reset Done cron tasks to Open and compute
+        // next fire time with jitter so they can be re-dispatched on schedule.
+        {
+            let cron_task_ids: Vec<String> = graph
+                .tasks()
+                .filter(|t| t.cron_enabled && t.status == Status::Done)
+                .map(|t| t.id.clone())
+                .collect();
+            for task_id in &cron_task_ids {
+                if let Some(task) = graph.get_task_mut(task_id) {
+                    if workgraph::cron::reset_cron_task(task) {
+                        eprintln!(
+                            "[coordinator] Cron reset: '{}' → Open (next fire: {})",
+                            task_id,
+                            task.next_cron_fire.as_deref().unwrap_or("unknown")
+                        );
+                        modified = true;
+                    }
+                }
+            }
+        }
+
         // Phase 2.10: (极maps Removed) Placement is now merged into the assignment step.
         // No separate .place-* tasks are created or handled.
 
@@ -5941,6 +5963,7 @@ mod tests {
             None,         // delay
             None,         // not_before
             None,         // verify
+            None,         // cron
             false,        // allow_phantom
             false,        // allow_cycle
         )
