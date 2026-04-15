@@ -2468,6 +2468,9 @@ fn main() -> Result<()> {
             message.as_deref(),
             max_turns,
         ),
+        Commands::TuiNex { model, endpoint } => {
+            commands::tui_nex::run(&workgraph_dir, model.as_deref(), endpoint.as_deref())
+        }
         Commands::NativeExec {
             prompt_file,
             exec_mode,

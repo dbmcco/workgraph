@@ -1790,6 +1790,18 @@ pub enum Commands {
         max_turns: usize,
     },
 
+    /// Interactive agentic TUI — ratatui-based nex (two-pane with streaming + Ctrl-C cancel)
+    #[command(name = "tui-nex")]
+    TuiNex {
+        /// Model to use (e.g., openrouter:qwen/qwen3-coder, ollama:llama3.2, sonnet)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+
+        /// Named endpoint from config
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+    },
+
     /// Run the native executor agent loop (internal, called by spawn)
     #[command(name = "native-exec", hide = true)]
     NativeExec {
@@ -3721,6 +3733,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Model { .. } => "model",
         Commands::Key { .. } => "key",
         Commands::Nex { .. } => "nex",
+        Commands::TuiNex { .. } => "tui-nex",
         Commands::NativeExec { .. } => "native-exec",
         Commands::Spend { .. } => "spend",
         Commands::Openrouter { .. } => "openrouter",
