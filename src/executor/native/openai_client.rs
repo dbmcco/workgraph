@@ -368,9 +368,11 @@ impl OpenAiClient {
         // output (8 192 tokens for a 32 k window, 32 768 for 128 k).
         let cap = (tokens / 4) as u32;
         if cap > 0 && self.max_tokens > cap {
-            eprintln!(
+            log::debug!(
                 "[openai-client] Capping max_tokens from {} to {} (context_window={})",
-                self.max_tokens, cap, tokens
+                self.max_tokens,
+                cap,
+                tokens
             );
             self.max_tokens = cap;
         }
