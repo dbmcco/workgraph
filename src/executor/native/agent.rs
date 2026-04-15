@@ -1430,6 +1430,743 @@ impl AgentLoop {
 
         messages
     }
+
+    /// Run an interactive multi-turn REPL.
+    ///
+    /// Like `run()`, but instead of exiting on `EndTurn`, prints the assistant's
+    /// text and reads the next user message from stdin. Streams tokens to stdout
+    /// as they arrive. The loop exits when the user sends EOF (Ctrl-D) or types
+    /// /quit or /exit.
+    pub async fn run_interactive(&mut self, initial_message: Option<&str>) -> Result<AgentResult> {
+        use rustyline::DefaultEditor;
+        use rustyline::error::ReadlineError;
+
+        let mut messages: Vec<Message> = Vec::new();
+        let mut total_usage = Usage::default();
+        let mut tool_calls = Vec::new();
+        let mut turns: usize = 0;
+        let mut consecutive_server_errors: u32 = 0;
+        const MAX_CONSECUTIVE_SERVER_ERRORS: u32 = 3;
+
+        // Rustyline editor for line editing + history.
+        let mut editor = DefaultEditor::new().context("failed to initialize rustyline editor")?;
+        // Persistent history file — survives sessions.
+        let history_path = if let Some(home) = std::env::var_os("HOME") {
+            std::path::PathBuf::from(home).join(".workgraph-nex-history")
+        } else {
+            std::path::PathBuf::from(".workgraph-nex-history")
+        };
+        let _ = editor.load_history(&history_path);
+
+        // Helper: read a user line with rustyline. Returns:
+        // - `Some(line)` on normal input (empty line allowed — caller filters)
+        // - `None` on Ctrl-D (EOF) or non-recoverable error → exit REPL
+        // - Loops on Ctrl-C at the prompt (does NOT exit — just re-prompts)
+        let read_user_input = |editor: &mut DefaultEditor| -> Option<String> {
+            loop {
+                match editor.readline("\x1b[1;36m>\x1b[0m ") {
+                    Ok(line) => return Some(line),
+                    Err(ReadlineError::Interrupted) => {
+                        // Ctrl-C at the prompt: re-display and re-read.
+                        eprintln!(
+                            "\x1b[2m(Ctrl-C — press again or /quit to exit, empty line to continue)\x1b[0m"
+                        );
+                        continue;
+                    }
+                    Err(ReadlineError::Eof) => return None,
+                    Err(e) => {
+                        eprintln!("\x1b[31m[nex] readline error: {}\x1b[0m", e);
+                        return None;
+                    }
+                }
+            }
+        };
+
+        let first_input = if let Some(msg) = initial_message {
+            msg.to_string()
+        } else {
+            match read_user_input(&mut editor) {
+                Some(line) => {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        let _ = editor.save_history(&history_path);
+                        return Ok(AgentResult {
+                            final_text: String::new(),
+                            turns: 0,
+                            total_usage,
+                            tool_calls,
+                        });
+                    }
+                    let _ = editor.add_history_entry(&trimmed);
+                    trimmed
+                }
+                None => {
+                    let _ = editor.save_history(&history_path);
+                    return Ok(AgentResult {
+                        final_text: String::new(),
+                        turns: 0,
+                        total_usage,
+                        tool_calls,
+                    });
+                }
+            }
+        };
+
+        // Handle slash commands on the first input too, so users can
+        // start with `/help` or `/load session.json` from a cold prompt.
+        if first_input.starts_with('/') {
+            match self
+                .handle_nex_slash_command(&first_input, &mut messages, &total_usage)
+                .await
+            {
+                NexSlashResult::Quit => {
+                    let _ = editor.save_history(&history_path);
+                    return Ok(AgentResult {
+                        final_text: String::new(),
+                        turns: 0,
+                        total_usage,
+                        tool_calls,
+                    });
+                }
+                NexSlashResult::Continue => {
+                    // Handled; fall through to the main loop which will
+                    // prompt for the next input.
+                }
+                NexSlashResult::NotASlashCommand => {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text { text: first_input }],
+                    });
+                }
+            }
+        } else {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: first_input }],
+            });
+        }
+
+        loop {
+            if turns >= self.max_turns {
+                eprintln!(
+                    "\n\x1b[33m[nex] Max turns ({}) reached.\x1b[0m",
+                    self.max_turns
+                );
+                break;
+            }
+
+            // If the last entry isn't a user message (e.g., we just
+            // handled a slash command that printed info), prompt again
+            // before the next LLM call.
+            let needs_user_input = messages
+                .last()
+                .map(|m| m.role != Role::User)
+                .unwrap_or(true);
+            if needs_user_input {
+                match read_user_input(&mut editor) {
+                    Some(line) => {
+                        let trimmed = line.trim().to_string();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let _ = editor.add_history_entry(&trimmed);
+                        if trimmed.starts_with('/') {
+                            match self
+                                .handle_nex_slash_command(&trimmed, &mut messages, &total_usage)
+                                .await
+                            {
+                                NexSlashResult::Quit => break,
+                                NexSlashResult::Continue => continue,
+                                NexSlashResult::NotASlashCommand => {
+                                    messages.push(Message {
+                                        role: Role::User,
+                                        content: vec![ContentBlock::Text { text: trimmed }],
+                                    });
+                                }
+                            }
+                        } else {
+                            messages.push(Message {
+                                role: Role::User,
+                                content: vec![ContentBlock::Text { text: trimmed }],
+                            });
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            let request = MessagesRequest {
+                model: self.client.model().to_string(),
+                max_tokens: self.client.max_tokens(),
+                system: Some(self.system_prompt.clone()),
+                messages: messages.clone(),
+                tools: if self.supports_tools {
+                    self.tools.definitions()
+                } else {
+                    vec![]
+                },
+                stream: false,
+            };
+
+            let on_text = |text: String| {
+                eprint!("{}", text);
+                let _ = std::io::stderr().flush();
+            };
+
+            // Wrap the streaming call in a Ctrl-C-aware select. On Ctrl-C
+            // the in-flight provider call is cancelled, the partial
+            // response is dropped, and we return to the prompt without
+            // pushing a (possibly malformed) assistant message.
+            let streaming_future = self.client.send_streaming(&request, &on_text);
+            let ctrl_c_future = tokio::signal::ctrl_c();
+            let response = tokio::select! {
+                biased;
+                _ = ctrl_c_future => {
+                    eprintln!(
+                        "\n\x1b[33m[nex] Interrupted — dropping in-flight response.\x1b[0m"
+                    );
+                    // The partial streaming output was already written to
+                    // stderr. Don't add a partial/malformed assistant
+                    // message to the history.
+                    continue;
+                }
+                res = streaming_future => match res {
+                Ok(resp) => {
+                    consecutive_server_errors = 0;
+                    resp
+                }
+                Err(e) => {
+                    if super::openai_client::is_context_too_long(&e) {
+                        eprintln!("\n\x1b[33m[nex] Context too long — compacting...\x1b[0m");
+                        let pre = messages.len();
+                        messages = ContextBudget::emergency_compact(messages, 5);
+                        eprintln!(
+                            "\x1b[33m[nex] Compacted {} -> {} messages\x1b[0m",
+                            pre,
+                            messages.len()
+                        );
+                        continue;
+                    }
+                    if let Some(api_err) = e.downcast_ref::<super::openai_client::ApiError>() {
+                        if api_err.status == 401 || api_err.status == 403 {
+                            return Err(e);
+                        }
+                        if super::openai_client::is_retryable_status(api_err.status) {
+                            consecutive_server_errors += 1;
+                            if consecutive_server_errors > MAX_CONSECUTIVE_SERVER_ERRORS {
+                                return Err(e);
+                            }
+                            eprintln!(
+                                "\n\x1b[33m[nex] API error {} — retrying ({}/{})\x1b[0m",
+                                api_err.status,
+                                consecutive_server_errors,
+                                MAX_CONSECUTIVE_SERVER_ERRORS
+                            );
+                            continue;
+                        }
+                    }
+                    if is_timeout_error(&e) {
+                        consecutive_server_errors += 1;
+                        if consecutive_server_errors > MAX_CONSECUTIVE_SERVER_ERRORS {
+                            return Err(e);
+                        }
+                        eprintln!("\n\x1b[33m[nex] Request timed out — retrying\x1b[0m");
+                        continue;
+                    }
+                    return Err(e).context("API request failed");
+                }
+                }
+            };
+
+            total_usage.add(&response.usage);
+            turns += 1;
+
+            messages.push(Message {
+                role: Role::Assistant,
+                content: response.content.clone(),
+            });
+
+            match response.stop_reason {
+                Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
+                    let has_text = response
+                        .content
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::Text { text } if !text.is_empty()));
+                    if has_text {
+                        eprintln!();
+                    }
+
+                    // Add a blank line between the assistant's response
+                    // and our next prompt. The readline call handles
+                    // rustyline's own display.
+                    eprintln!();
+                    match read_user_input(&mut editor) {
+                        Some(line) => {
+                            let trimmed = line.trim().to_string();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let _ = editor.add_history_entry(&trimmed);
+                            if trimmed.starts_with('/') {
+                                match self
+                                    .handle_nex_slash_command(&trimmed, &mut messages, &total_usage)
+                                    .await
+                                {
+                                    NexSlashResult::Quit => break,
+                                    NexSlashResult::Continue => continue,
+                                    NexSlashResult::NotASlashCommand => {
+                                        messages.push(Message {
+                                            role: Role::User,
+                                            content: vec![ContentBlock::Text { text: trimmed }],
+                                        });
+                                    }
+                                }
+                            } else {
+                                messages.push(Message {
+                                    role: Role::User,
+                                    content: vec![ContentBlock::Text { text: trimmed }],
+                                });
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                Some(StopReason::ToolUse) => {
+                    let tool_use_blocks: Vec<_> = response
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, name, input } => {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    for (_, name, input) in &tool_use_blocks {
+                        let input_summary = if let Some(cmd) =
+                            input.get("command").and_then(|v| v.as_str())
+                        {
+                            format!("command={}", truncate_for_display(cmd, 80))
+                        } else if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
+                            format!("path={}", path)
+                        } else if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
+                            format!("pattern={}", truncate_for_display(pat, 60))
+                        } else {
+                            let s = input.to_string();
+                            truncate_for_display(&s, 80).to_string()
+                        };
+                        eprintln!("\x1b[2m  > {}({})\x1b[0m", name, input_summary);
+                    }
+
+                    let mut parse_error_results = Vec::new();
+                    let mut batch_calls: Vec<(usize, String, super::tools::ToolCall)> = Vec::new();
+
+                    for (i, (id, name, input)) in tool_use_blocks.iter().enumerate() {
+                        if input.get("__parse_error").is_some() {
+                            let error_msg = input
+                                .get("__parse_error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown parse error");
+                            let raw_args = input
+                                .get("__raw_arguments")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            parse_error_results.push((
+                                i,
+                                id.clone(),
+                                name.clone(),
+                                input.clone(),
+                                super::tools::ToolOutput {
+                                    content: format!(
+                                        "ERROR: Tool arguments JSON parse failed: {}. Raw: {}",
+                                        error_msg, raw_args
+                                    ),
+                                    is_error: true,
+                                },
+                            ));
+                        } else {
+                            batch_calls.push((
+                                i,
+                                id.clone(),
+                                super::tools::ToolCall {
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                },
+                            ));
+                        }
+                    }
+
+                    let calls_only: Vec<_> =
+                        batch_calls.iter().map(|(_, _, c)| c.clone()).collect();
+                    let batch_results = self
+                        .tools
+                        .execute_batch(&calls_only, super::tools::DEFAULT_MAX_CONCURRENT_TOOLS)
+                        .await;
+
+                    let mut all_results: Vec<(
+                        usize,
+                        String,
+                        String,
+                        serde_json::Value,
+                        super::tools::ToolOutput,
+                        u64,
+                    )> = Vec::with_capacity(tool_use_blocks.len());
+
+                    for (orig_idx, id, name, input, output) in parse_error_results {
+                        all_results.push((orig_idx, id, name, input, output, 0));
+                    }
+                    for (batch_idx, batch_result) in batch_results.into_iter().enumerate() {
+                        let (orig_idx, id, _) = &batch_calls[batch_idx];
+                        let input = tool_use_blocks[*orig_idx].2.clone();
+                        all_results.push((
+                            *orig_idx,
+                            id.clone(),
+                            batch_result.name,
+                            input,
+                            batch_result.output,
+                            batch_result.duration_ms,
+                        ));
+                    }
+                    all_results.sort_by_key(|(idx, _, _, _, _, _)| *idx);
+
+                    let mut results = Vec::new();
+                    for (_, id, name, input, output, _) in &all_results {
+                        if output.is_error {
+                            eprintln!(
+                                "\x1b[2m  x {} error: {}\x1b[0m",
+                                name,
+                                truncate_for_display(&output.content, 100)
+                            );
+                        } else {
+                            eprintln!(
+                                "\x1b[2m  + {} ({} chars)\x1b[0m",
+                                name,
+                                output.content.len()
+                            );
+                        }
+
+                        tool_calls.push(ToolCallRecord {
+                            name: name.clone(),
+                            input: input.clone(),
+                            output: output.content.clone(),
+                            is_error: output.is_error,
+                        });
+
+                        results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output.content.clone(),
+                            is_error: output.is_error,
+                        });
+                    }
+
+                    messages.push(Message {
+                        role: Role::User,
+                        content: results,
+                    });
+                }
+                Some(StopReason::MaxTokens) => {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: "Your response was truncated. Please continue.".to_string(),
+                        }],
+                    });
+                }
+            }
+
+            match self.context_budget.check_pressure(&messages) {
+                ContextPressureAction::Ok | ContextPressureAction::Warning => {}
+                ContextPressureAction::EmergencyCompaction => {
+                    let pre = messages.len();
+                    messages = ContextBudget::emergency_compact(messages, 5);
+                    eprintln!(
+                        "\x1b[33m[nex] Context pressure — compacted {} -> {} messages\x1b[0m",
+                        pre,
+                        messages.len()
+                    );
+                }
+                ContextPressureAction::CleanExit => {
+                    eprintln!(
+                        "\x1b[33m[nex] Context limit reached. Please start a new session.\x1b[0m"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Persist history to disk on exit (best-effort).
+        let _ = editor.save_history(&history_path);
+
+        let final_text = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+
+        Ok(AgentResult {
+            final_text,
+            turns,
+            total_usage,
+            tool_calls,
+        })
+    }
+}
+
+fn truncate_for_display(s: &str, max: usize) -> &str {
+    if s.len() <= max { s } else { &s[..max] }
+}
+
+/// Result of processing a nex REPL slash command.
+enum NexSlashResult {
+    /// Command handled; the REPL should continue (prompt for next input).
+    Continue,
+    /// User asked to quit; the REPL should exit cleanly.
+    Quit,
+    /// Input was not actually a slash command (or was an unknown one
+    /// treated as literal text); the caller should push it as a regular
+    /// user message and proceed with an LLM turn.
+    NotASlashCommand,
+}
+
+impl AgentLoop {
+    /// Handle a nex REPL slash command. Returns what the caller should do
+    /// next. Unknown `/...` inputs print a help hint and return `Continue`
+    /// (they are NOT forwarded to the model as text).
+    ///
+    /// Supported commands:
+    /// - `/help`, `/?`             — print the command list
+    /// - `/quit`, `/exit`          — exit the REPL
+    /// - `/clear`                  — clear conversation history
+    /// - `/tokens`                 — print current cumulative token usage
+    /// - `/save <path>`            — save session messages as JSON
+    /// - `/load <path>`            — load session messages from JSON
+    /// - `/bg run <cmd>`           — start a background task
+    /// - `/bg list`                — list all background jobs
+    /// - `/bg status <id>`         — show status of a specific job
+    /// - `/bg output <id> [lines]` — stream output from a job
+    /// - `/bg kill <id>`           — terminate a background job
+    /// - `/bg delete <id>`         — remove a terminated job from the registry
+    /// - `/cancel <id>`            — alias for `/bg kill <id>`
+    async fn handle_nex_slash_command(
+        &self,
+        input: &str,
+        messages: &mut Vec<Message>,
+        total_usage: &Usage,
+    ) -> NexSlashResult {
+        let trimmed = input.trim();
+        if !trimmed.starts_with('/') {
+            return NexSlashResult::NotASlashCommand;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+
+        match cmd {
+            "/quit" | "/exit" => NexSlashResult::Quit,
+
+            "/help" | "/?" => {
+                eprintln!(
+                    "\x1b[1mNex REPL commands:\x1b[0m\n\
+                     \x1b[1;36m  /help, /?\x1b[0m                    — this message\n\
+                     \x1b[1;36m  /quit, /exit\x1b[0m                 — exit the REPL (Ctrl-D also works)\n\
+                     \x1b[1;36m  /clear\x1b[0m                       — clear conversation history\n\
+                     \x1b[1;36m  /tokens\x1b[0m                      — show cumulative token usage\n\
+                     \x1b[1;36m  /save <path>\x1b[0m                 — save session to JSON file\n\
+                     \x1b[1;36m  /load <path>\x1b[0m                 — load session from JSON file\n\
+                     \x1b[1;36m  /bg run <cmd>\x1b[0m                — start a background task\n\
+                     \x1b[1;36m  /bg list\x1b[0m                     — list all background jobs\n\
+                     \x1b[1;36m  /bg status <id>\x1b[0m              — show status of a job\n\
+                     \x1b[1;36m  /bg output <id> [lines]\x1b[0m      — stream output of a job\n\
+                     \x1b[1;36m  /bg kill <id>\x1b[0m                — kill a background job\n\
+                     \x1b[1;36m  /bg delete <id>\x1b[0m              — remove terminated job from registry\n\
+                     \x1b[1;36m  /cancel <id>\x1b[0m                 — alias for /bg kill <id>\n\
+                     \n\
+                     \x1b[2mCtrl-C during generation cancels the in-flight response.\x1b[0m\n\
+                     \x1b[2mCtrl-C at the prompt is a no-op (use /quit or Ctrl-D to exit).\x1b[0m"
+                );
+                NexSlashResult::Continue
+            }
+
+            "/clear" => {
+                messages.clear();
+                eprintln!("\x1b[2m[nex] conversation cleared.\x1b[0m");
+                NexSlashResult::Continue
+            }
+
+            "/tokens" => {
+                eprintln!(
+                    "\x1b[2m[nex] session: {} input + {} output tokens \
+                     (= {} total, {} messages in history)\x1b[0m",
+                    total_usage.input_tokens,
+                    total_usage.output_tokens,
+                    total_usage.input_tokens + total_usage.output_tokens,
+                    messages.len(),
+                );
+                NexSlashResult::Continue
+            }
+
+            "/save" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[31m[nex] /save requires a path argument\x1b[0m");
+                    return NexSlashResult::Continue;
+                }
+                match serde_json::to_string_pretty(messages) {
+                    Ok(json) => match std::fs::write(arg, json) {
+                        Ok(()) => eprintln!(
+                            "\x1b[2m[nex] saved {} messages to {}\x1b[0m",
+                            messages.len(),
+                            arg
+                        ),
+                        Err(e) => eprintln!("\x1b[31m[nex] failed to write {}: {}\x1b[0m", arg, e),
+                    },
+                    Err(e) => eprintln!("\x1b[31m[nex] failed to serialize session: {}\x1b[0m", e),
+                }
+                NexSlashResult::Continue
+            }
+
+            "/load" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[31m[nex] /load requires a path argument\x1b[0m");
+                    return NexSlashResult::Continue;
+                }
+                match std::fs::read_to_string(arg) {
+                    Ok(text) => match serde_json::from_str::<Vec<Message>>(&text) {
+                        Ok(loaded) => {
+                            let n = loaded.len();
+                            *messages = loaded;
+                            eprintln!("\x1b[2m[nex] loaded {} messages from {}\x1b[0m", n, arg);
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[31m[nex] failed to parse {}: {}\x1b[0m", arg, e)
+                        }
+                    },
+                    Err(e) => eprintln!("\x1b[31m[nex] failed to read {}: {}\x1b[0m", arg, e),
+                }
+                NexSlashResult::Continue
+            }
+
+            "/bg" => {
+                // Parse the bg subcommand.
+                let mut bg_parts = arg.splitn(2, char::is_whitespace);
+                let action = bg_parts.next().unwrap_or("");
+                let rest = bg_parts.next().unwrap_or("").trim();
+                if action.is_empty() {
+                    eprintln!(
+                        "\x1b[31m[nex] /bg requires an action: run|list|status|output|kill|delete\x1b[0m"
+                    );
+                    return NexSlashResult::Continue;
+                }
+                let input_json = match action {
+                    "run" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg run requires a command\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({
+                            "action": "run",
+                            "command": rest,
+                        })
+                    }
+                    "list" => serde_json::json!({ "action": "list" }),
+                    "status" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg status requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "status", "job": rest })
+                    }
+                    "kill" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg kill requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "kill", "job": rest })
+                    }
+                    "output" => {
+                        let mut out_parts = rest.splitn(2, char::is_whitespace);
+                        let job = out_parts.next().unwrap_or("").trim();
+                        if job.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg output requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        let lines: Option<i64> =
+                            out_parts.next().and_then(|s| s.trim().parse().ok());
+                        if let Some(n) = lines {
+                            serde_json::json!({
+                                "action": "output",
+                                "job": job,
+                                "lines": n,
+                            })
+                        } else {
+                            serde_json::json!({ "action": "output", "job": job })
+                        }
+                    }
+                    "delete" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg delete requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "delete", "job": rest })
+                    }
+                    other => {
+                        eprintln!(
+                            "\x1b[31m[nex] /bg: unknown action '{}'\x1b[0m — use run|list|status|output|kill|delete",
+                            other
+                        );
+                        return NexSlashResult::Continue;
+                    }
+                };
+
+                // Call the bg tool directly through the registry. No LLM
+                // round-trip — the REPL gets immediate feedback.
+                let result = self.tools.execute("bg", &input_json).await;
+                if result.is_error {
+                    eprintln!("\x1b[31m[nex] /bg error: {}\x1b[0m", result.content);
+                } else {
+                    // Print the tool result indented so it's visible as
+                    // output, not conversation.
+                    for line in result.content.lines() {
+                        eprintln!("\x1b[2m  {}\x1b[0m", line);
+                    }
+                }
+                NexSlashResult::Continue
+            }
+
+            "/cancel" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[31m[nex] /cancel requires a job id/name\x1b[0m");
+                    return NexSlashResult::Continue;
+                }
+                let input_json = serde_json::json!({ "action": "kill", "job": arg });
+                let result = self.tools.execute("bg", &input_json).await;
+                if result.is_error {
+                    eprintln!("\x1b[31m[nex] /cancel error: {}\x1b[0m", result.content);
+                } else {
+                    eprintln!("\x1b[2m[nex] {}\x1b[0m", result.content.trim());
+                }
+                NexSlashResult::Continue
+            }
+
+            other => {
+                eprintln!(
+                    "\x1b[31m[nex] unknown command: {}\x1b[0m — type /help for the list",
+                    other
+                );
+                NexSlashResult::Continue
+            }
+        }
+    }
 }
 
 /// Check whether an error is a request timeout.
