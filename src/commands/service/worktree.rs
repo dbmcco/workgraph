@@ -25,6 +25,15 @@ use std::os::unix::fs::PermissionsExt;
 /// The directory under the project root where agent worktrees live.
 pub const WORKTREES_DIR: &str = ".wg-worktrees";
 
+/// Heartbeat freshness timeout (seconds) for the worktree-cleanup
+/// liveness check. A worktree is considered owned by a live agent only
+/// if the agent's last heartbeat is within this window AND its process
+/// is alive AND its status is alive. Set generously (5 minutes) to
+/// accommodate agents that briefly stall during long tool calls.
+///
+/// See `AgentEntry::is_live` for the full invariant.
+const HEARTBEAT_LIVENESS_TIMEOUT_SECS: u64 = 300;
+
 /// Maximum number of retry attempts for transient failures.
 const MAX_RETRIES: usize = 3;
 
@@ -589,7 +598,7 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
         let is_alive = registry
             .agents
             .get(&name)
-            .map(|a| a.is_alive() && crate::commands::is_process_alive(a.pid))
+            .map(|a| a.is_live(HEARTBEAT_LIVENESS_TIMEOUT_SECS))
             .unwrap_or(false);
 
         if !is_alive {
@@ -703,7 +712,7 @@ pub fn prune_stale_worktrees(dir: &Path, max_age_secs: u64) -> Result<usize> {
         let is_alive = registry
             .agents
             .get(&name)
-            .map(|a| a.is_alive() && crate::commands::is_process_alive(a.pid))
+            .map(|a| a.is_live(HEARTBEAT_LIVENESS_TIMEOUT_SECS))
             .unwrap_or(false);
 
         if is_alive {
