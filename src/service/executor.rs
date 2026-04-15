@@ -603,6 +603,49 @@ const WG_CONTEXT_HINT: &str = "\
 - Use `wg context` to view the current task's full context
 - Use `wg list` to see all tasks and their statuses\n";
 
+/// Native executor file-tool guidance. Injected into the prompt only when
+/// the executor is `native`, since these tool names (`read_file`,
+/// `write_file`, `edit_file`, `grep`, `glob`) are specific to the native
+/// executor's in-process tool registry — claude/amplifier/etc. have
+/// different names (Read/Edit/Write) provided by their own runtimes.
+///
+/// The goal is to push models away from bash-based file manipulation
+/// (echo/cat/heredoc/sed), which is fragile across shell escaping rules
+/// for multi-line content, and toward the dedicated tools which take
+/// structured JSON input and return structured results.
+pub const NATIVE_FILE_TOOLS_SECTION: &str = "\
+## Native Executor File Tools
+
+You have dedicated file tools. **Prefer these over bash equivalents** — they are \
+more reliable (no shell escaping) and return structured results.
+
+- `read_file(path, offset?, limit?)` — read a file or a slice of it. Use instead of \
+`cat`/`head`/`tail`.
+- `write_file(path, content)` — create or overwrite a file. Use instead of `echo >`, \
+`cat <<EOF`, or any bash heredoc. **Shell escaping of multi-line content is fragile \
+and breaks on quotes, newlines, and special characters** — this is the single most \
+common cause of failed file creation.
+- `edit_file(path, old_string, new_string)` — surgical in-place replacement. Use \
+instead of `sed -i`. `old_string` must appear exactly once; include surrounding \
+context when needed to make it unique.
+- `grep(pattern, path?, ...)` — search file contents. Use instead of `grep -r`.
+- `glob(pattern)` — find files by name pattern. Use instead of `find` or shell globbing.
+
+Use `bash` for everything else: running programs (tests, builds, scripts), system \
+inspection (`ps`, `df`, `env`), piped operations, or anything that inherently needs \
+shell execution. **Never use bash for file creation or in-place editing of existing \
+files** — use the dedicated tools above.
+
+### Channeled tool outputs
+
+When any tool returns more than ~2KB, the full output is saved to \
+`.workgraph/agents/<agent-id>/tool-outputs/NNNNN.log` and replaced in your \
+conversation with a compact handle plus a short preview. The raw bytes are always \
+on disk — do NOT re-fetch from the original source. To read more from a channeled \
+output, use either `read_file` with `offset`/`limit` on the handle path, or `bash` \
+for text slicing (`sed -n 'A,Bp'`, `grep -n`, `wc -l`, `head`, `tail`).
+";
+
 /// Default workgraph usage guide for non-Claude models.
 ///
 /// Injected into the prompt when the executor is non-Claude (native) so that models
@@ -775,6 +818,11 @@ pub struct ScopeContext {
     pub decomp_guidance: bool,
     /// Whether Telegram escalation is configured and available (task+ scope)
     pub telegram_available: bool,
+    /// Whether to inject the native-executor file-tool guidance section.
+    /// Set when the spawning executor is `native` so the model learns it
+    /// has `read_file`/`write_file`/`edit_file`/`grep`/`glob` available
+    /// and should prefer them over bash equivalents.
+    pub native_file_tools: bool,
 }
 
 /// Build a scope-aware prompt for built-in executors.
@@ -880,6 +928,14 @@ pub fn build_prompt(vars: &TemplateVars, scope: ContextScope, ctx: &ScopeContext
             "## Workgraph Usage Guide\n\n{}",
             ctx.wg_guide_content
         ));
+    }
+
+    // Task+ scope: native-executor file-tool guidance. Teaches the model
+    // that it has dedicated read_file/write_file/edit_file/grep/glob tools
+    // and should prefer them over bash equivalents (echo/cat/heredoc/sed).
+    // This is foundational — place it near the top of the guidance stack.
+    if scope >= ContextScope::Task && ctx.native_file_tools {
+        parts.push(NATIVE_FILE_TOOLS_SECTION.to_string());
     }
 
     // Task+ scope: workflow sections (with {{task_id}} substitution)

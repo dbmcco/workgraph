@@ -103,6 +103,10 @@ pub struct AgentLoop {
     state_injector: Option<StateInjector>,
     /// Registry entry for cost estimation (populated from spawn path).
     registry_entry: Option<crate::config::ModelRegistryEntry>,
+    /// Channels oversized tool outputs to disk so the message vec can never
+    /// be exploded by a single large tool call. The agent retrieves full
+    /// content via `bash` (cat/head/tail/sed/grep) on the handle path.
+    tool_output_channeler: Option<super::channel::ToolOutputChanneler>,
 }
 
 /// NDJSON log entry types for the output file.
@@ -206,6 +210,14 @@ impl AgentLoop {
             ContextBudget::with_window_size(client.context_window()).with_overhead(overhead)
         };
 
+        // Tool output channeler: writes oversized tool outputs to
+        // `<agent_dir>/tool-outputs/` and returns a handle. The agent dir is
+        // derived from the output_log's parent. If output_log has no parent
+        // (unusual), channeling is disabled and outputs pass through.
+        let tool_output_channeler = output_log.parent().map(|agent_dir| {
+            super::channel::ToolOutputChanneler::new(agent_dir.join("tool-outputs"))
+        });
+
         Self {
             client,
             tools,
@@ -225,6 +237,7 @@ impl AgentLoop {
             context_budget,
             state_injector: None,
             registry_entry: None,
+            tool_output_channeler,
         }
     }
 
@@ -1018,10 +1031,12 @@ impl AgentLoop {
                             sw.write_tool_end(name, output.is_error, *duration_ms);
                         }
 
-                        // Log the tool call
+                        // Log the tool call (full output goes to the NDJSON
+                        // log regardless of channeling — the log is on disk).
                         self.log_tool_call(name, input, &output.content, output.is_error);
 
-                        // Journal the tool execution
+                        // Journal the tool execution (full output goes to
+                        // the journal, same reason — on-disk history).
                         if let Some(ref mut j) = journal {
                             let _ = j.append(JournalEntryKind::ToolExecution {
                                 tool_use_id: id.clone(),
@@ -1040,9 +1055,21 @@ impl AgentLoop {
                             is_error: output.is_error,
                         });
 
+                        // Channel oversized outputs to disk before they
+                        // enter the message vec. This is the hard invariant
+                        // enforcement from Layer 1 of the reliability plan:
+                        // no single tool call can exceed the channel
+                        // threshold (default 2KiB) in the conversation.
+                        // Agents retrieve full content via bash
+                        // (cat/head/tail/sed/grep) on the path in the handle.
+                        let channeled_content = match &self.tool_output_channeler {
+                            Some(c) => c.maybe_channel(name, &output.content),
+                            None => output.content.clone(),
+                        };
+
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: output.content.clone(),
+                            content: channeled_content,
                             is_error: output.is_error,
                         });
                     }

@@ -333,6 +333,12 @@ pub(crate) fn spawn_agent_inner(
     let model_tier = super::context::classify_model_tier(model_str);
     scope_ctx.wg_guide_content = super::context::build_tiered_guide(dir, model_tier, model_str);
 
+    // Native executor exposes its own in-process file tools
+    // (`read_file`/`write_file`/`edit_file`/`grep`/`glob`). When spawning
+    // via native, inject the guidance section that teaches the model about
+    // those tools and warns against bash-based file manipulation.
+    scope_ctx.native_file_tools = settings.executor_type == "native";
+
     // Scope-based prompt assembly for built-in executors.
     // When no custom prompt_template is defined (built-in defaults),
     // use build_prompt() to assemble the prompt based on context scope.
