@@ -1515,7 +1515,10 @@ impl AgentLoop {
         // Handle slash commands on the first input too, so users can
         // start with `/help` or `/load session.json` from a cold prompt.
         if first_input.starts_with('/') {
-            match Self::handle_nex_slash_command(&first_input, &mut messages, &total_usage) {
+            match self
+                .handle_nex_slash_command(&first_input, &mut messages, &total_usage)
+                .await
+            {
                 NexSlashResult::Quit => {
                     let _ = editor.save_history(&history_path);
                     return Ok(AgentResult {
@@ -1568,11 +1571,10 @@ impl AgentLoop {
                         }
                         let _ = editor.add_history_entry(&trimmed);
                         if trimmed.starts_with('/') {
-                            match Self::handle_nex_slash_command(
-                                &trimmed,
-                                &mut messages,
-                                &total_usage,
-                            ) {
+                            match self
+                                .handle_nex_slash_command(&trimmed, &mut messages, &total_usage)
+                                .await
+                            {
                                 NexSlashResult::Quit => break,
                                 NexSlashResult::Continue => continue,
                                 NexSlashResult::NotASlashCommand => {
@@ -1706,11 +1708,10 @@ impl AgentLoop {
                             }
                             let _ = editor.add_history_entry(&trimmed);
                             if trimmed.starts_with('/') {
-                                match Self::handle_nex_slash_command(
-                                    &trimmed,
-                                    &mut messages,
-                                    &total_usage,
-                                ) {
+                                match self
+                                    .handle_nex_slash_command(&trimmed, &mut messages, &total_usage)
+                                    .await
+                                {
                                     NexSlashResult::Quit => break,
                                     NexSlashResult::Continue => continue,
                                     NexSlashResult::NotASlashCommand => {
@@ -1944,15 +1945,21 @@ impl AgentLoop {
     /// (they are NOT forwarded to the model as text).
     ///
     /// Supported commands:
-    /// - `/help`                   — print the command list
+    /// - `/help`, `/?`             — print the command list
     /// - `/quit`, `/exit`          — exit the REPL
     /// - `/clear`                  — clear conversation history
     /// - `/tokens`                 — print current cumulative token usage
     /// - `/save <path>`            — save session messages as JSON
     /// - `/load <path>`            — load session messages from JSON
-    /// - `/bg list|run|kill|...`   — shorthand for the `bg` tool (placeholder;
-    ///   currently prints a reminder to call the `bg` tool directly from the turn)
-    fn handle_nex_slash_command(
+    /// - `/bg run <cmd>`           — start a background task
+    /// - `/bg list`                — list all background jobs
+    /// - `/bg status <id>`         — show status of a specific job
+    /// - `/bg output <id> [lines]` — stream output from a job
+    /// - `/bg kill <id>`           — terminate a background job
+    /// - `/bg delete <id>`         — remove a terminated job from the registry
+    /// - `/cancel <id>`            — alias for `/bg kill <id>`
+    async fn handle_nex_slash_command(
+        &self,
         input: &str,
         messages: &mut Vec<Message>,
         total_usage: &Usage,
@@ -1971,13 +1978,19 @@ impl AgentLoop {
             "/help" | "/?" => {
                 eprintln!(
                     "\x1b[1mNex REPL commands:\x1b[0m\n\
-                     \x1b[1;36m  /help, /?\x1b[0m              — this message\n\
-                     \x1b[1;36m  /quit, /exit\x1b[0m           — exit the REPL (Ctrl-D also works)\n\
-                     \x1b[1;36m  /clear\x1b[0m                 — clear conversation history\n\
-                     \x1b[1;36m  /tokens\x1b[0m                — show current cumulative token usage\n\
-                     \x1b[1;36m  /save <path>\x1b[0m           — save current session to JSON file\n\
-                     \x1b[1;36m  /load <path>\x1b[0m           — load session from JSON file (replaces current)\n\
-                     \x1b[1;36m  /bg\x1b[0m                    — hint to use the bg tool from your next turn\n\
+                     \x1b[1;36m  /help, /?\x1b[0m                    — this message\n\
+                     \x1b[1;36m  /quit, /exit\x1b[0m                 — exit the REPL (Ctrl-D also works)\n\
+                     \x1b[1;36m  /clear\x1b[0m                       — clear conversation history\n\
+                     \x1b[1;36m  /tokens\x1b[0m                      — show cumulative token usage\n\
+                     \x1b[1;36m  /save <path>\x1b[0m                 — save session to JSON file\n\
+                     \x1b[1;36m  /load <path>\x1b[0m                 — load session from JSON file\n\
+                     \x1b[1;36m  /bg run <cmd>\x1b[0m                — start a background task\n\
+                     \x1b[1;36m  /bg list\x1b[0m                     — list all background jobs\n\
+                     \x1b[1;36m  /bg status <id>\x1b[0m              — show status of a job\n\
+                     \x1b[1;36m  /bg output <id> [lines]\x1b[0m      — stream output of a job\n\
+                     \x1b[1;36m  /bg kill <id>\x1b[0m                — kill a background job\n\
+                     \x1b[1;36m  /bg delete <id>\x1b[0m              — remove terminated job from registry\n\
+                     \x1b[1;36m  /cancel <id>\x1b[0m                 — alias for /bg kill <id>\n\
                      \n\
                      \x1b[2mCtrl-C during generation cancels the in-flight response.\x1b[0m\n\
                      \x1b[2mCtrl-C at the prompt is a no-op (use /quit or Ctrl-D to exit).\x1b[0m"
@@ -2044,13 +2057,104 @@ impl AgentLoop {
             }
 
             "/bg" => {
-                eprintln!(
-                    "\x1b[2m[nex] To manage background jobs, tell the model to call the `bg` tool. \
-                     Example prompts:\n\
-                     \x20  'run cargo build in the background'\n\
-                     \x20  'list my background jobs'\n\
-                     \x20  'kill background job <id>'\x1b[0m"
-                );
+                // Parse the bg subcommand.
+                let mut bg_parts = arg.splitn(2, char::is_whitespace);
+                let action = bg_parts.next().unwrap_or("");
+                let rest = bg_parts.next().unwrap_or("").trim();
+                if action.is_empty() {
+                    eprintln!(
+                        "\x1b[31m[nex] /bg requires an action: run|list|status|output|kill|delete\x1b[0m"
+                    );
+                    return NexSlashResult::Continue;
+                }
+                let input_json = match action {
+                    "run" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg run requires a command\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({
+                            "action": "run",
+                            "command": rest,
+                        })
+                    }
+                    "list" => serde_json::json!({ "action": "list" }),
+                    "status" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg status requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "status", "job": rest })
+                    }
+                    "kill" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg kill requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "kill", "job": rest })
+                    }
+                    "output" => {
+                        let mut out_parts = rest.splitn(2, char::is_whitespace);
+                        let job = out_parts.next().unwrap_or("").trim();
+                        if job.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg output requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        let lines: Option<i64> =
+                            out_parts.next().and_then(|s| s.trim().parse().ok());
+                        if let Some(n) = lines {
+                            serde_json::json!({
+                                "action": "output",
+                                "job": job,
+                                "lines": n,
+                            })
+                        } else {
+                            serde_json::json!({ "action": "output", "job": job })
+                        }
+                    }
+                    "delete" => {
+                        if rest.is_empty() {
+                            eprintln!("\x1b[31m[nex] /bg delete requires a job id/name\x1b[0m");
+                            return NexSlashResult::Continue;
+                        }
+                        serde_json::json!({ "action": "delete", "job": rest })
+                    }
+                    other => {
+                        eprintln!(
+                            "\x1b[31m[nex] /bg: unknown action '{}'\x1b[0m — use run|list|status|output|kill|delete",
+                            other
+                        );
+                        return NexSlashResult::Continue;
+                    }
+                };
+
+                // Call the bg tool directly through the registry. No LLM
+                // round-trip — the REPL gets immediate feedback.
+                let result = self.tools.execute("bg", &input_json).await;
+                if result.is_error {
+                    eprintln!("\x1b[31m[nex] /bg error: {}\x1b[0m", result.content);
+                } else {
+                    // Print the tool result indented so it's visible as
+                    // output, not conversation.
+                    for line in result.content.lines() {
+                        eprintln!("\x1b[2m  {}\x1b[0m", line);
+                    }
+                }
+                NexSlashResult::Continue
+            }
+
+            "/cancel" => {
+                if arg.is_empty() {
+                    eprintln!("\x1b[31m[nex] /cancel requires a job id/name\x1b[0m");
+                    return NexSlashResult::Continue;
+                }
+                let input_json = serde_json::json!({ "action": "kill", "job": arg });
+                let result = self.tools.execute("bg", &input_json).await;
+                if result.is_error {
+                    eprintln!("\x1b[31m[nex] /cancel error: {}\x1b[0m", result.content);
+                } else {
+                    eprintln!("\x1b[2m[nex] {}\x1b[0m", result.content.trim());
+                }
                 NexSlashResult::Continue
             }
 
