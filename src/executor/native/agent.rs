@@ -485,6 +485,15 @@ impl AgentLoop {
         let mut tool_calls = Vec::new();
         let mut turns = 0;
         let mut consecutive_server_errors: u32 = 0;
+        // Consecutive proactive compactions that reduced zero tokens. When
+        // this hits ESCALATION_THRESHOLD, we escalate from soft emergency
+        // compact (tool-results only) to hard emergency compact (also strips
+        // Text/Thinking in elided messages) to prevent the plateau-then-
+        // hard-limit failure mode where the model's own Text/Thinking content
+        // keeps growing past the threshold even though tool-result compaction
+        // is already saturated.
+        let mut consecutive_noop_compactions: u32 = 0;
+        const NOOP_COMPACTION_ESCALATION_THRESHOLD: u32 = 2;
         const MAX_CONSECUTIVE_SERVER_ERRORS: u32 = 3;
 
         loop {
@@ -1144,16 +1153,43 @@ impl AgentLoop {
                     // for chatty file-reading workloads).
                     let pre_tokens = self.context_budget.effective_tokens(&messages);
                     let pre_count = messages.len();
-                    messages = ContextBudget::emergency_compact(messages, 2);
+
+                    // Decide whether to escalate from soft to hard. After
+                    // NOOP_COMPACTION_ESCALATION_THRESHOLD consecutive no-op
+                    // fires (soft compact has nothing left to shrink in tool
+                    // results), we need to also prune Text/Thinking in older
+                    // messages — that's what `hard_emergency_compact` does.
+                    let should_escalate =
+                        consecutive_noop_compactions >= NOOP_COMPACTION_ESCALATION_THRESHOLD;
+
+                    messages = if should_escalate {
+                        ContextBudget::hard_emergency_compact(messages, 1)
+                    } else {
+                        ContextBudget::emergency_compact(messages, 2)
+                    };
+
                     let post_tokens = self.context_budget.effective_tokens(&messages);
                     let delta = pre_tokens.saturating_sub(post_tokens);
+
+                    // Update consecutive-noop counter. Reset on any non-zero
+                    // reduction OR when we just escalated (the escalation
+                    // counted as a "fresh start" attempt, regardless of delta).
+                    if delta > 0 || should_escalate {
+                        consecutive_noop_compactions = 0;
+                    } else {
+                        consecutive_noop_compactions =
+                            consecutive_noop_compactions.saturating_add(1);
+                    }
+
                     eprintln!(
-                        "[native-agent] Proactive compaction: ~{} → ~{} tokens (Δ -{}, {} messages, overhead {} kept, keep_recent_tool_results=2)",
+                        "[native-agent] {} compaction: ~{} → ~{} tokens (Δ -{}, {} messages, overhead {} kept, noop_streak={})",
+                        if should_escalate { "Escalated hard" } else { "Proactive" },
                         pre_tokens,
                         post_tokens,
                         delta,
                         pre_count,
-                        self.context_budget.overhead_tokens
+                        self.context_budget.overhead_tokens,
+                        consecutive_noop_compactions,
                     );
 
                     // Journal the compaction event
