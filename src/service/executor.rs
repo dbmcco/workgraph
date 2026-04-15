@@ -603,38 +603,78 @@ const WG_CONTEXT_HINT: &str = "\
 - Use `wg context` to view the current task's full context
 - Use `wg list` to see all tasks and their statuses\n";
 
-/// Native executor file-tool guidance. Injected into the prompt only when
-/// the executor is `native`, since these tool names (`read_file`,
-/// `write_file`, `edit_file`, `grep`, `glob`) are specific to the native
+/// Native executor tool guidance. Injected into the prompt only when the
+/// executor is `native`, since these tool names are specific to the native
 /// executor's in-process tool registry — claude/amplifier/etc. have
-/// different names (Read/Edit/Write) provided by their own runtimes.
+/// different names provided by their own runtimes.
 ///
-/// The goal is to push models away from bash-based file manipulation
-/// (echo/cat/heredoc/sed), which is fragile across shell escaping rules
-/// for multi-line content, and toward the dedicated tools which take
-/// structured JSON input and return structured results.
+/// The goal is to make the full native toolset visible in the system
+/// prompt narrative, not just as API tool definitions. Models — especially
+/// smaller ones with strong bash training priors — otherwise default to
+/// shell-based workarounds for problems that have better first-class tools
+/// (echo/heredoc for file creation, sed for editing, curl for web access,
+/// polling loops for async work, etc.).
 pub const NATIVE_FILE_TOOLS_SECTION: &str = "\
-## Native Executor File Tools
+## Native Executor Tools
 
-You have dedicated file tools. **Prefer these over bash equivalents** — they are \
-more reliable (no shell escaping) and return structured results.
+You have a rich in-process toolset. **Prefer the dedicated tool over a bash \
+equivalent whenever one exists.** Bash is for things without a dedicated tool.
 
-- `read_file(path, offset?, limit?)` — read a file or a slice of it. Use instead of \
-`cat`/`head`/`tail`.
-- `write_file(path, content)` — create or overwrite a file. Use instead of `echo >`, \
-`cat <<EOF`, or any bash heredoc. **Shell escaping of multi-line content is fragile \
-and breaks on quotes, newlines, and special characters** — this is the single most \
-common cause of failed file creation.
-- `edit_file(path, old_string, new_string)` — surgical in-place replacement. Use \
-instead of `sed -i`. `old_string` must appear exactly once; include surrounding \
+### File operations (no shell escaping, structured results)
+
+- `read_file(path, offset?, limit?)` — read a file or a slice. Replaces `cat`/`head`/`tail`.
+- `write_file(path, content)` — create or overwrite a file. Replaces `echo >` and \
+heredocs. **Shell escaping of multi-line content is fragile — this is the #1 cause \
+of failed file creation.** Never use bash for new-file creation.
+- `edit_file(path, old_string, new_string)` — surgical in-place replacement. \
+Replaces `sed -i`. `old_string` must appear exactly once; include surrounding \
 context when needed to make it unique.
-- `grep(pattern, path?, ...)` — search file contents. Use instead of `grep -r`.
-- `glob(pattern)` — find files by name pattern. Use instead of `find` or shell globbing.
+- `grep(pattern, path?, ...)` — search file contents. Replaces `grep -r`.
+- `glob(pattern)` — find files by name pattern. Replaces `find` and shell globbing.
 
-Use `bash` for everything else: running programs (tests, builds, scripts), system \
-inspection (`ps`, `df`, `env`), piped operations, or anything that inherently needs \
-shell execution. **Never use bash for file creation or in-place editing of existing \
-files** — use the dedicated tools above.
+### Running programs
+
+- `bash(command)` — **synchronous** shell execution. Use for tests, builds, \
+system inspection, and quick one-shots. Outputs >2KB are channeled to disk \
+automatically (see below).
+- `bg(action, ...)` — **background/detached** execution for long-running commands \
+(cargo build, test suites, servers) that would otherwise block your turn loop. \
+Actions: `run`, `list`, `status`, `output`, `kill`, `delete`. Completion \
+notifications inject into your next turn automatically. **Use `bg` — never \
+`bash: nohup X &` or `while sleep; do check; done` — for anything longer than a \
+few seconds.**
+
+### Web access (structured content, no HTML parsing)
+
+- `web_search(query, max_results?)` — search the web, get ranked title/URL/snippet \
+results. Use instead of shelling out to curl+scraping.
+- `web_fetch(url)` — fetch a page and get clean markdown (navigation/ads/scripts \
+stripped, code blocks and tables preserved). Use instead of `bash: curl $URL` which \
+gives you raw HTML.
+
+### Delegation (focused sub-agent with its own context)
+
+- `delegate(prompt, exec_mode?, max_turns?)` — spawn a focused in-process sub-agent \
+with its own conversation context. **The sub-agent's token usage does NOT count \
+against your context** — only its final result text does. Use this for focused \
+queries that would otherwise bloat your own context window: \"read src/X.rs and list \
+its public functions\", \"find all callers of Y\", \"summarize the tests in tests/Z/\". \
+`exec_mode=light` (default) gives read-only tools; `exec_mode=full` gives the full \
+set minus `delegate` itself. `max_turns` caps the sub-agent at 5 (default) to 20 turns.
+
+### Workgraph task management (in-process, no CLI spawn)
+
+- `wg_show(task_id)`, `wg_list()`, `wg_log(task_id, message)` — inspect and \
+annotate tasks.
+- `wg_add(title, description?, after?, tags?, skills?)` — create follow-up tasks \
+(e.g., \"Verify: ...\" after your current task for fan-out).
+- `wg_done(task_id)`, `wg_fail(task_id, reason)`, `wg_artifact(task_id, path)` — \
+lifecycle operations.
+
+Prefer these over `bash: wg show ...` — they take structured input and return \
+structured results. For advanced flags not in the tool schemas \
+(`--subtask` for blocking subtask, `--cron \"expr\"` for scheduled tasks), fall \
+back to `bash: wg add --subtask ...` or `bash: wg add --cron ...`.
 
 ### Channeled tool outputs
 
@@ -644,6 +684,19 @@ conversation with a compact handle plus a short preview. The raw bytes are alway
 on disk — do NOT re-fetch from the original source. To read more from a channeled \
 output, use either `read_file` with `offset`/`limit` on the handle path, or `bash` \
 for text slicing (`sed -n 'A,Bp'`, `grep -n`, `wc -l`, `head`, `tail`).
+
+### Anti-patterns — DO NOT do these
+
+- `echo \"...\" > file` → use `write_file`
+- `cat <<EOF > file ... EOF` → use `write_file`
+- `sed -i 's/a/b/' file` → use `edit_file`
+- `find . -name '*.rs'` → use `glob` with `**/*.rs`
+- `grep -r foo src/` → use `grep`
+- `curl $URL | lynx -dump` → use `web_fetch`
+- `nohup long_command &` / `tmux new-session` → use `bg run`
+- `while ! ls output; do sleep 5; done` → use `bg` with status checks
+- Reading a whole huge file into context when you only need a slice → use \
+`read_file(offset, limit)` or `delegate` to a sub-agent
 ";
 
 /// Default workgraph usage guide for non-Claude models.
