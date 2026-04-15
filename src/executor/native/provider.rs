@@ -62,6 +62,38 @@ pub fn create_provider(workgraph_dir: &Path, model: &str) -> Result<Box<dyn Prov
     create_provider_ext(workgraph_dir, model, None, None, None)
 }
 
+/// Parse the `<endpoint>:<model>` shorthand in the model string.
+///
+/// Allows callers to write `lambda01:qwen3-coder-30b` as the model
+/// string and have it picked up as if `endpoint_name = Some("lambda01")`
+/// and `model = "qwen3-coder-30b"` had been passed explicitly. The
+/// shorthand is ONLY applied when:
+///
+/// 1. No explicit `endpoint_name` was passed (explicit always wins).
+/// 2. The prefix is NOT a known provider (so `openai:qwen3-coder-30b`
+///    keeps its legacy meaning of "openai provider, model qwen3-coder-30b").
+/// 3. The prefix matches a named endpoint in the config's
+///    `[[llm_endpoints.endpoints]]` table.
+///
+/// Returns `(endpoint_name, effective_model_string)`. If the shorthand
+/// did not apply, returns the inputs unchanged.
+fn parse_endpoint_model_shorthand(
+    config: &crate::config::Config,
+    model: &str,
+    endpoint_name: Option<&str>,
+) -> (Option<String>, String) {
+    if endpoint_name.is_some() {
+        return (endpoint_name.map(String::from), model.to_string());
+    }
+    if let Some((prefix, rest)) = model.split_once(':')
+        && !crate::config::KNOWN_PROVIDERS.contains(&prefix)
+        && config.llm_endpoints.find_by_name(prefix).is_some()
+    {
+        return (Some(prefix.to_string()), rest.to_string());
+    }
+    (None, model.to_string())
+}
+
 /// Create a provider, optionally overriding the provider name, endpoint, and/or API key.
 ///
 /// Resolution order for API key:
@@ -82,6 +114,12 @@ pub fn create_provider_ext(
     api_key_override: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
     let config = crate::config::Config::load_or_default(workgraph_dir);
+
+    // Endpoint-in-model shorthand — see `parse_endpoint_model_shorthand`.
+    let (endpoint_name_owned, effective_model_str) =
+        parse_endpoint_model_shorthand(&config, model, endpoint_name);
+    let endpoint_name = endpoint_name_owned.as_deref();
+    let model = effective_model_str.as_str();
 
     // Load merged TOML value (global + local) for legacy [native_executor] access
     let config_val: Option<toml::Value> =
@@ -279,5 +317,80 @@ pub fn create_provider_ext(
             eprintln!("[native-exec] Using Anthropic provider ({})", client.model);
             Ok(Box::new(client))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, EndpointConfig, EndpointsConfig};
+
+    fn config_with_endpoint(name: &str) -> Config {
+        let mut config = Config::default();
+        config.llm_endpoints = EndpointsConfig {
+            endpoints: vec![EndpointConfig {
+                name: name.to_string(),
+                provider: "openai".to_string(),
+                url: Some("https://example.com/v1".to_string()),
+                model: None,
+                api_key: None,
+                api_key_env: None,
+                api_key_file: None,
+                is_default: false,
+                context_window: Some(32768),
+            }],
+        };
+        config
+    }
+
+    #[test]
+    fn shorthand_splits_endpoint_and_model_when_prefix_is_endpoint_name() {
+        let config = config_with_endpoint("lambda01");
+        let (ep, model) = parse_endpoint_model_shorthand(&config, "lambda01:qwen3-coder-30b", None);
+        assert_eq!(ep.as_deref(), Some("lambda01"));
+        assert_eq!(model, "qwen3-coder-30b");
+    }
+
+    #[test]
+    fn shorthand_ignored_when_explicit_endpoint_name_passed() {
+        let config = config_with_endpoint("lambda01");
+        let (ep, model) = parse_endpoint_model_shorthand(
+            &config,
+            "lambda01:qwen3-coder-30b",
+            Some("other-endpoint"),
+        );
+        // Explicit wins — the shorthand is NOT applied and the model
+        // string is passed through untouched.
+        assert_eq!(ep.as_deref(), Some("other-endpoint"));
+        assert_eq!(model, "lambda01:qwen3-coder-30b");
+    }
+
+    #[test]
+    fn shorthand_ignored_when_prefix_is_known_provider() {
+        // `openai:...` is a known provider prefix — backward-compat
+        // says it keeps meaning "openai provider, model X" even if
+        // someone also has an endpoint named "openai" configured.
+        let config = config_with_endpoint("openai");
+        let (ep, model) = parse_endpoint_model_shorthand(&config, "openai:qwen3-coder-30b", None);
+        assert_eq!(ep, None);
+        assert_eq!(model, "openai:qwen3-coder-30b");
+    }
+
+    #[test]
+    fn shorthand_ignored_when_prefix_is_not_a_configured_endpoint() {
+        let config = config_with_endpoint("lambda01");
+        let (ep, model) =
+            parse_endpoint_model_shorthand(&config, "unknown-endpoint:some-model", None);
+        // Prefix is not a provider and not an endpoint — passthrough.
+        assert_eq!(ep, None);
+        assert_eq!(model, "unknown-endpoint:some-model");
+    }
+
+    #[test]
+    fn shorthand_ignored_for_bare_model_names_without_colon() {
+        let config = config_with_endpoint("lambda01");
+        let (ep, model) = parse_endpoint_model_shorthand(&config, "qwen3-coder-30b", None);
+        assert_eq!(ep, None);
+        assert_eq!(model, "qwen3-coder-30b");
     }
 }
