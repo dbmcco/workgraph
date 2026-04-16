@@ -137,6 +137,11 @@ enum Backend {
     /// distinguish us from a human browsing. Heavier than the reqwest
     /// backends (requires a chrome process) but more reliable.
     Browser,
+    /// Brave Search API — paid backend gated on BRAVE_SEARCH_API_KEY
+    /// env var. High-quality general search results. Free tier allows
+    /// 1 req/sec, paid allows 20 req/sec. Falls back gracefully via
+    /// circuit breaker when the key is not set.
+    Brave,
 }
 
 impl Backend {
@@ -151,6 +156,7 @@ impl Backend {
             Backend::CratesIo => "crates_io",
             Backend::Arxiv => "arxiv",
             Backend::Browser => "headless_chrome_ddg",
+            Backend::Brave => "brave_search",
         }
     }
 
@@ -181,6 +187,9 @@ impl Backend {
             // is slower than most real users but a reasonable floor
             // for a tool making many calls per session.
             Backend::Browser => Duration::from_millis(2000),
+            // Brave Search API: free tier 1 req/sec, paid 20 req/sec.
+            // 500ms is conservative enough for both tiers.
+            Backend::Brave => Duration::from_millis(500),
         }
     }
 
@@ -198,6 +207,7 @@ impl Backend {
             Backend::CratesIo,
             Backend::Arxiv,
             Backend::Browser,
+            Backend::Brave,
             Backend::DdgHtml,
         ]
     }
@@ -343,17 +353,17 @@ impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_search".to_string(),
-            description: "Search the web via parallel fan-out across multiple free backends: \
+            description: "Search the web via parallel fan-out across multiple backends: \
                           Wikipedia, Google News RSS, Hacker News, GitHub, Stack Exchange, \
-                          crates.io, arxiv, headless Chrome driving DuckDuckGo, and reqwest \
-                          DuckDuckGo HTML. Every query hits all available backends in \
-                          parallel, results are merged by URL and ranked by multi-source \
-                          agreement. Each result lists the backends that returned it under \
-                          `sources`. Response includes `backends_consulted` and \
-                          `backends_responded`. Results are cached for 10 minutes. Returns \
-                          an error (not an empty list) when every backend failed — on error, \
-                          try `web_fetch` against a specific URL or `bash` with `curl` \
-                          as a fallback."
+                          crates.io, arxiv, Brave Search (if BRAVE_SEARCH_API_KEY is set), \
+                          headless Chrome driving DuckDuckGo, and reqwest DuckDuckGo HTML. \
+                          Every query hits all available backends in parallel, results are \
+                          merged by URL and ranked by multi-source agreement. Each result \
+                          lists the backends that returned it under `sources`. Response \
+                          includes `backends_consulted` and `backends_responded`. Results \
+                          are cached for 10 minutes. Returns an error (not an empty list) \
+                          when every backend failed — on error, try `web_fetch` against a \
+                          specific URL or `bash` with `curl` as a fallback."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -702,6 +712,7 @@ async fn dispatch(
         Backend::CratesIo => search_crates_io(client, query).await,
         Backend::Arxiv => search_arxiv(client, query).await,
         Backend::Browser => search_browser_chrome(query).await,
+        Backend::Brave => search_brave(client, query).await,
     }
 }
 
@@ -1250,6 +1261,74 @@ fn parse_arxiv_atom(body: &str) -> Vec<SearchResult> {
     results
 }
 
+// ─── Backend: Brave Search API ─────────────────────────────────────────
+
+async fn search_brave(client: &rquest::Client, query: &str) -> Result<Vec<SearchResult>, String> {
+    let api_key = std::env::var("BRAVE_SEARCH_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "BRAVE_SEARCH_API_KEY not set".to_string())?;
+
+    let url = format!(
+        "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+        urlencoding::encode(query),
+        MAX_RESULTS
+    );
+
+    // Brave requires the API key in X-Subscription-Token header
+    let body = client
+        .get(&url)
+        .header("X-Subscription-Token", &api_key)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("Brave request: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Brave body: {}", e))?;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Brave JSON: {}", e))?;
+
+    let results = v
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array())
+        .ok_or_else(|| "Brave response missing web.results".to_string())?;
+
+    let mut out = Vec::new();
+    for item in results {
+        let title = item
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let url = item
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = item
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        out.push(SearchResult {
+            title,
+            snippet: truncate_snippet(&description),
+            url,
+            sources: Vec::new(),
+        });
+        if out.len() >= MAX_RESULTS {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 // ─── Backend: headless Chrome driving DuckDuckGo HTML ──────────────────
 
 /// Shared handle to a single long-lived headless Chrome process. We
@@ -1700,6 +1779,7 @@ mod tests {
         assert!(all.contains(&Backend::News));
         assert!(all.contains(&Backend::HackerNews));
         assert!(all.contains(&Backend::DdgHtml));
+        assert!(all.contains(&Backend::Brave));
     }
 
     #[test]
