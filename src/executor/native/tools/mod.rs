@@ -5,6 +5,7 @@
 
 pub mod bash;
 pub mod bg;
+pub mod deep_research;
 pub mod delegate;
 pub mod file;
 pub mod file_cache;
@@ -417,6 +418,9 @@ impl ToolRegistry {
 
         // Research tool (high-level: search + fetch + summarize in one call)
         research::register_research_tool(&mut registry, workgraph_dir.to_path_buf());
+
+        // Deep research (decompose → fan out via research → synthesize)
+        deep_research::register_deep_research_tool(&mut registry, workgraph_dir.to_path_buf());
 
         registry
     }

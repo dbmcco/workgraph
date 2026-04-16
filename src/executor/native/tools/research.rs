@@ -35,8 +35,8 @@ pub fn register_research_tool(registry: &mut super::ToolRegistry, workgraph_dir:
     registry.register(Box::new(ResearchTool { workgraph_dir }));
 }
 
-struct ResearchTool {
-    workgraph_dir: PathBuf,
+pub(crate) struct ResearchTool {
+    pub(crate) workgraph_dir: PathBuf,
 }
 
 #[async_trait]
