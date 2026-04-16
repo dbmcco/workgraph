@@ -295,9 +295,14 @@ pub(crate) fn spawn_agent_inner(
     let output_file_str = output_file.to_string_lossy().to_string();
 
     // --- Worktree isolation ---
-    // When enabled, each agent gets its own git worktree for file-level isolation.
-    // Falls back gracefully if worktree creation fails (e.g., not a git repo).
-    let worktree_info = if config.coordinator.worktree_isolation {
+    // See `should_create_worktree` for the gating rules.
+    let needs_worktree = should_create_worktree(
+        config.coordinator.worktree_isolation,
+        task_id,
+        resolved_exec_mode.as_str(),
+    );
+
+    let worktree_info = if needs_worktree {
         let project_root = dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from {:?}", dir))?;
@@ -318,6 +323,12 @@ pub(crate) fn spawn_agent_inner(
             }
         }
     } else {
+        if config.coordinator.worktree_isolation {
+            eprintln!(
+                "[spawn] Skipping worktree for {} (task '{}', exec_mode={}): meta or non-writing task",
+                temp_agent_id, task_id, resolved_exec_mode
+            );
+        }
         None
     };
 
@@ -735,9 +746,13 @@ pub(crate) fn spawn_agent_inner(
                     task_id, rollback_err
                 );
             }
-            // Clean up worktree on spawn failure
+            // Worktrees are sacred — preserved even on spawn failure so the
+            // user can inspect what was set up. Remove via `wg worktree archive --remove`.
             if let Some(ref wt) = worktree_info {
-                let _ = worktree::remove_worktree(&wt.project_root, &wt.path, &wt.branch);
+                eprintln!(
+                    "[spawn] Spawn failed for task '{}' — preserving worktree at {:?} (remove via: wg worktree archive <agent-id> --remove)",
+                    task_id, wt.path
+                );
             }
             return Err(anyhow::anyhow!(
                 "Failed to spawn executor '{}' (command: {}): {}",
@@ -809,6 +824,38 @@ pub(crate) fn spawn_agent_inner(
         output_file: output_file_str,
         model: effective_model,
     })
+}
+
+/// Decide whether a spawning agent should get its own git worktree.
+///
+/// Worktrees provide file-level isolation for agents that may edit source code.
+/// They are skipped for tasks that don't touch the source tree:
+///
+/// - **System/meta tasks** (`.assign-*`, `.flip-*`, `.evaluate-*`, `.place-*`,
+///   `.compact-*`, etc.) only call LLMs and mutate graph state — they never
+///   write to the filesystem. Identified by the leading `.` prefix convention
+///   documented in `graph.rs`.
+/// - **`bare` exec mode** — coordination-only tasks with just the `wg` CLI;
+///   cannot write to the source tree.
+/// - **`light` exec mode** — read-only tools for research/review tasks;
+///   cannot write to the source tree.
+///
+/// Code-touching tasks (`full`, `shell`) still get isolated worktrees.
+pub(crate) fn should_create_worktree(
+    worktree_isolation_enabled: bool,
+    task_id: &str,
+    exec_mode: &str,
+) -> bool {
+    if !worktree_isolation_enabled {
+        return false;
+    }
+    if task_id.starts_with('.') {
+        return false;
+    }
+    if matches!(exec_mode, "bare" | "light") {
+        return false;
+    }
+    true
 }
 
 /// Build the inner command string for the executor.
@@ -1268,15 +1315,9 @@ Squash-merged from worktree branch $WG_BRANCH" 2>> "$OUTPUT_FILE"
         fi
     fi
 
-    # Only clean up the worktree on success; preserve on failure for debugging/retry
-    if [ "$TASK_STATUS_FINAL" = "done" ] || [ "$TASK_STATUS_FINAL" = "pending-validation" ]; then
-        rm -f "$WG_WORKTREE_PATH/.workgraph" 2>/dev/null
-        git -C "$WG_PROJECT_ROOT" worktree remove --force "$WG_WORKTREE_PATH" 2>/dev/null
-        git -C "$WG_PROJECT_ROOT" branch -D "$WG_BRANCH" 2>/dev/null
-        echo "[wrapper] Cleaned up worktree at $WG_WORKTREE_PATH" >> "$OUTPUT_FILE"
-    else
-        echo "[wrapper] TASK_STATUS_FINAL is '$TASK_STATUS_FINAL' (failed or non-success) — skip cleanup, preserving worktree at $WG_WORKTREE_PATH for debugging" >> "$OUTPUT_FILE"
-    fi
+    # Worktrees are sacred — never auto-removed. Use `wg worktree archive <agent-id> --remove`
+    # to remove an agent's worktree by explicit user action.
+    echo "[wrapper] Task finished with status '$TASK_STATUS_FINAL' — worktree preserved at $WG_WORKTREE_PATH (remove via: wg worktree archive $WG_AGENT_ID --remove)" >> "$OUTPUT_FILE"
 fi
 
 exit $EXIT_CODE
@@ -1699,6 +1740,48 @@ fn handle_cost_cap_violation(
 mod tests {
     use super::*;
     use workgraph::config::CLAUDE_OPUS_MODEL_ID;
+
+    // --- should_create_worktree tests ---
+
+    #[test]
+    fn test_worktree_gate_disabled_globally() {
+        assert!(!should_create_worktree(false, "my-task", "full"));
+        assert!(!should_create_worktree(false, "my-task", "shell"));
+    }
+
+    #[test]
+    fn test_worktree_gate_full_and_shell_get_worktree() {
+        assert!(should_create_worktree(true, "my-task", "full"));
+        assert!(should_create_worktree(true, "my-task", "shell"));
+    }
+
+    #[test]
+    fn test_worktree_gate_bare_and_light_skip() {
+        assert!(!should_create_worktree(true, "my-task", "bare"));
+        assert!(!should_create_worktree(true, "my-task", "light"));
+    }
+
+    #[test]
+    fn test_worktree_gate_meta_tasks_skip_regardless_of_exec_mode() {
+        // System/meta tasks never get worktrees — they only touch graph state.
+        for prefix in [".assign-", ".flip-", ".evaluate-", ".place-", ".compact-"] {
+            let task_id = format!("{}my-real-task", prefix);
+            for exec_mode in ["full", "shell", "bare", "light"] {
+                assert!(
+                    !should_create_worktree(true, &task_id, exec_mode),
+                    "meta task {} with exec_mode={} should not get worktree",
+                    task_id,
+                    exec_mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_worktree_gate_unknown_exec_mode_defaults_to_worktree() {
+        // Conservative default: unrecognized modes get a worktree (fail-safe for writes).
+        assert!(should_create_worktree(true, "my-task", "future-mode-xyz"));
+    }
 
     // --- resolve_model_and_provider tests ---
 

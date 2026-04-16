@@ -29,14 +29,14 @@
 //! `docs/design/todo-web-search-fixes.md` for full ecosystem context.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use lru::LruCache;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -70,11 +70,10 @@ const BROWSER_USER_AGENT: &str =
 const CHROME_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// Query cache time-to-live. Same query within this window returns the
-/// cached response without hitting any backend.
-const CACHE_TTL: Duration = Duration::from_secs(600);
-
-/// Maximum number of cached query responses kept in memory.
-const CACHE_CAPACITY: usize = 128;
+/// cached response without hitting any backend. 7 days is long enough
+/// to absorb repeat research queries across sessions, short enough that
+/// news-flavored queries don't go stale for too long.
+const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How many consecutive failures trip the circuit breaker for a backend.
 const CIRCUIT_THRESHOLD: u32 = 3;
@@ -213,13 +212,111 @@ impl Backend {
     }
 }
 
-// ─── Politeness state: cache + rate limits + circuit breakers ───────────
+// ─── Persistent disk cache ──────────────────────────────────────────────
+//
+// SQLite-backed cache at `~/.workgraph/web-cache.db`, shared across
+// sessions and projects. Repeat queries within `CACHE_TTL` return the
+// stored response without hitting any backend — at research scale this
+// cuts an order of magnitude off query volume.
+//
+// Override path for tests via the `WG_WEB_CACHE_DB` env var.
 
-struct CachedEntry {
-    /// Pre-serialized JSON response, ready to return as tool output.
-    response: String,
-    at: Instant,
+fn cache_db_path() -> PathBuf {
+    if let Ok(override_path) = std::env::var("WG_WEB_CACHE_DB") {
+        return PathBuf::from(override_path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".workgraph")
+        .join("web-cache.db")
 }
+
+fn open_cache_db() -> rusqlite::Result<Connection> {
+    let path = cache_db_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS web_search_cache (
+             query_key  TEXT PRIMARY KEY,
+             response   TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_web_search_cache_created_at
+             ON web_search_cache(created_at);",
+    )?;
+    Ok(conn)
+}
+
+static CACHE_DB: OnceLock<Option<StdMutex<Connection>>> = OnceLock::new();
+
+fn cache_db() -> Option<&'static StdMutex<Connection>> {
+    CACHE_DB
+        .get_or_init(|| match open_cache_db() {
+            Ok(conn) => Some(StdMutex::new(conn)),
+            Err(e) => {
+                eprintln!(
+                    "[web_search] disk cache init failed: {} — continuing without persistence",
+                    e
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Inner cache read — testable with any connection, no globals.
+fn cache_get_with(conn: &Connection, key: &str, cutoff_created_at: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT response FROM web_search_cache \
+         WHERE query_key = ?1 AND created_at > ?2",
+        params![key, cutoff_created_at],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Inner cache write — testable with any connection, no globals.
+fn cache_put_with(conn: &Connection, key: &str, response: &str, created_at: i64) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO web_search_cache (query_key, response, created_at) \
+         VALUES (?1, ?2, ?3)",
+        params![key, response, created_at],
+    );
+}
+
+/// Look up a fresh cached response for this query. Returns `None` on miss,
+/// stale entry, or any DB error.
+fn cache_get(key: &str) -> Option<String> {
+    let db = cache_db()?;
+    let conn = db.lock().ok()?;
+    let cutoff = now_unix_secs().saturating_sub(CACHE_TTL.as_secs()) as i64;
+    cache_get_with(&conn, key, cutoff)
+}
+
+/// Store a response for this query. Silently drops on any DB error —
+/// cache writes are never critical-path.
+fn cache_put(key: &str, response: &str) {
+    let Some(db) = cache_db() else {
+        return;
+    };
+    let Ok(conn) = db.lock() else {
+        return;
+    };
+    cache_put_with(&conn, key, response, now_unix_secs() as i64);
+}
+
+// ─── Politeness state: rate limits + circuit breakers ───────────────────
 
 #[derive(Default)]
 struct BackendLimiter {
@@ -233,7 +330,6 @@ struct CircuitState {
 }
 
 struct PolitenessState {
-    cache: LruCache<String, CachedEntry>,
     limiters: HashMap<Backend, BackendLimiter>,
     breakers: HashMap<Backend, CircuitState>,
 }
@@ -241,35 +337,9 @@ struct PolitenessState {
 impl PolitenessState {
     fn new() -> Self {
         Self {
-            cache: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
             limiters: HashMap::new(),
             breakers: HashMap::new(),
         }
-    }
-
-    /// Fetch a cached response if present and fresh. Expired entries
-    /// are evicted as a side effect.
-    fn cache_get(&mut self, key: &str) -> Option<String> {
-        let expired = self
-            .cache
-            .peek(key)
-            .map(|entry| entry.at.elapsed() > CACHE_TTL)
-            .unwrap_or(false);
-        if expired {
-            self.cache.pop(key);
-            return None;
-        }
-        self.cache.get(key).map(|e| e.response.clone())
-    }
-
-    fn cache_put(&mut self, key: String, response: String) {
-        self.cache.put(
-            key,
-            CachedEntry {
-                response,
-                at: Instant::now(),
-            },
-        );
     }
 
     /// True if this backend is currently in circuit-open (cooldown) state.
@@ -389,12 +459,10 @@ impl Tool for WebSearchTool {
         let cache_key = normalize_query(&query);
 
         // Cache short-circuit. The biggest politeness win — repeat
-        // queries within 10 minutes cost zero backend requests.
-        {
-            let mut state = politeness().lock().unwrap();
-            if let Some(cached) = state.cache_get(&cache_key) {
-                return ToolOutput::success(truncate_for_tool(&cached, "web_search"));
-            }
+        // queries within `CACHE_TTL` cost zero backend requests and
+        // persist across sessions via SQLite at `~/.workgraph/web-cache.db`.
+        if let Some(cached) = cache_get(&cache_key) {
+            return ToolOutput::success(truncate_for_tool(&cached, "web_search"));
         }
 
         // Figure out which backends are currently available. Skip any
@@ -556,11 +624,9 @@ impl Tool for WebSearchTool {
         let rendered = render_results_as_text(&query, &consulted, &responded, &attempts, &merged);
 
         // Cache the rendered response so repeat queries return
-        // instantly without re-hitting any backend.
-        {
-            let mut state = politeness().lock().unwrap();
-            state.cache_put(cache_key, rendered.clone());
-        }
+        // instantly without re-hitting any backend. Writes go to the
+        // persistent SQLite cache and survive across sessions.
+        cache_put(&cache_key, &rendered);
 
         ToolOutput::success(truncate_for_tool(&rendered, "web_search"))
     }
@@ -1778,6 +1844,82 @@ fn clean_text(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_cache_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE web_search_cache (
+                 query_key  TEXT PRIMARY KEY,
+                 response   TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn cache_roundtrip_hit() {
+        let conn = fresh_cache_conn();
+        cache_put_with(&conn, "rust tokio", "RESULTS:1", 1000);
+        let got = cache_get_with(&conn, "rust tokio", 500);
+        assert_eq!(got.as_deref(), Some("RESULTS:1"));
+    }
+
+    #[test]
+    fn cache_miss_on_unknown_key() {
+        let conn = fresh_cache_conn();
+        cache_put_with(&conn, "rust tokio", "RESULTS:1", 1000);
+        assert!(cache_get_with(&conn, "nothing here", 0).is_none());
+    }
+
+    #[test]
+    fn cache_expired_entry_returns_none() {
+        let conn = fresh_cache_conn();
+        // Insert an entry stamped at t=100
+        cache_put_with(&conn, "old query", "STALE", 100);
+        // Ask for entries newer than t=200 — the entry is older, should miss
+        assert!(cache_get_with(&conn, "old query", 200).is_none());
+    }
+
+    #[test]
+    fn cache_put_overwrites_existing_key() {
+        let conn = fresh_cache_conn();
+        cache_put_with(&conn, "q", "first", 100);
+        cache_put_with(&conn, "q", "second", 200);
+        let got = cache_get_with(&conn, "q", 0);
+        assert_eq!(got.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn cache_schema_round_trips_via_open_cache_db() {
+        // Use WG_WEB_CACHE_DB to redirect to a temp file so we don't pollute ~/.workgraph.
+        let tmp = tempfile::Builder::new()
+            .prefix("wg-web-cache-test-")
+            .suffix(".db")
+            .tempfile()
+            .unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp); // rusqlite will recreate
+        // SAFETY: test-only env mutation; serialized via single-threaded test harness
+        // for this specific test. We restore afterward.
+        let old = std::env::var("WG_WEB_CACHE_DB").ok();
+        unsafe {
+            std::env::set_var("WG_WEB_CACHE_DB", &path);
+        }
+        let conn = open_cache_db().expect("open cache db");
+        cache_put_with(&conn, "persistent", "works", 1_000_000);
+        let got = cache_get_with(&conn, "persistent", 0);
+        assert_eq!(got.as_deref(), Some("works"));
+        // Cleanup
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("WG_WEB_CACHE_DB", v),
+                None => std::env::remove_var("WG_WEB_CACHE_DB"),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn normalize_query_lowercases_and_collapses_whitespace() {

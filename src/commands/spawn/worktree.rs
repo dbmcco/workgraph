@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Worktree paths and metadata for an isolated agent workspace.
+#[derive(Debug)]
 pub struct WorktreeInfo {
     /// Absolute path to the worktree directory
     pub path: PathBuf,
@@ -20,7 +21,8 @@ pub struct WorktreeInfo {
 
 /// Create a worktree for an agent.
 ///
-/// 1. Clean up any existing worktree/branch with the same name (for test isolation)
+/// 1. Error out if a worktree/branch with the same name already exists — worktrees
+///    are sacred and must only be removed by explicit user action (`wg worktree archive`)
 /// 2. `git worktree add .wg-worktrees/<agent-id> -b wg/<agent-id>/<task-id> HEAD`
 /// 3. Symlink `.workgraph` into the worktree
 /// 4. Run `worktree-setup.sh` if it exists (best-effort)
@@ -33,9 +35,18 @@ pub fn create_worktree(
     let branch = format!("wg/{}/{}", agent_id, task_id);
     let worktree_dir = project_root.join(".wg-worktrees").join(agent_id);
 
-    // Clean up any existing worktree/branch first (especially important for tests)
-    // This ensures we don't have leftover state from previous runs
-    let _ = remove_worktree(project_root, &worktree_dir, &branch);
+    // Worktrees are sacred. If one already exists at this path, refuse to overwrite —
+    // the user must explicitly archive it via `wg worktree archive`. Agent IDs are
+    // randomly generated so collisions here indicate leftover state that may contain
+    // uncommitted work.
+    if worktree_dir.exists() {
+        anyhow::bail!(
+            "Worktree already exists at {:?}. Worktrees are not auto-removed. \
+             Archive it explicitly with: wg worktree archive {} --remove",
+            worktree_dir,
+            agent_id
+        );
+    }
 
     // Create worktree from HEAD
     let output = Command::new("git")
@@ -198,6 +209,37 @@ mod tests {
 
         // The key test is that the function handles both cases gracefully without panicking
         // This test primarily ensures the function's error handling works correctly
+    }
+
+    #[test]
+    fn test_create_worktree_refuses_to_overwrite_existing() {
+        // Sacred-worktree invariant: if a worktree already exists at the target
+        // path, create_worktree must refuse rather than silently nuke it.
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+
+        let wg_dir = project.join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let info = create_worktree(&project, &wg_dir, "agent-collide", "task-one").unwrap();
+        assert!(info.path.exists());
+
+        // Second creation with the same agent-id must fail, preserving the first.
+        let err = create_worktree(&project, &wg_dir, "agent-collide", "task-two").unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("already exists"),
+            "expected 'already exists' in error, got: {}",
+            msg
+        );
+        assert!(
+            info.path.exists(),
+            "original worktree must be preserved on collision"
+        );
+
+        remove_worktree(&project, &info.path, &info.branch).unwrap();
     }
 
     #[test]

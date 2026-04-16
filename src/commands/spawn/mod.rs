@@ -856,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrapper_merge_back_cleans_up_worktree() {
+    fn test_wrapper_preserves_worktree() {
         let temp_dir = TempDir::new().unwrap();
         // Use a unique task ID to avoid branch collisions with parallel tests
         let unique_id = get_unique_id();
@@ -872,23 +872,22 @@ mod tests {
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
         let script = fs::read_to_string(&wrapper_path).unwrap();
 
+        // Worktrees are sacred — the wrapper must NOT auto-remove them.
         assert!(
-            script.contains(
-                r#"git -C "$WG_PROJECT_ROOT" worktree remove --force "$WG_WORKTREE_PATH""#
-            ),
-            "Should force-remove worktree"
+            !script.contains("worktree remove --force"),
+            "Wrapper script must not auto-remove worktrees (sacred-worktree invariant)"
         );
         assert!(
-            script.contains(r#"git -C "$WG_PROJECT_ROOT" branch -D "$WG_BRANCH""#),
-            "Should delete worktree branch"
+            !script.contains(r#"branch -D "$WG_BRANCH""#),
+            "Wrapper script must not auto-delete worktree branches"
         );
         assert!(
-            script.contains(r#"rm -f "$WG_WORKTREE_PATH/.workgraph""#),
-            "Should remove .workgraph symlink"
+            !script.contains(r#"rm -f "$WG_WORKTREE_PATH/.workgraph""#),
+            "Wrapper script must not remove the .workgraph symlink"
         );
         assert!(
-            script.contains("[wrapper] Cleaned up worktree"),
-            "Should log worktree cleanup"
+            script.contains("worktree preserved"),
+            "Wrapper should log preservation message"
         );
     }
 

@@ -492,12 +492,13 @@ pub fn run_interactive(
         }
     }
 
-    // --- Worktree cleanup ---
+    // Worktrees are sacred — preserved after interactive exec sessions so the user
+    // can inspect, continue, or cherry-pick. Remove via `wg worktree archive <agent-id> --remove`.
     if let Some(ref wt) = worktree_info {
-        eprintln!("Cleaning up worktree...");
-        if let Err(e) = worktree::remove_worktree(&wt.project_root, &wt.path, &wt.branch) {
-            eprintln!("Warning: failed to clean up worktree: {}", e);
-        }
+        eprintln!(
+            "Worktree preserved at {:?} (remove via: wg worktree archive <agent-id> --remove)",
+            wt.path
+        );
     }
 
     Ok(())
