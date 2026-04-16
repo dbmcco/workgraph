@@ -1828,6 +1828,15 @@ pub enum Commands {
         /// context (subject to any compaction that occurred).
         #[arg(long)]
         resume: bool,
+
+        /// Load an agency role/skill by name to augment the session.
+        /// Searches `.workgraph/agency/primitives/components/` for a
+        /// matching component and appends its content to the system
+        /// prompt. Use "coordinator" to enable workgraph management
+        /// tools (wg_add, wg_done) which are otherwise stripped in
+        /// interactive mode.
+        #[arg(long)]
+        role: Option<String>,
     },
 
     /// Interactive agentic TUI — ratatui-based nex (two-pane with streaming + Ctrl-C cancel)

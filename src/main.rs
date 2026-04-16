@@ -2702,6 +2702,7 @@ fn main() -> Result<()> {
             verbose,
             read_only,
             resume,
+            role,
         } => commands::nex::run(
             &workgraph_dir,
             model.as_deref(),
@@ -2713,6 +2714,7 @@ fn main() -> Result<()> {
             verbose,
             read_only,
             resume,
+            role.as_deref(),
         ),
         Commands::TuiNex { model, endpoint } => {
             commands::tui_nex::run(&workgraph_dir, model.as_deref(), endpoint.as_deref())

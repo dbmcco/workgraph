@@ -25,6 +25,7 @@ pub fn run(
     verbose: bool,
     read_only: bool,
     resume: bool,
+    role: Option<&str>,
 ) -> Result<()> {
     let config = Config::load_or_default(workgraph_dir);
 
@@ -35,23 +36,59 @@ pub fn run(
 
     let working_dir = std::env::current_dir().unwrap_or_default();
 
+    let is_coordinator = role.is_some_and(|r| r.eq_ignore_ascii_case("coordinator"));
+
     let registry = {
         let mut reg = ToolRegistry::default_all_with_config(
             workgraph_dir,
             &working_dir,
             &config.native_executor,
         );
-        // Strip workgraph mutation tools — nex is an interactive
-        // session, not a workgraph task. wg_done/wg_add/wg_fail have
-        // no meaningful target and confuse models that try to "complete
-        // the task" by calling them. wg_show/wg_list are kept (read-
-        // only graph browsing is fine).
-        reg.remove_tools(&["wg_done", "wg_add", "wg_fail", "wg_artifact"]);
+        if is_coordinator {
+            // Coordinator mode: keep ALL wg tools — the agent manages
+            // the workgraph (add tasks, mark done, log, etc.).
+        } else {
+            // Interactive/skill mode: strip wg mutation tools — there's
+            // no task context. wg_show/wg_list kept for browsing.
+            reg.remove_tools(&["wg_done", "wg_add", "wg_fail", "wg_artifact"]);
+        }
         if read_only {
             reg.filter_read_only()
         } else {
             reg
         }
+    };
+
+    // Load role/skill content from the agency primitives directory.
+    // "coordinator" is a special-case role handled above (restores
+    // wg tools). Other role names are looked up by fuzzy match
+    // against component names in .workgraph/agency/primitives/components/.
+    let role_prompt_addendum = if let Some(role_name) = role {
+        if is_coordinator {
+            Some(
+                "You are a workgraph coordinator agent. You manage the task graph: \
+                 create tasks with wg_add, mark them done with wg_done, log progress \
+                 with wg_log, and monitor the graph with wg_list/wg_show. You dispatch \
+                 work rather than doing it yourself."
+                    .to_string(),
+            )
+        } else {
+            match load_agency_role(workgraph_dir, role_name) {
+                Some(content) => {
+                    eprintln!("\x1b[2m[wg nex] loaded role: {}\x1b[0m", role_name);
+                    Some(content)
+                }
+                None => {
+                    eprintln!(
+                        "\x1b[33m[wg nex] role '{}' not found in agency primitives\x1b[0m",
+                        role_name
+                    );
+                    None
+                }
+            }
+        }
+    } else {
+        None
     };
 
     let default_system = format!(
@@ -72,7 +109,12 @@ pub fn run(
          from memory when you have real data from a tool call.",
         working_dir.display()
     );
-    let system = system_prompt.unwrap_or(&default_system);
+    let system_with_role = if let Some(ref addendum) = role_prompt_addendum {
+        format!("{}\n\n## Role\n\n{}", default_system, addendum)
+    } else {
+        default_system.clone()
+    };
+    let system = system_prompt.unwrap_or(&system_with_role);
 
     // Per-session timestamped paths. Every `wg nex` invocation gets:
     //
@@ -188,6 +230,42 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Load an agency role/skill component by name. Scans all YAML files
+/// in `.workgraph/agency/primitives/components/` for one whose `name`
+/// field matches (case-insensitive substring match). Returns the
+/// `content` field as a string, or None if no match found.
+fn load_agency_role(workgraph_dir: &Path, role_name: &str) -> Option<String> {
+    let components_dir = workgraph_dir.join("agency/primitives/components");
+    let entries = std::fs::read_dir(&components_dir).ok()?;
+    let needle = role_name.to_lowercase();
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        // Quick check before full YAML parse — skip files whose text
+        // doesn't contain the needle at all.
+        if !text.to_lowercase().contains(&needle) {
+            continue;
+        }
+        // Parse the YAML and check the name field.
+        let doc: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+        let name = doc.get("name")?.as_str()?;
+        if name.to_lowercase().contains(&needle) {
+            // Found it — return the content field.
+            let content = doc.get("content")?;
+            return match content {
+                serde_yaml::Value::Tagged(tagged) => Some(tagged.value.as_str()?.to_string()),
+                serde_yaml::Value::String(s) => Some(s.clone()),
+                _ => content.as_str().map(String::from),
+            };
+        }
+    }
+    None
 }
 
 /// Find the most recent `.journal.jsonl` file in the sessions
