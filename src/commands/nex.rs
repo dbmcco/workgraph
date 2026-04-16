@@ -39,12 +39,28 @@ pub fn run(
          Working directory: {}\n\n\
          You have tools available: read files, write/edit files, run bash commands, \
          grep/search, and more. Use them freely to help the user.\n\n\
-         Be concise. Show code when relevant. Execute commands to verify your work.",
+         Be concise. Show code when relevant. Execute commands to verify your work.\n\n\
+         IMPORTANT: You are a coordinator agent - your role is to facilitate development tasks \n\
+         but you should NOT attempt to mark tasks as 'done' or participate in the workgraph system.\n\
+         Your job is to assist developers, not to manage the workgraph lifecycle.",
         working_dir.display()
     );
     let system = system_prompt.unwrap_or(&default_system);
 
-    let output_log = workgraph_dir.join("nex-session.ndjson");
+    // Per-session timestamped log path — every invocation of `wg nex`
+    // leaves its own file under `.workgraph/nex-sessions/` so history
+    // is preserved and sessions don't clobber each other. Path format:
+    // `.workgraph/nex-sessions/<rfc3339-utc>.ndjson`
+    let output_log = {
+        let sessions_dir = workgraph_dir.join("nex-sessions");
+        let _ = std::fs::create_dir_all(&sessions_dir);
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        sessions_dir.join(format!("{}.ndjson", stamp))
+    };
+    eprintln!(
+        "\x1b[2m[wg nex] session log → {}\x1b[0m",
+        output_log.display()
+    );
 
     let client = create_provider_ext(workgraph_dir, &effective_model, None, endpoint, None)?;
 
