@@ -903,6 +903,12 @@ fn main() -> Result<()> {
         Commands::Aging => commands::aging::run(&workgraph_dir, cli.json),
         Commands::Forecast => commands::forecast::run(&workgraph_dir, cli.json),
         Commands::Workload => commands::workload::run(&workgraph_dir, cli.json),
+        Commands::Worktree(sub) => match sub {
+            cli::WorktreeCommand::List => commands::worktree_cmd::list(&workgraph_dir),
+            cli::WorktreeCommand::Archive { agent_id, remove } => {
+                commands::worktree_cmd::archive(&workgraph_dir, &agent_id, remove)
+            }
+        },
         Commands::Resources => commands::resources::run(&workgraph_dir, cli.json),
         Commands::CriticalPath => commands::critical_path::run(&workgraph_dir, cli.json),
         Commands::Analyze => commands::analyze::run(&workgraph_dir, cli.json),

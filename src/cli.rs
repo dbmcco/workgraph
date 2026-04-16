@@ -738,6 +738,10 @@ pub enum Commands {
     /// or completed, to identify over/under-utilization.
     Workload,
 
+    /// Manage agent worktrees (list, archive, inspect)
+    #[command(subcommand, name = "worktree")]
+    Worktree(WorktreeCommand),
+
     /// Show resource utilization - committed vs available capacity
     Resources,
 
@@ -1903,6 +1907,23 @@ pub enum Commands {
 
         /// Source task ID (the task being placed)
         source_task_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// List all agent worktrees with size, age, and uncommitted-changes status
+    List,
+
+    /// Archive an agent's worktree: auto-commit uncommitted work, optionally remove
+    Archive {
+        /// Agent ID (e.g., agent-16803)
+        agent_id: String,
+
+        /// Remove the worktree directory after committing.
+        /// Without this flag, the directory is preserved on disk.
+        #[arg(long)]
+        remove: bool,
     },
 }
 
@@ -3719,6 +3740,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Aging => "aging",
         Commands::Forecast => "forecast",
         Commands::Workload => "workload",
+        Commands::Worktree(_) => "worktree",
         Commands::Resources => "resources",
         Commands::CriticalPath => "critical-path",
         Commands::Analyze => "analyze",
@@ -3808,6 +3830,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Aging
             | Commands::Forecast
             | Commands::Workload
+            | Commands::Worktree(_)
             | Commands::Resources
             | Commands::CriticalPath
             | Commands::Analyze
