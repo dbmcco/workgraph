@@ -1925,6 +1925,26 @@ pub enum WorktreeCommand {
         #[arg(long)]
         remove: bool,
     },
+
+    /// Garbage-collect stale worktrees. Dry-run by default — use --execute
+    /// to actually remove. Filters (at least one recommended) narrow which
+    /// worktrees qualify; with no filters, nothing is removed.
+    Gc {
+        /// Actually perform the removal. Without this flag, prints what
+        /// would be removed and exits.
+        #[arg(long)]
+        execute: bool,
+
+        /// Only consider worktrees older than this duration (e.g. "7d", "24h").
+        /// Age is the last-modification time of the worktree directory.
+        #[arg(long)]
+        older: Option<String>,
+
+        /// Only consider worktrees whose owning agent is no longer alive
+        /// (process gone, registry status dead, or no registry entry).
+        #[arg(long)]
+        dead_only: bool,
+    },
 }
 
 #[derive(Subcommand)]

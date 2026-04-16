@@ -1,7 +1,8 @@
-//! `wg worktree` subcommands — list, archive, and inspect agent worktrees.
+//! `wg worktree` subcommands — list, archive, gc, and inspect agent worktrees.
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -185,5 +186,216 @@ fn humanize_duration(d: std::time::Duration) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Parse a human-friendly duration ("7d", "24h", "90m", "3600s").
+/// Used for the `--older` filter on `wg worktree gc`.
+pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let (num_part, unit_char): (&str, char) = {
+        let last = s.chars().last().unwrap();
+        if last.is_ascii_digit() {
+            (s, 's')
+        } else {
+            (&s[..s.len() - last.len_utf8()], last)
+        }
+    };
+    let n: u64 = num_part
+        .parse()
+        .with_context(|| format!("invalid duration number: '{}'", num_part))?;
+    let secs = match unit_char {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 60 * 60,
+        'd' => n * 60 * 60 * 24,
+        'w' => n * 60 * 60 * 24 * 7,
+        other => anyhow::bail!("unknown duration unit '{}' — use s/m/h/d/w", other),
+    };
+    Ok(Duration::from_secs(secs))
+}
+
+/// Garbage-collect stale agent worktrees. Dry-run by default.
+///
+/// Worktrees are sacred — this is the only bulk-removal path in workgraph,
+/// and it refuses to act without explicit filters to prevent accidental
+/// nuke-all. Per-worktree removal still goes through `archive --remove`
+/// so uncommitted work is committed to the agent's branch before the
+/// directory is dropped.
+pub fn gc(
+    workgraph_dir: &Path,
+    execute: bool,
+    older: Option<&str>,
+    dead_only: bool,
+) -> Result<()> {
+    let project_root = workgraph_dir
+        .parent()
+        .context("Cannot determine project root from workgraph dir")?;
+    let worktrees_dir = project_root.join(".wg-worktrees");
+
+    if !worktrees_dir.exists() {
+        println!("No worktrees directory found.");
+        return Ok(());
+    }
+
+    // Require at least one filter — refuse to nuke-all by default.
+    if older.is_none() && !dead_only {
+        anyhow::bail!(
+            "wg worktree gc requires at least one filter (--older <dur> and/or --dead-only). \
+             Worktrees are sacred — use explicit criteria to choose which ones to collect."
+        );
+    }
+
+    let older_than = match older {
+        Some(s) => Some(parse_duration(s).context("--older parse failed")?),
+        None => None,
+    };
+
+    // Build the live-agent set if we'll need it.
+    let alive_agents: std::collections::HashSet<String> = if dead_only {
+        use workgraph::service::AgentRegistry;
+        match AgentRegistry::load_locked(workgraph_dir) {
+            Ok(reg) => reg
+                .list_alive_agents()
+                .into_iter()
+                .map(|a| a.id.clone())
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut candidates: Vec<(String, std::path::PathBuf, String, String)> = Vec::new(); // (agent_id, path, age_str, size_str)
+    let now = SystemTime::now();
+
+    for entry in std::fs::read_dir(&worktrees_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("agent-") {
+            continue;
+        }
+        let path = entry.path();
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+
+        if let Some(threshold) = older_than
+            && age < threshold
+        {
+            continue;
+        }
+        if dead_only && alive_agents.contains(&name) {
+            continue;
+        }
+
+        candidates.push((
+            name.clone(),
+            path.clone(),
+            humanize_duration(age),
+            dir_size_human(&path),
+        ));
+    }
+
+    if candidates.is_empty() {
+        println!("No worktrees match the filters.");
+        return Ok(());
+    }
+
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if !execute {
+        println!("Would remove {} worktree(s) (dry-run):", candidates.len());
+        for (aid, _path, age, size) in &candidates {
+            println!("  {} — {} — {}", aid, size, age);
+        }
+        println!();
+        println!("Re-run with --execute to actually archive and remove.");
+        return Ok(());
+    }
+
+    let mut ok = 0;
+    let mut failed = 0;
+    for (aid, path, _age, _size) in &candidates {
+        let branch = find_branch_for_agent(project_root, aid)
+            .unwrap_or_else(|| format!("wg/{}/unknown", aid));
+        match crate::commands::spawn::worktree::remove_worktree(project_root, path, &branch) {
+            Ok(()) => {
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("[worktree-gc] {}: {}", aid, e);
+                failed += 1;
+            }
+        }
+    }
+    println!();
+    println!(
+        "Removed {} worktree(s); {} failed. Uncommitted agent work was NOT preserved — \
+         use `wg worktree archive <agent-id>` first if you want to save it.",
+        ok, failed
+    );
+    Ok(())
+}
+
+/// Look up the `wg/<agent>/<task>` branch for an agent-id, if any.
+fn find_branch_for_agent(project_root: &Path, agent_id: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["branch", "--list", &format!("wg/{}/*", agent_id)])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let trimmed = line.trim_start_matches(['*', '+', ' ']).trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_supports_common_units() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604800));
+        assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604800));
+    }
+
+    #[test]
+    fn parse_duration_bare_number_is_seconds() {
+        assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn parse_duration_rejects_unknown_unit() {
+        let err = parse_duration("7y").unwrap_err();
+        assert!(err.to_string().contains("unknown duration unit"));
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty() {
+        assert!(parse_duration("").is_err());
     }
 }

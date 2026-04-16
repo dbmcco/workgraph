@@ -908,6 +908,11 @@ fn main() -> Result<()> {
             cli::WorktreeCommand::Archive { agent_id, remove } => {
                 commands::worktree_cmd::archive(&workgraph_dir, &agent_id, remove)
             }
+            cli::WorktreeCommand::Gc {
+                execute,
+                older,
+                dead_only,
+            } => commands::worktree_cmd::gc(&workgraph_dir, execute, older.as_deref(), dead_only),
         },
         Commands::Resources => commands::resources::run(&workgraph_dir, cli.json),
         Commands::CriticalPath => commands::critical_path::run(&workgraph_dir, cli.json),
