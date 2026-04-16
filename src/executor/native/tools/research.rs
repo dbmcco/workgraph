@@ -168,19 +168,27 @@ impl Tool for ResearchTool {
             page_contents.len()
         );
 
-        // Step 3: Summarize each page with the query as focus
+        // Step 3: Summarize each page with the query as focus.
+        // Resolve the model from config the same way the agent does —
+        // WG_MODEL env var (set by the coordinator for task agents) or
+        // the configured task_agent model from config.toml.
+        let config = crate::config::Config::load_or_default(&self.workgraph_dir);
         let model = std::env::var("WG_MODEL")
             .ok()
             .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            .unwrap_or_else(|| {
+                config
+                    .resolve_model_for_role(crate::config::DispatchRole::TaskAgent)
+                    .model
+            });
 
         let provider =
             match crate::executor::native::provider::create_provider(&self.workgraph_dir, &model) {
                 Ok(p) => p,
                 Err(e) => {
                     return ToolOutput::error(format!(
-                        "Failed to create provider for summarization: {}",
-                        e
+                        "Failed to create provider for summarization (model: {}): {}",
+                        model, e
                     ));
                 }
             };

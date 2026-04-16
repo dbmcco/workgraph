@@ -100,10 +100,11 @@ pub fn run(
          grep/search, web search, web fetch, and more. Use them freely to help the user.\n\n\
          Be concise. Show code when relevant. Execute commands to verify your work.\n\n\
          IMPORTANT RULES:\n\
-         - When asked to search the web, ALWAYS follow up by fetching the top 2-3 \
-         result URLs with web_fetch to read the actual page content. Do NOT just \
-         report the search result titles and snippets — the user wants the real \
-         information from the pages, not a list of links.\n\
+         - For web research, prefer the `research` tool over manual web_search + \
+         web_fetch. The research tool handles the entire pipeline (search, fetch \
+         pages via Chrome, summarize each page, return a brief with citations) in \
+         one call. Use web_search/web_fetch only when you need a specific URL or \
+         want to browse raw page content.\n\
          - Do NOT call wg_done, wg_add, or any workgraph management tools. You are \
          in an interactive session, not a workgraph task. There is no task to mark \
          done and no graph to modify.\n\
