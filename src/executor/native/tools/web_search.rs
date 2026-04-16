@@ -799,6 +799,23 @@ async fn dispatch(
 }
 
 // ─── Backend: Google News RSS ───────────────────────────────────────────
+//
+// Google News RSS returns `<link>` URLs of the form
+// `https://news.google.com/rss/articles/CBMi...` — opaque base64url
+// tokens that resolve server-side to the real publisher URL (Action News 5,
+// WREG, etc.). Fetching the opaque URL with plain HTTP just redirects
+// back to itself with added query params — useless for `web_fetch`.
+//
+// The fix: right after parsing the RSS response, issue a no-follow HEAD
+// request with a Chrome TLS fingerprint. Google serves a real
+// `Location:` header pointing at the publisher URL when it believes
+// it's talking to a browser. We swap the opaque URL for the real one
+// before returning the result, so every downstream caller (web_fetch,
+// research, the model) only ever sees real publisher URLs.
+//
+// When resolution fails (timeout, non-redirect response, etc.) we keep
+// the original opaque URL — the snippet still carries useful info even
+// if the URL can't be fetched.
 
 async fn search_google_news(
     client: &rquest::Client,
@@ -809,7 +826,72 @@ async fn search_google_news(
         urlencoding::encode(query)
     );
     let body = http_get_text(client, &url, None).await?;
-    Ok(parse_google_news_rss(&body))
+    let parsed = parse_google_news_rss(&body);
+
+    // Resolve opaque news.google.com/rss/articles/... URLs to real
+    // publisher URLs in parallel. Cap concurrency to avoid hammering
+    // Google with 20 simultaneous requests; 5 is polite and keeps total
+    // added latency around 2 RTTs even for a full MAX_RESULTS response.
+    let mut resolved = Vec::with_capacity(parsed.len());
+    for chunk in parsed.chunks(5) {
+        let futures: Vec<_> = chunk
+            .iter()
+            .map(|r| {
+                let url = r.url.clone();
+                async move {
+                    if is_google_news_redirect(&url) {
+                        resolve_google_news_redirect(&url).await.unwrap_or(url)
+                    } else {
+                        url
+                    }
+                }
+            })
+            .collect();
+        let chunk_urls: Vec<String> = join_all(futures).await;
+        for (mut result, new_url) in chunk.iter().cloned().zip(chunk_urls.into_iter()) {
+            result.url = new_url;
+            resolved.push(result);
+        }
+    }
+    Ok(resolved)
+}
+
+/// True if `url` is one of Google News's opaque redirect URLs.
+pub(crate) fn is_google_news_redirect(url: &str) -> bool {
+    url.contains("news.google.com/rss/articles/")
+}
+
+/// Resolve a Google News RSS redirect URL to the actual article URL.
+///
+/// Uses rquest with Chrome136 TLS/HTTP2 fingerprint and no-redirect
+/// policy so we capture the `Location` header from Google's 302.
+/// When Google believes it's talking to a browser, the Location
+/// points at the real publisher URL. A short timeout keeps the
+/// per-query overhead bounded even if Google is slow.
+///
+/// Returns `None` on any failure (timeout, no Location header,
+/// redirect loop back to google). Callers should keep the original
+/// URL in that case rather than drop the result.
+pub(crate) async fn resolve_google_news_redirect(url: &str) -> Option<String> {
+    let client = rquest::Client::builder()
+        .emulation(rquest_util::Emulation::Chrome136)
+        .redirect(rquest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())?
+        .to_string();
+    // Guard against the trivial self-redirect (same URL with query params
+    // appended). Treat it as a resolution failure so the caller keeps the
+    // original and doesn't descend into a loop.
+    if is_google_news_redirect(&location) {
+        return None;
+    }
+    Some(location)
 }
 
 fn parse_google_news_rss(body: &str) -> Vec<SearchResult> {
@@ -2042,6 +2124,23 @@ mod tests {
         let mut lines = contents.lines();
         assert_eq!(lines.next(), Some("memphis news today"));
         assert_eq!(lines.next(), Some("(results)"));
+    }
+
+    #[test]
+    fn is_google_news_redirect_detects_rss_articles_path() {
+        assert!(is_google_news_redirect(
+            "https://news.google.com/rss/articles/CBMilgFBVV95cUxPU0VSOVlhYWRHV2FJUWRnQXloSElScWg?oc=5"
+        ));
+        assert!(is_google_news_redirect(
+            "https://news.google.com/rss/articles/foo?bar=baz"
+        ));
+    }
+
+    #[test]
+    fn is_google_news_redirect_ignores_real_publisher_urls() {
+        assert!(!is_google_news_redirect("https://www.actionnews5.com/news/foo"));
+        assert!(!is_google_news_redirect("https://wreg.com/article/123"));
+        assert!(!is_google_news_redirect("https://news.google.com/home"));
     }
 
     #[test]
