@@ -88,6 +88,23 @@ pub fn register_web_search_tool(registry: &mut super::ToolRegistry) {
 
 struct WebSearchTool;
 
+/// Internal accessor for the research tool to call web_search's
+/// execute without going through the registry.
+pub(crate) struct WebSearchToolInternal;
+
+#[async_trait]
+impl Tool for WebSearchToolInternal {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+    fn definition(&self) -> ToolDefinition {
+        WebSearchTool.definition()
+    }
+    async fn execute(&self, input: &serde_json::Value) -> ToolOutput {
+        WebSearchTool.execute(input).await
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct SearchResult {
     title: String,

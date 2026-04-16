@@ -8,6 +8,7 @@ pub mod bg;
 pub mod delegate;
 pub mod file;
 pub mod file_cache;
+pub mod research;
 pub mod summarize;
 pub mod web_fetch;
 pub mod web_search;
@@ -413,6 +414,9 @@ impl ToolRegistry {
             workgraph_dir.to_path_buf(),
             config.delegate.delegate_model.clone(),
         );
+
+        // Research tool (high-level: search + fetch + summarize in one call)
+        research::register_research_tool(&mut registry, workgraph_dir.to_path_buf());
 
         registry
     }
