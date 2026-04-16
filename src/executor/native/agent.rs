@@ -107,6 +107,24 @@ pub struct AgentLoop {
     /// be exploded by a single large tool call. The agent retrieves full
     /// content via `bash` (cat/head/tail/sed/grep) on the handle path.
     tool_output_channeler: Option<super::channel::ToolOutputChanneler>,
+    /// REPL verbose mode. When true, emits compaction diagnostics, token
+    /// accounting, session-log-path banner, and other infrastructure
+    /// telemetry on top of the tool-call action trace. Implies chatty
+    /// mode. Defaults to false. Toggled by `-v` / `--verbose` on `wg nex`.
+    nex_verbose: bool,
+    /// REPL chatty mode. When true, the full tool output content is
+    /// echoed under each tool-call line (as the model sees it, capped
+    /// at 20 lines / 1600 bytes). When false (default), only a one-line
+    /// summary per call is shown. Implied by `nex_verbose`. Toggled by
+    /// `-c` / `--chatty` on `wg nex`.
+    nex_chatty: bool,
+    /// REPL mode marker. When true, the agent is running inside an
+    /// interactive nex REPL where stdout is the human's terminal and
+    /// must stay sacred for assistant text. When false (the default,
+    /// used by background native-exec agents), the log events are
+    /// *also* mirrored to stdout so the wrapper script can capture
+    /// them into `output.log` for TUI display.
+    nex_repl_mode: bool,
 }
 
 /// NDJSON log entry types for the output file.
@@ -266,7 +284,38 @@ impl AgentLoop {
             state_injector: None,
             registry_entry: None,
             tool_output_channeler,
+            nex_verbose: false,
+            nex_chatty: false,
+            nex_repl_mode: false,
         }
+    }
+
+    /// Enable verbose REPL output in `run_interactive`.
+    /// Defaults to quiet. Use `--verbose` / `-v` on `wg nex` to turn on.
+    /// Implies chatty mode.
+    pub fn with_nex_verbose(mut self, verbose: bool) -> Self {
+        self.nex_verbose = verbose;
+        if verbose {
+            self.nex_chatty = true;
+        }
+        self
+    }
+
+    /// Enable chatty REPL output — echo the full tool output content
+    /// under each tool-call line, as the model sees it. Defaults to
+    /// false. Use `--chatty` / `-c` on `wg nex` to turn on.
+    pub fn with_nex_chatty(mut self, chatty: bool) -> Self {
+        self.nex_chatty = chatty;
+        self
+    }
+
+    /// Mark this agent as running inside a nex REPL. Suppresses the
+    /// stdout mirror of NDJSON log events so the human's terminal
+    /// stays clean (assistant text only). The disk-side session log
+    /// is unaffected.
+    pub fn with_nex_repl_mode(mut self, repl: bool) -> Self {
+        self.nex_repl_mode = repl;
+        self
     }
 
     /// Set the registry entry for cost estimation.
@@ -1465,9 +1514,13 @@ impl AgentLoop {
             {
                 let _ = writeln!(file, "{}", json);
             }
-            // Also write to stdout so the wrapper script captures it to output.log,
-            // making events visible to the TUI.
-            println!("{}", json);
+            // Also mirror to stdout so the background-agent wrapper
+            // script captures it into output.log for TUI display.
+            // Skip this in nex REPL mode — stdout is the human's
+            // terminal, the file is the only sink they care about.
+            if !self.nex_repl_mode {
+                println!("{}", json);
+            }
         }
     }
 
@@ -1532,6 +1585,40 @@ impl AgentLoop {
         // Emit the session-start event as the first line of the log
         // file so the trace has a clear beginning marker.
         self.log_session_start(None);
+
+        // Open the journal for this session (if configured via
+        // `with_journal`). The journal records the FULL replayable
+        // message history — Init, every Message (user/assistant/
+        // tool-result), ToolExecution, Compaction, End — in the same
+        // format background task agents use. This enables resume,
+        // fork, replay, and forensic analysis of nex sessions.
+        let mut journal = if let Some(ref path) = self.journal_path {
+            match Journal::open(path) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!("[nex] Warning: failed to open journal: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Write Init journal entry with session metadata.
+        if let Some(ref mut j) = journal {
+            let tool_defs = if self.supports_tools {
+                self.tools.definitions()
+            } else {
+                vec![]
+            };
+            let _ = j.append(JournalEntryKind::Init {
+                model: self.client.model().to_string(),
+                provider: self.client.name().to_string(),
+                system_prompt: self.system_prompt.clone(),
+                tools: tool_defs,
+                task_id: self.task_id.clone(),
+            });
+        }
 
         // Rustyline editor for line editing + history.
         let mut editor = DefaultEditor::new().context("failed to initialize rustyline editor")?;
@@ -1691,6 +1778,21 @@ impl AgentLoop {
                 }
             }
 
+            // Journal the last message (user input or tool results)
+            // before the API call so the journal captures the full
+            // input that drove each model turn.
+            if let Some(ref mut j) = journal
+                && let Some(last) = messages.last()
+            {
+                let _ = j.append(JournalEntryKind::Message {
+                    role: last.role,
+                    content: last.content.clone(),
+                    usage: None,
+                    response_id: None,
+                    stop_reason: None,
+                });
+            }
+
             let request = MessagesRequest {
                 model: self.client.model().to_string(),
                 max_tokens: self.client.max_tokens(),
@@ -1739,18 +1841,17 @@ impl AgentLoop {
                         // real reduction, and let the next turn use the
                         // reduced messages. Same pattern as the
                         // `AgentLoop::run` streaming-400 path.
-                        eprintln!(
-                            "\n\x1b[33m[nex] Context too long — hard compaction...\x1b[0m"
-                        );
                         let pre_tokens = self.context_budget.effective_tokens(&messages);
                         messages = ContextBudget::hard_emergency_compact(messages, 1);
                         let post_tokens = self.context_budget.effective_tokens(&messages);
-                        eprintln!(
-                            "\x1b[33m[nex] Hard emergency: ~{} → ~{} tokens (Δ -{})\x1b[0m",
-                            pre_tokens,
-                            post_tokens,
-                            pre_tokens.saturating_sub(post_tokens),
-                        );
+                        if self.nex_verbose {
+                            eprintln!(
+                                "\n\x1b[33m[nex] Context too long — hard compaction: ~{} → ~{} tokens (Δ -{})\x1b[0m",
+                                pre_tokens,
+                                post_tokens,
+                                pre_tokens.saturating_sub(post_tokens),
+                            );
+                        }
                         // Reset the streak — we just did the most
                         // aggressive compaction available.
                         nex_noop_streak = 0;
@@ -1794,6 +1895,18 @@ impl AgentLoop {
                 role: Role::Assistant,
                 content: response.content.clone(),
             });
+
+            // Journal the assistant message so the full conversation
+            // is replayable from the journal file.
+            if let Some(ref mut j) = journal {
+                let _ = j.append(JournalEntryKind::Message {
+                    role: Role::Assistant,
+                    content: response.content.clone(),
+                    usage: Some(response.usage.clone()),
+                    response_id: None,
+                    stop_reason: response.stop_reason,
+                });
+            }
 
             match response.stop_reason {
                 Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
@@ -1859,20 +1972,31 @@ impl AgentLoop {
                         })
                         .collect();
 
+                    // Tool-call previews are always shown (even in the
+                    // default non-verbose mode) so the human can follow
+                    // what the agent is doing — which command was run,
+                    // which file was read, etc. Verbose mode adds
+                    // compaction/token diagnostics on top of this, but
+                    // the per-call action trace is the minimum "I can
+                    // see what's happening" UX.
                     for (_, name, input) in &tool_use_blocks {
                         let input_summary = if let Some(cmd) =
                             input.get("command").and_then(|v| v.as_str())
                         {
-                            format!("command={}", truncate_for_display(cmd, 80))
+                            format!("command={}", truncate_for_display(cmd, 120))
                         } else if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
                             format!("path={}", path)
                         } else if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
-                            format!("pattern={}", truncate_for_display(pat, 60))
+                            format!("pattern={}", truncate_for_display(pat, 80))
+                        } else if let Some(q) = input.get("query").and_then(|v| v.as_str()) {
+                            format!("query={}", truncate_for_display(q, 80))
+                        } else if let Some(url) = input.get("url").and_then(|v| v.as_str()) {
+                            format!("url={}", url)
                         } else {
                             let s = input.to_string();
-                            truncate_for_display(&s, 80).to_string()
+                            truncate_for_display(&s, 120).to_string()
                         };
-                        eprintln!("\x1b[2m  > {}({})\x1b[0m", name, input_summary);
+                        eprintln!("\x1b[2;36m> {}({})\x1b[0m", name, input_summary);
                     }
 
                     let mut parse_error_results = Vec::new();
@@ -1915,10 +2039,49 @@ impl AgentLoop {
 
                     let calls_only: Vec<_> =
                         batch_calls.iter().map(|(_, _, c)| c.clone()).collect();
-                    let batch_results = self
-                        .tools
-                        .execute_batch(&calls_only, super::tools::DEFAULT_MAX_CONCURRENT_TOOLS)
-                        .await;
+
+                    // Wrap tool execution in a Ctrl-C-aware select so the
+                    // human can regain the prompt even if a tool is
+                    // running a long subprocess. On interrupt we produce
+                    // synthetic "[interrupted by user]" tool results for
+                    // every pending tool_use in the assistant message
+                    // (the OpenAI wire format requires a tool_result for
+                    // every tool_use), push them, and `continue` back to
+                    // the prompt. Note: this does NOT kill the child
+                    // process launched by `bash` — that needs proper
+                    // cancellation plumbing through ToolRegistry. But it
+                    // does return control to the human immediately.
+                    let batch_results = {
+                        let batch_future = self
+                            .tools
+                            .execute_batch(&calls_only, super::tools::DEFAULT_MAX_CONCURRENT_TOOLS);
+                        let ctrl_c_future = tokio::signal::ctrl_c();
+                        tokio::select! {
+                            biased;
+                            _ = ctrl_c_future => {
+                                eprintln!(
+                                    "\n\x1b[33m[nex] Interrupted during tool execution — returning to prompt.\x1b[0m"
+                                );
+                                // Synthesize interrupted results for every
+                                // tool_use in the assistant message so the
+                                // message history stays well-formed.
+                                let mut interrupted_results = Vec::new();
+                                for (id, _name, _input) in &tool_use_blocks {
+                                    interrupted_results.push(ContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: "[interrupted by user]".to_string(),
+                                        is_error: true,
+                                    });
+                                }
+                                messages.push(Message {
+                                    role: Role::User,
+                                    content: interrupted_results,
+                                });
+                                continue;
+                            }
+                            res = batch_future => res,
+                        }
+                    };
 
                     let mut all_results: Vec<(
                         usize,
@@ -1948,17 +2111,35 @@ impl AgentLoop {
 
                     let mut results = Vec::new();
                     for (_, id, name, input, output, _) in &all_results {
+                        // Default (non-chatty) mode shows a one-line
+                        // summary per tool call — enough to follow what
+                        // happened, not enough to flood the terminal.
+                        // Chatty mode (and verbose, which implies
+                        // chatty) dumps the full tool output exactly as
+                        // it enters the model's context, capped at
+                        // MAX_LINES / MAX_BYTES in print_indented_output.
+                        // Errors always get a visible distinguishing
+                        // marker and a compact excerpt even in default
+                        // mode — they're actionable signal.
                         if output.is_error {
                             eprintln!(
-                                "\x1b[2m  x {} error: {}\x1b[0m",
+                                "\x1b[31m× {} error: {}\x1b[0m",
                                 name,
-                                truncate_for_display(&output.content, 100)
+                                summarize_tool_output(&output.content)
                             );
+                            if self.nex_chatty {
+                                print_indented_output(&output.content, "\x1b[31m  ", "\x1b[0m");
+                            }
+                        } else if self.nex_chatty {
+                            eprintln!(
+                                "\x1b[2m  → {}\x1b[0m",
+                                summarize_tool_output(&output.content)
+                            );
+                            print_indented_output(&output.content, "\x1b[2m  ", "\x1b[0m");
                         } else {
                             eprintln!(
-                                "\x1b[2m  + {} ({} chars)\x1b[0m",
-                                name,
-                                output.content.len()
+                                "\x1b[2m  → {}\x1b[0m",
+                                summarize_tool_output(&output.content)
                             );
                         }
 
@@ -2056,16 +2237,18 @@ impl AgentLoop {
                         nex_noop_streak = nex_noop_streak.saturating_add(1);
                     }
 
-                    eprintln!(
-                        "\x1b[33m[nex] {} compaction: ~{} → ~{} tokens (Δ -{}, {} → {} msgs, noop_streak={})\x1b[0m",
-                        tier_name,
-                        pre_tokens,
-                        post_tokens,
-                        delta,
-                        pre_count,
-                        post_count,
-                        nex_noop_streak,
-                    );
+                    if self.nex_verbose {
+                        eprintln!(
+                            "\x1b[33m[nex] {} compaction: ~{} → ~{} tokens (Δ -{}, {} → {} msgs, noop_streak={})\x1b[0m",
+                            tier_name,
+                            pre_tokens,
+                            post_tokens,
+                            delta,
+                            pre_count,
+                            post_count,
+                            nex_noop_streak,
+                        );
+                    }
                 }
                 ContextPressureAction::CleanExit => {
                     eprintln!(
@@ -2099,6 +2282,26 @@ impl AgentLoop {
         // Emit the session-end marker and the final result into the
         // session log so the on-disk trace has a clear terminator.
         self.log_session_end(turns, session_exit_reason, &total_usage);
+
+        // Close the journal with an End entry.
+        if let Some(ref mut j) = journal {
+            use crate::executor::native::journal::EndReason;
+            let reason = match session_exit_reason {
+                "user_quit" | "eof" => EndReason::Complete,
+                "max_turns" => EndReason::MaxTurns,
+                "context_limit" => EndReason::Error {
+                    message: "context limit".to_string(),
+                },
+                other => EndReason::Error {
+                    message: other.to_string(),
+                },
+            };
+            let _ = j.append(JournalEntryKind::End {
+                reason,
+                total_usage: total_usage.clone(),
+                turns: turns as u32,
+            });
+        }
         let result_preview = AgentResult {
             final_text: final_text.clone(),
             turns,
@@ -2117,7 +2320,103 @@ impl AgentLoop {
 }
 
 fn truncate_for_display(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        // Walk back to the nearest char boundary so we don't slice a
+        // multi-byte UTF-8 sequence. `floor_char_boundary` is nightly,
+        // so do it by hand.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    }
+}
+
+/// Build a one-line summary of a tool output for the default
+/// (non-chatty) display mode. Goals:
+/// - short enough to fit on one terminal line
+/// - informative enough that the human doesn't need to go look at the
+///   session log for most routine calls
+/// - degrades gracefully for empty / single-line / multi-line outputs
+///
+/// For single-line outputs ≤ 120 bytes, echoes the whole thing. For
+/// multi-line or longer outputs, shows the first non-empty line
+/// (truncated) plus a `(N lines, M bytes)` suffix.
+fn summarize_tool_output(content: &str) -> String {
+    let total_bytes = content.len();
+    if total_bytes == 0 {
+        return "ok (empty)".to_string();
+    }
+    let first_line = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let total_lines = content.lines().count();
+
+    const LINE_CAP: usize = 120;
+    let truncated_first = if first_line.len() > LINE_CAP {
+        let end = {
+            let mut e = LINE_CAP;
+            while e > 0 && !first_line.is_char_boundary(e) {
+                e -= 1;
+            }
+            e
+        };
+        format!("{}…", &first_line[..end])
+    } else {
+        first_line.to_string()
+    };
+
+    if total_lines <= 1 && total_bytes <= LINE_CAP {
+        if truncated_first.is_empty() {
+            format!("ok ({} bytes)", total_bytes)
+        } else {
+            truncated_first
+        }
+    } else {
+        format!(
+            "{} ({} lines, {} bytes)",
+            truncated_first, total_lines, total_bytes
+        )
+    }
+}
+
+/// Render a tool output to stderr under the per-call trace line with
+/// uniform indent and sensible bounds — caps at both a byte limit and
+/// a line-count limit so a multi-megabyte file read doesn't saturate
+/// the terminal. `prefix` is printed before every output line (use for
+/// indent + ANSI color), `suffix` after (use to close the color span).
+fn print_indented_output(content: &str, prefix: &str, suffix: &str) {
+    const MAX_LINES: usize = 20;
+    const MAX_BYTES: usize = 1600;
+
+    let truncated = truncate_for_display(content, MAX_BYTES);
+    let mut line_count = 0usize;
+    for line in truncated.lines() {
+        if line_count >= MAX_LINES {
+            break;
+        }
+        eprintln!("{}{}{}", prefix, line, suffix);
+        line_count += 1;
+    }
+
+    let total_lines = content.lines().count();
+    let total_bytes = content.len();
+    let shown_lines = line_count;
+    let shown_bytes = truncated.len();
+    let line_overflow = total_lines > shown_lines;
+    let byte_overflow = total_bytes > shown_bytes;
+    if line_overflow || byte_overflow {
+        let extra_lines = total_lines.saturating_sub(shown_lines);
+        let extra_bytes = total_bytes.saturating_sub(shown_bytes);
+        eprintln!(
+            "{}… (+{} lines, +{} bytes truncated){}",
+            prefix, extra_lines, extra_bytes, suffix
+        );
+    }
 }
 
 /// Result of processing a nex REPL slash command.

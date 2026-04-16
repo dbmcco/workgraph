@@ -1796,6 +1796,31 @@ pub enum Commands {
         /// Maximum conversation turns
         #[arg(long, default_value = "200")]
         max_turns: usize,
+
+        /// Chatty mode: echo the full tool output content under each
+        /// tool-call line, exactly as the model sees it (capped at
+        /// 20 lines / 1600 bytes per call). Default shows only a
+        /// one-line summary per call. Useful when actively following
+        /// an agent's actions.
+        #[arg(long, short = 'c')]
+        chatty: bool,
+
+        /// Verbose console output: implies `--chatty` and also emits
+        /// compaction diagnostics, token accounting, and the
+        /// session-log path banner. Useful for debugging the REPL
+        /// itself. The on-disk NDJSON session log is always complete
+        /// regardless of this flag.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Read-only safety mode: only expose tools that cannot modify
+        /// state (read_file, grep, web_search, web_fetch, etc.). Tools
+        /// like write_file, edit_file, and bash (which can run arbitrary
+        /// commands) are removed from the registry. Use this when you
+        /// want to browse, research, or explore without risk of the
+        /// agent modifying any files.
+        #[arg(long, short = 'r')]
+        read_only: bool,
     },
 
     /// Interactive agentic TUI — ratatui-based nex (two-pane with streaming + Ctrl-C cancel)

@@ -440,8 +440,18 @@ fn main() -> Result<()> {
     // Handle subcommand-level help before clap parses (since we disable_help_flag globally)
     maybe_print_subcommand_help();
 
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    // Initialize logging.
+    //
+    // Default filter: "info" for normal commands, "warn" for nex/tui-nex
+    // so the interactive REPL stays quiet. Users can still override by
+    // setting RUST_LOG explicitly. We check argv directly here instead
+    // of parsing clap first, because clap's own error output depends
+    // on the logger already being initialized.
+    let is_repl_invocation = std::env::args()
+        .skip(1)
+        .any(|a| a == "nex" || a == "tui-nex");
+    let default_filter = if is_repl_invocation { "warn" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format_timestamp(None)
         .init();
 
@@ -2688,6 +2698,9 @@ fn main() -> Result<()> {
             system_prompt,
             message,
             max_turns,
+            chatty,
+            verbose,
+            read_only,
         } => commands::nex::run(
             &workgraph_dir,
             model.as_deref(),
@@ -2695,6 +2708,9 @@ fn main() -> Result<()> {
             system_prompt.as_deref(),
             message.as_deref(),
             max_turns,
+            chatty,
+            verbose,
+            read_only,
         ),
         Commands::TuiNex { model, endpoint } => {
             commands::tui_nex::run(&workgraph_dir, model.as_deref(), endpoint.as_deref())
