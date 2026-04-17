@@ -85,6 +85,11 @@ pub struct AgentLoop {
     journal_path: Option<PathBuf>,
     /// Task ID for journal metadata.
     task_id: Option<String>,
+    /// Workgraph directory root (the `.workgraph` dir). Set alongside
+    /// task_id to enable the workgraph inbox in interactive mode.
+    workgraph_dir: Option<PathBuf>,
+    /// Agent identifier used for inbox cursor tracking.
+    agent_id: Option<String>,
     /// Whether to attempt resume from an existing journal.
     resume_enabled: bool,
     /// Working directory for stale-state detection during resume.
@@ -282,6 +287,8 @@ impl AgentLoop {
             supports_tools,
             journal_path: None,
             task_id: None,
+            workgraph_dir: None,
+            agent_id: None,
             resume_enabled: true,
             working_dir: None,
             summary_interval_turns: DEFAULT_SUMMARY_INTERVAL_TURNS,
@@ -359,6 +366,23 @@ impl AgentLoop {
         agent_id: String,
     ) -> Self {
         self.state_injector = Some(StateInjector::new(workgraph_dir, task_id, agent_id));
+        self
+    }
+
+    /// Configure a workgraph message-queue inbox for this agent. When
+    /// set, interactive-mode sessions drain pending messages at every
+    /// turn boundary via `WorkgraphInbox` (Stage F). Urgent-priority
+    /// messages trigger a cooperative cancel so in-flight work aborts
+    /// and the message lands as the next user turn.
+    pub fn with_workgraph_inbox(
+        mut self,
+        workgraph_dir: PathBuf,
+        task_id: String,
+        agent_id: String,
+    ) -> Self {
+        self.workgraph_dir = Some(workgraph_dir);
+        self.task_id = Some(task_id);
+        self.agent_id = Some(agent_id);
         self
     }
 
@@ -620,13 +644,27 @@ impl AgentLoop {
             cancel.clone().spawn_ctrl_c_listener();
         }
 
-        // Inbox collects user inputs delivered between turn boundaries
-        // — from Stage E the TUI composing buffer will feed it, from
-        // Stage F the workgraph IPC will too. Stage B just wires the
-        // drain call so later stages have somewhere to plug producers.
-        // For now the inbox is always empty and `drain()` is cheap.
-        let mut inbox: Box<dyn super::inbox::AgentInbox> =
-            Box::new(super::inbox::InMemoryInbox::new());
+        // Inbox collects user inputs delivered between turn boundaries.
+        // In interactive mode with a workgraph task_id + workgraph_dir,
+        // we use the file-based WorkgraphInbox so messages sent via
+        // `wg msg send <task-id> "..."` from another terminal arrive
+        // here at the next boundary. Urgent-priority messages trigger
+        // cooperative cancel so in-flight work aborts. Autonomous
+        // sessions keep the state-injection path (no inbox here —
+        // would double-drain the message queue).
+        let mut inbox: Box<dyn super::inbox::AgentInbox> = if !self.autonomous
+            && let (Some(wgd), Some(tid), Some(aid)) =
+                (&self.workgraph_dir, &self.task_id, &self.agent_id)
+        {
+            Box::new(super::inbox::WorkgraphInbox::new(
+                wgd.clone(),
+                tid.clone(),
+                aid.clone(),
+                cancel.clone(),
+            ))
+        } else {
+            Box::new(super::inbox::InMemoryInbox::new())
+        };
 
         // Track files the agent has touched. Consulted on history-summary
         // compaction to re-inject a fresh view of the most-recent files

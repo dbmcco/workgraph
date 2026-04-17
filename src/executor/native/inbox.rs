@@ -28,6 +28,7 @@
 //!   or a workgraph coordinator.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -112,6 +113,87 @@ impl AgentInbox for InMemoryInbox {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => Vec::new(),
         }
+    }
+}
+
+/// Workgraph message-queue inbox: adapts the existing file-based
+/// `wg msg send <task-id>` machinery onto the `AgentInbox` trait.
+/// Producer side is the existing CLI / coordinator / `crate::messages::
+/// send_message` API; this struct is the consumer side.
+///
+/// Semantics:
+/// - Messages with `priority == "urgent"` become `UserInput::Interrupt`
+///   (the run loop's cancel token is flipped when they're drained —
+///   at the next boundary the agent abandons in-flight work, reads
+///   the urgent message, and acts).
+/// - All other priorities become `UserInput::Note` (delivered cleanly
+///   at the next boundary without interrupting).
+///
+/// File location, cursor tracking, file locking, and the read-cursor
+/// persistence are all handled by `crate::messages` — this struct is
+/// a thin adapter. See `docs/design/agent-message-queue.md` for the
+/// underlying protocol.
+pub struct WorkgraphInbox {
+    workgraph_dir: PathBuf,
+    task_id: String,
+    agent_id: String,
+    /// Cancel token flipped on urgent-priority message delivery so
+    /// in-flight work aborts at the next checkpoint.
+    cancel: CancelToken,
+}
+
+impl WorkgraphInbox {
+    pub fn new(
+        workgraph_dir: PathBuf,
+        task_id: String,
+        agent_id: String,
+        cancel: CancelToken,
+    ) -> Self {
+        Self {
+            workgraph_dir,
+            task_id,
+            agent_id,
+            cancel,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentInbox for WorkgraphInbox {
+    async fn drain(&mut self) -> Vec<UserInput> {
+        // `read_unread` is synchronous + disk-bound. Keep it on the
+        // runtime's blocking pool so the turn boundary doesn't stall
+        // on a fs operation.
+        let workgraph_dir = self.workgraph_dir.clone();
+        let task_id = self.task_id.clone();
+        let agent_id = self.agent_id.clone();
+        let messages = tokio::task::spawn_blocking(move || {
+            crate::messages::read_unread(&workgraph_dir, &task_id, &agent_id)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+
+        let mut any_urgent = false;
+        let inputs: Vec<UserInput> = messages
+            .into_iter()
+            .map(|m| {
+                let body = format!("[from {}] {}", m.sender, m.body);
+                if m.priority == "urgent" {
+                    any_urgent = true;
+                    UserInput::Interrupt(body)
+                } else {
+                    UserInput::Note(body)
+                }
+            })
+            .collect();
+
+        if any_urgent {
+            self.cancel.request_cooperative();
+        }
+
+        inputs
     }
 }
 
