@@ -86,9 +86,12 @@ fn resolve_inside_cwd(input: &str) -> Result<PathBuf, String> {
 }
 
 /// Register all file tools into the registry.
-pub fn register_file_tools(registry: &mut ToolRegistry) {
+pub fn register_file_tools(registry: &mut ToolRegistry, workgraph_dir: PathBuf) {
     let cache = Arc::new(Mutex::new(FileCache::new()));
-    registry.register(Box::new(ReadFileTool { cache }));
+    registry.register(Box::new(ReadFileTool {
+        cache,
+        workgraph_dir,
+    }));
     registry.register(Box::new(WriteFileTool));
     registry.register(Box::new(EditFileTool));
     registry.register(Box::new(GlobTool));
@@ -99,6 +102,8 @@ pub fn register_file_tools(registry: &mut ToolRegistry) {
 
 struct ReadFileTool {
     cache: Arc<Mutex<FileCache>>,
+    /// Needed to resolve a provider for `query` mode (LLM sub-call).
+    workgraph_dir: PathBuf,
 }
 
 #[async_trait]
@@ -114,7 +119,16 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read the contents of a file. Returns numbered lines.".to_string(),
+            description: "Read a file. Two modes:\n\
+                          \n\
+                          - Without `query`: returns numbered lines (bytes).\n\
+                          - With `query`: runs an LLM sub-call that reads the file \
+                          and returns a text answer to your query. For large files \
+                          an internal cursor-based traversal with compaction is used. \
+                          Prefer query-mode whenever you want an answer ABOUT a file \
+                          rather than the raw contents — much cheaper than reading \
+                          the whole file into context yourself."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -124,11 +138,21 @@ impl Tool for ReadFileTool {
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Line number to start reading from (1-based)"
+                        "description": "Line number to start reading from (1-based). \
+                                        In query mode, restricts the query to lines \
+                                        offset..offset+limit."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to read (default: 2000)"
+                        "description": "Maximum number of lines to read (default: 2000). \
+                                        In query mode, bounds the slice the query sees."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional. When set, the tool returns an LLM-generated \
+                                        answer to this question, computed over the file \
+                                        contents (or the offset/limit slice). Without this \
+                                        parameter the tool returns raw lines."
                     }
                 },
                 "required": ["path"]
@@ -144,6 +168,31 @@ impl Tool for ReadFileTool {
 
         let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
         let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
+
+        // Query mode: delegate to the file_query backend. This runs an
+        // LLM sub-call (single shot for small files, cursor-traversal
+        // with compaction for large ones) and returns the answer text.
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(query) = query {
+            let offset_opt = input.get("offset").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let limit_opt = input.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            return match super::file_query::run_query_on_file(
+                &self.workgraph_dir,
+                path_str,
+                query,
+                offset_opt,
+                limit_opt,
+            )
+            .await
+            {
+                Ok(answer) => ToolOutput::success(super::truncate_for_tool(&answer, "read_file")),
+                Err(e) => ToolOutput::error(format!("read_file query failed: {}", e)),
+            };
+        }
 
         // Get mtime for cache validation; error on stat failure.
         let mtime = match fs::metadata(path_str).and_then(|m| m.modified()) {
@@ -832,7 +881,10 @@ mod tests {
         use tokio::sync::Mutex;
 
         let cache = Arc::new(Mutex::new(FileCache::new()));
-        let tool = ReadFileTool { cache };
+        let tool = ReadFileTool {
+            cache,
+            workgraph_dir: std::env::temp_dir().join("wg-test-readfile"),
+        };
 
         // Create a temp file with exactly 3 lines
         let temp_file = tempfile::NamedTempFile::new().unwrap();

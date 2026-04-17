@@ -305,8 +305,6 @@ fn extract_urls_from_search_results(text: &str) -> Vec<String> {
 /// Fetch a page via headless Chrome (primary) with rquest fallback.
 /// Returns extracted markdown text.
 async fn fetch_page_content(url: &str) -> Result<String, String> {
-    use std::io::Cursor;
-
     // Try headless Chrome first — handles JS-rendered sites
     let html = match super::web_search::get_or_launch_browser_for_fetch().await {
         Ok(cell) => {
@@ -351,20 +349,11 @@ async fn fetch_page_content(url: &str) -> Result<String, String> {
         }
     };
 
-    // Extract readable content via readability + html2md
-    let parsed_url = url::Url::parse(url).map_err(|e| format!("parse url: {}", e))?;
-    let mut cursor = Cursor::new(html.as_bytes());
-    let markdown = match readability::extractor::extract(&mut cursor, &parsed_url) {
-        Ok(product) => {
-            let md = html2md::parse_html(&product.content);
-            if !product.title.is_empty() {
-                format!("# {}\n\n{}", product.title, md)
-            } else {
-                md
-            }
-        }
-        Err(_) => html2md::parse_html(&html),
-    };
+    // Convert the full HTML to markdown. See web_fetch::extract_to_markdown
+    // for the rationale: readability silently drops content on multi-region
+    // pages, so we bias toward inclusive extraction and let downstream
+    // summarization handle the noise.
+    let markdown = html2md::rewrite_html(&html, false);
 
     Ok(markdown)
 }

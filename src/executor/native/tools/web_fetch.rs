@@ -33,7 +33,6 @@
 //! fetch so sessions can be analyzed later to measure how often the
 //! browser fallback is actually needed.
 
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -201,14 +200,29 @@ impl Tool for WebFetchTool {
                 ref content_type,
                 ref bytes,
             } => {
-                return ToolOutput::error(format!(
-                    "Fetched {} but content-type is '{}' ({} bytes) — \
-                     web_fetch only handles HTML and PDF. For other binary \
-                     formats, use `bash` with `curl -o <file> <url>`.",
-                    url_str,
+                // Non-PDF binary: save raw bytes to the fetched-pages artifact
+                // directory and return a metadata entry. Agent can then do
+                // whatever it needs (display, pass to a vision model, upload,
+                // etc.) without having to fall back to `bash curl` — which was
+                // the previous "refuse" behavior and made image/asset workflows
+                // impossible through the tool alone.
+                match save_binary_artifact(
+                    &self.workgraph_dir,
+                    &url_str,
                     content_type,
-                    bytes.len()
-                ));
+                    bytes,
+                ) {
+                    Ok(metadata) => return ToolOutput::success(metadata),
+                    Err(e) => {
+                        return ToolOutput::error(format!(
+                            "Fetched {} ({}, {} bytes) but failed to save artifact: {}",
+                            url_str,
+                            content_type,
+                            bytes.len(),
+                            e
+                        ));
+                    }
+                }
             }
             FetchedBody::Html(ref html) => extract_to_markdown(html, &parsed_url),
         };
@@ -551,22 +565,121 @@ fn extract_pdf_text(bytes: &[u8], workgraph_dir: &std::path::Path) -> Result<Str
     Ok(text)
 }
 
-/// Extract main content from HTML and convert to markdown. Returns
-/// `(title, markdown)` — title may be empty if readability failed to
-/// find one.
-fn extract_to_markdown(html: &str, url: &Url) -> (String, String) {
-    let mut cursor = Cursor::new(html.as_bytes());
+/// Convert the full HTML to markdown. Returns `(title, markdown)`.
+///
+/// Previously this went through the `readability` crate to pick "the
+/// main article," then ran `html2md` only on that fragment. That
+/// extraction pattern silently dropped most of the page on any site
+/// with multiple content regions (directory pages, product listings,
+/// anything that isn't a single article). The bug report on the
+/// Tennessee State Parks cabin page was the concrete trigger:
+/// readability returned one `<article>` block of ~2KB from a 16KB
+/// page with five sections of relevant content.
+///
+/// We now convert the whole HTML to markdown via `fast_html2md` (based
+/// on Cloudflare's `lol_html`, benchmarked as the fastest + lowest-
+/// memory inclusive extractor in the Rust ecosystem). Boilerplate
+/// (nav, footer, cookie banners) comes through too — that's the
+/// deliberate tradeoff. The alternative was silent content loss,
+/// and noisy-complete always beats clean-incomplete for both human
+/// inspection and LLM consumption.
+///
+/// Title is pulled from the `<title>` tag directly.
+fn extract_to_markdown(html: &str, _url: &Url) -> (String, String) {
+    let title = extract_title(html).unwrap_or_default();
+    // `fast_html2md` exports its library as `html2md`; the fast (rewriter)
+    // path is `rewrite_html(html, commonmark)`. `commonmark=false` keeps
+    // the default markdown flavor.
+    let markdown = html2md::rewrite_html(html, false);
+    let cleaned = clean_markdown(&markdown);
+    (title, cleaned)
+}
 
-    match readability::extractor::extract(&mut cursor, url) {
-        Ok(product) => {
-            let markdown = html2md::parse_html(&product.content);
-            let cleaned = clean_markdown(&markdown);
-            (product.title, cleaned)
-        }
-        Err(_) => {
-            let markdown = html2md::parse_html(html);
-            (String::new(), clean_markdown(&markdown))
-        }
+/// Pull the `<title>` tag contents out of raw HTML. Case-insensitive,
+/// tolerant of attributes, returns `None` if no title tag exists.
+fn extract_title(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let start_tag = lower.find("<title")?;
+    let after_open = lower[start_tag..].find('>')? + start_tag + 1;
+    let end_tag = lower[after_open..].find("</title>")? + after_open;
+    let raw = &html[after_open..end_tag];
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        // Basic HTML-entity decode for the common cases (&amp; &lt; &gt; &quot; &#39;)
+        let decoded = trimmed
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'");
+        Some(decoded)
+    }
+}
+
+/// Save a binary (non-HTML, non-PDF) response to the fetched-pages
+/// artifact directory and return a metadata summary. Returns an error
+/// only if the write itself fails.
+fn save_binary_artifact(
+    workgraph_dir: &std::path::Path,
+    url: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let dir = workgraph_dir.join("nex-sessions").join("fetched-pages");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create artifact dir {:?}: {}", dir, e))?;
+    let counter = FETCH_COUNTER.fetch_add(1, Ordering::SeqCst);
+    // Infer extension from content-type; fall back to .bin.
+    let ext = binary_extension_for(content_type);
+    let slug = slug_from_url(url);
+    let filename = format!("{:05}-{}.{}", counter, slug, ext);
+    let path = dir.join(&filename);
+    std::fs::write(&path, bytes)
+        .map_err(|e| format!("write {:?}: {}", path, e))?;
+    Ok(format!(
+        "Saved binary artifact.\n\
+         URL:          {}\n\
+         Content-Type: {}\n\
+         Size:         {} bytes\n\
+         Path:         {}\n\
+         \n\
+         This is a binary resource (not HTML or PDF). The raw bytes are \
+         at the path above. Use `bash` to inspect — `file`, `identify`, \
+         `hexdump -C`, etc. — or pass the path to another tool. \
+         web_fetch does not attempt to interpret the content.",
+        url,
+        content_type,
+        bytes.len(),
+        path.display()
+    ))
+}
+
+/// Map a content-type to a reasonable file extension.
+fn binary_extension_for(content_type: &str) -> &'static str {
+    let ct = content_type.split(';').next().unwrap_or("").trim().to_lowercase();
+    match ct.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/tiff" => "tiff",
+        "image/bmp" => "bmp",
+        "image/avif" => "avif",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "application/zip" => "zip",
+        "application/x-tar" => "tar",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "text/csv" => "csv",
+        _ => "bin",
     }
 }
 

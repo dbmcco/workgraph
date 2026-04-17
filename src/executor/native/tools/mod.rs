@@ -9,9 +9,9 @@ pub mod deep_research;
 pub mod delegate;
 pub mod file;
 pub mod file_cache;
+pub mod file_query;
 pub mod research;
 pub mod summarize;
-pub mod survey;
 pub mod web_fetch;
 pub mod web_search;
 pub mod wg;
@@ -377,7 +377,7 @@ impl ToolRegistry {
         let mut registry = Self::new();
 
         // File tools
-        file::register_file_tools(&mut registry);
+        file::register_file_tools(&mut registry, workgraph_dir.to_path_buf());
 
         // Bash tool
         bash::register_bash_tool(&mut registry, working_dir.to_path_buf());
@@ -423,8 +423,9 @@ impl ToolRegistry {
         // Deep research (decompose → fan out via research → synthesize)
         deep_research::register_deep_research_tool(&mut registry, workgraph_dir.to_path_buf());
 
-        // Survey (stream-read a file to answer a focused question)
-        survey::register_survey_tool(&mut registry, workgraph_dir.to_path_buf());
+        // Note: what was `survey_file` is now the `query` parameter on
+        // `read_file`. The stream-read machinery lives in `file_query`
+        // as an internal backend — not a top-level tool.
 
         registry
     }

@@ -1,9 +1,20 @@
-//! Survey-file tool: stream-read a file to answer a focused question.
+//! File-query backend: stream-read a file to answer a focused question.
 //!
-//! Spins up a mini agent loop with three tightly-scoped tools —
-//! `read_chunk`, `note`, `finish` — and lets the agent traverse the
-//! file chunk by chunk, carrying running notes out of context, until
-//! it reaches an answer or exhausts its turn budget.
+//! This is the internal backend behind `read_file(path, query=...)`. It
+//! is NOT registered as a user-visible tool — there's only one file
+//! tool exposed to the model (`read_file`), and it transparently
+//! upgrades to this machinery when a `query` parameter is present.
+//! See `docs/design/unified-path-forward.md` for the thesis.
+//!
+//! Public entry: `run_query_on_file(workgraph_dir, path, query, offset, limit)`.
+//!
+//! Behavior:
+//!   - Load the file (respecting optional line offset/limit slice).
+//!   - If the slice fits in one LLM call, single-shot: ask the model
+//!     the question, feed it the slice, return the answer.
+//!   - Else spin up a mini agent loop with three tightly-scoped tools —
+//!     `read_chunk`, `note`, `finish` — and let it traverse the file
+//!     chunk by chunk with out-of-context running notes.
 //!
 //! ## Why this exists, and why not `recursive_summarize`
 //!
@@ -33,25 +44,21 @@
 //! survive unchanged.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::{Tool, ToolOutput, ToolRegistry, truncate_tool_output};
+use super::{Tool, ToolOutput, ToolRegistry};
 use crate::executor::native::client::{
     ContentBlock, Message, MessagesRequest, Role, StopReason, ToolDefinition,
 };
 use crate::executor::native::provider::Provider;
 
-/// Default max turns for a survey run. One turn = one LLM call.
-/// Must be high enough to let the agent iterate through many chunks.
+/// Default max turns for a cursor-traversal run. One turn = one LLM
+/// call. Must be high enough to let the agent iterate through many
+/// chunks.
 const DEFAULT_MAX_TURNS: usize = 40;
-
-/// Hard cap on max_turns — prevents a stuck agent from burning API
-/// calls indefinitely.
-const MAX_ALLOWED_TURNS: usize = 100;
 
 /// Fraction of the provider's context window to target per chunk.
 /// Leaves headroom for notes + the model's response + tool definitions.
@@ -64,9 +71,6 @@ const MIN_CHUNK_CHARS: usize = 4_000;
 /// Maximum chunk size — keeps any one chunk comfortably under the
 /// model's input limit even when the provider reports a large window.
 const MAX_CHUNK_CHARS: usize = 80_000;
-
-/// Maximum output chars for the final survey result.
-const MAX_OUTPUT_CHARS: usize = 16_000;
 
 const SURVEY_SYSTEM_PROMPT: &str = "\
 You are surveying a file to answer a specific question. You have three tools:
@@ -94,99 +98,143 @@ to consolidate, then call finish with your best answer based on notes.
 Never call finish with an empty answer — if you cannot answer, say so
 explicitly and explain what you saw.";
 
-pub fn register_survey_tool(registry: &mut ToolRegistry, workgraph_dir: PathBuf) {
-    registry.register(Box::new(SurveyFileTool { workgraph_dir }));
-}
+/// Public entry point: answer a `query` about `path`'s contents.
+///
+/// Called from `ReadFileTool::execute` when the caller passes a
+/// `query` parameter. Resolves the task-agent provider, reads the
+/// file (respecting optional 1-based line `offset` + `limit` slice),
+/// then branches:
+///
+/// - If the slice fits in ~60% of the model's context window, send
+///   a single LLM call with the file and the question; return the
+///   text response.
+/// - Else spin up the cursor-based mini agent loop
+///   (`run_cursor_traversal`) with read_chunk/note/finish, let it
+///   traverse the chunks with out-of-context running notes, and
+///   return its finish() answer (or its running notes if the
+///   agent exhausts `DEFAULT_MAX_TURNS` without calling finish).
+pub(crate) async fn run_query_on_file(
+    workgraph_dir: &std::path::Path,
+    path: &str,
+    query: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    // Resolve provider (same chain as research/deep_research).
+    let config = crate::config::Config::load_or_default(workgraph_dir);
+    let model = std::env::var("WG_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| {
+            config
+                .resolve_model_for_role(crate::config::DispatchRole::TaskAgent)
+                .model
+        });
+    let provider = crate::executor::native::provider::create_provider(workgraph_dir, &model)
+        .map_err(|e| format!("create provider (model {}): {}", model, e))?;
 
-struct SurveyFileTool {
-    workgraph_dir: PathBuf,
-}
+    // Read + slice.
+    let full_text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+    let text = apply_line_slice(&full_text, offset, limit);
 
-#[async_trait]
-impl Tool for SurveyFileTool {
-    fn name(&self) -> &str {
-        "survey_file"
+    if text.trim().is_empty() {
+        return Ok(format!(
+            "File '{}' slice is empty (offset={:?}, limit={:?}). Cannot answer: {}",
+            path, offset, limit, query
+        ));
     }
 
-    fn is_read_only(&self) -> bool {
-        true
+    // Single-shot vs. cursor-traversal threshold. We target ~60% of the
+    // context window (tokens → chars via the same ratio used by
+    // `compute_chunk_size`) so a single call has headroom for system
+    // prompt + the model's response. If the sliced text exceeds that,
+    // the cursor loop handles it.
+    let single_shot_budget =
+        (provider.context_window() as f64 * 0.6 * 3.0) as usize; // ~3 chars/token
+    if text.len() <= single_shot_budget {
+        run_single_shot_query(provider.as_ref(), path, query, &text).await
+    } else {
+        run_cursor_traversal(provider.as_ref(), path, query, &text, DEFAULT_MAX_TURNS).await
     }
+}
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "survey_file".to_string(),
-            description: "Read a large file to answer a focused question. Spawns a sub-agent \
-                          with read_chunk/note/finish tools that traverses the file chunk by \
-                          chunk, carrying running notes out of context. Use for questions that \
-                          need to scan a file too large to fit in context — 'find the passage \
-                          where X happens', 'what's the contradiction between sections 3 and \
-                          8', 'timeline of mentions of Y'. For a simple summary of a whole \
-                          document, `summarize` is lighter; for cross-referential or \
-                          cumulative questions, use this."
+/// Apply a 1-based line `offset` and `limit` to `text`. Returns the
+/// sliced portion, or the full text when neither is set.
+fn apply_line_slice(text: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.is_none() && limit.is_none() {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = offset.map(|o| o.saturating_sub(1)).unwrap_or(0).min(lines.len());
+    let end = limit
+        .map(|l| (start + l).min(lines.len()))
+        .unwrap_or(lines.len());
+    lines[start..end].join("\n")
+}
+
+/// Fire a single LLM call with the whole (sliced) file text in the
+/// prompt and return the answer. Used when the file fits comfortably.
+async fn run_single_shot_query(
+    provider: &dyn Provider,
+    path: &str,
+    query: &str,
+    text: &str,
+) -> Result<String, String> {
+    eprintln!(
+        "[file_query] single-shot on '{}' ({} chars): {:?}",
+        path,
+        text.len(),
+        truncate(query, 80)
+    );
+    let prompt = format!(
+        "You are answering a question from the contents of a file. Use ONLY the file \
+         contents provided — do not fabricate. If the answer isn't in the file, say so \
+         explicitly.\n\
+         \n\
+         File path: {}\n\
+         \n\
+         Question: {}\n\
+         \n\
+         --- File contents ---\n\
+         {}\n\
+         --- End of file ---\n\
+         \n\
+         Answer:",
+        path, query, text
+    );
+    let request = MessagesRequest {
+        model: provider.model().to_string(),
+        max_tokens: provider.max_tokens(),
+        system: Some(
+            "You answer questions from file contents. Cite specific lines or passages \
+             where relevant. Never fabricate — if the answer isn't in the provided text, \
+             say so explicitly."
                 .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to survey"
-                    },
-                    "question": {
-                        "type": "string",
-                        "description": "The question to answer by reading the file"
-                    },
-                    "max_turns": {
-                        "type": "integer",
-                        "description": "Maximum conversation turns (default: 40, max: 100). \
-                                        One turn per tool use. Larger files need more turns."
-                    }
-                },
-                "required": ["path", "question"]
-            }),
-        }
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> ToolOutput {
-        let path = match input.get("path").and_then(|v| v.as_str()) {
-            Some(p) if !p.is_empty() => p.to_string(),
-            _ => return ToolOutput::error("Missing or empty parameter: path".to_string()),
-        };
-        let question = match input.get("question").and_then(|v| v.as_str()) {
-            Some(q) if !q.trim().is_empty() => q.trim().to_string(),
-            _ => return ToolOutput::error("Missing or empty parameter: question".to_string()),
-        };
-        let max_turns = input
-            .get("max_turns")
-            .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).clamp(1, MAX_ALLOWED_TURNS))
-            .unwrap_or(DEFAULT_MAX_TURNS);
-
-        // Resolve model + provider the same way research/deep_research do:
-        // WG_MODEL env var > config.resolve_model_for_role(TaskAgent) > provider default.
-        let config = crate::config::Config::load_or_default(&self.workgraph_dir);
-        let model = std::env::var("WG_MODEL")
-            .ok()
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| {
-                config
-                    .resolve_model_for_role(crate::config::DispatchRole::TaskAgent)
-                    .model
-            });
-        let provider =
-            match crate::executor::native::provider::create_provider(&self.workgraph_dir, &model) {
-                Ok(p) => p,
-                Err(e) => {
-                    return ToolOutput::error(format!(
-                        "survey_file: failed to create provider (model {}): {}",
-                        model, e
-                    ));
-                }
-            };
-
-        match run_survey(provider.as_ref(), &path, &question, max_turns).await {
-            Ok(result) => ToolOutput::success(truncate_tool_output(&result, MAX_OUTPUT_CHARS)),
-            Err(e) => ToolOutput::error(format!("survey_file failed: {}", e)),
-        }
+        ),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }],
+        tools: vec![],
+        stream: false,
+    };
+    let response = provider
+        .send(&request)
+        .await
+        .map_err(|e| format!("single-shot API error: {}", e))?;
+    let answer: String = response
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    if answer.trim().is_empty() {
+        Err("empty single-shot response".to_string())
+    } else {
+        Ok(answer)
     }
 }
 
@@ -299,29 +347,29 @@ fn compact_read_chunk_results(messages: &mut Vec<Message>) {
     }
 }
 
-/// Main survey loop. Reads the file, chunks it, runs the mini agent
-/// loop until finish() is called or max_turns is exhausted.
-async fn run_survey(
+/// Cursor-traversal loop. Chunks the pre-loaded `text` and runs the
+/// mini agent loop until finish() is called or max_turns is exhausted.
+/// Called from `run_query_on_file` when the file is too large for a
+/// single-shot.
+async fn run_cursor_traversal(
     provider: &dyn Provider,
     path: &str,
     question: &str,
+    text: &str,
     max_turns: usize,
 ) -> Result<String, String> {
-    // Load + chunk the file.
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
     let chunk_chars = compute_chunk_size(provider.context_window());
-    let chunks = chunk_text(&text, chunk_chars);
+    let chunks = chunk_text(text, chunk_chars);
     if chunks.is_empty() {
         return Ok(format!(
-            "File '{}' is empty. Cannot answer: {}",
+            "File '{}' slice is empty. Cannot answer: {}",
             path, question
         ));
     }
     let n_chunks = chunks.len();
 
     eprintln!(
-        "[survey] {} → {} chunk(s) of ~{} chars, question: {:?}",
+        "[file_query] cursor-traversal on '{}' → {} chunk(s) of ~{} chars, question: {:?}",
         path,
         n_chunks,
         chunk_chars,
