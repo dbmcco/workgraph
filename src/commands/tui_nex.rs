@@ -66,10 +66,17 @@ use workgraph::models::ModelRegistry;
 
 /// Message from the UI to the agent task.
 enum UiToAgent {
-    /// User submitted a prompt.
-    UserInput(String),
-    /// User pressed Ctrl-C — cancel the in-flight turn.
+    /// User submitted a prompt. `interrupt=true` additionally cancels
+    /// the in-flight turn (Ctrl-Enter); `interrupt=false` is queued
+    /// and delivered cleanly at the next turn boundary (plain Enter
+    /// while agent is working).
+    UserInput { text: String, interrupt: bool },
+    /// Single Ctrl-C — cooperative cancel of the in-flight turn.
     Cancel,
+    /// Double Ctrl-C within DOUBLE_TAP_WINDOW — SIGKILL the subprocess
+    /// tree (bash children, headless chrome, curl, etc.) and return
+    /// to idle. nohup/disown'd children survive by Unix semantics.
+    HardCancel,
     /// User is quitting — stop the agent task.
     Quit,
 }
@@ -123,11 +130,19 @@ struct App {
     cursor_pos: usize,
     /// Current streaming turn's accumulated text, if any.
     streaming_buf: String,
-    /// True while the agent is processing a turn (input is disabled).
+    /// True while the agent is processing a turn. Does NOT disable
+    /// input — the composing buffer is always editable, Enter always
+    /// works. The flag controls whether Enter sends immediately
+    /// (idle) or queues for next turn boundary (working). See Stage E
+    /// in docs/design/native-executor-run-loop.md.
     awaiting_response: bool,
     scroll_offset: u16,
     should_quit: bool,
     model_label: String,
+    /// Timestamp of the last Ctrl-C press. Used to detect double-taps
+    /// for hard-cancel (SIGKILL subprocess tree) vs. single-tap
+    /// cooperative cancel.
+    last_ctrl_c: Option<std::time::Instant>,
 }
 
 impl App {
@@ -141,6 +156,7 @@ impl App {
             scroll_offset: 0,
             should_quit: false,
             model_label,
+            last_ctrl_c: None,
         }
     }
 
@@ -270,12 +286,32 @@ async fn run_agent_task(
     } else {
         vec![]
     };
+    // Inputs submitted via Enter while a turn is in flight land here
+    // rather than being dropped on the floor. Drained FIFO between turns.
+    let mut pending_inputs: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
 
-    while let Some(msg) = rx_input.recv().await {
-        let user_text = match msg {
-            UiToAgent::UserInput(s) => s,
-            UiToAgent::Cancel => continue, // Not in a turn — nothing to cancel.
-            UiToAgent::Quit => break,
+    'outer: loop {
+        // Pick the next user message: pending queue first, else block on
+        // the channel.
+        let user_text = if let Some(q) = pending_inputs.pop_front() {
+            q
+        } else {
+            match rx_input.recv().await {
+                Some(UiToAgent::UserInput { text, .. }) => text,
+                Some(UiToAgent::Cancel) => continue, // nothing to cancel
+                Some(UiToAgent::HardCancel) => {
+                    // At idle, a hard cancel kills any lingering
+                    // subprocess tree (e.g. leftover bash children)
+                    // and returns to idle. Rare but harmless.
+                    workgraph::service::kill_descendants(std::process::id());
+                    let _ = tx_output.send(AgentToUi::Info(
+                        "[hard-cancel] subprocess tree killed".to_string(),
+                    ));
+                    continue;
+                }
+                Some(UiToAgent::Quit) | None => break,
+            }
         };
 
         messages.push(Message {
@@ -305,28 +341,50 @@ async fn run_agent_task(
             let cancel_future = async {
                 loop {
                     match rx_input.recv().await {
-                        Some(UiToAgent::Cancel) => return true,
-                        Some(UiToAgent::Quit) => return true,
-                        Some(UiToAgent::UserInput(_)) => {
-                            // User hit Enter while we were generating. Drop it
-                            // on the floor for now — they can resend after the
-                            // turn ends. (A real enqueue would be nicer.)
+                        Some(UiToAgent::Cancel) => return UiToAgent::Cancel,
+                        Some(UiToAgent::HardCancel) => return UiToAgent::HardCancel,
+                        Some(UiToAgent::Quit) | None => return UiToAgent::Quit,
+                        Some(UiToAgent::UserInput { text, interrupt }) => {
+                            if interrupt {
+                                // Ctrl-Enter during generation: abort
+                                // in-flight work AND queue the message
+                                // as the next user turn.
+                                pending_inputs.push_back(text);
+                                return UiToAgent::Cancel;
+                            }
+                            // Plain Enter during generation: queue, keep
+                            // generating. The user is typing ahead.
+                            pending_inputs.push_back(text);
+                            let _ = tx_output
+                                .send(AgentToUi::Info(
+                                    "[queued for next turn]".to_string(),
+                                ));
                             continue;
                         }
-                        None => return true,
                     }
                 }
             };
 
             let response = tokio::select! {
                 biased;
-                cancelled = cancel_future => {
-                    if cancelled {
-                        let _ = tx_output.send(AgentToUi::Info(
-                            "[cancelled] in-flight turn aborted".to_string(),
-                        ));
-                        let _ = tx_output.send(AgentToUi::TurnEnded);
+                signal = cancel_future => {
+                    match signal {
+                        UiToAgent::Cancel => {
+                            let _ = tx_output.send(AgentToUi::Info(
+                                "[cancelled] in-flight turn aborted".to_string(),
+                            ));
+                        }
+                        UiToAgent::HardCancel => {
+                            workgraph::service::kill_descendants(std::process::id());
+                            let _ = tx_output.send(AgentToUi::Info(
+                                "[hard-cancel] subprocess tree killed".to_string(),
+                            ));
+                        }
+                        UiToAgent::Quit | _ => {
+                            break 'outer;
+                        }
                     }
+                    let _ = tx_output.send(AgentToUi::TurnEnded);
                     break;
                 }
                 res = streaming_future => match res {
@@ -609,43 +667,80 @@ async fn run_async(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let modifiers = key.modifiers;
+                    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+                    let shift = modifiers.contains(KeyModifiers::SHIFT);
                     match key.code {
                         KeyCode::Esc => {
                             app.should_quit = true;
                         }
-                        KeyCode::Char('q') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('q') if ctrl => {
                             app.should_quit = true;
                         }
-                        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        KeyCode::Char('c') if ctrl => {
+                            let now = std::time::Instant::now();
+                            let is_double_tap = app
+                                .last_ctrl_c
+                                .map(|t| {
+                                    now.duration_since(t)
+                                        <= workgraph::executor::native::cancel::DOUBLE_TAP_WINDOW
+                                })
+                                .unwrap_or(false);
+
                             if app.awaiting_response {
-                                let _ = tx_input.send(UiToAgent::Cancel);
-                            } else {
+                                if is_double_tap {
+                                    let _ = tx_input.send(UiToAgent::HardCancel);
+                                    app.last_ctrl_c = None;
+                                } else {
+                                    let _ = tx_input.send(UiToAgent::Cancel);
+                                    app.last_ctrl_c = Some(now);
+                                }
+                            } else if is_double_tap {
+                                // Two Ctrl-Cs at idle → quit (matches most
+                                // REPLs where Ctrl-C on empty prompt is a
+                                // no-op on the first and exit on the
+                                // second).
                                 app.should_quit = true;
+                            } else {
+                                app.last_ctrl_c = Some(now);
                             }
                         }
                         KeyCode::Enter => {
-                            if !app.awaiting_response && !app.input.trim().is_empty() {
+                            if !app.input.trim().is_empty() {
                                 let text = std::mem::take(&mut app.input);
                                 app.cursor_pos = 0;
                                 app.display.push(DisplayLine::User(text.clone()));
-                                app.awaiting_response = true;
-                                let _ = tx_input.send(UiToAgent::UserInput(text));
+                                let interrupt = ctrl;
+                                if !app.awaiting_response {
+                                    app.awaiting_response = true;
+                                }
+                                // Always send — the agent task queues mid-turn
+                                // inputs and delivers them at the next turn
+                                // boundary. See run_agent_task for the pending
+                                // queue logic.
+                                let _ = tx_input.send(UiToAgent::UserInput {
+                                    text,
+                                    interrupt,
+                                });
+                            } else if shift {
+                                // Shift-Enter on empty input: harmless, lets
+                                // the muscle-memory work when the user reaches
+                                // for it by accident.
                             }
                         }
                         KeyCode::Backspace => {
-                            if !app.awaiting_response && app.cursor_pos > 0 {
+                            if app.cursor_pos > 0 {
                                 let new_pos = app.cursor_pos - 1;
                                 app.input.remove(new_pos);
                                 app.cursor_pos = new_pos;
                             }
                         }
                         KeyCode::Left => {
-                            if !app.awaiting_response && app.cursor_pos > 0 {
+                            if app.cursor_pos > 0 {
                                 app.cursor_pos -= 1;
                             }
                         }
                         KeyCode::Right => {
-                            if !app.awaiting_response && app.cursor_pos < app.input.len() {
+                            if app.cursor_pos < app.input.len() {
                                 app.cursor_pos += 1;
                             }
                         }
@@ -662,10 +757,8 @@ async fn run_async(
                             app.scroll_offset = app.scroll_offset.saturating_add(5);
                         }
                         KeyCode::Char(c) => {
-                            if !app.awaiting_response {
-                                app.input.insert(app.cursor_pos, c);
-                                app.cursor_pos += 1;
-                            }
+                            app.input.insert(app.cursor_pos, c);
+                            app.cursor_pos += 1;
                         }
                         _ => {}
                     }
