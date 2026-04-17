@@ -13456,24 +13456,23 @@ fn extract_enriched_text_from_log(content: &str) -> String {
             }
         } else if msg_type == "turn" {
             // Native executor format: {"type":"turn","turn":N,"role":"assistant","content":[...]}
+            //
+            // Intentionally skip `tool_use` blocks here. The native executor
+            // emits BOTH a turn record (with tool_use blocks pre-execution) AND
+            // a `tool_call` record (with the full input+output post-execution).
+            // Rendering the tool_use from `turn` produced an empty box followed
+            // by the real box from `tool_call` — the doubled-render bug.
+            // The `tool_call` branch below carries everything we'd want to show.
             if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
                 for block in content {
                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                let trimmed_text = text.trim();
-                                if !trimmed_text.is_empty() {
-                                    parts.push(trimmed_text.to_string());
-                                }
+                    if block_type == "text" {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            let trimmed_text = text.trim();
+                            if !trimmed_text.is_empty() {
+                                parts.push(trimmed_text.to_string());
                             }
                         }
-                        "tool_use" => {
-                            let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-                            let summary = format!("┌─ {} ────\n└─", name);
-                            parts.push(summary);
-                        }
-                        _ => {}
                     }
                 }
             }
