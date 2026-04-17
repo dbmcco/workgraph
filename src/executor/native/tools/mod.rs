@@ -10,6 +10,7 @@ pub mod delegate;
 pub mod file;
 pub mod file_cache;
 pub mod file_query;
+pub mod reader;
 pub mod research;
 pub mod summarize;
 pub mod web_fetch;
@@ -423,9 +424,14 @@ impl ToolRegistry {
         // Deep research (decompose → fan out via research → synthesize)
         deep_research::register_deep_research_tool(&mut registry, workgraph_dir.to_path_buf());
 
-        // Note: what was `survey_file` is now the `query` parameter on
-        // `read_file`. The stream-read machinery lives in `file_query`
-        // as an internal backend — not a top-level tool.
+        // Reader (sub-executor with working dir for large-file survey)
+        reader::register_reader_tool(&mut registry, workgraph_dir.to_path_buf());
+
+        // Note: what was `survey_file` is now split across two entry points:
+        // - `read_file(path, query=...)` — single-shot LLM query, fails loudly
+        //   if the file doesn't fit in one call
+        // - `reader(path, task)` — sub-executor with working dir, for
+        //   arbitrarily large files or tasks that want a persistent workspace
 
         registry
     }
