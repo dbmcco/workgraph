@@ -1649,10 +1649,13 @@ impl AgentLoop {
             // enters the context budget.
             let l0_rejections: Vec<super::l0_defense::Rejection> = {
                 let last_idx = messages.len() - 1;
+                let threshold = super::l0_defense::threshold_for_window(
+                    self.client.context_window(),
+                );
                 super::l0_defense::compact_oversized_tool_uses(
                     &mut messages[last_idx],
                     &self.workgraph_dir_for_buffers(),
-                    super::l0_defense::DEFAULT_MAX_TOOL_USE_INPUT_BYTES,
+                    threshold,
                 )
             };
 

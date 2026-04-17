@@ -40,14 +40,35 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::client::ContentBlock;
 
-/// Default maximum bytes allowed for a single tool_use's serialized
-/// input before L0 intervenes. 8192 bytes (~2k tokens at 4 chars/tok)
-/// fits comfortably in the current-turn overhead budget of a 32k
-/// window model. Models with larger windows can raise this, but the
-/// fundamental pathology — model generates 20KB of content inline —
-/// is a prompt-engineering / tool-design issue regardless of window
-/// size, so the threshold is conservative.
-pub const DEFAULT_MAX_TOOL_USE_INPUT_BYTES: usize = 8192;
+/// Fraction of the model's context window (in chars) that a single
+/// tool_use's serialized `input` may occupy before L0 intervenes.
+/// 15% gives a realistic cap for legitimate file writes (source files,
+/// markdown docs) on small-window models while still rejecting the
+/// pathological 20KB+ inline content generations that blew up ulivo:
+///   32k window  →  19.2KB cap
+///   128k window →  76.8KB cap
+///   200k window →  120KB cap
+///   1M window   →  600KB cap
+/// Floor at 2KB so tiny windows still get a usable cap. No ceiling —
+/// if the window is huge, the cap is huge, which is the right behavior
+/// (L0 defends against arg-blowing-up-the-window, not against absolute
+/// size).
+const THRESHOLD_WINDOW_FRACTION: f64 = 0.15;
+const THRESHOLD_FLOOR_BYTES: usize = 2_048;
+
+/// Compute the L0 threshold for a given model context window.
+/// `chars_per_token` matches the estimate used by ContextBudget
+/// elsewhere (default 4.0).
+pub fn threshold_for_window(window_tokens: usize) -> usize {
+    let raw = (window_tokens as f64 * 4.0 * THRESHOLD_WINDOW_FRACTION) as usize;
+    raw.max(THRESHOLD_FLOOR_BYTES)
+}
+
+/// Backwards-compat constant: the threshold for a 32k window.
+/// New call sites should use `threshold_for_window(provider.context_window())`
+/// to size-match the active model.
+#[deprecated(note = "use threshold_for_window(context_window) instead")]
+pub const DEFAULT_MAX_TOOL_USE_INPUT_BYTES: usize = 19_200;
 
 /// Monotonic counter for pending-buffer filenames.
 static PENDING_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -299,6 +320,64 @@ mod tests {
         if let ContentBlock::Text { text } = &msg.content[0] {
             assert_eq!(text.len(), 50_000);
         }
+    }
+
+    #[test]
+    fn threshold_scales_with_window() {
+        // 32k window → ~19.2KB (15% × 4 chars/tok)
+        let t32 = threshold_for_window(32_000);
+        assert!(t32 > 18_000 && t32 < 20_000, "32k: got {}", t32);
+        // 128k window → ~76.8KB
+        let t128 = threshold_for_window(128_000);
+        assert!(t128 > 75_000 && t128 < 78_000, "128k: got {}", t128);
+        // 200k window → ~120KB
+        let t200 = threshold_for_window(200_000);
+        assert!(t200 > 118_000 && t200 < 122_000, "200k: got {}", t200);
+        // 1M window → ~600KB (no ceiling)
+        let t1m = threshold_for_window(1_000_000);
+        assert!(t1m > 595_000 && t1m < 605_000, "1M: got {}", t1m);
+        // Tiny window → floor at 2KB
+        assert_eq!(threshold_for_window(2_000), THRESHOLD_FLOOR_BYTES);
+    }
+
+    #[test]
+    fn ulivo_20kb_tool_use_gets_rejected_on_32k_window() {
+        // The actual failure mode from 2026-04-17 on ulivo:
+        // write_file(content=20KB) on a 32k-window model.
+        // With 15% threshold = 19.2KB, the 20KB arg should be rejected.
+        let dir = tempdir().unwrap();
+        let body = "x".repeat(20_480);
+        let mut msg = Message {
+            role: Role::Assistant,
+            content: vec![tool_use(
+                "t1",
+                "write_file",
+                json!({"path": "/tmp/out.md", "content": body}),
+            )],
+        };
+        let threshold = threshold_for_window(32_000);
+        let rejections = compact_oversized_tool_uses(&mut msg, dir.path(), threshold);
+        assert_eq!(rejections.len(), 1, "20KB write_file on 32k window should reject");
+    }
+
+    #[test]
+    fn small_legitimate_write_file_not_rejected_on_32k_window() {
+        // A 5KB write_file (typical source file or small doc) should
+        // pass through cleanly on a 32k-window model. This is the
+        // calibration check — we don't want to reject common cases.
+        let dir = tempdir().unwrap();
+        let body = "x".repeat(5_000);
+        let mut msg = Message {
+            role: Role::Assistant,
+            content: vec![tool_use(
+                "t1",
+                "write_file",
+                json!({"path": "/tmp/out.md", "content": body}),
+            )],
+        };
+        let threshold = threshold_for_window(32_000);
+        let rejections = compact_oversized_tool_uses(&mut msg, dir.path(), threshold);
+        assert!(rejections.is_empty(), "5KB write_file should pass");
     }
 
     #[test]
