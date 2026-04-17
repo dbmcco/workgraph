@@ -82,39 +82,57 @@ const MAX_READ_NOTE_CHARS: usize = 40_000;
 const BASH_TIMEOUT_SECS: u64 = 30;
 
 const READER_SYSTEM_PROMPT: &str = "\
-You are reading a large file to accomplish a task. You have seven tools:
+You are reading a large file to accomplish a task. Your conversation \
+context is SMALL and will be compacted aggressively. Your working \
+directory is your actual memory — files you write there persist \
+forever. Don't forget this.
 
-  - next_chunk(size): read the next `size` chars of the input file. \
-    Size is optional (default ~8000). Sequential — the cursor advances \
-    automatically; you don't track positions. Returns 'EOF' when the \
-    whole file has been read.
-  - write_note(name, content): create or overwrite a file `name` in \
-    your working directory. Use for structured artifacts — summaries, \
-    cross-references, outlines.
-  - append_note(name, content): append to a file `name` in your \
-    working directory (creates if missing). Use for running notes — \
-    one per topic, grown over time.
-  - list_notes(): list files in your working directory.
-  - read_note(name): read back a note you wrote earlier.
-  - bash(command): shell command with cwd set to your working dir. \
-    Useful for `grep`, `sed`, `wc`, combining notes, etc.
-  - finish(result): terminate with a final text result. The outer \
-    caller still has access to your working directory contents after \
-    you finish, so put durable output IN NOTES, not just in the \
-    result text.
+## The core rule
 
-Workflow:
-  1. Call next_chunk() to read the first page of the file.
-  2. Extract what matters into notes BEFORE the next chunk. The \
-     chunk text lives in your conversation history only until the \
-     next tool call; your notes on disk persist indefinitely.
-  3. Repeat until you have enough to finish, or until next_chunk \
-     returns EOF.
-  4. Call finish with your final answer. The outer caller will see \
-     both your result text AND your working-directory notes.
+**Between every two next_chunk() calls, you MUST call append_note() or \
+write_note() to capture what you saw.** Old next_chunk outputs get \
+replaced with a stub in your context on the next turn — if you didn't \
+save it to disk, the content is gone forever. The sequential cursor \
+means you can't go back. Pattern:
 
-Notes over chat. Persist things. Don't answer from memory of a chunk \
-you didn't note — re-read it or admit you don't know.";
+  next_chunk → append_note(findings) → next_chunk → append_note → ...
+
+Calling next_chunk twice in a row without a note in between IS A BUG, \
+even if the agent framework doesn't reject it — you'll just lose data.
+
+## Tools
+
+  - next_chunk(size): read the next `size` chars at the cursor, \
+    advancing the cursor. Default ~8000. Returns 'EOF' at end of file.
+  - append_note(name, content): append to a file in your working \
+    directory. Creates if missing. **Use this after every chunk.** \
+    Pattern: `append_note('findings.md', '## Line X-Y\\n- observed: ...')`.
+  - write_note(name, content): create/overwrite a file. Use for \
+    structured artifacts — the final outline, a cross-reference table, \
+    a synthesis.
+  - list_notes(): list files in the working directory.
+  - read_note(name): read back an earlier note.
+  - bash(command): shell with cwd set to working directory. Great for \
+    `grep` / `wc` / `cat` combining notes.
+  - finish(result): terminate. Result string is shown to the caller \
+    along with your working directory path — so put durable output \
+    IN NOTES, not just in the result text.
+
+## Workflow
+
+  1. next_chunk() — first page of the file
+  2. append_note('findings.md', ...) — capture what you observed
+  3. Repeat (1+2) until you have enough or hit EOF
+  4. Optionally: use bash/read_note to review/cross-reference notes
+  5. finish(result) — concise answer; the full details live in notes
+
+## Failure modes to avoid
+
+  - Calling next_chunk repeatedly without notes → data loss + context \
+    overflow → you will hit an API error and fail the task.
+  - Answering from memory of a chunk you didn't note → fabrication. \
+    If you didn't write it down, admit you don't have it.
+  - Calling finish before reading enough — notes < answer.";
 
 pub fn register_reader_tool(registry: &mut ToolRegistry, workgraph_dir: PathBuf) {
     registry.register(Box::new(ReaderTool { workgraph_dir }));
@@ -381,6 +399,21 @@ async fn run_reader(
                 if let Some(ref result) = s.final_result {
                     return Ok(format_exit(&s.working_dir, result, turn + 1, false));
                 }
+                drop(s);
+
+                // Bound context: replace all but the most recent
+                // next_chunk tool_result with a stub. Without this, a
+                // greedy agent that calls next_chunk repeatedly without
+                // noting anything will blow past the context window
+                // within ~15 turns (observed: qwen3-coder-30b in smoke
+                // test hit API 400 "token count exceeds model" at turn
+                // 15 with 8K chunks, 32K context). Notes live in the
+                // working dir on disk so they survive compaction; the
+                // chunk text itself was supposed to be extracted into
+                // notes before the next chunk — this enforces the
+                // "notes are your durable memory" invariant mechanically
+                // rather than relying on the agent to follow guidance.
+                compact_next_chunk_results(&mut messages);
             }
         }
     }
@@ -445,6 +478,71 @@ fn format_exit(working_dir: &Path, result: &str, turns: usize, hit_max: bool) ->
     )
 }
 
+/// Compact old `next_chunk` tool_results: keep the most recent one at
+/// full fidelity, replace all earlier ones with a short stub that
+/// preserves the position reference but drops the chunk text.
+///
+/// Detects next_chunk output by the distinctive prefix `"[chunk "` +
+/// `" of "` + `" chars, "` in the content — this shape comes from
+/// `NextChunkTool::execute`. Other tool_results (write_note, note-list,
+/// read_note, bash, finish) are left untouched.
+///
+/// Notes stay in `SurveyState`/`ReaderState` on disk, not in message
+/// history, so they survive compaction unchanged. The agent is
+/// therefore forced to extract what it needs into notes BEFORE
+/// calling next_chunk again, or the information is lost.
+fn compact_next_chunk_results(messages: &mut Vec<Message>) {
+    let mut positions = Vec::new();
+    for (msg_idx, msg) in messages.iter().enumerate() {
+        if msg.role != Role::User {
+            continue;
+        }
+        for (block_idx, block) in msg.content.iter().enumerate() {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && is_next_chunk_output(content)
+            {
+                positions.push((msg_idx, block_idx));
+            }
+        }
+    }
+    if positions.len() <= 1 {
+        return;
+    }
+    let keep = *positions.last().unwrap();
+    for (msg_idx, block_idx) in &positions {
+        if (*msg_idx, *block_idx) == keep {
+            continue;
+        }
+        if let Some(msg) = messages.get_mut(*msg_idx)
+            && let Some(block) = msg.content.get_mut(*block_idx)
+            && let ContentBlock::ToolResult {
+                content, is_error, ..
+            } = block
+        {
+            // Pull the "[chunk START..END of TOTAL chars, N% through file]"
+            // header and keep only that reference, dropping the text body.
+            let header = content.lines().next().unwrap_or("").to_string();
+            *content = format!(
+                "{} — full text dropped to save context. If you didn't capture it \
+                 in a note, call next_chunk with an earlier position is not supported \
+                 (this tool is sequential); you'd need to restart.",
+                header
+            );
+            *is_error = false;
+        }
+    }
+}
+
+/// True if `content` is the output of a successful `next_chunk` call —
+/// i.e., starts with the distinctive header the tool produces.
+fn is_next_chunk_output(content: &str) -> bool {
+    // Shape: "[chunk {start}..{end} of {total} chars, {pct}% through file]\n..."
+    // Also matches the bare "EOF" signal only loosely — we DON'T want to
+    // stub that since the agent might need it repeatedly. EOF has no
+    // payload worth dropping anyway.
+    content.starts_with("[chunk ") && content.contains(" of ") && content.contains(" chars,")
+}
+
 fn count_notes(working_dir: &Path) -> usize {
     std::fs::read_dir(working_dir)
         .map(|iter| iter.filter_map(|e| e.ok()).count())
@@ -491,9 +589,16 @@ impl Tool for NextChunkTool {
         ToolDefinition {
             name: "next_chunk".to_string(),
             description: format!(
-                "Read the next `size` chars of the input file at the current cursor, \
-                 advance the cursor, return the chunk. `size` is optional (default {}, \
-                 range {}..{}). Returns 'EOF' when the whole file has been read.",
+                "Read the next `size` chars of the input file at the cursor, advance \
+                 the cursor, return the chunk. `size` default {}, range [{}, {}]. \
+                 Returns 'EOF' when the file is fully read.\n\
+                 \n\
+                 IMPORTANT: the previous chunk's text is REPLACED with a short stub \
+                 on your next tool call to keep context bounded. Before calling \
+                 next_chunk again, save anything you want to keep via append_note \
+                 or write_note. Calling next_chunk twice in a row without a note in \
+                 between means the earlier chunk's content is lost from your context \
+                 permanently (the cursor is sequential; you can't go back).",
                 DEFAULT_CHUNK_CHARS, MIN_CHUNK_CHARS, MAX_CHUNK_CHARS
             ),
             input_schema: json!({
@@ -1079,6 +1184,86 @@ mod tests {
         assert!(out.content.contains("b.md"));
         assert!(out.content.contains("2 bytes"));
         assert!(out.content.contains("4 bytes"));
+    }
+
+    #[test]
+    fn compact_stubs_all_but_last_next_chunk_result() {
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "id1".into(),
+                    content: "[chunk 0..8000 of 100000 chars, 8% through file]\n<lots of text 1>".into(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "thinking".into(),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "id2".into(),
+                    content: "[chunk 8000..16000 of 100000 chars, 16% through file]\n<lots of text 2>".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        compact_next_chunk_results(&mut messages);
+        let first = match &messages[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            _ => panic!("expected tool result"),
+        };
+        assert!(first.contains("full text dropped"), "first should be stubbed: {}", first);
+        assert!(first.contains("[chunk 0..8000"));
+        assert!(!first.contains("<lots of text 1>"));
+        let last = match &messages[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => content,
+            _ => panic!("expected tool result"),
+        };
+        assert!(last.contains("<lots of text 2>"), "newest should be kept: {}", last);
+    }
+
+    #[test]
+    fn compact_leaves_non_next_chunk_results_alone() {
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id1".into(),
+                content: "Wrote 42 bytes to findings.md".into(),
+                is_error: false,
+            }],
+        }];
+        compact_next_chunk_results(&mut messages);
+        match &messages[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "Wrote 42 bytes to findings.md");
+            }
+            _ => panic!("expected tool result"),
+        }
+    }
+
+    #[test]
+    fn compact_does_not_touch_eof_stubs() {
+        // EOF tool_result doesn't start with "[chunk" so it shouldn't match.
+        let mut messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id1".into(),
+                content: "EOF".into(),
+                is_error: false,
+            }],
+        }];
+        compact_next_chunk_results(&mut messages);
+        match &messages[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "EOF");
+            }
+            _ => panic!("expected tool result"),
+        }
     }
 
     #[tokio::test]
