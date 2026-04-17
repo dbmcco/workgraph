@@ -779,7 +779,12 @@ fn run_inner(
     // haven't run, but children are blocked on the parent completing. We resolve this
     // by detecting children and deferring verify to a synthetic aggregate task that
     // runs after all children complete.
-    if let Some(task) = graph.get_task(id)
+    //
+    // Gated on coordinator.verify_autospawn_enabled (default false as of 2026-04-17).
+    // The shadow-task pattern is deprecated in favor of single-leaf evaluate +
+    // wg rescue proxy-insert on FAIL.
+    if Config::load_or_default(dir).coordinator.verify_autospawn_enabled
+        && let Some(task) = graph.get_task(id)
         && task.verify.is_some()
     {
         // Find non-system children: tasks that list this task in their `after` field
@@ -2962,6 +2967,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
 
+        // This test covers the deprecated .verify-deferred-* autospawn path.
+        // Default is OFF as of 2026-04-17; the test enables it explicitly to
+        // continue exercising the code path for the users who still opt in.
+        std::fs::write(
+            dir_path.join("config.toml"),
+            "[coordinator]\nverify_autospawn_enabled = true\n",
+        )
+        .unwrap();
+
         // Parent task with a verify command that would fail (children haven't done work yet)
         let mut parent = make_task("parent", "Parent task", Status::InProgress);
         parent.verify = Some("exit 1".to_string()); // would fail normally
@@ -3088,6 +3102,14 @@ mod tests {
     fn test_done_deferred_verify_preserves_timeout() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
+
+        // Deprecated-feature test (see test_done_defers_verify_when_task_has_children).
+        // Enable the autospawn explicitly to exercise the path.
+        std::fs::write(
+            dir_path.join("config.toml"),
+            "[coordinator]\nverify_autospawn_enabled = true\n",
+        )
+        .unwrap();
 
         let mut parent = make_task("parent", "Parent", Status::InProgress);
         parent.verify = Some("exit 1".to_string());

@@ -225,6 +225,26 @@ pub fn run(
         );
     }
 
+    // When the loop exited abnormally (context_limit, max_turns, etc.),
+    // propagate that as a non-zero process exit so any wrapper (e.g., the
+    // autonomous agent runner that calls `complete_task` on exit 0) marks
+    // the driving task as FAILED rather than DONE. Observed 2026-04-17 on
+    // ulivo: a research task hit the context limit on turn 34, the loop
+    // returned Ok(result), the wrapper saw exit 0 and marked the graph
+    // task done — with no deliverable on disk and FLIP scoring 0.45. The
+    // mis-status broke downstream assumptions.
+    if !result.terminated_cleanly() {
+        anyhow::bail!(
+            "agent loop terminated abnormally (reason: {}). \
+             {} turns, {} input + {} output tokens. \
+             Session journal is preserved; inspect it to recover state.",
+            result.exit_reason,
+            result.turns,
+            result.total_usage.input_tokens,
+            result.total_usage.output_tokens,
+        );
+    }
+
     Ok(())
 }
 

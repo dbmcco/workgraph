@@ -2092,7 +2092,17 @@ fn default_eval_gate_threshold() -> Option<f64> {
     Some(0.7)
 }
 fn default_flip_verification_threshold() -> Option<f64> {
-    Some(0.7)
+    // Deprecated as of 2026-04-17. FLIP-driven autospawn of .verify-* tasks
+    // generated runaway meta-task cascades (observed on ulivo: every real
+    // task accumulated .flip-*, .verify-*, .flip-.verify-*, .evaluate-*,
+    // and .evaluate-.verify-* shadow tasks — 5-6x inflation). Replacement
+    // is single-leaf .evaluate-* with `wg rescue` on FAIL (see
+    // docs/design/eval-rescue-graph-surgery.md when written). FLIP scores
+    // are still computed and attached to tasks as a diagnostic signal;
+    // they just no longer trigger task creation.
+    //
+    // Set explicitly in config.toml to re-enable the old behavior.
+    None
 }
 fn default_evolution_interval() -> u64 {
     7200
@@ -2499,6 +2509,20 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_verify_mode")]
     pub verify_mode: String,
 
+    /// Master switch for `.verify-*` / `.verify-deferred-*` shadow-task
+    /// auto-spawning. Deprecated as of 2026-04-17 — default FALSE. The
+    /// pattern generated runaway meta-task cascades (every real task
+    /// accumulating 5–6 shadow tasks). Replacement design: single
+    /// `.evaluate-*` per real task, with `wg rescue` proxy-inserting a
+    /// new task on FAIL. See the rescue-graph-surgery design notes.
+    ///
+    /// When false, the `verify` field on tasks is still stored (so
+    /// inline verification in the same agent still works if explicitly
+    /// invoked) but the coordinator will not create new shadow tasks
+    /// from it. Set to true in config.toml to restore the old behavior.
+    #[serde(default)]
+    pub verify_autospawn_enabled: bool,
+
     /// Maximum consecutive verify command failures before a task is auto-failed.
     /// When a task's verify command fails this many times in a row, the task
     /// transitions to Failed with a descriptive error. Default: 3.
@@ -2827,6 +2851,7 @@ impl Default for CoordinatorConfig {
             archive_retention_days: default_archive_retention_days(),
             registry_refresh_interval: default_registry_refresh_interval(),
             verify_mode: default_verify_mode(),
+            verify_autospawn_enabled: false,
             max_verify_failures: default_max_verify_failures(),
             max_spawn_failures: default_max_spawn_failures(),
             max_escalation_depth: default_max_escalation_depth(),

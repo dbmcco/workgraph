@@ -3874,8 +3874,13 @@ pub fn coordinator_tick(
         // Phase 4.5: FLIP verification
         modified |= build_flip_verification_tasks(dir, graph, &config);
 
-        // Phase 4.55: Separate-agent verification for --verify tasks
-        if config.coordinator.verify_mode == "separate" {
+        // Phase 4.55: Separate-agent verification for --verify tasks.
+        // Double-gated: requires both (a) the separate-mode explicit config
+        // AND (b) the shadow-task autospawn master switch. Master switch
+        // defaults off as of 2026-04-17 — see AgencyConfig::verify_autospawn_enabled.
+        if config.coordinator.verify_autospawn_enabled
+            && config.coordinator.verify_mode == "separate"
+        {
             modified |= build_separate_verify_tasks(dir, graph, &config);
         }
 

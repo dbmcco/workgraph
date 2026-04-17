@@ -69,6 +69,27 @@ pub struct AgentResult {
     pub turns: usize,
     pub total_usage: Usage,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Exit reason for the loop. Populated from `session_exit_reason`
+    /// in run_interactive. Callers should treat anything other than
+    /// `"end_turn"`, `"user_quit"`, or `"eof"` as a failure and mark
+    /// the driving task accordingly (discovered 2026-04-17: previously,
+    /// `"context_limit"` exits silently landed as task.status = Done
+    /// on ulivo because the agent wrapper had no signal that the loop
+    /// didn't terminate cleanly).
+    #[serde(default)]
+    pub exit_reason: String,
+}
+
+impl AgentResult {
+    /// True when the loop terminated cleanly (model said done, user quit,
+    /// stdin closed). False for context_limit / max_turns / any other
+    /// abnormal exit — caller should mark the driving task failed.
+    pub fn terminated_cleanly(&self) -> bool {
+        matches!(
+            self.exit_reason.as_str(),
+            "end_turn" | "user_quit" | "eof"
+        )
+    }
 }
 
 /// The main agent loop.
@@ -901,6 +922,7 @@ impl AgentLoop {
                                 turns: 0,
                                 total_usage,
                                 tool_calls,
+                                exit_reason: "empty_first_input".to_string(),
                             });
                         }
                         let _ = editor.add_history_entry(&trimmed);
@@ -915,6 +937,7 @@ impl AgentLoop {
                             turns: 0,
                             total_usage,
                             tool_calls,
+                            exit_reason: "eof".to_string(),
                         });
                     }
                 }
@@ -941,6 +964,7 @@ impl AgentLoop {
                             turns: 0,
                             total_usage,
                             tool_calls,
+                            exit_reason: "user_quit".to_string(),
                         });
                     }
                     NexSlashResult::Continue => {
@@ -2124,6 +2148,7 @@ impl AgentLoop {
             turns,
             total_usage: total_usage.clone(),
             tool_calls,
+            exit_reason: session_exit_reason.to_string(),
         };
 
         // Log result and emit stream result event
