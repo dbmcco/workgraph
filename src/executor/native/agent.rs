@@ -1491,7 +1491,42 @@ impl AgentLoop {
                 // is flipped by the Ctrl-C listener task; we also
                 // re-check-and-clear at the next turn boundary so a
                 // late signal doesn't get stuck in the flag.
-                let streaming_future = self.client.send_streaming(&request, &on_text);
+                //
+                // Idle watchdog (from claude-code-ts pattern): track
+                // the timestamp of the last chunk; if the stream goes
+                // quiet for STREAM_IDLE_TIMEOUT_SECS (90s default),
+                // abort it. Prevents indefinite hangs on silently
+                // dropped connections. Override via env var
+                // WG_STREAM_IDLE_TIMEOUT_SECS.
+                let idle_timeout_secs = std::env::var("WG_STREAM_IDLE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(90);
+                let last_chunk =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+                let last_chunk_for_callback = last_chunk.clone();
+                let inner_on_text = on_text;
+                let watched_on_text = move |text: String| {
+                    if let Ok(mut t) = last_chunk_for_callback.lock() {
+                        *t = std::time::Instant::now();
+                    }
+                    inner_on_text(text);
+                };
+                let streaming_future =
+                    self.client.send_streaming(&request, &watched_on_text);
+                let last_chunk_for_watchdog = last_chunk.clone();
+                let idle_watchdog = async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let elapsed = last_chunk_for_watchdog
+                            .lock()
+                            .map(|t| t.elapsed())
+                            .unwrap_or_default();
+                        if elapsed.as_secs() >= idle_timeout_secs {
+                            return elapsed;
+                        }
+                    }
+                };
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -1499,6 +1534,15 @@ impl AgentLoop {
                             "\n\x1b[33m[nex] Interrupted — dropping in-flight response.\x1b[0m"
                         );
                         cancel.take_cooperative();
+                        force_fresh_input = true;
+                        continue;
+                    }
+                    elapsed = idle_watchdog => {
+                        eprintln!(
+                            "\n\x1b[33m[nex] Streaming idle for {}s (no chunks) — aborting. \
+                             Likely a dropped upstream connection. Next prompt is yours.\x1b[0m",
+                            elapsed.as_secs(),
+                        );
                         force_fresh_input = true;
                         continue;
                     }
