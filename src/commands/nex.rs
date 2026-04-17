@@ -50,7 +50,7 @@ pub fn run(
         } else {
             // Interactive/skill mode: strip wg mutation tools — there's
             // no task context. wg_show/wg_list kept for browsing.
-            reg.remove_tools(&["wg_done", "wg_add", "wg_fail", "wg_artifact"]);
+            reg.remove_tools(&["wg_done", "wg_add", "wg_fail", "wg_rescue", "wg_artifact"]);
         }
         if read_only {
             reg.filter_read_only()

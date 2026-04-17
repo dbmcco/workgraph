@@ -88,6 +88,7 @@ pub mod reprioritize;
 pub mod requeue;
 pub mod reschedule;
 pub mod rescue;
+pub mod reset;
 pub mod resource;
 pub mod resources;
 pub mod resume;

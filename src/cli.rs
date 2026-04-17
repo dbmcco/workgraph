@@ -50,6 +50,41 @@ pub enum Commands {
         global: bool,
     },
 
+    /// Bulk-reset a subgraph: given one or more seed tasks, close the
+    /// reachable set in the chosen direction and reset each task to
+    /// Open (clearing status, failure_reason, retry_count). With
+    /// --also-strip-meta, also delete all dot-prefixed system tasks
+    /// (.flip-*, .evaluate-*, .verify-*, .assign-*, .place-*, ...)
+    /// attached to the closure, so the coordinator can regenerate
+    /// fresh ones instead of reviving stale done ones.
+    Reset {
+        /// First (required) seed task.
+        seed: String,
+
+        /// Additional seed tasks (comma-separated or repeated --seeds).
+        #[arg(long = "seeds", value_delimiter = ',', num_args = 0..)]
+        seeds: Vec<String>,
+
+        /// Traversal direction: `forward` (downstream, default),
+        /// `backward` (upstream), or `both`.
+        #[arg(long, default_value = "forward")]
+        direction: String,
+
+        /// Also delete dot-prefixed system tasks (.flip-*, .evaluate-*,
+        /// .verify-*, .assign-*, .place-*, .verify-deferred-*)
+        /// attached to any closure member.
+        #[arg(long = "also-strip-meta")]
+        also_strip_meta: bool,
+
+        /// Show what would be reset/stripped without mutating.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Confirm destructive execution when affecting more than one task.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// Rescue a failed task by inserting a first-class replacement at
     /// its graph slot. Successors are rewired to unblock from the
     /// rescue instead of the failed target; the target stays in the
@@ -3789,6 +3824,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Init { .. } => "init",
         Commands::Insert { .. } => "insert",
         Commands::Rescue { .. } => "rescue",
+        Commands::Reset { .. } => "reset",
         Commands::Add { .. } => "add",
         Commands::Edit { .. } => "edit",
         Commands::Done { .. } => "done",

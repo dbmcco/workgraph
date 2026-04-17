@@ -542,6 +542,27 @@ fn main() -> Result<()> {
             };
             commands::init::run(&target_dir, no_agency)
         }
+        Commands::Reset {
+            seed,
+            seeds,
+            direction,
+            also_strip_meta,
+            dry_run,
+            yes,
+        } => {
+            let dir_parsed: commands::reset::Direction =
+                direction.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let mut all_seeds = vec![seed];
+            all_seeds.extend(seeds);
+            let opts = commands::reset::ResetOptions {
+                direction: dir_parsed,
+                also_strip_meta,
+                dry_run,
+                yes,
+            };
+            commands::reset::run(&workgraph_dir, &all_seeds, opts)?;
+            Ok(())
+        }
         Commands::Rescue {
             target,
             description,

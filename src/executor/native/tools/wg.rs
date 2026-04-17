@@ -31,6 +31,9 @@ pub fn register_wg_tools(registry: &mut ToolRegistry, workgraph_dir: PathBuf) {
     registry.register(Box::new(WgFailTool {
         dir: workgraph_dir.clone(),
     }));
+    registry.register(Box::new(WgRescueTool {
+        dir: workgraph_dir.clone(),
+    }));
     registry.register(Box::new(WgLogTool {
         dir: workgraph_dir.clone(),
     }));
@@ -707,6 +710,147 @@ impl Tool for WgFailTool {
         }
 
         ToolOutput::success(format!("Task '{}' marked as failed: {}", task_id, reason))
+    }
+}
+
+// ── wg_rescue ───────────────────────────────────────────────────────────
+
+struct WgRescueTool {
+    dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for WgRescueTool {
+    fn name(&self) -> &str {
+        "wg_rescue"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "wg_rescue".to_string(),
+            description:
+                "Create a first-class replacement task for a failed task. \
+                 The rescue task inherits the failed target's position in the graph — \
+                 its predecessors and successors — and successors are routed to unblock \
+                 from the rescue instead of the failed target. The failed task stays \
+                 in the graph for history (with superseded_by log entries). Use this \
+                 when you've evaluated a task as failed AND can describe a concrete \
+                 fix. The `description` becomes the rescue agent's brief — be specific. \
+                 If you can't describe a fix, use wg_fail + wg_log to flag for human \
+                 review instead of rescuing blind.\n\
+                 \n\
+                 Intended primary caller: the .evaluate-* agent. Other agents with \
+                 graph-mutation authority (coordinators) can also invoke this."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "The failed task's ID to rescue (position + edges will be inherited)"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What the rescue task needs to do differently. Becomes the rescue task's brief — treat as the next agent's assignment. Be specific about what went wrong and what the fix should be."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional title for the rescue task (default: 'Rescue: <target>')"
+                    },
+                    "from_eval": {
+                        "type": "string",
+                        "description": "The ID of the eval task driving this rescue (recorded in provenance). If you are the eval, pass your own task_id from WG_TASK_ID."
+                    }
+                },
+                "required": ["target", "description"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> ToolOutput {
+        let target = match input.get("target").and_then(|v| v.as_str()) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => return ToolOutput::error("Missing required parameter: target".to_string()),
+        };
+        let description = match input.get("description").and_then(|v| v.as_str()) {
+            Some(d) if !d.trim().is_empty() => d.to_string(),
+            _ => {
+                return ToolOutput::error(
+                    "Missing or empty required parameter: description. \
+                     The description becomes the rescue agent's assignment — be specific."
+                        .to_string(),
+                );
+            }
+        };
+        let title = input
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let from_eval = input
+            .get("from_eval")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            // Fall back to the caller's own task_id if not supplied —
+            // the evaluator typically knows its own id via WG_TASK_ID.
+            .or_else(|| std::env::var("WG_TASK_ID").ok());
+
+        // Invoke `wg rescue` as a subprocess. Binary-level call keeps
+        // the tool library self-contained (bin-specific command logic
+        // lives in src/commands/rescue.rs) and reuses the full rescue
+        // plumbing (metadata stamping, operations log, interactive
+        // stderr) exactly as a human CLI invocation would.
+        let dir = self.dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new("wg");
+            cmd.arg("--dir").arg(&dir);
+            cmd.arg("rescue");
+            cmd.arg(&target);
+            cmd.arg("--description").arg(&description);
+            if let Some(t) = title.as_deref() {
+                cmd.arg("--title").arg(t);
+            }
+            if let Some(e) = from_eval.as_deref() {
+                cmd.arg("--from-eval").arg(e);
+            }
+            cmd.output()
+        })
+        .await;
+
+        match result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if output.status.success() {
+                    ToolOutput::success(format!(
+                        "{}\n\
+                         Your evaluation work is complete — you may now mark your \
+                         own eval done.{}",
+                        stdout.trim(),
+                        if stderr.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n\n[telemetry]\n{}", stderr.trim())
+                        }
+                    ))
+                } else {
+                    ToolOutput::error(format!(
+                        "wg rescue exited {}: {}{}",
+                        output.status,
+                        stderr.trim(),
+                        if stdout.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nstdout: {}", stdout.trim())
+                        }
+                    ))
+                }
+            }
+            Ok(Err(e)) => ToolOutput::error(format!(
+                "Failed to invoke `wg rescue`: {}. Is `wg` on PATH?",
+                e
+            )),
+            Err(e) => ToolOutput::error(format!("spawn_blocking panicked: {}", e)),
+        }
     }
 }
 
