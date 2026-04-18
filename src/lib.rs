@@ -4,7 +4,6 @@ pub mod chat_sessions;
 pub mod check;
 pub mod config;
 pub mod context_scope;
-pub mod coordinator_prompt;
 pub mod cron;
 pub mod cycle;
 pub mod executor;
