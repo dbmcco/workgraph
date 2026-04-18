@@ -201,9 +201,7 @@ impl Tool for MapTool {
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),
             None => {
-                return ToolOutput::error(
-                    "Missing or non-array parameter: inputs".to_string(),
-                );
+                return ToolOutput::error("Missing or non-array parameter: inputs".to_string());
             }
         };
         if inputs.is_empty() {
@@ -298,20 +296,18 @@ pub(crate) async fn run_map(
         );
         // Fresh provider per item — keeps the conversations truly
         // independent even if the underlying client has caches.
-        let provider = match crate::executor::native::provider::create_provider(
-            workgraph_dir,
-            &model,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                per_item_results.push((
-                    i,
-                    item_input.clone(),
-                    Err(format!("create provider: {}", e)),
-                ));
-                continue;
-            }
-        };
+        let provider =
+            match crate::executor::native::provider::create_provider(workgraph_dir, &model) {
+                Ok(p) => p,
+                Err(e) => {
+                    per_item_results.push((
+                        i,
+                        item_input.clone(),
+                        Err(format!("create provider: {}", e)),
+                    ));
+                    continue;
+                }
+            };
         let item_label = format!("{}/{}", i + 1, inputs.len());
         let outcome = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs_per_item),
@@ -348,16 +344,15 @@ pub(crate) async fn run_map(
     // Aggregate results into parent_dir/results.md.
     let results_md = aggregate_results(task, &per_item_results);
     let results_path = parent_dir.join("results.md");
-    std::fs::write(&results_path, &results_md)
-        .map_err(|e| format!("write results.md: {}", e))?;
+    std::fs::write(&results_path, &results_md).map_err(|e| format!("write results.md: {}", e))?;
 
-    let (ok, fail) = per_item_results.iter().fold((0, 0), |(o, f), (_, _, r)| {
-        if r.is_ok() {
-            (o + 1, f)
-        } else {
-            (o, f + 1)
-        }
-    });
+    let (ok, fail) =
+        per_item_results.iter().fold(
+            (0, 0),
+            |(o, f), (_, _, r)| {
+                if r.is_ok() { (o + 1, f) } else { (o, f + 1) }
+            },
+        );
 
     Ok(format!(
         "Map result: {} of {} items completed ({} failed).\n\
@@ -488,8 +483,7 @@ async fn run_item(
                 // Per-turn progress line so the outer user sees work
                 // happening inside an item's sub-agent. Otherwise a
                 // long-running item looks frozen.
-                let tool_names: Vec<&str> =
-                    tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                let tool_names: Vec<&str> = tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
                 eprintln!(
                     "\x1b[2m[map item {} turn {}/{}: {}]\x1b[0m",
                     item_label,
@@ -523,7 +517,10 @@ async fn run_item(
     let s = state.lock().unwrap();
     match s.final_result.clone() {
         Some(r) => Ok(r),
-        None => Err(format!("item reached max turns ({}) without finish", max_turns)),
+        None => Err(format!(
+            "item reached max turns ({}) without finish",
+            max_turns
+        )),
     }
 }
 
@@ -578,10 +575,7 @@ fn item_slug_from_input(input: &str, index: usize) -> String {
 }
 
 /// Build the aggregated results.md from per-item outcomes.
-fn aggregate_results(
-    task: &str,
-    items: &[(usize, String, Result<String, String>)],
-) -> String {
+fn aggregate_results(task: &str, items: &[(usize, String, Result<String, String>)]) -> String {
     let mut s = String::new();
     s.push_str(&format!("# Map results: {}\n\n", task));
     s.push_str(&format!("Total items: {}\n\n", items.len()));
@@ -711,8 +705,9 @@ impl Tool for AppendNoteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "append_note".to_string(),
-            description: "Append content to a file `name` in your working dir (creates if missing)."
-                .to_string(),
+            description:
+                "Append content to a file `name` in your working dir (creates if missing)."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -738,7 +733,9 @@ impl Tool for AppendNoteTool {
             Err(e) => return ToolOutput::error(e),
         };
         drop(s);
-        let existing_len = std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
+        let existing_len = std::fs::metadata(&path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         if existing_len + content.len() > MAX_NOTE_CHARS {
             return ToolOutput::error(format!(
                 "Note would exceed cap: {} + {} > {}",
@@ -1004,7 +1001,10 @@ mod tests {
     #[test]
     fn task_slug_basic() {
         assert_eq!(task_slug("summarize each file"), "summarize-each-file");
-        assert_eq!(task_slug("Extract X from the docs"), "extract-x-from-the-docs");
+        assert_eq!(
+            task_slug("Extract X from the docs"),
+            "extract-x-from-the-docs"
+        );
     }
 
     #[test]

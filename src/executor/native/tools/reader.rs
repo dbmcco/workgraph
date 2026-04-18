@@ -237,8 +237,8 @@ async fn run_reader(
     task: &str,
     max_turns: usize,
 ) -> Result<String, String> {
-    let input_text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read '{}': {}", path, e))?;
+    let input_text =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read '{}': {}", path, e))?;
     let total_chars = input_text.len();
 
     // Create working directory. Lives at <workgraph_dir>/readers/<stamp>-<slug>/
@@ -442,7 +442,10 @@ async fn run_reader(
                     } else {
                         ""
                     };
-                    format!(" cursor {}→{} ({}%{})", cursor_before, cursor_after, pct, eof_marker)
+                    format!(
+                        " cursor {}→{} ({}%{})",
+                        cursor_before, cursor_after, pct, eof_marker
+                    )
                 } else {
                     String::new()
                 };
@@ -502,8 +505,7 @@ fn make_working_dir(workgraph_dir: &Path, input_path: &str) -> Result<PathBuf, S
     let dir = workgraph_dir
         .join("readers")
         .join(format!("{}-{}", stamp, slug));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create working dir {:?}: {}", dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create working dir {:?}: {}", dir, e))?;
     Ok(dir)
 }
 
@@ -516,7 +518,13 @@ fn slug_from_path(path: &str) -> String {
         .unwrap_or_else(|| "input".to_string());
     let mut out: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     // Collapse runs of '-'
     while out.contains("--") {
@@ -559,7 +567,7 @@ fn format_exit(working_dir: &Path, result: &str, turns: usize, hit_max: bool) ->
 /// history, so they survive compaction unchanged. The agent is
 /// therefore forced to extract what it needs into notes BEFORE
 /// calling next_chunk again, or the information is lost.
-fn compact_next_chunk_results(messages: &mut Vec<Message>) {
+fn compact_next_chunk_results(messages: &mut [Message]) {
     let mut positions = Vec::new();
     for (msg_idx, msg) in messages.iter().enumerate() {
         if msg.role != Role::User {
@@ -817,7 +825,9 @@ impl Tool for AppendNoteTool {
         drop(s);
 
         // Enforce the note-size cap on the cumulative size.
-        let existing_len = std::fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
+        let existing_len = std::fs::metadata(&path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         if existing_len + content.len() > MAX_NOTE_CHARS {
             return ToolOutput::error(format!(
                 "Note would exceed cap: {} existing + {} new > {}",
@@ -850,9 +860,7 @@ impl Tool for AppendNoteTool {
             let _ = f.write_all(b"\n");
         }
         match f.write_all(content.as_bytes()) {
-            Ok(()) => {
-                ToolOutput::success(format!("Appended {} bytes to {}", content.len(), name))
-            }
+            Ok(()) => ToolOutput::success(format!("Appended {} bytes to {}", content.len(), name)),
             Err(e) => ToolOutput::error(format!("append_note write {:?}: {}", path, e)),
         }
     }
@@ -1135,7 +1143,10 @@ mod tests {
 
     #[test]
     fn slug_from_path_collapses_dashes() {
-        assert_eq!(slug_from_path("/some!@#path/with-many--non-ascii.ext"), "with-many-non-ascii-ext");
+        assert_eq!(
+            slug_from_path("/some!@#path/with-many--non-ascii.ext"),
+            "with-many-non-ascii-ext"
+        );
     }
 
     #[test]
@@ -1271,7 +1282,8 @@ mod tests {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "id1".into(),
-                    content: "[chunk 0..8000 of 100000 chars, 8% through file]\n<lots of text 1>".into(),
+                    content: "[chunk 0..8000 of 100000 chars, 8% through file]\n<lots of text 1>"
+                        .into(),
                     is_error: false,
                 }],
             },
@@ -1285,7 +1297,9 @@ mod tests {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "id2".into(),
-                    content: "[chunk 8000..16000 of 100000 chars, 16% through file]\n<lots of text 2>".into(),
+                    content:
+                        "[chunk 8000..16000 of 100000 chars, 16% through file]\n<lots of text 2>"
+                            .into(),
                     is_error: false,
                 }],
             },
@@ -1295,14 +1309,22 @@ mod tests {
             ContentBlock::ToolResult { content, .. } => content,
             _ => panic!("expected tool result"),
         };
-        assert!(first.contains("full text dropped"), "first should be stubbed: {}", first);
+        assert!(
+            first.contains("full text dropped"),
+            "first should be stubbed: {}",
+            first
+        );
         assert!(first.contains("[chunk 0..8000"));
         assert!(!first.contains("<lots of text 1>"));
         let last = match &messages[2].content[0] {
             ContentBlock::ToolResult { content, .. } => content,
             _ => panic!("expected tool result"),
         };
-        assert!(last.contains("<lots of text 2>"), "newest should be kept: {}", last);
+        assert!(
+            last.contains("<lots of text 2>"),
+            "newest should be kept: {}",
+            last
+        );
     }
 
     #[test]

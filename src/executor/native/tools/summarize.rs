@@ -333,7 +333,14 @@ pub(crate) fn recursive_summarize_cancellable<'a>(
             let started = std::time::Instant::now();
             let summary = summarize_chunk(provider, chunk, &chunk_instruction).await?;
             let elapsed = started.elapsed();
-            log_summarize_chunk(depth, i + 1, chunks.len(), chunk.len(), summary.len(), elapsed);
+            log_summarize_chunk(
+                depth,
+                i + 1,
+                chunks.len(),
+                chunk.len(),
+                summary.len(),
+                elapsed,
+            );
             chunk_summaries.push(summary);
         }
 
@@ -377,7 +384,12 @@ pub(crate) fn recursive_summarize_cancellable<'a>(
 /// Format a single-shot summarization telemetry line. Dim-styled so the
 /// user can visually tune it out when the agent is working hard but it
 /// stays visible for when they want to check on progress.
-fn log_summarize_call(depth: usize, in_bytes: usize, out_bytes: usize, elapsed: std::time::Duration) {
+fn log_summarize_call(
+    depth: usize,
+    in_bytes: usize,
+    out_bytes: usize,
+    elapsed: std::time::Duration,
+) {
     eprintln!(
         "\x1b[2m[summarize] depth={}: {} bytes → {} bytes in {:.1}s ({})\x1b[0m",
         depth,
@@ -786,9 +798,7 @@ pub async fn microcompact_oldest_block(
                     target = Some((mi, bi, text.clone(), true));
                     break 'outer;
                 }
-                ContentBlock::Thinking { thinking, .. }
-                    if thinking.len() >= min_block_bytes =>
-                {
+                ContentBlock::Thinking { thinking, .. } if thinking.len() >= min_block_bytes => {
                     target = Some((mi, bi, thinking.clone(), true));
                     break 'outer;
                 }
@@ -978,7 +988,9 @@ mod tests {
         let messages = vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "start".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "start".into(),
+                }],
             },
             Message {
                 role: Role::Assistant,
@@ -1009,7 +1021,9 @@ mod tests {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text { text: "sure".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "sure".into(),
+                }],
             },
             Message {
                 role: Role::User,
@@ -1043,15 +1057,21 @@ mod tests {
         let messages = vec![
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "tiny".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "tiny".into(),
+                }],
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text { text: "short".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "short".into(),
+                }],
             },
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: "next".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "next".into(),
+                }],
             },
             Message {
                 role: Role::Assistant,
@@ -1088,9 +1108,7 @@ mod tests {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: big.clone(),
-                }],
+                content: vec![ContentBlock::Text { text: big.clone() }],
             },
         ];
         let provider = StubSummarizer {

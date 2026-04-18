@@ -728,8 +728,7 @@ impl Tool for WgRescueTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "wg_rescue".to_string(),
-            description:
-                "Create a first-class replacement task for a failed task. \
+            description: "Create a first-class replacement task for a failed task. \
                  The rescue task inherits the failed target's position in the graph — \
                  its predecessors and successors — and successors are routed to unblock \
                  from the rescue instead of the failed target. The failed task stays \
@@ -741,7 +740,7 @@ impl Tool for WgRescueTool {
                  \n\
                  Intended primary caller: the .evaluate-* agent. Other agents with \
                  graph-mutation authority (coordinators) can also invoke this."
-                    .to_string(),
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

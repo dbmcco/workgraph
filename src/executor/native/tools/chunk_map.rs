@@ -181,9 +181,7 @@ impl Tool for ChunkMapTool {
             }
             (_, Some(t)) if !t.is_empty() => ("inline text".to_string(), t.to_string()),
             _ => {
-                return ToolOutput::error(
-                    "Provide one of `path` or `text`.".to_string(),
-                );
+                return ToolOutput::error("Provide one of `path` or `text`.".to_string());
             }
         };
 
@@ -202,18 +200,15 @@ impl Tool for ChunkMapTool {
                     .resolve_model_for_role(crate::config::DispatchRole::TaskAgent)
                     .model
             });
-        let provider = match crate::executor::native::provider::create_provider(
-            &self.workgraph_dir,
-            &model,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return ToolOutput::error(format!("resolve provider: {}", e));
-            }
-        };
+        let provider =
+            match crate::executor::native::provider::create_provider(&self.workgraph_dir, &model) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolOutput::error(format!("resolve provider: {}", e));
+                }
+            };
 
-        let default_chunk_bytes =
-            super::summarize::chunk_size_chars(provider.context_window());
+        let default_chunk_bytes = super::summarize::chunk_size_chars(provider.context_window());
         let chunk_bytes = input
             .get("max_bytes_per_chunk")
             .and_then(|v| v.as_u64())
@@ -309,9 +304,7 @@ mod tests {
     async fn missing_source_errors_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let tool = test_tool(dir.path());
-        let out = tool
-            .execute(&json!({"task": "do a thing"}))
-            .await;
+        let out = tool.execute(&json!({"task": "do a thing"})).await;
         assert!(out.is_error);
         assert!(out.content.to_lowercase().contains("path"));
     }
@@ -320,9 +313,7 @@ mod tests {
     async fn empty_text_errors_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let tool = test_tool(dir.path());
-        let out = tool
-            .execute(&json!({"task": "x", "text": ""}))
-            .await;
+        let out = tool.execute(&json!({"task": "x", "text": ""})).await;
         assert!(out.is_error);
         // Either "empty" or "Provide one of" — both are acceptable rejections.
         let s = out.content.to_lowercase();

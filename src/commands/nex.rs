@@ -14,6 +14,7 @@ use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
 use workgraph::models::ModelRegistry;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     workgraph_dir: &Path,
     model: Option<&str>,
@@ -260,7 +261,7 @@ fn load_agency_role(workgraph_dir: &Path, role_name: &str) -> Option<String> {
 
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "yaml") {
+        if path.extension().is_none_or(|ext| ext != "yaml") {
             continue;
         }
         let text = std::fs::read_to_string(&path).ok()?;

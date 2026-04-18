@@ -199,12 +199,7 @@ impl Tool for WebFetchTool {
                 // etc.) without having to fall back to `bash curl` — which was
                 // the previous "refuse" behavior and made image/asset workflows
                 // impossible through the tool alone.
-                match save_binary_artifact(
-                    &self.workgraph_dir,
-                    &url_str,
-                    content_type,
-                    bytes,
-                ) {
+                match save_binary_artifact(&self.workgraph_dir, &url_str, content_type, bytes) {
                     Ok(metadata) => return ToolOutput::success(metadata),
                     Err(e) => {
                         return ToolOutput::error(format!(
@@ -441,7 +436,10 @@ async fn fetch_via_rquest(url: &str, timeout_secs: u64) -> Result<FetchedBody, S
     // Non-text content-type that wasn't PDF magic — preserve as binary with
     // its real content-type so the save_binary_artifact path can pick the
     // right extension.
-    Ok(FetchedBody::Binary { content_type, bytes })
+    Ok(FetchedBody::Binary {
+        content_type,
+        bytes,
+    })
 }
 
 /// True when the content-type is text-like (HTML, XML, JSON, plain text,
@@ -610,16 +608,14 @@ fn save_binary_artifact(
     bytes: &[u8],
 ) -> Result<String, String> {
     let dir = workgraph_dir.join("nex-sessions").join("fetched-pages");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create artifact dir {:?}: {}", dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create artifact dir {:?}: {}", dir, e))?;
     let counter = FETCH_COUNTER.fetch_add(1, Ordering::SeqCst);
     // Infer extension from content-type; fall back to .bin.
     let ext = binary_extension_for(content_type);
     let slug = slug_from_url(url);
     let filename = format!("{:05}-{}.{}", counter, slug, ext);
     let path = dir.join(&filename);
-    std::fs::write(&path, bytes)
-        .map_err(|e| format!("write {:?}: {}", path, e))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("write {:?}: {}", path, e))?;
     Ok(format!(
         "Saved binary artifact.\n\
          URL:          {}\n\
@@ -640,7 +636,12 @@ fn save_binary_artifact(
 
 /// Map a content-type to a reasonable file extension.
 fn binary_extension_for(content_type: &str) -> &'static str {
-    let ct = content_type.split(';').next().unwrap_or("").trim().to_lowercase();
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     match ct.as_str() {
         "image/jpeg" | "image/jpg" => "jpg",
         "image/png" => "png",

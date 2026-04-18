@@ -162,11 +162,7 @@ pub fn kill_process_graceful(pid: u32, wait_secs: u64) -> anyhow::Result<()> {
         remaining.push(pid);
     }
     let late_descendants = collect_process_descendants(pid);
-    for child in descendants
-        .iter()
-        .chain(late_descendants.iter())
-        .copied()
-    {
+    for child in descendants.iter().chain(late_descendants.iter()).copied() {
         if is_process_alive(child) && !remaining.contains(&child) {
             remaining.push(child);
         }

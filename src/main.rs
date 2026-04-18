@@ -582,7 +582,10 @@ fn main() -> Result<()> {
                 from_eval.as_deref(),
                 actor.as_deref(),
             )?;
-            println!("Rescue task '{}' created (supersedes '{}').", new_id, target);
+            println!(
+                "Rescue task '{}' created (supersedes '{}').",
+                new_id, target
+            );
             Ok(())
         }
         Commands::Insert {
@@ -594,9 +597,8 @@ fn main() -> Result<()> {
             splice,
             replace_edges,
         } => {
-            let pos: commands::insert::Position = position.parse().map_err(|e: String| {
-                anyhow::anyhow!(e)
-            })?;
+            let pos: commands::insert::Position =
+                position.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let opts = commands::insert::InsertOptions {
                 splice,
                 replace_edges,

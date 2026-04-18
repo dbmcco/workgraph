@@ -11,8 +11,8 @@
 //! 2. Rewires successors to unblock from R only (not from the failed
 //!    target).
 //! 3. Writes metadata on both tasks:
-//!      target.log: "superseded by R (rescue from eval <eval-id>)"
-//!      R.log:     "supersedes target (created from eval <eval-id>)"
+//!    - target.log: "superseded by R (rescue from eval <eval-id>)"
+//!    - R.log:     "supersedes target (created from eval <eval-id>)"
 //! 4. Appends an `op: "rescue"` entry to `.workgraph/log/operations.jsonl`.
 //! 5. Emits a dim stderr line for interactive visibility.
 //!
@@ -196,10 +196,10 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use workgraph::graph::Task;
     use workgraph::parser::load_graph;
     use workgraph::test_helpers::{make_task_with_status, setup_workgraph};
-    use tempfile::tempdir;
 
     fn make(id: &str, status: Status) -> Task {
         make_task_with_status(id, id, status)
@@ -236,7 +236,10 @@ mod tests {
         let g = load_graph(&crate::commands::graph_path(dir.path())).unwrap();
         let r = g.get_task(&new_id).unwrap();
         // First-class ID — no dot-prefix
-        assert!(!r.id.starts_with('.'), "rescue task must not be dot-prefixed");
+        assert!(
+            !r.id.starts_with('.'),
+            "rescue task must not be dot-prefixed"
+        );
         // Tagged for discoverability
         assert!(r.tags.iter().any(|t| t == "rescue"));
         // Description carries provenance

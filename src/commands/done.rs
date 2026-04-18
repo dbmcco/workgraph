@@ -783,7 +783,9 @@ fn run_inner(
     // Gated on coordinator.verify_autospawn_enabled (default false as of 2026-04-17).
     // The shadow-task pattern is deprecated in favor of single-leaf evaluate +
     // wg rescue proxy-insert on FAIL.
-    if Config::load_or_default(dir).coordinator.verify_autospawn_enabled
+    if Config::load_or_default(dir)
+        .coordinator
+        .verify_autospawn_enabled
         && let Some(task) = graph.get_task(id)
         && task.verify.is_some()
     {

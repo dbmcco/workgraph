@@ -83,7 +83,7 @@ impl TouchedFiles {
     /// path as touched. Silently ignores tools not in the allow-list
     /// and inputs without a usable `path`.
     pub fn observe(&mut self, tool_name: &str, input: &serde_json::Value) {
-        if !FILE_TOUCHING_TOOLS.iter().any(|t| *t == tool_name) {
+        if !FILE_TOUCHING_TOOLS.contains(&tool_name) {
             return;
         }
         // `reader` and `summarize` accept either `path` or `source`.
@@ -191,7 +191,11 @@ mod tests {
         t.mark("a.txt");
         t.mark("b.txt");
         t.mark("c.txt");
-        let top: Vec<_> = t.top(3).into_iter().map(|p| p.to_str().unwrap().to_string()).collect();
+        let top: Vec<_> = t
+            .top(3)
+            .into_iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
         assert_eq!(top, vec!["c.txt", "b.txt", "a.txt"]);
     }
 
@@ -201,7 +205,11 @@ mod tests {
         t.mark("a.txt");
         t.mark("b.txt");
         t.mark("a.txt"); // re-touch
-        let top: Vec<_> = t.top(3).into_iter().map(|p| p.to_str().unwrap().to_string()).collect();
+        let top: Vec<_> = t
+            .top(3)
+            .into_iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
         assert_eq!(top, vec!["a.txt", "b.txt"]);
         assert_eq!(t.len(), 2, "re-touch should not duplicate");
     }

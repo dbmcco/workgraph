@@ -275,14 +275,21 @@ mod tests {
 
         // Buffer content should be the original serialized input
         let saved = std::fs::read_to_string(&r.buffer_path).unwrap();
-        assert!(saved.contains(&big), "buffer should contain the full 20k content");
+        assert!(
+            saved.contains(&big),
+            "buffer should contain the full 20k content"
+        );
 
         // tool_use input should now be the placeholder
         if let ContentBlock::ToolUse { input, .. } = &msg.content[0] {
             assert!(input.get("_compacted_by_l0_defense").is_some());
             // And its serialized size should be small
             let s = serde_json::to_string(input).unwrap();
-            assert!(s.len() < 500, "placeholder should be small, got {}", s.len());
+            assert!(
+                s.len() < 500,
+                "placeholder should be small, got {}",
+                s.len()
+            );
         } else {
             panic!("expected ToolUse");
         }
@@ -294,7 +301,9 @@ mod tests {
             tool_use_id: "t1".to_string(),
             tool_name: "write_file".to_string(),
             original_bytes: 20_480,
-            buffer_path: PathBuf::from("/wg/nex-sessions/pending-tool-use-buffers/00001-write_file-t1.json"),
+            buffer_path: PathBuf::from(
+                "/wg/nex-sessions/pending-tool-use-buffers/00001-write_file-t1.json",
+            ),
         };
         let msg = r.explain();
         assert!(msg.contains("20480"));
@@ -357,7 +366,11 @@ mod tests {
         };
         let threshold = threshold_for_window(32_000);
         let rejections = compact_oversized_tool_uses(&mut msg, dir.path(), threshold);
-        assert_eq!(rejections.len(), 1, "20KB write_file on 32k window should reject");
+        assert_eq!(
+            rejections.len(),
+            1,
+            "20KB write_file on 32k window should reject"
+        );
     }
 
     #[test]

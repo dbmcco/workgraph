@@ -288,8 +288,7 @@ async fn run_agent_task(
     };
     // Inputs submitted via Enter while a turn is in flight land here
     // rather than being dropped on the floor. Drained FIFO between turns.
-    let mut pending_inputs: std::collections::VecDeque<String> =
-        std::collections::VecDeque::new();
+    let mut pending_inputs: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     'outer: loop {
         // Pick the next user message: pending queue first, else block on
@@ -356,9 +355,7 @@ async fn run_agent_task(
                             // generating. The user is typing ahead.
                             pending_inputs.push_back(text);
                             let _ = tx_output
-                                .send(AgentToUi::Info(
-                                    "[queued for next turn]".to_string(),
-                                ));
+                                .send(AgentToUi::Info("[queued for next turn]".to_string()));
                             continue;
                         }
                     }
@@ -380,7 +377,7 @@ async fn run_agent_task(
                                 "[hard-cancel] subprocess tree killed".to_string(),
                             ));
                         }
-                        UiToAgent::Quit | _ => {
+                        _ => {
                             break 'outer;
                         }
                     }
@@ -717,10 +714,7 @@ async fn run_async(
                                 // inputs and delivers them at the next turn
                                 // boundary. See run_agent_task for the pending
                                 // queue logic.
-                                let _ = tx_input.send(UiToAgent::UserInput {
-                                    text,
-                                    interrupt,
-                                });
+                                let _ = tx_input.send(UiToAgent::UserInput { text, interrupt });
                             } else if shift {
                                 // Shift-Enter on empty input: harmless, lets
                                 // the muscle-memory work when the user reaches

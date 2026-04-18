@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 
 use workgraph::graph::{LogEntry, Status, WorkGraph};
@@ -90,6 +90,11 @@ pub struct ResetOptions {
 }
 
 /// Outcome describing what happened (or would happen, on dry run).
+/// Fields are currently only read by integration-style callers (tests
+/// and scripted drivers); the `Debug` impl is also load-bearing for
+/// test inspection. Mark allow(dead_code) to keep clippy happy while
+/// preserving the public surface.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct ResetReport {
     pub closure: Vec<String>,
@@ -180,7 +185,7 @@ pub fn run(dir: &Path, seeds: &[String], opts: ResetOptions) -> Result<ResetRepo
 
     let closure_set: HashSet<String> = closure_sorted.iter().cloned().collect();
     let meta_set: HashSet<String> = meta_sorted.iter().cloned().collect();
-    let seeds_owned: Vec<String> = seeds.iter().cloned().collect();
+    let seeds_owned: Vec<String> = seeds.to_vec();
 
     let mut reset_count = 0usize;
     let mut stripped_count = 0usize;
@@ -276,11 +281,7 @@ pub fn run(dir: &Path, seeds: &[String], opts: ResetOptions) -> Result<ResetRepo
 /// would just set them to Open and leave them lying around); the
 /// correct behavior for a meta task during a reset is DELETE, and
 /// that's gated behind `--also-strip-meta`.
-fn compute_closure(
-    graph: &WorkGraph,
-    seeds: &[String],
-    direction: Direction,
-) -> HashSet<String> {
+fn compute_closure(graph: &WorkGraph, seeds: &[String], direction: Direction) -> HashSet<String> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = seeds
         .iter()
@@ -318,10 +319,7 @@ fn compute_closure(
 /// (after or before) pointing to a closure member. These are the
 /// agency-pipeline scaffolding around the closure and get stripped
 /// with `--also-strip-meta`.
-fn find_meta_attached_to_closure(
-    graph: &WorkGraph,
-    closure: &HashSet<String>,
-) -> HashSet<String> {
+fn find_meta_attached_to_closure(graph: &WorkGraph, closure: &HashSet<String>) -> HashSet<String> {
     graph
         .tasks()
         .filter(|t| workgraph::graph::is_system_task(&t.id))
@@ -336,10 +334,10 @@ fn find_meta_attached_to_closure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use workgraph::graph::Task;
     use workgraph::parser::load_graph;
     use workgraph::test_helpers::{make_task_with_status, setup_workgraph};
-    use tempfile::tempdir;
 
     fn make(id: &str, status: Status) -> Task {
         make_task_with_status(id, id, status)
@@ -529,7 +527,10 @@ mod tests {
         use std::str::FromStr;
         assert_eq!(Direction::from_str("forward").unwrap(), Direction::Forward);
         assert_eq!(Direction::from_str("down").unwrap(), Direction::Forward);
-        assert_eq!(Direction::from_str("upstream").unwrap(), Direction::Backward);
+        assert_eq!(
+            Direction::from_str("upstream").unwrap(),
+            Direction::Backward
+        );
         assert_eq!(Direction::from_str("both").unwrap(), Direction::Both);
         assert!(Direction::from_str("sideways").is_err());
     }

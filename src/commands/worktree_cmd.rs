@@ -225,12 +225,7 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration> {
 /// nuke-all. Per-worktree removal still goes through `archive --remove`
 /// so uncommitted work is committed to the agent's branch before the
 /// directory is dropped.
-pub fn gc(
-    workgraph_dir: &Path,
-    execute: bool,
-    older: Option<&str>,
-    dead_only: bool,
-) -> Result<()> {
+pub fn gc(workgraph_dir: &Path, execute: bool, older: Option<&str>, dead_only: bool) -> Result<()> {
     let project_root = workgraph_dir
         .parent()
         .context("Cannot determine project root from workgraph dir")?;

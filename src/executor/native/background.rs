@@ -321,17 +321,17 @@ impl JobStore {
         // and the agent's intent was to stop it. Mark the job record
         // so subsequent status calls reflect reality.
         if !process_exists(pid) {
-            if let Some(job) = self.jobs.get_mut(&job_id) {
-                if job.status == JobStatus::Running {
-                    // Race with natural exit: infer status from exit code.
-                    // Non-zero or missing code = Failed; zero = Completed.
-                    let code = get_exit_code(pid);
-                    job.status = match code {
-                        Some(0) => JobStatus::Completed,
-                        _ => JobStatus::Failed,
-                    };
-                    job.exit_code = code;
-                }
+            if let Some(job) = self.jobs.get_mut(&job_id)
+                && job.status == JobStatus::Running
+            {
+                // Race with natural exit: infer status from exit code.
+                // Non-zero or missing code = Failed; zero = Completed.
+                let code = get_exit_code(pid);
+                job.status = match code {
+                    Some(0) => JobStatus::Completed,
+                    _ => JobStatus::Failed,
+                };
+                job.exit_code = code;
             }
             return Ok(());
         }

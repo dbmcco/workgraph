@@ -89,9 +89,7 @@ impl InMemoryInbox {
         if let Ok(mut q) = self.queue.lock() {
             q.push_back(input);
         }
-        if is_interrupt
-            && let Some(token) = cancel
-        {
+        if is_interrupt && let Some(token) = cancel {
             token.request_cooperative();
         }
     }
@@ -234,10 +232,7 @@ mod tests {
         let inbox = InMemoryInbox::new();
         let cancel = CancelToken::new();
         assert!(!cancel.is_cooperative());
-        inbox.push(
-            UserInput::Interrupt("stop that".into()),
-            Some(&cancel),
-        );
+        inbox.push(UserInput::Interrupt("stop that".into()), Some(&cancel));
         assert!(cancel.is_cooperative());
     }
 

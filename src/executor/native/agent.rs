@@ -85,10 +85,7 @@ impl AgentResult {
     /// stdin closed). False for context_limit / max_turns / any other
     /// abnormal exit — caller should mark the driving task failed.
     pub fn terminated_cleanly(&self) -> bool {
-        matches!(
-            self.exit_reason.as_str(),
-            "end_turn" | "user_quit" | "eof"
-        )
+        matches!(self.exit_reason.as_str(), "end_turn" | "user_quit" | "eof")
     }
 }
 
@@ -443,9 +440,9 @@ impl AgentLoop {
     /// session without a workgraph root still doesn't crash when
     /// trying to stash an oversized tool_use.
     fn workgraph_dir_for_buffers(&self) -> PathBuf {
-        self.workgraph_dir.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join("wg-nex-buffers")
-        })
+        self.workgraph_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("wg-nex-buffers"))
     }
 
     /// Set the session summary extraction interval (in turns).
@@ -1047,9 +1044,7 @@ impl AgentLoop {
             if cancel.take_hard() {
                 let pid = std::process::id();
                 crate::service::kill_descendants(pid);
-                eprintln!(
-                    "\n\x1b[31m[nex] Hard cancel — subprocess tree killed.\x1b[0m"
-                );
+                eprintln!("\n\x1b[31m[nex] Hard cancel — subprocess tree killed.\x1b[0m");
                 // Hard implies cooperative — clear both so the next
                 // iteration's checks start fresh. Force a fresh
                 // readline so the loop doesn't just resend the same
@@ -1062,9 +1057,7 @@ impl AgentLoop {
 
             // 2. Cooperative cancel: return to prompt, preserve state.
             if cancel.take_cooperative() {
-                eprintln!(
-                    "\n\x1b[33m[nex] Cancelled — returning to prompt.\x1b[0m"
-                );
+                eprintln!("\n\x1b[33m[nex] Cancelled — returning to prompt.\x1b[0m");
                 force_fresh_input = true;
                 // If the last message is an assistant turn with
                 // unresolved tool_use blocks, synthesize cancelled
@@ -1131,8 +1124,7 @@ impl AgentLoop {
             let pre_micro_count = messages.len();
             if matches!(
                 self.context_budget.check_pressure(&messages),
-                ContextPressureAction::Warning
-                    | ContextPressureAction::EmergencyCompaction
+                ContextPressureAction::Warning | ContextPressureAction::EmergencyCompaction
             ) {
                 let (new_messages, bytes_freed) =
                     super::tools::summarize::microcompact_oldest_block(
@@ -1151,7 +1143,10 @@ impl AgentLoop {
                     if !self.autonomous {
                         eprintln!(
                             "\x1b[2m[microcompact: -{} B (~{} tokens) · {} → {} msgs]\x1b[0m",
-                            bytes_freed, delta, pre_micro_count, messages.len()
+                            bytes_freed,
+                            delta,
+                            pre_micro_count,
+                            messages.len()
                         );
                     }
                     if let Some(ref mut j) = journal {
@@ -1512,8 +1507,7 @@ impl AgentLoop {
                     }
                     inner_on_text(text);
                 };
-                let streaming_future =
-                    self.client.send_streaming(&request, &watched_on_text);
+                let streaming_future = self.client.send_streaming(&request, &watched_on_text);
                 let last_chunk_for_watchdog = last_chunk.clone();
                 let idle_watchdog = async move {
                     loop {
@@ -1693,9 +1687,8 @@ impl AgentLoop {
             // enters the context budget.
             let l0_rejections: Vec<super::l0_defense::Rejection> = {
                 let last_idx = messages.len() - 1;
-                let threshold = super::l0_defense::threshold_for_window(
-                    self.client.context_window(),
-                );
+                let threshold =
+                    super::l0_defense::threshold_for_window(self.client.context_window());
                 super::l0_defense::compact_oversized_tool_uses(
                     &mut messages[last_idx],
                     &self.workgraph_dir_for_buffers(),
@@ -2155,12 +2148,13 @@ impl AgentLoop {
                     let pre_tokens = self.context_budget.effective_tokens(&messages);
                     let pre_count = messages.len();
 
-                    messages = super::tools::summarize::summarize_history_for_compaction_cancellable(
-                        self.client.as_ref(),
-                        messages,
-                        Some(cancel.clone()),
-                    )
-                    .await;
+                    messages =
+                        super::tools::summarize::summarize_history_for_compaction_cancellable(
+                            self.client.as_ref(),
+                            messages,
+                            Some(cancel.clone()),
+                        )
+                        .await;
 
                     // Post-compaction file re-injection (Stage D). The
                     // summary preserves narrative; the re-read files

@@ -809,7 +809,11 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
         let err = resolve_inside_cwd("/etc/passwd").expect_err("should reject escape");
-        assert!(err.contains("outside the working directory"), "got: {}", err);
+        assert!(
+            err.contains("outside the working directory"),
+            "got: {}",
+            err
+        );
         std::env::set_current_dir(prev).unwrap();
     }
 
@@ -822,8 +826,13 @@ mod tests {
         std::fs::create_dir_all(&inner).unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&inner).unwrap();
-        let err = resolve_inside_cwd("../outside.txt").expect_err("dotdot escape should be rejected");
-        assert!(err.contains("outside the working directory"), "got: {}", err);
+        let err =
+            resolve_inside_cwd("../outside.txt").expect_err("dotdot escape should be rejected");
+        assert!(
+            err.contains("outside the working directory"),
+            "got: {}",
+            err
+        );
         std::env::set_current_dir(prev).unwrap();
     }
 

@@ -272,8 +272,7 @@ async fn run_mini_loop(
                 // Per-turn progress line so the outer user sees work
                 // happening inside the delegated sub-agent instead of
                 // a silent multi-turn loop that looks hung.
-                let tool_names: Vec<&str> =
-                    tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                let tool_names: Vec<&str> = tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
                 eprintln!(
                     "\x1b[2m[delegate turn {}/{}: {}]\x1b[0m",
                     turn + 1,

@@ -1688,10 +1688,7 @@ fn resolve_searxng_url() -> Option<String> {
         .map(|u| u.trim().trim_end_matches('/').to_string())
 }
 
-async fn search_searxng(
-    client: &rquest::Client,
-    query: &str,
-) -> Result<Vec<SearchResult>, String> {
+async fn search_searxng(client: &rquest::Client, query: &str) -> Result<Vec<SearchResult>, String> {
     let Some(base_url) = resolve_searxng_url() else {
         // No instance configured — backend is a no-op. Return Ok with
         // zero results so the circuit breaker stays closed and we don't
@@ -2276,9 +2273,7 @@ mod tests {
     fn cache_file_miss_on_unknown_key() {
         let tmp = tempfile::tempdir().unwrap();
         cache_put_with(tmp.path(), "rust tokio", "RESULTS:1");
-        assert!(
-            cache_get_with(tmp.path(), "nothing here", Duration::from_secs(3600)).is_none()
-        );
+        assert!(cache_get_with(tmp.path(), "nothing here", Duration::from_secs(3600)).is_none());
     }
 
     #[test]
@@ -2326,7 +2321,9 @@ mod tests {
 
     #[test]
     fn is_google_news_redirect_ignores_real_publisher_urls() {
-        assert!(!is_google_news_redirect("https://www.actionnews5.com/news/foo"));
+        assert!(!is_google_news_redirect(
+            "https://www.actionnews5.com/news/foo"
+        ));
         assert!(!is_google_news_redirect("https://wreg.com/article/123"));
         assert!(!is_google_news_redirect("https://news.google.com/home"));
     }

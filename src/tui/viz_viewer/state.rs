@@ -13466,12 +13466,12 @@ fn extract_enriched_text_from_log(content: &str) -> String {
             if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
                 for block in content {
                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if block_type == "text" {
-                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                            let trimmed_text = text.trim();
-                            if !trimmed_text.is_empty() {
-                                parts.push(trimmed_text.to_string());
-                            }
+                    if block_type == "text"
+                        && let Some(text) = block.get("text").and_then(|v| v.as_str())
+                    {
+                        let trimmed_text = text.trim();
+                        if !trimmed_text.is_empty() {
+                            parts.push(trimmed_text.to_string());
                         }
                     }
                 }

@@ -264,16 +264,14 @@ async fn decompose_question(
     // 120s timeout on the decompose LLM call. Prevents deep_research
     // from hanging on a dropped connection (no chunks arrive before
     // non-streaming completion).
-    let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        provider.send(&request),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("decompose API call: {}", e)),
-        Err(_) => return Err("decompose API call timed out after 120s".to_string()),
-    };
+    let response =
+        match tokio::time::timeout(std::time::Duration::from_secs(120), provider.send(&request))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(format!("decompose API call: {}", e)),
+            Err(_) => return Err("decompose API call timed out after 120s".to_string()),
+        };
 
     let text: String = response
         .content
@@ -311,8 +309,8 @@ pub(crate) fn parse_sub_questions(text: &str) -> Result<Vec<String>, String> {
     }
     let json_slice = &cleaned[start..=end];
 
-    let v: serde_json::Value = serde_json::from_str(json_slice)
-        .map_err(|e| format!("parse decompose JSON: {}", e))?;
+    let v: serde_json::Value =
+        serde_json::from_str(json_slice).map_err(|e| format!("parse decompose JSON: {}", e))?;
     let arr = v
         .get("sub_questions")
         .and_then(|a| a.as_array())
@@ -384,16 +382,14 @@ async fn synthesize(
     // 180s timeout on synthesis. Synthesis processes multiple briefs
     // (up to MAX_SUB_QUESTIONS=7 of them) so it can legitimately take
     // longer than decompose. 180s caps the hang case.
-    let response = match tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        provider.send(&request),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("synthesize API call: {}", e)),
-        Err(_) => return Err("synthesize API call timed out after 180s".to_string()),
-    };
+    let response =
+        match tokio::time::timeout(std::time::Duration::from_secs(180), provider.send(&request))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(format!("synthesize API call: {}", e)),
+            Err(_) => return Err("synthesize API call timed out after 180s".to_string()),
+        };
 
     let text: String = response
         .content

@@ -158,10 +158,10 @@ pub fn run(
                 } else {
                     // Additive: N is a new prerequisite alongside the old ones.
                     new_task.before = vec![target_id.to_string()];
-                    if let Some(t) = graph.get_task_mut(target_id) {
-                        if !t.after.contains(&final_id) {
-                            t.after.push(final_id.clone());
-                        }
+                    if let Some(t) = graph.get_task_mut(target_id)
+                        && !t.after.contains(&final_id)
+                    {
+                        t.after.push(final_id.clone());
                     }
                 }
             }
@@ -186,10 +186,10 @@ pub fn run(
                 } else {
                     // Additive: N is a new successor alongside the old ones.
                     new_task.after = vec![target_id.to_string()];
-                    if let Some(t) = graph.get_task_mut(target_id) {
-                        if !t.before.contains(&final_id) {
-                            t.before.push(final_id.clone());
-                        }
+                    if let Some(t) = graph.get_task_mut(target_id)
+                        && !t.before.contains(&final_id)
+                    {
+                        t.before.push(final_id.clone());
                     }
                 }
             }
@@ -224,10 +224,10 @@ pub fn run(
                 // If replace_edges, target's outgoing edges are superseded
                 // by N's — clear them from target so it becomes a dead node
                 // (still present for history but no longer a live dependency).
-                if opts.replace_edges {
-                    if let Some(t) = graph.get_task_mut(target_id) {
-                        t.before.clear();
-                    }
+                if opts.replace_edges
+                    && let Some(t) = graph.get_task_mut(target_id)
+                {
+                    t.before.clear();
                 }
             }
         }
@@ -286,9 +286,9 @@ fn unique_id(graph: &workgraph::graph::WorkGraph, candidate: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workgraph::test_helpers::{make_task_with_status, setup_workgraph};
-    use workgraph::parser::load_graph;
     use tempfile::tempdir;
+    use workgraph::parser::load_graph;
+    use workgraph::test_helpers::{make_task_with_status, setup_workgraph};
 
     fn make(id: &str) -> Task {
         make_task_with_status(id, id, Status::Open)
@@ -351,12 +351,19 @@ mod tests {
 
         let g = load_graph(&crate::commands::graph_path(dir.path())).unwrap();
         let t2 = g.get_task("t").unwrap();
-        assert_eq!(t2.after, vec!["n".to_string()], "splice: t depends only on n");
+        assert_eq!(
+            t2.after,
+            vec!["n".to_string()],
+            "splice: t depends only on n"
+        );
         let n = g.get_task("n").unwrap();
         assert_eq!(n.after, vec!["p".to_string()], "splice: n inherited p");
         let p2 = g.get_task("p").unwrap();
         assert!(p2.before.contains(&"n".to_string()), "p.before has n");
-        assert!(!p2.before.contains(&"t".to_string()), "p.before no longer has t");
+        assert!(
+            !p2.before.contains(&"t".to_string()),
+            "p.before no longer has t"
+        );
     }
 
     // ── after ──────────────────────────────────────────────────────
