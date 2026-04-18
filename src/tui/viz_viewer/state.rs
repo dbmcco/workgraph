@@ -13966,6 +13966,8 @@ mod hud_tests {
                     summary: "summary".to_string(),
                     original_message_count: 4,
                     original_token_count: 400,
+                    model_used: None,
+                    fallback_reason: None,
                 },
             )
             .unwrap();

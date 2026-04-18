@@ -314,7 +314,9 @@ impl AgentLoop {
             let tool_defs = tools.definitions();
             let overhead =
                 estimate_agent_overhead(&system_prompt, &tool_defs, client.max_tokens(), 4.0);
-            ContextBudget::with_window_size(client.context_window()).with_overhead(overhead)
+            ContextBudget::with_window_size(client.context_window())
+                .with_overhead(overhead)
+                .with_model(client.model())
         };
 
         // Tool output channeler: writes oversized tool outputs to
@@ -1259,6 +1261,10 @@ impl AgentLoop {
                             ),
                             original_message_count: pre_micro_count as u32,
                             original_token_count: pre_micro as u32,
+                            // Microcompact is structural — it trims tool results
+                            // by size — not LLM-summarized. No model used.
+                            model_used: None,
+                            fallback_reason: None,
                         });
                     }
                 }
@@ -2348,17 +2354,55 @@ impl AgentLoop {
                         );
                     }
 
-                    // Journal the compaction event
+                    // Journal the compaction event. The LLM
+                    // summarization already happened inside
+                    // `summarize_history_for_compaction_cancellable`
+                    // above — if it succeeded, the resulting
+                    // `messages[0]` is a user-role block prefixed
+                    // "PRIOR CONVERSATION SUMMARY:" with the real
+                    // summary text. If it failed, it returned the
+                    // original vec unchanged, which means
+                    // `post_count == pre_count` and no summary was
+                    // produced. Distinguish those cases so resume
+                    // logic can see whether the journal captures a
+                    // real summary or just a metadata marker.
                     if let Some(ref mut j) = journal {
                         let compacted_through_seq = j.seq();
+                        let llm_succeeded = post_count < pre_count;
+                        let (summary_text, model_used, fallback_reason) = if llm_succeeded {
+                            let first_text = messages
+                                .first()
+                                .and_then(|m| m.content.first())
+                                .and_then(|b| match b {
+                                    ContentBlock::Text { text } => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| {
+                                    format!(
+                                        "history-summary compaction ({} → {} msgs, ~{} → ~{} tokens)",
+                                        pre_count, post_count, pre_tokens, post_tokens
+                                    )
+                                });
+                            (first_text, Some(self.client.model().to_string()), None)
+                        } else {
+                            (
+                                format!(
+                                    "history-summary compaction attempted but returned unchanged ({} msgs, ~{} tokens)",
+                                    pre_count, pre_tokens
+                                ),
+                                None,
+                                Some(
+                                    "summarize_history returned messages unchanged (LLM or recursive-summary error; see stderr)".to_string(),
+                                ),
+                            )
+                        };
                         let _ = j.append(JournalEntryKind::Compaction {
                             compacted_through_seq,
-                            summary: format!(
-                                "history-summary compaction. Tokens: ~{} → ~{}, messages: {} → {}.",
-                                pre_tokens, post_tokens, pre_count, post_count
-                            ),
+                            summary: summary_text,
                             original_message_count: pre_count as u32,
                             original_token_count: pre_tokens as u32,
+                            model_used,
+                            fallback_reason,
                         });
                     }
                 }

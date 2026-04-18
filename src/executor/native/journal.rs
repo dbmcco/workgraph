@@ -83,6 +83,18 @@ pub enum JournalEntryKind {
         original_message_count: u32,
         /// Total tokens in the compacted region.
         original_token_count: u32,
+        /// Name of the model that produced the summary, when the
+        /// summary came from a real LLM call. `None` means the
+        /// summary was produced by the local heuristic extractor
+        /// in `summarize_messages` (no LLM call was made).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_used: Option<String>,
+        /// If the LLM summarization attempt failed, this records
+        /// why (timeout, rate limit, context overflow). Presence
+        /// means the summary in `summary` is the heuristic
+        /// fallback, not the LLM output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_reason: Option<String>,
     },
 
     /// Conversation ended.

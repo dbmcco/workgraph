@@ -281,11 +281,22 @@ fn compact_messages(messages: Vec<Message>, _budget_tokens: usize) -> Vec<Messag
     compacted
 }
 
-/// Generate a text summary of a block of messages.
+/// Local, synchronous fallback summarizer.
 ///
-/// This is a local, synchronous summarizer — it extracts key information
-/// rather than calling an LLM. For deeper summarization, the compaction
-/// entry type in the journal can be used by an external process.
+/// This is the **resume-time fallback** used when a journal needs
+/// additional compaction beyond what runtime compaction already
+/// produced — e.g. the journal grew so large between runs that even
+/// the prior LLM-generated summary plus the post-compaction tail
+/// exceeds budget. In practice this path rarely fires because
+/// runtime compaction keeps journals within budget.
+///
+/// The runtime-time compaction path is LLM-backed:
+/// `tools/summarize.rs::summarize_history_for_compaction_cancellable`
+/// is called whenever soft-pressure fires, and its result lands in
+/// the `Compaction` journal entry with `model_used` set. `load_resume_data`
+/// reads the stored LLM summary directly (see `reconstruct_messages`);
+/// this function is only invoked when we need to summarize *more*
+/// on top of what's already compacted.
 fn summarize_messages(messages: &[Message]) -> String {
     let mut parts = Vec::new();
     let mut tool_calls_seen = Vec::new();
@@ -784,8 +795,16 @@ pub enum ContextPressureAction {
 pub struct ContextBudget {
     /// Total context window size in tokens (from provider config).
     pub window_size: usize,
-    /// Rough chars-per-token estimate (default 4.0).
+    /// Rough chars-per-token estimate (default 4.0). Used as a
+    /// fallback when `model` is None or the tokenizer fails to load.
+    /// When `model` is set, token counts come from the real
+    /// tokenizer instead (see `executor::native::tokenizer`).
     pub chars_per_token: f64,
+    /// Model id for tokenizer lookup. When set, `estimate_tokens`
+    /// uses the real tokenizer; when None, the `chars_per_token`
+    /// heuristic is used (kept for back-compat with tests and
+    /// callers that don't have a model yet).
+    pub model: Option<String>,
     /// Fraction at which to inject a warning (default 0.70).
     pub warning_threshold: f64,
     /// Fraction at which to trigger emergency compaction (default 0.75).
@@ -803,6 +822,7 @@ impl Default for ContextBudget {
         Self {
             window_size: 200_000,
             chars_per_token: 4.0,
+            model: None,
             warning_threshold: 0.70,
             compact_threshold: 0.75,
             hard_limit: 0.95,
@@ -830,11 +850,20 @@ impl ContextBudget {
         Self {
             window_size,
             chars_per_token: 4.0,
+            model: None,
             warning_threshold: warning,
             compact_threshold: compact,
             hard_limit: hard,
             overhead_tokens: 0,
         }
+    }
+
+    /// Attach a model id so `estimate_tokens` uses the real
+    /// tokenizer for that model instead of the `chars / 4` heuristic.
+    /// Set at agent init via `AgentLoop::with_model_for_tokenizer`.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Set the fixed overhead tokens (system prompt + tool defs + completion reservation).
@@ -848,7 +877,34 @@ impl ContextBudget {
     }
 
     /// Estimate the current token count from a list of messages.
+    ///
+    /// With a model attached (via `with_model`), uses `tiktoken-rs`
+    /// for real tokenization. Without, falls back to
+    /// `total_chars / chars_per_token` — preserved for tests and
+    /// callers that don't have a model id yet.
     pub fn estimate_tokens(&self, messages: &[Message]) -> usize {
+        if let Some(model) = self.model.as_deref() {
+            return messages
+                .iter()
+                .map(|m| {
+                    m.content
+                        .iter()
+                        .map(|b| {
+                            let text: String = match b {
+                                ContentBlock::Text { text } => text.clone(),
+                                ContentBlock::Thinking { thinking, .. } => thinking.clone(),
+                                ContentBlock::ToolUse { input, name, .. } => {
+                                    format!("{} {}", name, input)
+                                }
+                                ContentBlock::ToolResult { content, .. } => content.clone(),
+                            };
+                            super::tokenizer::count_tokens(&text, model)
+                        })
+                        .sum::<usize>()
+                })
+                .sum();
+        }
+        // Heuristic fallback when no model is set.
         let total_chars: usize = messages
             .iter()
             .map(|m| {
@@ -1233,6 +1289,8 @@ mod tests {
                 summary: "User asked question, assistant answered.".to_string(),
                 original_message_count: 3,
                 original_token_count: 42,
+                model_used: None,
+                fallback_reason: None,
             })
             .unwrap();
         // seq 6, 7: post-compaction messages
@@ -1354,6 +1412,8 @@ mod tests {
                 summary: "FIRST SUMMARY".to_string(),
                 original_message_count: 1,
                 original_token_count: 10,
+                model_used: None,
+                fallback_reason: None,
             })
             .unwrap();
         // seq 4: message
@@ -1375,6 +1435,8 @@ mod tests {
                 summary: "SECOND SUMMARY".to_string(),
                 original_message_count: 2,
                 original_token_count: 20,
+                model_used: None,
+                fallback_reason: None,
             })
             .unwrap();
         // seq 6: final message
