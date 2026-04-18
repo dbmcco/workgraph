@@ -1978,16 +1978,52 @@ impl AgentLoop {
                                 truncate_for_display(&s, 120).to_string()
                             };
                             eprintln!("\x1b[2;36m> {}({})\x1b[0m", name, input_summary);
-                            // Mirror tool-call markers into the chat
-                            // transcript so the TUI sees them too.
-                            // Without this, the chat pane shows only
-                            // the model's text between tool uses —
-                            // multi-step turns look like single lines
-                            // flickering instead of a coherent log.
+                            // Mirror tool activity into the chat
+                            // transcript using the TUI's expected
+                            // box-drawing format
+                            // (`┌─ Name ───\n│ ...\n└─`). The TUI's
+                            // markdown renderer special-cases these
+                            // lines into bordered tool boxes; a
+                            // stderr-style `> name(args)` would
+                            // render as a markdown blockquote which
+                            // looks wrong and loses tool grouping.
                             if let Some(ref chat) = chat_surface {
-                                let line = format!("\n> {}({})\n", name, input_summary);
                                 let mut t = chat.transcript.lock().unwrap();
-                                t.push_str(&line);
+                                // Close any previous open tool box.
+                                if t.ends_with("│ \n")
+                                    || t.contains("┌─ ") && !t.trim_end().ends_with("└─")
+                                {
+                                    // Heuristic: if the last non-empty
+                                    // section is still inside a box,
+                                    // close it. We detect this by
+                                    // whether the last line starts
+                                    // with `│` and no `└─` follows.
+                                    let needs_close = t
+                                        .rsplit_terminator('\n')
+                                        .find(|l| !l.is_empty())
+                                        .is_some_and(|l| l.starts_with("│"));
+                                    if needs_close {
+                                        t.push_str("└─\n");
+                                    }
+                                }
+                                // New tool box header + input line.
+                                let header_rule =
+                                    "─".repeat(40usize.saturating_sub(name.len() + 4));
+                                t.push_str(&format!("\n┌─ {} {}\n", name, header_rule));
+                                // Friendly input line matching the
+                                // legacy Claude-CLI format so Bash
+                                // shows `│ $ cmd` and other tools
+                                // show the first meaningful arg.
+                                if name == "Bash" || name == "bash" {
+                                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+                                    {
+                                        t.push_str(&format!("│ $ {}\n", cmd));
+                                    } else {
+                                        t.push_str(&format!("│ {}\n", input_summary));
+                                    }
+                                } else {
+                                    t.push_str(&format!("│ {}\n", input_summary));
+                                }
                                 let _ = super::chat_surface::write_streaming(
                                     &chat.workgraph_dir,
                                     &chat.session_ref,
@@ -2130,11 +2166,13 @@ impl AgentLoop {
                                 }
                                 if let Some((ref wg_dir, ref sref, ref transcript)) = ct {
                                     let mut t = transcript.lock().unwrap();
-                                    // Indent streaming chunks with
-                                    // two spaces so they visually nest
-                                    // under their parent tool marker.
+                                    // Prefix each streamed line with
+                                    // `│ ` so it lands inside the
+                                    // box the TUI draws. Matches the
+                                    // legacy Claude-CLI coordinator
+                                    // format.
                                     for line in text.lines() {
-                                        t.push_str("  ");
+                                        t.push_str("│ ");
                                         t.push_str(line);
                                         t.push('\n');
                                     }
@@ -2274,22 +2312,39 @@ impl AgentLoop {
                                     summarize_tool_output(&output.content)
                                 );
                             }
-                            // Mirror the one-line result summary into
-                            // the chat transcript. We emit the short
-                            // form regardless of `nex_chatty` so the
-                            // TUI doesn't get flooded with huge
-                            // outputs — full content is already in
-                            // the journal for post-hoc inspection.
+                            // Mirror the result into the chat
+                            // transcript, inside the tool box started
+                            // when the tool_use was dispatched. Lines
+                            // get the `│ ` prefix; we cap at ~15
+                            // lines with a "... N more" tail so the
+                            // TUI doesn't get flooded. Full content
+                            // is in the journal for post-hoc review.
                             if let Some(ref chat) = chat_surface {
-                                let marker = if output.is_error { "×" } else { "→" };
-                                let line = format!(
-                                    "  {} {}: {}\n",
-                                    marker,
-                                    name,
-                                    summarize_tool_output(&output.content)
-                                );
                                 let mut t = chat.transcript.lock().unwrap();
-                                t.push_str(&line);
+                                let body = if output.is_error {
+                                    format!("× {}", output.content)
+                                } else {
+                                    output.content.clone()
+                                };
+                                let lines: Vec<&str> = body.lines().collect();
+                                const MAX_LINES: usize = 15;
+                                if lines.is_empty() {
+                                    t.push_str("│ (no output)\n");
+                                } else if lines.len() > MAX_LINES {
+                                    for line in &lines[..MAX_LINES] {
+                                        t.push_str(&format!("│ {}\n", line));
+                                    }
+                                    t.push_str(&format!(
+                                        "│ ... ({} more lines)\n",
+                                        lines.len() - MAX_LINES
+                                    ));
+                                } else {
+                                    for line in &lines {
+                                        t.push_str(&format!("│ {}\n", line));
+                                    }
+                                }
+                                // Close the box.
+                                t.push_str("└─\n");
                                 let _ = super::chat_surface::write_streaming(
                                     &chat.workgraph_dir,
                                     &chat.session_ref,
