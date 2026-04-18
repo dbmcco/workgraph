@@ -180,9 +180,16 @@ struct ChatSurfaceState {
     /// Whatever the caller passed to `with_chat_ref`. All chat-dir
     /// path construction resolves via this + filesystem symlinks.
     session_ref: String,
-    /// Buffer accumulating the current turn's streamed text. Flushed
-    /// to outbox on turn-end, and the streaming file mirrors it live.
-    streaming_buf: String,
+    /// Live transcript of the current turn. Accumulates across ALL
+    /// model calls within one user turn — model text chunks, tool
+    /// call markers (`> name(args)`), tool outputs, streaming
+    /// tool-progress lines — so the TUI's chat pane sees the same
+    /// rich transcript `wg nex` shows on stderr, not just the
+    /// latest model response. Cleared on new inbox message, flushed
+    /// to the outbox on EndTurn. Wrapped in `Arc<Mutex>` so streaming
+    /// callbacks (which run on tokio tasks) can append without
+    /// borrowing `self`.
+    transcript: Arc<Mutex<String>>,
     /// request_id of the inbox entry currently being responded to —
     /// tagged into the outbox entry so the TUI correlates.
     current_request_id: Option<String>,
@@ -534,7 +541,7 @@ impl AgentLoop {
                     reader,
                     workgraph_dir,
                     session_ref,
-                    streaming_buf: String::new(),
+                    transcript: Arc::new(Mutex::new(String::new())),
                     current_request_id: None,
                 });
             }
@@ -1417,14 +1424,18 @@ impl AgentLoop {
             let streaming_file = self.streaming_file_path.clone();
             let stream_writer_clone = self.stream_writer.clone();
             let is_autonomous = self.autonomous;
-            let chat_target = chat_surface
-                .as_ref()
-                .map(|c| (c.workgraph_dir.clone(), c.session_ref.clone()));
-            // Shared accumulator for the chat `.streaming` dotfile so
-            // we don't re-read-and-append on every chunk (that
-            // re-read-then-write pattern is O(N²) for long outputs).
-            let chat_accum: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-            let chat_accum_cb = chat_accum.clone();
+            // Capture: the persistent turn transcript (which accumulates
+            // across model calls within this turn) + the paths so the
+            // streaming closure can mirror each chunk to `.streaming`
+            // as text arrives, producing the same rich progressive
+            // view the TUI/attach gets that `wg nex` shows on stderr.
+            let chat_target = chat_surface.as_ref().map(|c| {
+                (
+                    c.workgraph_dir.clone(),
+                    c.session_ref.clone(),
+                    c.transcript.clone(),
+                )
+            });
             let on_text = move |text: String| {
                 if is_autonomous {
                     if let Some(ref sw) = stream_writer_clone {
@@ -1439,10 +1450,10 @@ impl AgentLoop {
                     eprint!("{}", text);
                     let _ = std::io::stderr().flush();
                 }
-                if let Some((ref wg_dir, ref sref)) = chat_target {
-                    let mut acc = chat_accum_cb.lock().unwrap();
-                    acc.push_str(&text);
-                    let _ = super::chat_surface::write_streaming(wg_dir, sref, &acc);
+                if let Some((ref wg_dir, ref sref, ref transcript)) = chat_target {
+                    let mut t = transcript.lock().unwrap();
+                    t.push_str(&text);
+                    let _ = super::chat_surface::write_streaming(wg_dir, sref, &t);
                 }
             };
 
@@ -1833,14 +1844,16 @@ impl AgentLoop {
                         }
                     }
 
-                    // Chat-surface mode: the streaming file has been
-                    // accumulating tokens; append the finalized text to
-                    // the outbox tagged with the request_id, then clear
-                    // the streaming file so the TUI moves on.
+                    // Chat-surface mode: the transcript has been
+                    // accumulating model text + tool markers + tool
+                    // progress across every model call in this turn.
+                    // Flush the full transcript to the outbox tagged
+                    // with the request_id, then clear for the next
+                    // user turn.
                     if let Some(ref mut chat) = chat_surface {
                         let final_text = {
-                            let acc = chat_accum.lock().unwrap();
-                            acc.clone()
+                            let t = chat.transcript.lock().unwrap();
+                            t.clone()
                         };
                         if !final_text.is_empty()
                             && let Some(rid) = chat.current_request_id.clone()
@@ -1853,14 +1866,12 @@ impl AgentLoop {
                         {
                             eprintln!("[agent-loop] chat outbox append failed: {} — continuing", e);
                         }
-                        // Clear streaming dotfile + accumulator for next turn.
                         super::chat_surface::clear_streaming(
                             &chat.workgraph_dir,
                             &chat.session_ref,
                         );
-                        chat_accum.lock().unwrap().clear();
+                        chat.transcript.lock().unwrap().clear();
                         chat.current_request_id = None;
-                        chat.streaming_buf.clear();
                     }
 
                     // In autonomous mode (task agents), EndTurn means
@@ -1967,6 +1978,22 @@ impl AgentLoop {
                                 truncate_for_display(&s, 120).to_string()
                             };
                             eprintln!("\x1b[2;36m> {}({})\x1b[0m", name, input_summary);
+                            // Mirror tool-call markers into the chat
+                            // transcript so the TUI sees them too.
+                            // Without this, the chat pane shows only
+                            // the model's text between tool uses —
+                            // multi-step turns look like single lines
+                            // flickering instead of a coherent log.
+                            if let Some(ref chat) = chat_surface {
+                                let line = format!("\n> {}({})\n", name, input_summary);
+                                let mut t = chat.transcript.lock().unwrap();
+                                t.push_str(&line);
+                                let _ = super::chat_surface::write_streaming(
+                                    &chat.workgraph_dir,
+                                    &chat.session_ref,
+                                    &t,
+                                );
+                            }
                         }
                     }
 
@@ -2070,12 +2097,27 @@ impl AgentLoop {
                             None
                         };
 
-                        // Streaming callback factory for bash tool output
+                        // Streaming callback factory for tool output.
+                        // Used by long-running tools (bash, deep_research,
+                        // map, chunk_map, …) to emit progress chunks.
+                        // Chunks get mirrored to: autonomous stream.jsonl,
+                        // autonomous `.streaming`, and — now — the chat
+                        // transcript, so the TUI sees tool progress lines
+                        // in real time rather than a line that only
+                        // changes when the model speaks.
                         let streaming_file = self.streaming_file_path.clone();
                         let stream_writer_clone = self.stream_writer.clone();
+                        let chat_transcript_target = chat_surface.as_ref().map(|c| {
+                            (
+                                c.workgraph_dir.clone(),
+                                c.session_ref.clone(),
+                                c.transcript.clone(),
+                            )
+                        });
                         let make_callback = move |_idx: usize| {
                             let sw = stream_writer_clone.clone();
                             let sf = streaming_file.clone();
+                            let ct = chat_transcript_target.clone();
                             Box::new(move |text: String| {
                                 if let Some(ref writer) = sw {
                                     writer.write_tool_output_chunk("bash", &text);
@@ -2085,6 +2127,18 @@ impl AgentLoop {
                                     acc.push_str(&text);
                                     acc.push('\n');
                                     let _ = std::fs::write(path, &acc);
+                                }
+                                if let Some((ref wg_dir, ref sref, ref transcript)) = ct {
+                                    let mut t = transcript.lock().unwrap();
+                                    // Indent streaming chunks with
+                                    // two spaces so they visually nest
+                                    // under their parent tool marker.
+                                    for line in text.lines() {
+                                        t.push_str("  ");
+                                        t.push_str(line);
+                                        t.push('\n');
+                                    }
+                                    let _ = super::chat_surface::write_streaming(wg_dir, sref, &t);
                                 }
                             }) as super::tools::ToolStreamCallback
                         };
@@ -2218,6 +2272,28 @@ impl AgentLoop {
                                 eprintln!(
                                     "\x1b[2m  → {}\x1b[0m",
                                     summarize_tool_output(&output.content)
+                                );
+                            }
+                            // Mirror the one-line result summary into
+                            // the chat transcript. We emit the short
+                            // form regardless of `nex_chatty` so the
+                            // TUI doesn't get flooded with huge
+                            // outputs — full content is already in
+                            // the journal for post-hoc inspection.
+                            if let Some(ref chat) = chat_surface {
+                                let marker = if output.is_error { "×" } else { "→" };
+                                let line = format!(
+                                    "  {} {}: {}\n",
+                                    marker,
+                                    name,
+                                    summarize_tool_output(&output.content)
+                                );
+                                let mut t = chat.transcript.lock().unwrap();
+                                t.push_str(&line);
+                                let _ = super::chat_surface::write_streaming(
+                                    &chat.workgraph_dir,
+                                    &chat.session_ref,
+                                    &t,
                                 );
                             }
                         }
@@ -2516,6 +2592,13 @@ async fn read_next_user_turn(
             .next_entry(std::time::Duration::from_millis(250))
             .await?;
         c.current_request_id = Some(entry.request_id.clone());
+        // Fresh user turn — reset the transcript and the
+        // streaming dotfile so the display starts clean.
+        // EndTurn clears these too, but an interrupted or errored
+        // prior turn can leave stale content; this is the
+        // belt-and-suspenders reset.
+        c.transcript.lock().unwrap().clear();
+        super::chat_surface::clear_streaming(&c.workgraph_dir, &c.session_ref);
         return Some(entry.message);
     }
     loop {

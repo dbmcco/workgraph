@@ -5500,7 +5500,12 @@ impl VizApp {
         use std::time::Duration;
 
         let flag = self.fs_change_pending.clone();
-        let debouncer = new_debouncer(Duration::from_millis(50), move |res| {
+        // 5ms debounce: just enough to coalesce a burst of events
+        // from one write (inotify can fire twice per append on some
+        // filesystems), not so much that the user perceives lag.
+        // On a chat write, we want the TUI to react within a single
+        // frame (16ms @ 60Hz), and 5ms leaves plenty of headroom.
+        let debouncer = new_debouncer(Duration::from_millis(5), move |res| {
             if let Ok(_events) = res {
                 flag.store(true, Ordering::Relaxed);
             }

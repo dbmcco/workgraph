@@ -106,6 +106,9 @@ fn run_new(workgraph_dir: &Path, alias: &str, label: Option<String>) -> Result<(
 /// Eventually a flag like `--bidir` would make this the full
 /// interactive attach.
 fn run_attach(workgraph_dir: &Path, session_ref: &str) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
     let uuid = workgraph::chat_sessions::resolve_ref(workgraph_dir, session_ref)
         .with_context(|| format!("no session matching {:?}", session_ref))?;
     eprintln!(
@@ -133,13 +136,33 @@ fn run_attach(workgraph_dir: &Path, session_ref: &str) -> Result<()> {
         0
     };
 
+    // Set up an inotify (or FSEvents on macOS) watcher on the chat
+    // dir so we wake sub-millisecond when anything changes, instead
+    // of polling at human-eyeblink granularity. A 2s timeout on the
+    // recv is the safety-net floor — if an event gets dropped we
+    // still re-scan within that window.
+    let (tx, rx) = channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .context("create filesystem watcher for attach")?;
+    watcher
+        .watch(&chat_dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watch {:?}", chat_dir))?;
+
     eprintln!("\x1b[2m[attached — Ctrl-C to detach]\x1b[0m");
-    // Simple poll loop. An inotify-based watcher would be lower
-    // latency, but attach is a human-latency operation (eye blinks
-    // are ~100ms, so 250ms is fine).
-    let poll = Duration::from_millis(250);
+    let idle_timeout = Duration::from_secs(2);
     let mut last_streaming = String::new();
     loop {
+        // Wait for a filesystem event OR the idle timeout, whichever
+        // comes first. Drain any burst so we don't rerun the scan N
+        // times for N coalesced events.
+        match rx.recv_timeout(idle_timeout) {
+            Ok(_) => while rx.try_recv().is_ok() {},
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
         // Streaming: print the diff since last seen.
         if let Ok(current) = std::fs::read_to_string(&streaming)
             && current != last_streaming
@@ -168,6 +191,6 @@ fn run_attach(workgraph_dir: &Path, session_ref: &str) -> Result<()> {
                 outbox_pos = len;
             }
         }
-        std::thread::sleep(poll);
     }
+    Ok(())
 }
