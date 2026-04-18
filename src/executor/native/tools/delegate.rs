@@ -269,6 +269,18 @@ async fn run_mini_loop(
                     })
                     .collect();
 
+                // Per-turn progress line so the outer user sees work
+                // happening inside the delegated sub-agent instead of
+                // a silent multi-turn loop that looks hung.
+                let tool_names: Vec<&str> =
+                    tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                eprintln!(
+                    "\x1b[2m[delegate turn {}/{}: {}]\x1b[0m",
+                    turn + 1,
+                    max_turns,
+                    tool_names.join("+")
+                );
+
                 let mut results = Vec::new();
                 for (id, name, input) in &tool_uses {
                     let output = tools.execute(name, input).await;

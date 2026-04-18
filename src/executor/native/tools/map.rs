@@ -312,6 +312,7 @@ pub(crate) async fn run_map(
                 continue;
             }
         };
+        let item_label = format!("{}/{}", i + 1, inputs.len());
         let outcome = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs_per_item),
             run_item(
@@ -320,6 +321,7 @@ pub(crate) async fn run_map(
                 item_input,
                 task,
                 max_turns_per_item,
+                &item_label,
             ),
         )
         .await
@@ -379,12 +381,17 @@ pub(crate) async fn run_map(
 
 /// Run the mini-executor for a single input. Returns the sub-agent's
 /// finish(result) on success, or an error describing why we gave up.
+///
+/// `item_label` is a human-readable "N/M" string used in per-turn
+/// telemetry so the outer user can see progress inside an item's
+/// sub-agent loop (otherwise a 20-turn item looks hung).
 async fn run_item(
     provider: &dyn crate::executor::native::provider::Provider,
     working_dir: &Path,
     item_input: &str,
     task: &str,
     max_turns: usize,
+    item_label: &str,
 ) -> Result<String, String> {
     let state = Arc::new(Mutex::new(MapItemState {
         working_dir: working_dir.to_path_buf(),
@@ -478,6 +485,18 @@ async fn run_item(
                         _ => None,
                     })
                     .collect();
+                // Per-turn progress line so the outer user sees work
+                // happening inside an item's sub-agent. Otherwise a
+                // long-running item looks frozen.
+                let tool_names: Vec<&str> =
+                    tool_uses.iter().map(|(_, n, _)| n.as_str()).collect();
+                eprintln!(
+                    "\x1b[2m[map item {} turn {}/{}: {}]\x1b[0m",
+                    item_label,
+                    turn + 1,
+                    max_turns,
+                    tool_names.join("+")
+                );
                 let mut results = Vec::new();
                 for (id, name, input) in &tool_uses {
                     let output = registry.execute(name, input).await;
