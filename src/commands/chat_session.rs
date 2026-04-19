@@ -21,6 +21,7 @@ pub fn run(workgraph_dir: &Path, cmd: SessionCommands) -> Result<()> {
         SessionCommands::List { json } => run_list(workgraph_dir, json),
         SessionCommands::Attach { session } => run_attach(workgraph_dir, &session),
         SessionCommands::New { alias, label } => run_new(workgraph_dir, &alias, label),
+        SessionCommands::Fork { source, alias } => run_fork(workgraph_dir, &source, alias),
         SessionCommands::Alias { command } => match command {
             SessionAliasCommands::Add { session, alias } => {
                 workgraph::chat_sessions::add_alias(workgraph_dir, &session, &alias)?;
@@ -80,6 +81,27 @@ fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {
         let label = meta.label.clone().unwrap_or_default();
         println!("{:<12} {:<12} {:<40} {}", short, kind, aliases, label);
     }
+    Ok(())
+}
+
+fn run_fork(workgraph_dir: &Path, source: &str, alias: Option<String>) -> Result<()> {
+    let fork_uuid = workgraph::chat_sessions::fork_session(workgraph_dir, source, alias.clone())?;
+    let reg = workgraph::chat_sessions::load(workgraph_dir)?;
+    let meta = reg
+        .sessions
+        .get(&fork_uuid)
+        .ok_or_else(|| anyhow::anyhow!("fork not in registry"))?;
+    let handle = meta
+        .aliases
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fork_uuid.clone());
+    eprintln!(
+        "\x1b[32m[wg session]\x1b[0m forked {} → {} (alias: {})",
+        source, fork_uuid, handle
+    );
+    eprintln!("\x1b[2m  Resume it with: \x1b[0mwg nex --chat {}", handle);
+    println!("{}", fork_uuid);
     Ok(())
 }
 

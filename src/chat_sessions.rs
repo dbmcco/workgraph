@@ -74,6 +74,13 @@ pub struct SessionMeta {
     /// Optional free-form label for `wg chat list` display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// UUID of the parent session if this one was forked. Populated
+    /// by `fork_session`. Forked sessions start with a copy of the
+    /// parent's journal at fork time and then evolve independently.
+    /// `wg session list` shows a `forked-from <short>` annotation
+    /// when this is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
 }
 
 /// The on-disk registry file shape.
@@ -168,6 +175,7 @@ pub fn create_session(
             created: Utc::now().to_rfc3339(),
             aliases: aliases.to_vec(),
             label,
+            forked_from: None,
         },
     );
     save(workgraph_dir, &reg)?;
@@ -177,6 +185,95 @@ pub fn create_session(
         create_alias_symlink(workgraph_dir, a, &uuid)?;
     }
     Ok(uuid)
+}
+
+/// Fork an existing session: copy its journal (`conversation.jsonl`
+/// and `session-summary.md`) into a fresh UUID-named dir and register
+/// the new session with `forked_from = <source_uuid>`.
+///
+/// The fork is an independent session from that point forward — its
+/// own inbox, outbox, cursor, streaming file. Writing to it doesn't
+/// affect the parent, and vice versa. Future messages evolve
+/// independently.
+///
+/// `source_ref` accepts the same formats as `resolve_ref`: UUID,
+/// UUID prefix, or alias. `new_alias` is optional; when omitted, the
+/// fork gets a generated `fork-<short>` alias so it's addressable.
+///
+/// Returns the fork's UUID.
+pub fn fork_session(
+    workgraph_dir: &Path,
+    source_ref: &str,
+    new_alias: Option<String>,
+) -> Result<String> {
+    let source_uuid = resolve_ref(workgraph_dir, source_ref)?;
+    let source_dir = chat_dir_for_uuid(workgraph_dir, &source_uuid);
+    if !source_dir.exists() {
+        bail!("source session {} has no chat dir on disk", source_uuid);
+    }
+
+    // Allocate the fork's UUID and set up its directory.
+    let fork_uuid = Uuid::new_v4().to_string();
+    let fork_dir = chat_dir_for_uuid(workgraph_dir, &fork_uuid);
+    fs::create_dir_all(&fork_dir).with_context(|| format!("create_dir_all {:?}", fork_dir))?;
+
+    // Copy journal + session summary. Skip inbox/outbox/streaming —
+    // those are per-session live state, not history; the fork starts
+    // with an empty inbox ready for fresh input.
+    for name in ["conversation.jsonl", "session-summary.md"] {
+        let src = source_dir.join(name);
+        if src.exists() {
+            let dst = fork_dir.join(name);
+            fs::copy(&src, &dst).with_context(|| format!("copy {:?} -> {:?}", src, dst))?;
+        }
+    }
+
+    // Pick or generate the fork's alias.
+    let short = &fork_uuid[..8];
+    let alias = new_alias.unwrap_or_else(|| format!("fork-{}", short));
+
+    // Carry over the parent's SessionKind when it's interactive-ish;
+    // coordinator/task-agent forks are rare and the user can
+    // re-classify via the registry if needed.
+    let reg = load(workgraph_dir).unwrap_or_default();
+    let parent_kind = reg
+        .sessions
+        .get(&source_uuid)
+        .map(|m| m.kind)
+        .unwrap_or(SessionKind::Interactive);
+    let parent_label = reg
+        .sessions
+        .get(&source_uuid)
+        .and_then(|m| m.label.clone())
+        .unwrap_or_else(|| source_uuid.clone());
+
+    // Check alias isn't already in use.
+    if let Some((existing, _)) = find_by_alias(&reg, &alias) {
+        bail!(
+            "alias {:?} already points to session {} — pass a different `new_alias`",
+            alias,
+            existing
+        );
+    }
+
+    // Insert the new session meta.
+    let mut reg = reg;
+    reg.sessions.insert(
+        fork_uuid.clone(),
+        SessionMeta {
+            kind: parent_kind,
+            created: Utc::now().to_rfc3339(),
+            aliases: vec![alias.clone()],
+            label: Some(format!("fork of: {}", parent_label)),
+            forked_from: Some(source_uuid),
+        },
+    );
+    save(workgraph_dir, &reg)?;
+
+    // Install the alias symlink.
+    create_alias_symlink(workgraph_dir, &alias, &fork_uuid)?;
+
+    Ok(fork_uuid)
 }
 
 /// Register a coordinator session the way the daemon needs it.
@@ -467,6 +564,7 @@ pub fn migrate_numeric_coord_dir(workgraph_dir: &Path, n: u32) -> Result<Option<
             created: Utc::now().to_rfc3339(),
             aliases: vec![alias.clone(), numeric_alias.clone()],
             label: Some(format!("coordinator {} (migrated)", n)),
+            forked_from: None,
         },
     );
     save(workgraph_dir, &reg)?;
@@ -527,6 +625,7 @@ mod tests {
                 created: "2026-01-01".into(),
                 aliases: vec![],
                 label: None,
+                forked_from: None,
             },
         );
         reg.sessions.insert(
@@ -536,6 +635,7 @@ mod tests {
                 created: "2026-01-02".into(),
                 aliases: vec![],
                 label: None,
+                forked_from: None,
             },
         );
         save(wg, &reg).unwrap();
@@ -565,6 +665,113 @@ mod tests {
         assert!(resolve_ref(wg, "secondary").is_err());
         // Primary still works.
         assert_eq!(resolve_ref(wg, "primary").unwrap(), uuid);
+    }
+
+    #[test]
+    fn fork_copies_journal_and_records_parent() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+
+        // Parent: create a session and seed its journal + summary so
+        // we can verify both get copied into the fork.
+        let parent_uuid = create_session(
+            wg,
+            SessionKind::Interactive,
+            &["parent".into()],
+            Some("the original".into()),
+        )
+        .unwrap();
+        let parent_dir = chat_dir_for_uuid(wg, &parent_uuid);
+        std::fs::write(parent_dir.join("conversation.jsonl"), "turn-1\nturn-2\n").unwrap();
+        std::fs::write(
+            parent_dir.join("session-summary.md"),
+            "## Summary\nsome text",
+        )
+        .unwrap();
+        // Seed an inbox too so we can verify it does NOT get forked.
+        std::fs::write(parent_dir.join("inbox.jsonl"), "{\"id\":1}\n").unwrap();
+
+        // Fork from the parent's alias with an explicit new alias.
+        let fork_uuid = fork_session(wg, "parent", Some("alt-take".into())).unwrap();
+        assert_ne!(fork_uuid, parent_uuid);
+
+        // Journal + summary got copied verbatim.
+        let fork_dir = chat_dir_for_uuid(wg, &fork_uuid);
+        assert_eq!(
+            std::fs::read_to_string(fork_dir.join("conversation.jsonl")).unwrap(),
+            "turn-1\nturn-2\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_dir.join("session-summary.md")).unwrap(),
+            "## Summary\nsome text",
+        );
+        // Inbox did NOT get copied — the fork starts clean.
+        assert!(
+            !fork_dir.join("inbox.jsonl").exists(),
+            "fork must start with an empty inbox",
+        );
+
+        // Registry entry records the parent UUID.
+        let reg = load(wg).unwrap();
+        let meta = reg.sessions.get(&fork_uuid).expect("fork registered");
+        assert_eq!(meta.forked_from.as_deref(), Some(parent_uuid.as_str()));
+        assert_eq!(meta.kind, SessionKind::Interactive);
+        assert!(meta.aliases.iter().any(|a| a == "alt-take"));
+
+        // The new alias is resolvable.
+        assert_eq!(resolve_ref(wg, "alt-take").unwrap(), fork_uuid);
+
+        // Writing to the fork doesn't mutate the parent (and vice
+        // versa) — independence invariant.
+        std::fs::write(fork_dir.join("conversation.jsonl"), "new-turn\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent_dir.join("conversation.jsonl")).unwrap(),
+            "turn-1\nturn-2\n",
+            "parent must be untouched by fork writes",
+        );
+    }
+
+    #[test]
+    fn fork_with_default_alias() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let parent_uuid =
+            create_session(wg, SessionKind::Interactive, &["orig".into()], None).unwrap();
+        std::fs::write(
+            chat_dir_for_uuid(wg, &parent_uuid).join("conversation.jsonl"),
+            "seed\n",
+        )
+        .unwrap();
+        let fork_uuid = fork_session(wg, "orig", None).unwrap();
+        let reg = load(wg).unwrap();
+        let meta = reg.sessions.get(&fork_uuid).unwrap();
+        // Generated alias has the fork-<short> shape.
+        assert!(
+            meta.aliases.iter().any(|a| a.starts_with("fork-")),
+            "expected fork-<short> alias, got {:?}",
+            meta.aliases
+        );
+    }
+
+    #[test]
+    fn fork_rejects_taken_alias() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let _parent =
+            create_session(wg, SessionKind::Interactive, &["parent".into()], None).unwrap();
+        let _other = create_session(
+            wg,
+            SessionKind::Interactive,
+            &["already-taken".into()],
+            None,
+        )
+        .unwrap();
+        let err = fork_session(wg, "parent", Some("already-taken".into())).unwrap_err();
+        assert!(
+            format!("{}", err).contains("already-taken"),
+            "error should mention the taken alias: {}",
+            err
+        );
     }
 
     #[test]

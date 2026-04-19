@@ -166,6 +166,7 @@ pub fn run(
             created: chrono::Utc::now().to_rfc3339(),
             aliases: vec![session_alias.clone()],
             label: Some(format!("task {}", task_id)),
+            forked_from: None,
         }
     });
     let _ = workgraph::chat_sessions::save(workgraph_dir, &reg);

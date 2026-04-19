@@ -3306,6 +3306,19 @@ pub enum SessionCommands {
         label: Option<String>,
     },
 
+    /// Fork an existing session. Copies its conversation journal
+    /// into a fresh session so you can explore a different
+    /// direction without losing the original. The new session has
+    /// its own inbox/outbox; writes to it don't affect the parent.
+    Fork {
+        /// Source session reference: UUID, prefix, or alias.
+        source: String,
+
+        /// Alias for the fork. Defaults to `fork-<short-uuid>`.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+
     /// Manage aliases on an existing session.
     Alias {
         #[command(subcommand)]

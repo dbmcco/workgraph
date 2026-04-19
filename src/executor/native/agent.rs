@@ -2825,6 +2825,49 @@ impl AgentLoop {
         match cmd {
             "/quit" | "/exit" => NexSlashResult::Quit,
 
+            "/fork" => {
+                // Fork the current session into a new one with a
+                // copy of its journal. The fork evolves
+                // independently from here — new inbox, new outbox,
+                // writes don't affect the parent.
+                let Some(ref wg_dir) = self.workgraph_dir else {
+                    eprintln!("\x1b[33m[nex] /fork unavailable: no workgraph dir in scope\x1b[0m");
+                    return NexSlashResult::Continue;
+                };
+                // Source session = the currently-bound chat surface.
+                // Interactive sessions without a chat surface can't
+                // be forked from inside /fork (they don't know their
+                // own session_ref here); users can still fork from
+                // another terminal via `wg session fork <source>`.
+                let Some(ref cs) = self.chat_surface else {
+                    eprintln!(
+                        "\x1b[33m[nex] /fork: this session has no chat-surface ref; fork from another terminal with `wg session fork <source>`\x1b[0m"
+                    );
+                    return NexSlashResult::Continue;
+                };
+                let source_ref = cs.session_ref.clone();
+                let new_alias = if arg.is_empty() {
+                    None
+                } else {
+                    Some(arg.to_string())
+                };
+                match crate::chat_sessions::fork_session(wg_dir, &source_ref, new_alias) {
+                    Ok(fork_uuid) => {
+                        let reg = crate::chat_sessions::load(wg_dir).ok();
+                        let handle = reg
+                            .as_ref()
+                            .and_then(|r| r.sessions.get(&fork_uuid))
+                            .and_then(|m| m.aliases.first().cloned())
+                            .unwrap_or_else(|| fork_uuid.clone());
+                        let short = &fork_uuid[..std::cmp::min(fork_uuid.len(), 8)];
+                        eprintln!("\x1b[1;32m[nex]\x1b[0m forked → {} ({})", handle, short);
+                        eprintln!("\x1b[2m  /quit and run: \x1b[0mwg nex --chat {}", handle);
+                    }
+                    Err(e) => eprintln!("\x1b[31m[nex] /fork failed: {}\x1b[0m", e),
+                }
+                NexSlashResult::Continue
+            }
+
             "/sessions" | "/resume" => {
                 // List all registered chat sessions, most-recent
                 // first, with the exec command to resume each. We
@@ -2921,6 +2964,7 @@ impl AgentLoop {
                      \x1b[1;36m  /compact\x1b[0m                      — manually compact context (hard L2)\n\
                      \x1b[1;36m  /status\x1b[0m                       — show agent state (context, tokens, paths)\n\
                      \x1b[1;36m  /resume, /sessions\x1b[0m            — list all chat sessions with resume hints\n\
+                     \x1b[1;36m  /fork [alias]\x1b[0m                 — fork this session (copy journal) to explore a different branch\n\
                      \n\
                      \x1b[2mCtrl-C during generation cancels the in-flight response.\x1b[0m\n\
                      \x1b[2mCtrl-C at the prompt is a no-op (use /quit or Ctrl-D to exit).\x1b[0m"
