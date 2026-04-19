@@ -331,7 +331,13 @@ fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
                 out.extend_from_slice(bytes);
             }
         }
-        KeyCode::Enter => out.push(b'\r'),
+        // Enter: send both \r and \n so whichever the remote side
+        // expects gets recognized. A PTY in cooked mode maps \r→\n
+        // via ICRNL; in raw mode (rustyline inside wg nex), neither
+        // translation happens, and some readers accept only \r and
+        // some only \n. Sending both is safe — nothing reads empty
+        // lines from a \r\n pair.
+        KeyCode::Enter => out.extend_from_slice(b"\r\n"),
         KeyCode::Tab => {
             if shift {
                 out.extend_from_slice(b"\x1b[Z"); // xterm back-tab
@@ -391,9 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_maps_to_cr() {
+    fn enter_maps_to_crlf() {
         let e = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(key_event_to_bytes(&e), vec![b'\r']);
+        assert_eq!(key_event_to_bytes(&e), b"\r\n");
     }
 
     #[test]

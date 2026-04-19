@@ -1132,11 +1132,20 @@ fn handle_normal_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     // regardless of focused panel. Works from the graph pane or the
     // right panel — users expect "enable live terminal view" to be
     // always accessible. No-op when the active right tab isn't Chat.
+    //
+    // Also: when enabling PTY mode, auto-focus the right panel so
+    // subsequent keys reach the embedded handler's stdin. Without
+    // this, Ctrl+T from the graph pane would put the user in a
+    // confusing state where they'd see the PTY but their keys would
+    // still be driving graph navigation.
     if modifiers.contains(KeyModifiers::CONTROL)
         && matches!(code, KeyCode::Char('t'))
         && app.right_panel_tab == RightPanelTab::Chat
     {
         toggle_chat_pty_mode(app);
+        if app.chat_pty_mode {
+            app.focused_panel = super::state::FocusedPanel::RightPanel;
+        }
         return;
     }
     match app.focused_panel {
@@ -1676,6 +1685,29 @@ fn handle_history_browser_key(app: &mut VizApp, code: KeyCode, _modifiers: KeyMo
 }
 
 fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+    // Chat tab OWNER PTY mode: forward ALL keys (except Ctrl+T and
+    // a few escape hatches) to the embedded handler's stdin BEFORE
+    // any global key handling. The user has indicated "this is the
+    // live terminal" by toggling on; they expect `q`, `/`, Enter,
+    // arrow keys etc. to reach the embedded nex, not close the TUI
+    // or open search. Escape hatches that keep the TUI usable:
+    //   * Ctrl+T: toggle PTY mode off (already handled in
+    //     `handle_normal_key`'s global branch)
+    //   * Ctrl+Q: reserved for future "force quit TUI"
+    //
+    // Observer mode (chat_pty_observer=true) does NOT forward —
+    // keys flow through the normal handler so the user can use the
+    // TUI's chat composer to trigger takeover.
+    // NOTE: chat-tethered `wg nex` reads user input from the session's
+    // inbox.jsonl, NOT from stdin — so forwarding keystrokes to the
+    // embedded handler's PTY stdin achieves nothing. The PTY pane is
+    // display-only in both owner and observer modes. All user input
+    // flows through the TUI's chat composer (`Enter` in Chat tab →
+    // `InputMode::ChatInput` → `send_chat_message`), which writes to
+    // `inbox.jsonl` via `wg chat`. In owner mode the TUI's own
+    // handler processes the inbox. In observer mode, the external
+    // handler does (with release-marker triggering takeover).
+
     // Files tab has its own key handler — intercept early.
     // When search mode is active, only Ctrl+C stays global; everything else
     // (including Esc, character keys) goes to the file browser handler.
@@ -2053,20 +2085,8 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         {
             toggle_chat_pty_mode(app);
         }
-        // Chat tab: when PTY mode is on and user is NOT in the chat
-        // input editor, forward keys to the embedded handler's stdin.
-        // Text input flows into rustyline/slash commands/etc. inside
-        // the PTY.
-        _ if app.chat_pty_mode
-            && app.right_panel_tab == RightPanelTab::Chat
-            && app.input_mode == InputMode::Normal =>
-        {
-            let task_id = format!(".coordinator-{}", app.active_coordinator_id);
-            if let Some(pane) = app.task_panes.get_mut(&task_id) {
-                let key = crossterm::event::KeyEvent::new(code, modifiers);
-                let _ = pane.send_key(key);
-            }
-        }
+        // (PTY-forward branch moved to the top of
+        // handle_right_panel_key — see comment there.)
         KeyCode::Char('[') if app.right_panel_tab == RightPanelTab::Chat => {
             let ids = app.list_coordinator_ids();
             if ids.len() > 1 {
@@ -2337,19 +2357,28 @@ fn poll_chat_pty_takeover(app: &mut VizApp) -> bool {
 /// the handler. Phase 3b will add the lock-held observer path;
 /// Phase 3c will wire takeover-on-send.
 fn toggle_chat_pty_mode(app: &mut VizApp) {
-    app.chat_pty_mode = !app.chat_pty_mode;
-    if !app.chat_pty_mode {
+    let task_id = format!(".coordinator-{}", app.active_coordinator_id);
+    let pane_live = app
+        .task_panes
+        .get_mut(&task_id)
+        .map(|p| p.is_alive())
+        .unwrap_or(false);
+
+    // If PTY mode is on and the pane DIED while it was on (handler
+    // crashed / was externally released), the user's Ctrl+T intent
+    // is clearly "give me the PTY back" — respawn instead of
+    // toggling off. Only actually toggle off when the pane is live
+    // and the user wants to see the normal chat view.
+    if app.chat_pty_mode && pane_live {
+        app.chat_pty_mode = false;
         return;
     }
-    let task_id = format!(".coordinator-{}", app.active_coordinator_id);
-    // Already have a live pane? Keep it.
-    if let Some(p) = app.task_panes.get_mut(&task_id) {
-        if p.is_alive() {
-            return;
-        }
-        // Dead — drop so we can respawn fresh.
-        app.task_panes.remove(&task_id);
+    // Turning on (or respawning after death).
+    app.chat_pty_mode = true;
+    if pane_live {
+        return;
     }
+    app.task_panes.remove(&task_id);
 
     // Decide spawn mode by lock state. Observer mode (another
     // handler already owns the session) spawns `wg session attach`

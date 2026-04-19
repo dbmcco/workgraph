@@ -227,13 +227,19 @@ fn run_attach(workgraph_dir: &Path, session_ref: &str) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
     use std::sync::mpsc::{RecvTimeoutError, channel};
 
-    let uuid = workgraph::chat_sessions::resolve_ref(workgraph_dir, session_ref)
-        .with_context(|| format!("no session matching {:?}", session_ref))?;
+    // Tolerate bare chat-dir refs (same pattern as release/status)
+    // so `wg session attach .coordinator-0` works even for sessions
+    // that weren't registered through `ensure_session`. The TUI's
+    // observer pane spawns this for the active coordinator's task.
+    let chat_dir = resolve_chat_dir(workgraph_dir, session_ref)?;
+    let display_ref = chat_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(session_ref);
     eprintln!(
-        "\x1b[1;32m[wg session attach]\x1b[0m {} (uuid {})",
-        session_ref, uuid
+        "\x1b[1;32m[wg session attach]\x1b[0m {}",
+        display_ref
     );
-    let chat_dir = workgraph_dir.join("chat").join(session_ref);
     let streaming = chat_dir.join(".streaming");
     let outbox = chat_dir.join("outbox.jsonl");
 
