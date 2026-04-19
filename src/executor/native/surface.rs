@@ -79,13 +79,41 @@ pub trait ConversationSurface: Send {
     /// `Arc<Mutex<...>>` internally for their transcript buffer.
     fn stream_sink(&self) -> Arc<dyn Fn(&str) + Send + Sync>;
 
-    /// Called when a tool starts / ends — the surface can render
-    /// progress lines, write per-call artifacts, etc. Default impl
-    /// is a no-op so surfaces that don't care don't have to override.
-    fn on_tool_start(&mut self, _name: &str, _input_summary: &str) {}
+    /// Called when a tool dispatch begins. Default impl is a no-op;
+    /// ChatSurfaceState overrides this to render the opening of a
+    /// tool "box" (┌─ Name ──── + `│ input` line) in the per-turn
+    /// transcript.
+    ///
+    /// `input_summary` is a short one-line summary suitable for
+    /// display (e.g. "pattern=foo" for grep, "$ ls" for bash). The
+    /// full input JSON is also passed so surfaces that want it can
+    /// render more detail.
+    fn on_tool_start(
+        &mut self,
+        _name: &str,
+        _input_summary: &str,
+        _input: &serde_json::Value,
+    ) {
+    }
 
-    /// Called when a tool finishes.
-    fn on_tool_end(&mut self, _name: &str, _is_error: bool, _duration_ms: u64) {}
+    /// Called as streaming tool output arrives (chunk by chunk,
+    /// typically from `execute_batch_streaming`'s per-call callback).
+    /// ChatSurfaceState overrides this to mirror the chunk into the
+    /// transcript inside the current tool box (`│ ` prefix per line).
+    fn on_tool_progress_chunk(&mut self, _chunk: &str) {}
+
+    /// Called when a tool call completes. `output` is the full
+    /// content the model will see in the tool_result block; surfaces
+    /// that render to a chat transcript use it to fill in the box.
+    /// Default impl is a no-op.
+    fn on_tool_end(
+        &mut self,
+        _name: &str,
+        _output: &str,
+        _is_error: bool,
+        _duration_ms: u64,
+    ) {
+    }
 }
 
 /// One user turn as delivered by a surface. Carries the text plus an

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::Serialize;
 
 use super::client::{
@@ -193,6 +194,142 @@ struct ChatSurfaceState {
     /// request_id of the inbox entry currently being responded to —
     /// tagged into the outbox entry so the TUI correlates.
     current_request_id: Option<String>,
+}
+
+// ConversationSurface impl for ChatSurfaceState. Moves the chat-
+// specific rendering (box drawing, transcript accumulation, outbox
+// flush) from the agent-loop body into here so the loop can call
+// trait methods instead of accessing ChatSurfaceState fields
+// directly. Behavior identical to the inline code that lives in
+// `run_interactive` — ported verbatim.
+#[async_trait]
+impl super::surface::ConversationSurface for ChatSurfaceState {
+    async fn next_user_input(&mut self) -> Option<super::surface::UserTurn> {
+        let entry = self
+            .reader
+            .next_entry(std::time::Duration::from_millis(250))
+            .await?;
+        Some(super::surface::UserTurn::with_request_id(
+            entry.message,
+            entry.request_id,
+        ))
+    }
+
+    fn on_turn_start(&mut self, request_id: Option<&str>) {
+        self.current_request_id = request_id.map(|s| s.to_string());
+        // Fresh user turn — reset the transcript and the streaming
+        // dotfile so the display starts clean. EndTurn clears these
+        // too, but an interrupted or errored prior turn can leave
+        // stale content; this is the belt-and-suspenders reset.
+        self.transcript.lock().unwrap().clear();
+        super::chat_surface::clear_streaming(&self.workgraph_dir, &self.session_ref);
+    }
+
+    fn on_turn_end(&mut self) {
+        let final_text = {
+            let t = self.transcript.lock().unwrap();
+            t.clone()
+        };
+        if !final_text.is_empty()
+            && let Some(rid) = self.current_request_id.clone()
+            && let Err(e) = super::chat_surface::append_outbox(
+                &self.workgraph_dir,
+                &self.session_ref,
+                &final_text,
+                &rid,
+            )
+        {
+            eprintln!("[agent-loop] chat outbox append failed: {} — continuing", e);
+        }
+        super::chat_surface::clear_streaming(&self.workgraph_dir, &self.session_ref);
+        self.transcript.lock().unwrap().clear();
+        self.current_request_id = None;
+    }
+
+    fn stream_sink(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let wg_dir = self.workgraph_dir.clone();
+        let sref = self.session_ref.clone();
+        let transcript = self.transcript.clone();
+        Arc::new(move |text: &str| {
+            let mut t = transcript.lock().unwrap();
+            t.push_str(text);
+            let _ = super::chat_surface::write_streaming(&wg_dir, &sref, &t);
+        })
+    }
+
+    fn on_tool_start(
+        &mut self,
+        name: &str,
+        input_summary: &str,
+        input: &serde_json::Value,
+    ) {
+        let mut t = self.transcript.lock().unwrap();
+        // Close any previous open tool box.
+        if t.ends_with("│ \n") || t.contains("┌─ ") && !t.trim_end().ends_with("└─") {
+            let needs_close = t
+                .rsplit_terminator('\n')
+                .find(|l| !l.is_empty())
+                .is_some_and(|l| l.starts_with("│"));
+            if needs_close {
+                t.push_str("└─\n");
+            }
+        }
+        // New tool box header + input line.
+        let header_rule = "─".repeat(40usize.saturating_sub(name.len() + 4));
+        t.push_str(&format!("\n┌─ {} {}\n", name, header_rule));
+        if name == "Bash" || name == "bash" {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                t.push_str(&format!("│ $ {}\n", cmd));
+            } else {
+                t.push_str(&format!("│ {}\n", input_summary));
+            }
+        } else {
+            t.push_str(&format!("│ {}\n", input_summary));
+        }
+        let _ = super::chat_surface::write_streaming(&self.workgraph_dir, &self.session_ref, &t);
+    }
+
+    fn on_tool_progress_chunk(&mut self, chunk: &str) {
+        let mut t = self.transcript.lock().unwrap();
+        for line in chunk.lines() {
+            t.push_str("│ ");
+            t.push_str(line);
+            t.push('\n');
+        }
+        let _ = super::chat_surface::write_streaming(&self.workgraph_dir, &self.session_ref, &t);
+    }
+
+    fn on_tool_end(
+        &mut self,
+        _name: &str,
+        output: &str,
+        is_error: bool,
+        _duration_ms: u64,
+    ) {
+        let mut t = self.transcript.lock().unwrap();
+        let body = if is_error {
+            format!("× {}", output)
+        } else {
+            output.to_string()
+        };
+        let lines: Vec<&str> = body.lines().collect();
+        const MAX_LINES: usize = 15;
+        if lines.is_empty() {
+            t.push_str("│ (no output)\n");
+        } else if lines.len() > MAX_LINES {
+            for line in &lines[..MAX_LINES] {
+                t.push_str(&format!("│ {}\n", line));
+            }
+            t.push_str(&format!("│ ... ({} more lines)\n", lines.len() - MAX_LINES));
+        } else {
+            for line in &lines {
+                t.push_str(&format!("│ {}\n", line));
+            }
+        }
+        // Close the box.
+        t.push_str("└─\n");
+        let _ = super::chat_surface::write_streaming(&self.workgraph_dir, &self.session_ref, &t);
+    }
 }
 
 /// NDJSON log entry types for the output file.
