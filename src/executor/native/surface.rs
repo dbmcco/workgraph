@@ -102,6 +102,16 @@ pub trait ConversationSurface: Send {
     /// transcript inside the current tool box (`│ ` prefix per line).
     fn on_tool_progress_chunk(&mut self, _chunk: &str) {}
 
+    /// Return an Arc-friendly sink for tool-progress chunks. Used by
+    /// the agent loop to capture the sink in an `Fn(String)` streaming
+    /// callback that tokio tasks can invoke (where `&mut self` is not
+    /// available). Default impl returns a no-op sink; ChatSurfaceState
+    /// overrides to produce one that prefixes each line with `│ ` and
+    /// mirrors to the per-session streaming file.
+    fn tool_progress_sink(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(|_: &str| {})
+    }
+
     /// Called when a tool call completes. `output` is the full
     /// content the model will see in the tool_result block; surfaces
     /// that render to a chat transcript use it to fill in the box.

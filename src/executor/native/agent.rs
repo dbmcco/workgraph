@@ -299,6 +299,21 @@ impl super::surface::ConversationSurface for ChatSurfaceState {
         let _ = super::chat_surface::write_streaming(&self.workgraph_dir, &self.session_ref, &t);
     }
 
+    fn tool_progress_sink(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let wg_dir = self.workgraph_dir.clone();
+        let sref = self.session_ref.clone();
+        let transcript = self.transcript.clone();
+        Arc::new(move |chunk: &str| {
+            let mut t = transcript.lock().unwrap();
+            for line in chunk.lines() {
+                t.push_str("│ ");
+                t.push_str(line);
+                t.push('\n');
+            }
+            let _ = super::chat_surface::write_streaming(&wg_dir, &sref, &t);
+        })
+    }
+
     fn on_tool_end(
         &mut self,
         _name: &str,
@@ -1561,17 +1576,14 @@ impl AgentLoop {
             let streaming_file = self.streaming_file_path.clone();
             let stream_writer_clone = self.stream_writer.clone();
             let is_autonomous = self.autonomous;
-            // Capture: the persistent turn transcript (which accumulates
-            // across model calls within this turn) + the paths so the
-            // streaming closure can mirror each chunk to `.streaming`
-            // as text arrives, producing the same rich progressive
-            // view the TUI/attach gets that `wg nex` shows on stderr.
-            let chat_target = chat_surface.as_ref().map(|c| {
-                (
-                    c.workgraph_dir.clone(),
-                    c.session_ref.clone(),
-                    c.transcript.clone(),
-                )
+            // Chat-transcript mirror goes through the surface's
+            // stream sink — captures transcript buffer + streaming
+            // file paths internally; each chunk is appended and the
+            // accumulated transcript written to the chat-streaming
+            // dotfile the TUI tails.
+            let chat_text_sink = chat_surface.as_ref().map(|c| {
+                use super::surface::ConversationSurface;
+                c.stream_sink()
             });
             let on_text = move |text: String| {
                 if is_autonomous {
@@ -1587,10 +1599,8 @@ impl AgentLoop {
                     eprint!("{}", text);
                     let _ = std::io::stderr().flush();
                 }
-                if let Some((ref wg_dir, ref sref, ref transcript)) = chat_target {
-                    let mut t = transcript.lock().unwrap();
-                    t.push_str(&text);
-                    let _ = super::chat_surface::write_streaming(wg_dir, sref, &t);
+                if let Some(ref sink) = chat_text_sink {
+                    sink(&text);
                 }
             };
 
@@ -1981,34 +1991,14 @@ impl AgentLoop {
                         }
                     }
 
-                    // Chat-surface mode: the transcript has been
-                    // accumulating model text + tool markers + tool
-                    // progress across every model call in this turn.
-                    // Flush the full transcript to the outbox tagged
-                    // with the request_id, then clear for the next
-                    // user turn.
+                    // Chat-surface mode: flush the accumulated per-turn
+                    // transcript to the outbox tagged with request_id,
+                    // clear streaming + transcript + current id. See
+                    // `ChatSurfaceState::on_turn_end` for the full
+                    // sequence.
                     if let Some(ref mut chat) = chat_surface {
-                        let final_text = {
-                            let t = chat.transcript.lock().unwrap();
-                            t.clone()
-                        };
-                        if !final_text.is_empty()
-                            && let Some(rid) = chat.current_request_id.clone()
-                            && let Err(e) = super::chat_surface::append_outbox(
-                                &chat.workgraph_dir,
-                                &chat.session_ref,
-                                &final_text,
-                                &rid,
-                            )
-                        {
-                            eprintln!("[agent-loop] chat outbox append failed: {} — continuing", e);
-                        }
-                        super::chat_surface::clear_streaming(
-                            &chat.workgraph_dir,
-                            &chat.session_ref,
-                        );
-                        chat.transcript.lock().unwrap().clear();
-                        chat.current_request_id = None;
+                        use super::surface::ConversationSurface;
+                        chat.on_turn_end();
                     }
 
                     // In autonomous mode (task agents), EndTurn means
@@ -2124,48 +2114,9 @@ impl AgentLoop {
                             // stderr-style `> name(args)` would
                             // render as a markdown blockquote which
                             // looks wrong and loses tool grouping.
-                            if let Some(ref chat) = chat_surface {
-                                let mut t = chat.transcript.lock().unwrap();
-                                // Close any previous open tool box.
-                                if t.ends_with("│ \n")
-                                    || t.contains("┌─ ") && !t.trim_end().ends_with("└─")
-                                {
-                                    // Heuristic: if the last non-empty
-                                    // section is still inside a box,
-                                    // close it. We detect this by
-                                    // whether the last line starts
-                                    // with `│` and no `└─` follows.
-                                    let needs_close = t
-                                        .rsplit_terminator('\n')
-                                        .find(|l| !l.is_empty())
-                                        .is_some_and(|l| l.starts_with("│"));
-                                    if needs_close {
-                                        t.push_str("└─\n");
-                                    }
-                                }
-                                // New tool box header + input line.
-                                let header_rule =
-                                    "─".repeat(40usize.saturating_sub(name.len() + 4));
-                                t.push_str(&format!("\n┌─ {} {}\n", name, header_rule));
-                                // Friendly input line matching the
-                                // legacy Claude-CLI format so Bash
-                                // shows `│ $ cmd` and other tools
-                                // show the first meaningful arg.
-                                if name == "Bash" || name == "bash" {
-                                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str())
-                                    {
-                                        t.push_str(&format!("│ $ {}\n", cmd));
-                                    } else {
-                                        t.push_str(&format!("│ {}\n", input_summary));
-                                    }
-                                } else {
-                                    t.push_str(&format!("│ {}\n", input_summary));
-                                }
-                                let _ = super::chat_surface::write_streaming(
-                                    &chat.workgraph_dir,
-                                    &chat.session_ref,
-                                    &t,
-                                );
+                            if let Some(ref mut chat) = chat_surface {
+                                use super::surface::ConversationSurface;
+                                chat.on_tool_start(name, &input_summary, input);
                             }
                         }
                     }
@@ -2280,17 +2231,20 @@ impl AgentLoop {
                         // changes when the model speaks.
                         let streaming_file = self.streaming_file_path.clone();
                         let stream_writer_clone = self.stream_writer.clone();
-                        let chat_transcript_target = chat_surface.as_ref().map(|c| {
-                            (
-                                c.workgraph_dir.clone(),
-                                c.session_ref.clone(),
-                                c.transcript.clone(),
-                            )
+                        // Tool-progress chunks mirror into the chat
+                        // transcript via the surface's sink — which
+                        // captures the transcript buffer + streaming
+                        // file paths internally and prefixes each
+                        // line with `│ ` so it lands inside the open
+                        // tool box the TUI draws.
+                        let chat_progress_sink = chat_surface.as_ref().map(|c| {
+                            use super::surface::ConversationSurface;
+                            c.tool_progress_sink()
                         });
                         let make_callback = move |_idx: usize| {
                             let sw = stream_writer_clone.clone();
                             let sf = streaming_file.clone();
-                            let ct = chat_transcript_target.clone();
+                            let cps = chat_progress_sink.clone();
                             Box::new(move |text: String| {
                                 if let Some(ref writer) = sw {
                                     writer.write_tool_output_chunk("bash", &text);
@@ -2301,19 +2255,8 @@ impl AgentLoop {
                                     acc.push('\n');
                                     let _ = std::fs::write(path, &acc);
                                 }
-                                if let Some((ref wg_dir, ref sref, ref transcript)) = ct {
-                                    let mut t = transcript.lock().unwrap();
-                                    // Prefix each streamed line with
-                                    // `│ ` so it lands inside the
-                                    // box the TUI draws. Matches the
-                                    // legacy Claude-CLI coordinator
-                                    // format.
-                                    for line in text.lines() {
-                                        t.push_str("│ ");
-                                        t.push_str(line);
-                                        t.push('\n');
-                                    }
-                                    let _ = super::chat_surface::write_streaming(wg_dir, sref, &t);
+                                if let Some(ref sink) = cps {
+                                    sink(&text);
                                 }
                             }) as super::tools::ToolStreamCallback
                         };
@@ -2456,37 +2399,9 @@ impl AgentLoop {
                             // lines with a "... N more" tail so the
                             // TUI doesn't get flooded. Full content
                             // is in the journal for post-hoc review.
-                            if let Some(ref chat) = chat_surface {
-                                let mut t = chat.transcript.lock().unwrap();
-                                let body = if output.is_error {
-                                    format!("× {}", output.content)
-                                } else {
-                                    output.content.clone()
-                                };
-                                let lines: Vec<&str> = body.lines().collect();
-                                const MAX_LINES: usize = 15;
-                                if lines.is_empty() {
-                                    t.push_str("│ (no output)\n");
-                                } else if lines.len() > MAX_LINES {
-                                    for line in &lines[..MAX_LINES] {
-                                        t.push_str(&format!("│ {}\n", line));
-                                    }
-                                    t.push_str(&format!(
-                                        "│ ... ({} more lines)\n",
-                                        lines.len() - MAX_LINES
-                                    ));
-                                } else {
-                                    for line in &lines {
-                                        t.push_str(&format!("│ {}\n", line));
-                                    }
-                                }
-                                // Close the box.
-                                t.push_str("└─\n");
-                                let _ = super::chat_surface::write_streaming(
-                                    &chat.workgraph_dir,
-                                    &chat.session_ref,
-                                    &t,
-                                );
+                            if let Some(ref mut chat) = chat_surface {
+                                use super::surface::ConversationSurface;
+                                chat.on_tool_end(name, &output.content, output.is_error, *duration_ms);
                             }
                         }
 
@@ -2768,10 +2683,12 @@ impl AgentLoop {
     }
 }
 
-/// Read one user-turn: chat inbox if present (async, non-blocking
-/// poll), else rustyline (sync). Side effect: updates
-/// `current_request_id` on chat_surface so streaming + outbox writes
-/// correlate to the right inbox entry.
+/// Read one user-turn: chat inbox if present (via the
+/// ConversationSurface trait impl), else rustyline (sync).
+///
+/// When a chat surface is installed, calls its `next_user_input`
+/// and `on_turn_start(request_id)` to deliver the turn and reset
+/// per-turn state (transcript buffer + streaming file).
 async fn read_next_user_turn(
     chat_surface: &mut Option<ChatSurfaceState>,
     editor: &mut rustyline::DefaultEditor,
@@ -2779,19 +2696,12 @@ async fn read_next_user_turn(
     use rustyline::error::ReadlineError;
 
     if let Some(c) = chat_surface.as_mut() {
-        let entry = c
-            .reader
-            .next_entry(std::time::Duration::from_millis(250))
-            .await?;
-        c.current_request_id = Some(entry.request_id.clone());
-        // Fresh user turn — reset the transcript and the
-        // streaming dotfile so the display starts clean.
-        // EndTurn clears these too, but an interrupted or errored
-        // prior turn can leave stale content; this is the
-        // belt-and-suspenders reset.
-        c.transcript.lock().unwrap().clear();
-        super::chat_surface::clear_streaming(&c.workgraph_dir, &c.session_ref);
-        return Some(entry.message);
+        use super::surface::ConversationSurface;
+        let turn = c.next_user_input().await?;
+        // Fresh user turn — reset the transcript + streaming dotfile
+        // and record the request_id for outbox correlation.
+        c.on_turn_start(turn.request_id.as_deref());
+        return Some(turn.text);
     }
     loop {
         match editor.readline("\x1b[1;36m>\x1b[0m ") {
