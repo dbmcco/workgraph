@@ -43,7 +43,103 @@ pub fn run(workgraph_dir: &Path, cmd: SessionCommands) -> Result<()> {
             eprintln!("\x1b[32m[wg session]\x1b[0m removed session {}", uuid);
             Ok(())
         }
+        SessionCommands::Release { session, wait } => run_release(workgraph_dir, &session, wait),
+        SessionCommands::Status { session } => run_status(workgraph_dir, &session),
     }
+}
+
+/// Resolve `ref` to a chat dir path. Tries the session registry
+/// first; falls back to `<wg>/chat/<ref>` if that directory exists
+/// on disk. Makes release/status work on chat-dirs that weren't
+/// registered via `ensure_session` (e.g., raw `wg nex --chat foo`
+/// invocations).
+fn resolve_chat_dir(workgraph_dir: &Path, session: &str) -> Result<std::path::PathBuf> {
+    if let Ok(uuid) = workgraph::chat_sessions::resolve_ref(workgraph_dir, session) {
+        return Ok(workgraph_dir.join("chat").join(uuid));
+    }
+    let direct = workgraph_dir.join("chat").join(session);
+    if direct.exists() {
+        return Ok(direct);
+    }
+    anyhow::bail!(
+        "session reference {:?} did not match any UUID, prefix, alias, or chat dir",
+        session
+    );
+}
+
+fn run_release(workgraph_dir: &Path, session: &str, wait_secs: u64) -> Result<()> {
+    let chat_dir = resolve_chat_dir(workgraph_dir, session)?;
+    match workgraph::session_lock::read_holder(&chat_dir)? {
+        None => {
+            eprintln!(
+                "\x1b[2m[wg session]\x1b[0m {} has no live handler — nothing to release",
+                session
+            );
+            return Ok(());
+        }
+        Some(info) if !info.alive => {
+            eprintln!(
+                "\x1b[33m[wg session]\x1b[0m {} lock is stale (pid {} not running) — clearing",
+                session, info.pid
+            );
+            // Stale lock — just remove it.
+            let _ = std::fs::remove_file(workgraph::session_lock::SessionLock::lock_path(&chat_dir));
+            return Ok(());
+        }
+        Some(info) => {
+            eprintln!(
+                "\x1b[1;33m[wg session]\x1b[0m asking handler (pid={} kind={}) on {} to release...",
+                info.pid,
+                info.kind.map(|k| k.label()).unwrap_or("unknown"),
+                session
+            );
+            workgraph::session_lock::request_release(&chat_dir)?;
+        }
+    }
+    if wait_secs == 0 {
+        eprintln!("\x1b[2m[wg session]\x1b[0m release requested (not waiting for completion)");
+        return Ok(());
+    }
+    match workgraph::session_lock::wait_for_release(
+        &chat_dir,
+        std::time::Duration::from_secs(wait_secs),
+    ) {
+        Ok(()) => {
+            eprintln!("\x1b[32m[wg session]\x1b[0m {} released", session);
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!(
+                "\x1b[33m[wg session]\x1b[0m {} handler did not release within {}s — may be mid-tool-call",
+                session, wait_secs
+            );
+            eprintln!(
+                "\x1b[2m  The release marker is still set; handler will exit at its next turn boundary\x1b[0m"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_status(workgraph_dir: &Path, session: &str) -> Result<()> {
+    let chat_dir = resolve_chat_dir(workgraph_dir, session)?;
+    match workgraph::session_lock::read_holder(&chat_dir)? {
+        None => {
+            println!("{}: no handler", session);
+        }
+        Some(info) => {
+            let alive_label = if info.alive { "live" } else { "STALE" };
+            println!(
+                "{}: {} pid={} kind={} started={}",
+                session,
+                alive_label,
+                info.pid,
+                info.kind.map(|k| k.label()).unwrap_or("unknown"),
+                info.started_at
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_list(workgraph_dir: &Path, json: bool) -> Result<()> {

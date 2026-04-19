@@ -162,7 +162,19 @@ impl ChatInboxReader {
     /// Returns `None` only on persistent read errors; callers should
     /// treat that as shutdown.
     pub async fn next_entry(&self, poll_interval: Duration) -> Option<InboxEntry> {
+        let chat_dir = self.workgraph_dir.join("chat").join(&self.session_ref);
         loop {
+            // Check cooperative release marker. If another process
+            // (typically the TUI, after a user-send takeover trigger)
+            // asked us to release, return None — the caller treats
+            // None as EOF and exits the loop cleanly at the next turn
+            // boundary. Without this check, the handler would block
+            // forever on the inbox even after the release was
+            // requested. See docs/design/sessions-as-identity.md
+            // §Handoff policy.
+            if crate::session_lock::release_requested(&chat_dir) {
+                return None;
+            }
             match self.try_next_entry() {
                 Ok(Some(entry)) => return Some(entry),
                 Ok(None) => {

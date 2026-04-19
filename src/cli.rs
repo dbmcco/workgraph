@@ -3373,6 +3373,28 @@ pub enum SessionCommands {
         /// Session reference: UUID, prefix, or alias.
         session: String,
     },
+
+    /// Ask the live handler of a session (if any) to exit cleanly at
+    /// its next turn boundary. Writes a release marker that the
+    /// handler observes. Does not forcefully kill anything — a
+    /// runaway tool call will delay the release until it completes.
+    /// If no handler is running, this is a no-op.
+    Release {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+
+        /// Wait up to this many seconds for the handler to actually
+        /// release before returning. 0 = don't wait.
+        #[arg(long, default_value_t = 10)]
+        wait: u64,
+    },
+
+    /// Show who currently holds the handler lock for a session (if
+    /// anyone). Prints PID, kind, start time, and live/stale status.
+    Status {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]

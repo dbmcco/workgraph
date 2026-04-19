@@ -1333,6 +1333,29 @@ impl AgentLoop {
             // point for end-of-turn hooks. Stage C will add microcompact
             // here; Stage B wires the cancel + inbox-drain hooks.
 
+            // 0. Cooperative release: another process (typically the
+            //    TUI, when a user sends a message in observer mode)
+            //    wrote a release marker asking us to exit cleanly at
+            //    the next safe point. We're at that point now. Clear
+            //    the marker so a successor handler doesn't immediately
+            //    re-exit, record the exit reason, break out.
+            //    See docs/design/sessions-as-identity.md §Handoff policy.
+            if let (Some(wgd), Some(sref)) =
+                (&self.workgraph_dir, &self.chat_session_ref)
+            {
+                let chat_dir = wgd.join("chat").join(sref);
+                if crate::session_lock::release_requested(&chat_dir) {
+                    crate::session_lock::clear_release_marker(&chat_dir);
+                    if !self.autonomous {
+                        eprintln!(
+                            "\x1b[2m[nex] release requested — exiting cleanly at turn boundary\x1b[0m"
+                        );
+                    }
+                    session_exit_reason = "release_requested";
+                    break;
+                }
+            }
+
             // 1. Hard cancel: SIGKILL the subprocess tree so any bash /
             //    chrome / curl children from the interrupted tool die
             //    immediately. Descendants detached with setsid/nohup

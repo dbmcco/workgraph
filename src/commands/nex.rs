@@ -235,6 +235,52 @@ pub fn run(
     let journal_path = chat_dir.join("conversation.jsonl");
     let output_log = chat_dir.join("trace.ndjson");
 
+    // Acquire the per-session handler lock. This enforces
+    // at-most-one live handler per session (see
+    // docs/design/sessions-as-identity.md). The lock file lives at
+    // <chat_dir>/.handler.pid; Drop removes it on clean exit; stale
+    // (dead-PID) locks are auto-recovered. For eval-mode we skip
+    // this — eval runs are short-lived and the benchmark harness
+    // shouldn't leave lock files in the repo it's grading.
+    //
+    // Held across `rt.block_on` so the agent loop sees it alive for
+    // its entire duration. Dropped at function return (any exit
+    // path — normal, error, panic) releasing cleanly.
+    let handler_kind = if eval_mode {
+        workgraph::session_lock::HandlerKind::Adapter
+    } else if autonomous && (chat_ref.is_some() || chat_id.is_some()) {
+        workgraph::session_lock::HandlerKind::ChatNex
+    } else if autonomous {
+        workgraph::session_lock::HandlerKind::AutonomousNex
+    } else if chat_ref.is_some() || chat_id.is_some() {
+        workgraph::session_lock::HandlerKind::ChatNex
+    } else {
+        workgraph::session_lock::HandlerKind::InteractiveNex
+    };
+    let _session_lock = if eval_mode {
+        None
+    } else {
+        match workgraph::session_lock::SessionLock::acquire(&chat_dir, handler_kind) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!(
+                    "\x1b[31m[wg nex] session {} is already owned by another handler: {}\x1b[0m",
+                    session_ref, e
+                );
+                eprintln!(
+                    "\x1b[2m  Takeover is intentional: send a message via `wg tui` or another client,\n  \
+                     or signal the existing handler via `wg session release {}`.\x1b[0m",
+                    session_ref
+                );
+                anyhow::bail!("session lock busy");
+            }
+        }
+    };
+    // Clear any stale release marker left by a prior run. If we were
+    // signalled-to-release but exited before observing, the next
+    // handler shouldn't see that marker and immediately quit.
+    workgraph::session_lock::clear_release_marker(&chat_dir);
+
     // Resume is enabled iff the chosen session has a journal.
     // With the new semantics, this is always true for `--resume` /
     // `--chat <ref>` pointing at a real session, and always false
