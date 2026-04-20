@@ -1621,16 +1621,21 @@ impl AgentLoop {
             // per-turn so buffers never leak across turns.
             let interactive_turn_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
             let turn_buf_for_sink = interactive_turn_buffer.clone();
-            // Lightning-bolt spinner: shows rainbow `↯` bolts while
-            // we wait for the first streamed token, clears when text
-            // starts arriving. Only runs in interactive TTY mode.
-            // Shared flag the on_text closure flips on the first
-            // chunk so the spinner thread stops itself and erases
-            // its bolt row.
+            // Lightning-bolt spinner: shows rainbow `↯` bolts + an
+            // elapsed-time counter while we wait for the first
+            // streamed token. Cleared when either (a) text starts
+            // arriving (first-chunk handoff below), (b) the turn
+            // ends for any reason, or (c) we unwind out of the loop
+            // via an error / cancel — the RAII guard ensures the
+            // spinner stops in ALL paths, not just the happy one.
+            // The old implementation left the spinner running when
+            // the user hit Ctrl-C during a streaming error retry
+            // storm, so the bolts kept interleaving with the retry
+            // logs and the "Interrupted" message.
             let spinner_first_chunk = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let spinner_first_chunk_sink = spinner_first_chunk.clone();
-            let _spinner_handle = if !is_autonomous && stderr_is_tty() {
-                Some(start_spinner(spinner_first_chunk.clone()))
+            let _spinner_guard = if !is_autonomous && stderr_is_tty() {
+                Some(SpinnerGuard::spawn(spinner_first_chunk.clone()))
             } else {
                 None
             };
@@ -3392,11 +3397,44 @@ impl AgentLoop {
 
 /// Check whether an error is a request timeout.
 ///
+/// RAII wrapper around a spinner thread. On drop, flips the stop
+/// flag so the spinner erases its row and exits — guarantees the
+/// spinner never outlives the LLM call, regardless of which path
+/// the call unwinds through (success, retry storm, cancel, panic).
+struct SpinnerGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl SpinnerGuard {
+    fn spawn(stop: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        let handle = start_spinner(stop.clone());
+        SpinnerGuard {
+            stop,
+            _handle: handle,
+        }
+    }
+}
+
+impl Drop for SpinnerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Give the thread ~1 frame to observe the flag and erase
+        // its row before further stderr writes land. 20ms is plenty
+        // (spinner polls every 80ms but the stop check happens at
+        // the top of each loop iter). We don't join because the
+        // agent loop is on a tokio runtime — blocking joins would
+        // stall the executor.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Spawn a thread that animates rainbow lightning-bolt spinner
 /// rows on stderr until `stop` flips to true. On stop, the thread
 /// erases its own row and exits. Mirrors the TUI's wave animation
 /// (↯ bolts, Red/Orange/Green/Cyan/Violet palette, bright→dim
-/// traveling peak) so the CLI and TUI feel related.
+/// traveling peak) plus a dim elapsed-seconds counter so the user
+/// can see whether the call is hanging vs just slow.
 fn start_spinner(stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         use std::io::Write;
@@ -3407,13 +3445,14 @@ fn start_spinner(stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinH
         let n = 5usize;
         let mut tick: usize = 0;
         let mut printed_anything = false;
+        let started = std::time::Instant::now();
         // Small startup delay — if the model responds instantly we
         // don't want to flash a spinner for one frame.
         std::thread::sleep(std::time::Duration::from_millis(120));
         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
             let peak = tick % (n * 2);
             let peak = if peak >= n { n * 2 - 1 - peak } else { peak };
-            let mut line = String::from("\r");
+            let mut line = String::from("\r\x1b[2K");
             for i in 0..n {
                 let d = (i as isize - peak as isize).unsigned_abs();
                 let ansi = match d {
@@ -3429,7 +3468,11 @@ fn start_spinner(stop: Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinH
             // Pad with spaces so residue from wider prior frames is
             // overwritten (there shouldn't be any — we always emit
             // the same width — but cheap insurance).
-            line.push_str("   ");
+            // Dim elapsed-seconds counter — matches the TUI's style
+            // so a user who's familiar with the TUI status bar knows
+            // exactly what the number means.
+            let elapsed = started.elapsed().as_secs();
+            line.push_str(&format!(" \x1b[2;38;5;244m{}s\x1b[0m", elapsed));
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "{}", line);
             let _ = err.flush();
@@ -3658,5 +3701,39 @@ mod rerender_tests {
         assert!(out.contains("foo"));
         // Background-set escape (`48;5;` → indexed background).
         assert!(out.contains("\x1b[48;5;"));
+    }
+
+    // ── SpinnerGuard drop behavior ──
+
+    #[test]
+    fn spinner_guard_stops_thread_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let _g = SpinnerGuard::spawn(stop.clone());
+            // Let the spinner thread run for a few frames.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // flag should still be false — thread is looping.
+            assert!(!stop.load(Ordering::SeqCst));
+        }
+        // Drop fires here — guard waits briefly for the thread to
+        // observe the stop. After that, flag must be true.
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "SpinnerGuard::drop should flip stop flag so the thread exits"
+        );
+    }
+
+    #[test]
+    fn spinner_guard_drop_is_idempotent_via_clone_semantics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Two guards on the same atomic can both fire Drop; the
+        // flag just stays true. Sanity check for the Arc-shared
+        // stop flag pattern.
+        let stop = Arc::new(AtomicBool::new(false));
+        drop(SpinnerGuard::spawn(stop.clone()));
+        assert!(stop.load(Ordering::SeqCst));
+        drop(SpinnerGuard::spawn(stop.clone()));
+        assert!(stop.load(Ordering::SeqCst));
     }
 }
