@@ -297,7 +297,7 @@ fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
                 // Ctrl-[ → 0x1b (ESC), Ctrl-\ → 0x1c, etc. Upper-case
                 // and lower-case map identically per terminal convention.
                 let ch = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&ch) {
+                if ch.is_ascii_lowercase() {
                     out.push((ch as u8) - b'a' + 1);
                 } else if c == '[' {
                     out.push(0x1b);

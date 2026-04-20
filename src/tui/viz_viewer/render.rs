@@ -2472,30 +2472,6 @@ fn render_iteration_navigator(frame: &mut Frame, app: &VizApp, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Create header text for Log tab with iteration context.
-fn create_log_tab_header(app: &VizApp) -> String {
-    let base_title = "Task Log";
-    match app.viewing_iteration {
-        None => base_title.to_string(),
-        Some(idx) => {
-            let total = app.iteration_archives.len() + 1;
-            format!("{} [viewing iter {}/{}]", base_title, idx + 1, total)
-        }
-    }
-}
-
-/// Create header text for Messages tab with iteration context.
-fn create_messages_tab_header(app: &VizApp) -> String {
-    let base_title = "Messages";
-    match app.viewing_iteration {
-        None => base_title.to_string(),
-        Some(idx) => {
-            let total = app.iteration_archives.len() + 1;
-            format!("{} [viewing iter {}/{}]", base_title, idx + 1, total)
-        }
-    }
-}
-
 /// Draw the Detail tab content (evolved from HUD).
 fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let detail = match &app.hud_detail {
@@ -4174,8 +4150,6 @@ fn render_editor_word_wrap(
     }
 }
 
-/// Draw the Log tab content (panel 2) — reverse chronological activity log.
-
 /// Draw the Coordinator Log tab (panel 7) — activity feed from operations.jsonl.
 fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let header_lines = build_coordinator_runtime_lines(app);
@@ -4451,25 +4425,6 @@ fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
         ActivityEventKind::UserAction => (Color::White, Style::default().fg(Color::White)),
     }
 }
-
-/// Agent color palette for the firehose view.
-const FIREHOSE_COLORS: [Color; 8] = [
-    Color::Cyan,
-    Color::Green,
-    Color::Yellow,
-    Color::Magenta,
-    Color::Blue,
-    Color::LightRed,
-    Color::LightCyan,
-    Color::LightGreen,
-];
-
-/// Draw the Firehose tab content (panel 8) — merged stream of all agent output.
-
-/// Draw the Messages tab content (panel 3) — message queue for selected task.
-/// Uses chat-app style: incoming messages left-aligned, outgoing right-aligned,
-/// with a stats header showing sent/received/reply status.
-/// Draw the Output tab (panel 9) — live per-agent model output with markdown rendering.
 
 fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     use super::state::DashboardAgentActivity;
@@ -4763,105 +4718,6 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.dashboard.viewport_height = area.height as usize;
 }
 
-
-/// Draw the message input line at the bottom of the messages panel.
-fn draw_message_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    let is_editing = app.input_mode == InputMode::MessageInput;
-    let has_text = !super::state::editor_is_empty(&app.messages_panel.editor);
-    app.last_message_input_area = area;
-    let border_color = if is_editing {
-        Color::Magenta
-    } else {
-        Color::DarkGray
-    };
-    let prompt_color = if is_editing {
-        Color::LightMagenta
-    } else {
-        Color::DarkGray
-    };
-    if is_editing || has_text {
-        let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default()
-                .fg(border_color)
-                .add_modifier(if is_editing {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ));
-        if area.height >= 2 {
-            frame.render_widget(
-                Paragraph::new(sep),
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-        }
-        let input_y = if area.height >= 2 { area.y + 1 } else { area.y };
-        let input_h = if area.height >= 2 {
-            area.height - 1
-        } else {
-            area.height
-        };
-        let prefix_len: u16 = 2;
-        if input_h > 0 {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "> ",
-                    Style::default()
-                        .fg(prompt_color)
-                        .add_modifier(if is_editing {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ))),
-                Rect {
-                    x: area.x,
-                    y: input_y,
-                    width: prefix_len,
-                    height: 1,
-                },
-            );
-        }
-        let editor_area = Rect {
-            x: area.x + prefix_len,
-            y: input_y,
-            width: area.width.saturating_sub(prefix_len),
-            height: input_h,
-        };
-        let text_color = if is_editing {
-            Color::Reset
-        } else {
-            Color::DarkGray
-        };
-        let cursor_style = if is_editing {
-            Style::default().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::default().fg(text_color)
-        };
-        render_editor_word_wrap(
-            frame,
-            &app.messages_panel.editor,
-            editor_area,
-            Style::default().fg(text_color),
-            cursor_style,
-            is_editing,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " Type a message...",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
-    }
-}
 
 /// Highlight all occurrences of `query_lower` (already lowercased) in a Line
 /// by splitting spans and applying `bg` to matching regions.

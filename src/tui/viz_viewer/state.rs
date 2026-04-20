@@ -2726,7 +2726,10 @@ impl Default for ActivityFeedState {
 }
 
 /// A single line in the firehose view — one output line from one agent.
+/// Phase 4 dead code — structs kept until the full enum-variant removal
+/// cleanup; fields never read because the Firehose tab is gone.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct FirehoseLine {
     /// Agent ID (e.g. "agent-7220").
     pub agent_id: String,
@@ -2794,7 +2797,9 @@ impl Default for OutputAgentScroll {
 }
 
 /// Per-agent accumulated text buffer for the Output pane.
+/// Phase 4 dead code — Output tab removed.
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct OutputAgentText {
     /// Accumulated extracted markdown text from output.log.
     pub full_text: String,
@@ -2843,7 +2848,9 @@ pub enum MessageDirection {
 }
 
 /// A single parsed message with direction metadata for rendering.
+/// Phase 4 dead code — Messages tab removed.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct MessageEntry {
     /// Sender identifier as stored in the message.
     pub sender: String,
@@ -2867,7 +2874,9 @@ pub struct MessageEntry {
 }
 
 /// Summary stats for the messages panel header.
+/// Phase 4 dead code — Messages tab removed.
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 pub struct MessageSummary {
     /// Number of incoming messages (sent to the task).
     pub incoming: usize,

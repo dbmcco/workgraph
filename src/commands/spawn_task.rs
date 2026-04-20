@@ -19,7 +19,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::cli::Commands;
 use workgraph::graph::Task;
 
 /// Dispatch table for what handler to run for a task. Parsed from
@@ -274,23 +273,6 @@ fn dispatch_native(
     }
 }
 
-/// Helper for consumers (e.g., the TUI) who want to extract the
-/// `Commands::SpawnTask` fields cleanly.
-pub fn from_command(
-    workgraph_dir: &Path,
-    cmd: &Commands,
-) -> Option<Result<()>> {
-    if let Commands::SpawnTask {
-        task_id,
-        role,
-        dry_run,
-    } = cmd
-    {
-        Some(run(workgraph_dir, task_id, role.as_deref(), *dry_run))
-    } else {
-        None
-    }
-}
 
 #[cfg(test)]
 mod tests {

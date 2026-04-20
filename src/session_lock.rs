@@ -197,13 +197,13 @@ impl SessionLock {
         if self.released {
             return;
         }
-        if self.path.exists() {
-            if let Err(e) = std::fs::remove_file(&self.path) {
-                eprintln!(
-                    "[session-lock] warning: failed to remove lock {:?}: {}",
-                    self.path, e
-                );
-            }
+        if self.path.exists()
+            && let Err(e) = std::fs::remove_file(&self.path)
+        {
+            eprintln!(
+                "[session-lock] warning: failed to remove lock {:?}: {}",
+                self.path, e
+            );
         }
         self.released = true;
     }
