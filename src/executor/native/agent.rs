@@ -2799,25 +2799,19 @@ async fn read_next_user_turn(
     loop {
         match editor.readline("\x1b[1;36m>\x1b[0m ") {
             Ok(line) => {
-                // Re-paint the line the user just typed in light
-                // yellow (same tint the old TUI coordinator view
-                // used for user messages), then emit a blank line
-                // so turn boundaries are easy to scan. We scroll
-                // up to the prompt row, clear it, and re-emit.
-                if stderr_is_tty() {
-                    use std::io::Write;
-                    let mut err = std::io::stderr().lock();
-                    let _ = write!(
-                        err,
-                        "\x1b[1A\r\x1b[2K\x1b[1;36m>\x1b[0m \x1b[38;5;229m{}\x1b[0m\n\n",
-                        line
-                    );
-                    let _ = err.flush();
-                } else {
-                    // Non-TTY: blank line is still nice, skip the
-                    // cursor gymnastics.
-                    eprintln!();
-                }
+                // Blank line between user input and assistant reply
+                // so turn boundaries are easy to scan.
+                //
+                // An earlier version tried to repaint the user's
+                // line in light-yellow via cursor-up + clear + rewrite.
+                // That worked on some terminals but miscounted rows on
+                // others — responses drifted to column ~80 when the
+                // input wrapped or when \x1b[1A didn't land where we
+                // assumed. Doing it right needs rustyline's
+                // Highlighter trait (live tinting as the user types,
+                // no cursor math); until that refactor lands, drop
+                // the post-hoc repaint and keep the separator only.
+                eprintln!();
                 return Some(line);
             }
             Err(ReadlineError::Interrupted) => {
