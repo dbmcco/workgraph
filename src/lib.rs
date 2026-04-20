@@ -20,6 +20,7 @@ pub mod context_scope;
 pub mod cron;
 pub mod cycle;
 pub mod executor;
+pub mod executor_discovery;
 pub mod federation;
 pub mod function;
 pub mod function_memory;

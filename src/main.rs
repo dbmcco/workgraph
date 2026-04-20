@@ -537,6 +537,27 @@ fn main() -> Result<()> {
     workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
 
     match command {
+        Commands::Executors { all } => {
+            let entries = if all {
+                workgraph::executor_discovery::discover()
+            } else {
+                workgraph::executor_discovery::available()
+            };
+            for e in &entries {
+                let status = if e.available {
+                    "\x1b[32m✓\x1b[0m"
+                } else {
+                    "\x1b[31m✗\x1b[0m"
+                };
+                let path = e
+                    .binary_path
+                    .as_ref()
+                    .map(|p| format!(" [{}]", p.display()))
+                    .unwrap_or_default();
+                println!("{} {:<12} {}{}", status, e.name, e.description, path);
+            }
+            return Ok(());
+        }
         Commands::Which {} => {
             // Print resolved dir + which resolver step won, so users
             // can debug "which graph am I talking to?" without having

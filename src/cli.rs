@@ -2146,6 +2146,17 @@ pub enum Commands {
     #[command(name = "which")]
     Which {},
 
+    /// List executors wg knows about, which are usable on this
+    /// system, and where their backing binaries live. Useful for
+    /// seeing what `--executor` values `wg service create-coordinator`
+    /// and `wg edit --model` can target.
+    #[command(name = "executors")]
+    Executors {
+        /// Show all executors, including unusable ones.
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Run the native executor agent loop (internal, called by spawn)
     #[command(name = "native-exec", hide = true)]
     NativeExec {
@@ -4218,6 +4229,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::CodexHandler { .. } => "codex-handler",
         Commands::NativeExec { .. } => "native-exec",
         Commands::Which { .. } => "which",
+        Commands::Executors { .. } => "executors",
         Commands::Spend { .. } => "spend",
         Commands::Openrouter { .. } => "openrouter",
         Commands::ApplyPlacement { .. } => "apply-placement",
