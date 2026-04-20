@@ -129,6 +129,17 @@ pub fn create_provider_ext(
     endpoint_name: Option<&str>,
     api_key_override: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
+    // Test hook: `WG_FAKE_LLM=<path>` swaps in a pre-canned-response
+    // provider. Great for smoking the rendering path (streaming,
+    // wrapping, markdown rewrite) without burning tokens or waiting
+    // on the network. Real smoke targets stay on the real path;
+    // only turns on when this env var is set.
+    if let Ok(path) = std::env::var("WG_FAKE_LLM")
+        && !path.is_empty()
+    {
+        return Ok(Box::new(FakeProvider::from_file(&path, model)?));
+    }
+
     let config = crate::config::Config::load_or_default(workgraph_dir);
 
     // Endpoint-in-model shorthand — see `parse_endpoint_model_shorthand`.
@@ -486,5 +497,217 @@ mod tests {
         // "my-claude-clone" getting routed to the real Anthropic API.
         assert!(!looks_like_claude_model("my-claude-model"));
         assert!(!looks_like_claude_model("opuscoin"));
+    }
+}
+
+// ── Fake provider (testing hook) ───────────────────────────────────────
+//
+// Activated by `WG_FAKE_LLM=<path>`. Reads the file once; each turn
+// replays the whole text as a streamed response, split into small
+// chunks so the streaming path + markdown rewrite can be exercised
+// end-to-end without hitting a real LLM. Round-robins across the
+// file's turn boundaries (`---` on a line by itself) so multi-turn
+// sessions can be tested too.
+
+use std::sync::Mutex;
+
+use super::client::{ContentBlock, StopReason, Usage};
+
+pub struct FakeProvider {
+    /// Canned responses, one per turn. If the script file has
+    /// multiple turns separated by lines containing only `---`,
+    /// each becomes its own entry. Otherwise the whole file is
+    /// one turn that repeats.
+    turns: Vec<String>,
+    /// Next turn index, wraps around.
+    cursor: Mutex<usize>,
+    model: String,
+}
+
+impl FakeProvider {
+    pub fn from_file(path: &str, model: &str) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading WG_FAKE_LLM script at {}", path))?;
+        let mut turns: Vec<String> = raw
+            .split("\n---\n")
+            .map(|s| s.trim_end_matches('\n').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if turns.is_empty() {
+            // Empty file: one fallback turn so handlers don't explode.
+            turns.push("(fake-llm: empty script)".to_string());
+        }
+        Ok(Self {
+            turns,
+            cursor: Mutex::new(0),
+            model: model.to_string(),
+        })
+    }
+
+    /// Whole-text response for the current turn; advances the
+    /// round-robin cursor.
+    fn next_turn_text(&self) -> String {
+        let mut guard = self.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = *guard;
+        *guard = (idx + 1) % self.turns.len();
+        self.turns[idx].clone()
+    }
+
+    /// Chunk the response into ~24-char slices on UTF-8 char
+    /// boundaries so streaming looks real. Small enough that
+    /// wrapping + markdown rewrite get exercised; large enough
+    /// that thousands of chunks don't pound stderr.
+    fn chunks_for(text: &str) -> Vec<String> {
+        const TARGET: usize = 24;
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        for ch in text.chars() {
+            cur.push(ch);
+            if cur.len() >= TARGET {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for FakeProvider {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn max_tokens(&self) -> u32 {
+        4096
+    }
+    async fn send(&self, _req: &MessagesRequest) -> Result<MessagesResponse> {
+        let text = self.next_turn_text();
+        Ok(MessagesResponse {
+            id: "fake-msg".to_string(),
+            content: vec![ContentBlock::Text { text }],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        })
+    }
+    async fn send_streaming(
+        &self,
+        _request: &MessagesRequest,
+        on_text: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse> {
+        let text = self.next_turn_text();
+        // Trickle chunks out with a tiny delay so the streaming
+        // spinner + live display path are exercised, then fall
+        // through to the same envelope as send().
+        for chunk in Self::chunks_for(&text) {
+            on_text(chunk);
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        Ok(MessagesResponse {
+            id: "fake-msg".to_string(),
+            content: vec![ContentBlock::Text { text }],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod fake_provider_tests {
+    use super::super::client::{Message, MessagesRequest, Role};
+    use super::*;
+
+    fn empty_request(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 100,
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![],
+            }],
+            tools: vec![],
+            stream: true,
+        }
+    }
+
+    fn write_script(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn fake_provider_streams_full_text_across_chunks() {
+        let f = write_script("one two three four five six\n");
+        let p = FakeProvider::from_file(f.path().to_str().unwrap(), "test-model").unwrap();
+
+        let acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let chunk_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acc2 = acc.clone();
+        let cc2 = chunk_count.clone();
+        let on_text = move |s: String| {
+            acc2.lock().unwrap().push_str(&s);
+            cc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+
+        let req = empty_request("test-model");
+        let resp = p.send_streaming(&req, &on_text).await.unwrap();
+
+        // Chunks should concatenate to the full turn.
+        assert_eq!(*acc.lock().unwrap(), "one two three four five six");
+        // More than one chunk — streaming path exercised.
+        assert!(chunk_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        // Response envelope has the same text.
+        assert!(matches!(
+            resp.stop_reason,
+            Some(super::super::client::StopReason::EndTurn)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_provider_round_robins_turns_on_triple_dash() {
+        let script = "turn one\n---\nturn two\n---\nturn three\n";
+        let f = write_script(script);
+        let p = FakeProvider::from_file(f.path().to_str().unwrap(), "m").unwrap();
+
+        let req = empty_request("m");
+        let r1 = p.send(&req).await.unwrap();
+        let r2 = p.send(&req).await.unwrap();
+        let r3 = p.send(&req).await.unwrap();
+        let r4 = p.send(&req).await.unwrap(); // wraps around
+
+        let text = |r: &super::super::client::MessagesResponse| match &r.content[0] {
+            super::super::client::ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected Text"),
+        };
+        assert_eq!(text(&r1), "turn one");
+        assert_eq!(text(&r2), "turn two");
+        assert_eq!(text(&r3), "turn three");
+        assert_eq!(text(&r4), "turn one", "should wrap back to first turn");
+    }
+
+    #[tokio::test]
+    async fn fake_provider_empty_file_does_not_panic() {
+        let f = write_script("");
+        let p = FakeProvider::from_file(f.path().to_str().unwrap(), "m").unwrap();
+        let req = empty_request("m");
+        // Should not panic; falls back to a stub turn.
+        let r = p.send(&req).await.unwrap();
+        assert!(r.content.len() == 1);
     }
 }

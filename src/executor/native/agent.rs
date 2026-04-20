@@ -3483,19 +3483,70 @@ fn stderr_cols() -> usize {
 fn rerender_markdown_on_stderr(buffer: &str) {
     use std::io::Write;
     let width = stderr_cols().max(20);
-    let rendered = crate::markdown::markdown_to_ansi(buffer, width);
-    let newlines = buffer.matches('\n').count();
+    let bytes = build_rerender_bytes(buffer, width);
     let mut err = std::io::stderr().lock();
-    // The EndTurn path prints a trailing `eprintln!()` BEFORE us
-    // (see the EndTurn arm in AgentLoop::run), which consumes one
-    // row but doesn't appear in `buffer`. Move up that extra row
-    // too, then clear the streamed text rows.
-    let _ = write!(err, "\r\x1b[2K\x1b[1A\x1b[2K");
-    for _ in 0..newlines {
-        let _ = write!(err, "\x1b[1A\x1b[2K");
-    }
-    let _ = write!(err, "{}", rendered);
+    let _ = err.write_all(bytes.as_bytes());
     let _ = err.flush();
+}
+
+/// Pure: compute the exact byte sequence to emit when re-rendering
+/// `buffer` as markdown at terminal width `term_cols`.
+///
+/// The sequence is:
+///   1. Cursor return + clear current row (for the trailing
+///      blank row that the EndTurn arm's `eprintln!()` left us on).
+///   2. `(rows_consumed - 0)` more "move up one row + clear row"
+///      pairs, one per terminal row the streamed plain text took
+///      up — wrapped logical lines are counted as multiple rows.
+///   3. The rendered markdown as ANSI.
+///
+/// Counting terminal rows (not `\n` count) is the fix for a bug
+/// where long lines soft-wrapped into multiple rows and the erase
+/// undercounted — leftover wrapped tails of the plain stream then
+/// appeared above the rendered version, producing visual doubling.
+pub(crate) fn build_rerender_bytes(buffer: &str, term_cols: usize) -> String {
+    let rendered = crate::markdown::markdown_to_ansi(buffer, term_cols);
+    let stream_rows = rows_consumed(buffer, term_cols);
+    // Plus 1: cursor is one row below the streamed content thanks
+    // to the trailing `eprintln!()` in the EndTurn arm.
+    let rows_to_clear = stream_rows + 1;
+    let mut out = String::with_capacity(rendered.len() + rows_to_clear * 8);
+    out.push_str("\r\x1b[2K");
+    for _ in 1..rows_to_clear {
+        out.push_str("\x1b[1A\x1b[2K");
+    }
+    out.push_str(&rendered);
+    out
+}
+
+/// Count terminal rows occupied by `buffer` at column width
+/// `term_cols`, accounting for `\n` and soft-wraps. `""` → 0.
+pub(crate) fn rows_consumed(buffer: &str, term_cols: usize) -> usize {
+    if buffer.is_empty() {
+        return 0;
+    }
+    let w = term_cols.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for ch in buffer.chars() {
+        if ch == '\n' {
+            rows += 1;
+            col = 0;
+            continue;
+        }
+        let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_w == 0 {
+            // Zero-width (combining, ZWJ). Doesn't advance column.
+            continue;
+        }
+        if col + ch_w > w {
+            rows += 1;
+            col = ch_w;
+        } else {
+            col += ch_w;
+        }
+    }
+    rows
 }
 
 /// Detects both reqwest timeouts and generic timeout messages from the error chain.
@@ -3509,4 +3560,103 @@ fn is_timeout_error(err: &anyhow::Error) -> bool {
     // Check error message chain for timeout indicators
     let msg = format!("{:#}", err).to_lowercase();
     msg.contains("timed out") || msg.contains("timeout") || msg.contains("deadline exceeded")
+}
+
+#[cfg(test)]
+mod rerender_tests {
+    use super::*;
+
+    // ── rows_consumed ──
+
+    #[test]
+    fn rows_empty_buffer_is_zero() {
+        assert_eq!(rows_consumed("", 80), 0);
+    }
+
+    #[test]
+    fn rows_short_line_is_one() {
+        assert_eq!(rows_consumed("hello", 80), 1);
+    }
+
+    #[test]
+    fn rows_trailing_newline_adds_empty_row() {
+        // "hello\n" leaves the cursor on an empty row below.
+        assert_eq!(rows_consumed("hello\n", 80), 2);
+    }
+
+    #[test]
+    fn rows_multiple_lines_each_counted() {
+        assert_eq!(rows_consumed("a\nb\nc", 80), 3);
+    }
+
+    #[test]
+    fn rows_soft_wrap_counts_each_terminal_row() {
+        // 10-char line, width 5 → wraps to 2 rows.
+        assert_eq!(rows_consumed("abcdefghij", 5), 2);
+        // 12-char line, width 5 → wraps to 3 rows (5+5+2).
+        assert_eq!(rows_consumed("abcdefghijkl", 5), 3);
+        // 5-char line exactly fits width → 1 row.
+        assert_eq!(rows_consumed("abcde", 5), 1);
+    }
+
+    #[test]
+    fn rows_mixed_wrap_and_newlines() {
+        // Two logical lines: "ab" (1 row) and "cccccccccc" at w=4 →
+        // ceil(10/4) = 3 rows. Total 4.
+        assert_eq!(rows_consumed("ab\ncccccccccc", 4), 4);
+    }
+
+    // ── build_rerender_bytes ──
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn rerender_erases_then_renders_short_line() {
+        let out = build_rerender_bytes("hello", 80);
+        // stream_rows=1 → rows_to_clear=2 → one "clear current" + one
+        // "up + clear" pair. Move-up escape shows up once.
+        assert_eq!(count_occurrences(&out, "\x1b[1A"), 1);
+        // Plus the rendered text at the end.
+        assert!(out.contains("hello"));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn rerender_wide_line_erases_all_wrap_rows_not_just_the_logical_line() {
+        // 60 chars at width 20 → 3 terminal rows of content + 1 trailing
+        // empty row → 4 rows_to_clear → 3 "up + clear" escapes.
+        let long = "x".repeat(60);
+        let out = build_rerender_bytes(&long, 20);
+        assert_eq!(
+            count_occurrences(&out, "\x1b[1A"),
+            3,
+            "must erase every wrapped row to avoid the stream-tail duplication bug"
+        );
+    }
+
+    #[test]
+    fn rerender_emits_rendered_markdown_with_ansi_styling() {
+        let out = build_rerender_bytes("# Heading\n", 80);
+        // Heading should carry ANSI color codes.
+        assert!(out.contains("Heading"));
+        assert!(out.contains("\x1b["));
+    }
+
+    #[test]
+    fn rerender_bullet_glyph_substituted() {
+        let out = build_rerender_bytes("- one\n- two\n", 80);
+        assert!(out.contains('•'));
+        assert!(out.contains("one"));
+        assert!(out.contains("two"));
+    }
+
+    #[test]
+    fn rerender_inline_code_has_background() {
+        let out = build_rerender_bytes("See `foo` here.\n", 80);
+        assert!(out.contains("foo"));
+        // Background-set escape (`48;5;` → indexed background).
+        assert!(out.contains("\x1b[48;5;"));
+    }
 }
