@@ -20,12 +20,13 @@ cd "$tmp"
 export WG_DIR="$tmp/.workgraph"
 wg init --no-agency >/dev/null 2>&1
 
-# Phase 6a change lives in the NATIVE coordinator loop
-# (nex_subprocess_coordinator_loop). Force the daemon's auto-spawned
-# coordinator-0 onto that path by setting executor=native globally,
-# otherwise the daemon takes the Claude CLI loop and never exercises
-# the spawn-task change under test.
+# Phase 6a change lives in the NATIVE coordinator loop. Force the
+# daemon's auto-spawned coordinator-0 onto that path by setting
+# executor=native globally. Pair with a native-compatible model so
+# the role-coordinator default (claude-opus-*) doesn't override to
+# an Anthropic-only model and 404 against the oai-compat endpoint.
 wg config --coordinator-executor native >/dev/null 2>&1
+wg config --coordinator-model oai-compat:qwen3-coder-30b >/dev/null 2>&1
 
 fail() { echo "FAIL: $*"; exit 1; }
 pass() { echo "PASS: $*"; }
@@ -56,6 +57,11 @@ task_id=".coordinator-$cid"
 chat_dir="$WG_DIR/chat/coordinator-$cid"
 lock_path="$chat_dir/.handler.pid"
 
+# Non-default coordinators are lazy-spawned on first message. Fire a
+# wake-up in the background so the handler actually starts, then poll
+# for its lock.
+wg chat --coordinator "$cid" "wake" --timeout 60 >/dev/null 2>&1 &
+
 # Poll for lock file — proves the spawned handler (via spawn-task)
 # acquired the Phase 1 lock. This is the key assertion: daemon's new
 # codepath reaches through spawn-task → wg nex → session_lock.
@@ -84,7 +90,7 @@ else
   # spawn-task exec's into wg nex immediately — it may already be gone.
   # In that case the child is wg nex and its parent is... tricky to
   # prove definitively post-exec. Accept either pattern.
-  if pgrep -f "wg nex --chat $task_id" >/dev/null; then
+  if pgrep -f "wg nex --chat coordinator-$cid" >/dev/null; then
     pass "wg nex running under expected coordinator path (spawn-task exec'd cleanly)"
   else
     fail "neither spawn-task nor expected wg nex visible"
@@ -93,8 +99,9 @@ fi
 
 echo
 echo "=== Test D: handler processes a message ==="
-# Write an inbox message via wg chat (the IPC path).
-wg chat --coordinator "$cid" "say hi in one word" --timeout 60 >/dev/null 2>&1 || true
+# The wake-up message from Test B/C is what triggered the handler
+# to spawn; now we just wait for its outbox response.
+wait
 # Wait up to 90s for outbox response (lambda01 first-token latency
 # plus role-prompt warmup can be slow — we just need any response).
 for i in {1..180}; do
