@@ -2044,7 +2044,6 @@ fn main() -> Result<()> {
             max_agents,
             coordinator_interval,
             poll_interval,
-            heartbeat_interval,
             coordinator_executor,
             coordinator_model,
             coordinator_provider,
@@ -2320,8 +2319,7 @@ fn main() -> Result<()> {
                     && chat_history.is_none()
                     && chat_history_max.is_none()
                     && tui_counters.is_none()
-                    && retry_context_tokens.is_none()
-                    && heartbeat_interval.is_none())
+                    && retry_context_tokens.is_none())
             {
                 commands::config_cmd::show(&workgraph_dir, scope, cli.json)
             } else {
@@ -2363,7 +2361,6 @@ fn main() -> Result<()> {
                     chat_history_max,
                     tui_counters.as_deref(),
                     retry_context_tokens,
-                    heartbeat_interval,
                 )
             }
         }

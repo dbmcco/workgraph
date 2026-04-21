@@ -2,8 +2,7 @@
 //!
 //! Validates the coordinator/compact/archive cycle structure to prevent regressions:
 //! 1. No circular coordinator↔archive dependency (deadlock)
-//! 2. heartbeat_interval > 0 on autonomous coordinators
-//! 3. Context injection path exists (compact → context.md → coordinator)
+//! 2. Context injection path exists (compact → context.md → coordinator)
 //!
 //! ## Safe Pattern
 //!
@@ -20,7 +19,6 @@
 
 use std::collections::HashSet;
 
-use crate::config::Config;
 use crate::graph::WorkGraph;
 
 /// A warning issued during coordinator cycle validation.
@@ -125,42 +123,6 @@ fn check_circular_archive_dependency(
     None
 }
 
-/// Check heartbeat_interval configuration.
-///
-/// An autonomous coordinator with heartbeat_interval=0 and no trigger mechanism
-/// will stall if no events fire. Warn users who might expect autonomous behavior.
-fn check_heartbeat_configuration(
-    graph: &WorkGraph,
-    coordinator_id: &str,
-) -> Option<CoordinatorCycleWarning> {
-    let _coordinator = graph.get_task(coordinator_id)?;
-    let config = Config::load_or_default(std::path::Path::new("."));
-
-    // If heartbeat_interval is explicitly set to 0, check for trigger mechanisms
-    if config.coordinator.heartbeat_interval == 0 {
-        // Check if there's a user board or other trigger mechanism
-        let has_user_board = graph
-            .tasks()
-            .any(|t| t.tags.iter().any(|tag| tag == "user-board"));
-
-        if !has_user_board {
-            return Some(CoordinatorCycleWarning {
-                severity: WarningSeverity::Warning,
-                message: format!(
-                    "Coordinator '{}' has heartbeat_interval=0 (autonomous heartbeats disabled) \
-                     and no user board detected. The coordinator will only run on GraphChanged \
-                     events or manual messages. Set heartbeat_interval > 0 for autonomous \
-                     operation, or ensure external trigger mechanisms exist.",
-                    coordinator_id
-                ),
-                task_id: Some(coordinator_id.to_string()),
-            });
-        }
-    }
-
-    None
-}
-
 /// Check that the context injection path exists.
 ///
 /// For coordinator to receive compaction output, we need:
@@ -241,11 +203,6 @@ pub fn validate_coordinator_cycle(
 
     // Check for circular coordinator↔archive dependency
     if let Some(warning) = check_circular_archive_dependency(graph, coordinator_id) {
-        warnings.push(warning);
-    }
-
-    // Check heartbeat_interval configuration
-    if let Some(warning) = check_heartbeat_configuration(graph, coordinator_id) {
         warnings.push(warning);
     }
 

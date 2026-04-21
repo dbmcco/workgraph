@@ -3619,7 +3619,6 @@ With no options (or `--show`), displays current configuration.
 | `--coordinator-executor <NAME>` | Set coordinator executor |
 | `--coordinator-model <MODEL>` | Set coordinator model (e.g., opus, sonnet, haiku) |
 | `--coordinator-provider <PROVIDER>` | **[DEPRECATED]** Set coordinator provider — use `provider:model` format in `--coordinator-model` instead |
-| `--heartbeat-interval <SECS>` | Set autonomous heartbeat interval in seconds (0 to disable). When enabled, the coordinator agent receives periodic synthetic prompts to review graph state and take action without human input |
 | `--max-coordinators <N>` | Set max concurrent coordinator agents (LLM sessions). Default: 4 |
 | `--auto-evaluate <BOOL>` | Enable/disable automatic evaluation |
 | `--auto-assign <BOOL>` | Enable/disable automatic identity assignment |

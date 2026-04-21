@@ -1217,37 +1217,6 @@ pub(crate) struct DaemonConfig {
 /// injection, LLM processing, and outbox writing asynchronously.
 ///
 /// Returns the number of messages routed.
-/// Did a user chat message land in coordinator N's inbox within
-/// the last `window`? Used by the heartbeat loop to suppress
-/// synthetic prompts while a human is actively driving — otherwise
-/// heartbeat NOOP replies pollute the TUI chat pane.
-///
-/// "User" messages are identified by role=user AND a request_id
-/// that doesn't match the `heartbeat-*` prefix (those ARE role=user
-/// too, but synthetic).
-fn user_chat_within(dir: &Path, coordinator_id: u32, window: Duration) -> Result<bool> {
-    let msgs = workgraph::chat::read_inbox_since_for(dir, coordinator_id, 0)?;
-    let now = chrono::Utc::now();
-    let cutoff =
-        now - chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::seconds(300));
-    for msg in msgs.iter().rev() {
-        // Synthetic heartbeats we inject ourselves.
-        if msg.request_id.starts_with("heartbeat-") {
-            continue;
-        }
-        // Older than cutoff — rev iter so we can stop early.
-        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-            && ts.with_timezone(&chrono::Utc) < cutoff
-        {
-            return Ok(false);
-        }
-        if msg.role == "user" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn route_chat_to_agent(
     dir: &Path,
     coordinator_id: u32,
@@ -2070,23 +2039,6 @@ pub fn run_daemon(
     // Load max_coordinators limit from config
     let max_coordinators = config.coordinator.max_coordinators;
 
-    // Autonomous heartbeat: periodically inject a synthetic prompt into the
-    // coordinator agent so it reviews graph state and takes action without
-    // human interaction. Used for TB heartbeat orchestration (Condition G Phase 3).
-    let heartbeat_interval_secs = config.coordinator.heartbeat_interval;
-    let heartbeat_interval: Option<Duration> = if heartbeat_interval_secs > 0 {
-        logger.info(&format!(
-            "Autonomous heartbeat enabled: interval={}s",
-            heartbeat_interval_secs
-        ));
-        Some(Duration::from_secs(heartbeat_interval_secs))
-    } else {
-        None
-    };
-    let mut last_heartbeat = Instant::now(); // first heartbeat after one interval
-    let mut heartbeat_tick_number: u64 = 0;
-    let daemon_start_time = Instant::now();
-
     // Restore error counts from persisted state so they survive daemon restarts
     let mut archival_error_count: u64 = 0;
     let mut refresh_error_count: u64 = 0;
@@ -2122,12 +2074,6 @@ pub fn run_daemon(
                 .saturating_sub(last_coordinator_tick.elapsed());
             poll_timeout_ms =
                 poll_timeout_ms.min(until_tick.as_millis().min(i32::MAX as u128) as i32);
-        }
-        // Also wake for heartbeat interval if enabled.
-        if let Some(hb_interval) = heartbeat_interval {
-            let until_hb = hb_interval.saturating_sub(last_heartbeat.elapsed());
-            poll_timeout_ms =
-                poll_timeout_ms.min(until_hb.as_millis().min(i32::MAX as u128) as i32);
         }
         // Floor: don't spin faster than 50ms even with a deadline in the past.
         poll_timeout_ms = poll_timeout_ms.max(50);
@@ -2339,14 +2285,6 @@ pub fn run_daemon(
             if last_coordinator_tick.elapsed() >= daemon_cfg.poll_interval {
                 should_tick = true;
             }
-            // Autonomous heartbeat: also trigger a coordinator tick when the
-            // heartbeat interval elapses, so the mechanical tick phases (cleanup,
-            // spawn) run alongside the heartbeat prompt injection.
-            if let Some(hb_interval) = heartbeat_interval
-                && last_heartbeat.elapsed() >= hb_interval
-            {
-                should_tick = true;
-            }
         }
         // Short-circuit the tick phase if Shutdown was just processed.
         // Without this, an IPC Shutdown that arrives while should_tick is
@@ -2428,61 +2366,6 @@ pub fn run_daemon(
                     }
                     coord_state.save(&dir);
                     logger.error(&format!("Coordinator tick error: {}", e));
-                }
-            }
-
-            // --- Autonomous heartbeat ---
-            // If heartbeat is enabled and the interval has elapsed,
-            // inject a synthetic "check your state" prompt into the
-            // coordinator. This exists for AUTONOMOUS operation —
-            // when nobody's at the TUI and the daemon still wants
-            // the coordinator to notice stuck agents, etc.
-            //
-            // During INTERACTIVE use a heartbeat turn lands between
-            // the user's messages and the coord's replies, polluting
-            // the chat pane with "NOOP — all systems nominal" noise.
-            // The fix: skip the heartbeat when we've seen a real
-            // user chat message recently. The coord is already being
-            // prompted by the human; it doesn't need a second synthetic
-            // drumbeat.
-            if let Some(hb_interval) = heartbeat_interval
-                && last_heartbeat.elapsed() >= hb_interval
-                && enable_coordinator_agent
-            {
-                let interactive_grace =
-                    Duration::from_secs(config.coordinator.heartbeat_quiet_grace_secs);
-                let skip_due_to_activity =
-                    user_chat_within(&dir, 0, interactive_grace).unwrap_or(false);
-
-                if skip_due_to_activity {
-                    last_heartbeat = Instant::now();
-                    logger.info(&format!(
-                        "Heartbeat suppressed: user activity in last {}s — autonomous heartbeats pause while someone's interacting",
-                        interactive_grace.as_secs()
-                    ));
-                } else {
-                    last_heartbeat = Instant::now();
-                    heartbeat_tick_number += 1;
-                    if let Some(agent) = coordinator_agents.get(&0) {
-                        match agent.send_heartbeat(
-                            heartbeat_tick_number,
-                            daemon_start_time,
-                            config.coordinator.trial_budget_secs,
-                        ) {
-                            Ok(()) => {
-                                logger.info(&format!(
-                                    "Heartbeat #{} sent to coordinator agent",
-                                    heartbeat_tick_number
-                                ));
-                            }
-                            Err(e) => {
-                                logger.warn(&format!(
-                                    "Failed to send heartbeat #{}: {}",
-                                    heartbeat_tick_number, e
-                                ));
-                            }
-                        }
-                    }
                 }
             }
 
@@ -3648,35 +3531,6 @@ pub fn send_request(_dir: &Path, _request: &IpcRequest) -> Result<IpcResponse> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn user_chat_within_no_activity_returns_false() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        // No inbox yet → no activity.
-        assert!(!user_chat_within(dir, 0, Duration::from_secs(300)).unwrap());
-    }
-
-    #[test]
-    fn user_chat_within_recent_user_msg_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        // Register the coord session so chat_dir_for_ref resolves.
-        workgraph::chat_sessions::register_coordinator_session(dir, 0).unwrap();
-        workgraph::chat::append_inbox_for(dir, 0, "hi", "chat-test-123").unwrap();
-        assert!(user_chat_within(dir, 0, Duration::from_secs(300)).unwrap());
-    }
-
-    #[test]
-    fn user_chat_within_only_heartbeats_returns_false() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path();
-        workgraph::chat_sessions::register_coordinator_session(dir, 0).unwrap();
-        // Only synthetic heartbeats in the inbox — don't count.
-        workgraph::chat::append_inbox_for(dir, 0, "[HEARTBEAT]", "heartbeat-1").unwrap();
-        workgraph::chat::append_inbox_for(dir, 0, "[HEARTBEAT]", "heartbeat-2").unwrap();
-        assert!(!user_chat_within(dir, 0, Duration::from_secs(300)).unwrap());
-    }
 
     #[test]
     fn test_default_socket_path() {

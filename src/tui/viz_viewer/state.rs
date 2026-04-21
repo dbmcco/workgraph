@@ -10310,11 +10310,6 @@ impl VizApp {
 
             self.chat.messages.clear();
             for msg in &history {
-                // Skip synthetic heartbeat turns (both the injected
-                // [AUTONOMOUS HEARTBEAT] user message and the NOOP reply).
-                if msg.request_id.starts_with("heartbeat-") {
-                    continue;
-                }
                 let role = match msg.role.as_str() {
                     "user" => ChatRole::User,
                     "coordinator" => ChatRole::Coordinator,
@@ -10574,14 +10569,6 @@ impl VizApp {
         }
 
         for msg in &new_msgs {
-            // Skip heartbeat replies — the coordinator answers synthetic
-            // `[AUTONOMOUS HEARTBEAT]` prompts with "NOOP — all systems
-            // nominal" and those shouldn't pollute the interactive chat.
-            // The outbox still carries them (for agent context + audit),
-            // the TUI just doesn't render them.
-            if msg.request_id.starts_with("heartbeat-") {
-                continue;
-            }
             let att_names: Vec<String> = msg
                 .attachments
                 .iter()
@@ -11832,13 +11819,6 @@ impl VizApp {
             section: ConfigSection::Service,
         });
         entries.push(ConfigEntry {
-            key: "coordinator.heartbeat_interval".into(),
-            label: "Heartbeat interval (s, 0=off)".into(),
-            value: config.coordinator.heartbeat_interval.to_string(),
-            edit_kind: ConfigEditKind::TextInput,
-            section: ConfigSection::Service,
-        });
-        entries.push(ConfigEntry {
             key: "coordinator.executor".into(),
             label: "Executor".into(),
             value: config.coordinator.effective_executor(),
@@ -12467,11 +12447,6 @@ impl VizApp {
             "coordinator.poll_interval" => {
                 if let Ok(v) = new_value.parse::<u64>() {
                     config.coordinator.poll_interval = v;
-                }
-            }
-            "coordinator.heartbeat_interval" => {
-                if let Ok(v) = new_value.parse::<u64>() {
-                    config.coordinator.heartbeat_interval = v;
                 }
             }
             "coordinator.executor" => config.coordinator.executor = Some(new_value),
@@ -16203,7 +16178,6 @@ mod tui_config_panel_tests {
                     let test_value = match key.as_str() {
                         "coordinator.max_agents"
                         | "coordinator.poll_interval"
-                        | "coordinator.heartbeat_interval"
                         | "coordinator.settling_delay_ms"
                         | "coordinator.max_coordinators"
                         | "agent.heartbeat_timeout"
@@ -16328,7 +16302,6 @@ mod tui_config_panel_tests {
             // Service
             "coordinator.max_agents",
             "coordinator.poll_interval",
-            "coordinator.heartbeat_interval",
             "coordinator.executor",
             "coordinator.model",
             "coordinator.agent_timeout",

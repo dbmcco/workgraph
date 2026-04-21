@@ -51,12 +51,6 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         if let Some(ref m) = config.coordinator.model {
             println!("  model = \"{}\"", m);
         }
-        if config.coordinator.heartbeat_interval > 0 {
-            println!(
-                "  heartbeat_interval = {}",
-                config.coordinator.heartbeat_interval
-            );
-        }
         println!();
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);
@@ -324,7 +318,6 @@ pub fn update(
     chat_history_max: Option<usize>,
     tui_counters: Option<&str>,
     retry_context_tokens: Option<u32>,
-    heartbeat_interval: Option<u64>,
 ) -> Result<()> {
     let mut config = match scope {
         ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
@@ -380,16 +373,6 @@ pub fn update(
     if let Some(i) = poll_interval {
         config.coordinator.poll_interval = i;
         println!("Set coordinator.poll_interval = {}", i);
-        changed = true;
-    }
-
-    if let Some(i) = heartbeat_interval {
-        config.coordinator.heartbeat_interval = i;
-        if i > 0 {
-            println!("Set coordinator.heartbeat_interval = {} (enabled)", i);
-        } else {
-            println!("Set coordinator.heartbeat_interval = 0 (disabled)");
-        }
         changed = true;
     }
 
@@ -1804,7 +1787,6 @@ mod tests {
             None,
             None,
             None,
-            None, // heartbeat_interval
         );
         assert!(result.is_ok());
 
@@ -1855,7 +1837,6 @@ mod tests {
             None,
             None,
             None,
-            None, // heartbeat_interval
         );
         assert!(result.is_ok());
 
@@ -1906,7 +1887,6 @@ mod tests {
             None,
             None,
             None,
-            None, // heartbeat_interval
         );
         assert!(result.is_ok());
 
@@ -1955,7 +1935,6 @@ mod tests {
             None, // chat_history_max
             None, // tui_counters
             None, // retry_context_tokens
-            None, // heartbeat_interval
         );
         assert!(result.is_ok());
 

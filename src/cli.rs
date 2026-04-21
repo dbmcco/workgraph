@@ -1382,12 +1382,6 @@ pub enum Commands {
         #[arg(long)]
         poll_interval: Option<u64>,
 
-        /// Set autonomous heartbeat interval in seconds (0 to disable).
-        /// When enabled, the coordinator agent receives periodic synthetic
-        /// prompts to review graph state and take action without human input.
-        #[arg(long)]
-        heartbeat_interval: Option<u64>,
-
         /// Set coordinator executor
         #[arg(long)]
         coordinator_executor: Option<String>,

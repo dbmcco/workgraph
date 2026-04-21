@@ -43,7 +43,6 @@ The coordinator waits for archive, but archive waits for coordinator (implicitly
 
 | Setting | Safe Default | Rationale |
 |---------|-------------|----------|
-| `heartbeat_interval` | 60 (seconds) | Prevents coordinator from stalling if no user input |
 | `max_agents` | 8 | Limits concurrent agents to prevent resource exhaustion |
 | `eval_frequency` | "every_5" | Balance between evaluation overhead and quality monitoring |
 | `compactor_interval` | 5 | Run compaction every 5 coordinator ticks |
@@ -69,14 +68,7 @@ When a coordinator task is created or modified, validate:
 - And task has archive task in `after` list
 - Then ERROR: "Coordinator cannot depend on archive — creates circular deadlock"
 
-### 2. Warn on heartbeat_interval = 0
-
-When coordinator config has `heartbeat_interval = 0`:
-- WARN if no explicit trigger mechanism (no user board, no scheduled trigger)
-- The coordinator will only run on GraphChanged events or manual messages
-- This is valid for reactive-only mode but risky for autonomous operation
-
-### 3. Verify Context Injection Path
+### 2. Verify Context Injection Path
 
 For coordinator to receive compaction output:
 - Verify `.compactor/context.md` exists and is readable
@@ -99,11 +91,6 @@ pub fn validate_coordinator_cycle(
     
     // Check for circular coordinator↔archive dependency
     if let Some(warning) = check_circular_archive_dependency(graph, coordinator_id) {
-        warnings.push(warning);
-    }
-    
-    // Check heartbeat_interval configuration
-    if let Some(warning) = check_heartbeat_configuration(graph, coordinator_id) {
         warnings.push(warning);
     }
     
@@ -135,8 +122,7 @@ pub fn validate_coordinator_cycle(
 Test: coordinator_with_compact_archive_cycle
 1. Create coordinator with compact and archive tasks
 2. Verify NO circular coordinator↔archive dependency
-3. Verify heartbeat_interval > 0
-4. Verify context injection path exists (compact task → context.md → coordinator)
+3. Verify context injection path exists (compact task → context.md → coordinator)
 ```
 
 ## Pattern Keywords
