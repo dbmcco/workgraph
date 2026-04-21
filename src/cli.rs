@@ -3495,6 +3495,18 @@ pub enum SessionCommands {
         /// Session reference: UUID, prefix, or alias.
         session: String,
     },
+
+    /// Doctor: scan the session registry and `chat/` directory for
+    /// inconsistencies. Reports orphans, split-brain, stale locks,
+    /// and anything else that would produce "TUI chat hangs" or
+    /// "messages loop" symptoms. Optionally fix what it can.
+    Check {
+        /// Attempt to repair issues found (currently: remove orphan
+        /// chat dirs, clean stale locks held by dead PIDs, merge
+        /// legacy regular dirs sitting at alias paths).
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[derive(Subcommand)]

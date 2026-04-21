@@ -45,7 +45,214 @@ pub fn run(workgraph_dir: &Path, cmd: SessionCommands) -> Result<()> {
         }
         SessionCommands::Release { session, wait } => run_release(workgraph_dir, &session, wait),
         SessionCommands::Status { session } => run_status(workgraph_dir, &session),
+        SessionCommands::Check { fix } => run_check(workgraph_dir, fix),
     }
+}
+
+/// Doctor: scan `chat/` + `sessions.json` for inconsistencies and
+/// report them. With `--fix`, perform safe cleanup.
+///
+/// Checks performed:
+///   1. Sessions in the registry whose `chat/<uuid>/` dir is missing.
+///   2. `chat/<uuid>/` dirs with no registry entry (orphan storage).
+///   3. Non-UUID filesystem entries under `chat/` that aren't
+///      `sessions.json`: leftover legacy regular dirs or symlinks
+///      from pre-full-UUID installs. These should be gone; if they
+///      exist, `chat::chat_dir_for_ref` might still hit them
+///      through the naive-join fallback — split-brain risk.
+///   4. Stale session locks: `.handler.pid` files where the listed
+///      PID is no longer alive.
+///   5. Duplicate aliases in the registry (two sessions claiming
+///      the same alias — shouldn't happen but we check).
+fn run_check(workgraph_dir: &Path, fix: bool) -> Result<()> {
+    use std::collections::HashSet;
+
+    let chat_root = workgraph_dir.join("chat");
+    if !chat_root.is_dir() {
+        println!("\x1b[2mno chat/ dir yet — nothing to check\x1b[0m");
+        return Ok(());
+    }
+
+    let reg = workgraph::chat_sessions::load(workgraph_dir).unwrap_or_default();
+    let registered: HashSet<String> = reg.sessions.keys().cloned().collect();
+
+    // 36-char canonical UUID; we don't want to require uuid crate parse
+    // here — cheap shape check is enough to distinguish UUID-named dirs
+    // from legacy alias paths like `0` or `coordinator-0`.
+    let looks_like_uuid = |s: &str| s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4;
+
+    let mut issues = 0usize;
+    let mut fixed = 0usize;
+
+    // (1) Registry → disk
+    for (uuid, meta) in &reg.sessions {
+        let dir = chat_root.join(uuid);
+        if !dir.is_dir() {
+            println!(
+                "\x1b[33m⚠\x1b[0m missing dir for registered session {} ({:?})",
+                &uuid[..8],
+                meta.kind
+            );
+            issues += 1;
+        }
+    }
+
+    // (2) + (3) Disk → registry + legacy paths
+    let mut orphan_uuid_dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut legacy_paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&chat_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy().to_string();
+            if name_s == "sessions.json" {
+                continue;
+            }
+            let path = entry.path();
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if looks_like_uuid(&name_s) {
+                if !registered.contains(&name_s) && md.file_type().is_dir() {
+                    orphan_uuid_dirs.push(path.clone());
+                }
+            } else {
+                // Non-UUID entry — legacy alias path that shouldn't
+                // exist anymore in full-UUID mode.
+                legacy_paths.push(path.clone());
+            }
+        }
+    }
+    for p in &orphan_uuid_dirs {
+        println!(
+            "\x1b[33m⚠\x1b[0m orphan chat dir (no registry entry): {}",
+            p.display()
+        );
+        issues += 1;
+    }
+    for p in &legacy_paths {
+        let md = std::fs::symlink_metadata(p).ok();
+        let kind = match md.as_ref().map(|m| m.file_type()) {
+            Some(ft) if ft.is_symlink() => "symlink",
+            Some(ft) if ft.is_dir() => "directory",
+            Some(_) => "file",
+            None => "unknown",
+        };
+        println!(
+            "\x1b[33m⚠\x1b[0m legacy alias path at {} ({}): full-UUID expects registry-only aliases",
+            p.display(),
+            kind
+        );
+        issues += 1;
+    }
+
+    // (4) Stale locks
+    for (uuid, _meta) in &reg.sessions {
+        let dir = chat_root.join(uuid);
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(Some(info)) = workgraph::session_lock::read_holder(&dir)
+            && !info.alive
+        {
+            println!(
+                "\x1b[33m⚠\x1b[0m stale lock on session {} (PID {} is dead, kind={:?})",
+                &uuid[..8],
+                info.pid,
+                info.kind
+            );
+            issues += 1;
+            if fix {
+                let lock_path = workgraph::session_lock::SessionLock::lock_path(&dir);
+                if std::fs::remove_file(&lock_path).is_ok() {
+                    fixed += 1;
+                    println!(
+                        "  \x1b[32m✓\x1b[0m removed stale lock {}",
+                        lock_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // (5) Duplicate aliases
+    let mut seen_aliases: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (uuid, meta) in &reg.sessions {
+        for a in &meta.aliases {
+            seen_aliases
+                .entry(a.clone())
+                .or_default()
+                .push(uuid.clone());
+        }
+    }
+    for (alias, uuids) in &seen_aliases {
+        if uuids.len() > 1 {
+            println!(
+                "\x1b[31m✗\x1b[0m alias {:?} is claimed by {} sessions: {}",
+                alias,
+                uuids.len(),
+                uuids
+                    .iter()
+                    .map(|u| u[..8].to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            issues += 1;
+        }
+    }
+
+    // Apply --fix for the cleanups we're confident about.
+    if fix {
+        // Merge-and-remove legacy alias paths (symlinks + regular dirs).
+        // We only touch paths that have a corresponding registered
+        // alias — other paths we leave alone (could be user data).
+        let all_aliases: HashSet<String> = reg
+            .sessions
+            .values()
+            .flat_map(|m| m.aliases.iter().cloned())
+            .collect();
+        for p in &legacy_paths {
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if !all_aliases.contains(&name) {
+                continue; // unregistered, leave it alone
+            }
+            // Trigger re-registration by resolving the alias; the
+            // alias_symlink path does the merge+remove dance.
+            match workgraph::chat_sessions::resolve_ref(workgraph_dir, &name) {
+                Ok(uuid) => {
+                    // Call into the cleanup indirectly by re-adding
+                    // the alias — add_alias runs create_alias_symlink
+                    // which is now the cleanup path.
+                    if workgraph::chat_sessions::add_alias(workgraph_dir, &uuid, &name).is_ok() {
+                        fixed += 1;
+                        println!(
+                            "  \x1b[32m✓\x1b[0m cleaned legacy alias path {}",
+                            p.display()
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    if issues == 0 {
+        println!("\x1b[32m✓\x1b[0m no issues found — registry and chat/ are consistent");
+    } else if fix {
+        println!(
+            "\n{} issues found, {} auto-fixed. Remaining need manual triage.",
+            issues, fixed
+        );
+    } else {
+        println!(
+            "\n{} issues found. Rerun with --fix to auto-repair.",
+            issues
+        );
+    }
+    Ok(())
 }
 
 /// Resolve `ref` to a chat dir path. Tries the session registry
