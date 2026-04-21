@@ -1949,11 +1949,36 @@ async fn launch_browser() -> Result<BrowserHandle, String> {
 
     // Persistent user-data-dir so cookies survive across sessions.
     // Separate from ~/.config/google-chrome to avoid colliding with
-    // an interactive Chrome session (Chrome refuses to start when two
-    // instances fight for the same profile — ProcessSingleton lock).
-    let user_data_dir = dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".wg-chrome-profile");
+    // an interactive Chrome session (Chrome refuses to start when
+    // two instances fight for the same profile — ProcessSingleton
+    // lock).
+    //
+    // Snap chromium's confinement sandbox blocks writes to paths
+    // outside its home (~/snap/chromium/...). If we pass
+    // `--user-data-dir=$HOME/.wg-chrome-profile` to a snap binary,
+    // the flag is silently dropped and chromium falls back to its
+    // default profile at `~/snap/chromium/common/chromium/`. That
+    // path collides with any interactive chromium and produces the
+    // "Failed to create SingletonLock / ProcessSingleton" error
+    // seen on ulivo. Fix: when the chrome binary lives under
+    // `/snap/`, put our profile INSIDE the snap-allowed tree.
+    let is_snap_chromium = chrome_path.starts_with("/snap/")
+        || chrome_path.contains("/snap/bin/");
+    let user_data_dir = if is_snap_chromium {
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("snap/chromium/common/wg-profile")
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".wg-chrome-profile")
+    };
+    // Ensure the parent exists — `~/snap/chromium/common/` is
+    // auto-created by snap on first chromium launch but may not
+    // exist yet on fresh installs.
+    if let Some(parent) = user_data_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     // If an orphaned workgraph Chrome is holding the profile's
     // SingletonLock, reap it first. Otherwise Chrome's ProcessSingleton
