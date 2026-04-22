@@ -11256,7 +11256,22 @@ impl VizApp {
         let config = Config::load_or_default(&self.workgraph_dir);
         let executor = config.coordinator.effective_executor();
 
+        // Task ID (`.coordinator-N`, with dot) is what `wg spawn-task`
+        // needs to look the task up in the graph and what our
+        // `task_panes` map is keyed by. Chat ref (`coordinator-N`,
+        // without dot) is what `chat::chat_dir_for_ref` and
+        // `session_lock::read_holder` take — that's the session
+        // alias registered in `sessions.json`. Mixing them up means
+        // chat_dir_for_ref can't find the alias, falls back to the
+        // literal `chat/.coordinator-N/` (which doesn't exist),
+        // observer_mode reads as false, and we then spawn-task in
+        // owner mode even though the daemon already holds the lock.
+        // spawn-task fails with "session lock busy", child exits
+        // immediately, render falls through to file-tailing — which
+        // is exactly the broken state the user smoke-tested into.
         let task_id = format!(".coordinator-{}", self.active_coordinator_id);
+        let chat_ref = format!("coordinator-{}", self.active_coordinator_id);
+
         let pane_live = self
             .task_panes
             .get_mut(&task_id)
@@ -11276,7 +11291,7 @@ impl VizApp {
         // Resolve (binary, args, observer_mode) per executor. Observer
         // mode (lock-tailing) only applies to native today because the
         // vendor CLIs run their own session management off-graph.
-        let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &task_id);
+        let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
         let observer_mode = workgraph::session_lock::read_holder(&chat_dir)
             .ok()
             .flatten()
