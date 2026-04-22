@@ -6,48 +6,36 @@ use workgraph::config::{
     Config, ConfigSource, EndpointConfig, MatrixConfig, ModelRegistryEntry, Tier,
 };
 
-/// Send an all-None Reconfigure IPC to the daemon to make it re-read
-/// `config.toml` from disk. Returns `Ok(true)` when the daemon
-/// acknowledged, `Ok(false)` when no daemon is running (benign — the
-/// config change is already on disk for the next startup), or `Err`
-/// when the daemon is running but the IPC failed.
+/// When model/endpoint changes land, a soft reload (`Reconfigure` IPC)
+/// isn't enough — already-spawned coordinator subprocesses keep their
+/// old env. We restart the daemon instead so the coordinator respawns
+/// reading the just-written config.toml.
+///
+/// Returns `Ok(true)` when a restart happened, `Ok(false)` when no
+/// daemon was running (benign — the config is on disk for next start),
+/// or `Err` when stop/start failed.
 #[cfg(unix)]
-fn try_reload_daemon(dir: &Path) -> Result<bool> {
-    use crate::commands::service;
-    use crate::commands::service::{IpcRequest, ServiceState};
+fn try_restart_daemon(dir: &Path) -> Result<bool> {
+    use crate::commands::service::{self, ServiceState};
 
-    // Short-circuit if no daemon state file exists — nothing to reload.
-    match ServiceState::load(dir) {
-        Ok(Some(_)) => {}
-        _ => return Ok(false),
-    }
-
-    let req = IpcRequest::Reconfigure {
-        max_agents: None,
-        executor: None,
-        poll_interval: None,
-        model: None,
+    let running = match ServiceState::load(dir) {
+        Ok(Some(state)) => workgraph::service::is_process_alive(state.pid),
+        _ => false,
     };
-    match service::send_request(dir, &req) {
-        Ok(resp) if resp.ok => Ok(true),
-        Ok(resp) => Err(anyhow::anyhow!(
-            "daemon rejected reconfigure: {}",
-            resp.error.unwrap_or_else(|| "unknown".to_string())
-        )),
-        Err(e) => {
-            // "Service not running" / stale state → treat as no-op.
-            let msg = format!("{:#}", e);
-            if msg.contains("not running") || msg.contains("stale") {
-                Ok(false)
-            } else {
-                Err(e)
-            }
-        }
+    if !running {
+        return Ok(false);
     }
+
+    // Full restart — same code path as `wg service restart`. This tears
+    // down the stale CoordinatorAgent subprocesses and spawns fresh
+    // ones reading the current config. We pass json=true so its
+    // logging goes through structured output; the caller already
+    // printed a human-readable summary.
+    service::run_restart(dir, false).map(|()| true)
 }
 
 #[cfg(not(unix))]
-fn try_reload_daemon(_dir: &Path) -> Result<bool> {
+fn try_restart_daemon(_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
@@ -673,20 +661,21 @@ pub fn update(
             }
         }
 
-        // Auto-reload: when the user changed model/endpoint on the local
-        // config and a daemon is running, signal it to re-read config.toml
-        // so the change takes effect without a `wg service reload`. Only
-        // fires for local scope (global config isn't read by a daemon).
-        let wants_reload = !no_reload
+        // Auto-restart: model/endpoint changes don't propagate through a
+        // soft Reconfigure IPC — already-running CoordinatorAgent
+        // subprocesses hold their spawn-time env (endpoint, executor,
+        // model). Full restart is the only reliable way to pick up a
+        // new model/endpoint end-to-end. Skip with `--no-reload`.
+        let wants_restart = !no_reload
             && matches!(scope, ConfigScope::Local)
             && (endpoint.is_some() || model.is_some());
-        if wants_reload {
-            match try_reload_daemon(dir) {
-                Ok(true) => println!("Daemon reconfigured (picked up new config)."),
+        if wants_restart {
+            match try_restart_daemon(dir) {
+                Ok(true) => println!("Daemon restarted (coordinator respawned with new config)."),
                 Ok(false) => {} // no daemon running; nothing to do
                 Err(e) => {
                     println!(
-                        "Note: config saved but daemon reload failed ({}). Run `wg service reload` to retry.",
+                        "Note: config saved but daemon restart failed ({}). Run `wg service restart` to retry.",
                         e
                     );
                 }
