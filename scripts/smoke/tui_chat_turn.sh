@@ -38,10 +38,6 @@ READY="$TMPHOME/fake.ready"
 FAKE_PID=
 cleanup() {
     tmux kill-session -t "$SESSION" 2>/dev/null
-    # Stop the per-smoke daemon if we started one.
-    if [[ -S "$TMPHOME/.wg/service/daemon.sock" ]]; then
-        (cd "$TMPHOME" && wg service stop --kill-agents >/dev/null 2>&1) || true
-    fi
     [[ -n "$FAKE_PID" ]] && kill "$FAKE_PID" 2>/dev/null
     wait 2>/dev/null
     cd /
@@ -99,17 +95,10 @@ sess.write_text(json.dumps({
 PY
 wg add ".coordinator-1" --id .coordinator-1 --tag coordinator-loop >/dev/null 2>&1
 
-# `wg chat` (which the TUI calls to submit a message) IPCs the service
-# daemon; it writes inbox.jsonl via that relay. Without a daemon, submit
-# fails silently. Start a no-coordinator-agent daemon so the inbox path
-# works but the daemon doesn't spawn its own coordinator subprocess
-# that would fight our PTY-spawned nex for the session lock.
-wg service start --no-coordinator-agent >/dev/null 2>&1 || true
-# Wait up to 3s for the daemon socket to be ready.
-for i in 1 2 3 4 5 6; do
-    [[ -S "$TMPHOME/.wg/service/daemon.sock" ]] && break
-    sleep 0.5
-done
+# NO daemon started: auto-PTY mode writes directly to inbox.jsonl
+# (see `send_chat_message` in viz_viewer/state.rs). The PTY-spawned
+# `wg nex --chat` tails inbox, hits the fake server, writes outbox —
+# TUI's polling cycle picks up outbox. Full round-trip with zero IPC.
 
 # Launch wg tui in a detached tmux session.
 tmux kill-session -t "$SESSION" 2>/dev/null

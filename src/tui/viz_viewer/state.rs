@@ -10857,7 +10857,53 @@ impl VizApp {
         }
         self.chat.pending_request_ids.insert(request_id.clone());
 
-        // Build `wg chat` command args, including --attachment and --coordinator flags.
+        // Fast path: when we're the PTY owner for this coordinator
+        // (our own `wg nex --chat <ref>` is tailing the inbox), write
+        // to inbox directly instead of routing through `wg chat` → IPC
+        // → daemon. The daemon doesn't do any useful work for chat in
+        // this mode — it's just a relay — and requiring it means the
+        // user's Enter silently drops onto the floor when no daemon is
+        // running. Observer mode still goes via IPC so the external
+        // handler (that owns the session) sees the release marker
+        // through the daemon's lock-aware write path.
+        if self.chat_pty_mode && !self.chat_pty_observer {
+            // Build attachment list in `chat::Attachment` shape so
+            // append_inbox_with_attachments_for can record them.
+            let attachments: Vec<workgraph::chat::Attachment> = self
+                .chat
+                .pending_attachments
+                .iter()
+                .map(|a| workgraph::chat::Attachment {
+                    path: a.stored_path.clone(),
+                    mime_type: a.mime_type.clone(),
+                    size_bytes: a.size_bytes,
+                })
+                .collect();
+            self.chat.pending_attachments.clear();
+
+            if let Err(e) = workgraph::chat::append_inbox_with_attachments_for(
+                &self.workgraph_dir,
+                self.active_coordinator_id,
+                &text,
+                &request_id,
+                attachments,
+            ) {
+                eprintln!(
+                    "[tui] direct inbox write failed for {}: {}",
+                    request_id, e
+                );
+            }
+            // No exec_command + no CommandEffect::ChatResponse — the
+            // response arrives by `poll_chat_messages` tailing the
+            // outbox, same polling cycle used for file-tailing mode.
+            // `pending_request_ids` will be retired when the outbox
+            // picks up a response.
+            return;
+        }
+
+        // Standard path (file-tailing mode, observer, or non-PTY): run
+        // `wg chat` which IPCs the daemon. Daemon writes inbox + (in
+        // daemon-coordinator mode) routes the response back.
         let mut args = vec!["chat".to_string(), text];
         if self.active_coordinator_id != 0 {
             args.push("--coordinator".to_string());
