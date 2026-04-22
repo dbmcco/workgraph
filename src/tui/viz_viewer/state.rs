@@ -11282,28 +11282,62 @@ impl VizApp {
             .flatten()
             .is_some_and(|info| info.alive);
 
-        // Owned String args so we can build per-executor without
-        // lifetime gymnastics.
-        let (bin, args_owned): (String, Vec<String>) = match executor.as_str() {
-            "native" => {
-                let args = if observer_mode {
-                    vec![
-                        "session".to_string(),
-                        "attach".to_string(),
-                        task_id.clone(),
-                    ]
-                } else {
-                    vec!["spawn-task".to_string(), task_id.clone()]
-                };
-                (self_exe.clone(), args)
-            }
-            "claude" => ("claude".to_string(), Vec::new()),
-            "codex" => ("codex".to_string(), Vec::new()),
-            _ => {
-                // Unknown executor — leave file-tailing path in charge.
-                return;
-            }
-        };
+        // Resolve per-coordinator cwd for vendor CLIs. claude and codex
+        // look at "most recent session in current dir" when `--continue`
+        // is used, so giving each coordinator its own chat_dir lets
+        // each tab resume its own conversation independently. Make
+        // sure the dir exists; claude/codex will error otherwise.
+        let _ = std::fs::create_dir_all(&chat_dir);
+
+        // Owned String args per executor.
+        let (bin, args_owned, cwd_opt): (String, Vec<String>, Option<std::path::PathBuf>) =
+            match executor.as_str() {
+                "native" => {
+                    // `wg nex --chat <ref>` auto-resumes from
+                    // `chat/<ref>/conversation.jsonl`. `spawn-task`
+                    // handles lock acquisition + exec into nex.
+                    let args = if observer_mode {
+                        vec![
+                            "session".to_string(),
+                            "attach".to_string(),
+                            task_id.clone(),
+                        ]
+                    } else {
+                        vec!["spawn-task".to_string(), task_id.clone()]
+                    };
+                    (self_exe.clone(), args, None)
+                }
+                "claude" => {
+                    // `-c / --continue` resumes the most recent session
+                    // in CWD. By pinning CWD per coordinator (chat_dir),
+                    // each tab's Claude session is kept separate.
+                    // First-launch: nothing to continue — claude starts
+                    // fresh. Subsequent launches pick up right where
+                    // the previous `wg tui` session left off.
+                    (
+                        "claude".to_string(),
+                        vec!["--continue".to_string()],
+                        Some(chat_dir.clone()),
+                    )
+                }
+                "codex" => {
+                    // Bare `codex` in per-coordinator CWD. Resume flows
+                    // stay manual via codex's own `/resume` in-TUI flow:
+                    // `codex resume --last` errors on empty state,
+                    // which would blow up first-launch UX. CWD pinning
+                    // still helps because codex tracks its history per
+                    // project dir.
+                    (
+                        "codex".to_string(),
+                        Vec::new(),
+                        Some(chat_dir.clone()),
+                    )
+                }
+                _ => {
+                    // Unknown executor — leave file-tailing path in charge.
+                    return;
+                }
+            };
         self.chat_pty_observer = observer_mode && executor == "native";
 
         let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
@@ -11312,7 +11346,15 @@ impl VizApp {
             self.workgraph_dir.display().to_string(),
         )];
 
-        match crate::tui::pty_pane::PtyPane::spawn(&bin, &args_ref, &env, 24, 80) {
+        let spawn_result = crate::tui::pty_pane::PtyPane::spawn_in(
+            &bin,
+            &args_ref,
+            &env,
+            cwd_opt.as_deref(),
+            24,
+            80,
+        );
+        match spawn_result {
             Ok(pane) => {
                 self.task_panes.insert(task_id, pane);
                 self.chat_pty_mode = true;

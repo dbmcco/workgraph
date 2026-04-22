@@ -83,6 +83,21 @@ impl PtyPane {
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
+        Self::spawn_in(command, args, env, None, rows, cols)
+    }
+
+    /// Like `spawn`, but lets the caller pin the child's working
+    /// directory. Useful when embedding vendor CLIs whose
+    /// session-resumption heuristics (e.g. `claude --continue` picks
+    /// the most recent session in the current dir) depend on it.
+    pub fn spawn_in(
+        command: &str,
+        args: &[&str],
+        env: &[(String, String)],
+        cwd: Option<&std::path::Path>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -98,7 +113,10 @@ impl PtyPane {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        if let Ok(cwd) = std::env::current_dir() {
+        let resolved_cwd = cwd
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = resolved_cwd {
             cmd.cwd(cwd);
         }
 
