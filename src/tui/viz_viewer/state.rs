@@ -11227,25 +11227,34 @@ impl VizApp {
         }
     }
 
-    /// For the currently-active coordinator, if its effective executor is
-    /// `native`, auto-enable `chat_pty_mode` and spawn the embedded
-    /// `wg nex --chat` REPL. This makes Chat tab "just work" without a
-    /// running daemon for native/oai-compat setups — the user types into
-    /// a real `wg nex` process rendered inside the pane.
+    /// For the currently-active coordinator, auto-enable `chat_pty_mode`
+    /// and spawn an embedded REPL chosen by the coordinator's effective
+    /// executor. The coordinator view is just a container for
+    /// interactive chat sessions associated with this workgraph — we
+    /// pick the child process per executor type:
     ///
-    /// Non-native executors (`claude`, `codex`) keep the file-tailing
-    /// chat path for now; those still need a running daemon until we
-    /// ship vendor-CLI adapters (Step 2 of the "nex-as-everything"
-    /// rollout). Idempotent: no-op when a live pane already exists or
-    /// when `chat_pty_mode` was flipped off explicitly (Ctrl+T).
+    /// - `native`  → `wg spawn-task .coordinator-<N>` which exec's into
+    ///   `wg nex --chat <ref>` (our own REPL, uses workgraph config
+    ///   for endpoint/model, writes to `chat/<ref>/{inbox,outbox}.jsonl`).
+    /// - `claude`  → `claude` CLI direct. Uses the user's Claude
+    ///   subscription auth + Claude's native interactive UI.
+    /// - `codex`   → `codex` CLI direct. Uses the user's ChatGPT/Codex
+    ///   subscription auth + Codex's native UI.
+    ///
+    /// The tradeoff for claude/codex is ephemeral: the chat transcript
+    /// lives in the vendor's session store, not in `chat/<ref>/`. If
+    /// the user wants the workgraph chat history to include those
+    /// turns, they should pick the `native` executor with
+    /// `-m claude:opus` — that routes through our REPL which does write
+    /// inbox/outbox, at the cost of using the raw API budget instead
+    /// of the subscription.
+    ///
+    /// Falls through to the file-tailing chat path silently if the
+    /// vendor CLI isn't on PATH or the spawn fails. Ctrl+T still toggles
+    /// manually. Idempotent: no-op when a live pane already exists.
     pub fn maybe_auto_enable_chat_pty(&mut self) {
         let config = Config::load_or_default(&self.workgraph_dir);
         let executor = config.coordinator.effective_executor();
-        if executor != "native" {
-            // claude / codex / custom — leave PTY mode alone. User can
-            // still press Ctrl+T to opt in manually.
-            return;
-        }
 
         let task_id = format!(".coordinator-{}", self.active_coordinator_id);
         let pane_live = self
@@ -11259,37 +11268,61 @@ impl VizApp {
         }
         self.task_panes.remove(&task_id);
 
-        // Match `toggle_chat_pty_mode`: observer vs owner based on lock.
+        let self_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "wg".to_string());
+
+        // Resolve (binary, args, observer_mode) per executor. Observer
+        // mode (lock-tailing) only applies to native today because the
+        // vendor CLIs run their own session management off-graph.
         let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &task_id);
         let observer_mode = workgraph::session_lock::read_holder(&chat_dir)
             .ok()
             .flatten()
             .is_some_and(|info| info.alive);
-        self.chat_pty_observer = observer_mode;
 
-        let self_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "wg".to_string());
+        // Owned String args so we can build per-executor without
+        // lifetime gymnastics.
+        let (bin, args_owned): (String, Vec<String>) = match executor.as_str() {
+            "native" => {
+                let args = if observer_mode {
+                    vec![
+                        "session".to_string(),
+                        "attach".to_string(),
+                        task_id.clone(),
+                    ]
+                } else {
+                    vec!["spawn-task".to_string(), task_id.clone()]
+                };
+                (self_exe.clone(), args)
+            }
+            "claude" => ("claude".to_string(), Vec::new()),
+            "codex" => ("codex".to_string(), Vec::new()),
+            _ => {
+                // Unknown executor — leave file-tailing path in charge.
+                return;
+            }
+        };
+        self.chat_pty_observer = observer_mode && executor == "native";
+
+        let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
         let env: Vec<(String, String)> = vec![(
             "WG_DIR".to_string(),
             self.workgraph_dir.display().to_string(),
         )];
-        let args: Vec<&str> = if observer_mode {
-            vec!["session", "attach", &task_id]
-        } else {
-            vec!["spawn-task", &task_id]
-        };
 
-        match crate::tui::pty_pane::PtyPane::spawn(&self_exe, &args, &env, 24, 80) {
+        match crate::tui::pty_pane::PtyPane::spawn(&bin, &args_ref, &env, 24, 80) {
             Ok(pane) => {
                 self.task_panes.insert(task_id, pane);
                 self.chat_pty_mode = true;
             }
             Err(e) => {
                 eprintln!(
-                    "[tui] auto-enable chat PTY failed ({}): falling back to file-tailing",
-                    e
+                    "[tui] auto-enable chat PTY for executor '{}' failed ({}): \
+                     falling back to file-tailing. \
+                     Is the `{}` binary on PATH?",
+                    executor, e, bin
                 );
                 self.chat_pty_mode = false;
             }
