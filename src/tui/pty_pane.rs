@@ -51,8 +51,9 @@ const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 pub struct PtyPane {
     parser: Arc<Mutex<vt100::Parser>>,
     /// Writer end of the PTY master — sending bytes here feeds the
-    /// embedded process's stdin.
-    writer: Box<dyn Write + Send>,
+    /// embedded process's stdin. Shared with the reader thread so it
+    /// can answer terminal capability queries the child emits.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Master PTY handle, kept alive so resize(..) works.
     master: Box<dyn MasterPty + Send>,
     /// Handle to the embedded child process. We never try to
@@ -129,10 +130,14 @@ impl PtyPane {
         // exits and we'd hang in the reader thread.
         drop(pair.slave);
 
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
+        // The PTY master has ONE writer; share it between the public
+        // `send_key`/`send_text` path AND the reader thread's
+        // capability-query responder via Arc<Mutex>.
+        let writer_shared = Arc::new(Mutex::new(
+            pair.master
+                .take_writer()
+                .context("failed to take PTY writer")?,
+        ));
         let mut reader = pair
             .master
             .try_clone_reader()
@@ -145,16 +150,41 @@ impl PtyPane {
         )));
 
         let reader_parser = Arc::clone(&parser);
+        // Optional: tee PTY output to a file for debugging terminal
+        // emulation issues (vt100 parser / tui-term gaps). Activated
+        // by WG_PTY_DUMP=<path>; every PTY child writes raw bytes to
+        // `<path>.<command>.<pid>.bin`.
+        let tee_path = std::env::var_os("WG_PTY_DUMP").map(|p| {
+            let pid = std::process::id();
+            std::path::PathBuf::from(p)
+                .with_extension(format!("{}.{}.bin", command, pid))
+        });
+        // The reader thread peeks at raw PTY bytes for capability
+        // queries and writes the expected replies through this Arc.
+        // Some vendor CLIs (claude in particular) send DA/XTVERSION/
+        // DECRQM queries on startup and block input processing
+        // until they get responses — a pure render-only pipeline
+        // never answers, and the CLI freezes post-splash.
+        let reader_responder = Arc::clone(&writer_shared);
         let reader_thread = thread::Builder::new()
             .name(format!("pty-reader-{}", command))
             .spawn(move || {
-                // Small buffer — vt100::Parser::process is cheap and
-                // the TUI's render latency wants prompt updates.
+                use std::io::Write as _;
+                let mut tee_file = tee_path.and_then(|p| std::fs::File::create(&p).ok());
                 let mut buf = [0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break, // EOF — child exited
                         Ok(n) => {
+                            if let Some(f) = tee_file.as_mut() {
+                                let _ = f.write_all(&buf[..n]);
+                                let _ = f.flush();
+                            }
+                            // Answer any terminal-capability queries the
+                            // child asked about in this chunk. Critical
+                            // for claude / codex / any CLI that probes
+                            // for features at startup.
+                            respond_to_queries(&buf[..n], &reader_responder);
                             // vt100 0.15 has known panics on certain
                             // wide-char sequences at column boundaries
                             // (em-dash in our banner, some emoji,
@@ -177,7 +207,7 @@ impl PtyPane {
 
         Ok(Self {
             parser,
-            writer,
+            writer: writer_shared,
             master: pair.master,
             child,
             reader_thread: Some(reader_thread),
@@ -203,9 +233,11 @@ impl PtyPane {
     /// writes silently. Caller should use `is_alive()` to detect exit.
     pub fn send_key(&mut self, key: KeyEvent) -> Result<()> {
         let bytes = key_event_to_bytes(&key);
-        if !bytes.is_empty() {
-            let _ = self.writer.write_all(&bytes);
-            let _ = self.writer.flush();
+        if !bytes.is_empty()
+            && let Ok(mut w) = self.writer.lock()
+        {
+            let _ = w.write_all(&bytes);
+            let _ = w.flush();
         }
         Ok(())
     }
@@ -213,8 +245,10 @@ impl PtyPane {
     /// Forward arbitrary text (e.g. pasted content) to the child's
     /// stdin verbatim, no key-event encoding.
     pub fn send_text(&mut self, text: &str) -> Result<()> {
-        let _ = self.writer.write_all(text.as_bytes());
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(text.as_bytes());
+            let _ = w.flush();
+        }
         Ok(())
     }
 
@@ -302,6 +336,86 @@ impl Drop for PtyPane {
 /// expects. Handles control characters, arrow keys (CSI sequences),
 /// function keys, and plain text. Not exhaustive — covers what a
 /// `wg nex` REPL user actually presses.
+/// Scan PTY output for terminal capability queries and write the
+/// conventional replies back through the shared writer. Minimal
+/// coverage — just the queries claude and codex send on startup that,
+/// if unanswered, make the CLI freeze post-splash.
+///
+/// This is standard terminal emulator behavior: xterm, gnome-terminal,
+/// alacritty etc. all respond to these. portable-pty is a raw pipe
+/// and vt100-the-parser doesn't generate replies, so we fill the gap.
+fn respond_to_queries(chunk: &[u8], writer: &std::sync::Arc<Mutex<Box<dyn Write + Send>>>) {
+    // Scan for well-known query sequences. Byte patterns:
+    //   ESC [ c            — Primary Device Attributes (DA1)
+    //   ESC [ > c          — Secondary Device Attributes (DA2)
+    //   ESC [ ? 6 n        — cursor position request (also common)
+    //   ESC [ > 0 q        — XTVERSION
+    //   ESC [ ? 2026 $ p   — DECRQM for mode 2026 (synchronized output)
+    //
+    // We don't implement a full state machine; we just match the exact
+    // byte sequences. Claude / codex emit these verbatim on startup.
+    let mut reply = Vec::new();
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        // Match starting at `ESC`.
+        let tail = &chunk[i..];
+        // ESC [ c — Primary DA. Reply: ESC [ ? 65 ; 1 ; 6 c
+        // (VT500 with 132 cols + selective erase — conservative.)
+        if tail.starts_with(b"\x1b[c") {
+            reply.extend_from_slice(b"\x1b[?65;1;6c");
+            i += 3;
+            continue;
+        }
+        // ESC [ > c — Secondary DA. Reply: ESC [ > 41 ; 330 ; 0 c
+        // (mimic xterm)
+        if tail.starts_with(b"\x1b[>c") || tail.starts_with(b"\x1b[>0c") {
+            reply.extend_from_slice(b"\x1b[>41;330;0c");
+            i += tail[..].iter().position(|&b| b == b'c').unwrap_or(3) + 1;
+            continue;
+        }
+        // ESC [ > 0 q — XTVERSION. Reply: ESC P > | wg-tui ESC \
+        if tail.starts_with(b"\x1b[>0q") || tail.starts_with(b"\x1b[>q") {
+            reply.extend_from_slice(b"\x1bP>|wg-tui(0.1.0)\x1b\\");
+            let end = tail[..].iter().position(|&b| b == b'q').unwrap_or(4) + 1;
+            i += end;
+            continue;
+        }
+        // ESC [ ? 2026 $ p — DECRQM for synchronized output.
+        // Reply: ESC [ ? 2026 ; 2 $ y (mode reset / not supported).
+        if tail.starts_with(b"\x1b[?2026$p") {
+            reply.extend_from_slice(b"\x1b[?2026;2$y");
+            i += 9;
+            continue;
+        }
+        // ESC [ ? <N> $ p — DECRQM for any mode. Reply "not recognized".
+        if tail.starts_with(b"\x1b[?")
+            && let Some(end) = tail.iter().position(|&b| b == b'p')
+            && tail.get(end.saturating_sub(1)) == Some(&b'$')
+        {
+            // Extract the mode number between "?" and "$".
+            let inner = &tail[3..end.saturating_sub(1)];
+            if inner.iter().all(|b| b.is_ascii_digit()) && !inner.is_empty() {
+                reply.extend_from_slice(b"\x1b[?");
+                reply.extend_from_slice(inner);
+                reply.extend_from_slice(b";0$y");
+            }
+            i += end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    if !reply.is_empty()
+        && let Ok(mut w) = writer.lock()
+    {
+        let _ = w.write_all(&reply);
+        let _ = w.flush();
+    }
+}
+
 fn key_event_to_bytes(key: &KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);

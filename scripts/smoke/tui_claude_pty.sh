@@ -123,7 +123,7 @@ fi
 
 # Assertion 3: live claude child still present (the Down key didn't
 # terminate it — that'd only happen if "2. No, exit" were invoked).
-if ! pgrep -f "^claude --continue" >/dev/null; then
+if ! pgrep -f "^claude" >/dev/null; then
     echo "FAIL: claude --continue child process not found after key events"
     pgrep -af claude | head
     exit 1

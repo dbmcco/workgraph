@@ -11448,21 +11448,20 @@ impl VizApp {
                     (self_exe.clone(), args, None)
                 }
                 "claude" => {
-                    // CWD: use the project root (parent of workgraph_dir)
-                    // — the user almost certainly has Claude Code
-                    // already trusted there from their regular use.
-                    // A per-coordinator chat_dir as CWD forces the
-                    // trust prompt every launch AND causes claude to
-                    // exit after trust-accept in the portable-pty +
-                    // ratatui hosting environment (exact cause TBD,
-                    // possibly terminal-capability related).
+                    // CWD: project root (parent of workgraph_dir). The
+                    // user almost certainly has Claude Code already
+                    // trusted there from regular use; a per-coord
+                    // chat_dir would re-trigger the trust prompt on
+                    // every launch.
                     //
-                    // Tradeoff: per-coord claude-session isolation
-                    // breaks — `--continue` picks the most recent in
-                    // CWD regardless of which tab the user's on.
-                    // Multi-coord users can switch via claude's own
-                    // `/resume` picker or by pressing the `-n` name
-                    // we set below.
+                    // Args: bare `claude` (no `--continue`). Claude
+                    // Code exits with "No conversation found to
+                    // continue" when `--continue` is passed and no
+                    // prior session exists in the CWD — which is why
+                    // the REPL was vanishing right after trust accept.
+                    // Bare launch starts a fresh session; `-n
+                    // wg-<ref>` names it for visibility in claude's
+                    // own session picker.
                     let project_root = self
                         .workgraph_dir
                         .parent()
@@ -11470,11 +11469,7 @@ impl VizApp {
                         .to_path_buf();
                     (
                         "claude".to_string(),
-                        vec![
-                            "--continue".to_string(),
-                            "-n".to_string(),
-                            format!("wg-{}", chat_ref),
-                        ],
+                        vec!["-n".to_string(), format!("wg-{}", chat_ref)],
                         Some(project_root),
                     )
                 }
