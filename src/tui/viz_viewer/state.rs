@@ -11454,24 +11454,25 @@ impl VizApp {
                     // chat_dir would re-trigger the trust prompt on
                     // every launch.
                     //
-                    // Args: bare `claude` (no `--continue`). Claude
-                    // Code exits with "No conversation found to
-                    // continue" when `--continue` is passed and no
-                    // prior session exists in the CWD — which is why
-                    // the REPL was vanishing right after trust accept.
-                    // Bare launch starts a fresh session; `-n
-                    // wg-<ref>` names it for visibility in claude's
-                    // own session picker.
+                    // Resume: if any prior claude session exists in
+                    // `~/.claude/projects/<cwd-slug>/` for this CWD,
+                    // pass `--continue` to reconnect to the most
+                    // recent one. On a truly fresh CWD, `--continue`
+                    // exits with "No conversation found to continue"
+                    // and terminates the REPL — so we only add it
+                    // when we know a session file exists. `-n
+                    // wg-<ref>` names the session for visibility in
+                    // claude's own /resume picker.
                     let project_root = self
                         .workgraph_dir
                         .parent()
                         .unwrap_or(&self.workgraph_dir)
                         .to_path_buf();
-                    (
-                        "claude".to_string(),
-                        vec!["-n".to_string(), format!("wg-{}", chat_ref)],
-                        Some(project_root),
-                    )
+                    let mut args = vec!["-n".to_string(), format!("wg-{}", chat_ref)];
+                    if claude_has_session_for(&project_root) {
+                        args.insert(0, "--continue".to_string());
+                    }
+                    ("claude".to_string(), args, Some(project_root))
                 }
                 "codex" => {
                     // Bare `codex` in per-coordinator CWD. Resume flows
@@ -13801,6 +13802,29 @@ fn find_all_archives(
 
 /// Returns the file at `filename` within the given archive directory, if it exists.
 /// Falls back to common alternative names (e.g. output.log → output.txt).
+/// Does Claude Code have any saved session for this CWD? Checked by
+/// looking at `~/.claude/projects/<cwd-slug>/` where Claude persists
+/// its session JSONLs. The slug is the absolute CWD with `/` → `-`.
+/// Used to decide whether `claude --continue` will find a session to
+/// resume (else it'd exit immediately with "No conversation found").
+fn claude_has_session_for(cwd: &std::path::Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Some(cwd_str) = cwd.to_str() else {
+        return false;
+    };
+    let slug = cwd_str.replace('/', "-");
+    let dir = home.join(".claude").join("projects").join(slug);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "jsonl")
+            && e.metadata().map(|m| m.len() > 0).unwrap_or(false))
+}
+
 fn find_archive_file(archive_dir: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
     let candidate = archive_dir.join(filename);
     if candidate.exists() {
