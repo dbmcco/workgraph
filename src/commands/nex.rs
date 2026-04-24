@@ -137,12 +137,13 @@ pub fn run(
     // against component names in .workgraph/agency/primitives/components/.
     let role_prompt_addendum = if let Some(role_name) = role {
         if is_coordinator {
-            Some(
-                "You are operating as a workgraph coordinator. Your tools include \
-                 wg_add, wg_done, wg_log, wg_list, wg_show, and related graph operations. \
-                 You dispatch work rather than doing it directly."
-                    .to_string(),
-            )
+            // Full coordinator prompt (~290 lines) — matches what the
+            // service-spawned claude_handler injects via --system-prompt.
+            // Falls back to a hardcoded prompt if the agency/
+            // coordinator-prompt/ dir is missing.
+            Some(crate::commands::service::coordinator_agent::build_system_prompt(
+                workgraph_dir,
+            ))
         } else {
             match load_agency_role(workgraph_dir, role_name) {
                 Some(content) => {

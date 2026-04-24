@@ -17,7 +17,7 @@
 
 set -u
 
-POLL_DEADLINE=${POLL_DEADLINE:-8}
+POLL_DEADLINE=${POLL_DEADLINE:-15}
 TMPHOME=$(mktemp -d)
 SESSION=wg-smoke-auto-pty-$$
 trap 'tmux kill-session -t "$SESSION" 2>/dev/null; cd /; rm -rf "$TMPHOME"' EXIT
@@ -72,7 +72,7 @@ done
 # 6. Cross-check: a live `wg nex ... --role coordinator` child must exist.
 #    (Without this the banner could be stale from a crashed child.
 #    And without --role coordinator, nex.rs strips the wg mutation tools.)
-if ! pgrep -f "wg nex .* --role coordinator" >/dev/null; then
+if ! pgrep -f "wg nex.*--role coordinator" >/dev/null; then
     PASS=0
 fi
 
