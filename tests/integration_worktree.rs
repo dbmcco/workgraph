@@ -246,22 +246,31 @@ fn test_worktree_creates_separate_target_dirs() {
 }
 
 #[test]
-fn test_registry_round_trip_with_live_agent() {
-    use workgraph::registry::{Agent, AgentStatus, Registry};
+fn test_cleanup_orphaned_worktrees_skips_live_agents() {
+    use workgraph::commands::service::worktree::cleanup_orphaned_worktrees;
+    use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 
     let temp = TempDir::new().expect("Failed to create temp dir");
-    let wg_dir = temp.path().join(".workgraph");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("Failed to create project dir");
+    init_test_repo(&project);
 
-    let mut registry = Registry::default();
+    let wg_dir = project.join(".workgraph");
+    std::fs::create_dir_all(wg_dir.join("service")).expect("Failed to create service dir");
+
+    let worktree_dir = create_test_worktree(&project, "agent-1");
+
+    // Use our own PID so is_live passes.
+    let our_pid = std::process::id();
     let now = chrono::Utc::now().to_rfc3339();
-
+    let mut registry = AgentRegistry::default();
     registry.agents.insert(
         "agent-1".to_string(),
-        Agent {
+        AgentEntry {
             id: "agent-1".to_string(),
-            pid: 999999,
+            pid: our_pid,
             task_id: "task-1".to_string(),
-            executor: "claude".to_string(),
+            executor: "test".to_string(),
             started_at: now.clone(),
             last_heartbeat: now.clone(),
             status: AgentStatus::Working,
@@ -270,34 +279,38 @@ fn test_registry_round_trip_with_live_agent() {
             completed_at: None,
         },
     );
-
     registry.save(&wg_dir).expect("Failed to save registry");
 
-    let loaded = Registry::load(&wg_dir).expect("Failed to load registry");
-    assert_eq!(loaded.agents.len(), 1);
-
-    let agent = loaded.agents.get("agent-1").unwrap();
-    assert_eq!(agent.task_id, "task-1");
-    assert!(agent.is_alive());
+    let cleaned_count =
+        cleanup_orphaned_worktrees(&wg_dir).expect("Cleanup should not fail");
+    assert_eq!(cleaned_count, 0);
+    assert!(worktree_dir.exists());
 }
 
 #[test]
-fn test_registry_dead_agent_not_alive() {
-    use workgraph::registry::{Agent, AgentStatus, Registry};
+fn test_cleanup_orphaned_worktrees_removes_dead_agents() {
+    use workgraph::commands::service::worktree::cleanup_orphaned_worktrees;
+    use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 
     let temp = TempDir::new().expect("Failed to create temp dir");
-    let wg_dir = temp.path().join(".workgraph");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("Failed to create project dir");
+    init_test_repo(&project);
 
-    let mut registry = Registry::default();
+    let wg_dir = project.join(".workgraph");
+    std::fs::create_dir_all(wg_dir.join("service")).expect("Failed to create service dir");
+
+    let worktree_dir = create_test_worktree(&project, "agent-2");
+
     let now = chrono::Utc::now().to_rfc3339();
-
+    let mut registry = AgentRegistry::default();
     registry.agents.insert(
         "agent-2".to_string(),
-        Agent {
+        AgentEntry {
             id: "agent-2".to_string(),
-            pid: 999999,
+            pid: 999_999_999,
             task_id: "task-2".to_string(),
-            executor: "claude".to_string(),
+            executor: "test".to_string(),
             started_at: now.clone(),
             last_heartbeat: now.clone(),
             status: AgentStatus::Dead,
@@ -306,19 +319,33 @@ fn test_registry_dead_agent_not_alive() {
             completed_at: None,
         },
     );
-
     registry.save(&wg_dir).expect("Failed to save registry");
 
-    let loaded = Registry::load(&wg_dir).expect("Failed to load registry");
-    let agent = loaded.agents.get("agent-2").unwrap();
-    assert!(!agent.is_alive());
+    let cleaned_count =
+        cleanup_orphaned_worktrees(&wg_dir).expect("Cleanup should not fail");
+    assert_eq!(cleaned_count, 1);
+    assert!(!worktree_dir.exists());
 }
 
 #[test]
-fn test_registry_default_empty() {
-    use workgraph::registry::Registry;
+fn test_cleanup_dead_agent_worktree() {
+    use workgraph::commands::service::worktree::cleanup_dead_agent_worktree_with_config;
 
-    let registry = Registry::default();
-    assert!(registry.agents.is_empty());
-    assert_eq!(registry.next_agent_id, 1);
+    let temp = TempDir::new().expect("Failed to create temp dir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).expect("Failed to create project dir");
+    init_test_repo(&project);
+
+    let worktree_dir = create_test_worktree(&project, "agent-test");
+
+    // cleanup_dead_agent_worktree_with_config returns () — handles errors internally.
+    cleanup_dead_agent_worktree_with_config(
+        &project,
+        &worktree_dir,
+        "wg/agent-test/test-task",
+        "agent-test",
+        None,
+    );
+
+    assert!(!worktree_dir.exists());
 }
