@@ -392,24 +392,26 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     }
 
     // Vendor-CLI PTY: forward every keystroke to the embedded child's
-    // stdin. Vendor CLIs (claude, codex) are their own REPL; they read
-    // stdin directly, not inbox.jsonl. Without this branch keys flow
-    // into our own composer and claude/codex never hear from the user.
+    // stdin. Vendor CLIs (native wg nex REPL, claude, codex) read
+    // stdin directly. Without this branch keys flow into our own
+    // composer and the CLI never hears the user.
     //
     // Scoping: only fires on the Chat tab when the forward flag is set
-    // (matches vendor-CLI executors, not native wg-nex). Escape
-    // hatches: Ctrl+T still toggles PTY mode off, Ctrl+Q reserved for
-    // host-exit. Everything else — letters, digits, Enter, arrows,
-    // even 'q' on its own — goes to the vendor CLI so slash commands,
-    // vendor hotkeys, etc. work naturally.
+    // (matches interactive-REPL executors). Escape hatch: Ctrl+T
+    // toggles PTY mode off so the user can use TUI graph/tabs again.
+    // Everything else — letters, digits, Enter, arrows, Ctrl-C,
+    // Ctrl-Q (user's tmux prefix, often), Ctrl-whatever — goes to
+    // the vendor CLI so slash commands, readline editing, vendor
+    // hotkeys, user's own tmux prefix binding, etc. all work
+    // naturally. If you really want to exit the host TUI, Ctrl-T
+    // out of PTY mode first, then use the normal `q` quit.
     let vendor_pty_active = app.chat_pty_mode
         && app.chat_pty_forwards_stdin
         && app.right_panel_tab == RightPanelTab::Chat
         && !app.chat_pty_observer;
     if vendor_pty_active {
         let is_toggle = matches!(code, KeyCode::Char('t')) && modifiers.contains(KeyModifiers::CONTROL);
-        let is_host_quit = matches!(code, KeyCode::Char('q')) && modifiers.contains(KeyModifiers::CONTROL);
-        if !is_toggle && !is_host_quit {
+        if !is_toggle {
             let task_id = format!(".coordinator-{}", app.active_coordinator_id);
             if let Some(pane) = app.task_panes.get_mut(&task_id) {
                 let key_event = crossterm::event::KeyEvent::new(code, modifiers);
@@ -417,7 +419,7 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 return;
             }
         }
-        // Fall through for Ctrl+T / Ctrl+Q so the usual handlers run.
+        // Fall through only for Ctrl+T so it toggles PTY mode.
     }
 
     // Dispatch based on input mode
