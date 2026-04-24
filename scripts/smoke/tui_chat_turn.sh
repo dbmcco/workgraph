@@ -164,7 +164,7 @@ if ! wait_for "Glad to help"; then
 fi
 
 # ---- Final sanity: live wg nex child still present ----
-if ! pgrep -f "wg nex -m " >/dev/null; then
+if ! pgrep -f "wg nex.*--role coordinator" >/dev/null; then
     echo "FAIL: wg nex child missing after two turns"
     exit 1
 fi

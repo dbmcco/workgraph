@@ -68,6 +68,12 @@ pub struct PtyPane {
     /// and pushes the new size through to master + parser.
     rows: u16,
     cols: u16,
+    /// Optional tee file for the INPUT stream (stdin we write to the
+    /// child). Set when `WG_PTY_DUMP` is exported — the output tee
+    /// goes to `<prefix>.<cmd>.<pid>.bin`, this input tee goes to
+    /// `<prefix>.<cmd>.<pid>.in.bin`. Smoke tests read it to assert
+    /// key-forwarding byte sequences.
+    input_tee: Option<Arc<Mutex<std::fs::File>>>,
 }
 
 impl PtyPane {
@@ -154,7 +160,7 @@ impl PtyPane {
         // emulation issues (vt100 parser / tui-term gaps). Activated
         // by WG_PTY_DUMP=<prefix>; every PTY child writes raw bytes
         // to `<prefix>.<command-basename>.<pid>.bin`.
-        let tee_path = std::env::var_os("WG_PTY_DUMP").map(|p| {
+        let (tee_path, input_tee_path) = if let Some(p) = std::env::var_os("WG_PTY_DUMP") {
             let pid = std::process::id();
             // Strip any path from `command` (can be absolute, like
             // /home/user/.cargo/bin/wg) — `with_extension` panics on
@@ -163,14 +169,27 @@ impl PtyPane {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("pty");
-            let mut path = std::path::PathBuf::from(p);
-            let current_name = path
+            let mut out_path = std::path::PathBuf::from(&p);
+            let current_name = out_path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            path.set_file_name(format!("{}.{}.{}.bin", current_name, basename, pid));
-            path
+            out_path.set_file_name(format!(
+                "{}.{}.{}.bin",
+                current_name, basename, pid
+            ));
+            let mut in_path = std::path::PathBuf::from(&p);
+            in_path.set_file_name(format!(
+                "{}.{}.{}.in.bin",
+                current_name, basename, pid
+            ));
+            (Some(out_path), Some(in_path))
+        } else {
+            (None, None)
+        };
+        let input_tee = input_tee_path.and_then(|p| {
+            std::fs::File::create(&p).ok().map(|f| Arc::new(Mutex::new(f)))
         });
         // The reader thread peeks at raw PTY bytes for capability
         // queries and writes the expected replies through this Arc.
@@ -217,6 +236,7 @@ impl PtyPane {
             reader_thread: Some(reader_thread),
             rows,
             cols,
+            input_tee,
         })
     }
 
@@ -242,6 +262,7 @@ impl PtyPane {
         {
             let _ = w.write_all(&bytes);
             let _ = w.flush();
+            self.tee_input(&bytes);
         }
         Ok(())
     }
@@ -252,8 +273,19 @@ impl PtyPane {
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
+            self.tee_input(text.as_bytes());
         }
         Ok(())
+    }
+
+    fn tee_input(&self, bytes: &[u8]) {
+        if let Some(tee) = &self.input_tee
+            && let Ok(mut f) = tee.lock()
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(bytes);
+            let _ = f.flush();
+        }
     }
 
     /// Push a new size through to both the vt100 parser (so rendered

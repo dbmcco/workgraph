@@ -405,9 +405,16 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     // hotkeys, user's own tmux prefix binding, etc. all work
     // naturally. If you really want to exit the host TUI, Ctrl-T
     // out of PTY mode first, then use the normal `q` quit.
+    // Focus gating: only forward keys to the PTY when the right
+    // panel is actually focused. A mouse click on the graph panel
+    // shifts focused_panel to Graph, naturally "escaping" the PTY
+    // without needing Ctrl-T — matches pane-focus behavior users
+    // expect from tmux/vim splits. Ctrl-T still works as the
+    // keyboard escape hatch (handled below).
     let vendor_pty_active = app.chat_pty_mode
         && app.chat_pty_forwards_stdin
         && app.right_panel_tab == RightPanelTab::Chat
+        && app.focused_panel == FocusedPanel::RightPanel
         && !app.chat_pty_observer;
     if vendor_pty_active {
         let is_toggle = matches!(code, KeyCode::Char('t')) && modifiers.contains(KeyModifiers::CONTROL);
