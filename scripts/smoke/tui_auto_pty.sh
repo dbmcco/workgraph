@@ -69,9 +69,10 @@ for i in $(seq 1 "$POLL_DEADLINE"); do
     fi
 done
 
-# 6. Cross-check: a live `wg nex --chat coordinator-1` child must exist.
-#    (Without this the banner could be stale from a crashed child.)
-if ! pgrep -f "wg nex -m " >/dev/null; then
+# 6. Cross-check: a live `wg nex ... --role coordinator` child must exist.
+#    (Without this the banner could be stale from a crashed child.
+#    And without --role coordinator, nex.rs strips the wg mutation tools.)
+if ! pgrep -f "wg nex .* --role coordinator" >/dev/null; then
     PASS=0
 fi
 

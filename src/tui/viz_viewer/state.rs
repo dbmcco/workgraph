@@ -11441,7 +11441,16 @@ impl VizApp {
                     // else let nex resolve from config itself (empty
                     // -m won't be appended). Endpoint comes from the
                     // default `[[llm_endpoints.endpoints]]` entry.
-                    let mut args = vec!["nex".to_string()];
+                    // `--role coordinator` keeps the wg mutation tools
+                    // (wg_add, wg_done, ...) — nex.rs:77 otherwise strips
+                    // them on interactive sessions. Interactive mode (no
+                    // `--chat`) renders the REPL to stdout so the PTY
+                    // pane shows banner + prompt + responses.
+                    let mut args = vec![
+                        "nex".to_string(),
+                        "--role".to_string(),
+                        "coordinator".to_string(),
+                    ];
                     let model = config
                         .coordinator
                         .model
