@@ -11532,12 +11532,25 @@ impl VizApp {
                     ("claude".to_string(), args, Some(project_root))
                 }
                 "codex" => {
-                    // Bare `codex` in per-coordinator CWD. Resume flows
-                    // stay manual via codex's own `/resume` in-TUI flow:
-                    // `codex resume --last` errors on empty state,
-                    // which would blow up first-launch UX. CWD pinning
-                    // still helps because codex tracks its history per
-                    // project dir.
+                    // Coordinator priming: codex auto-loads AGENTS.md
+                    // from CWD (hierarchically, up to the git root), so
+                    // we materialize the full coordinator prompt into
+                    // `<chat_dir>/AGENTS.md` before spawn. codex has no
+                    // --system-prompt flag in interactive mode; AGENTS.md
+                    // is the supported mechanism. Scoping to chat_dir
+                    // keeps per-coordinator priming isolated from any
+                    // project-level AGENTS.md.
+                    //
+                    // Resume flows stay manual via codex's own `/resume`
+                    // in-TUI flow: `codex resume --last` errors on empty
+                    // state, which would blow up first-launch UX. CWD
+                    // pinning still helps because codex tracks its
+                    // history per project dir.
+                    let sys_prompt = crate::commands::service::coordinator_agent::build_system_prompt(
+                        &self.workgraph_dir,
+                    );
+                    let agents_md = chat_dir.join("AGENTS.md");
+                    let _ = std::fs::write(&agents_md, sys_prompt);
                     (
                         "codex".to_string(),
                         Vec::new(),
