@@ -40,6 +40,10 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
         println!("  interval = {}", config.coordinator.interval);
         println!("  poll_interval = {}", config.coordinator.poll_interval);
         println!("  executor = \"{}\"", config.coordinator.executor);
+        println!(
+            "  worktree_isolation = {}",
+            config.coordinator.worktree_isolation
+        );
         println!();
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);

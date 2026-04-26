@@ -9,13 +9,14 @@ use std::process::{Command, Stdio};
 
 use workgraph::config::Config;
 use workgraph::graph::{LogEntry, Node, Status, Task, is_system_task};
-use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
+use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
 use workgraph::service::executor::{ExecutorRegistry, PromptTemplate, TemplateVars, build_prompt};
 use workgraph::service::registry::AgentRegistry;
 
 use super::context::{
     build_scope_context, build_task_context, resolve_task_exec_mode, resolve_task_scope,
 };
+use super::worktree;
 use super::{
     SpawnResult, agent_output_dir, graph_path, parse_timeout_secs, prompt_file_command,
     shell_escape,
@@ -144,6 +145,29 @@ pub(crate) fn spawn_agent_inner(
     let output_file = output_dir.join("output.log");
     let output_file_str = output_file.to_string_lossy().to_string();
 
+    let needs_worktree = should_create_worktree(
+        config.coordinator.worktree_isolation,
+        task_id,
+        resolved_exec_mode.as_str(),
+    );
+    let worktree_info = if needs_worktree {
+        let project_root = dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine project root from {:?}", dir))?;
+        match worktree::create_worktree(project_root, dir, &temp_agent_id, task_id) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!(
+                    "[spawn] Worktree creation failed for {}, falling back to shared working directory: {}",
+                    temp_agent_id, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Apply templates to executor settings (with effective model in vars)
     let mut settings = executor_config.apply_templates(&vars);
 
@@ -232,8 +256,14 @@ pub(crate) fn spawn_agent_inner(
         cmd.env("WG_MODEL", m);
     }
 
-    // Set working directory if specified
-    if let Some(ref wd) = settings.working_dir {
+    if let Some(ref wt) = worktree_info {
+        cmd.current_dir(&wt.path);
+        cmd.env("WG_WORKTREE_PATH", &wt.path);
+        cmd.env("WG_BRANCH", &wt.branch);
+        cmd.env("WG_PROJECT_ROOT", &wt.project_root);
+        cmd.env("WG_WORKTREE_ACTIVE", "1");
+        cmd.env("CARGO_TARGET_DIR", wt.path.join("target"));
+    } else if let Some(ref wd) = settings.working_dir {
         cmd.current_dir(wd);
     }
 
@@ -409,6 +439,12 @@ pub(crate) fn spawn_agent_inner(
         "started_at": Utc::now().to_rfc3339(),
         "timeout_secs": effective_timeout_secs,
     });
+    let mut metadata = metadata;
+    if let Some(ref wt) = worktree_info {
+        metadata["worktree_path"] = serde_json::json!(wt.path.to_string_lossy());
+        metadata["worktree_branch"] = serde_json::json!(&wt.branch);
+        metadata["project_root"] = serde_json::json!(wt.project_root.to_string_lossy());
+    }
     fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)?;
 
     Ok(SpawnResult {
@@ -420,6 +456,23 @@ pub(crate) fn spawn_agent_inner(
         output_file: output_file_str,
         model: effective_model,
     })
+}
+
+pub(crate) fn should_create_worktree(
+    worktree_isolation_enabled: bool,
+    task_id: &str,
+    exec_mode: &str,
+) -> bool {
+    if !worktree_isolation_enabled {
+        return false;
+    }
+    if task_id.starts_with('.') {
+        return false;
+    }
+    if matches!(exec_mode, "bare" | "light") {
+        return false;
+    }
+    true
 }
 
 /// Build the inner command string for the executor.
@@ -767,6 +820,10 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
     fi
 fi
 
+if [ -n "$WG_WORKTREE_PATH" ]; then
+    touch "$WG_WORKTREE_PATH/.wg-cleanup-pending" 2>/dev/null || true
+fi
+
 exit $EXIT_CODE
 "#,
         escaped_task_id = shell_escape(task_id),
@@ -792,4 +849,28 @@ exit $EXIT_CODE
     }
 
     Ok(wrapper_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_create_worktree;
+
+    #[test]
+    fn worktree_creation_is_disabled_without_flag() {
+        assert!(!should_create_worktree(false, "task-1", "full"));
+        assert!(!should_create_worktree(false, "task-1", "shell"));
+    }
+
+    #[test]
+    fn worktree_creation_skips_meta_and_read_only_tasks() {
+        assert!(!should_create_worktree(true, ".assign-task-1", "full"));
+        assert!(!should_create_worktree(true, "task-1", "bare"));
+        assert!(!should_create_worktree(true, "task-1", "light"));
+    }
+
+    #[test]
+    fn worktree_creation_enables_code_writing_tasks() {
+        assert!(should_create_worktree(true, "task-1", "full"));
+        assert!(should_create_worktree(true, "task-1", "shell"));
+    }
 }

@@ -13,6 +13,7 @@
 
 mod context;
 mod execution;
+mod worktree;
 
 use anyhow::{Context, Result};
 use serde::Serialize;

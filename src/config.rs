@@ -1061,6 +1061,13 @@ pub struct CoordinatorConfig {
     #[serde(default = "default_agent_timeout")]
     pub agent_timeout: String,
 
+    /// Whether spawned agents should execute from per-agent git worktrees.
+    /// When enabled, code-writing tasks get isolated worktrees under
+    /// `.wg-worktrees/<agent-id>/`, while graph/meta tasks continue to run
+    /// against the shared repository root.
+    #[serde(default)]
+    pub worktree_isolation: bool,
+
     /// Settling delay in milliseconds after a GraphChanged event before the
     /// coordinator tick fires. During burst graph construction (rapid task
     /// additions), this prevents premature dispatch by waiting for the burst
@@ -1129,6 +1136,7 @@ impl Default for CoordinatorConfig {
             model: None,
             default_context_scope: None,
             agent_timeout: default_agent_timeout(),
+            worktree_isolation: false,
             settling_delay_ms: default_settling_delay_ms(),
             coordinator_agent: default_coordinator_agent(),
             max_consecutive_failures: default_max_consecutive_failures(),
@@ -2080,5 +2088,23 @@ model = "haiku"
         config.agency.evaluator_model = Some("haiku".to_string());
         let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
         assert_eq!(resolved.model, "haiku");
+    }
+
+    #[test]
+    fn test_coordinator_worktree_isolation_defaults_false() {
+        let config = Config::default();
+        assert!(!config.coordinator.worktree_isolation);
+    }
+
+    #[test]
+    fn test_coordinator_worktree_isolation_toml_round_trip() {
+        let config: Config = toml::from_str(
+            r#"
+[coordinator]
+worktree_isolation = true
+"#,
+        )
+        .unwrap();
+        assert!(config.coordinator.worktree_isolation);
     }
 }
