@@ -11,6 +11,7 @@ pub mod compactor;
 pub mod coordinator_cycle;
 pub mod dispatch_boot;
 pub mod executor;
+pub mod graph_watcher;
 pub mod llm;
 pub mod provider_health;
 pub mod registry;
