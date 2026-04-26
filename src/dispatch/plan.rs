@@ -258,8 +258,8 @@ pub fn plan_spawn(
 /// **Crucially: model is never consulted here.** The caller may have a
 /// non-Anthropic model spec, but if the dispatcher is pinned to claude,
 /// we honor claude. The previous implementation auto-switched to native
-/// when `requires_native_executor(model, …)` was true; that behavior
-/// is what this function deliberately removes.
+/// based on a model→provider lookup; that behavior is what this function
+/// deliberately removes.
 fn resolve_executor(
     task: &Task,
     config: &Config,

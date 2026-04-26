@@ -3403,39 +3403,6 @@ fn check_respawn_throttle(task: &Task, graph_path: &Path) -> std::result::Result
     Ok(())
 }
 
-/// Check if a model string represents a non-Anthropic model that requires the
-/// native executor instead of the Claude CLI.
-///
-/// Checks three things in order:
-/// 1. If the model uses `provider:model` format, the provider prefix determines
-///    the executor directly (only `claude:*` uses the Claude CLI).
-/// 2. If the model contains a `/` and doesn't start with `anthropic/`, it's a
-///    non-Anthropic full model ID (e.g. `google/gemini-2.0-flash-001`).
-/// 3. If the model is a registry alias (e.g. `gemini-flash`), look up its provider
-///    in the registry — if the provider isn't `anthropic`, it needs native.
-///
-/// Returns `false` for Anthropic models, bare Anthropic model names, and
-/// built-in tier aliases (`haiku`, `sonnet`, `opus`).
-pub(crate) fn requires_native_executor(model: &str, config: &Config) -> bool {
-    // 1. Unified provider:model check — provider prefix determines executor directly
-    let spec = workgraph::config::parse_model_spec(model);
-    if let Some(ref prefix) = spec.provider {
-        return workgraph::config::provider_to_executor(prefix) != "claude";
-    }
-
-    // 2. Legacy: direct provider/model format check (org/model without provider: prefix)
-    if spec.model_id.contains('/') {
-        return !spec.model_id.starts_with("anthropic/");
-    }
-    // 3. Registry alias check: look up the model and check its provider
-    if let Some(entry) = config.registry_lookup(&spec.model_id) {
-        return entry.provider != "anthropic";
-    }
-    // Bare model names without registry entries are assumed Anthropic-compatible
-    // (e.g. "claude-sonnet-4-6", "haiku", "sonnet", "opus")
-    false
-}
-
 /// Check if a task has exceeded the spawn failure threshold and should be skipped.
 ///
 /// Returns:
@@ -5619,110 +5586,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // requires_native_executor: model-based executor detection
+    // Model-based executor detection (formerly `requires_native_executor`)
+    // is gone — the dispatcher's executor pin is no longer overridden by
+    // model spec. The single source of truth is now
+    // `dispatch::plan::resolve_executor`; see tests in src/dispatch/plan.rs.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_requires_native_for_non_anthropic_models() {
-        let config = Config::default();
-        assert!(requires_native_executor(
-            "google/gemini-2.0-flash-001",
-            &config
-        ));
-        assert!(requires_native_executor("deepseek/deepseek-chat", &config));
-        assert!(requires_native_executor("qwen/qwen-2.5-72b", &config));
-        assert!(requires_native_executor("meta-llama/llama-3-70b", &config));
-        assert!(requires_native_executor("openai/gpt-4o", &config));
-    }
-
-    #[test]
-    fn test_does_not_require_native_for_anthropic_models() {
-        let config = Config::default();
-        assert!(!requires_native_executor(
-            "anthropic/claude-sonnet-4-6",
-            &config
-        ));
-        assert!(!requires_native_executor(
-            "anthropic/claude-opus-4-6",
-            &config
-        ));
-        assert!(!requires_native_executor(
-            "anthropic/claude-3.5-haiku",
-            &config
-        ));
-    }
-
-    #[test]
-    fn test_does_not_require_native_for_bare_model_names() {
-        // Bare model names (no slash) are assumed Anthropic / Claude CLI compatible
-        let config = Config::default();
-        assert!(!requires_native_executor("claude-sonnet-4-6", &config));
-        assert!(!requires_native_executor("haiku", &config));
-        assert!(!requires_native_executor("sonnet", &config));
-        assert!(!requires_native_executor("opus", &config));
-    }
-
-    #[test]
-    fn test_requires_native_for_registry_alias_non_anthropic() {
-        // Registry aliases with non-Anthropic providers should require native
-        let mut config = Config::default();
-        config
-            .model_registry
-            .push(workgraph::config::ModelRegistryEntry {
-                id: "gemini-flash".to_string(),
-                provider: "openrouter".to_string(),
-                model: "google/gemini-2.0-flash-001".to_string(),
-                tier: workgraph::config::Tier::Fast,
-                endpoint: None,
-                ..Default::default()
-            });
-        assert!(requires_native_executor("gemini-flash", &config));
-    }
-
-    #[test]
-    fn test_does_not_require_native_for_registry_alias_anthropic() {
-        // Built-in aliases like "haiku" resolve to Anthropic provider
-        let config = Config::default();
-        // "haiku" is a built-in registry alias with provider "anthropic"
-        assert!(!requires_native_executor("haiku", &config));
-    }
-
-    // provider:model format tests
-    #[test]
-    fn test_requires_native_for_openrouter_prefix() {
-        let config = Config::default();
-        assert!(requires_native_executor(
-            "openrouter:deepseek/deepseek-v3.2",
-            &config
-        ));
-        assert!(requires_native_executor(
-            "openrouter:minimax/minimax-m2.5",
-            &config
-        ));
-    }
-
-    #[test]
-    fn test_does_not_require_native_for_claude_prefix() {
-        let config = Config::default();
-        assert!(!requires_native_executor("claude:opus", &config));
-        assert!(!requires_native_executor("claude:sonnet", &config));
-        assert!(!requires_native_executor(
-            "claude:claude-sonnet-4-6",
-            &config
-        ));
-    }
-
-    #[test]
-    fn test_requires_native_for_other_provider_prefixes() {
-        let config = Config::default();
-        assert!(requires_native_executor("openai:gpt-5", &config));
-        assert!(requires_native_executor(
-            "gemini:gemini-2.0-flash-001",
-            &config
-        ));
-        assert!(requires_native_executor("ollama:llama3", &config));
-        assert!(requires_native_executor("local:my-model", &config));
-    }
 
     ///.assign-* tasks with `assignment` tag and `exec` field are detected as inline
     /// tasks and spawned via the lightweight inline path, not as full Claude agents.
