@@ -4,9 +4,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
+use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
 
 use super::graph_path;
+
+#[cfg(test)]
+use workgraph::parser::load_graph;
 
 fn archive_path(dir: &Path) -> std::path::PathBuf {
     dir.join("archive.jsonl")
@@ -346,6 +349,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use workgraph::graph::WorkGraph;
+    use workgraph::parser::{load_graph, save_graph};
 
     fn make_task(id: &str, title: &str, status: Status, completed_at: Option<&str>) -> Task {
         Task {

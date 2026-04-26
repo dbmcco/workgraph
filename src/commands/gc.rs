@@ -3,12 +3,22 @@ use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::path::Path;
 use workgraph::graph::Status;
-use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
+use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
 
 use super::graph_path;
 
+#[cfg(test)]
+use workgraph::parser::load_graph;
+
 /// Auto-generated task prefixes that should be gc'd alongside their parent task.
-const INTERNAL_PREFIXES: &[&str] = &[".assign-", ".evaluate-", ".verify-flip-", ".respond-to-", "assign-", "evaluate-"];
+const INTERNAL_PREFIXES: &[&str] = &[
+    ".assign-",
+    ".evaluate-",
+    ".verify-flip-",
+    ".respond-to-",
+    "assign-",
+    "evaluate-",
+];
 
 /// Get the best available terminal timestamp for a task.
 /// For done tasks, uses completed_at. For failed/abandoned, uses the last log
@@ -265,6 +275,7 @@ mod tests {
     use chrono::Duration;
     use tempfile::tempdir;
     use workgraph::graph::{LogEntry, Node, WorkGraph};
+    use workgraph::parser::{load_graph, save_graph};
 
     fn make_task(id: &str, title: &str, status: Status) -> workgraph::graph::Task {
         workgraph::graph::Task {

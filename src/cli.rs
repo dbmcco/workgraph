@@ -42,6 +42,83 @@ pub enum Commands {
         no_agency: bool,
     },
 
+    /// Bulk-reset a subgraph from one or more seed tasks
+    Reset {
+        /// First seed task
+        seed: String,
+
+        /// Additional seed tasks
+        #[arg(long = "seeds", value_delimiter = ',', num_args = 0..)]
+        seeds: Vec<String>,
+
+        /// Traversal direction: forward, backward, or both
+        #[arg(long, default_value = "forward")]
+        direction: String,
+
+        /// Also delete attached dot-prefixed system tasks
+        #[arg(long = "also-strip-meta")]
+        also_strip_meta: bool,
+
+        /// Show what would be reset without mutating
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Confirm destructive execution when affecting more than one task
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Rescue a failed task by inserting a first-class replacement at its graph slot
+    Rescue {
+        /// Target task to rescue
+        target: String,
+
+        /// What the rescue task needs to do differently
+        #[arg(long, short = 'd', alias = "desc")]
+        description: String,
+
+        /// Optional title override
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Explicit ID for the rescue task
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Eval task that concluded the failure
+        #[arg(long = "from-eval")]
+        from_eval: Option<String>,
+    },
+
+    /// Insert a task before, after, or parallel to an existing task
+    Insert {
+        /// Where to insert: before, after, or parallel
+        position: String,
+
+        /// Existing task that anchors the insertion
+        target: String,
+
+        /// Title for the new task
+        #[arg(long)]
+        title: String,
+
+        /// Detailed description for the new task
+        #[arg(long, short = 'd', alias = "desc")]
+        description: Option<String>,
+
+        /// Explicit ID for the new task
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Rewire direct edges through the new node exclusively in before/after mode
+        #[arg(long)]
+        splice: bool,
+
+        /// In parallel mode, route successors to the new node only
+        #[arg(long = "replace-edges")]
+        replace_edges: bool,
+    },
+
     /// Add a new task
     Add {
         /// Task title
@@ -2449,6 +2526,9 @@ pub enum TelegramCommands {
 pub fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Init { .. } => "init",
+        Commands::Reset { .. } => "reset",
+        Commands::Rescue { .. } => "rescue",
+        Commands::Insert { .. } => "insert",
         Commands::Add { .. } => "add",
         Commands::Edit { .. } => "edit",
         Commands::Done { .. } => "done",

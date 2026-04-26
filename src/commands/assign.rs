@@ -2,9 +2,12 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use workgraph::agency;
 use workgraph::config::Config;
-use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
+use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
 
 use super::graph_path;
+
+#[cfg(test)]
+use workgraph::parser::load_graph;
 
 /// Record an evaluation against the assigner special agent's performance.
 ///
@@ -243,6 +246,7 @@ mod tests {
     use tempfile::tempdir;
     use workgraph::agency::{Lineage, PerformanceRecord};
     use workgraph::graph::{Node, Task, WorkGraph};
+    use workgraph::parser::{load_graph, save_graph};
 
     fn make_task(id: &str, title: &str) -> Task {
         Task {

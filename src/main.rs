@@ -297,6 +297,81 @@ fn main() -> Result<()> {
 
     match command {
         Commands::Init { no_agency } => commands::init::run(&workgraph_dir, no_agency),
+        Commands::Reset {
+            seed,
+            seeds,
+            direction,
+            also_strip_meta,
+            dry_run,
+            yes,
+        } => {
+            let direction: commands::reset::Direction =
+                direction.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let mut all_seeds = vec![seed];
+            all_seeds.extend(seeds);
+            commands::reset::run(
+                &workgraph_dir,
+                &all_seeds,
+                commands::reset::ResetOptions {
+                    direction,
+                    also_strip_meta,
+                    dry_run,
+                    yes,
+                },
+            )?;
+            Ok(())
+        }
+        Commands::Rescue {
+            target,
+            description,
+            title,
+            id,
+            from_eval,
+        } => {
+            let actor = std::env::var("WG_ACTOR")
+                .ok()
+                .or_else(|| std::env::var("WG_AGENT_ID").ok());
+            let new_id = commands::rescue::run(
+                &workgraph_dir,
+                &target,
+                &description,
+                title.as_deref(),
+                id.as_deref(),
+                from_eval.as_deref(),
+                actor.as_deref(),
+            )?;
+            println!(
+                "Rescue task '{}' created (supersedes '{}').",
+                new_id, target
+            );
+            Ok(())
+        }
+        Commands::Insert {
+            position,
+            target,
+            title,
+            description,
+            id,
+            splice,
+            replace_edges,
+        } => {
+            let position: commands::insert::Position =
+                position.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let new_id = commands::insert::run(
+                &workgraph_dir,
+                position,
+                &target,
+                &title,
+                description.as_deref(),
+                id.as_deref(),
+                commands::insert::InsertOptions {
+                    splice,
+                    replace_edges,
+                },
+            )?;
+            println!("Inserted task '{}' ({:?} {}).", new_id, position, target);
+            Ok(())
+        }
         Commands::Add {
             title,
             id,
