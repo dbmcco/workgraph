@@ -51,7 +51,11 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
 }
 
 fn init_git_repo(path: &Path) {
-    Command::new("git").args(["init"]).arg(path).output().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .arg(path)
+        .output()
+        .unwrap();
     Command::new("git")
         .args(["config", "user.email", "test@test.com"])
         .current_dir(path)
@@ -115,6 +119,17 @@ fn wait_for(path: &Path) {
     panic!("Timed out waiting for {:?}", path);
 }
 
+fn wait_for_absent(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("Timed out waiting for {:?} to be removed", path);
+}
+
 #[test]
 fn spawn_uses_isolated_worktree_when_enabled() {
     let (dir, wg_dir) = setup_repo();
@@ -125,16 +140,14 @@ fn spawn_uses_isolated_worktree_when_enabled() {
     let metadata_path = agent_dir.join("metadata.json");
     wait_for(&metadata_path);
 
-    let metadata: Value = serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     let worktree_path = PathBuf::from(
         metadata["worktree_path"]
             .as_str()
             .expect("worktree_path missing from metadata"),
     );
-    assert_eq!(
-        metadata["worktree_branch"].as_str(),
-        Some("wg/agent-1/t1")
-    );
+    assert_eq!(metadata["worktree_branch"].as_str(), Some("wg/agent-1/t1"));
 
     let output_file = worktree_path.join("isolated_pwd.txt");
     wait_for(&output_file);
@@ -142,4 +155,54 @@ fn spawn_uses_isolated_worktree_when_enabled() {
     assert_eq!(recorded_pwd.trim(), worktree_path.to_string_lossy());
     assert!(worktree_path.join(".workgraph").exists());
     assert!(!dir.path().join("isolated_pwd.txt").exists());
+}
+
+#[test]
+fn service_tick_reaps_marked_isolated_worktree_after_agent_exit() {
+    let (dir, wg_dir) = setup_repo();
+
+    wg_ok(&wg_dir, &["spawn", "t1", "--executor", "shell"]);
+
+    let agent_dir = wg_dir.join("agents").join("agent-1");
+    let metadata_path = agent_dir.join("metadata.json");
+    wait_for(&metadata_path);
+
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let worktree_path = PathBuf::from(
+        metadata["worktree_path"]
+            .as_str()
+            .expect("worktree_path missing from metadata"),
+    );
+    let worktree_branch = metadata["worktree_branch"]
+        .as_str()
+        .expect("worktree_branch missing from metadata")
+        .to_string();
+
+    let output_file = worktree_path.join("isolated_pwd.txt");
+    wait_for(&output_file);
+
+    let cleanup_marker = worktree_path.join(".wg-cleanup-pending");
+    wait_for(&cleanup_marker);
+
+    wg_ok(&wg_dir, &["service", "tick"]);
+
+    wait_for_absent(&worktree_path);
+
+    let branch_check = Command::new("git")
+        .args(["branch", "--list", &worktree_branch])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        branch_check.status.success(),
+        "git branch --list failed: {}",
+        String::from_utf8_lossy(&branch_check.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&branch_check.stdout)
+            .trim()
+            .is_empty(),
+        "worktree branch should be deleted after cleanup"
+    );
 }

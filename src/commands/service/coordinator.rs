@@ -20,11 +20,11 @@ use workgraph::graph::{
     evaluate_all_cycle_iterations,
 };
 use workgraph::messages;
-use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, save_graph_locked};
+use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
 use workgraph::query::ready_tasks_with_peers_cycle_aware;
 use workgraph::service::registry::AgentRegistry;
 
-use super::triage;
+use super::{triage, worktree};
 use crate::commands::{graph_path, is_process_alive, spawn};
 
 /// Result of a single coordinator tick
@@ -51,6 +51,14 @@ fn cleanup_and_count_alive(
             "[coordinator] Cleaned up {} dead agent(s): {:?}",
             finished_agents.len(),
             finished_agents
+        );
+    }
+
+    let swept_worktrees = worktree::sweep_cleanup_pending_worktrees(dir)?;
+    if swept_worktrees > 0 {
+        eprintln!(
+            "[coordinator] Cleaned up {} finished worktree(s)",
+            swept_worktrees
         );
     }
 
@@ -928,17 +936,16 @@ fn build_auto_assign_tasks(
         };
 
         // Resolve the agent hash from the verdict
-        let resolved_agent =
-            match agency::find_agent_by_prefix(&agents_dir, &verdict.agent_hash) {
-                Ok(agent) => agent,
-                Err(e) => {
-                    eprintln!(
-                        "[coordinator] Assignment verdict agent '{}' not found for '{}': {}",
-                        verdict.agent_hash, task_id, e
-                    );
-                    continue;
-                }
-            };
+        let resolved_agent = match agency::find_agent_by_prefix(&agents_dir, &verdict.agent_hash) {
+            Ok(agent) => agent,
+            Err(e) => {
+                eprintln!(
+                    "[coordinator] Assignment verdict agent '{}' not found for '{}': {}",
+                    verdict.agent_hash, task_id, e
+                );
+                continue;
+            }
+        };
 
         // Apply assignment to the original task
         if let Some(task) = graph.get_task_mut(&task_id) {
@@ -1508,8 +1515,10 @@ fn spawn_eval_inline(
     use std::process::{Command, Stdio};
 
     let graph_path = graph_path(dir);
-    let _graph_lock = lock_graph_file(&graph_path).context("Failed to lock graph for eval spawn")?;
-    let mut graph = load_graph_locked(&graph_path, &_graph_lock).context("Failed to load graph for eval spawn")?;
+    let _graph_lock =
+        lock_graph_file(&graph_path).context("Failed to lock graph for eval spawn")?;
+    let mut graph = load_graph_locked(&graph_path, &_graph_lock)
+        .context("Failed to load graph for eval spawn")?;
 
     // Extract needed fields from the eval task before releasing the mutable borrow.
     let (eval_task_status, eval_task_exec, eval_task_agent) = {
@@ -1646,7 +1655,8 @@ exit $EXIT_CODE"#,
                 .unwrap_or_default()
         ),
     });
-    save_graph_locked(&graph, &graph_path, &_graph_lock).context("Failed to save graph after claiming eval task")?;
+    save_graph_locked(&graph, &graph_path, &_graph_lock)
+        .context("Failed to save graph after claiming eval task")?;
 
     // Fork the process
     let mut cmd = Command::new("bash");
@@ -1732,10 +1742,7 @@ fn spawn_agents_for_ready_tasks(
         // before being spawned.  The assignment flow sets `task.agent`; if it's
         // still None the task hasn't been assigned yet — skip it so the next
         // tick's Phase 3 can create the .assign-* task.
-        if auto_assign
-            && !workgraph::graph::is_system_task(&task.id)
-            && task.agent.is_none()
-        {
+        if auto_assign && !workgraph::graph::is_system_task(&task.id) && task.agent.is_none() {
             continue;
         }
 
@@ -2067,7 +2074,8 @@ pub fn coordinator_tick(
     {
         let resurrect_modified = resurrect_done_tasks(&mut graph, dir);
         if resurrect_modified {
-            save_graph_locked(&graph, &graph_path, &_tick_lock).context("Failed to save graph after resurrection")?;
+            save_graph_locked(&graph, &graph_path, &_tick_lock)
+                .context("Failed to save graph after resurrection")?;
         }
     }
 
@@ -2245,7 +2253,7 @@ mod tests {
             .unwrap_or_else(|| {
                 eval_task_id
                     .strip_prefix(".evaluate-")
-        .or_else(|| eval_task_id.strip_prefix("evaluate-"))
+                    .or_else(|| eval_task_id.strip_prefix("evaluate-"))
                     .unwrap_or(eval_task_id)
             });
         assert_eq!(source_id, "some-task");
@@ -3277,16 +3285,14 @@ mod tests {
         save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
 
         let result = spawn_agents_for_ready_tasks(
-            wg_dir,
-            &graph,
-            "shell",
-            None,
-            10,
-            true, // auto_assign = true
+            wg_dir, &graph, "shell", None, 10, true, // auto_assign = true
         );
 
         // Task should be skipped (no agent), so nothing spawned
-        assert_eq!(result, 0, "unassigned task should NOT be spawned when auto_assign=true");
+        assert_eq!(
+            result, 0,
+            "unassigned task should NOT be spawned when auto_assign=true"
+        );
     }
 
     /// When auto_assign=true, a ready task WITH an agent field SHOULD be
@@ -3310,7 +3316,10 @@ mod tests {
         // The filter: skip if auto_assign && !is_system && agent.is_none()
         // For system tasks, !is_system is false, so the condition is false → not skipped
         let would_skip = true && !is_system && true; // auto_assign=true, agent=None
-        assert!(!would_skip, "system tasks should never be skipped by auto_assign filter");
+        assert!(
+            !would_skip,
+            "system tasks should never be skipped by auto_assign filter"
+        );
     }
 
     /// When auto_assign=false, tasks without agent field should still be spawned.

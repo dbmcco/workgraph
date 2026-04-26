@@ -21,6 +21,7 @@ mod coordinator;
 pub(crate) mod coordinator_agent;
 pub mod ipc;
 mod triage;
+mod worktree;
 
 pub use ipc::{IpcRequest, IpcResponse};
 
