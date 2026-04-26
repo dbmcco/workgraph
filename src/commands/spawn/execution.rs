@@ -22,6 +22,56 @@ use super::{
     shell_escape,
 };
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EndpointExecutionConfig {
+    provider: Option<String>,
+    endpoint_name: Option<String>,
+    endpoint_url: Option<String>,
+    api_key: Option<String>,
+    provider_env_vars: Vec<String>,
+}
+
+fn resolve_endpoint_execution_config(
+    config: &Config,
+    task: &Task,
+    effective_model: Option<&str>,
+) -> EndpointExecutionConfig {
+    let task_provider = task
+        .provider
+        .as_deref()
+        .map(workgraph::config::provider_to_native_provider)
+        .map(String::from);
+    let model_provider = effective_model
+        .and_then(|model| workgraph::config::parse_model_spec(model).provider)
+        .map(|provider| workgraph::config::provider_to_native_provider(&provider).to_string());
+    let hinted_provider = task_provider.or(model_provider);
+    let endpoint = hinted_provider
+        .as_deref()
+        .and_then(|provider| config.llm_endpoints.find_for_provider(provider))
+        .or_else(|| config.llm_endpoints.find_default());
+
+    let provider = hinted_provider.or_else(|| endpoint.map(|ep| ep.provider.clone()));
+    let endpoint_name = endpoint.map(|ep| ep.name.clone());
+    let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
+    let api_key = endpoint.and_then(|ep| ep.resolve_api_key().ok().flatten());
+    let provider_env_vars = endpoint
+        .map(|ep| {
+            workgraph::config::EndpointConfig::env_var_names_for_provider(&ep.provider)
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    EndpointExecutionConfig {
+        provider,
+        endpoint_name,
+        endpoint_url,
+        api_key,
+        provider_env_vars,
+    }
+}
+
 /// Internal shared implementation for spawning an agent.
 /// Both `run()` (CLI) and `spawn_agent()` (coordinator) delegate here.
 pub(crate) fn spawn_agent_inner(
@@ -123,6 +173,8 @@ pub(crate) fn spawn_agent_inner(
     let effective_model = task_model
         .or_else(|| executor_config.executor.model.clone())
         .or_else(|| model.map(std::string::ToString::to_string));
+    let endpoint_execution =
+        resolve_endpoint_execution_config(&config, task, effective_model.as_deref());
 
     // Override model in template vars with effective model
     if let Some(ref m) = effective_model {
@@ -255,6 +307,22 @@ pub(crate) fn spawn_agent_inner(
     if let Some(ref m) = effective_model {
         cmd.env("WG_MODEL", m);
     }
+    if let Some(ref provider) = endpoint_execution.provider {
+        cmd.env("WG_LLM_PROVIDER", provider);
+    }
+    if let Some(ref endpoint_name) = endpoint_execution.endpoint_name {
+        cmd.env("WG_ENDPOINT", endpoint_name);
+        cmd.env("WG_ENDPOINT_NAME", endpoint_name);
+    }
+    if let Some(ref endpoint_url) = endpoint_execution.endpoint_url {
+        cmd.env("WG_ENDPOINT_URL", endpoint_url);
+    }
+    if let Some(ref api_key) = endpoint_execution.api_key {
+        cmd.env("WG_API_KEY", api_key);
+        for var_name in &endpoint_execution.provider_env_vars {
+            cmd.env(var_name, api_key);
+        }
+    }
 
     if let Some(ref wt) = worktree_info {
         cmd.current_dir(&wt.path);
@@ -370,7 +438,9 @@ pub(crate) fn spawn_agent_inner(
                             actor: Some(temp_agent_id.clone()),
                             message: format!("Spawn failed, reverting claim: {}", e),
                         });
-                        if let Err(save_err) = save_graph_locked(&rollback_graph, &graph_path, &_spawn_lock) {
+                        if let Err(save_err) =
+                            save_graph_locked(&rollback_graph, &graph_path, &_spawn_lock)
+                        {
                             eprintln!(
                                 "Warning: failed to save rollback graph for task '{}': {}",
                                 task_id, save_err
@@ -853,7 +923,9 @@ exit $EXIT_CODE
 
 #[cfg(test)]
 mod tests {
-    use super::should_create_worktree;
+    use super::{resolve_endpoint_execution_config, should_create_worktree};
+    use workgraph::config::{Config, EndpointConfig};
+    use workgraph::graph::Task;
 
     #[test]
     fn worktree_creation_is_disabled_without_flag() {
@@ -872,5 +944,79 @@ mod tests {
     fn worktree_creation_enables_code_writing_tasks() {
         assert!(should_create_worktree(true, "task-1", "full"));
         assert!(should_create_worktree(true, "task-1", "shell"));
+    }
+
+    #[test]
+    fn endpoint_execution_prefers_task_provider_match() {
+        let mut config = Config::default();
+        config.llm_endpoints.endpoints = vec![
+            EndpointConfig {
+                name: "openrouter-default".to_string(),
+                provider: "openrouter".to_string(),
+                url: Some("https://openrouter.ai/api/v1".to_string()),
+                model: None,
+                api_key: Some("sk-openrouter".to_string()),
+                is_default: true,
+            },
+            EndpointConfig {
+                name: "anthropic-direct".to_string(),
+                provider: "anthropic".to_string(),
+                url: Some("https://api.anthropic.com".to_string()),
+                model: None,
+                api_key: Some("sk-anthropic".to_string()),
+                is_default: false,
+            },
+        ];
+        let task = Task {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = resolve_endpoint_execution_config(
+            &config,
+            &task,
+            Some("openrouter:minimax/minimax-m1"),
+        );
+
+        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(resolved.endpoint_name.as_deref(), Some("anthropic-direct"));
+        assert_eq!(
+            resolved.endpoint_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-anthropic"));
+        assert_eq!(resolved.provider_env_vars, vec!["ANTHROPIC_API_KEY"]);
+    }
+
+    #[test]
+    fn endpoint_execution_falls_back_to_default_endpoint() {
+        let mut config = Config::default();
+        config.llm_endpoints.endpoints = vec![EndpointConfig {
+            name: "openrouter-default".to_string(),
+            provider: "openrouter".to_string(),
+            url: Some("https://openrouter.ai/api/v1".to_string()),
+            model: None,
+            api_key: Some("sk-openrouter".to_string()),
+            is_default: true,
+        }];
+        let task = Task::default();
+
+        let resolved =
+            resolve_endpoint_execution_config(&config, &task, Some("openai:gpt-4o-mini"));
+
+        assert_eq!(resolved.provider.as_deref(), Some("openai"));
+        assert_eq!(
+            resolved.endpoint_name.as_deref(),
+            Some("openrouter-default")
+        );
+        assert_eq!(
+            resolved.endpoint_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-openrouter"));
+        assert_eq!(
+            resolved.provider_env_vars,
+            vec!["OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+        );
     }
 }

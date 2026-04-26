@@ -311,6 +311,38 @@ fn default_provider() -> String {
 }
 
 impl EndpointConfig {
+    /// Return the provider-specific environment variables that may carry an API key.
+    pub fn env_var_names_for_provider(provider: &str) -> &'static [&'static str] {
+        match provider {
+            "openrouter" => &["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+            "openai" => &["OPENAI_API_KEY"],
+            "anthropic" => &["ANTHROPIC_API_KEY"],
+            _ => &[],
+        }
+    }
+
+    /// Resolve the API key for this endpoint.
+    ///
+    /// Priority:
+    /// 1. Inline `api_key`
+    /// 2. Provider-specific environment variable fallback
+    pub fn resolve_api_key(&self) -> anyhow::Result<Option<String>> {
+        if let Some(ref key) = self.api_key
+            && !key.trim().is_empty()
+        {
+            return Ok(Some(key.trim().to_string()));
+        }
+        for var_name in Self::env_var_names_for_provider(&self.provider) {
+            if let Ok(key) = std::env::var(var_name) {
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    return Ok(Some(key));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the API key masked for display: "sk-****...ab12"
     pub fn masked_key(&self) -> String {
         match &self.api_key {
@@ -342,6 +374,37 @@ pub struct EndpointsConfig {
     /// List of configured endpoints
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+}
+
+impl EndpointsConfig {
+    /// Find the best endpoint for a given provider.
+    pub fn find_for_provider(&self, provider: &str) -> Option<&EndpointConfig> {
+        let mut first_match: Option<&EndpointConfig> = None;
+        for endpoint in &self.endpoints {
+            if endpoint.provider == provider {
+                if endpoint.is_default {
+                    return Some(endpoint);
+                }
+                if first_match.is_none() {
+                    first_match = Some(endpoint);
+                }
+            }
+        }
+        first_match
+    }
+
+    /// Find an endpoint by its configured name.
+    pub fn find_by_name(&self, name: &str) -> Option<&EndpointConfig> {
+        self.endpoints.iter().find(|endpoint| endpoint.name == name)
+    }
+
+    /// Find the default endpoint, or fall back to the first configured endpoint.
+    pub fn find_default(&self) -> Option<&EndpointConfig> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.is_default)
+            .or_else(|| self.endpoints.first())
+    }
 }
 
 /// Checkpoint configuration for agent context preservation
@@ -1232,6 +1295,17 @@ pub fn provider_to_executor(provider: &str) -> &'static str {
     }
 }
 
+/// Map a provider prefix to the internal provider name used by the native executor.
+pub fn provider_to_native_provider(provider: &str) -> &str {
+    match provider {
+        "claude" => "anthropic",
+        "openrouter" => "openrouter",
+        "openai" | "oai-compat" | "codex" | "gemini" | "native" => "openai",
+        "ollama" | "llamacpp" | "vllm" | "local" => "local",
+        other => other,
+    }
+}
+
 fn default_executor() -> String {
     "claude".to_string()
 }
@@ -1635,6 +1709,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -2213,5 +2288,131 @@ worktree_isolation = true
         config.coordinator.executor = "amplifier".to_string();
         config.coordinator.model = Some("openrouter:minimax/minimax-m1".to_string());
         assert_eq!(config.coordinator.effective_executor(), "amplifier");
+    }
+
+    #[test]
+    fn test_find_for_provider_prefers_default_endpoint() {
+        let endpoints = EndpointsConfig {
+            endpoints: vec![
+                EndpointConfig {
+                    name: "first-openai".to_string(),
+                    provider: "openai".to_string(),
+                    url: None,
+                    model: None,
+                    api_key: Some("sk-first".to_string()),
+                    is_default: false,
+                },
+                EndpointConfig {
+                    name: "default-openai".to_string(),
+                    provider: "openai".to_string(),
+                    url: Some("https://api.openai.com/v1".to_string()),
+                    model: None,
+                    api_key: Some("sk-default".to_string()),
+                    is_default: true,
+                },
+            ],
+        };
+
+        let endpoint = endpoints.find_for_provider("openai").unwrap();
+        assert_eq!(endpoint.name, "default-openai");
+        assert_eq!(endpoint.api_key.as_deref(), Some("sk-default"));
+    }
+
+    #[test]
+    fn test_find_default_falls_back_to_first_endpoint() {
+        let endpoints = EndpointsConfig {
+            endpoints: vec![EndpointConfig {
+                name: "only".to_string(),
+                provider: "openrouter".to_string(),
+                url: Some("https://openrouter.ai/api/v1".to_string()),
+                model: None,
+                api_key: None,
+                is_default: false,
+            }],
+        };
+
+        let endpoint = endpoints.find_default().unwrap();
+        assert_eq!(endpoint.name, "only");
+    }
+
+    #[test]
+    fn test_find_by_name_returns_named_endpoint() {
+        let endpoints = EndpointsConfig {
+            endpoints: vec![
+                EndpointConfig {
+                    name: "anthropic-direct".to_string(),
+                    provider: "anthropic".to_string(),
+                    url: Some("https://api.anthropic.com".to_string()),
+                    model: None,
+                    api_key: None,
+                    is_default: false,
+                },
+                EndpointConfig {
+                    name: "openrouter-default".to_string(),
+                    provider: "openrouter".to_string(),
+                    url: Some("https://openrouter.ai/api/v1".to_string()),
+                    model: None,
+                    api_key: None,
+                    is_default: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            endpoints.find_by_name("anthropic-direct").unwrap().provider,
+            "anthropic"
+        );
+        assert!(endpoints.find_by_name("missing").is_none());
+    }
+
+    #[test]
+    fn test_endpoint_resolve_api_key_prefers_inline_key() {
+        let endpoint = EndpointConfig {
+            name: "openrouter".to_string(),
+            provider: "openrouter".to_string(),
+            url: None,
+            model: None,
+            api_key: Some(" sk-inline ".to_string()),
+            is_default: false,
+        };
+
+        let key = endpoint.resolve_api_key().unwrap();
+        assert_eq!(key.as_deref(), Some("sk-inline"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_endpoint_resolve_api_key_falls_back_to_provider_env() {
+        let saved = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-openai") };
+
+        let endpoint = EndpointConfig {
+            name: "openai".to_string(),
+            provider: "openai".to_string(),
+            url: None,
+            model: None,
+            api_key: None,
+            is_default: false,
+        };
+
+        let key = endpoint.resolve_api_key().unwrap();
+        assert_eq!(key.as_deref(), Some("sk-env-openai"));
+
+        match saved {
+            Some(value) => unsafe { std::env::set_var("OPENAI_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+    }
+
+    #[test]
+    fn test_provider_to_native_provider_mapping() {
+        assert_eq!(provider_to_native_provider("claude"), "anthropic");
+        assert_eq!(provider_to_native_provider("openrouter"), "openrouter");
+        assert_eq!(provider_to_native_provider("openai"), "openai");
+        assert_eq!(provider_to_native_provider("oai-compat"), "openai");
+        assert_eq!(provider_to_native_provider("codex"), "openai");
+        assert_eq!(provider_to_native_provider("gemini"), "openai");
+        assert_eq!(provider_to_native_provider("local"), "local");
+        assert_eq!(provider_to_native_provider("ollama"), "local");
     }
 }

@@ -14,6 +14,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use workgraph::config::Config;
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
 use workgraph::executor::native::client::{AnthropicClient, LlmClient};
@@ -22,30 +23,56 @@ use workgraph::executor::native::tools::ToolRegistry;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250514";
 
-/// Resolve which LLM provider to use and create the appropriate client.
-///
-/// Resolution order:
-/// 1. `[native_executor] provider` in config.toml ("anthropic" or "openai")
-/// 2. `WG_LLM_PROVIDER` environment variable
-/// 3. Heuristic: if model contains "/" (e.g., "openai/gpt-4o"), use OpenAI
-/// 4. Default to "anthropic"
-fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>> {
-    // Read config for provider and endpoint settings
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedNativeClientConfig {
+    provider: String,
+    api_base: Option<String>,
+    api_key: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+fn resolve_legacy_native_executor_settings(
+    workgraph_dir: &Path,
+) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
     let config_path = workgraph_dir.join("config.toml");
     let config_val: Option<toml::Value> = std::fs::read_to_string(&config_path)
         .ok()
-        .and_then(|c| toml::from_str(&c).ok());
+        .and_then(|content| toml::from_str(&content).ok());
+    let native_cfg = config_val
+        .as_ref()
+        .and_then(|value| value.get("native_executor"));
 
-    let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
-
-    // Resolve provider
     let provider = native_cfg
-        .and_then(|c| c.get("provider"))
-        .and_then(|v| v.as_str())
+        .and_then(|cfg| cfg.get("provider"))
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let api_base = native_cfg
+        .and_then(|cfg| cfg.get("api_base"))
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let api_key = native_cfg
+        .and_then(|cfg| cfg.get("api_key"))
+        .and_then(|value| value.as_str())
         .map(String::from)
-        .or_else(|| std::env::var("WG_LLM_PROVIDER").ok())
+        .filter(|value| !value.trim().is_empty());
+    let max_tokens = native_cfg
+        .and_then(|cfg| cfg.get("max_tokens"))
+        .and_then(|value| value.as_integer())
+        .map(|value| value as u32);
+
+    (provider, api_base, api_key, max_tokens)
+}
+
+fn resolve_native_client_config(workgraph_dir: &Path, model: &str) -> ResolvedNativeClientConfig {
+    let config = Config::load_or_default(workgraph_dir);
+    let (legacy_provider, legacy_api_base, legacy_api_key, max_tokens) =
+        resolve_legacy_native_executor_settings(workgraph_dir);
+
+    let provider = std::env::var("WG_LLM_PROVIDER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or(legacy_provider)
         .unwrap_or_else(|| {
-            // Heuristic: models with "/" are likely OpenRouter format
             if model.contains('/') {
                 "openai".to_string()
             } else {
@@ -53,32 +80,60 @@ fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>
             }
         });
 
-    // Resolve optional base URL and max_tokens from config
-    let api_base = native_cfg
-        .and_then(|c| c.get("api_base"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let endpoint = config
+        .llm_endpoints
+        .find_for_provider(&provider)
+        .or_else(|| config.llm_endpoints.find_default());
 
-    let max_tokens = native_cfg
-        .and_then(|c| c.get("max_tokens"))
-        .and_then(|v| v.as_integer())
-        .map(|v| v as u32);
+    let api_base = std::env::var("WG_ENDPOINT_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| endpoint.and_then(|ep| ep.url.clone()))
+        .or(legacy_api_base);
 
-    match provider.as_str() {
+    let api_key = std::env::var("WG_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| endpoint.and_then(|ep| ep.resolve_api_key().ok().flatten()))
+        .or(legacy_api_key);
+
+    ResolvedNativeClientConfig {
+        provider,
+        api_base,
+        api_key,
+        max_tokens,
+    }
+}
+
+/// Resolve which LLM provider to use and create the appropriate client.
+///
+/// Resolution order:
+/// 1. Spawn-resolved `WG_*` endpoint env vars
+/// 2. Matching/default `[llm_endpoints]` config
+/// 3. Legacy `[native_executor]` config
+/// 4. Model heuristic / provider-specific env fallback
+fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>> {
+    let resolved = resolve_native_client_config(workgraph_dir, model);
+
+    match resolved.provider.as_str() {
         "openai" | "openrouter" => {
-            let mut client = OpenAiClient::from_env(model)
-                .or_else(|_| {
-                    // Fall back to Anthropic key for OpenRouter (it accepts both)
-                    let key = workgraph::executor::native::client::resolve_api_key_from_dir(
+            let api_key = resolved
+                .api_key
+                .clone()
+                .or_else(|| {
+                    workgraph::executor::native::openai_client::resolve_openai_api_key_from_dir(
                         workgraph_dir,
-                    )?;
-                    OpenAiClient::new(key, model, None)
+                    )
+                    .ok()
+                })
+                .or_else(|| {
+                    workgraph::executor::native::client::resolve_api_key_from_dir(workgraph_dir)
+                        .ok()
                 })
                 .context("Failed to initialize OpenAI-compatible client")?;
-            if let Some(base) = api_base {
-                client = client.with_base_url(&base);
-            }
-            if let Some(mt) = max_tokens {
+            let mut client = OpenAiClient::new(api_key, model, resolved.api_base.as_deref())
+                .context("Failed to initialize OpenAI-compatible client")?;
+            if let Some(mt) = resolved.max_tokens {
                 client = client.with_max_tokens(mt);
             }
             eprintln!(
@@ -88,13 +143,20 @@ fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>
             Ok(Box::new(client))
         }
         _ => {
-            // Default: Anthropic
-            let mut client = AnthropicClient::from_env(model)
+            let api_key = resolved
+                .api_key
+                .clone()
+                .or_else(|| {
+                    workgraph::executor::native::client::resolve_api_key_from_dir(workgraph_dir)
+                        .ok()
+                })
                 .context("Failed to initialize Anthropic client")?;
-            if let Some(base) = api_base {
+            let mut client = AnthropicClient::from_config(&api_key, model)
+                .context("Failed to initialize Anthropic client")?;
+            if let Some(base) = resolved.api_base {
                 client = client.with_base_url(&base);
             }
-            if let Some(mt) = max_tokens {
+            if let Some(mt) = resolved.max_tokens {
                 client = client.with_max_tokens(mt);
             }
             eprintln!("[native-exec] Using Anthropic provider ({})", client.model);
@@ -182,4 +244,116 @@ pub fn run(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_native_client_config;
+    use serial_test::serial;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    #[serial]
+    fn native_client_config_prefers_spawn_env_over_legacy_config() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("config.toml"),
+            r#"
+[native_executor]
+provider = "anthropic"
+api_base = "https://anthropic.example"
+api_key = "sk-legacy"
+max_tokens = 321
+"#,
+        )
+        .unwrap();
+
+        let saved_provider = std::env::var("WG_LLM_PROVIDER").ok();
+        let saved_url = std::env::var("WG_ENDPOINT_URL").ok();
+        let saved_key = std::env::var("WG_API_KEY").ok();
+        unsafe {
+            std::env::set_var("WG_LLM_PROVIDER", "openrouter");
+            std::env::set_var("WG_ENDPOINT_URL", "https://router.example/v1");
+            std::env::set_var("WG_API_KEY", "sk-spawn");
+        }
+
+        let resolved = resolve_native_client_config(temp_dir.path(), "openrouter:qwen/qwen3");
+
+        assert_eq!(resolved.provider, "openrouter");
+        assert_eq!(
+            resolved.api_base.as_deref(),
+            Some("https://router.example/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-spawn"));
+        assert_eq!(resolved.max_tokens, Some(321));
+
+        match saved_provider {
+            Some(value) => unsafe { std::env::set_var("WG_LLM_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("WG_LLM_PROVIDER") },
+        }
+        match saved_url {
+            Some(value) => unsafe { std::env::set_var("WG_ENDPOINT_URL", value) },
+            None => unsafe { std::env::remove_var("WG_ENDPOINT_URL") },
+        }
+        match saved_key {
+            Some(value) => unsafe { std::env::set_var("WG_API_KEY", value) },
+            None => unsafe { std::env::remove_var("WG_API_KEY") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn native_client_config_uses_matching_endpoint_when_spawn_env_is_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("config.toml"),
+            r#"
+[llm_endpoints]
+[[llm_endpoints.endpoints]]
+name = "router"
+provider = "openrouter"
+url = "https://openrouter.ai/api/v1"
+api_key = "sk-router"
+is_default = true
+
+[native_executor]
+provider = "openrouter"
+max_tokens = 111
+"#,
+        )
+        .unwrap();
+
+        let saved_provider = std::env::var("WG_LLM_PROVIDER").ok();
+        let saved_url = std::env::var("WG_ENDPOINT_URL").ok();
+        let saved_key = std::env::var("WG_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("WG_LLM_PROVIDER");
+            std::env::remove_var("WG_ENDPOINT_URL");
+            std::env::remove_var("WG_API_KEY");
+        }
+
+        let resolved = resolve_native_client_config(temp_dir.path(), "openrouter:qwen/qwen3");
+
+        assert_eq!(resolved.provider, "openrouter");
+        assert_eq!(
+            resolved.api_base.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-router"));
+        assert_eq!(resolved.max_tokens, Some(111));
+
+        match saved_provider {
+            Some(value) => unsafe { std::env::set_var("WG_LLM_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("WG_LLM_PROVIDER") },
+        }
+        match saved_url {
+            Some(value) => unsafe { std::env::set_var("WG_ENDPOINT_URL", value) },
+            None => unsafe { std::env::remove_var("WG_ENDPOINT_URL") },
+        }
+        match saved_key {
+            Some(value) => unsafe { std::env::set_var("WG_API_KEY", value) },
+            None => unsafe { std::env::remove_var("WG_API_KEY") },
+        }
+    }
 }
