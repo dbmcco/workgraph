@@ -85,3 +85,13 @@ owners = [
 ]
 description = "wg tui's '4: Log' pane renders raw_stream.jsonl events for an in-progress task's assigned agent on first draw, and picks up new events as they're appended. Regression for the tui-agent-activity merge that surfaced 'no agent output yet' to users despite stream files existing."
 timeout_seconds = 60
+
+[[scenario]]
+name = "evaluate_record_flag_args"
+script = "scenarios/evaluate_record_flag_args.sh"
+owners = [
+    "wg-evaluate-record",
+    "smoke-gate-is",
+]
+description = "wg evaluate record requires --task/--score/--source (flag-style). Regression for the inline-eval wrapper script in coordinator.rs that passed positionally and silently dropped every FLIP / agency eval result."
+timeout_seconds = 30

@@ -2658,6 +2658,64 @@ fn write_inline_artifacts(
 ///
 /// The forked process is still tracked in the agent registry for dead-agent
 /// detection.
+/// Build the bash script that runs an inline eval, optionally records a
+/// special-agent performance row, and marks the eval task done/failed.
+///
+/// Inputs `escaped_eval_id` and `escaped_output` are already shell-escaped
+/// for single-quoted contexts (i.e. each `'` already replaced with `'\''`).
+/// `special_agent_id`, when present, is similarly escaped by the caller.
+fn build_inline_eval_script(
+    eval_cmd: &str,
+    escaped_eval_id: &str,
+    escaped_output: &str,
+    special_agent_id: Option<&str>,
+) -> String {
+    if let Some(sa_id) = special_agent_id {
+        let escaped_sa_id = sa_id.replace('\'', "'\\''");
+        format!(
+            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+_WG_STDERR=$(mktemp)
+{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+EXIT_CODE=$?
+cat "$_WG_STDERR" >> '{escaped_output}'
+if [ $EXIT_CODE -eq 0 ]; then
+    rm -f "$_WG_STDERR"
+    wg evaluate record --task '{escaped_eval_id}' --score 1.0 --source system --notes "Inline evaluation completed successfully (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
+    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
+else
+    _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
+    _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
+    rm -f "$_WG_STDERR"
+    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
+    wg evaluate record --task '{escaped_eval_id}' --score 0.0 --source system --notes "Inline evaluation failed with exit code $EXIT_CODE (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
+    REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
+    wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
+fi
+exit $EXIT_CODE"#,
+        )
+    } else {
+        format!(
+            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
+_WG_STDERR=$(mktemp)
+{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
+EXIT_CODE=$?
+cat "$_WG_STDERR" >> '{escaped_output}'
+if [ $EXIT_CODE -eq 0 ]; then
+    rm -f "$_WG_STDERR"
+    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
+else
+    _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
+    _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
+    rm -f "$_WG_STDERR"
+    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
+    REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
+    wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
+fi
+exit $EXIT_CODE"#,
+        )
+    }
+}
+
 fn spawn_eval_inline(
     dir: &Path,
     eval_task_id: &str,
@@ -2774,50 +2832,12 @@ fn spawn_eval_inline(
     // Single script: run eval, record special agent perf, then mark done/failed.
     // Token usage is captured by `wg done` which parses __WG_TOKENS__ lines
     // from the output.log directly.
-    let script = if let Some(ref sa_id) = special_agent_verified {
-        let escaped_sa_id = sa_id.replace('\'', "'\\''");
-        format!(
-            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
-_WG_STDERR=$(mktemp)
-{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
-EXIT_CODE=$?
-cat "$_WG_STDERR" >> '{escaped_output}'
-if [ $EXIT_CODE -eq 0 ]; then
-    rm -f "$_WG_STDERR"
-    wg evaluate record '{escaped_eval_id}' 1.0 --source system --notes "Inline evaluation completed successfully (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
-    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
-else
-    _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
-    _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
-    rm -f "$_WG_STDERR"
-    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
-    wg evaluate record '{escaped_eval_id}' 0.0 --source system --notes "Inline evaluation failed with exit code $EXIT_CODE (agent: {escaped_sa_id})" 2>> '{escaped_output}' || true
-    REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
-    wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
-fi
-exit $EXIT_CODE"#,
-        )
-    } else {
-        format!(
-            r#"unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT
-_WG_STDERR=$(mktemp)
-{eval_cmd} >> '{escaped_output}' 2>"$_WG_STDERR"
-EXIT_CODE=$?
-cat "$_WG_STDERR" >> '{escaped_output}'
-if [ $EXIT_CODE -eq 0 ]; then
-    rm -f "$_WG_STDERR"
-    wg done '{escaped_eval_id}' 2>> '{escaped_output}'
-else
-    _WG_STDERR_TAIL=$(tail -n 20 "$_WG_STDERR" 2>/dev/null | head -c 2000 || true)
-    _WG_STDERR_FULL=$(tail -n 100 "$_WG_STDERR" 2>/dev/null || true)
-    rm -f "$_WG_STDERR"
-    wg log '{escaped_eval_id}' "Eval stderr: $_WG_STDERR_FULL" 2>> '{escaped_output}' || true
-    REASON=$(printf 'wg evaluate exited with code %s\n---\n%s' "$EXIT_CODE" "$_WG_STDERR_TAIL")
-    wg fail '{escaped_eval_id}' --reason "$REASON" 2>> '{escaped_output}'
-fi
-exit $EXIT_CODE"#,
-        )
-    };
+    let script = build_inline_eval_script(
+        &eval_cmd,
+        &escaped_eval_id,
+        &escaped_output,
+        special_agent_verified.as_deref(),
+    );
 
     write_inline_artifacts(&output_dir, &agent_id, eval_task_id, "eval", evaluator_model, &script);
 
@@ -4433,6 +4453,64 @@ mod tests {
                     .unwrap_or(eval_task_id)
             });
         assert_eq!(source_id, "some-task");
+    }
+
+    #[test]
+    fn test_flip_eval_record_invocation_uses_flag_args() {
+        // Regression test: the inline-eval script that wraps FLIP / agency
+        // evaluations MUST invoke `wg evaluate record` with flag-style args
+        // (`--task <id> --score <n>`), not positional, because the CLI now
+        // requires them. Positional args here cause:
+        //   error: unexpected argument '.flip-...' found
+        // and the eval result is silently dropped.
+        let script = build_inline_eval_script(
+            "wg evaluate run my-source",
+            ".flip-my-source",
+            "/tmp/out.log",
+            Some("agent-hash-deadbeef"),
+        );
+
+        // Success branch: must use --task / --score, NOT positional.
+        assert!(
+            script.contains(
+                "wg evaluate record --task '.flip-my-source' --score 1.0 --source system"
+            ),
+            "success branch must use flag-style record invocation; got:\n{script}"
+        );
+
+        // Failure branch: same contract, score 0.0.
+        assert!(
+            script.contains(
+                "wg evaluate record --task '.flip-my-source' --score 0.0 --source system"
+            ),
+            "failure branch must use flag-style record invocation; got:\n{script}"
+        );
+
+        // Negative assertion: no positional `record <task-id>` form survives.
+        assert!(
+            !script.contains("wg evaluate record '.flip-my-source'"),
+            "positional record invocation must not appear; got:\n{script}"
+        );
+        assert!(
+            !script.contains("wg evaluate record '.flip-my-source' 1.0"),
+            "positional record invocation must not appear; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn test_inline_eval_script_without_special_agent_skips_record() {
+        // When there is no resolved special agent, the script must NOT
+        // emit a `wg evaluate record` line at all (success or failure branch).
+        let script =
+            build_inline_eval_script("wg evaluate run my-source", "evaluate-my-source", "/tmp/out.log", None);
+
+        assert!(
+            !script.contains("wg evaluate record"),
+            "no-special-agent branch must skip record entirely; got:\n{script}"
+        );
+        // Sanity: still wraps the eval and finalizes the task.
+        assert!(script.contains("wg evaluate run my-source"));
+        assert!(script.contains("wg done 'evaluate-my-source'"));
     }
 
     #[test]
