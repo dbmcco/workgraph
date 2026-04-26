@@ -99,6 +99,7 @@ pub mod commands {
     pub mod service {
         pub mod worktree;
     }
+    pub mod codex_oai_compat;
 }
 
 /// Return the current user identity.

@@ -1911,7 +1911,7 @@ impl AgentLoop {
                 // quiet for STREAM_IDLE_TIMEOUT_SECS (600s default),
                 // abort it. Prevents indefinite hangs on silently
                 // dropped connections. Override via env var
-                // WG_STREAM_IDLE_TIMEOUT_SECS.
+                // WG_STREAM_IDLE_TIMEOUT_SECS or --idle-timeout-secs flag.
                 //
                 // 600s because local llama.cpp / vLLM servers on modest
                 // hardware can spend several minutes on prompt-processing
