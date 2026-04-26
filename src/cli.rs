@@ -1486,12 +1486,12 @@ pub enum Commands {
         #[arg(long)]
         poll_interval: Option<u64>,
 
-        /// Set coordinator executor
-        #[arg(long)]
-        coordinator_executor: Option<String>,
+        /// Set dispatcher executor (legacy alias: --coordinator-executor)
+        #[arg(long, alias = "coordinator-executor")]
+        dispatcher_executor: Option<String>,
 
-        /// Set coordinator model (e.g., opus, sonnet, haiku)
-        #[arg(long)]
+        /// Set dispatcher model (e.g., opus, sonnet, haiku); legacy alias: --coordinator-model
+        #[arg(long, alias = "coordinator-model")]
         coordinator_model: Option<String>,
 
         /// [DEPRECATED] Set coordinator provider — use provider:model in --coordinator-model instead
@@ -1759,12 +1759,18 @@ pub enum Commands {
 
     /// Detect and recover orphaned in-progress tasks with dead agents
     #[command(
-        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the coordinator can re-dispatch.\n\nThis is safe to run anytime — it is idempotent."
+        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nThis is safe to run anytime — it is idempotent."
     )]
     Sweep {
         /// Only report orphaned tasks, don't fix them
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Run a one-shot graph migration (chat-rename, etc.)
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCommands,
     },
 
     /// List running agent processes (service workers)
@@ -3974,6 +3980,21 @@ pub enum ServerCommands {
 }
 
 #[derive(Subcommand)]
+pub enum MigrateCommands {
+    /// Rewrite legacy `.coordinator-N` task ids to `.chat-N`,
+    /// rename `coordinator-loop` tags to `chat-loop`, fix up
+    /// after-edges that referenced the old ids, and rewrite
+    /// `Coordinator: <name>` / `Coordinator N` titles.
+    ///
+    /// Safe to run multiple times — idempotent.
+    ChatRename {
+        /// Only report what would change, don't write.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ServiceCommands {
     /// Start the agent service daemon
     Start {
@@ -4005,9 +4026,9 @@ pub enum ServiceCommands {
         #[arg(long)]
         force: bool,
 
-        /// Disable the persistent coordinator agent (LLM chat session)
-        #[arg(long)]
-        no_coordinator_agent: bool,
+        /// Disable the persistent chat agent (LLM session); legacy alias: --no-coordinator-agent
+        #[arg(long, alias = "no-coordinator-agent")]
+        no_chat_agent: bool,
     },
 
     /// Stop the agent service daemon
@@ -4092,27 +4113,28 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
-    /// Create a new coordinator session
-    CreateCoordinator {
-        /// Optional name for the coordinator
+    /// Create a new chat agent session (legacy alias: create-coordinator)
+    #[command(alias = "create-coordinator")]
+    CreateChat {
+        /// Optional name for the chat agent
         #[arg(long)]
         name: Option<String>,
-        /// Model for this coordinator (e.g., "openai:qwen3-coder-30b")
+        /// Model for this chat agent (e.g., "openai:qwen3-coder-30b")
         #[arg(long)]
         model: Option<String>,
-        /// Executor for this coordinator (e.g., "native", "claude")
+        /// Executor for this chat agent (e.g., "native", "claude")
         #[arg(long)]
         executor: Option<String>,
     },
 
-    /// Hot-swap a coordinator's executor and/or model.
+    /// Hot-swap a chat agent's executor and/or model.
     /// SIGTERMs the live handler; the supervisor respawns it with
     /// the new settings. Conversation history is preserved via
     /// chat/<ref>/{inbox,outbox}.jsonl — the new handler sees
     /// prior turns on startup.
     #[command(name = "set-executor", alias = "switch")]
-    SetCoordinatorExecutor {
-        /// Coordinator ID (0, 1, ...)
+    SetChatExecutor {
+        /// Chat agent ID (0, 1, ...)
         id: u32,
         /// New executor: `native`, `claude`, `codex`, ...
         /// Omit to keep current executor (model-only change).
@@ -4124,27 +4146,31 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
-    /// Delete a coordinator session
-    DeleteCoordinator {
-        /// Coordinator ID to delete
+    /// Delete a chat agent session (legacy alias: delete-coordinator)
+    #[command(alias = "delete-coordinator")]
+    DeleteChat {
+        /// Chat agent ID to delete
         id: u32,
     },
 
-    /// Archive a coordinator session (mark as Done)
-    ArchiveCoordinator {
-        /// Coordinator ID to archive
+    /// Archive a chat agent session — mark as Done (legacy alias: archive-coordinator)
+    #[command(alias = "archive-coordinator")]
+    ArchiveChat {
+        /// Chat agent ID to archive
         id: u32,
     },
 
-    /// Stop a coordinator session (kill agent, reset to Open)
-    StopCoordinator {
-        /// Coordinator ID to stop
+    /// Stop a chat agent session — kill agent, reset to Open (legacy alias: stop-coordinator)
+    #[command(alias = "stop-coordinator")]
+    StopChat {
+        /// Chat agent ID to stop
         id: u32,
     },
 
-    /// Interrupt a coordinator's current generation (sends SIGINT, preserves context)
-    InterruptCoordinator {
-        /// Coordinator ID to interrupt
+    /// Interrupt a chat agent's current generation — sends SIGINT, preserves context (legacy alias: interrupt-coordinator)
+    #[command(alias = "interrupt-coordinator")]
+    InterruptChat {
+        /// Chat agent ID to interrupt
         id: u32,
     },
 
@@ -4171,9 +4197,9 @@ pub enum ServiceCommands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Disable the persistent coordinator agent (LLM chat session)
-        #[arg(long)]
-        no_coordinator_agent: bool,
+        /// Disable the persistent chat agent (LLM session); legacy alias: --no-coordinator-agent
+        #[arg(long, alias = "no-coordinator-agent")]
+        no_chat_agent: bool,
     },
 }
 
@@ -4367,6 +4393,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Config { .. } => "config",
         Commands::DeadAgents { .. } => "dead-agents",
         Commands::Sweep { .. } => "sweep",
+        Commands::Migrate { .. } => "migrate",
         Commands::Agents { .. } => "agents",
         Commands::Kill { .. } => "kill",
         Commands::Reap { .. } => "reap",

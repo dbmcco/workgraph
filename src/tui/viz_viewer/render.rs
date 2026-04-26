@@ -4687,7 +4687,7 @@ fn build_coordinator_runtime_lines(app: &VizApp) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             Span::styled(
-                format!("Coordinator {} ", cid),
+                format!("Chat {} ", cid),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -4863,7 +4863,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 Span::raw("  "),
                 status_icon,
                 Span::styled(
-                    format!("Coordinator #{}", card.id),
+                    format!("Chat #{}", card.id),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -6135,7 +6135,7 @@ fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     // Title
     lines.push(Line::from(Span::styled(
-        "  New Coordinator",
+        "  New Chat",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
