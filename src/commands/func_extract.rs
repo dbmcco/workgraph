@@ -468,7 +468,7 @@ fn extract_json_from_response(response: &str) -> String {
 ///   3. Identify which {{input.*}} placeholders to create
 fn generalize_with_executor(dir: &Path, func: &TraceFunction) -> Result<TraceFunction> {
     let config = workgraph::config::Config::load_or_default(dir);
-    let executor = &config.coordinator.executor;
+    let executor = config.coordinator.effective_executor();
 
     if executor != "claude" {
         bail!(

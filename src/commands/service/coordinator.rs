@@ -2206,7 +2206,7 @@ mod tests {
     use crate::commands::checkpoint::{self, CheckpointType};
     use tempfile::tempdir;
     use workgraph::graph::{Node, Task, WorkGraph};
-    use workgraph::parser::save_graph;
+    use workgraph::parser::{load_graph, save_graph};
     use workgraph::stream_event::{self, StreamEvent, StreamWriter};
 
     fn make_agent_entry(output_file: &std::path::Path) -> workgraph::service::registry::AgentEntry {

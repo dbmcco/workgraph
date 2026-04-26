@@ -1094,6 +1094,26 @@ pub struct CoordinatorConfig {
     pub failure_window_seconds: u64,
 }
 
+impl CoordinatorConfig {
+    /// Resolve the executor the runtime should actually use.
+    ///
+    /// Preserve explicit non-default executors, but allow `provider:model`
+    /// specs to upgrade the default `claude` executor to the correct runtime.
+    pub fn effective_executor(&self) -> String {
+        if let Some(model) = self.model.as_deref() {
+            let spec = parse_model_spec(model);
+            if let Some(provider) = spec.provider.as_deref() {
+                let inferred = provider_to_executor(provider);
+                if self.executor == default_executor() || self.executor == inferred {
+                    return inferred.to_string();
+                }
+            }
+        }
+
+        self.executor.clone()
+    }
+}
+
 fn default_max_agents() -> usize {
     4
 }
@@ -1159,6 +1179,57 @@ pub struct ProjectConfig {
     /// Default skills for new actors
     #[serde(default)]
     pub default_skills: Vec<String>,
+}
+
+/// Recognized provider prefixes for `provider:model` specs.
+pub const KNOWN_PROVIDERS: &[&str] = &[
+    "claude",
+    "openrouter",
+    "oai-compat",
+    "openai",
+    "codex",
+    "gemini",
+    "ollama",
+    "llamacpp",
+    "vllm",
+    "local",
+    "native",
+];
+
+/// Parsed representation of a `provider:model` string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    pub provider: Option<String>,
+    pub model_id: String,
+}
+
+/// Parse a model spec into provider and model ID parts.
+///
+/// If the prefix before `:` is not a known provider, the entire string is
+/// treated as a bare model ID so legacy model names continue to work.
+pub fn parse_model_spec(spec: &str) -> ModelSpec {
+    if let Some((prefix, rest)) = spec.split_once(':')
+        && KNOWN_PROVIDERS.contains(&prefix)
+    {
+        return ModelSpec {
+            provider: Some(prefix.to_string()),
+            model_id: rest.to_string(),
+        };
+    }
+
+    ModelSpec {
+        provider: None,
+        model_id: spec.to_string(),
+    }
+}
+
+/// Map a model provider prefix to the executor that can service it.
+pub fn provider_to_executor(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => "native",
+    }
 }
 
 fn default_executor() -> String {
@@ -2106,5 +2177,41 @@ worktree_isolation = true
         )
         .unwrap();
         assert!(config.coordinator.worktree_isolation);
+    }
+
+    #[test]
+    fn test_parse_model_spec_recognizes_provider_prefix() {
+        let spec = parse_model_spec("openrouter:minimax/minimax-m1");
+        assert_eq!(spec.provider.as_deref(), Some("openrouter"));
+        assert_eq!(spec.model_id, "minimax/minimax-m1");
+    }
+
+    #[test]
+    fn test_parse_model_spec_preserves_bare_model_names() {
+        let spec = parse_model_spec("deepseek-coder-v2:16b");
+        assert!(spec.provider.is_none());
+        assert_eq!(spec.model_id, "deepseek-coder-v2:16b");
+    }
+
+    #[test]
+    fn test_coordinator_effective_executor_infers_native_from_model_prefix() {
+        let mut config = Config::default();
+        config.coordinator.model = Some("openrouter:minimax/minimax-m1".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "native");
+    }
+
+    #[test]
+    fn test_coordinator_effective_executor_infers_codex_from_model_prefix() {
+        let mut config = Config::default();
+        config.coordinator.model = Some("codex:gpt-5-codex".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "codex");
+    }
+
+    #[test]
+    fn test_coordinator_effective_executor_preserves_custom_executor() {
+        let mut config = Config::default();
+        config.coordinator.executor = "amplifier".to_string();
+        config.coordinator.model = Some("openrouter:minimax/minimax-m1".to_string());
+        assert_eq!(config.coordinator.effective_executor(), "amplifier");
     }
 }

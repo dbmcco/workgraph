@@ -415,7 +415,7 @@ pub fn run_tick(
     let max_agents = max_agents.unwrap_or(config.coordinator.max_agents);
     let executor = executor
         .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| config.coordinator.executor.clone());
+        .unwrap_or_else(|| config.coordinator.effective_executor());
 
     let graph_path = graph_path(dir);
     if !graph_path.exists() {
@@ -693,7 +693,7 @@ pub fn run_start(
     let eff_poll_interval = interval.unwrap_or(config.coordinator.poll_interval);
     let eff_executor = executor
         .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| config.coordinator.executor.clone());
+        .unwrap_or_else(|| config.coordinator.effective_executor());
     let eff_model: Option<String> = model
         .map(std::string::ToString::to_string)
         .or_else(|| config.coordinator.model.clone());
@@ -1129,7 +1129,7 @@ pub fn run_daemon(
         max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
         executor: cli_executor
             .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| config.coordinator.executor.clone()),
+            .unwrap_or_else(|| config.coordinator.effective_executor()),
         // The poll_interval is the slow background safety-net timer.
         // CLI --interval overrides it; otherwise use config.coordinator.poll_interval.
         poll_interval: Duration::from_secs(

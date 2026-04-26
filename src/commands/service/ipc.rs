@@ -540,6 +540,7 @@ fn handle_reconfigure(
 ) -> IpcResponse {
     let has_overrides =
         max_agents.is_some() || executor.is_some() || poll_interval.is_some() || model.is_some();
+    let executor_overridden = executor.is_some();
 
     if has_overrides {
         // Apply individual overrides
@@ -555,12 +556,18 @@ fn handle_reconfigure(
         if let Some(m) = model {
             daemon_cfg.model = Some(m);
         }
+        if !executor_overridden && daemon_cfg.model.is_some() {
+            let mut coordinator_cfg = workgraph::config::CoordinatorConfig::default();
+            coordinator_cfg.executor = daemon_cfg.executor.clone();
+            coordinator_cfg.model = daemon_cfg.model.clone();
+            daemon_cfg.executor = coordinator_cfg.effective_executor();
+        }
     } else {
         // No flags: re-read config.toml from disk
         match Config::load(dir) {
             Ok(config) => {
                 daemon_cfg.max_agents = config.coordinator.max_agents;
-                daemon_cfg.executor = config.coordinator.executor;
+                daemon_cfg.executor = config.coordinator.effective_executor();
                 daemon_cfg.poll_interval = Duration::from_secs(config.coordinator.poll_interval);
                 daemon_cfg.model = config.coordinator.model;
                 daemon_cfg.settling_delay =
@@ -1041,6 +1048,82 @@ poll_interval = 120
         assert_eq!(cfg.executor, "shell");
         assert_eq!(cfg.poll_interval, Duration::from_secs(120));
         assert_eq!(cfg.model, None); // config.toml doesn't set model
+    }
+
+    #[test]
+    fn test_handle_reconfigure_from_disk_infers_native_executor_from_model_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let config_content = r#"
+[coordinator]
+model = "openrouter:minimax/minimax-m1"
+"#;
+        fs::write(dir.join("config.toml"), config_content).unwrap();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let coord = CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            poll_interval: 60,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        coord.save(dir);
+
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(60),
+            model: None,
+            paused: false,
+            settling_delay: Duration::from_millis(2000),
+        };
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        let resp = handle_reconfigure(dir, &mut cfg, None, None, None, None, &logger);
+        assert!(resp.ok);
+        assert_eq!(cfg.executor, "native");
+        assert_eq!(cfg.model, Some("openrouter:minimax/minimax-m1".to_string()));
+    }
+
+    #[test]
+    fn test_handle_reconfigure_model_override_infers_executor_when_not_explicit() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        fs::create_dir_all(dir.join("service")).unwrap();
+        let coord = CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            poll_interval: 60,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        coord.save(dir);
+
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(60),
+            model: None,
+            paused: false,
+            settling_delay: Duration::from_millis(2000),
+        };
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        let resp = handle_reconfigure(
+            dir,
+            &mut cfg,
+            None,
+            None,
+            None,
+            Some("codex:gpt-5-codex".to_string()),
+            &logger,
+        );
+        assert!(resp.ok);
+        assert_eq!(cfg.executor, "codex");
+        assert_eq!(cfg.model, Some("codex:gpt-5-codex".to_string()));
     }
 
     #[test]

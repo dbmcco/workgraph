@@ -75,7 +75,7 @@ pub fn run(dir: &Path, no_agency: bool) -> Result<()> {
 
     // Check skill/bundle status for the configured executor
     let config = workgraph::config::Config::load_global()?.unwrap_or_default();
-    let executor = &config.coordinator.executor;
+    let executor = config.coordinator.effective_executor();
     match executor.as_str() {
         "claude" => {
             if !super::setup::is_claude_skill_installed() {
