@@ -7,8 +7,6 @@
 //! - Agent registry for tracking running agents
 
 pub mod chat_compactor;
-pub mod compactor;
-pub mod coordinator_cycle;
 pub mod dispatch_boot;
 pub mod executor;
 pub mod graph_watcher;
