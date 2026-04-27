@@ -201,17 +201,23 @@ fn openrouter_config(params: &RouteParams) -> Config {
         premium: Some("openrouter:anthropic/claude-opus-4".to_string()),
     };
 
-    // Default model: standard tier.
-    let default_model = params
+    // Worker default: premium tier (opus) — real implementation needs the
+    // strongest model. User --model overrides.
+    let agent_model = params
         .model
         .clone()
-        .unwrap_or_else(|| "openrouter:anthropic/claude-sonnet-4".to_string());
-    let default_model = ensure_provider_prefix(&default_model, "openrouter");
-    config.agent.model = default_model.clone();
-    config.coordinator.model = Some(default_model.clone());
+        .unwrap_or_else(|| "openrouter:anthropic/claude-opus-4".to_string());
+    let agent_model = ensure_provider_prefix(&agent_model, "openrouter");
+    config.agent.model = agent_model.clone();
+    config.coordinator.model = Some(agent_model.clone());
 
-    // models.evaluator + assigner — match standard tier.
-    config.models = standard_models_routing(&default_model);
+    // Eval / assign default to haiku — summarization + scoring is fine on
+    // the cheap tier, ~10x cost vs sonnet for nearly identical scores.
+    config.models = split_role_models_routing(
+        &agent_model,
+        "openrouter:anthropic/claude-haiku-4",
+        "openrouter:anthropic/claude-haiku-4",
+    );
 
     config
 }
@@ -234,16 +240,19 @@ fn claude_cli_config(params: &RouteParams) -> Config {
         premium: Some("claude:opus".to_string()),
     };
 
-    // Default model: claude:sonnet (standard tier).
-    let default_model = params
+    // Worker default: claude:opus (premium tier) — workers do real
+    // implementation. User --model overrides.
+    let agent_model = params
         .model
         .clone()
-        .unwrap_or_else(|| "claude:sonnet".to_string());
-    let default_model = ensure_provider_prefix(&default_model, "claude");
-    config.agent.model = default_model.clone();
-    config.coordinator.model = Some(default_model.clone());
+        .unwrap_or_else(|| "claude:opus".to_string());
+    let agent_model = ensure_provider_prefix(&agent_model, "claude");
+    config.agent.model = agent_model.clone();
+    config.coordinator.model = Some(agent_model.clone());
 
-    config.models = standard_models_routing(&default_model);
+    // Eval / assign default to haiku — scoring + assignment is mostly
+    // summarization, sonnet adds ~10x cost for nearly identical scores.
+    config.models = split_role_models_routing(&agent_model, "claude:haiku", "claude:haiku");
 
     config
 }
@@ -267,15 +276,18 @@ fn codex_cli_config(params: &RouteParams) -> Config {
         premium: Some("codex:o1-pro".to_string()),
     };
 
-    let default_model = params
+    // Worker default: codex:o1-pro (premium tier). User --model overrides.
+    let agent_model = params
         .model
         .clone()
-        .unwrap_or_else(|| "codex:gpt-5".to_string());
-    let default_model = ensure_provider_prefix(&default_model, "codex");
-    config.agent.model = default_model.clone();
-    config.coordinator.model = Some(default_model.clone());
+        .unwrap_or_else(|| "codex:o1-pro".to_string());
+    let agent_model = ensure_provider_prefix(&agent_model, "codex");
+    config.agent.model = agent_model.clone();
+    config.coordinator.model = Some(agent_model.clone());
 
-    config.models = standard_models_routing(&default_model);
+    // Eval / assign default to the cheap tier (gpt-5-mini).
+    config.models =
+        split_role_models_routing(&agent_model, "codex:gpt-5-mini", "codex:gpt-5-mini");
 
     config
 }
@@ -460,8 +472,21 @@ fn codex_default_registry() -> Vec<ModelRegistryEntry> {
 
 /// `[models.evaluator]` + `[models.assigner]` pinned to the given default
 /// model spec, so eval / assign runs don't fall back to a different
-/// model the user hasn't authorized.
+/// model the user hasn't authorized. Used by routes where cost ≈ 0
+/// (local, nex-custom) — same model fills every role.
 fn standard_models_routing(default_model: &str) -> ModelRoutingConfig {
+    split_role_models_routing(default_model, default_model, default_model)
+}
+
+/// Build a `[models.*]` routing block with role-specific models. Used by
+/// paid routes (claude-cli, openrouter, codex-cli) where worker cost
+/// dominates: workers run premium for real implementation; eval / assign
+/// run cheap because scoring + assignment is mostly summarization.
+fn split_role_models_routing(
+    default_model: &str,
+    evaluator_model: &str,
+    assigner_model: &str,
+) -> ModelRoutingConfig {
     ModelRoutingConfig {
         default: Some(RoleModelConfig {
             provider: None,
@@ -471,13 +496,13 @@ fn standard_models_routing(default_model: &str) -> ModelRoutingConfig {
         }),
         evaluator: Some(RoleModelConfig {
             provider: None,
-            model: Some(default_model.to_string()),
+            model: Some(evaluator_model.to_string()),
             tier: None,
             endpoint: None,
         }),
         assigner: Some(RoleModelConfig {
             provider: None,
-            model: Some(default_model.to_string()),
+            model: Some(assigner_model.to_string()),
             tier: None,
             endpoint: None,
         }),
@@ -606,15 +631,151 @@ mod tests {
         assert_eq!(config.tiers.standard.as_deref(), Some("claude:sonnet"));
         assert_eq!(config.tiers.premium.as_deref(), Some("claude:opus"));
 
-        // Default model: claude:sonnet
-        assert_eq!(config.agent.model, "claude:sonnet");
-        assert_eq!(config.coordinator.model.as_deref(), Some("claude:sonnet"));
+        // Worker / dispatcher default to opus (premium tier).
+        assert_eq!(config.agent.model, "claude:opus");
+        assert_eq!(config.coordinator.model.as_deref(), Some("claude:opus"));
 
         assert_models_evaluator_and_assigner_pinned(&config);
 
         let reloaded = round_trip(&config);
         assert_eq!(reloaded.tiers.standard, config.tiers.standard);
         assert_eq!(reloaded.agent.model, config.agent.model);
+    }
+
+    #[test]
+    fn test_route_claude_cli_agent_is_opus() {
+        let config = config_for_route(SetupRoute::ClaudeCli, RouteParams::default());
+        assert_eq!(
+            config.agent.model, "claude:opus",
+            "claude-cli worker agent should default to opus (premium) for real implementation"
+        );
+    }
+
+    #[test]
+    fn test_route_claude_cli_evaluator_is_haiku() {
+        let config = config_for_route(SetupRoute::ClaudeCli, RouteParams::default());
+        let evaluator = config
+            .models
+            .evaluator
+            .as_ref()
+            .expect("models.evaluator must be set");
+        assert_eq!(
+            evaluator.model.as_deref(),
+            Some("claude:haiku"),
+            "claude-cli evaluator should default to haiku (cheap, sufficient for scoring)"
+        );
+    }
+
+    #[test]
+    fn test_route_claude_cli_assigner_is_haiku() {
+        let config = config_for_route(SetupRoute::ClaudeCli, RouteParams::default());
+        let assigner = config
+            .models
+            .assigner
+            .as_ref()
+            .expect("models.assigner must be set");
+        assert_eq!(
+            assigner.model.as_deref(),
+            Some("claude:haiku"),
+            "claude-cli assigner should default to haiku (cheap, sufficient for assignment)"
+        );
+    }
+
+    #[test]
+    fn test_route_openrouter_role_split() {
+        let config = config_for_route(SetupRoute::Openrouter, RouteParams::default());
+        assert_eq!(
+            config.agent.model, "openrouter:anthropic/claude-opus-4",
+            "openrouter agent should default to opus equivalent"
+        );
+        let evaluator = config.models.evaluator.as_ref().unwrap();
+        assert_eq!(
+            evaluator.model.as_deref(),
+            Some("openrouter:anthropic/claude-haiku-4"),
+            "openrouter evaluator should default to haiku equivalent"
+        );
+        let assigner = config.models.assigner.as_ref().unwrap();
+        assert_eq!(
+            assigner.model.as_deref(),
+            Some("openrouter:anthropic/claude-haiku-4"),
+            "openrouter assigner should default to haiku equivalent"
+        );
+    }
+
+    #[test]
+    fn test_route_codex_cli_role_split() {
+        let config = config_for_route(SetupRoute::CodexCli, RouteParams::default());
+        assert_eq!(
+            config.agent.model, "codex:o1-pro",
+            "codex-cli agent should default to o1-pro (premium)"
+        );
+        let evaluator = config.models.evaluator.as_ref().unwrap();
+        assert_eq!(
+            evaluator.model.as_deref(),
+            Some("codex:gpt-5-mini"),
+            "codex-cli evaluator should default to gpt-5-mini (cheap)"
+        );
+        let assigner = config.models.assigner.as_ref().unwrap();
+        assert_eq!(
+            assigner.model.as_deref(),
+            Some("codex:gpt-5-mini"),
+            "codex-cli assigner should default to gpt-5-mini (cheap)"
+        );
+    }
+
+    #[test]
+    fn test_route_local_uses_same_model_everywhere() {
+        let config = config_for_route(
+            SetupRoute::Local,
+            RouteParams {
+                model: Some("qwen3-coder".to_string()),
+                url: Some("http://lambda01.example/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        let expected = "local:qwen3-coder";
+        assert_eq!(config.agent.model, expected);
+        assert_eq!(config.coordinator.model.as_deref(), Some(expected));
+        assert_eq!(config.tiers.fast.as_deref(), Some(expected));
+        assert_eq!(config.tiers.standard.as_deref(), Some(expected));
+        assert_eq!(config.tiers.premium.as_deref(), Some(expected));
+        assert_eq!(
+            config.models.default.as_ref().unwrap().model.as_deref(),
+            Some(expected),
+            "local: models.default should match the single local model"
+        );
+        assert_eq!(
+            config.models.evaluator.as_ref().unwrap().model.as_deref(),
+            Some(expected),
+            "local: cost ≈ 0, evaluator should reuse the same model — no need for a tier split"
+        );
+        assert_eq!(
+            config.models.assigner.as_ref().unwrap().model.as_deref(),
+            Some(expected),
+            "local: cost ≈ 0, assigner should reuse the same model — no need for a tier split"
+        );
+    }
+
+    #[test]
+    fn test_route_nex_custom_uses_same_model_everywhere() {
+        let config = config_for_route(
+            SetupRoute::NexCustom,
+            RouteParams {
+                url: Some("https://my.endpoint.example/v1".to_string()),
+                model: Some("my-model".to_string()),
+                ..Default::default()
+            },
+        );
+        let expected = "oai-compat:my-model";
+        assert_eq!(
+            config.models.evaluator.as_ref().unwrap().model.as_deref(),
+            Some(expected),
+            "nex-custom: user-supplied model used everywhere by default"
+        );
+        assert_eq!(
+            config.models.assigner.as_ref().unwrap().model.as_deref(),
+            Some(expected),
+        );
     }
 
     // ── codex-cli ────────────────────────────────────────────────────
@@ -633,9 +794,9 @@ mod tests {
 
         assert_tiers_filled(&config);
 
-        // Default = standard tier model = codex:gpt-5.
-        assert_eq!(config.agent.model, "codex:gpt-5");
-        assert_eq!(config.coordinator.model.as_deref(), Some("codex:gpt-5"));
+        // Default = premium tier model = codex:o1-pro (worker runs premium for real implementation).
+        assert_eq!(config.agent.model, "codex:o1-pro");
+        assert_eq!(config.coordinator.model.as_deref(), Some("codex:o1-pro"));
 
         assert_models_evaluator_and_assigner_pinned(&config);
 
