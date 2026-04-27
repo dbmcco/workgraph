@@ -504,9 +504,12 @@ fn agent_thread_main(
 
                 // If there was a pending request, write an error response
                 if let Some(req) = request {
-                    let _ = chat::append_outbox(
+                    let _ = chat::append_error(
                         dir,
-                        "The coordinator agent crashed and is being restarted. Please try again in a moment.",
+                        &format!(
+                            "The coordinator agent crashed and is being restarted.\n\nProcess status: {:?}",
+                            status
+                        ),
                         &req.request_id,
                     );
                 }
@@ -551,9 +554,12 @@ fn agent_thread_main(
                             e
                         ));
                         chat::clear_streaming(dir);
-                        let _ = chat::append_outbox(
+                        let _ = chat::append_error(
                             dir,
-                            "The coordinator agent encountered an error. Please try again.",
+                            &format!(
+                                "The coordinator agent failed to accept your message.\n\nError:\n{:#}",
+                                e
+                            ),
                             &req.request_id,
                         );
                         break; // Restart
@@ -597,7 +603,7 @@ fn agent_thread_main(
                     }
                     Some(_) => {
                         logger.warn("Coordinator agent: empty response from Claude CLI");
-                        let _ = chat::append_outbox(
+                        let _ = chat::append_error(
                             dir,
                             "The coordinator processed your message but produced no response text.",
                             &req.request_id,
@@ -605,7 +611,7 @@ fn agent_thread_main(
                     }
                     None => {
                         logger.warn("Coordinator agent: response timeout");
-                        let _ = chat::append_outbox(
+                        let _ = chat::append_error(
                             dir,
                             "The coordinator agent timed out processing your message. It may be performing a long-running operation.",
                             &req.request_id,

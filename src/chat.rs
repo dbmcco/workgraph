@@ -270,6 +270,15 @@ pub fn append_outbox_full(
     )
 }
 
+/// Append a system error to the outbox.
+///
+/// Uses a distinct role so chat consumers can render runtime failures
+/// differently from normal coordinator replies.
+pub fn append_error(workgraph_dir: &Path, content: &str, request_id: &str) -> Result<u64> {
+    let path = outbox_path(workgraph_dir);
+    append_message(&path, "system-error", content, request_id, vec![], None)
+}
+
 /// Read all inbox messages (user → coordinator).
 pub fn read_inbox(workgraph_dir: &Path) -> Result<Vec<ChatMessage>> {
     read_messages(&inbox_path(workgraph_dir))
@@ -796,6 +805,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r2.content, "answer to second");
+    }
+
+    #[test]
+    fn test_append_error_writes_system_error_role() {
+        let (_tmp, wg_dir) = setup();
+
+        append_error(&wg_dir, "coordinator crashed", "req-err").unwrap();
+
+        let msgs = read_outbox_since(&wg_dir, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "system-error");
+        assert_eq!(msgs[0].content, "coordinator crashed");
+        assert_eq!(msgs[0].request_id, "req-err");
     }
 
     #[test]

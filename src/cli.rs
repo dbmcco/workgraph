@@ -2423,6 +2423,23 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
+    /// Set the coordinator executor/model without touching other runtime settings.
+    ///
+    /// This is a compatibility-oriented alias over the existing reload/override path.
+    #[command(name = "set-executor", alias = "switch")]
+    SetExecutor {
+        /// Coordinator ID. This fork currently supports only the primary coordinator.
+        id: u32,
+
+        /// Executor to use for spawned agents
+        #[arg(long)]
+        executor: Option<String>,
+
+        /// Model to use for spawned agents
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
     /// Pause the coordinator (running agents continue, no new spawns)
     Pause,
 
@@ -2630,6 +2647,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::NativeExec { .. } => "native-exec",
     }
 }
+
 
 /// Returns true if the command supports `--json` output.
 pub fn supports_json(cmd: &Commands) -> bool {

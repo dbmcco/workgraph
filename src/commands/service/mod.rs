@@ -864,9 +864,12 @@ fn route_chat_to_agent(
                 e
             ));
             // Write an error response so the user isn't left hanging
-            let _ = workgraph::chat::append_outbox(
+            let _ = workgraph::chat::append_error(
                 dir,
-                "The coordinator agent is not available. Please try again.",
+                &format!(
+                    "The coordinator agent is not available.\n\nError:\n{:#}",
+                    e
+                ),
                 &msg.request_id,
             );
         }
@@ -1803,12 +1806,42 @@ pub fn run_reload(
     Ok(())
 }
 
+#[cfg(unix)]
+pub fn run_set_executor(
+    dir: &Path,
+    coordinator_id: u32,
+    executor: Option<&str>,
+    model: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if coordinator_id != 0 {
+        anyhow::bail!(
+            "This workgraph line supports only the primary coordinator (id 0) for `wg service set-executor`"
+        );
+    }
+    if executor.is_none() && model.is_none() {
+        anyhow::bail!("Specify at least one of --executor or --model");
+    }
+    run_reload(dir, None, executor, None, model, json)
+}
+
 #[cfg(not(unix))]
 pub fn run_reload(
     _dir: &Path,
     _max_agents: Option<usize>,
     _executor: Option<&str>,
     _interval: Option<u64>,
+    _model: Option<&str>,
+    _json: bool,
+) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+#[cfg(not(unix))]
+pub fn run_set_executor(
+    _dir: &Path,
+    _coordinator_id: u32,
+    _executor: Option<&str>,
     _model: Option<&str>,
     _json: bool,
 ) -> Result<()> {
@@ -2117,6 +2150,20 @@ poll_interval = 60
             daemon_cfg.model,
             Some("openrouter:minimax/minimax-m1".to_string())
         );
+    }
+
+    #[test]
+    fn test_run_set_executor_requires_primary_coordinator() {
+        let temp_dir = TempDir::new().unwrap();
+        let err = run_set_executor(temp_dir.path(), 1, Some("native"), None, false).unwrap_err();
+        assert!(err.to_string().contains("primary coordinator"));
+    }
+
+    #[test]
+    fn test_run_set_executor_requires_executor_or_model() {
+        let temp_dir = TempDir::new().unwrap();
+        let err = run_set_executor(temp_dir.path(), 0, None, None, false).unwrap_err();
+        assert!(err.to_string().contains("Specify at least one"));
     }
 
     #[test]
