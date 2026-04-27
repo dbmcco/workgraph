@@ -4036,7 +4036,11 @@ fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
     } else {
         let hint_text = if app.chat_pty_mode && app.chat_pty_forwards_stdin {
-            " Ctrl+T: leave PTY  PgUp/Dn: scroll".to_string()
+            if app.focused_panel == FocusedPanel::RightPanel {
+                " [PTY]  Ctrl+T: command mode  PgUp/Dn: scroll".to_string()
+            } else {
+                " [CMD]  Ctrl+T: back to chat  ←→: coordinators  +: new  -: close".to_string()
+            }
         } else if app.chat_pty_mode {
             " Enter: chat  ↑↓: scroll  Ctrl+T: focus PTY".to_string()
         } else if app.chat.pending_attachments.is_empty() {
@@ -7298,13 +7302,24 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                 let mut hints: Vec<(&str, &str)> = Vec::new();
                 match tab {
                     RightPanelTab::Chat if app.chat_pty_mode && app.chat_pty_forwards_stdin => {
-                        hints.push(("Ctrl+T", "leave PTY"));
-                        hints.push(("PgUp/Dn", "scroll"));
+                        // PTY-active branch: in PTY mode the only TUI hotkey
+                        // is Ctrl+T to enter command mode. Show the
+                        // appropriate hint depending on whether we are in
+                        // PTY focus or have already broken out.
+                        if app.focused_panel == FocusedPanel::RightPanel {
+                            hints.push(("Ctrl+T", "command mode"));
+                            hints.push(("PgUp/Dn", "scroll"));
+                        } else {
+                            hints.push(("Ctrl+T", "back to chat"));
+                            hints.push(("←→", "coordinators"));
+                            hints.push(("+", "new"));
+                            hints.push(("-", "close"));
+                            hints.push(("↑↓", "scroll"));
+                        }
                     }
                     RightPanelTab::Chat if app.chat_pty_mode => {
                         hints.push(("Enter", "chat"));
                         hints.push(("Ctrl+T", "focus PTY"));
-                        hints.push(("Ctrl+W", "retire"));
                         hints.push(("↑↓", "scroll"));
                         hints.push(("←→", "chats"));
                     }
@@ -7312,7 +7327,6 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         hints.push(("←→", "chats"));
                         hints.push(("+", "new"));
                         hints.push(("-", "close"));
-                        hints.push(("Ctrl+W", "retire"));
                         hints.push(("Enter", "chat"));
                         hints.push(("↑↓", "scroll"));
                     }
@@ -7491,14 +7505,46 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         return;
     }
 
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Modal mode indicator (PTY vs CMD) — leading badge so it's visible
+    // even when terminal is narrow and the status bar gets truncated by
+    // the right-aligned service-health pill. Only meaningful when a chat
+    // tab is the active right-panel tab and a PTY is rendering.
+    // Implementation gate matches `vendor_pty_active` in event.rs.
+    if app.right_panel_tab == RightPanelTab::Chat
+        && app.chat_pty_mode
+        && app.chat_pty_forwards_stdin
+        && !app.chat_pty_observer
+    {
+        if app.focused_panel == FocusedPanel::RightPanel {
+            spans.push(Span::styled(
+                " [PTY] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                " [CMD] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(" ", Style::default()));
+    }
+
     let c = &app.task_counts;
-    let mut spans = vec![Span::styled(
+    spans.push(Span::styled(
         format!(
             " {} tasks ({} done, {} open, {} active",
             c.total, c.done, c.open, c.in_progress
         ),
         Style::default().fg(Color::White),
-    )];
+    ));
 
     if c.failed > 0 {
         spans.push(Span::styled(
@@ -8662,10 +8708,10 @@ fn draw_help_overlay(frame: &mut Frame) {
         binding("~ / `", "Open chat picker"),
         binding("+", "Add new chat (picker)"),
         binding("-", "Close/archive chat"),
-        binding("Ctrl-W", "Retire current chat (works inside PTY)"),
+        binding("Ctrl-W", "Close current tab (command mode only)"),
         binding("[ / ]", "Prev / next chat"),
         binding("←/→", "Prev / next chat"),
-        binding("Ctrl-T", "Toggle PTY mode"),
+        binding("Ctrl-T", "Toggle PTY focus / command mode"),
         blank(),
         heading("Search (vim-style)"),
         binding("/", "Start search"),

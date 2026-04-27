@@ -483,25 +483,16 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         && app.focused_panel == FocusedPanel::RightPanel
         && !app.chat_pty_observer;
     if vendor_pty_active {
+        // Modal contract (implement-tui-modal): when chat PTY has focus, the
+        // ONLY key allowed to break out is Ctrl+T. Every other keystroke —
+        // letters, digits, Enter, Ctrl+N, Ctrl+W, Ctrl+anything — flows to
+        // the embedded REPL. Earlier versions intercepted Ctrl+N and Ctrl+W
+        // as global "escape hatches" so users could break in to the launcher
+        // / retire-chat dialog from inside a PTY; that contradicts the modal
+        // model. Use Ctrl+T to enter command mode, then `n`/`w` (see
+        // implement-tui-command).
         let is_toggle =
             matches!(code, KeyCode::Char('t')) && modifiers.contains(KeyModifiers::CONTROL);
-        // Ctrl+N: global "new chat" hotkey. Without this escape hatch the
-        // launcher dialog is unreachable from inside a PTY-focused chat —
-        // every other keystroke gets forwarded to the embedded REPL. The
-        // only way out before was Ctrl+T → click [+] in the coord bar, and
-        // users repeatedly reported being unable to "break in" to start a
-        // new chat. Ctrl+N flips out of PTY mode AND opens the launcher in
-        // one keystroke. Fall through to the global handler below.
-        let is_new_chat =
-            matches!(code, KeyCode::Char('n')) && modifiers.contains(KeyModifiers::CONTROL);
-        // Ctrl+W: global "retire/close current chat" escape hatch. Same
-        // motivation as Ctrl+N — the embedded CLI (claude --resume) can show
-        // its own modal that swallows Esc/digit keys, leaving users stuck
-        // unable to reach the wg TUI's Archive/Stop/Abandon dialog. Ctrl+W
-        // breaks out of PTY forwarding so the global handler below can open
-        // the retire dialog regardless of what the embedded CLI is showing.
-        let is_close_chat =
-            matches!(code, KeyCode::Char('w')) && modifiers.contains(KeyModifiers::CONTROL);
         let is_scroll = matches!(
             code,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
@@ -520,40 +511,44 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 return;
             }
         }
-        if !is_toggle && !is_new_chat && !is_close_chat {
+        if !is_toggle {
             let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
             if let Some(pane) = app.task_panes.get_mut(&task_id) {
                 let key_event = crossterm::event::KeyEvent::new(code, modifiers);
                 let _ = pane.send_key(key_event);
-                return;
             }
+            // Always consume the key — we are nominally in PTY focus, so
+            // letting it fall through to global handlers below would
+            // re-introduce the old escape-hatch behavior the modal contract
+            // explicitly removes.
+            return;
         }
-        // Fall through for Ctrl+T (toggles PTY mode), Ctrl+N (opens launcher),
-        // and Ctrl+W (opens retire-chat dialog).
+        // Ctrl+T falls through to the toggle handler in handle_normal_key.
     }
 
-    // Global Ctrl+N: open the launcher unconditionally.
+    // Global Ctrl+N: open the launcher (only fires when NOT in PTY focus —
+    // PTY-focused mode swallows it above). In command mode this is a
+    // legacy alias for the new `n` single-key binding (see
+    // implement-tui-command).
     if matches!(code, KeyCode::Char('n'))
         && modifiers.contains(KeyModifiers::CONTROL)
         && !matches!(app.input_mode, InputMode::Launcher)
     {
-        // Move focus off the chat PTY so the launcher is the active surface.
         app.focused_panel = FocusedPanel::Graph;
         app.right_panel_tab = RightPanelTab::Chat;
         app.open_launcher();
         return;
     }
 
-    // Global Ctrl+W: close the active chat tab (removes from view, no graph change).
-    // Works regardless of focused_panel, input_mode, or whether the chat
-    // PTY is currently in vendor-active mode (escape hatch). Only fires when
-    // a chat tab is the active right-panel tab — otherwise falls through.
+    // Global Ctrl+W: close the active chat tab (removes from view, no graph
+    // change). Only fires when NOT in PTY focus — the PTY-focused branch
+    // above swallows it. Legacy alias for the `w` single-key binding in
+    // command mode (see implement-tui-command).
     if matches!(code, KeyCode::Char('w'))
         && modifiers.contains(KeyModifiers::CONTROL)
         && app.right_panel_tab == RightPanelTab::Chat
         && !matches!(app.input_mode, InputMode::ChoiceDialog(_))
     {
-        // Exit PTY mode before closing so we don't leave a dangling pane.
         app.focused_panel = FocusedPanel::Graph;
         let cid = app.active_coordinator_id;
         app.close_tab(cid);
@@ -7694,28 +7689,51 @@ mod scrollbar_tests {
         assert_eq!(app.input_mode, InputMode::Normal);
     }
 
-    /// Test: Ctrl+N opens the launcher even when chat PTY has focus.
-    /// Regression guard: without this hotkey, users can't "break in" to the
-    /// launcher when an embedded REPL is consuming all keystrokes.
+    /// Test: in command mode (PTY not focused / focused_panel = Graph),
+    /// the legacy global Ctrl+N alias still opens the launcher. The
+    /// modal contract only swallows keys when the chat PTY has focus.
     #[test]
-    fn test_dialog_ctrl_n_opens_launcher_from_pty() {
+    fn test_command_mode_ctrl_n_opens_launcher() {
         let (mut app, tmp) = build_test_app();
-        // Simulate the worst case: chat PTY active and forwarding stdin.
+        app.right_panel_tab = RightPanelTab::Chat;
+        // Command mode: focused_panel = Graph (Ctrl+T'd out of PTY).
+        app.focused_panel = FocusedPanel::Graph;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.workgraph_dir = tmp.path().to_path_buf();
+        std::fs::write(tmp.path().join("config.toml"), "").ok();
+        super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(
+            app.launcher.is_some(),
+            "Ctrl+N in command mode must open the launcher"
+        );
+        assert_eq!(app.input_mode, InputMode::Launcher);
+    }
+
+    /// Test: when chat PTY has focus (modal "PTY mode"), Ctrl+N is forwarded
+    /// to the embedded editor rather than escaping to open the launcher.
+    /// Only Ctrl+T is allowed to break out of PTY focus — see implement-tui-modal.
+    #[test]
+    fn test_pty_mode_passes_ctrl_n_to_editor() {
+        let (mut app, tmp) = build_test_app();
+        // Simulate vendor PTY active and forwarding stdin.
         app.right_panel_tab = RightPanelTab::Chat;
         app.focused_panel = FocusedPanel::RightPanel;
         app.chat_pty_mode = true;
         app.chat_pty_forwards_stdin = true;
-        // Need a real workgraph dir so open_launcher's Config::load_or_default
-        // succeeds.
         app.workgraph_dir = tmp.path().to_path_buf();
         std::fs::write(tmp.path().join("config.toml"), "").ok();
         // Simulate Ctrl+N keystroke.
         super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert!(
-            app.launcher.is_some(),
-            "Ctrl+N should open the launcher even from PTY focus"
+            app.launcher.is_none(),
+            "Ctrl+N in PTY mode must NOT open the launcher (must pass through to editor)"
         );
-        assert_eq!(app.input_mode, InputMode::Launcher);
+        assert_eq!(
+            app.input_mode,
+            InputMode::Normal,
+            "input_mode must remain Normal — only Ctrl+T should escape PTY mode"
+        );
     }
 
     /// Test: full submit flow — open launcher, press Enter, dialog dismisses
@@ -8575,24 +8593,87 @@ mod chat_tab_navigation_tests {
         assert_eq!(app.focused_panel, FocusedPanel::Graph);
     }
 
-    /// `Ctrl+W` works even when chat PTY mode is active — exits PTY and
-    /// closes the tab directly (no dialog, no loop back to PTY modal).
+    /// `Ctrl+W` does NOT escape PTY mode — only `Ctrl+T` is allowed to
+    /// break out (see implement-tui-modal). When the chat PTY has focus,
+    /// Ctrl+W is forwarded to the embedded editor (e.g. readline's kill-word).
+    /// The user must press `Ctrl+T` to enter command mode, then `Ctrl+W`
+    /// (or the `w` single-key binding from implement-tui-command) to close
+    /// the tab. This supersedes the prior behavior where Ctrl+W from inside
+    /// PTY also closed the tab — that contradicted the modal contract.
     #[test]
-    fn ctrl_w_in_pty_mode_closes_tab() {
+    fn pty_mode_passes_ctrl_w_to_editor() {
         let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
         app.focused_panel = FocusedPanel::RightPanel;
         app.right_panel_tab = RightPanelTab::Chat;
         switch_chat_tab_to_index(&mut app, 1); // cid = 4
 
+        // Simulate the user being inside an active vendor PTY.
         app.chat_pty_mode = true;
         app.chat_pty_forwards_stdin = true;
         app.chat_pty_observer = false;
 
         super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
 
-        assert_eq!(app.focused_panel, FocusedPanel::Graph, "focus must move off PTY");
-        assert!(!app.active_tabs.contains(&4), "tab must be removed");
-        assert!(!matches!(app.input_mode, InputMode::ChoiceDialog(_)), "no dialog");
+        // PTY focus must NOT be broken, the tab must NOT be closed, and
+        // no dialog must open — the key must pass through to the editor.
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Ctrl+W in PTY mode must NOT shift focus off the chat PTY"
+        );
+        assert!(
+            app.active_tabs.contains(&4),
+            "Ctrl+W in PTY mode must NOT close the tab"
+        );
+        assert!(
+            !matches!(&app.input_mode, InputMode::ChoiceDialog(_)),
+            "Ctrl+W in PTY mode must NOT open any dialog"
+        );
+    }
+
+    /// Modal contract: Ctrl+T toggles between PTY-focused and
+    /// command-mode focused (focused_panel = RightPanel ⇄ Graph).
+    #[test]
+    fn ctrl_t_toggles_pty_modal_state() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        // Simulate a live PTY pane so toggle_chat_pty_mode takes the
+        // shift-focus branch (rather than respawning).
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        // Insert a stub pane so `pane.is_alive()` returns true.
+        if let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "sleep 60"],
+            &[],
+            None,
+            24,
+            80,
+        ) {
+            app.task_panes.insert(task_id.clone(), pane);
+        } else {
+            // /bin/sh unavailable — skip the assertion silently.
+            return;
+        }
+
+        // Ctrl+T from PTY focus → command mode (focused_panel becomes Graph).
+        super::handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::Graph,
+            "Ctrl+T from PTY mode must move focus to graph (command mode)"
+        );
+
+        // Ctrl+T from command mode → back into PTY focus.
+        super::handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Ctrl+T from command mode must return focus to chat PTY"
+        );
     }
 
     /// `Ctrl+W` off the Chat tab is a no-op.
