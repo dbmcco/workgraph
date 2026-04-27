@@ -2859,22 +2859,17 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         };
         app.last_coordinator_bar_area = tab_area;
 
-        // Color palette for coordinator dots — hashed from coordinator ID.
-        const DOT_COLORS: &[Color] = &[
-            Color::Cyan,
-            Color::Green,
-            Color::Yellow,
-            Color::Blue,
-            Color::Magenta,
-            Color::Red,
-            Color::LightCyan,
-            Color::LightGreen,
-        ];
-        fn dot_color(cid: u32) -> Color {
-            // Knuth multiplicative hash to spread sequential IDs across the palette
-            let hash = cid.wrapping_mul(2654435761);
-            DOT_COLORS[hash as usize % DOT_COLORS.len()]
-        }
+        // Per-tab state: blue=idle/resumable, yellow=responding,
+        // gray=supervisor down, red=error. Restores the prior "nice blue
+        // color" for the idle case (per task tui-chat-tab).
+        use super::chat_tab_state::{ActiveChatSnapshot, ChatTabState, infer as infer_tab_state};
+
+        let active_snapshot = ActiveChatSnapshot {
+            awaiting_response: app.chat.awaiting_response(),
+            // Future: wire chat-level error state if/when surfaced.
+            error: false,
+        };
+        let service_alive = app.chat.coordinator_active;
 
         // Determine which user board is currently selected (if any).
         let selected_user_board: Option<String> = app
@@ -2897,14 +2892,32 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         for (cid, label) in coordinator_entries.iter() {
             let cid = *cid;
             let is_active = cid == app.active_coordinator_id;
-            let color = dot_color(cid);
-            // Tab content: " ◉ Label [state] " or " ◉ Label [state] ✕ "
-            // dot(1) + space(1) + label + state(2 if active) + space(1) + close(2)
+            let snapshot_for_cid = if is_active {
+                Some(active_snapshot)
+            } else {
+                None
+            };
+            let tab_state = infer_tab_state(
+                &app.workgraph_dir,
+                cid,
+                service_alive,
+                snapshot_for_cid,
+            );
+            let state_color = tab_state.color();
+            // Tab content: "[N] ◉ Label ✕ "
+            // hotkey(3=" [N]") + space+dot(2) + space+label + space+close(2)
             let label_width = label.len();
             let close_width: usize = 2; // " ✕"
-            let state_width: usize = if is_active { 2 } else { 0 }; // " ●" / " ⟳" / " ○"
-            // Content: dot(1) + " "(1) + label + state + " "(1) + close
-            let tab_content_width = 1 + 1 + label_width + state_width + 1 + close_width;
+            // Hotkey hint: "[1]".."[9]" for the first 9 tabs, blank otherwise.
+            let hotkey_n = tab_index + 1;
+            let hotkey_str: String = if hotkey_n <= 9 {
+                format!(" [{}]", hotkey_n)
+            } else {
+                String::new()
+            };
+            let hotkey_width = hotkey_str.len();
+            // Content: hotkey + " ◉"(2) + " "+label + " "+close(2)
+            let tab_content_width = hotkey_width + 2 + 1 + label_width + 1 + close_width;
             // Separator: "│" between tabs (1 column wide)
             let sep_w: usize = if tab_index > 0 { 1 } else { 0 };
 
@@ -2926,40 +2939,44 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
             let tab_start = (bar_x as usize + col) as u16;
 
-            // Dot
-            if is_active {
+            // Hotkey hint (Alt+N jumps to this tab).
+            if hotkey_width > 0 {
                 spans.push(Span::styled(
-                    " ◉",
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    hotkey_str,
+                    Style::default().fg(Color::DarkGray),
                 ));
-            } else {
-                spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
+                col += hotkey_width;
             }
+
+            // Dot — colored by chat state (blue/yellow/gray/red).
+            // Active tab uses ◉ + bold; inactive uses ● in the same state color.
+            let dot_glyph = if is_active { " ◉" } else { " ●" };
+            let dot_style = if is_active {
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Inactive: dim the state color slightly so the active tab stands out.
+                let dim_color = match tab_state {
+                    ChatTabState::SupervisorDown => Color::DarkGray,
+                    _ => state_color,
+                };
+                Style::default().fg(dim_color)
+            };
+            spans.push(Span::styled(dot_glyph, dot_style));
             col += 2; // " ◉" = space + dot
 
-            // Label
+            // Label — bright + bold + underlined for active; state-colored + dim for inactive.
             let label_style = if is_active {
                 Style::default()
                     .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+                    .bg(state_color)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(state_color)
             };
             spans.push(Span::styled(format!(" {}", label), label_style));
             col += 1 + label_width; // " " + label
-
-            // Coordinator state indicator (only on active tab).
-            if is_active {
-                let (state_icon, state_style) = if !app.chat.coordinator_active {
-                    (" ○", Style::default().fg(Color::DarkGray))
-                } else if app.chat.awaiting_response() {
-                    (" ⟳", Style::default().fg(Color::Yellow))
-                } else {
-                    (" ●", Style::default().fg(Color::Green))
-                };
-                spans.push(Span::styled(state_icon, state_style));
-                col += 2; // " " + icon
-            }
 
             // Close button (padded for wider touch target)
             let close_start = (bar_x as usize + col) as u16;
@@ -11966,6 +11983,210 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    /// Verify chat-tab dot colors reflect chat state (per task tui-chat-tab):
+    ///   - blue   = idle/resumable (supervisor alive, no in-flight call)
+    ///   - yellow = LLM actively responding
+    ///   - gray   = supervisor down
+    ///
+    /// We render `draw_chat_tab` directly into a TestBackend, locate the
+    /// `◉` glyph for the active tab, and inspect its foreground color.
+    /// This catches the regression class where the tab was perpetually
+    /// yellow (or perpetually any non-state hashed color) regardless of
+    /// whether the chat was idle or generating.
+    fn build_app_for_tab_color_test(coordinator_ids: &[u32]) -> (VizApp, tempfile::TempDir) {
+        use crate::tui::viz_viewer::state::{RightPanelTab, VizApp};
+        use workgraph::parser::save_graph;
+
+        let mut graph = WorkGraph::new();
+        for &cid in coordinator_ids {
+            let id = if cid == 0 {
+                ".coordinator".to_string()
+            } else {
+                format!(".coordinator-{}", cid)
+            };
+            let title = format!("Coordinator {}", cid);
+            let mut task = make_task_with_status(&id, &title, Status::InProgress);
+            task.tags = vec!["coordinator-loop".to_string()];
+            graph.add_node(Node::Task(task));
+        }
+        let regular = make_task_with_status("regular", "Regular Task", Status::Open);
+        graph.add_node(Node::Task(regular));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+        // Unknown executor so auto-PTY doesn't fire during the test render.
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir;
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.active_coordinator_id = coordinator_ids[0];
+        (app, tmp)
+    }
+
+    /// Locate the active-tab dot (`◉`) cell and return its foreground color.
+    fn active_tab_dot_color(buf: &ratatui::buffer::Buffer) -> Option<Color> {
+        let area = buf.area();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buf.cell((x, y))?;
+                if cell.symbol() == "◉" {
+                    return Some(cell.fg);
+                }
+            }
+        }
+        None
+    }
+
+    fn render_chat_tab_to_buffer(app: &mut VizApp) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, app, area);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn test_chat_tab_color_idle_is_blue() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        // Supervisor alive, no in-flight call → idle.
+        app.chat.coordinator_active = true;
+        // pending_request_ids is empty by default.
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::Blue,
+            "Idle chat tab should be Blue (restoring the prior persistent color); got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_active_is_yellow() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        app.chat.coordinator_active = true;
+        // Mark a request in-flight → awaiting_response() == true → Responding.
+        app.chat.pending_request_ids.insert("req-1".to_string());
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::Yellow,
+            "Chat tab mid-LLM-call should be Yellow; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_supervisor_down_is_gray() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        // Service stopped → all tabs gray, regardless of in-flight state.
+        app.chat.coordinator_active = false;
+        app.chat.pending_request_ids.insert("req-1".to_string());
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::DarkGray,
+            "Tab with supervisor down should be DarkGray; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_inactive_tab_reflects_per_chat_state() {
+        // Active tab is cid=0 (idle). Inactive tab cid=1 has a streaming
+        // file on disk → should render Yellow even though it's not the
+        // active tab.
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0, 1]);
+        app.chat.coordinator_active = true;
+        // Write streaming text for cid=1 (the non-active tab).
+        workgraph::chat::write_streaming(&app.workgraph_dir, 1, "partial reply").unwrap();
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        // Find inactive tab dot `●` and its color. The first `●` we
+        // encounter belongs to cid=1 (since cid=0 is active and uses ◉).
+        let area = buf.area();
+        let mut inactive_dot_color = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == "●" {
+                    inactive_dot_color = Some(cell.fg);
+                    break;
+                }
+            }
+            if inactive_dot_color.is_some() {
+                break;
+            }
+        }
+        let color = inactive_dot_color.expect("● not found for inactive tab");
+        assert_eq!(
+            color,
+            Color::Yellow,
+            "Inactive tab with active streaming file should be Yellow; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_renders_hotkey_hint_for_first_nine_tabs() {
+        // The tab bar should render `[1]`, `[2]`, ... hints so users
+        // discover the Alt+N hotkey for tab switching.
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0, 1]);
+        app.chat.coordinator_active = true;
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let mut rendered = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                rendered.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(
+            rendered.contains("[1]"),
+            "Tab bar should include `[1]` hotkey hint.\nRendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("[2]"),
+            "Tab bar should include `[2]` hotkey hint.\nRendered:\n{}",
+            rendered
+        );
     }
 
     #[test]

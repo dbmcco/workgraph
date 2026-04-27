@@ -22,6 +22,38 @@ use super::state::{
     RightPanelTab, TabBarEntryKind, TaskFormField, TextPromptAction, VizApp,
 };
 
+/// Switch to a chat tab by zero-based positional index in
+/// `list_coordinator_ids()`. No-op if the index is out of range.
+/// Used by the Alt+N hotkey handler in the right-panel key flow.
+pub(crate) fn switch_chat_tab_to_index(app: &mut VizApp, idx: usize) {
+    let ids = app.list_coordinator_ids();
+    if let Some(&target) = ids.get(idx)
+        && target != app.active_coordinator_id
+    {
+        app.switch_coordinator(target);
+    }
+}
+
+/// Cycle to the chat tab `delta` positions away from the current one
+/// (positive = next, negative = previous), wrapping around. No-op if
+/// only one chat tab exists. Used by the Ctrl+Tab / Ctrl+Shift+Tab
+/// chord handlers.
+pub(crate) fn switch_chat_tab_relative(app: &mut VizApp, delta: i32) {
+    let ids = app.list_coordinator_ids();
+    if ids.len() < 2 {
+        return;
+    }
+    let pos = ids
+        .iter()
+        .position(|&id| id == app.active_coordinator_id)
+        .unwrap_or(0) as i32;
+    let len = ids.len() as i32;
+    let new_pos = ((pos + delta).rem_euclid(len)) as usize;
+    if let Some(&target) = ids.get(new_pos) {
+        app.switch_coordinator(target);
+    }
+}
+
 /// Handle content reload when iteration changes.
 fn handle_iteration_change(app: &mut VizApp) {
     // Always reload Detail tab content
@@ -2361,9 +2393,36 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             app.open_history_browser();
         }
 
+        // Ctrl+Tab / Ctrl+Shift+Tab: cycle chat tabs (Chat tab only).
+        // Provides a discoverable, IDE-style chord for switching between
+        // multiple coordinator chats (per task tui-chat-tab).
+        KeyCode::Tab
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && app.right_panel_tab == RightPanelTab::Chat =>
+        {
+            switch_chat_tab_relative(app, 1);
+        }
+        KeyCode::BackTab
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && app.right_panel_tab == RightPanelTab::Chat =>
+        {
+            switch_chat_tab_relative(app, -1);
+        }
+
         // Tab: switch panel focus back to graph
         KeyCode::Tab => {
             app.toggle_panel_focus();
+        }
+
+        // Alt+1..Alt+9: jump directly to chat tab N (Chat tab only).
+        // The tab bar renders [N] hotkey hints in the dim-gray prefix to
+        // make these discoverable.
+        KeyCode::Char(d @ '1'..='9')
+            if modifiers.contains(KeyModifiers::ALT)
+                && app.right_panel_tab == RightPanelTab::Chat =>
+        {
+            let n = (d as u8 - b'0') as usize;
+            switch_chat_tab_to_index(app, n - 1);
         }
 
         // ]/[: cycle single-panel views in compact mode
@@ -7863,5 +7922,257 @@ mod iteration_nav_click_tests {
         assert_eq!(iter_nav_click_zone(13, 16, 2, 12), IterNavClickZone::Middle);
         assert_eq!(iter_nav_click_zone(14, 16, 2, 12), IterNavClickZone::Right);
         assert_eq!(iter_nav_click_zone(15, 16, 2, 12), IterNavClickZone::Right);
+    }
+}
+
+#[cfg(test)]
+mod chat_tab_navigation_tests {
+    //! Tests for multi-chat-tab navigation (per task tui-chat-tab):
+    //!   - Alt+1..9 jumps to chat tab N
+    //!   - Ctrl+Tab / Ctrl+Shift+Tab cycles forward/backward
+    //!   - Helper functions cover the underlying state mutation
+    //!
+    //! Click-to-switch is already covered by `mouse_click_on_each_tab_in_bar`
+    //! and `mouse_click_on_tab_bar_switches_tab_stacked_mode` above.
+
+    use super::*;
+    use crate::commands::viz::LayoutMode as VizLayoutMode;
+    use crate::commands::viz::ascii::generate_ascii;
+    use std::collections::{HashMap, HashSet};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    /// Build a VizApp whose graph contains chat-loop tasks for each
+    /// `coordinator_ids` entry, so `list_coordinator_ids()` returns them
+    /// in order. Returns `(app, tmpdir)` — keep the tmpdir alive.
+    fn build_app_with_chats(coordinator_ids: &[u32]) -> (VizApp, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        for &cid in coordinator_ids {
+            let id = if cid == 0 {
+                ".coordinator".to_string()
+            } else {
+                format!(".coordinator-{}", cid)
+            };
+            let title = format!("Coordinator {}", cid);
+            let mut task = make_task_with_status(&id, &title, Status::InProgress);
+            task.tags = vec!["coordinator-loop".to_string()];
+            graph.add_node(Node::Task(task));
+        }
+        // A regular task so the viz output isn't empty.
+        let regular = make_task_with_status("regular-task", "Regular Task", Status::Open);
+        graph.add_node(Node::Task(regular));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let graph_path = wg_dir.join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        // Use an unknown executor so `maybe_auto_enable_chat_pty` returns
+        // early and does NOT spawn a real `claude` PTY child during the
+        // test (which would set `chat_pty_forwards_stdin = true` and
+        // swallow all subsequent keystrokes).
+        let config_path = wg_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            VizLayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir;
+        // Default to first coordinator so cycling has a predictable starting point.
+        app.active_coordinator_id = coordinator_ids[0];
+        app.right_panel_tab = RightPanelTab::Chat;
+        (app, tmp)
+    }
+
+    // ── Helper-function tests ──
+
+    #[test]
+    fn switch_chat_tab_to_index_jumps_to_nth_tab() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        assert_eq!(app.active_coordinator_id, 0);
+
+        switch_chat_tab_to_index(&mut app, 2);
+        assert_eq!(
+            app.active_coordinator_id, 2,
+            "Index 2 should switch to the 3rd chat tab (cid=2)"
+        );
+
+        switch_chat_tab_to_index(&mut app, 0);
+        assert_eq!(app.active_coordinator_id, 0, "Index 0 → cid=0");
+    }
+
+    #[test]
+    fn switch_chat_tab_to_index_out_of_range_is_noop() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1]);
+        switch_chat_tab_to_index(&mut app, 9);
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "Out-of-range index should not switch chats"
+        );
+    }
+
+    #[test]
+    fn switch_chat_tab_relative_cycles_forward() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        switch_chat_tab_relative(&mut app, 1);
+        assert_eq!(app.active_coordinator_id, 1);
+        switch_chat_tab_relative(&mut app, 1);
+        assert_eq!(app.active_coordinator_id, 2);
+        // Wrap.
+        switch_chat_tab_relative(&mut app, 1);
+        assert_eq!(app.active_coordinator_id, 0);
+    }
+
+    #[test]
+    fn switch_chat_tab_relative_cycles_backward() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        switch_chat_tab_relative(&mut app, -1);
+        assert_eq!(app.active_coordinator_id, 2, "Wrap from index 0 → 2");
+        switch_chat_tab_relative(&mut app, -1);
+        assert_eq!(app.active_coordinator_id, 1);
+    }
+
+    #[test]
+    fn switch_chat_tab_relative_noop_with_single_chat() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        switch_chat_tab_relative(&mut app, 1);
+        assert_eq!(app.active_coordinator_id, 0);
+        switch_chat_tab_relative(&mut app, -1);
+        assert_eq!(app.active_coordinator_id, 0);
+    }
+
+    // ── Key-routing tests (end-to-end via handle_key) ──
+
+    #[test]
+    fn alt_number_key_switches_to_chat_n_on_chat_tab() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        // Move focus to right panel so handle_right_panel_key fires.
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+
+        super::handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "Alt+2 should jump to the 2nd chat tab (positional index 1, cid=1)"
+        );
+
+        super::handle_key(&mut app, KeyCode::Char('3'), KeyModifiers::ALT);
+        assert_eq!(
+            app.active_coordinator_id, 2,
+            "Alt+3 should jump to the 3rd chat tab (positional index 2, cid=2)"
+        );
+
+        super::handle_key(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "Alt+1 should jump back to the 1st chat tab"
+        );
+    }
+
+    #[test]
+    fn alt_number_key_does_nothing_off_chat_tab() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        // Off the Chat tab — Alt+N should not switch chats.
+        app.right_panel_tab = RightPanelTab::Detail;
+
+        super::handle_key(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "Alt+N off the Chat tab should not switch chats"
+        );
+    }
+
+    #[test]
+    fn plain_number_key_still_switches_right_panel_tab() {
+        // Regression: don't break the existing 0-9 right-panel-tab shortcut
+        // by adding the Alt+N chat-jump handler.
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+
+        super::handle_key(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Detail,
+            "Plain '1' should switch to right-panel tab #1 (Detail), not jump chats"
+        );
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "Plain '1' must not change the active chat"
+        );
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_chat_tabs_forward() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+
+        super::handle_key(&mut app, KeyCode::Tab, KeyModifiers::CONTROL);
+        assert_eq!(app.active_coordinator_id, 1);
+        super::handle_key(&mut app, KeyCode::Tab, KeyModifiers::CONTROL);
+        assert_eq!(app.active_coordinator_id, 2);
+        super::handle_key(&mut app, KeyCode::Tab, KeyModifiers::CONTROL);
+        assert_eq!(app.active_coordinator_id, 0, "Wraps after last chat");
+    }
+
+    #[test]
+    fn ctrl_shift_tab_cycles_chat_tabs_backward() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+
+        super::handle_key(
+            &mut app,
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.active_coordinator_id, 2, "Wrap from 0 → 2");
+        super::handle_key(
+            &mut app,
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.active_coordinator_id, 1);
+    }
+
+    #[test]
+    fn ctrl_tab_off_chat_tab_falls_through_to_panel_focus_toggle() {
+        // When NOT on the Chat tab, plain Tab still toggles panel focus.
+        // The Ctrl+Tab branch is gated to Chat tab only, so on Detail tab
+        // the existing Tab handler runs (which toggles focus for plain Tab).
+        let (mut app, _tmp) = build_app_with_chats(&[0, 1, 2]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Detail;
+
+        super::handle_key(&mut app, KeyCode::Tab, KeyModifiers::CONTROL);
+        // active_coordinator_id should not change; Ctrl+Tab on Detail tab
+        // is a no-op for chat navigation (the Tab handler runs but only
+        // plain Tab calls toggle_panel_focus).
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "Ctrl+Tab off the Chat tab should not switch chats"
+        );
     }
 }
