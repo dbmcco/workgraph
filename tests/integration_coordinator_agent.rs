@@ -568,7 +568,7 @@ fn coordinator_agent_cursor_tracking() {
 }
 
 /// When the coordinator agent process crashes, the daemon should:
-/// 1. Write an error/timeout response for the pending request
+/// 1. Surface an explicit crash/error response for the pending request
 /// 2. Detect the dead process (via try_wait or stdin write failure)
 /// 3. Restart the agent process automatically
 /// 4. Successfully handle subsequent messages
@@ -596,7 +596,8 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         &[("MOCK_CRASH_FILE", &crash_file_str)],
     );
 
-    // Step 1: Send a message that causes the subprocess to die.
+    // Step 1: Send a message that causes the subprocess to die and surface
+    // a chat-visible crash/error response instead of a normal reply.
     let crash_output = guard.chat("trigger subprocess crash", 15);
     let crash_stdout = String::from_utf8_lossy(&crash_output.stdout).to_string();
     assert!(
