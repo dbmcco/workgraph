@@ -152,6 +152,32 @@ fn wait_for_path(path: &Path) {
     }
 }
 
+fn wait_for_lock_owner_pid(path: &Path, expected_pid: u32) -> String {
+    wait_for_path(path);
+
+    let start = Instant::now();
+    loop {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        if contents
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse::<u32>().ok())
+            == Some(expected_pid)
+        {
+            return contents;
+        }
+
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!(
+                "Lock owner PID was not fully written within 10s at {:?}. Expected {}, got contents {:?}",
+                path, expected_pid, contents
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Wait for the coordinator agent to be spawned (look for log marker).
 fn wait_for_coordinator_agent(wg_dir: &Path) {
     let log_path = wg_dir.join("service").join("daemon.log");
@@ -559,17 +585,13 @@ fn claude_handler_rejects_duplicate_coordinator_session_owner() {
     ));
 
     let lock_path = wg_dir.join("chat").join(".handler.pid");
-    wait_for_path(&lock_path);
+    let lock_contents = wait_for_lock_owner_pid(&lock_path, first.id());
 
     assert!(
         first.try_wait().unwrap().is_none(),
         "first claude-handler exited before duplicate-owner check.\nDaemon log:\n{}",
         read_daemon_log(&wg_dir),
     );
-
-    let lock_contents = fs::read_to_string(&lock_path).unwrap();
-    let owner_pid = lock_contents.lines().next().unwrap_or_default().to_string();
-    assert_eq!(owner_pid, first.id().to_string());
 
     let output = wg_cmd_env(
         &wg_dir,

@@ -1,31 +1,16 @@
 //! Per-session handler lock — enforces at-most-one live handler per
 //! chat session at a time.
 //!
-//! This module implements the lock contract:
+//! External contract:
+//! - `.handler.pid` remains the human-readable holder metadata file
+//! - `.handler.release-requested` remains the cooperative release marker
 //!
-//!   * `acquire(dir, kind)`: O_EXCL create on `<dir>/.handler.pid`.
-//!     If the file exists with a LIVE PID, refuses. If the file
-//!     exists with a DEAD PID, recovers (removes + retakes).
-//!   * `SessionLock::drop`: removes the file on clean exit.
-//!   * `read_holder(dir)`: non-destructive read of who currently
-//!     holds the lock.
-//!   * `request_release(dir)`: writes `<dir>/.handler.release-requested`
-//!     as a cooperative signal.
-//!
-//! The lock file format is deliberately small and human-readable:
-//!
-//! ```text
-//! <pid>\n
-//! <iso-8601-start-time>\n
-//! <kind-label>\n
-//! ```
-//!
-//! Stale detection uses `kill(pid, 0)` on Unix. On non-Unix targets we
-//! conservatively treat the lock as alive.
+//! Internally we serialize acquisition through a sidecar guard file held for
+//! the lock lifetime, so `.handler.pid` can be updated safely and `release()`
+//! only removes metadata that still belongs to this instance.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,8 +18,9 @@ use anyhow::{Context, Result, anyhow};
 
 const LOCK_FILENAME: &str = ".handler.pid";
 const RELEASE_MARKER: &str = ".handler.release-requested";
+const GUARD_FILENAME: &str = ".handler.pid.guard";
+const OWNER_METADATA_WAIT: Duration = Duration::from_millis(250);
 
-/// What kind of handler owns the lock. Used for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandlerKind {
     InteractiveNex,
@@ -67,7 +53,6 @@ impl HandlerKind {
     }
 }
 
-/// Snapshot of the current lock holder.
 #[derive(Clone, Debug)]
 pub struct LockInfo {
     pub pid: u32,
@@ -76,9 +61,36 @@ pub struct LockInfo {
     pub alive: bool,
 }
 
-/// RAII lock handle. Drop removes the file.
+struct GuardFile {
+    file: File,
+}
+
+impl GuardFile {
+    fn acquire(chat_dir: &Path) -> Result<Option<Self>> {
+        let path = guard_path(chat_dir);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("open guard file {:?}", path))?;
+
+        if try_lock_exclusive_nonblocking(&file)? {
+            Ok(Some(Self { file }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn touch(&self) {
+        let _ = self.file.metadata();
+    }
+}
+
 pub struct SessionLock {
     path: PathBuf,
+    expected_contents: String,
+    guard: Option<GuardFile>,
     released: bool,
 }
 
@@ -96,71 +108,73 @@ impl SessionLock {
             .with_context(|| format!("create chat dir {:?}", chat_dir))?;
         let path = Self::lock_path(chat_dir);
 
-        let create_result = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .open(&path);
+        let guard = match GuardFile::acquire(chat_dir)? {
+            Some(guard) => guard,
+            None => return Err(live_owner_error(chat_dir)?),
+        };
 
-        match create_result {
-            Ok(mut file) => {
-                let contents = format!(
-                    "{}\n{}\n{}\n",
-                    std::process::id(),
-                    chrono::Utc::now().to_rfc3339(),
-                    kind.label(),
+        let expected_contents = format_lock_contents(std::process::id(), kind);
+        match read_holder_at(&path)? {
+            Some(holder) if holder.alive => {
+                return Err(anyhow!(
+                    "session lock held by live handler pid={} kind={} started={}",
+                    holder.pid,
+                    holder.kind.map(|k| k.label()).unwrap_or("unknown"),
+                    holder.started_at
+                ));
+            }
+            Some(holder) => {
+                eprintln!(
+                    "[session-lock] recovering stale lock (dead pid={}, kind={}) at {:?}",
+                    holder.pid,
+                    holder.kind.map(|k| k.label()).unwrap_or("unknown"),
+                    path
                 );
-                file.write_all(contents.as_bytes())
-                    .with_context(|| format!("write lock file {:?}", path))?;
-                file.sync_all().context("fsync lock file")?;
-                Ok(Self {
-                    path,
-                    released: false,
-                })
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                match read_holder_at(&path)? {
-                    Some(holder) if holder.alive => Err(anyhow!(
-                        "session lock held by live handler pid={} kind={} started={}",
-                        holder.pid,
-                        holder.kind.map(|k| k.label()).unwrap_or("unknown"),
-                        holder.started_at
-                    )),
-                    Some(holder) => {
-                        eprintln!(
-                            "[session-lock] recovering stale lock (dead pid={}, kind={}) at {:?}",
-                            holder.pid,
-                            holder.kind.map(|k| k.label()).unwrap_or("unknown"),
-                            path
-                        );
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("remove stale lock {:?}", path))?;
-                        Self::acquire(chat_dir, kind)
-                    }
-                    None => {
-                        eprintln!("[session-lock] recovering unparseable lock at {:?}", path);
-                        std::fs::remove_file(&path)
-                            .with_context(|| format!("remove corrupt lock {:?}", path))?;
-                        Self::acquire(chat_dir, kind)
-                    }
-                }
+            None if path.exists() => {
+                eprintln!("[session-lock] recovering unparseable lock at {:?}", path);
             }
-            Err(err) => Err(anyhow!("open lock file {:?}: {}", path, err)),
+            None => {}
         }
+
+        write_lock_contents(&path, &expected_contents)?;
+
+        Ok(Self {
+            path,
+            expected_contents,
+            guard: Some(guard),
+            released: false,
+        })
     }
 
     pub fn release(&mut self) {
         if self.released {
             return;
         }
-        if self.path.exists()
-            && let Err(err) = std::fs::remove_file(&self.path)
-        {
-            eprintln!(
-                "[session-lock] warning: failed to remove lock {:?}: {}",
-                self.path, err
-            );
+
+        if let Some(guard) = self.guard.as_ref() {
+            guard.touch();
+            match std::fs::read_to_string(&self.path) {
+                Ok(current) if current == self.expected_contents => {
+                    if let Err(err) = std::fs::remove_file(&self.path) {
+                        eprintln!(
+                            "[session-lock] warning: failed to remove lock {:?}: {}",
+                            self.path, err
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    eprintln!(
+                        "[session-lock] warning: failed to read lock {:?} during release: {}",
+                        self.path, err
+                    );
+                }
+            }
         }
+
+        self.guard = None;
         self.released = true;
     }
 }
@@ -244,6 +258,91 @@ pub fn wait_for_release(chat_dir: &Path, timeout: Duration) -> Result<()> {
     }
 }
 
+fn live_owner_error(chat_dir: &Path) -> Result<anyhow::Error> {
+    let start = std::time::Instant::now();
+    loop {
+        match read_holder(chat_dir)? {
+            Some(holder) if holder.alive => {
+                return Ok(anyhow!(
+                    "session lock held by live handler pid={} kind={} started={}",
+                    holder.pid,
+                    holder.kind.map(|k| k.label()).unwrap_or("unknown"),
+                    holder.started_at
+                ));
+            }
+            Some(_) => {}
+            None => {}
+        }
+
+        if start.elapsed() >= OWNER_METADATA_WAIT {
+            return Ok(anyhow!(
+                "session lock is currently being acquired by another handler"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn guard_path(chat_dir: &Path) -> PathBuf {
+    chat_dir.join(GUARD_FILENAME)
+}
+
+fn format_lock_contents(pid: u32, kind: HandlerKind) -> String {
+    format!(
+        "{}\n{}\n{}\n",
+        pid,
+        chrono::Utc::now().to_rfc3339(),
+        kind.label(),
+    )
+}
+
+fn write_lock_contents(path: &Path, contents: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    let mut tmp = open_write_truncate(&tmp_path)
+        .with_context(|| format!("open temp lock file {:?}", tmp_path))?;
+    tmp.write_all(contents.as_bytes())
+        .with_context(|| format!("write temp lock file {:?}", tmp_path))?;
+    tmp.sync_all()
+        .with_context(|| format!("fsync temp lock file {:?}", tmp_path))?;
+    drop(tmp);
+
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("rename temp lock file {:?}", path))?;
+    Ok(())
+}
+
+fn open_write_truncate(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive_nonblocking(file: &File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(true)
+    } else {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Ok(false),
+            _ => Err(anyhow!("acquire guard flock: {}", err)),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive_nonblocking(_file: &File) -> Result<bool> {
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
@@ -290,8 +389,8 @@ mod tests {
         assert!(second.is_err(), "second acquire must fail while first held");
         let err = second.err().unwrap().to_string();
         assert!(
-            err.contains("pid="),
-            "error must name the holder pid: {}",
+            err.contains("pid=") || err.contains("being acquired"),
+            "error must identify the live owner or in-progress owner: {}",
             err
         );
     }
@@ -340,6 +439,19 @@ mod tests {
         let mut lock = SessionLock::acquire(dir.path(), HandlerKind::ChatNex).unwrap();
         lock.release();
         let _new = SessionLock::acquire(dir.path(), HandlerKind::ChatNex).unwrap();
+    }
+
+    #[test]
+    fn release_does_not_remove_lock_when_contents_change() {
+        let dir = tempdir().unwrap();
+        let mut lock = SessionLock::acquire(dir.path(), HandlerKind::ChatNex).unwrap();
+        let path = SessionLock::lock_path(dir.path());
+        let replacement = "424242\n2026-01-01T00:00:00Z\nadapter\n";
+        std::fs::write(&path, replacement).unwrap();
+
+        lock.release();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
     }
 
     #[test]
