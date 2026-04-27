@@ -825,7 +825,9 @@ fn resolve_daemon_config(
     DaemonConfig {
         max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
         executor,
-        poll_interval: Duration::from_secs(cli_interval.unwrap_or(config.coordinator.poll_interval)),
+        poll_interval: Duration::from_secs(
+            cli_interval.unwrap_or(config.coordinator.poll_interval),
+        ),
         model,
         paused: false,
         settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
@@ -834,9 +836,9 @@ fn resolve_daemon_config(
 
 /// Route new chat inbox messages to the persistent coordinator agent.
 ///
-/// Reads the inbox since the coordinator cursor, sends each message to the
-/// agent thread, and advances the cursor. The agent thread handles context
-/// injection, LLM processing, and outbox writing asynchronously.
+/// Reads the inbox since the coordinator cursor and signals the coordinator
+/// supervisor about each new message. The handler subprocess owns cursor
+/// advancement after it actually processes each inbox entry.
 ///
 /// Returns the number of messages routed.
 fn route_chat_to_agent(
@@ -866,18 +868,10 @@ fn route_chat_to_agent(
             // Write an error response so the user isn't left hanging
             let _ = workgraph::chat::append_error(
                 dir,
-                &format!(
-                    "The coordinator agent is not available.\n\nError:\n{:#}",
-                    e
-                ),
+                &format!("The coordinator agent is not available.\n\nError:\n{:#}", e),
                 &msg.request_id,
             );
         }
-    }
-
-    // Advance the coordinator cursor past these messages
-    if let Some(last) = new_messages.last() {
-        workgraph::chat::write_coordinator_cursor(dir, last.id)?;
     }
 
     Ok(count)

@@ -364,7 +364,13 @@ fn coordinator_spawn_task_dry_run_primary() {
 
     let stdout = wg_ok(
         &wg_dir,
-        &["spawn-task", ".coordinator-0", "--role", "coordinator", "--dry-run"],
+        &[
+            "spawn-task",
+            ".coordinator-0",
+            "--role",
+            "coordinator",
+            "--dry-run",
+        ],
     );
 
     assert!(
@@ -388,7 +394,13 @@ fn coordinator_spawn_task_rejects_unsupported_executor() {
 
     let output = wg_cmd(
         &wg_dir,
-        &["spawn-task", ".coordinator-0", "--role", "coordinator", "--dry-run"],
+        &[
+            "spawn-task",
+            ".coordinator-0",
+            "--role",
+            "coordinator",
+            "--dry-run",
+        ],
     );
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -413,7 +425,13 @@ fn coordinator_spawn_task_rejects_unsupported_role() {
 
     let output = wg_cmd(
         &wg_dir,
-        &["spawn-task", ".coordinator-0", "--role", "agent", "--dry-run"],
+        &[
+            "spawn-task",
+            ".coordinator-0",
+            "--role",
+            "agent",
+            "--dry-run",
+        ],
     );
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -633,8 +651,9 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         crash_stdout
     );
 
-    // Step 2: Wait for the daemon to restart the agent.
-    // Look for a second "Claude CLI started" in the daemon log.
+    // Step 2: Wait for the daemon to restart the supervised handler subprocess.
+    // In this slice the daemon owns the supervisor child, not Claude stdio directly,
+    // so the stable restart marker is the handler-supervisor launch line.
     let log_path = wg_dir.join("service").join("daemon.log");
     let start = Instant::now();
     loop {
@@ -646,7 +665,9 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
             );
         }
         if let Ok(content) = fs::read_to_string(&log_path) {
-            let starts: Vec<_> = content.match_indices("Claude CLI started").collect();
+            let starts: Vec<_> = content
+                .match_indices("claude-handler supervisor child started")
+                .collect();
             if starts.len() >= 2 {
                 break;
             }

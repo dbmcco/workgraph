@@ -23,10 +23,10 @@
 //!   the daemon main thread and the agent thread.
 
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -56,6 +56,12 @@ const RECOVERY_MSG_MAX_CHARS: usize = 500;
 
 /// Maximum number of messages to keep per file when rotating chat history.
 const HISTORY_ROTATION_KEEP: usize = 200;
+
+/// Poll interval for the handler subprocess to notice new inbox work.
+pub(crate) const HANDLER_IDLE_POLL_MS: u64 = 200;
+
+/// Timeout for a single coordinator turn.
+pub(crate) const COORDINATOR_TURN_TIMEOUT_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Event log: bounded ring buffer for inter-interaction event tracking
@@ -212,7 +218,11 @@ pub fn new_event_log() -> SharedEventLog {
 /// A chat message to be injected into the coordinator agent.
 pub struct ChatRequest {
     pub request_id: String,
-    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    request_id: String,
 }
 
 /// Handle to the running coordinator agent.
@@ -317,12 +327,9 @@ impl CoordinatorAgent {
     ///
     /// Returns Ok(()) if the message was queued. The response will be
     /// written to the chat outbox asynchronously.
-    pub fn send_message(&self, request_id: String, message: String) -> Result<()> {
+    pub fn send_message(&self, request_id: String, _message: String) -> Result<()> {
         self.tx
-            .send(ChatRequest {
-                request_id,
-                message,
-            })
+            .send(ChatRequest { request_id })
             .map_err(|_| anyhow::anyhow!("Coordinator agent thread has exited"))
     }
 
@@ -370,69 +377,31 @@ fn agent_thread_main(
     alive: Arc<Mutex<bool>>,
     pid: Arc<Mutex<u32>>,
     logger: &DaemonLogger,
-    event_log: &SharedEventLog,
+    _event_log: &SharedEventLog,
 ) {
-    // Track restart timestamps for time-windowed rate limiting.
-    // Instead of a simple counter, we track when each restart occurred
-    // and only count restarts within the window.
     let mut restart_timestamps: VecDeque<std::time::Instant> = VecDeque::new();
+    let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
+    let mut pending_ids: HashSet<String> = HashSet::new();
+    let mut last_observed_cursor = chat::read_coordinator_cursor(dir).unwrap_or(0);
 
     loop {
-        // --- Time-windowed restart rate limiting ---
-        let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(RESTART_WINDOW_SECS);
+        enforce_restart_window(&mut restart_timestamps, logger);
 
-        // Purge restart timestamps outside the window
-        while let Some(front) = restart_timestamps.front() {
-            if now.duration_since(*front) > window {
-                restart_timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // If we've hit the max restarts within the window, pause
-        if restart_timestamps.len() >= MAX_RESTARTS_PER_WINDOW {
-            let oldest = restart_timestamps.front().copied();
-            if let Some(oldest_time) = oldest {
-                let wait_time = window.saturating_sub(now.duration_since(oldest_time));
-                logger.error(&format!(
-                    "Coordinator agent: {} restarts in last {} minutes, pausing for {}s",
-                    MAX_RESTARTS_PER_WINDOW,
-                    RESTART_WINDOW_SECS / 60,
-                    wait_time.as_secs(),
-                ));
-                std::thread::sleep(wait_time);
-                // Purge again after sleeping
-                let now = std::time::Instant::now();
-                while let Some(front) = restart_timestamps.front() {
-                    if now.duration_since(*front) > window {
-                        restart_timestamps.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let is_restart = !restart_timestamps.is_empty();
-
-        // Rotate old chat history on restart to prevent unbounded growth
-        if is_restart && let Err(e) = chat::rotate_history(dir, HISTORY_ROTATION_KEEP) {
+        if !restart_timestamps.is_empty()
+            && let Err(e) = chat::rotate_history(dir, HISTORY_ROTATION_KEEP)
+        {
             logger.warn(&format!(
                 "Coordinator agent: failed to rotate chat history: {}",
                 e
             ));
         }
 
-        // Spawn the Claude CLI process
-        logger.info("Coordinator agent: spawning Claude CLI process");
-        let spawn_result = spawn_claude_process(dir, model, logger);
-        let (mut child, mut stdin, stdout) = match spawn_result {
-            Ok(handles) => handles,
+        logger.info("Coordinator agent: launching subprocess via `wg spawn-task .coordinator-0 --role coordinator`");
+        let mut child = match spawn_handler_subprocess(dir, model, logger) {
+            Ok(child) => child,
             Err(e) => {
                 logger.error(&format!(
-                    "Coordinator agent: failed to spawn Claude CLI: {}",
+                    "Coordinator agent: failed to spawn handler subprocess: {}",
                     e
                 ));
                 restart_timestamps.push_back(std::time::Instant::now());
@@ -445,65 +414,53 @@ fn agent_thread_main(
         *pid.lock().unwrap_or_else(|e| e.into_inner()) = child_pid;
         *alive.lock().unwrap_or_else(|e| e.into_inner()) = true;
         logger.info(&format!(
-            "Coordinator agent: Claude CLI started (PID {})",
+            "Coordinator agent: claude-handler supervisor child started (PID {})",
             child_pid
         ));
 
-        // Spawn stdout reader thread
-        let (response_tx, response_rx) = mpsc::channel::<ResponseEvent>();
-        let reader_logger = logger.clone();
-        let reader_dir = dir.to_path_buf();
-        let _reader_thread = thread::Builder::new()
-            .name("coordinator-stdout".to_string())
-            .spawn(move || {
-                stdout_reader(stdout, response_tx, &reader_logger, &reader_dir);
-            });
-
-        // If this is a restart, inject crash recovery context
-        if is_restart {
-            logger.info("Coordinator agent: injecting crash recovery context");
-            if let Err(e) = inject_crash_recovery_context(dir, &mut stdin, &response_rx, logger) {
-                logger.warn(&format!(
-                    "Coordinator agent: failed to inject crash recovery context: {}",
-                    e
-                ));
-            }
-        }
-
-        // Track the last interaction time for context injection
-        let mut last_interaction = chrono::Utc::now().to_rfc3339();
-
-        // Process messages from the main daemon thread
         loop {
-            // Wait for a chat message (with timeout to check process health)
-            let request = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(req) => Some(req),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // Channel closed — daemon is shutting down
-                    logger.info("Coordinator agent: channel closed, shutting down");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                    *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-                    return;
-                }
-            };
+            reconcile_pending_requests(
+                dir,
+                &mut last_observed_cursor,
+                &mut pending_requests,
+                &mut pending_ids,
+                logger,
+            );
 
-            // Check if the process is still alive
+            let mut disconnected = false;
+            match rx.recv_timeout(std::time::Duration::from_millis(HANDLER_IDLE_POLL_MS)) {
+                Ok(req) => {
+                    if pending_ids.insert(req.request_id.clone()) {
+                        pending_requests.push_back(PendingRequest {
+                            request_id: req.request_id,
+                        });
+                    }
+                    while let Ok(req) = rx.try_recv() {
+                        if pending_ids.insert(req.request_id.clone()) {
+                            pending_requests.push_back(PendingRequest {
+                                request_id: req.request_id,
+                            });
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                }
+            }
+
             if let Some(status) = child.try_wait().unwrap_or(None) {
-                logger.warn(&format!(
-                    "Coordinator agent: Claude CLI exited with status {:?}, restarting",
-                    status
-                ));
                 *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-
-                // Clear any in-progress streaming
                 chat::clear_streaming(dir);
-
-                // If there was a pending request, write an error response
-                if let Some(req) = request {
+                reconcile_pending_requests(
+                    dir,
+                    &mut last_observed_cursor,
+                    &mut pending_requests,
+                    &mut pending_ids,
+                    logger,
+                );
+                if let Some(req) = pending_requests.front() {
                     let _ = chat::append_error(
                         dir,
                         &format!(
@@ -513,117 +470,23 @@ fn agent_thread_main(
                         &req.request_id,
                     );
                 }
-                break; // Break inner loop to restart
+                logger.warn(&format!(
+                    "Coordinator agent: handler subprocess exited with status {:?}, restarting",
+                    status
+                ));
+                break;
             }
 
-            if let Some(req) = request {
-                logger.info(&format!(
-                    "Coordinator agent: processing request_id={}",
-                    req.request_id
-                ));
-
-                // Build context injection with event log
-                let context =
-                    match build_coordinator_context(dir, &last_interaction, Some(event_log)) {
-                        Ok(ctx) => ctx,
-                        Err(e) => {
-                            logger.warn(&format!(
-                                "Coordinator agent: failed to build context: {}",
-                                e
-                            ));
-                            String::new()
-                        }
-                    };
-
-                // Format the user message with context injection prepended
-                let full_content = if context.is_empty() {
-                    format!("User message:\n{}", req.message)
-                } else {
-                    format!("{}\n\n---\n\nUser message:\n{}", context, req.message)
-                };
-
-                // Write the stream-json user message to stdin
-                let user_msg = format_stream_json_user_message(&full_content);
-                match stdin.write_all(user_msg.as_bytes()) {
-                    Ok(()) => {
-                        let _ = stdin.flush();
-                    }
-                    Err(e) => {
-                        logger.error(&format!(
-                            "Coordinator agent: failed to write to stdin: {}",
-                            e
-                        ));
-                        chat::clear_streaming(dir);
-                        let _ = chat::append_error(
-                            dir,
-                            &format!(
-                                "The coordinator agent failed to accept your message.\n\nError:\n{:#}",
-                                e
-                            ),
-                            &req.request_id,
-                        );
-                        break; // Restart
-                    }
-                }
-
-                // Wait for the response, streaming partial text to the TUI as it arrives
-                let collected = collect_response_streaming(
-                    &response_rx,
-                    logger,
-                    std::time::Duration::from_secs(300),
-                    dir,
-                );
-
-                // Clear the streaming file now that the response is complete
-                chat::clear_streaming(dir);
-
-                match collected {
-                    Some(resp) if !resp.summary.is_empty() => {
-                        logger.info(&format!(
-                            "Coordinator agent: got response ({} chars{}) for request_id={}",
-                            resp.summary.len(),
-                            if resp.full_text.is_some() {
-                                ", with tool calls"
-                            } else {
-                                ""
-                            },
-                            req.request_id
-                        ));
-                        if let Err(e) = chat::append_outbox_full(
-                            dir,
-                            &resp.summary,
-                            resp.full_text,
-                            &req.request_id,
-                        ) {
-                            logger.error(&format!(
-                                "Coordinator agent: failed to write outbox: {}",
-                                e
-                            ));
-                        }
-                    }
-                    Some(_) => {
-                        logger.warn("Coordinator agent: empty response from Claude CLI");
-                        let _ = chat::append_error(
-                            dir,
-                            "The coordinator processed your message but produced no response text.",
-                            &req.request_id,
-                        );
-                    }
-                    None => {
-                        logger.warn("Coordinator agent: response timeout");
-                        let _ = chat::append_error(
-                            dir,
-                            "The coordinator agent timed out processing your message. It may be performing a long-running operation.",
-                            &req.request_id,
-                        );
-                    }
-                }
-
-                last_interaction = chrono::Utc::now().to_rfc3339();
+            if disconnected {
+                logger.info("Coordinator agent: channel closed, shutting down");
+                let _ = child.kill();
+                let _ = child.wait();
+                *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                return;
             }
         }
 
-        // If we're here, the process died — record restart timestamp and wait
         restart_timestamps.push_back(std::time::Instant::now());
         logger.info(&format!(
             "Coordinator agent: restarting (restarts in window: {})",
@@ -631,6 +494,110 @@ fn agent_thread_main(
         ));
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
+}
+
+fn enforce_restart_window(
+    restart_timestamps: &mut VecDeque<std::time::Instant>,
+    logger: &DaemonLogger,
+) {
+    let now = std::time::Instant::now();
+    let window = std::time::Duration::from_secs(RESTART_WINDOW_SECS);
+
+    while let Some(front) = restart_timestamps.front() {
+        if now.duration_since(*front) > window {
+            restart_timestamps.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if restart_timestamps.len() < MAX_RESTARTS_PER_WINDOW {
+        return;
+    }
+
+    if let Some(oldest_time) = restart_timestamps.front().copied() {
+        let wait_time = window.saturating_sub(now.duration_since(oldest_time));
+        logger.error(&format!(
+            "Coordinator agent: {} restarts in last {} minutes, pausing for {}s",
+            MAX_RESTARTS_PER_WINDOW,
+            RESTART_WINDOW_SECS / 60,
+            wait_time.as_secs(),
+        ));
+        std::thread::sleep(wait_time);
+    }
+}
+
+fn reconcile_pending_requests(
+    dir: &Path,
+    last_observed_cursor: &mut u64,
+    pending_requests: &mut VecDeque<PendingRequest>,
+    pending_ids: &mut HashSet<String>,
+    logger: &DaemonLogger,
+) {
+    let current_cursor = match chat::read_coordinator_cursor(dir) {
+        Ok(cursor) => cursor,
+        Err(e) => {
+            logger.warn(&format!(
+                "Coordinator agent: failed to read coordinator cursor while reconciling pending requests: {}",
+                e
+            ));
+            return;
+        }
+    };
+
+    if current_cursor <= *last_observed_cursor {
+        return;
+    }
+
+    let completed = current_cursor.saturating_sub(*last_observed_cursor) as usize;
+    for _ in 0..completed {
+        if let Some(req) = pending_requests.pop_front() {
+            pending_ids.remove(&req.request_id);
+        } else {
+            break;
+        }
+    }
+    *last_observed_cursor = current_cursor;
+}
+
+fn spawn_handler_subprocess(
+    dir: &Path,
+    model: Option<&str>,
+    logger: &DaemonLogger,
+) -> Result<Child> {
+    let wg = std::env::current_exe().context("Failed to resolve current wg binary")?;
+    let mut cmd = Command::new(wg);
+    cmd.arg("--dir")
+        .arg(dir)
+        .arg("spawn-task")
+        .arg(".coordinator-0")
+        .arg("--role")
+        .arg("coordinator");
+
+    if let Some(model) = model {
+        cmd.env("WG_COORDINATOR_MODEL_OVERRIDE", model);
+    }
+
+    cmd.current_dir(dir.parent().unwrap_or(dir));
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+
+    let stderr_path = dir.join("service").join("coordinator-handler-stderr.log");
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    cmd.stderr(stderr_file);
+
+    logger.info(&format!(
+        "Coordinator agent: spawning child command `wg spawn-task .coordinator-0 --role coordinator` (cwd={:?}, stderr={:?})",
+        dir.parent().unwrap_or(dir),
+        stderr_path,
+    ));
+
+    cmd.spawn().context("Failed to spawn handler subprocess")
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +714,61 @@ enum ResponseEvent {
     StreamEnd,
 }
 
+pub(crate) struct ClaudeSession {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    response_rx: mpsc::Receiver<ResponseEvent>,
+    _reader_thread: JoinHandle<()>,
+}
+
+impl ClaudeSession {
+    pub(crate) fn start(dir: &Path, model: Option<&str>, logger: &DaemonLogger) -> Result<Self> {
+        let (child, stdin, stdout) = spawn_claude_process(dir, model, logger)?;
+        let (response_tx, response_rx) = mpsc::channel::<ResponseEvent>();
+        let reader_logger = logger.clone();
+        let reader_dir = dir.to_path_buf();
+        let reader_thread = thread::Builder::new()
+            .name("coordinator-stdout".to_string())
+            .spawn(move || {
+                stdout_reader(stdout, response_tx, &reader_logger, &reader_dir);
+            })
+            .context("Failed to spawn coordinator stdout reader thread")?;
+
+        Ok(Self {
+            child,
+            stdin,
+            response_rx,
+            _reader_thread: reader_thread,
+        })
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(crate) fn send_user_turn(&mut self, content: &str) -> Result<()> {
+        let user_msg = format_stream_json_user_message(content);
+        self.stdin
+            .write_all(user_msg.as_bytes())
+            .context("Failed to write user turn to claude stdin")?;
+        self.stdin.flush().context("Failed to flush claude stdin")?;
+        Ok(())
+    }
+
+    pub(crate) fn collect_response_streaming(
+        &self,
+        logger: &DaemonLogger,
+        timeout: std::time::Duration,
+        dir: &Path,
+    ) -> CollectedTurn {
+        collect_response_streaming(&self.response_rx, logger, timeout, dir)
+    }
+}
+
 /// Ordered parts of a coordinator response, for building the full response text.
 enum ResponsePart {
     Text(String),
@@ -755,12 +777,18 @@ enum ResponsePart {
 }
 
 /// Collected coordinator response with summary and full text.
-struct CollectedResponse {
+pub(crate) struct CollectedResponse {
     /// Summary text (last text block) for the collapsed view.
-    summary: String,
+    pub(crate) summary: String,
     /// Full response text including tool calls, for the expanded view.
     /// None if the response had no tool calls (full == summary).
-    full_text: Option<String>,
+    pub(crate) full_text: Option<String>,
+}
+
+pub(crate) enum CollectedTurn {
+    Response(CollectedResponse),
+    Timeout,
+    StreamEnded,
 }
 
 /// Path to the thinking tokens file, read by the TUI for live token display.
@@ -1032,7 +1060,7 @@ fn collect_response_streaming(
     logger: &DaemonLogger,
     timeout: std::time::Duration,
     dir: &Path,
-) -> Option<CollectedResponse> {
+) -> CollectedTurn {
     let deadline = std::time::Instant::now() + timeout;
     let mut parts: Vec<ResponsePart> = Vec::new();
     let mut has_tool_calls = false;
@@ -1045,7 +1073,9 @@ fn collect_response_streaming(
             .unwrap_or(std::time::Duration::ZERO);
         if remaining.is_zero() {
             logger.warn("Coordinator agent: response collection timed out");
-            return build_collected_response(&parts, has_tool_calls);
+            return build_collected_response(&parts, has_tool_calls)
+                .map(CollectedTurn::Response)
+                .unwrap_or(CollectedTurn::Timeout);
         }
 
         match rx.recv_timeout(remaining) {
@@ -1071,17 +1101,25 @@ fn collect_response_streaming(
                 if !has_text {
                     continue;
                 }
-                return build_collected_response(&parts, has_tool_calls);
+                return build_collected_response(&parts, has_tool_calls)
+                    .map(CollectedTurn::Response)
+                    .unwrap_or(CollectedTurn::Timeout);
             }
             Ok(ResponseEvent::StreamEnd) => {
                 logger.warn("Coordinator agent: stdout stream ended during response collection");
-                return build_collected_response(&parts, has_tool_calls);
+                return build_collected_response(&parts, has_tool_calls)
+                    .map(CollectedTurn::Response)
+                    .unwrap_or(CollectedTurn::StreamEnded);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                return build_collected_response(&parts, has_tool_calls);
+                return build_collected_response(&parts, has_tool_calls)
+                    .map(CollectedTurn::Response)
+                    .unwrap_or(CollectedTurn::Timeout);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return build_collected_response(&parts, has_tool_calls);
+                return build_collected_response(&parts, has_tool_calls)
+                    .map(CollectedTurn::Response)
+                    .unwrap_or(CollectedTurn::StreamEnded);
             }
         }
     }
