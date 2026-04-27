@@ -502,6 +502,8 @@ fn handle_status(dir: &Path) -> IpcResponse {
             "poll_interval": coord.poll_interval,
             "executor": coord.executor,
             "model": coord.model,
+            "executor_override": coord.executor_override,
+            "model_override": coord.model_override,
             "ticks": coord.ticks,
             "last_tick": coord.last_tick,
             "agents_alive": coord.agents_alive,
@@ -541,6 +543,8 @@ fn handle_reconfigure(
     let has_overrides =
         max_agents.is_some() || executor.is_some() || poll_interval.is_some() || model.is_some();
     let executor_overridden = executor.is_some();
+    let executor_override_update = executor.clone();
+    let model_override_update = model.clone();
 
     if has_overrides {
         // Apply individual overrides
@@ -582,6 +586,17 @@ fn handle_reconfigure(
 
     // Update persisted coordinator state so `wg service status` reflects the change
     if let Some(mut coord_state) = CoordinatorState::load(dir) {
+        if has_overrides {
+            if let Some(executor_override) = executor_override_update {
+                coord_state.executor_override = Some(executor_override);
+            }
+            if let Some(model_override) = model_override_update {
+                coord_state.model_override = Some(model_override);
+            }
+        } else {
+            coord_state.executor_override = None;
+            coord_state.model_override = None;
+        }
         coord_state.max_agents = daemon_cfg.max_agents;
         coord_state.executor = daemon_cfg.executor.clone();
         coord_state.poll_interval = daemon_cfg.poll_interval.as_secs();
@@ -971,6 +986,8 @@ mod tests {
             max_agents: 4,
             poll_interval: 60,
             executor: "claude".to_string(),
+            executor_override: None,
+            model_override: None,
             ..Default::default()
         };
         fs::create_dir_all(dir.join("service")).unwrap();
@@ -1005,6 +1022,8 @@ mod tests {
         let loaded = CoordinatorState::load(dir).unwrap();
         assert_eq!(loaded.max_agents, 8);
         assert_eq!(loaded.executor, "opencode");
+        assert_eq!(loaded.executor_override, Some("opencode".to_string()));
+        assert_eq!(loaded.model_override, Some("haiku".to_string()));
     }
 
     #[test]
@@ -1027,6 +1046,8 @@ poll_interval = 120
             max_agents: 4,
             poll_interval: 60,
             executor: "claude".to_string(),
+            executor_override: Some("codex".to_string()),
+            model_override: Some("codex:gpt-5-codex".to_string()),
             ..Default::default()
         };
         coord.save(dir);
@@ -1048,6 +1069,10 @@ poll_interval = 120
         assert_eq!(cfg.executor, "shell");
         assert_eq!(cfg.poll_interval, Duration::from_secs(120));
         assert_eq!(cfg.model, None); // config.toml doesn't set model
+
+        let loaded = CoordinatorState::load(dir).unwrap();
+        assert_eq!(loaded.executor_override, None);
+        assert_eq!(loaded.model_override, None);
     }
 
     #[test]
@@ -1067,6 +1092,8 @@ model = "openrouter:minimax/minimax-m1"
             max_agents: 4,
             poll_interval: 60,
             executor: "claude".to_string(),
+            executor_override: None,
+            model_override: None,
             ..Default::default()
         };
         coord.save(dir);
@@ -1098,6 +1125,8 @@ model = "openrouter:minimax/minimax-m1"
             max_agents: 4,
             poll_interval: 60,
             executor: "claude".to_string(),
+            executor_override: None,
+            model_override: None,
             ..Default::default()
         };
         coord.save(dir);

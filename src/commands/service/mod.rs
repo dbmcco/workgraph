@@ -261,6 +261,12 @@ pub struct CoordinatorState {
     /// Effective config: model for spawned agents
     #[serde(default)]
     pub model: Option<String>,
+    /// Persisted executor override from runtime reconfigure operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_override: Option<String>,
+    /// Persisted model override from runtime reconfigure operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
     /// Total coordinator ticks completed
     pub ticks: u64,
     /// ISO 8601 timestamp of the last tick
@@ -791,6 +797,41 @@ pub(crate) struct DaemonConfig {
     settling_delay: Duration,
 }
 
+fn resolve_daemon_config(
+    dir: &Path,
+    cli_max_agents: Option<usize>,
+    cli_executor: Option<&str>,
+    cli_interval: Option<u64>,
+    cli_model: Option<&str>,
+) -> DaemonConfig {
+    let config = Config::load_or_default(dir);
+    let coord_state = CoordinatorState::load(dir).unwrap_or_default();
+
+    let model = cli_model
+        .map(std::string::ToString::to_string)
+        .or_else(|| coord_state.model_override.clone())
+        .or_else(|| config.coordinator.model.clone());
+
+    let executor = cli_executor
+        .map(std::string::ToString::to_string)
+        .or_else(|| coord_state.executor_override.clone())
+        .unwrap_or_else(|| {
+            let mut coordinator_cfg = workgraph::config::CoordinatorConfig::default();
+            coordinator_cfg.executor = config.coordinator.executor.clone();
+            coordinator_cfg.model = model.clone();
+            coordinator_cfg.effective_executor()
+        });
+
+    DaemonConfig {
+        max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
+        executor,
+        poll_interval: Duration::from_secs(cli_interval.unwrap_or(config.coordinator.poll_interval)),
+        model,
+        paused: false,
+        settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
+    }
+}
+
 /// Route new chat inbox messages to the persistent coordinator agent.
 ///
 /// Reads the inbox since the coordinator cursor, sends each message to the
@@ -1123,24 +1164,12 @@ pub fn run_daemon(
     let dir = dir.to_path_buf();
     let mut running = true;
 
-    // Load coordinator config, CLI args override config values
+    // Load coordinator config, CLI args override config values, and persisted
+    // reload overrides survive daemon restarts until explicitly cleared.
     let config = Config::load_or_default(&dir);
-    let mut daemon_cfg = DaemonConfig {
-        max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
-        executor: cli_executor
-            .map(std::string::ToString::to_string)
-            .unwrap_or_else(|| config.coordinator.effective_executor()),
-        // The poll_interval is the slow background safety-net timer.
-        // CLI --interval overrides it; otherwise use config.coordinator.poll_interval.
-        poll_interval: Duration::from_secs(
-            cli_interval.unwrap_or(config.coordinator.poll_interval),
-        ),
-        model: cli_model
-            .map(std::string::ToString::to_string)
-            .or_else(|| config.coordinator.model.clone()),
-        paused: false,
-        settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
-    };
+    let mut daemon_cfg =
+        resolve_daemon_config(&dir, cli_max_agents, cli_executor, cli_interval, cli_model);
+    let previous_coord_state = CoordinatorState::load_or_default(&dir);
 
     logger.info(&format!(
         "Coordinator config: poll_interval={}s, max_agents={}, executor={}, model={}",
@@ -1171,6 +1200,8 @@ pub fn run_daemon(
         poll_interval: daemon_cfg.poll_interval.as_secs(),
         executor: daemon_cfg.executor.clone(),
         model: daemon_cfg.model.clone(),
+        executor_override: previous_coord_state.executor_override,
+        model_override: previous_coord_state.model_override,
         ticks: 0,
         last_tick: None,
         agents_alive: 0,
@@ -2049,6 +2080,43 @@ mod tests {
         // the state cleanup happens by checking ServiceState::load after removal
         ServiceState::remove(dir).unwrap();
         assert!(!state_path.exists());
+    }
+
+    #[test]
+    fn test_resolve_daemon_config_prefers_persisted_overrides() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        fs::write(
+            dir.join("config.toml"),
+            r#"
+[coordinator]
+executor = "claude"
+model = "claude:sonnet"
+poll_interval = 60
+"#,
+        )
+        .unwrap();
+
+        CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            poll_interval: 60,
+            executor: "native".to_string(),
+            model: Some("openrouter:minimax/minimax-m1".to_string()),
+            executor_override: Some("native".to_string()),
+            model_override: Some("openrouter:minimax/minimax-m1".to_string()),
+            ..Default::default()
+        }
+        .save(dir);
+
+        let daemon_cfg = resolve_daemon_config(dir, None, None, None, None);
+        assert_eq!(daemon_cfg.executor, "native");
+        assert_eq!(
+            daemon_cfg.model,
+            Some("openrouter:minimax/minimax-m1".to_string())
+        );
     }
 
     #[test]
