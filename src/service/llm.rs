@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::{Config, DispatchRole, ModelRegistryEntry};
+use crate::config::{CLAUDE_HAIKU_MODEL_ID, Config, DispatchRole, ModelRegistryEntry};
 use crate::graph::TokenUsage;
 
 /// Result of a lightweight LLM call, including both the text response and token usage.
@@ -27,12 +27,50 @@ pub struct LlmCallResult {
 /// can easily exceed 1024 tokens. 4096 provides comfortable headroom.
 const LIGHTWEIGHT_MAX_TOKENS: u32 = 4096;
 
+/// Roles whose only output is a one-shot JSON scoring/assignment response —
+/// the agency pipeline. These are intentionally pinned to the cheap
+/// `claude:haiku` registry default running on the claude CLI so that
+/// project-level cascade (e.g. `coordinator.model = "openrouter:..."`)
+/// can't quietly route them through a provider that lacks credentials.
+///
+/// A user who *explicitly* sets `[models.<role>].provider` or
+/// `[models.<role>].model` for one of these roles still gets the
+/// configured native path — only cascade fallthrough is overridden.
+fn is_agency_oneshot_role(role: DispatchRole) -> bool {
+    matches!(
+        role,
+        DispatchRole::Evaluator
+            | DispatchRole::FlipInference
+            | DispatchRole::FlipComparison
+            | DispatchRole::Assigner
+    )
+}
+
+/// True when the user has explicitly configured `[models.<role>]` with
+/// a model or provider override (i.e., the resolved provider for this role
+/// is NOT the result of cascade from `[models.default]` or
+/// `coordinator.model` / `agent.model`).
+fn role_has_explicit_override(config: &Config, role: DispatchRole) -> bool {
+    config
+        .models
+        .get_role(role)
+        .map(|c| c.model.is_some() || c.provider.is_some())
+        .unwrap_or(false)
+}
+
 /// Run a lightweight (no tool-use) LLM call for an internal dispatch role.
 ///
 /// Resolves the model and provider for the given role, then dispatches via:
-/// 1. If `provider` is set to a native provider ("anthropic", "openai", "openrouter"),
-///    attempts a direct API call using the native client.
-/// 2. Falls back to shelling out to `claude` CLI.
+/// 1. Agency one-shot roles (Evaluator, FlipInference, FlipComparison,
+///    Assigner) without an explicit per-role override are pinned to the
+///    claude CLI with `claude:haiku`. This makes agency tasks immune to
+///    `coordinator.model` cascade silently routing them through a
+///    provider that lacks credentials.
+/// 2. If `provider` is set to a native provider ("anthropic", "openai",
+///    "openrouter"), attempts a direct API call using the native client.
+///    Native-call errors are surfaced (logged to stderr) before falling
+///    back to the claude CLI.
+/// 3. Falls back to shelling out to `claude` CLI.
 ///
 /// Returns both the text response and token usage when available.
 pub fn run_lightweight_llm_call(
@@ -41,30 +79,38 @@ pub fn run_lightweight_llm_call(
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<LlmCallResult> {
+    if is_agency_oneshot_role(role) && !role_has_explicit_override(config, role) {
+        return call_claude_cli(CLAUDE_HAIKU_MODEL_ID, prompt, timeout_secs);
+    }
+
     let resolved = config.resolve_model_for_role(role);
     let model = &resolved.model;
     let provider = resolved.provider.as_deref();
     let registry_entry = resolved.registry_entry.as_ref();
     let endpoint_name = resolved.endpoint.as_deref();
 
-    // Try native API call if provider is explicitly configured
+    // Try native API call if provider is explicitly configured. Native-call
+    // errors used to be swallowed here, leaving the daemon log silent on
+    // why we fell back. Surface the error so misconfigurations (e.g. an
+    // openrouter provider with no API key) are diagnosable.
     if let Some(prov) = provider {
         match prov {
-            "anthropic" => {
-                if let Ok(result) = call_anthropic_native(
-                    config,
-                    prov,
-                    model,
-                    prompt,
-                    timeout_secs,
-                    registry_entry,
-                    endpoint_name,
-                ) {
-                    return Ok(result);
-                }
-            }
+            "anthropic" => match call_anthropic_native(
+                config,
+                prov,
+                model,
+                prompt,
+                timeout_secs,
+                registry_entry,
+                endpoint_name,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(e) => eprintln!(
+                    "[lightweight-llm] native anthropic call failed for role={role} model={model}: {e:#} — falling back to claude CLI",
+                ),
+            },
             "oai-compat" | "openai" | "openrouter" | "local" => {
-                if let Ok(result) = call_openai_native(
+                match call_openai_native(
                     config,
                     prov,
                     model,
@@ -73,7 +119,10 @@ pub fn run_lightweight_llm_call(
                     registry_entry,
                     endpoint_name,
                 ) {
-                    return Ok(result);
+                    Ok(result) => return Ok(result),
+                    Err(e) => eprintln!(
+                        "[lightweight-llm] native {prov} call failed for role={role} model={model}: {e:#} — falling back to claude CLI",
+                    ),
                 }
             }
             _ => {}
@@ -523,6 +572,73 @@ mod tests {
         let resolved = config.resolve_model_for_role(DispatchRole::Triage);
         assert_eq!(resolved.model, "gpt-4o-mini");
         assert_eq!(resolved.provider, Some("openai".to_string()));
+    }
+
+    #[test]
+    fn test_is_agency_oneshot_role_covers_eval_flip_assign() {
+        assert!(is_agency_oneshot_role(DispatchRole::Evaluator));
+        assert!(is_agency_oneshot_role(DispatchRole::FlipInference));
+        assert!(is_agency_oneshot_role(DispatchRole::FlipComparison));
+        assert!(is_agency_oneshot_role(DispatchRole::Assigner));
+    }
+
+    #[test]
+    fn test_is_agency_oneshot_role_excludes_other_roles() {
+        // Triage, Compactor, TaskAgent, Evolver etc. keep their cascade
+        // behavior — only the agency pipeline is pinned to claude CLI.
+        assert!(!is_agency_oneshot_role(DispatchRole::Triage));
+        assert!(!is_agency_oneshot_role(DispatchRole::Compactor));
+        assert!(!is_agency_oneshot_role(DispatchRole::TaskAgent));
+        assert!(!is_agency_oneshot_role(DispatchRole::Default));
+        assert!(!is_agency_oneshot_role(DispatchRole::Evolver));
+        assert!(!is_agency_oneshot_role(DispatchRole::Verification));
+    }
+
+    #[test]
+    fn test_role_has_explicit_override_detects_user_config() {
+        let mut config = Config::default();
+        // No per-role config → not explicit (cascade-only).
+        assert!(!role_has_explicit_override(&config, DispatchRole::Evaluator));
+
+        // Setting a per-role provider counts as explicit.
+        config
+            .models
+            .set_provider(DispatchRole::Evaluator, "openrouter");
+        assert!(role_has_explicit_override(&config, DispatchRole::Evaluator));
+
+        // Setting a per-role model also counts as explicit.
+        let mut config2 = Config::default();
+        config2
+            .models
+            .set_model(DispatchRole::Assigner, "claude:sonnet");
+        assert!(role_has_explicit_override(&config2, DispatchRole::Assigner));
+    }
+
+    #[test]
+    fn test_agency_role_ignores_coordinator_model_cascade() {
+        // Reproduces today's outage: project sets coordinator.model to an
+        // openrouter spec, no per-role config exists. Without the bypass,
+        // the resolved provider for Evaluator cascades to "openrouter" and
+        // the call would silently route through the OpenAI-compat path.
+        // After the fix, agency one-shot roles ignore this cascade and we
+        // run claude CLI on claude:haiku regardless.
+        let mut config = Config::default();
+        config.coordinator.model = Some("openrouter:anthropic/claude-sonnet-4-6".to_string());
+
+        // Sanity: the cascade *would* have polluted the resolved provider.
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(
+            resolved.provider.as_deref(),
+            Some("openrouter"),
+            "cascade pollution exists at the resolver level — exactly the case the bypass guards against"
+        );
+
+        // The bypass kicks in because no per-role explicit override is set.
+        assert!(is_agency_oneshot_role(DispatchRole::Evaluator));
+        assert!(!role_has_explicit_override(
+            &config,
+            DispatchRole::Evaluator
+        ));
     }
 
     #[test]

@@ -234,3 +234,13 @@ owners = [
 ]
 description = "Pins the three critical invariants of the TUI chat redesign (umbrella: integrate-tui-chat). (1) MODAL TOGGLE: chat tab shows [PTY]/[CMD] modal indicator; Ctrl+T flips between them. Without this, users have no visual cue that the modal contract — which stops Ctrl+N/Ctrl+W/letters from being intercepted as global hotkeys inside the embedded vendor CLI — is in effect. (2) CLOSE IS NON-DESTRUCTIVE: Ctrl+W in command mode closes the active tab (visible tab count drops by 1), the underlying graph task status stays unchanged (NOT marked abandoned/archived), and NO ChoiceDialog appears. The redesign explicitly removed the close-confirmation dialog from the tab-close path. (3) PERSISTENCE: relaunching `wg tui` after a kill restores the last-active coordinator id from tui-state.json. Drives a real `wg tui` inside tmux, sends synthetic Ctrl+T / Ctrl+W / digit keys via tmux send-keys, and asserts on `wg --json tui-dump`'s screen text + graph.jsonl statuses + tui-state.json contents."
 timeout_seconds = 120
+
+[[scenario]]
+name = "agency_inline_spawn_registers_executor_claude"
+script = "scenarios/agency_inline_spawn_registers_executor_claude.sh"
+owners = [
+    "migrate-agency-tasks",
+    "smoke-gate-is",
+]
+description = "Inline spawn of an `.evaluate-*` task must register the agent with `executor=\"claude\"` (not legacy `\"eval\"`) in both registry.json and the agent's metadata.json. Regression: agency one-shot LLM calls share the claude CLI dispatch path with worker agents, so the registered executor label must reflect that — `executor=\"eval\"` was misleading observability noise that masked today's openrouter-cascade outage."
+timeout_seconds = 60

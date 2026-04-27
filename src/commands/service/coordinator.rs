@@ -2933,7 +2933,20 @@ fn spawn_eval_inline(
         special_agent_verified.as_deref(),
     );
 
-    write_inline_artifacts(&output_dir, &agent_id, eval_task_id, "eval", evaluator_model, &script);
+    // Agency one-shot tasks (.evaluate-* / .flip-*) run on the claude CLI
+    // via run_lightweight_llm_call inside the spawned `wg evaluate` command.
+    // Register them with executor="claude" so observability matches reality
+    // (the binary that ends up doing the LLM call is `claude`, just like
+    // worker agents). The legacy "eval" label was misleading — there is
+    // no separate eval handler.
+    write_inline_artifacts(
+        &output_dir,
+        &agent_id,
+        eval_task_id,
+        "claude",
+        evaluator_model,
+        &script,
+    );
 
     // Fork the process
     let mut cmd = Command::new("bash");
@@ -2986,7 +2999,7 @@ fn spawn_eval_inline(
     locked_registry.register_agent_with_model(
         pid,
         eval_task_id,
-        "eval",
+        "claude",
         &output_file_str,
         evaluator_model,
     );
@@ -3104,7 +3117,19 @@ fi
 exit $EXIT_CODE"#,
     );
 
-    write_inline_artifacts(&output_dir, &agent_id, assign_task_id, "assign", None, &script);
+    // Agency one-shot tasks (.assign-*) run on the claude CLI via
+    // run_lightweight_llm_call inside the spawned `wg assign` command.
+    // Register them with executor="claude" / model="claude:haiku" so
+    // observability matches reality. The legacy "assign" label was
+    // misleading — there is no separate assignment handler.
+    write_inline_artifacts(
+        &output_dir,
+        &agent_id,
+        assign_task_id,
+        "claude",
+        Some("claude:haiku"),
+        &script,
+    );
 
     // Fork the process
     let mut cmd = Command::new("bash");
@@ -3157,9 +3182,9 @@ exit $EXIT_CODE"#,
     locked_registry.register_agent_with_model(
         pid,
         assign_task_id,
-        "assign",
+        "claude",
         &output_file_str,
-        None,
+        Some("claude:haiku"),
     );
     locked_registry
         .save()
@@ -6712,8 +6737,8 @@ mod tests {
             &output_dir,
             "agent-42",
             ".evaluate-my-task",
-            "eval",
-            Some("sonnet"),
+            "claude",
+            Some("claude:haiku"),
             "#!/bin/bash\nwg evaluate run my-task",
         );
 
@@ -6726,12 +6751,12 @@ mod tests {
                 .unwrap();
         assert_eq!(metadata["agent_id"], "agent-42");
         assert_eq!(metadata["task_id"], ".evaluate-my-task");
-        assert_eq!(metadata["executor"], "eval");
-        assert_eq!(metadata["model"], "sonnet");
+        assert_eq!(metadata["executor"], "claude");
+        assert_eq!(metadata["model"], "claude:haiku");
         assert_eq!(metadata["inline"], true);
 
         let prompt = fs::read_to_string(output_dir.join("prompt.txt")).unwrap();
-        assert!(prompt.contains("eval"));
+        assert!(prompt.contains("claude"));
 
         let run_sh = fs::read_to_string(output_dir.join("run.sh")).unwrap();
         assert!(run_sh.contains("wg evaluate run my-task"));
@@ -6748,8 +6773,8 @@ mod tests {
             &output_dir,
             "agent-99",
             ".assign-my-task",
-            "assign",
-            None,
+            "claude",
+            Some("claude:haiku"),
             "wg assign 'my-task' --auto",
         );
 
@@ -6761,8 +6786,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(output_dir.join("metadata.json")).unwrap())
                 .unwrap();
         assert_eq!(metadata["agent_id"], "agent-99");
-        assert_eq!(metadata["executor"], "assign");
-        assert!(metadata["model"].is_null());
+        assert_eq!(metadata["executor"], "claude");
+        assert_eq!(metadata["model"], "claude:haiku");
 
         let run_sh = fs::read_to_string(output_dir.join("run.sh")).unwrap();
         assert!(run_sh.contains("wg assign"));
@@ -6788,7 +6813,14 @@ mod tests {
         fs::create_dir_all(output_dir).unwrap();
 
         // Simulate what both inline spawn paths now do after building script
-        write_inline_artifacts(output_dir, "agent-1", "task-1", "eval", None, "echo test");
+        write_inline_artifacts(
+            output_dir,
+            "agent-1",
+            "task-1",
+            "claude",
+            Some("claude:haiku"),
+            "echo test",
+        );
 
         let expected_files = ["metadata.json", "prompt.txt", "run.sh"];
         for f in &expected_files {

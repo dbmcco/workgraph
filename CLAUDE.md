@@ -34,6 +34,20 @@ to disk run `wg config init --global` (minimal canonical claude-cli config) or
 keys or stale model strings, run `wg migrate config --dry-run` then
 `wg migrate config --all`. See `docs/config-ux-design.md` for full details.
 
+### Agency tasks run on claude CLI
+
+`.evaluate-*`, `.flip-*`, and `.assign-*` tasks are short one-shot LLM
+calls (scoring + assignment verdicts), not full worker agents. They are
+pinned to `claude:haiku` running on the claude CLI — the same handler
+worker agents use — and ignore project-level provider cascade from
+`coordinator.model`. This keeps agency cheap and immune to "openrouter
+configured but no key" silent failures. Power users who *want* a
+non-Anthropic provider for these roles can override per-role via
+`[models.evaluator]` / `[models.assigner]` etc. in config; explicit
+overrides win, cascade does not. The agent registry records these as
+`executor=claude` (the legacy `eval` / `assign` labels are gone — they
+were always cosmetic).
+
 ## For All Agents (Including the Chat Agent)
 
 CRITICAL: Do NOT use built-in TaskCreate/TaskUpdate/TaskList/TaskGet tools.

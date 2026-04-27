@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     /// Verify active_count counts agents consistently across all executor types
-    /// (claude, eval/assign, shell) — no executor-based filtering.
+    /// (claude worker / claude inline / shell) — no executor-based filtering.
     /// This is the same logic the TUI and `wg service status` use.
     #[test]
     fn test_set_worktree_path_persists() {
@@ -1318,10 +1318,11 @@ mod tests {
         registry.register_agent(100, "implement-feature", "claude", "/tmp/1.log");
         registry.register_agent(101, "fix-bug", "claude", "/tmp/2.log");
 
-        // Dot-task agents (inline eval/assign/flip)
-        registry.register_agent(200, ".assign-implement-feature", "assign", "/tmp/3.log");
-        registry.register_agent(201, ".evaluate-fix-bug", "eval", "/tmp/4.log");
-        registry.register_agent(202, ".flip-fix-bug", "eval", "/tmp/5.log");
+        // Dot-task agents (inline eval/assign/flip — also "claude" executor;
+        // they run on claude CLI via run_lightweight_llm_call).
+        registry.register_agent(200, ".assign-implement-feature", "claude", "/tmp/3.log");
+        registry.register_agent(201, ".evaluate-fix-bug", "claude", "/tmp/4.log");
+        registry.register_agent(202, ".flip-fix-bug", "claude", "/tmp/5.log");
 
         // Shell executor agent
         registry.register_agent(300, "run-tests", "shell", "/tmp/6.log");
@@ -1333,10 +1334,10 @@ mod tests {
         registry.set_status("agent-3", AgentStatus::Done);
         registry.set_status("agent-5", AgentStatus::Done);
 
-        // Now 4 alive: 2 claude + 1 eval + 1 shell
+        // Now 4 alive: 3 claude + 1 shell
         assert_eq!(registry.active_count(), 4);
 
-        // Mark a claude agent as dead
+        // Mark a claude worker agent as dead
         registry.set_status("agent-2", AgentStatus::Dead);
         assert_eq!(registry.active_count(), 3);
 
