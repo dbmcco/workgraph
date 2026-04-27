@@ -21542,3 +21542,69 @@ mod agent_stream_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod launcher_history_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// `open_launcher` should pull recent invocations from
+    /// `launcher_history` and surface them as a one-click recall list,
+    /// per the user expectation that any prior CLI/TUI invocation
+    /// reappears as a recallable option.
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_tui_dialog_reads_history_and_offers_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let history_path = tmp.path().join("launcher-history.jsonl");
+
+        // Seed launcher history with a `wg nex -m qwen3-coder -e ...`
+        // invocation, like the example in the task spec.
+        let entry = workgraph::launcher_history::HistoryEntry::new(
+            "native",
+            Some("qwen3-coder"),
+            Some("https://lambda01.tail334fe6.ts.net:30000"),
+            "cli",
+        );
+        {
+            let mut f = std::fs::File::create(&history_path).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("WG_LAUNCHER_HISTORY_PATH", &history_path);
+        }
+
+        let workgraph_dir = tmp.path().to_path_buf();
+        std::fs::write(workgraph_dir.join("graph.jsonl"), "").unwrap();
+        let mut app = VizApp::new(
+            workgraph_dir,
+            crate::commands::viz::VizOptions::default(),
+            Some(true),
+            None,
+            false,
+        );
+
+        app.open_launcher();
+
+        unsafe {
+            std::env::remove_var("WG_LAUNCHER_HISTORY_PATH");
+        }
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("open_launcher should have populated the launcher state");
+        assert!(
+            !launcher.recent_list.is_empty(),
+            "launcher should surface the seeded history entry as a recall option"
+        );
+        let recent = &launcher.recent_list[0];
+        assert_eq!(recent.executor, "native");
+        assert_eq!(recent.model.as_deref(), Some("qwen3-coder"));
+        assert_eq!(
+            recent.endpoint.as_deref(),
+            Some("https://lambda01.tail334fe6.ts.net:30000")
+        );
+    }
+}

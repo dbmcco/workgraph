@@ -645,6 +645,8 @@ pub fn run_non_interactive(args: &SetupArgs) -> Result<()> {
 
     config.save_global()?;
 
+    record_setup_history(&choices, "cli");
+
     println!("Configuration written to {}", global_path.display());
     println!();
     println!("Summary:");
@@ -670,6 +672,21 @@ pub fn run_non_interactive(args: &SetupArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Record a successful `wg setup` (interactive or non-interactive) in
+/// launcher history so the TUI new-coordinator dialog and other config
+/// UIs can surface this combo as a one-click recall.
+fn record_setup_history(choices: &SetupChoices, source: &str) {
+    let endpoint_url = choices.endpoint.as_ref().map(|e| e.url.as_str());
+    let _ = workgraph::launcher_history::record_use(
+        &workgraph::launcher_history::HistoryEntry::new(
+            &choices.executor,
+            Some(&choices.model),
+            endpoint_url,
+            source,
+        ),
+    );
 }
 
 /// Resolve an API key from SetupArgs (key file or env var).
@@ -1015,6 +1032,8 @@ pub fn run() -> Result<()> {
     }
 
     config.save_global()?;
+
+    record_setup_history(&choices, "cli");
 
     // Post-save: guide skill/bundle installation based on executor
     println!();
@@ -1775,7 +1794,67 @@ fn guide_notification_setup() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
     use workgraph::config::{CLAUDE_SONNET_MODEL_ID, Config};
+
+    fn with_history_env<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let history_path = tmp.path().join("launcher-history.jsonl");
+        unsafe {
+            std::env::set_var("WG_LAUNCHER_HISTORY_PATH", &history_path);
+        }
+        f(&history_path);
+        unsafe {
+            std::env::remove_var("WG_LAUNCHER_HISTORY_PATH");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_cli_setup_records_to_launcher_history() {
+        with_history_env(|history_path| {
+            let choices = SetupChoices {
+                provider: "openrouter".to_string(),
+                executor: "native".to_string(),
+                model: "qwen3-coder".to_string(),
+                agency_enabled: true,
+                max_agents: 4,
+                endpoint: Some(EndpointChoices {
+                    name: "openrouter".to_string(),
+                    provider: "openrouter".to_string(),
+                    url: "https://openrouter.ai/api/v1".to_string(),
+                    api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+                    api_key_file: None,
+                }),
+                model_registry_entries: vec![],
+            };
+
+            record_setup_history(&choices, "cli");
+
+            let contents = fs::read_to_string(history_path).expect("history file should exist");
+            assert!(
+                contents.contains("\"executor\":\"native\""),
+                "setup records executor: {}",
+                contents
+            );
+            assert!(
+                contents.contains("qwen3-coder"),
+                "setup records model: {}",
+                contents
+            );
+            assert!(
+                contents.contains("openrouter.ai"),
+                "setup records endpoint url: {}",
+                contents
+            );
+            assert!(
+                contents.contains("\"source\":\"cli\""),
+                "setup records source as cli: {}",
+                contents
+            );
+        });
+    }
 
     #[test]
     fn test_build_config_defaults() {

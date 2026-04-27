@@ -83,6 +83,8 @@ pub fn run(
         .or_else(|| std::env::var("WG_MODEL").ok())
         .unwrap_or_else(|| config.resolve_model_for_role(DispatchRole::TaskAgent).model);
 
+    record_nex_invocation(&effective_model, endpoint, eval_mode);
+
     let working_dir = std::env::current_dir().unwrap_or_default();
 
     let is_coordinator = role.is_some_and(|r| r.eq_ignore_ascii_case("coordinator"));
@@ -640,6 +642,25 @@ fn default_interactive_alias(stamp: &str) -> String {
     format!("session-{}", stamp)
 }
 
+/// Record a `wg nex` invocation in launcher history. Done early in
+/// `run()` (before the long-running agent loop) so even a Ctrl-C'd
+/// session leaves a recallable entry for the TUI new-coordinator
+/// dialog. Eval mode skips recording — benchmark harnesses don't
+/// want to pollute the history with one-shot grader invocations.
+fn record_nex_invocation(effective_model: &str, endpoint: Option<&str>, eval_mode: bool) {
+    if eval_mode {
+        return;
+    }
+    let _ = workgraph::launcher_history::record_use(
+        &workgraph::launcher_history::HistoryEntry::new(
+            "native",
+            Some(effective_model),
+            endpoint,
+            "cli",
+        ),
+    );
+}
+
 /// Load an agency role/skill component by name. Scans all YAML files
 /// in `.workgraph/agency/primitives/components/` for one whose `name`
 /// field matches (case-insensitive substring match). Returns the
@@ -674,4 +695,68 @@ fn load_agency_role(workgraph_dir: &Path, role_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn with_history_env<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let history_path = tmp.path().join("launcher-history.jsonl");
+        unsafe {
+            std::env::set_var("WG_LAUNCHER_HISTORY_PATH", &history_path);
+        }
+        f(&history_path);
+        unsafe {
+            std::env::remove_var("WG_LAUNCHER_HISTORY_PATH");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_cli_nex_records_to_launcher_history() {
+        with_history_env(|history_path| {
+            record_nex_invocation(
+                "qwen3-coder",
+                Some("https://lambda01.tail334fe6.ts.net:30000"),
+                false,
+            );
+            let contents = fs::read_to_string(history_path).expect("history file should exist");
+            assert!(
+                contents.contains("\"executor\":\"native\""),
+                "wg nex records as native executor: {}",
+                contents
+            );
+            assert!(
+                contents.contains("qwen3-coder"),
+                "history contains the model: {}",
+                contents
+            );
+            assert!(
+                contents.contains("lambda01.tail334fe6.ts.net"),
+                "history contains the endpoint: {}",
+                contents
+            );
+            assert!(
+                contents.contains("\"source\":\"cli\""),
+                "wg nex source = cli: {}",
+                contents
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_cli_nex_eval_mode_skips_recording() {
+        with_history_env(|history_path| {
+            record_nex_invocation("qwen3-coder", None, true);
+            assert!(
+                !history_path.exists() || fs::read_to_string(history_path).unwrap().is_empty(),
+                "eval mode should not write to history"
+            );
+        });
+    }
 }

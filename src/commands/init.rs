@@ -200,6 +200,23 @@ pub fn run(
         }
     }
 
+    // Record this invocation so future `wg setup`, the TUI new-coordinator
+    // dialog, and any model-picker UI can offer it as a one-click recall.
+    // Use the canonical executor name ("native" not "nex") so dedup
+    // collapses entries that came in via different aliases.
+    let canonical_executor = match executor {
+        "nex" => "native",
+        other => other,
+    };
+    let _ = workgraph::launcher_history::record_use(
+        &workgraph::launcher_history::HistoryEntry::new(
+            canonical_executor,
+            model,
+            endpoint,
+            "cli",
+        ),
+    );
+
     Ok(())
 }
 
@@ -474,5 +491,88 @@ mod tests {
             "error chain should mention http(s):// — got: {}",
             chain
         );
+    }
+
+    /// Run a closure with `WG_LAUNCHER_HISTORY_PATH` pointed at a tempfile.
+    /// `unsafe` is required because `set_var` is process-global; serial-test
+    /// gates these env-var tests so they never race with each other.
+    fn with_history_env<F: FnOnce(&Path)>(f: F) {
+        let tmp = TempDir::new().unwrap();
+        let history_path = tmp.path().join("launcher-history.jsonl");
+        unsafe {
+            std::env::set_var("WG_LAUNCHER_HISTORY_PATH", &history_path);
+        }
+        f(&history_path);
+        unsafe {
+            std::env::remove_var("WG_LAUNCHER_HISTORY_PATH");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_cli_init_records_to_launcher_history() {
+        with_history_env(|history_path| {
+            let tmp = TempDir::new().unwrap();
+            let wg_dir = tmp.path().join(".wg");
+            run(
+                &wg_dir,
+                true,
+                Some("shell"),
+                Some("opus"),
+                Some("https://example.com:8080"),
+            )
+            .unwrap();
+
+            let contents = fs::read_to_string(history_path)
+                .expect("history file should have been created by init");
+            assert!(
+                contents.contains("\"executor\":\"shell\""),
+                "history should contain executor: {}",
+                contents
+            );
+            // The model gets the `local:` prefix because we passed an
+            // endpoint, but the history records the prefixed form (matches
+            // what landed in config.toml).
+            assert!(
+                contents.contains("\"opus\""),
+                "history should contain model: {}",
+                contents
+            );
+            assert!(
+                contents.contains("https://example.com:8080"),
+                "history should contain endpoint: {}",
+                contents
+            );
+            assert!(
+                contents.contains("\"source\":\"cli\""),
+                "history should mark source as cli: {}",
+                contents
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(launcher_history_env)]
+    fn test_cli_init_records_canonical_executor_for_nex() {
+        // `wg init --executor nex` should be recorded as canonical
+        // "native" so the TUI dedup can collapse entries that came in
+        // through different aliases.
+        with_history_env(|history_path| {
+            let tmp = TempDir::new().unwrap();
+            let wg_dir = tmp.path().join(".wg");
+            run(&wg_dir, true, Some("nex"), None, None).unwrap();
+
+            let contents = fs::read_to_string(history_path).unwrap();
+            assert!(
+                contents.contains("\"executor\":\"native\""),
+                "history should canonicalize nex → native: {}",
+                contents
+            );
+            assert!(
+                !contents.contains("\"executor\":\"nex\""),
+                "history should not record raw 'nex' alias: {}",
+                contents
+            );
+        });
     }
 }
