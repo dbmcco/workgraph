@@ -32,11 +32,16 @@ fn resolve_handler(
         anyhow::bail!("this workgraph line supports only the primary coordinator for spawn-task");
     }
 
+    match role_override {
+        None | Some("coordinator") => {}
+        Some(other) => anyhow::bail!(
+            "unsupported coordinator role for this tranche: {} (expected coordinator)",
+            other
+        ),
+    }
+
     let config = workgraph::config::Config::load_or_default(workgraph_dir);
     let coordinator_cfg = config.coordinator.clone();
-    if role_override == Some("coordinator") {
-        // Keep current coordinator semantics; no extra mutation needed.
-    }
 
     let executor = coordinator_cfg.effective_executor();
     if executor != "claude" {
