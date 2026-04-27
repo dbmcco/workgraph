@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -61,6 +61,21 @@ fn wg_cmd_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::p
     }
     cmd.output()
         .unwrap_or_else(|e| panic!("Failed to run wg {:?}: {}", args, e))
+}
+
+fn spawn_wg_cmd_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> Child {
+    let mut cmd = Command::new(wg_binary());
+    cmd.arg("--dir")
+        .arg(wg_dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for &(key, val) in env_vars {
+        cmd.env(key, val);
+    }
+    cmd.spawn()
+        .unwrap_or_else(|e| panic!("Failed to spawn wg {:?}: {}", args, e))
 }
 
 fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
@@ -122,6 +137,16 @@ fn wait_for_socket(wg_dir: &Path) {
     while !socket.exists() {
         if start.elapsed() > Duration::from_secs(10) {
             panic!("Daemon socket did not appear within 10s at {:?}", socket);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_path(path: &Path) {
+    let start = Instant::now();
+    while !path.exists() {
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("Path did not appear within 10s at {:?}", path);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -267,6 +292,33 @@ done
 struct CoordinatorDaemonGuard<'a> {
     wg_dir: &'a Path,
     env_vars: Vec<(String, String)>,
+}
+
+struct ChildGuard {
+    child: Child,
+}
+
+impl ChildGuard {
+    fn spawn(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl<'a> CoordinatorDaemonGuard<'a> {
@@ -489,6 +541,75 @@ fn coordinator_agent_uses_claude_handler_subprocess() {
         log.contains("spawn-task") || log.contains("claude-handler"),
         "Expected daemon log to show subprocess path markers.\nLog:\n{}",
         log
+    );
+}
+
+#[test]
+fn claude_handler_rejects_duplicate_coordinator_session_owner() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = init_workgraph(&tmp);
+    let mock = MockClaude::new();
+    let path_env = mock.path_env();
+    let env_vars = [("PATH", path_env.as_str())];
+
+    let mut first = ChildGuard::spawn(spawn_wg_cmd_env(
+        &wg_dir,
+        &["claude-handler", "--chat", "coordinator-0"],
+        &env_vars,
+    ));
+
+    let lock_path = wg_dir.join("chat").join(".handler.pid");
+    wait_for_path(&lock_path);
+
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "first claude-handler exited before duplicate-owner check.\nDaemon log:\n{}",
+        read_daemon_log(&wg_dir),
+    );
+
+    let lock_contents = fs::read_to_string(&lock_path).unwrap();
+    let owner_pid = lock_contents.lines().next().unwrap_or_default().to_string();
+    assert_eq!(owner_pid, first.id().to_string());
+
+    let output = wg_cmd_env(
+        &wg_dir,
+        &["claude-handler", "--chat", "coordinator-0"],
+        &env_vars,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "second claude-handler unexpectedly succeeded.\nstdout: {}\nstderr: {}\nDaemon log:\n{}",
+        stdout,
+        stderr,
+        read_daemon_log(&wg_dir),
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "duplicate-owner rejection must keep stdout pristine, got:\n{}",
+        stdout
+    );
+    assert!(
+        stderr.contains("session lock held by live handler"),
+        "expected duplicate-owner rejection in stderr, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!("pid={}", first.id())),
+        "expected stderr to name first handler pid {}, got:\n{}",
+        first.id(),
+        stderr
+    );
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "first claude-handler should remain alive after duplicate-owner rejection"
+    );
+    assert_eq!(
+        fs::read_to_string(&lock_path).unwrap(),
+        lock_contents,
+        "duplicate-owner rejection must not replace the active lock"
     );
 }
 

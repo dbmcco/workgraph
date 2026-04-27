@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 
 use workgraph::chat;
+use workgraph::session_lock::{HandlerKind, SessionLock};
 
 use crate::commands::service::DaemonLogger;
 use crate::commands::service::coordinator_agent::{
@@ -20,6 +21,10 @@ pub fn run(workgraph_dir: &Path, chat_ref: &str, model: Option<&str>) -> Result<
             chat_ref
         );
     }
+
+    let chat_dir = coordinator_chat_dir(workgraph_dir, chat_ref);
+    let _session_lock = SessionLock::acquire(&chat_dir, HandlerKind::Adapter)
+        .with_context(|| format!("claude-handler[{chat_ref}] failed to acquire session lock"))?;
 
     let logger = DaemonLogger::open(workgraph_dir)
         .context("Failed to open daemon log for claude-handler")?;
@@ -68,6 +73,11 @@ pub fn run(workgraph_dir: &Path, chat_ref: &str, model: Option<&str>) -> Result<
             last_interaction = Utc::now().to_rfc3339();
         }
     }
+}
+
+fn coordinator_chat_dir(workgraph_dir: &Path, chat_ref: &str) -> std::path::PathBuf {
+    debug_assert_eq!(chat_ref, "coordinator-0");
+    workgraph_dir.join("chat")
 }
 
 fn process_message(

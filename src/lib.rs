@@ -24,6 +24,7 @@ pub mod provenance;
 pub mod query;
 pub mod runs;
 pub mod service;
+pub mod session_lock;
 pub mod stream_event;
 pub mod telegram_commands;
 pub mod usage;
