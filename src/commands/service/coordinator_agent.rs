@@ -612,6 +612,8 @@ fn spawn_handler_subprocess(
     );
     if let Some(model) = runtime_intent.model.as_deref() {
         cmd.env(COORDINATOR_MODEL_OVERRIDE_ENV, model);
+    } else {
+        cmd.env_remove(COORDINATOR_MODEL_OVERRIDE_ENV);
     }
 
     cmd.current_dir(dir.parent().unwrap_or(dir));
