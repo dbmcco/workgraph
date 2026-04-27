@@ -8,6 +8,11 @@
 //! Internally we serialize acquisition through a sidecar guard file held for
 //! the lock lifetime, so `.handler.pid` can be updated safely and `release()`
 //! only removes metadata that still belongs to this instance.
+//!
+//! Current implementation status:
+//! - Unix: fully supported via `flock()` on the sidecar guard file
+//! - non-Unix: compiles cleanly but returns an explicit unsupported error
+//!   rather than pretending to provide at-most-one-owner semantics
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -340,7 +345,9 @@ fn try_lock_exclusive_nonblocking(file: &File) -> Result<bool> {
 
 #[cfg(not(unix))]
 fn try_lock_exclusive_nonblocking(_file: &File) -> Result<bool> {
-    Ok(true)
+    Err(anyhow!(
+        "session lock is unsupported on this platform until a real cross-platform guard is implemented"
+    ))
 }
 
 #[cfg(unix)]
