@@ -132,7 +132,7 @@ Each tick does:
 Start the background daemon.
 
 ```bash
-wg service start [--max-agents <N>] [--executor <NAME>] [--interval <SECS>] [--model <MODEL>]
+wg service start [--max-agents <N>] [--interval <SECS>] [--model <MODEL>]
 ```
 
 Additional flags:
@@ -195,10 +195,10 @@ wg service thaw
 Re-read config.toml or apply specific overrides without restarting.
 
 ```bash
-wg service reload                              # re-read config.toml
-wg service reload --max-agents 8 --model haiku # apply overrides
-wg service reload --interval 120               # change poll interval
-wg service reload --executor amplifier         # switch executor at runtime
+wg service reload                                  # re-read config.toml
+wg service reload --max-agents 8 --model claude:haiku  # apply overrides
+wg service reload --interval 120                   # change poll interval
+wg service reload --model local:qwen3-coder        # switch handler by switching model
 ```
 
 Sends a `reconfigure` IPC message to the running daemon.
@@ -274,26 +274,31 @@ Generate a systemd user service file.
 wg service install
 ```
 
-## Executor Types
+## Handlers (derived from the model spec)
 
-The coordinator spawns agents via a configurable executor. Built-in executors:
+You don't pick a handler directly — wg derives it from the model spec's provider prefix. The `(model, endpoint)` pair is the single user-facing primitive; everything else is internal:
 
-| Executor | Command | Use case |
-|----------|---------|----------|
-| **claude** | `claude --print --model <M>` | Default — Anthropic Claude CLI agents |
-| **codex** | `codex --model <M>` | OpenAI Codex CLI agents |
-| **native** (a.k.a. **nex**) | In-process OAI-compatible HTTP client | OpenRouter, local Ollama / vLLM, custom OAI-compatible endpoints. Used by the `openrouter`, `local`, and `nex-custom` setup routes |
-| **amplifier** | `amplifier run --mode single -m <M>` | OpenRouter-backed models, supports `provider:model` syntax (e.g., `provider-openai:gpt-4o`) |
-| **shell** | Custom command from task `exec` field | Non-LLM tasks, scripts, builds |
+| Model spec example                          | Handler subprocess        | Wire protocol  | Endpoint                  |
+|---------------------------------------------|---------------------------|----------------|---------------------------|
+| `claude:opus` (and bare `opus`/`sonnet`)    | `claude` CLI              | Anthropic      | none (CLI auths itself)   |
+| `codex:gpt-5`                               | `codex` CLI               | OAI-compat     | none (CLI auths itself)   |
+| `local:qwen3-coder`                         | `native` (in-process nex) | OAI-compat     | required (`-e <url>`)     |
+| `openrouter:anthropic/claude-opus-4-6`      | `native` (in-process nex) | OAI-compat     | optional                  |
+| `oai-compat:gpt-5` / `openai:gpt-5`         | `native` (in-process nex) | OAI-compat     | required                  |
+| `ollama:llama3` / `vllm:*` / `llamacpp:*`   | `native` (in-process nex) | OAI-compat     | required                  |
+| (task with `exec` field set)                | `shell`                   | n/a            | n/a                       |
+
+The mapping lives in one place: `src/dispatch/handler_for_model.rs`. Adding a new handler (aider, llm, …) is a one-arm change there; nothing else in the codebase needs to know.
 
 ```bash
-wg config --coordinator-executor claude      # default
-wg config --coordinator-executor amplifier   # switch to amplifier
+wg config -m claude:opus                                   # claude CLI
+wg config -m local:qwen3-coder -e http://127.0.0.1:8088    # nex against local server
+wg config -m openrouter:anthropic/claude-opus-4-6          # nex against openrouter
 ```
 
-The `nex` executor is the **native path for any OAI-compatible endpoint** — when you pick the `openrouter`, `local`, or `nex-custom` route in `wg setup`, it's the executor wired in under the hood. The legacy alias `nex` is normalized to the canonical `native` in config.
+Legacy `--executor` / `-x` flags and `[agent].executor` / `[dispatcher].executor` config keys are deprecated. They still work for one release with a deprecation warning, but the model spec is the single source of truth. After the deprecation window, the executor surfaces are removed entirely.
 
-Custom executors can be defined in `.workgraph/executors/<name>.toml`.
+Custom handler argv templates can be defined in `.workgraph/executors/<name>.toml`.
 
 ### Environment variables injected into spawned agents
 
@@ -349,10 +354,10 @@ When the coordinator spawns an agent for a task:
 
 ### Manual spawning
 
-Outside the service, you can spawn agents directly:
+Outside the service, you can spawn agents directly. The handler is derived from the model spec — `--executor` is deprecated:
 
 ```bash
-wg spawn my-task --executor claude --model haiku --timeout 30m
+wg spawn my-task --model claude:haiku --timeout 30m
 ```
 
 ## Agent Registry
@@ -489,12 +494,10 @@ max_agents = 4           # max parallel agents (default: 4)
 max_coordinators = 4     # max concurrent coordinator sessions (default: 4)
 interval = 30            # standalone coordinator tick interval
 poll_interval = 60       # daemon safety-net poll interval (default: 60)
-executor = "claude"      # executor for spawned agents
-model = "opus"           # model override for all spawns (optional)
+model = "claude:opus"    # provider:model — handler is implied (claude here)
 
 [agent]
-executor = "claude"      # default executor
-model = "opus"           # default model
+model = "claude:opus"    # default model (handler is implied from prefix)
 heartbeat_timeout = 5    # minutes before stale (default: 5)
 
 [agency]

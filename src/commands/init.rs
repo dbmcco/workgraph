@@ -17,13 +17,20 @@ matrix.toml
 *.credentials
 "#;
 
-/// Init entry that supports the new `--route <name>` flag and `--dry-run`.
+/// Init entry that supports `--route <name>`, `--dry-run`, and the
+/// model-implies-executor flow.
 ///
-/// When `route` is `Some`, the route's complete defaults populate `[tiers]`
-/// + endpoint + model registry. When only `executor` is given, the closest
-/// matching route is used (so `wg init -x claude` still produces filled
-/// tiers, fixing the "empty [tiers]" bug). Falls back to the legacy
-/// `executor`-only path when neither is specified.
+/// User-facing concept is `(model, endpoint)`. If `--executor` is supplied
+/// we accept it for backwards compatibility (with a one-line deprecation
+/// warning) but the supported entry points are now:
+///
+/// - `wg init -m claude:opus`           (claude handler implied)
+/// - `wg init -m local:qwen3-coder -e https://…`   (nex/native implied)
+/// - `wg init --route <name>`           (canonical for fully-filled tiers)
+///
+/// When the user supplies neither route nor model we fall back to the
+/// legacy executor-only path (which still requires `-x` and prints the
+/// migration hint) so existing scripts and tests keep working.
 pub fn run_with_route(
     dir: &Path,
     no_agency: bool,
@@ -33,11 +40,28 @@ pub fn run_with_route(
     route: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
-    // Explicit --route always wins. Otherwise, derive a route from
-    // --executor — but ONLY when the executor maps to one of the 5
-    // routes. Unknown executors (`shell`, `amplifier`, custom names)
-    // fall through to the legacy path so we don't clobber them with
-    // claude defaults.
+    // 0. If `--executor` was supplied, emit a single deprecation line and
+    //    keep going. We never refuse the flag: existing scripts / tests
+    //    must keep working for one release.
+    if executor.is_some() {
+        emit_executor_deprecation_warning(executor.unwrap());
+    }
+
+    // 1. If only `-m` is given (no `-x`, no `--route`), derive the route
+    //    from the model spec's provider prefix. This is the new canonical
+    //    flow: model → handler → route.
+    let derived_executor: Option<&str> = if executor.is_none() && route.is_none() {
+        model.and_then(executor_for_model_spec)
+    } else {
+        None
+    };
+    let effective_executor: Option<&str> = executor.or(derived_executor);
+
+    // 2. Explicit --route always wins. Otherwise, derive a route from the
+    //    (legacy or model-derived) executor — but ONLY when the executor
+    //    maps to one of the named routes. Unknown executors (`shell`,
+    //    `amplifier`, custom names) fall through to the legacy path so we
+    //    don't clobber them with claude defaults.
     let resolved_route: Option<SetupRoute> = if let Some(name) = route {
         Some(SetupRoute::from_name(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -46,7 +70,7 @@ pub fn run_with_route(
             )
         })?)
     } else {
-        executor.and_then(SetupRoute::try_from_executor)
+        effective_executor.and_then(SetupRoute::try_from_executor)
     };
 
     if dry_run {
@@ -68,13 +92,14 @@ pub fn run_with_route(
             return Ok(());
         }
         anyhow::bail!(
-            "--dry-run requires either --route or --executor so the would-be config can be shown."
+            "--dry-run requires either --route or a model spec with a provider prefix \
+             (e.g. -m claude:opus) so the would-be config can be shown."
         );
     }
 
     // If no route was resolved, fall back to the legacy executor-only path.
     let Some(route) = resolved_route else {
-        return run(dir, no_agency, executor, model, endpoint);
+        return run(dir, no_agency, effective_executor, model, endpoint);
     };
 
     // Route-driven init: create dir, write config from route defaults.
@@ -128,6 +153,14 @@ pub fn run_with_route(
         }
     }
 
+    // The `executor` user-facing concept is deprecated — wg derives the
+    // handler from the model spec's provider prefix. Drop the redundant
+    // field from the freshly-written config so users who later run
+    // `wg config show` / load the file don't see a deprecation warning
+    // for a key wg itself wrote. Existing legacy configs still emit the
+    // warning; this purge only prevents new ones from spawning it.
+    workgraph::config::strip_redundant_executor_keys(&mut config);
+
     config.save(dir).context("Failed to save config.toml")?;
 
     let tier_summary = format!(
@@ -173,6 +206,46 @@ pub fn run_with_route(
     }
 
     Ok(())
+}
+
+/// Map a model spec (e.g. `claude:opus`, `local:qwen3-coder`) to the
+/// executor string used by `apply_executor` / `SetupRoute::try_from_executor`.
+///
+/// Mirrors `dispatch::handler_for_model` but in the user-facing string
+/// vocabulary that init.rs / setup.rs already speak. Bare names with no
+/// recognized provider prefix → `None` (caller falls back to the
+/// legacy required-executor path with a migration hint).
+fn executor_for_model_spec(model: &str) -> Option<&'static str> {
+    let spec = workgraph::config::parse_model_spec(model);
+    spec.provider
+        .as_deref()
+        .map(workgraph::config::provider_to_executor)
+}
+
+/// Emit a one-line deprecation warning when `--executor` (`-x`) is supplied
+/// to `wg init`. We never refuse the flag — existing scripts must keep
+/// working for one release — but we surface that the right path going
+/// forward is `-m <provider>:<model>`.
+fn emit_executor_deprecation_warning(executor: &str) {
+    eprintln!(
+        "warning: `--executor {0}` (`-x {0}`) is deprecated; pass a `provider:model` \
+         spec instead (e.g. `wg init -m {1}`). The handler is derived from the \
+         model's provider prefix.",
+        executor,
+        suggested_model_for_executor(executor),
+    );
+}
+
+/// Suggest a sensible `-m` value for a deprecated `-x <exec>` invocation.
+fn suggested_model_for_executor(executor: &str) -> &'static str {
+    match executor {
+        "claude" => "claude:opus",
+        "codex" => "codex:gpt-5",
+        "nex" | "native" => "local:qwen3-coder -e <ENDPOINT>",
+        "amplifier" => "claude:opus  # amplifier wraps the same model",
+        "shell" => "shell  # exec_mode, not a model — keep the route",
+        _ => "<provider>:<model>",
+    }
 }
 
 /// Write the repo-level .gitignore entry for the workgraph dir basename.
@@ -246,15 +319,21 @@ pub fn run(
         Some(e) => e,
         None => {
             anyhow::bail!(
-                "Executor is required for `wg init`.\n\
+                "Cannot infer the handler for `wg init` — no model spec or route given.\n\
                 \n\
-                Choose one of the supported executors and re-run:\n\
+                The recommended path is to pass a `provider:model` spec (and an\n\
+                endpoint URL when the model is local):\n\
                 \n\
-                  wg init --executor claude      # Anthropic Claude Code (default for most users)\n\
-                  wg init --executor amplifier   # Amplifier multi-agent bundles\n\
-                  wg init --executor codex       # OpenAI Codex\n\
-                  wg init --executor shell       # Plain shell commands\n\
-                  wg init --executor nex         # Native executor (wg nex)\n\
+                  wg init -m claude:opus                                 # Anthropic Claude Code\n\
+                  wg init -m codex:gpt-5                                 # OpenAI Codex CLI\n\
+                  wg init -m local:qwen3-coder -e http://127.0.0.1:8088  # local OAI-compat server\n\
+                  wg init -m openrouter:anthropic/claude-opus-4-6        # OpenRouter via nex\n\
+                \n\
+                Or pick a complete preset with --route:\n\
+                \n\
+                  wg init --route claude-cli\n\
+                  wg init --route openrouter\n\
+                  wg init --route local --endpoint http://127.0.0.1:8088 -m qwen3-coder\n\
                 \n\
                 Tip: use `wg setup` for an interactive wizard."
             );
@@ -486,6 +565,7 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
     } else {
         config.coordinator.executor = Some(canonical.to_string());
     }
+    workgraph::config::strip_redundant_executor_keys(&mut config);
     config.save(dir).context("Failed to save config.toml")?;
     println!("Set coordinator.executor = \"{}\"", canonical);
     if route.is_some() {

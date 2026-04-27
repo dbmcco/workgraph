@@ -7,6 +7,8 @@
 //! by exactly one function (`plan_spawn`). Every spawn site calls it; nobody
 //! else picks the executor.
 
+pub mod handler_for_model;
 pub mod plan;
 
+pub use handler_for_model::handler_for_model;
 pub use plan::{ExecutorKind, ResolvedModelSpec, SpawnPlan, SpawnProvenance, plan_spawn};

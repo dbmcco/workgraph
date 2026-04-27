@@ -50,30 +50,36 @@ pub enum Commands {
         #[arg(long)]
         global: bool,
 
-        /// Agent executor to use (required). Supported values:
-        /// claude, amplifier, codex, shell, nex.
-        /// Example: `wg init --executor claude`
-        /// Use `-x` as a short alias (not `-e`, which is reserved for --endpoint).
+        /// [DEPRECATED] Agent executor (`claude`, `codex`, `nex`/`native`,
+        /// `amplifier`, `shell`). The executor is now derived from the
+        /// model spec's provider prefix — you should not need this flag.
+        /// Kept for one release with a deprecation warning so existing
+        /// scripts keep working. Migrate to `-m <provider>:<model>`.
         #[arg(short = 'x', long)]
         executor: Option<String>,
 
-        /// Pre-populate the coordinator/agent model in config.toml.
-        /// Accepts `provider:model` (e.g. `openai:gpt-4o`) or a bare model
-        /// name when combined with `-e URL` (which implies oai-compat).
+        /// Model spec for this project. Use `provider:model` form
+        /// (e.g. `claude:opus`, `local:qwen3-coder`,
+        /// `openrouter:anthropic/claude-opus-4-6`, `oai-compat:gpt-5`).
+        /// The provider prefix tells wg which handler to spawn — claude
+        /// CLI for `claude:*`, codex CLI for `codex:*`, in-process nex
+        /// for `local:*` / `openrouter:*` / `oai-compat:*` / etc.
+        /// Bare aliases (`opus`, `sonnet`, `haiku`) default to claude.
         #[arg(short = 'm', long)]
         model: Option<String>,
 
-        /// Inline LLM endpoint URL. When given, a default oai-compat
-        /// endpoint entry is written to config.toml so every command in
-        /// this project points at that server out of the box.
-        /// Example: `wg init -m nemotron-h-8b -e http://127.0.0.1:8088`
+        /// Inline LLM endpoint URL. Required for `local:*` models and
+        /// any other model whose handler needs an explicit URL (nex /
+        /// native). Ignored for handlers that auth themselves
+        /// (claude / codex CLIs).
+        /// Example: `wg init -m local:qwen3-coder -e http://127.0.0.1:8088`
         #[arg(short = 'e', long)]
         endpoint: Option<String>,
 
-        /// Pick one of the 5 named setup routes (openrouter, claude-cli,
-        /// codex-cli, local, nex-custom) and produce a complete config —
-        /// executor + tiers + endpoint when applicable. Alternative to
-        /// `-x <executor>` when you want fully-populated tiers out of the box.
+        /// Pick one of the named setup routes (openrouter, claude-cli,
+        /// codex-cli, local, nex-custom) for a complete fill-in of
+        /// tiers + endpoint + model registry. Equivalent to picking a
+        /// model+endpoint pair; routes are the canonical entry point.
         #[arg(long)]
         route: Option<String>,
 

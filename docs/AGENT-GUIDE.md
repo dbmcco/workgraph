@@ -635,25 +635,30 @@ wg viz --mermaid                # output Mermaid diagram format
 wg viz --graph                  # 2D spatial graph with box-drawing characters
 ```
 
-### Executor types
+### Picking a model (and endpoint)
 
-The dispatcher spawns agents via an executor. Three built-in executors:
+The user-facing primitives are **model** and **endpoint**. Pass a `provider:model` spec and (when the model needs it) an endpoint URL — wg derives which handler subprocess to spawn from the model's provider prefix:
 
-| Executor | What it does | When to use |
-|----------|-------------|-------------|
-| **claude** | Pipes prompt into `claude --print` (Anthropic CLI) | Default — Claude Code agents |
-| **amplifier** | Pipes prompt into `amplifier run --mode single` | OpenRouter-backed models, multi-provider setups |
-| **shell** | Runs the task's `exec` command directly (no LLM) | Scripts, builds, non-AI work |
+| Model spec example                          | Handler            | Wire protocol  | Endpoint required          |
+|---------------------------------------------|--------------------|----------------|----------------------------|
+| `claude:opus` (or bare `opus`/`sonnet`)     | claude CLI         | Anthropic      | no (CLI auths itself)      |
+| `codex:gpt-5`                               | codex CLI          | OAI-compat     | no (CLI auths itself)      |
+| `local:qwen3-coder`                         | nex (in-process)   | OAI-compat     | yes (`-e <url>`)           |
+| `openrouter:anthropic/claude-opus-4-6`      | nex (in-process)   | OAI-compat     | optional                   |
+| `oai-compat:gpt-5`                          | nex (in-process)   | OAI-compat     | yes                        |
 
 ```bash
-wg config --dispatcher-executor claude      # default
-wg config --dispatcher-executor amplifier   # switch to amplifier
+wg config -m claude:opus                                  # claude handler
+wg config -m local:qwen3-coder -e http://127.0.0.1:8088   # nex handler against local server
+wg config -m openrouter:anthropic/claude-opus-4-6         # nex handler against openrouter
 ```
+
+The legacy `--executor` / `-x` CLI flag and `[agent].executor` / `[dispatcher].executor` config keys are deprecated. They still work for one release with a deprecation warning, but the model spec is the single source of truth — see `src/dispatch/handler_for_model.rs`. After the deprecation window, `executor` is removed entirely.
 
 Spawned agents receive environment variables indicating their runtime context:
 - `WG_TASK_ID` — the task ID being worked on
 - `WG_AGENT_ID` — the agent registry ID (e.g., `agent-7`)
-- `WG_EXECUTOR_TYPE` — the executor that spawned them (e.g., `claude`, `amplifier`)
+- `WG_EXECUTOR_TYPE` — the resolved handler kind (e.g., `claude`, `native`, `codex`)
 - `WG_MODEL` — the effective model selected for this agent (set only when a model is resolved)
 - `WG_USER` — the current user identity
 - `WG_WORKTREE_PATH` / `WG_BRANCH` / `WG_PROJECT_ROOT` — worktree isolation paths (set when worktree isolation is active)
@@ -665,8 +670,7 @@ Spawned agents receive environment variables indicating their runtime context:
 [dispatcher]
 max_agents = 4
 poll_interval = 60
-executor = "claude"
-model = "opus"
+model = "claude:opus"  # provider:model — handler is implied (claude CLI)
 
 [agent]
 heartbeat_timeout = 5   # minutes before agent is considered dead

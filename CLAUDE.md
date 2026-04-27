@@ -18,7 +18,14 @@ to update the global binary. Forgetting this step is a common source of "why isn
 
 ## Service Configuration
 
-Configure the dispatcher's executor and model with `wg config --dispatcher-executor <type>` and `wg config --model <model>`. (Legacy `--coordinator-executor` is still accepted with a deprecation warning.) Supported executors: `claude` (default), `amplifier` (provides bundles and multi-agent delegation). Spawned agents receive `WG_EXECUTOR_TYPE` and `WG_MODEL` env vars indicating their runtime context.
+Pick a **(model, endpoint)** pair — wg derives the handler from the model spec's provider prefix:
+
+- `wg config -m claude:opus` → claude CLI handler (no endpoint needed; CLI auths itself)
+- `wg config -m codex:gpt-5` → codex CLI handler (no endpoint needed)
+- `wg config -m local:qwen3-coder -e http://127.0.0.1:8088` → in-process nex handler
+- `wg config -m openrouter:anthropic/claude-opus-4-6` → in-process nex handler
+
+The legacy `--executor` / `-x` flag and `[agent].executor` / `[dispatcher].executor` config keys are deprecated; they still work for one release with a deprecation warning, but the model spec is the single source of truth for which handler runs. Spawned agents continue to receive `WG_EXECUTOR_TYPE` and `WG_MODEL` env vars (handler kind + resolved model). See `src/dispatch/handler_for_model.rs` for the full mapping.
 
 ## For All Agents (Including the Chat Agent)
 

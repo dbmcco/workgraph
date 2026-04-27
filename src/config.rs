@@ -1752,6 +1752,128 @@ pub fn provider_to_executor(provider: &str) -> &'static str {
     }
 }
 
+/// Inspect a raw config.toml string and produce deprecation warnings for
+/// any explicit `executor = …` keys.
+///
+/// The `executor` user-facing concept was retired in favour of `(model,
+/// endpoint)` — wg derives the handler from the model spec's provider
+/// prefix. Existing configs continue to work for one release; this
+/// surface is what tells users to migrate.
+///
+/// Detected surfaces:
+/// - `[agent].executor`                  (per-task agent default)
+/// - `[coordinator].executor` /
+///   `[dispatcher].executor`             (legacy + canonical name)
+pub fn deprecated_executor_warnings_for_toml(content: &str) -> Vec<String> {
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let surfaces: &[(&str, &[&str], &[&str])] = &[
+        ("agent.executor", &["agent", "executor"], &["agent", "model"]),
+        (
+            "coordinator.executor",
+            &["coordinator", "executor"],
+            &["coordinator", "model"],
+        ),
+        (
+            "dispatcher.executor",
+            &["dispatcher", "executor"],
+            &["dispatcher", "model"],
+        ),
+    ];
+    for (label, exec_path, model_path) in surfaces {
+        let Some(toml::Value::String(exec_v)) = lookup_toml_path(&value, exec_path) else {
+            continue;
+        };
+        let sibling_model = match lookup_toml_path(&value, model_path) {
+            Some(toml::Value::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        let implied: Option<&'static str> = sibling_model.and_then(|m| {
+            parse_model_spec(m)
+                .provider
+                .as_deref()
+                .map(provider_to_executor)
+        });
+        let detail = match implied {
+            Some(imp) if imp != exec_v.as_str() => format!(
+                " (and contradicts sibling model='{}' which implies handler '{}')",
+                sibling_model.unwrap_or(""),
+                imp,
+            ),
+            _ => String::new(),
+        };
+        out.push(format!(
+            "config key `{0} = \"{1}\"` is deprecated{2}; \
+             wg now derives the handler from the model spec's provider \
+             prefix (e.g. `model = \"claude:opus\"` → claude CLI, \
+             `model = \"local:qwen3-coder\"` → nex). Remove the explicit \
+             `executor` key; use a `provider:model` value in `model` instead.",
+            label, exec_v, detail,
+        ));
+    }
+    out
+}
+
+/// Walk a `toml::Value` along a key path. Returns the value at the leaf
+/// or `None` if any segment is missing / not a table.
+fn lookup_toml_path<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = root;
+    for seg in path {
+        current = current.as_table()?.get(*seg)?;
+    }
+    Some(current)
+}
+
+/// Drop the `executor` keys from `[agent]` / `[dispatcher]` / `[coordinator]`
+/// when they're redundant with the model spec's implied handler. Used by
+/// `wg init` so freshly-written configs don't carry the deprecated
+/// `executor` field — and don't trigger the deprecation warning on
+/// every subsequent load.
+///
+/// Specifically:
+/// - `agent.executor` is reset to its default ("claude") when the model's
+///   provider prefix implies the same handler. With `skip_serializing_if =
+///   "is_default_executor"`, the default value is omitted on save.
+/// - `coordinator.executor` is set to `None` when the coordinator/agent
+///   model's provider prefix implies the same handler. `Option::is_none`
+///   is already skipped on serialize.
+///
+/// Bare-alias models (no provider prefix, e.g. `opus`) leave the keys
+/// alone — they don't carry handler information yet, so we let the
+/// existing executor field stand and let the warning nudge the user
+/// toward `provider:model`.
+pub fn strip_redundant_executor_keys(config: &mut Config) {
+    let agent_implied: Option<&'static str> = parse_model_spec(&config.agent.model)
+        .provider
+        .as_deref()
+        .map(provider_to_executor);
+    if let Some(imp) = agent_implied
+        && imp == config.agent.executor.as_str()
+    {
+        config.agent.executor = default_executor();
+    }
+
+    // For dispatcher/coordinator, prefer its own model field, then fall
+    // back to agent.model (the dispatcher inherits when unset).
+    let dispatcher_model = config
+        .coordinator
+        .model
+        .as_deref()
+        .unwrap_or(&config.agent.model);
+    let dispatcher_implied: Option<&'static str> = parse_model_spec(dispatcher_model)
+        .provider
+        .as_deref()
+        .map(provider_to_executor);
+    if let Some(imp) = dispatcher_implied
+        && let Some(ref current) = config.coordinator.executor
+        && imp == current.as_str()
+    {
+        config.coordinator.executor = None;
+    }
+}
+
 /// Map a provider prefix to the internal provider name used by the native executor.
 ///
 /// This determines which API wire format and default URL to use.
@@ -2583,8 +2705,11 @@ impl Default for AgencyConfig {
 /// Agent-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Executor system: "claude", "opencode", "codex", "shell"
-    #[serde(default = "default_executor")]
+    /// **Deprecated**: handler is derived from the model spec's provider
+    /// prefix. Kept for one release with a deprecation warning when set
+    /// explicitly in config.toml. Skipped on serialize when it holds the
+    /// default value, so freshly-written configs no longer carry the key.
+    #[serde(default = "default_executor", skip_serializing_if = "is_default_executor")]
     pub executor: String,
 
     /// Model to use (e.g., "opus-4-5", "sonnet", "haiku")
@@ -3179,6 +3304,10 @@ fn default_executor() -> String {
     "claude".to_string()
 }
 
+fn is_default_executor(s: &str) -> bool {
+    s == default_executor()
+}
+
 fn default_model() -> String {
     "claude:opus".to_string()
 }
@@ -3641,6 +3770,18 @@ impl Config {
         );
         emit_legacy_warnings(&warnings);
 
+        // Surface deprecated `executor` keys regardless of which file
+        // they live in. Read each file's raw content directly (we already
+        // have it as TOML values, but `deprecated_executor_warnings_for_toml`
+        // takes the raw string for symmetry with `Config::load`).
+        for (label, path) in [("global", &global_path), ("local", &local_path)] {
+            if let Ok(content) = fs::read_to_string(path) {
+                for w in deprecated_executor_warnings_for_toml(&content) {
+                    eprintln!("warning: ({}) {}", label, w);
+                }
+            }
+        }
+
         let agent_model_is_local = local_val
             .get("agent")
             .and_then(|a| a.get("model"))
@@ -3742,6 +3883,14 @@ impl Config {
         config.validate_model_format()?;
 
         for warning in config.deprecated_compaction_warnings() {
+            eprintln!("warning: {}", warning);
+        }
+
+        // The `executor` taxonomy has been deprecated as a user-facing
+        // concept in favor of model+endpoint. Warn loudly (once per load)
+        // when explicit `executor = …` keys are still in config.toml so
+        // users have one release to migrate.
+        for warning in deprecated_executor_warnings_for_toml(&content) {
             eprintln!("warning: {}", warning);
         }
 

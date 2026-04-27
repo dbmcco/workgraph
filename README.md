@@ -48,17 +48,17 @@ wg --help
 wg setup    # interactive wizard — pick one of 5 named routes
 ```
 
-Writes `~/.workgraph/config.toml`. Pick one of 5 smooth routes — each produces a complete, working config (executor + tiers + endpoint when applicable) end-to-end:
+Writes `~/.workgraph/config.toml`. Pick one of 5 smooth routes — each produces a complete, working config (model + tiers + endpoint when applicable) end-to-end:
 
-| Route | Executor | Use case |
-|-------|----------|----------|
-| `claude-cli` | `claude` | Local `claude` CLI login (no API key in config) |
-| `codex-cli` | `codex` | Local `codex` CLI login |
-| `openrouter` | `nex` (native) | One API key, every major provider |
-| `local` | `nex` (native) | Ollama / vLLM / llama.cpp on `localhost` |
-| `nex-custom` | `nex` (native) | Bring your own OAI-compatible URL + key + model |
+| Route | Default model spec | Use case |
+|-------|--------------------|----------|
+| `claude-cli` | `claude:opus` | Local `claude` CLI login (no API key in config) |
+| `codex-cli` | `codex:gpt-5` | Local `codex` CLI login |
+| `openrouter` | `openrouter:<model>` | One API key, every major provider |
+| `local` | `local:<model>` | Ollama / vLLM / llama.cpp on `localhost` |
+| `nex-custom` | `oai-compat:<model>` | Bring your own OAI-compatible URL + key + model |
 
-The `nex` (a.k.a. `native`) executor is the in-process OAI-compatible HTTP client — three of the five routes use it under the hood.
+You don't pick an executor — wg derives the handler from the model spec's provider prefix (`claude:*` → claude CLI, `codex:*` → codex CLI, everything else → in-process nex). The `nex` (a.k.a. `native`) handler is the in-process OAI-compatible HTTP client; three of the five routes use it under the hood.
 
 Non-interactive use:
 
@@ -343,12 +343,10 @@ The service reads from `.workgraph/config.toml`:
 [dispatcher]           # legacy alias [coordinator] still accepted
 max_agents = 4         # max parallel agents (default: 4)
 poll_interval = 60     # seconds between safety-net ticks (default: 60)
-executor = "claude"    # executor: "claude" (default), "amplifier", or "shell"
-model = "opus"         # model override for all spawned agents (optional)
+model = "claude:opus"  # provider:model — handler is implied (claude CLI here)
 
 [agent]
-executor = "claude"
-model = "opus"         # default model (default: "opus")
+model = "claude:opus"  # default model (handler implied from prefix)
 heartbeat_timeout = 5  # minutes before agent is considered dead (default: 5)
 
 [agency]
@@ -364,9 +362,9 @@ Set config values with:
 
 ```bash
 wg config --max-agents 8
-wg config --model sonnet
+wg config --model claude:sonnet
 wg config --poll-interval 120
-wg config --executor shell
+# wg config --executor shell  # DEPRECATED — pass `provider:model` to --model instead
 
 # Agency settings
 wg config --auto-evaluate true
@@ -407,7 +405,7 @@ wg config --local           # show/set project config only (.workgraph/config.to
 CLI flags on `wg service start` override config.toml:
 
 ```bash
-wg service start --max-agents 8 --executor shell --interval 120 --model haiku
+wg service start --max-agents 8 --interval 120 --model claude:haiku
 ```
 
 ### Managing the service
@@ -490,21 +488,21 @@ Models are selected in priority order:
 1. Task's `model` property (set with `wg add --model` or `wg edit --model`) — highest priority
 2. Executor config model (model field in the executor's config file)
 3. `coordinator.model` in config.toml (or `--model` on `wg spawn` / `wg service start`)
-4. Executor default (if no model is resolved, no `--model` flag is passed)
+4. Handler default (if no model is resolved, no `--model` flag is passed)
 
 ```bash
 # Set model per-task at creation
-wg add "Simple fix" --model haiku
-wg add "Complex design" --model opus
+wg add "Simple fix" --model claude:haiku
+wg add "Complex design" --model claude:opus
 
 # Change model on an existing task
-wg edit my-task --model sonnet
+wg edit my-task --model claude:sonnet
 
-# Override at spawn time
-wg spawn my-task --executor claude --model haiku
+# Override at spawn time (--executor is deprecated; the model spec implies the handler)
+wg spawn my-task --model claude:haiku
 
 # Set coordinator default (applies to all auto-spawned agents)
-wg config --model sonnet
+wg config --model claude:sonnet
 wg service reload
 ```
 
@@ -993,8 +991,7 @@ Configuration is in `.workgraph/config.toml`:
 
 ```toml
 [agent]
-executor = "claude"
-model = "opus"
+model = "claude:opus"  # provider:model — handler is implied
 interval = 10
 
 [coordinator]

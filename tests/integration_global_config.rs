@@ -363,8 +363,15 @@ max_agents = 6
         sources.get("agency.auto_evaluate"),
         Some(&ConfigSource::Global)
     );
-    // In neither → default
-    assert_eq!(sources.get("agent.executor"), Some(&ConfigSource::Default));
+    // In neither → default. (`agent.executor` was a useful sample here
+    // historically, but as part of `simplify-executor-taxonomy` that
+    // field skips serialization when it holds its default value, so it
+    // no longer surfaces in the source map. `agent.heartbeat_timeout`
+    // is a stable always-serialized scalar with no skip-on-default.)
+    assert_eq!(
+        sources.get("agent.heartbeat_timeout"),
+        Some(&ConfigSource::Default),
+    );
 }
 
 // ===========================================================================

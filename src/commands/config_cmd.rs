@@ -430,6 +430,13 @@ pub fn update(
 
     // Agent settings
     if let Some(exec) = executor {
+        eprintln!(
+            "warning: `wg config --executor {0}` is deprecated; \
+             pass a `provider:model` spec to `--model` instead \
+             (e.g. `wg config --model claude:opus`). The handler is \
+             derived from the model's provider prefix.",
+            exec,
+        );
         config.agent.executor = exec.to_string();
         println!("Set agent.executor = \"{}\"", exec);
         changed = true;
@@ -482,6 +489,14 @@ pub fn update(
     }
 
     if let Some(exec) = coordinator_executor {
+        eprintln!(
+            "warning: `wg config --dispatcher-executor {0}` (and the legacy \
+             `--coordinator-executor` alias) is deprecated; pass a \
+             `provider:model` spec to `--model` / `--coordinator-model` \
+             instead (e.g. `wg config --model claude:opus`). The handler \
+             is derived from the model's provider prefix.",
+            exec,
+        );
         config.coordinator.executor = Some(exec.to_string());
         println!("Set coordinator.executor = \"{}\"", exec);
         changed = true;

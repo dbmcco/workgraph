@@ -1,4 +1,10 @@
-//! Integration tests for `wg init` executor selection requirement.
+//! Integration tests for `wg init` model/executor selection.
+//!
+//! As of `simplify-executor-taxonomy`, `wg init` derives the handler
+//! from the model spec's provider prefix. The legacy `--executor` /
+//! `-x` flag is still accepted (with a deprecation warning) for one
+//! release. These tests cover both the new (`-m`) and legacy (`-x`)
+//! invocations.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,8 +40,8 @@ fn wg_cmd_in(dir: &Path, args: &[&str]) -> std::process::Output {
 // test_init_requires_executor
 // ---------------------------------------------------------------------------
 
-/// `wg init` with no --executor flag must fail with a message containing
-/// "executor" and at least one example invocation.
+/// `wg init` with no flags at all must fail with a helpful error
+/// pointing the user at the new `-m provider:model` flow (or `--route`).
 #[test]
 fn test_init_requires_executor() {
     let tmp = TempDir::new().unwrap();
@@ -44,23 +50,19 @@ fn test_init_requires_executor() {
 
     assert!(
         !output.status.success(),
-        "wg init should fail when --executor is omitted"
+        "wg init with no inputs should fail with a helpful error"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}{}", stderr, stdout);
 
+    // Error must offer at least one example using the new model-spec form.
     assert!(
-        combined.contains("executor"),
-        "error must mention 'executor'. Got:\n{}",
-        combined
-    );
-
-    // Should show at least one example invocation.
-    assert!(
-        combined.contains("--executor claude") || combined.contains("--executor"),
-        "error must show an example command. Got:\n{}",
+        combined.contains("-m claude:opus")
+            || combined.contains("provider:model")
+            || combined.contains("--route"),
+        "error must show the new model+route flow. Got:\n{}",
         combined
     );
 }
@@ -69,8 +71,10 @@ fn test_init_requires_executor() {
 // test_init_with_executor_claude_succeeds
 // ---------------------------------------------------------------------------
 
-/// `wg init --executor claude` must succeed and write coordinator.executor = "claude"
-/// to config.toml.
+/// Legacy `wg init --executor claude` must still succeed (deprecated, but
+/// supported for one release). The dispatcher's resolved handler must
+/// be claude — verified through `parse_model_spec` rather than the
+/// (now-stripped) `coordinator.executor` field.
 #[test]
 fn test_init_with_executor_claude_succeeds() {
     let tmp = TempDir::new().unwrap();
@@ -81,8 +85,15 @@ fn test_init_with_executor_claude_succeeds() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "wg init --executor claude should succeed.\nstdout: {}\nstderr: {}",
+        "wg init --executor claude should still succeed (deprecated).\nstdout: {}\nstderr: {}",
         stdout,
+        stderr
+    );
+
+    // Legacy invocations must emit a deprecation warning.
+    assert!(
+        stderr.contains("deprecated"),
+        "legacy --executor invocation should emit a deprecation warning, got: {}",
         stderr
     );
 
@@ -91,10 +102,16 @@ fn test_init_with_executor_claude_succeeds() {
 
     let config =
         workgraph::config::Config::load(&wg_dir).expect("config.toml should be loadable");
-    assert_eq!(
-        config.coordinator.executor.as_deref(),
-        Some("claude"),
-        "coordinator.executor should be set to 'claude' in config.toml"
+    // The handler is now derived from the model spec. The fresh config
+    // should have claude:* set as the model — that's what the route
+    // populates for `--executor claude`.
+    let agent_model = &config.agent.model;
+    assert!(
+        agent_model.starts_with("claude:") || agent_model == "claude" || agent_model.is_empty()
+            || workgraph::dispatch::handler_for_model(agent_model)
+                == workgraph::dispatch::ExecutorKind::Claude,
+        "agent.model must imply the claude handler, got: {:?}",
+        agent_model
     );
 }
 
@@ -102,8 +119,10 @@ fn test_init_with_executor_claude_succeeds() {
 // test_init_endpoint_only_still_requires_executor
 // ---------------------------------------------------------------------------
 
-/// `wg init -e https://example.com` (endpoint only, no executor) must still
-/// fail with the missing-executor error.
+/// `wg init -e https://example.com` (endpoint only, no model + no
+/// executor + no route) must fail with a helpful error pointing at the
+/// new `-m provider:model` flow. An endpoint alone is ambiguous —
+/// without a model, wg can't pick a handler.
 #[test]
 fn test_init_endpoint_only_still_requires_executor() {
     let tmp = TempDir::new().unwrap();
@@ -112,16 +131,19 @@ fn test_init_endpoint_only_still_requires_executor() {
 
     assert!(
         !output.status.success(),
-        "wg init with only -e (no --executor) should fail"
+        "wg init with only -e (no -m, no -x, no --route) should fail"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{}{}", stderr, stdout);
 
+    // Error must offer the new model-spec flow as the migration target.
     assert!(
-        combined.contains("executor"),
-        "error must mention 'executor'. Got:\n{}",
+        combined.contains("provider:model")
+            || combined.contains("-m claude:opus")
+            || combined.contains("--route"),
+        "error must show the new model+route flow. Got:\n{}",
         combined
     );
 }
@@ -130,8 +152,11 @@ fn test_init_endpoint_only_still_requires_executor() {
 // test_init_executor_and_endpoint_succeeds
 // ---------------------------------------------------------------------------
 
-/// `wg init --executor claude -e https://example.com` must succeed and
-/// store both executor and endpoint in config.toml.
+/// Legacy `wg init --executor shell -e <url>` must still succeed
+/// (deprecated). `shell` is special — it's an exec_mode rather than an
+/// LLM handler, so `coordinator.executor = "shell"` is preserved
+/// (`strip_redundant_executor_keys` only strips when the model spec
+/// implies the same handler, which shell never does).
 #[test]
 fn test_init_executor_and_endpoint_succeeds() {
     let tmp = TempDir::new().unwrap();
@@ -163,7 +188,7 @@ fn test_init_executor_and_endpoint_succeeds() {
     assert_eq!(
         config.coordinator.executor.as_deref(),
         Some("shell"),
-        "coordinator.executor should be 'shell'"
+        "coordinator.executor should be 'shell' (no model implies it)"
     );
 
     let default_ep = config
