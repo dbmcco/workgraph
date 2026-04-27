@@ -40,6 +40,14 @@ pub enum Commands {
         /// Skip agency initialization (roles, agents, auto-assign config)
         #[arg(long)]
         no_agency: bool,
+
+        /// Pre-populate the coordinator/agent model in config.toml.
+        #[arg(short = 'm', long)]
+        model: Option<String>,
+
+        /// Inline LLM endpoint URL written into config.toml on init.
+        #[arg(short = 'e', long)]
+        endpoint: Option<String>,
     },
 
     /// Bulk-reset a subgraph from one or more seed tasks

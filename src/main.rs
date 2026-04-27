@@ -296,7 +296,16 @@ fn main() -> Result<()> {
     workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
 
     match command {
-        Commands::Init { no_agency } => commands::init::run(&workgraph_dir, no_agency),
+        Commands::Init {
+            no_agency,
+            model,
+            endpoint,
+        } => commands::init::run(
+            &workgraph_dir,
+            no_agency,
+            model.as_deref(),
+            endpoint.as_deref(),
+        ),
         Commands::Reset {
             seed,
             seeds,

@@ -16,7 +16,7 @@ matrix.toml
 *.credentials
 "#;
 
-pub fn run(dir: &Path, no_agency: bool) -> Result<()> {
+pub fn run(dir: &Path, no_agency: bool, model: Option<&str>, endpoint: Option<&str>) -> Result<()> {
     if dir.exists() {
         anyhow::bail!("Workgraph already initialized at {}", dir.display());
     }
@@ -59,6 +59,11 @@ pub fn run(dir: &Path, no_agency: bool) -> Result<()> {
     fs::write(&gitignore_path, GITIGNORE_CONTENT).context("Failed to create .gitignore")?;
 
     println!("Initialized workgraph at {}", dir.display());
+
+    if model.is_some() || endpoint.is_some() {
+        apply_model_endpoint(dir, model, endpoint)
+            .context("Failed to write model/endpoint config")?;
+    }
 
     // Full agency initialization: roles, tradeoffs, default agents, config
     if !no_agency {
@@ -114,17 +119,30 @@ pub fn run(dir: &Path, no_agency: bool) -> Result<()> {
     Ok(())
 }
 
+fn apply_model_endpoint(dir: &Path, model: Option<&str>, endpoint: Option<&str>) -> Result<()> {
+    let mut config = workgraph::config::Config::load(dir).unwrap_or_default();
+    let summary = config
+        .apply_model_endpoint(model, endpoint)
+        .context("apply model/endpoint")?;
+    for line in &summary {
+        println!("{}", line);
+    }
+    config.save(dir).context("Failed to save config.toml")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use workgraph::config::Config;
 
     #[test]
     fn test_creates_workgraph_directory() {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         assert!(wg_dir.exists());
         assert!(wg_dir.is_dir());
@@ -135,7 +153,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let graph_path = wg_dir.join("graph.jsonl");
         assert!(graph_path.exists());
@@ -148,7 +166,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let gitignore = wg_dir.join(".gitignore");
         assert!(gitignore.exists());
@@ -164,7 +182,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let repo_gitignore = tmp.path().join(".gitignore");
         assert!(repo_gitignore.exists());
@@ -179,7 +197,7 @@ mod tests {
         fs::write(&repo_gitignore, "node_modules/\n").unwrap();
 
         let wg_dir = tmp.path().join(".workgraph");
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert!(contents.contains("node_modules/"));
@@ -193,7 +211,7 @@ mod tests {
         fs::write(&repo_gitignore, ".workgraph\n").unwrap();
 
         let wg_dir = tmp.path().join(".workgraph");
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert_eq!(
@@ -208,7 +226,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
+        run(&wg_dir, false, None, None).unwrap();
 
         let agency_dir = wg_dir.join("agency");
         assert!(agency_dir.exists());
@@ -249,7 +267,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, true).unwrap();
+        run(&wg_dir, true, None, None).unwrap();
 
         // Workgraph dir and graph.jsonl should exist
         assert!(wg_dir.exists());
@@ -268,11 +286,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".workgraph");
 
-        run(&wg_dir, false).unwrap();
-        let result = run(&wg_dir, false);
+        run(&wg_dir, false, None, None).unwrap();
+        let result = run(&wg_dir, false, None, None);
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("already initialized"));
+    }
+
+    #[test]
+    fn test_init_writes_model_and_endpoint_config() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+
+        run(
+            &wg_dir,
+            true,
+            Some("qwen3-coder"),
+            Some("http://lambda01:8089"),
+        )
+        .unwrap();
+
+        let config = Config::load(&wg_dir).unwrap();
+        assert_eq!(config.agent.model, "local:qwen3-coder");
+        assert_eq!(
+            config.coordinator.model.as_deref(),
+            Some("local:qwen3-coder")
+        );
+        let default_endpoint = config
+            .llm_endpoints
+            .find_default()
+            .expect("default endpoint created by init");
+        assert_eq!(default_endpoint.provider, "local");
+        assert_eq!(
+            default_endpoint.url.as_deref(),
+            Some("http://lambda01:8089")
+        );
+        assert_eq!(default_endpoint.model.as_deref(), Some("qwen3-coder"));
     }
 }

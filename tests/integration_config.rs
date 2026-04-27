@@ -96,6 +96,29 @@ fn config_init_idempotent() {
     assert!(output.contains("already exists"));
 }
 
+#[test]
+fn init_with_endpoint_and_model() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = tmp.path().join(".workgraph");
+
+    let output = wg_ok(
+        &wg_dir,
+        &[
+            "init",
+            "--model",
+            "qwen3-coder",
+            "--endpoint",
+            "http://lambda01:8089",
+        ],
+    );
+    assert!(output.contains("Initialized workgraph"));
+
+    let config_text = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
+    assert!(config_text.contains("local:qwen3-coder"));
+    assert!(config_text.contains("url = \"http://lambda01:8089\""));
+    assert!(config_text.contains("provider = \"local\""));
+}
+
 // ===========================================================================
 // wg config --show
 // ===========================================================================
