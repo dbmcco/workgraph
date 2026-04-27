@@ -843,6 +843,8 @@ fn apply_config_swap_tradeoff(
         trust_level: old_agent.trust_level.clone(),
         contact: old_agent.contact.clone(),
         executor: old_agent.executor.clone(),
+        preferred_model: old_agent.preferred_model.clone(),
+        preferred_provider: old_agent.preferred_provider.clone(),
         deployment_history: vec![],
         attractor_weight: 0.3, // untested new config
         staleness_flags: vec![],

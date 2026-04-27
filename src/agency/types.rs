@@ -310,6 +310,12 @@ pub struct Agent {
         skip_serializing_if = "is_default_executor"
     )]
     pub executor: String,
+    /// Preferred model for this agent (for routing and assignment defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+    /// Preferred provider for this agent (for executor routing defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployment_history: Vec<DeploymentRef>,
     #[serde(default = "default_attractor_weight")]
@@ -324,6 +330,8 @@ fn default_attractor_weight() -> f64 {
 
 /// Executor types that represent human operators (not AI agents).
 const HUMAN_EXECUTORS: &[&str] = &["matrix", "email", "shell"];
+/// Providers that should route through the native executor when executor is still default claude.
+const NON_ANTHROPIC_PROVIDERS: &[&str] = &["openrouter", "oai-compat", "openai", "local"];
 
 /// Returns true if the given executor string represents a human operator.
 pub fn is_human_executor(executor: &str) -> bool {
@@ -334,6 +342,21 @@ impl Agent {
     /// Returns true if this agent uses a human executor (matrix, email, shell).
     pub fn is_human(&self) -> bool {
         is_human_executor(&self.executor)
+    }
+
+    /// Return the effective executor, considering provider-based auto-detection.
+    pub fn effective_executor(&self) -> &str {
+        if !is_default_executor(&self.executor) {
+            &self.executor
+        } else if let Some(ref provider) = self.preferred_provider {
+            if NON_ANTHROPIC_PROVIDERS.contains(&provider.as_str()) {
+                "native"
+            } else {
+                &self.executor
+            }
+        } else {
+            &self.executor
+        }
     }
 }
 
@@ -565,4 +588,52 @@ pub struct TaskAssignmentRecord {
     /// Snapshot of run_mode at time of assignment.
     pub run_mode_value: f64,
     pub mode: AssignmentMode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_agent() -> Agent {
+        Agent {
+            id: "agent-1".to_string(),
+            role_id: "role-1".to_string(),
+            tradeoff_id: "tradeoff-1".to_string(),
+            name: "Sample Agent".to_string(),
+            performance: PerformanceRecord::default(),
+            lineage: Lineage::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: TrustLevel::Provisional,
+            contact: None,
+            executor: "claude".to_string(),
+            preferred_model: None,
+            preferred_provider: None,
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        }
+    }
+
+    #[test]
+    fn agent_effective_executor_defaults_to_configured_executor() {
+        let agent = sample_agent();
+        assert_eq!(agent.effective_executor(), "claude");
+    }
+
+    #[test]
+    fn agent_effective_executor_promotes_openrouter_to_native() {
+        let mut agent = sample_agent();
+        agent.preferred_provider = Some("openrouter".to_string());
+        assert_eq!(agent.effective_executor(), "native");
+    }
+
+    #[test]
+    fn agent_effective_executor_preserves_explicit_nondefault_executor() {
+        let mut agent = sample_agent();
+        agent.executor = "shell".to_string();
+        agent.preferred_provider = Some("openrouter".to_string());
+        assert_eq!(agent.effective_executor(), "shell");
+    }
 }

@@ -455,6 +455,8 @@ fn migrate_agents(
                 trust_level: old_agent.trust_level.clone(),
                 contact: old_agent.contact.clone(),
                 executor: old_agent.executor.clone(),
+                preferred_model: None,
+                preferred_provider: None,
                 deployment_history: vec![],
                 attractor_weight: 0.5,
                 staleness_flags: vec![],

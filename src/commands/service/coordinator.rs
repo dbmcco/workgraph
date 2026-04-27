@@ -1740,6 +1740,27 @@ fn maybe_override_executor_for_task_route(
         .to_string()
 }
 
+fn resolve_ready_task_executor(
+    base_executor: &str,
+    task_provider: Option<&str>,
+    task_model: Option<&str>,
+    agent: Option<&agency::Agent>,
+) -> String {
+    let effective_executor = agent
+        .map(|agent| agent.effective_executor().to_string())
+        .unwrap_or_else(|| base_executor.to_string());
+
+    let effective_model = task_model.or_else(|| agent.and_then(|a| a.preferred_model.as_deref()));
+    let effective_provider =
+        task_provider.or_else(|| agent.and_then(|a| a.preferred_provider.as_deref()));
+
+    maybe_override_executor_for_task_route(
+        &effective_executor,
+        effective_provider,
+        effective_model,
+    )
+}
+
 fn spawn_agents_for_ready_tasks(
     dir: &Path,
     graph: &workgraph::graph::WorkGraph,
@@ -1797,23 +1818,23 @@ fn spawn_agents_for_ready_tasks(
 
         // Resolve executor: tasks with exec commands or exec_mode=shell use shell executor,
         // otherwise: agent.executor > config.coordinator.executor
+        let agent = task
+            .agent
+            .as_ref()
+            .and_then(|agent_hash| agency::find_agent_by_prefix(&agents_dir, agent_hash).ok());
+
         let effective_executor = if task.exec.is_some()
             || task.exec_mode.as_deref() == Some("shell")
         {
             "shell".to_string()
         } else {
-            task.agent
-                .as_ref()
-                .and_then(|agent_hash| agency::find_agent_by_prefix(&agents_dir, agent_hash).ok())
-                .map(|agent| agent.executor)
-                .unwrap_or_else(|| executor.to_string())
+            resolve_ready_task_executor(
+                executor,
+                task.provider.as_deref(),
+                task.model.as_deref().or(model),
+                agent.as_ref(),
+            )
         };
-
-        let effective_executor = maybe_override_executor_for_task_route(
-            &effective_executor,
-            task.provider.as_deref(),
-            task.model.as_deref().or(model),
-        );
 
         // Pass coordinator model to spawn; spawn resolves the full hierarchy:
         // task.model > executor.model > coordinator.model > 'default'
@@ -3390,6 +3411,32 @@ mod tests {
             Some("openrouter:minimax/minimax-m1"),
         );
         assert_eq!(routed, "shell");
+    }
+
+    #[test]
+    fn test_task_route_prefers_agent_preferred_model_when_task_model_absent() {
+        let agent = agency::Agent {
+            id: "agent-1".to_string(),
+            role_id: "role-1".to_string(),
+            tradeoff_id: "tradeoff-1".to_string(),
+            name: "Sample Agent".to_string(),
+            performance: agency::PerformanceRecord::default(),
+            lineage: agency::Lineage::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: Default::default(),
+            contact: None,
+            executor: "claude".to_string(),
+            preferred_model: Some("openrouter:minimax/minimax-m1".to_string()),
+            preferred_provider: Some("openrouter".to_string()),
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        };
+
+        let routed = resolve_ready_task_executor("claude", None, None, Some(&agent));
+        assert_eq!(routed, "native");
     }
 
     #[test]

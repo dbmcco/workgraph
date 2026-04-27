@@ -70,6 +70,8 @@ fn make_agent(id: &str, name: &str, role_id: &str, tradeoff_id: &str) -> Agent {
         trust_level: TrustLevel::Provisional,
         contact: None,
         executor: "claude".to_string(),
+        preferred_model: None,
+        preferred_provider: None,
         deployment_history: vec![],
         attractor_weight: 0.5,
         staleness_flags: vec![],

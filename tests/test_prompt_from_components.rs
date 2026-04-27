@@ -45,6 +45,8 @@ fn create_and_save_agent(
         trust_level: Default::default(),
         contact: None,
         executor: "claude".to_string(),
+        preferred_model: None,
+        preferred_provider: None,
         deployment_history: vec![],
         attractor_weight: 1.0,
         staleness_flags: vec![],

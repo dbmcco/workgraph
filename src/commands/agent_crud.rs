@@ -133,6 +133,8 @@ pub fn run_create(
         trust_level: trust,
         contact: contact.map(std::string::ToString::to_string),
         executor: executor.to_string(),
+        preferred_model: None,
+        preferred_provider: None,
         deployment_history: vec![],
         attractor_weight: 0.5,
         staleness_flags: vec![],
