@@ -356,6 +356,55 @@ impl Drop for CoordinatorDaemonGuard<'_> {
 // Mock-based tests: validate plumbing without real Claude CLI
 // ===========================================================================
 
+/// Dry-run contract for the coordinator spawn-task precursor.
+#[test]
+fn coordinator_spawn_task_dry_run_primary() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = init_workgraph(&tmp);
+
+    let stdout = wg_ok(
+        &wg_dir,
+        &["spawn-task", ".coordinator-0", "--role", "coordinator", "--dry-run"],
+    );
+
+    assert!(
+        stdout.contains("wg claude-handler"),
+        "Expected dry-run to show claude-handler command, got:\n{}",
+        stdout
+    );
+}
+
+/// Unsupported coordinator executors should be rejected explicitly.
+#[test]
+fn coordinator_spawn_task_rejects_unsupported_executor() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = init_workgraph(&tmp);
+
+    fs::write(
+        wg_dir.join("config.toml"),
+        "[coordinator]\ncoordinator_agent = true\nexecutor = \"native\"\nmodel = \"openrouter:minimax/minimax-m1\"\n",
+    )
+    .unwrap();
+
+    let output = wg_cmd(
+        &wg_dir,
+        &["spawn-task", ".coordinator-0", "--role", "coordinator", "--dry-run"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "Expected unsupported executor to fail.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("unsupported coordinator executor"),
+        "Expected unsupported executor error, got:\n{}",
+        stderr
+    );
+}
+
 /// Basic round-trip: send a message via `wg chat` → coordinator agent processes
 /// it via the mock claude → response appears in chat output.
 #[test]
@@ -373,6 +422,30 @@ fn coordinator_agent_basic_conversation() {
         "Expected mock coordinator response, got:\n{}\nDaemon log:\n{}",
         stdout,
         read_daemon_log(&wg_dir),
+    );
+}
+
+/// The coordinator daemon should route through the claude-handler subprocess path.
+#[test]
+fn coordinator_agent_uses_claude_handler_subprocess() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = init_workgraph(&tmp);
+    let mock = MockClaude::new();
+    let guard = CoordinatorDaemonGuard::start(&wg_dir, &mock);
+
+    let stdout = guard.chat_ok("subprocess path test", 15);
+    assert!(
+        stdout.contains("Mock coordinator response"),
+        "Expected mock coordinator response, got:\n{}\nDaemon log:\n{}",
+        stdout,
+        read_daemon_log(&wg_dir),
+    );
+
+    let log = read_daemon_log(&wg_dir);
+    assert!(
+        log.contains("spawn-task") || log.contains("claude-handler"),
+        "Expected daemon log to show subprocess path markers.\nLog:\n{}",
+        log
     );
 }
 
@@ -506,7 +579,7 @@ fn coordinator_agent_cursor_tracking() {
 /// crash again. The file trigger is deleted on first crash, so the restarted
 /// process works normally.
 #[test]
-fn coordinator_agent_crash_recovery() {
+fn coordinator_handler_crash_surfaces_error_and_recovers() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
     let mock = MockClaude::new_with_crash_trigger();
@@ -529,33 +602,21 @@ fn coordinator_agent_crash_recovery() {
         r1
     );
 
-    // Step 2: Create the crash trigger file, then send a message.
-    // The mock will see the file, delete it, and exit with code 1.
+    // Step 2: Create the crash trigger file, then send a message that causes
+    // the subprocess to die. The mock will see the file, delete it, and exit.
     fs::write(&crash_file, "crash").unwrap();
 
-    let crash_output = guard.chat("this message triggers crash", 15);
+    let crash_output = guard.chat("trigger subprocess crash", 15);
     let crash_stdout = String::from_utf8_lossy(&crash_output.stdout).to_string();
-    // The response should be an error/timeout message (not a mock response)
     assert!(
         crash_stdout.contains("crashed")
-            || crash_stdout.contains("timed out")
             || crash_stdout.contains("error")
-            || crash_stdout.contains("no response")
-            || crash_stdout.contains("timeout")
-            || crash_stdout.contains("Error"),
-        "Crash message should produce an error response, got: {}",
+            || crash_stdout.contains("system-error"),
+        "Crash message should produce a chat-visible crash error, got: {}",
         crash_stdout
     );
 
-    // Step 3: The agent may need one more message to detect the broken pipe
-    // and initiate restart (due to reap_zombies race with try_wait).
-    // Send a recovery-trigger message. This will either:
-    // - Get a mock response (if agent already restarted)
-    // - Get an error (stdin write fails → triggers restart)
-    let trigger_output = guard.chat("recovery trigger", 30);
-    let _trigger_stdout = String::from_utf8_lossy(&trigger_output.stdout).to_string();
-
-    // Step 4: Wait for the daemon to restart the agent.
+    // Step 3: Wait for the daemon to restart the agent.
     // Look for a second "Claude CLI started" in the daemon log.
     let log_path = wg_dir.join("service").join("daemon.log");
     let start = Instant::now();
@@ -579,10 +640,8 @@ fn coordinator_agent_crash_recovery() {
     // Wait for the restarted agent to be fully ready
     std::thread::sleep(Duration::from_millis(1000));
 
-    // Step 5: Send a normal message after recovery — should work.
-    // The crash file was deleted by the mock on first crash, so the new
-    // process won't crash.
-    let r3 = guard.chat_ok("message after recovery", 15);
+    // Step 4: Send a normal message after recovery — should work.
+    let r3 = guard.chat_ok("message after restart", 15);
     assert!(
         r3.contains("Mock coordinator response"),
         "Post-recovery message should get a response: {}\nDaemon log:\n{}",
