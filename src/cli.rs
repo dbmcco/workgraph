@@ -1346,6 +1346,10 @@ pub enum Commands {
         /// Kill all running agents
         #[arg(long)]
         all: bool,
+
+        /// Leave the killed task open for immediate re-dispatch instead of auto-pausing it
+        #[arg(long)]
+        redispatch: bool,
     },
 
     /// Manage the agent service daemon

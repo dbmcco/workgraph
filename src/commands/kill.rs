@@ -1,17 +1,21 @@
 //! Kill running agents
 //!
 //! Terminates agent processes and cleans up their registry entries.
+//! By default, kills also pause the agent's task to prevent immediate re-dispatch.
 //!
 //! Usage:
-//!   wg kill agent-1           # Graceful kill (SIGTERM, wait, SIGKILL)
-//!   wg kill agent-1 --force   # Force kill (SIGKILL immediately)
-//!   wg kill --all             # Kill all running agents
+//!   wg kill agent-1              # Kill + pause task (default)
+//!   wg kill agent-1 --redispatch # Kill but leave task open for re-dispatch
+//!   wg kill agent-1 --force      # Force kill (SIGKILL immediately)
+//!   wg kill --all                # Kill all running agents + pause their tasks
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::{load_graph, lock_graph_file, load_graph_locked, save_graph_locked};
+#[cfg(test)]
+use workgraph::parser::load_graph;
+use workgraph::parser::{lock_graph_file, load_graph_locked, save_graph_locked};
 use workgraph::service::{AgentRegistry, AgentStatus};
 
 use super::{graph_path, kill_process_force, kill_process_graceful};
@@ -20,7 +24,7 @@ use super::{graph_path, kill_process_force, kill_process_graceful};
 const DEFAULT_WAIT_SECS: u64 = 5;
 
 /// Kill a single agent
-pub fn run(dir: &Path, agent_id: &str, force: bool, json: bool) -> Result<()> {
+pub fn run(dir: &Path, agent_id: &str, force: bool, redispatch: bool, json: bool) -> Result<()> {
     let mut locked_registry = AgentRegistry::load_locked(dir)?;
 
     let agent = locked_registry
@@ -41,19 +45,21 @@ pub fn run(dir: &Path, agent_id: &str, force: bool, json: bool) -> Result<()> {
     locked_registry.update_status(agent_id, AgentStatus::Stopping)?;
     locked_registry.save_ref()?;
 
-    // Unclaim the task
-    unclaim_task(dir, &task_id, agent_id)?;
+    // Unclaim the task and pause it unless explicit redispatch was requested.
+    unclaim_task(dir, &task_id, agent_id, !redispatch)?;
 
     // Remove agent from registry
     locked_registry.unregister_agent(agent_id);
     locked_registry.save()?;
 
+    let paused = !redispatch;
     if json {
         let output = serde_json::json!({
             "killed": agent_id,
             "pid": pid,
             "task_id": task_id,
             "force": force,
+            "paused": paused,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -62,14 +68,21 @@ pub fn run(dir: &Path, agent_id: &str, force: bool, json: bool) -> Result<()> {
         } else {
             println!("Killed {} (PID {})", agent_id, pid);
         }
-        println!("Task '{}' unclaimed", task_id);
+        if paused {
+            println!(
+                "Task '{}' paused (use 'wg resume {}' to re-enable dispatch)",
+                task_id, task_id
+            );
+        } else {
+            println!("Task '{}' unclaimed (will be re-dispatched)", task_id);
+        }
     }
 
     Ok(())
 }
 
 /// Kill all running agents
-pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
+pub fn run_all(dir: &Path, force: bool, redispatch: bool, json: bool) -> Result<()> {
     let mut locked_registry = AgentRegistry::load_locked(dir)?;
 
     // Get all alive agents
@@ -92,6 +105,7 @@ pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
+    let pause = !redispatch;
     let mut killed = Vec::new();
     let mut errors = Vec::new();
 
@@ -116,8 +130,8 @@ pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
             );
         }
 
-        // Unclaim task
-        if let Err(e) = unclaim_task(dir, task_id, agent_id) {
+        // Unclaim task and pause it unless explicit redispatch was requested.
+        if let Err(e) = unclaim_task(dir, task_id, agent_id, pause) {
             errors.push(format!("Failed to unclaim task '{}': {}", task_id, e));
             // Don't unregister: agent entry needed so the task can be linked back
             continue;
@@ -141,6 +155,7 @@ pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
                 })
             }).collect::<Vec<_>>(),
             "count": killed.len(),
+            "paused": pause,
             "errors": errors,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -148,7 +163,11 @@ pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
         if killed.is_empty() {
             println!("No agents were killed.");
         } else {
-            println!("Killed {} agent(s):", killed.len());
+            println!(
+                "Killed {} agent(s){}:",
+                killed.len(),
+                if pause { " (tasks paused)" } else { "" }
+            );
             for (id, pid, task) in &killed {
                 println!("  {} (PID {}) - task '{}'", id, pid, task);
             }
@@ -167,7 +186,7 @@ pub fn run_all(dir: &Path, force: bool, json: bool) -> Result<()> {
 }
 
 /// Unclaim the task that was being worked on by the killed agent
-fn unclaim_task(dir: &Path, task_id: &str, agent_id: &str) -> Result<()> {
+fn unclaim_task(dir: &Path, task_id: &str, agent_id: &str, pause: bool) -> Result<()> {
     let path = graph_path(dir);
 
     if !path.exists() {
@@ -182,12 +201,22 @@ fn unclaim_task(dir: &Path, task_id: &str, agent_id: &str) -> Result<()> {
         if task.status == Status::InProgress {
             task.status = Status::Open;
             task.assigned = None;
+            if pause {
+                task.paused = true;
+            }
 
             // Add log entry
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: None,
-                message: format!("Task unclaimed: agent '{}' was killed", agent_id),
+                message: if pause {
+                    format!(
+                        "Agent '{}' killed — task auto-paused (use 'wg resume' to re-enable dispatch)",
+                        agent_id
+                    )
+                } else {
+                    format!("Task unclaimed: agent '{}' was killed (--redispatch)", agent_id)
+                },
             });
 
             save_graph_locked(&graph, &path, &_lock).context("Failed to save graph")?;
@@ -253,15 +282,33 @@ mod tests {
         let temp_dir = setup_with_agent_and_task();
 
         // Unclaim the task
-        let result = unclaim_task(temp_dir.path(), "task-1", "agent-1");
+        let result = unclaim_task(temp_dir.path(), "task-1", "agent-1", true);
         assert!(result.is_ok());
 
         // Verify task is unclaimed
         let graph = load_graph(graph_path(temp_dir.path())).unwrap();
         let task = graph.get_task("task-1").unwrap();
         assert_eq!(task.status, Status::Open);
+        assert!(task.paused);
         assert!(task.assigned.is_none());
         assert!(!task.log.is_empty());
+        assert!(task.log[0].message.contains("auto-paused"));
+    }
+
+    #[test]
+    fn test_unclaim_task_redispatch_leaves_task_open() {
+        let temp_dir = setup_with_agent_and_task();
+
+        let result = unclaim_task(temp_dir.path(), "task-1", "agent-1", false);
+        assert!(result.is_ok());
+
+        let graph = load_graph(graph_path(temp_dir.path())).unwrap();
+        let task = graph.get_task("task-1").unwrap();
+        assert_eq!(task.status, Status::Open);
+        assert!(!task.paused);
+        assert!(task.assigned.is_none());
+        assert!(!task.log.is_empty());
+        assert!(task.log[0].message.contains("--redispatch"));
     }
 
     #[test]
@@ -275,7 +322,7 @@ mod tests {
         save_graph(&graph, &path).unwrap();
 
         // Unclaim should succeed but not change anything
-        let result = unclaim_task(temp_dir.path(), "task-1", "agent-1");
+        let result = unclaim_task(temp_dir.path(), "task-1", "agent-1", true);
         assert!(result.is_ok());
 
         // Verify task is still done
@@ -293,7 +340,7 @@ mod tests {
         save_graph(&graph, &path).unwrap();
 
         // No agents registered
-        let result = run_all(temp_dir.path(), false, false);
+        let result = run_all(temp_dir.path(), false, false, false);
         assert!(result.is_ok());
     }
 
@@ -305,7 +352,7 @@ mod tests {
         let graph = WorkGraph::new();
         save_graph(&graph, &path).unwrap();
 
-        let result = run(temp_dir.path(), "agent-999", false, false);
+        let result = run(temp_dir.path(), "agent-999", false, false, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }

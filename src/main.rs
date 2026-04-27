@@ -1743,11 +1743,16 @@ fn main() -> Result<()> {
             };
             commands::agents::run(&workgraph_dir, filter, cli.json)
         }
-        Commands::Kill { agent, force, all } => {
+        Commands::Kill {
+            agent,
+            force,
+            all,
+            redispatch,
+        } => {
             if all {
-                commands::kill::run_all(&workgraph_dir, force, cli.json)
+                commands::kill::run_all(&workgraph_dir, force, redispatch, cli.json)
             } else if let Some(agent_id) = agent {
-                commands::kill::run(&workgraph_dir, &agent_id, force, cli.json)
+                commands::kill::run(&workgraph_dir, &agent_id, force, redispatch, cli.json)
             } else {
                 anyhow::bail!("Must specify an agent ID or use --all")
             }

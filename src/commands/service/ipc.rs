@@ -37,6 +37,8 @@ pub enum IpcRequest {
         agent_id: String,
         #[serde(default)]
         force: bool,
+        #[serde(default)]
+        redispatch: bool,
     },
     /// Record heartbeat for an agent
     Heartbeat { agent_id: String },
@@ -256,9 +258,16 @@ fn handle_request(
             resp
         }
         IpcRequest::Agents => handle_agents(dir),
-        IpcRequest::Kill { agent_id, force } => {
-            logger.info(&format!("IPC Kill: agent_id={}, force={}", agent_id, force));
-            handle_kill(dir, &agent_id, force)
+        IpcRequest::Kill {
+            agent_id,
+            force,
+            redispatch,
+        } => {
+            logger.info(&format!(
+                "IPC Kill: agent_id={}, force={}, redispatch={}",
+                agent_id, force, redispatch
+            ));
+            handle_kill(dir, &agent_id, force, redispatch)
         }
         IpcRequest::Heartbeat { agent_id } => handle_heartbeat(dir, &agent_id),
         IpcRequest::Status => handle_status(dir),
@@ -440,11 +449,12 @@ fn handle_agents(dir: &Path) -> IpcResponse {
 }
 
 /// Handle kill request
-fn handle_kill(dir: &Path, agent_id: &str, force: bool) -> IpcResponse {
-    match crate::commands::kill::run(dir, agent_id, force, true) {
+fn handle_kill(dir: &Path, agent_id: &str, force: bool, redispatch: bool) -> IpcResponse {
+    match crate::commands::kill::run(dir, agent_id, force, redispatch, true) {
         Ok(()) => IpcResponse::success(serde_json::json!({
             "killed": agent_id,
             "force": force,
+            "paused": !redispatch,
         })),
         Err(e) => IpcResponse::error(&e.to_string()),
     }
@@ -518,7 +528,7 @@ fn handle_shutdown(dir: &Path, kill_agents: bool, logger: &DaemonLogger) -> IpcR
     if kill_agents {
         // Only kill agents if explicitly requested.
         // Agents are detached (setsid) and survive daemon stop by default.
-        if let Err(e) = crate::commands::kill::run_all(dir, true, true) {
+        if let Err(e) = crate::commands::kill::run_all(dir, true, false, true) {
             logger.error(&format!("Error killing agents during shutdown: {}", e));
         }
     }
