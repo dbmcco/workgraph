@@ -1486,6 +1486,7 @@ fn main() -> Result<()> {
             list,
             executor,
             model,
+            endpoint,
             set_interval,
             max_agents,
             coordinator_interval,
@@ -1527,6 +1528,7 @@ fn main() -> Result<()> {
             show_models,
             set_model,
             set_provider,
+            set_endpoint,
             role_model,
             role_provider,
         } => {
@@ -1568,6 +1570,7 @@ fn main() -> Result<()> {
                 commands::config_cmd::show_model_routing(&workgraph_dir, cli.json)
             } else if set_model.is_some()
                 || set_provider.is_some()
+                || set_endpoint.is_some()
                 || role_model.is_some()
                 || role_provider.is_some()
             {
@@ -1603,6 +1606,7 @@ fn main() -> Result<()> {
                     write_scope,
                     effective_model.as_deref(),
                     effective_provider.as_deref(),
+                    set_endpoint.as_deref(),
                 )
             } else if list {
                 commands::config_cmd::list(&workgraph_dir, cli.json)
@@ -1611,6 +1615,7 @@ fn main() -> Result<()> {
             } else if show
                 || (executor.is_none()
                     && model.is_none()
+                    && endpoint.is_none()
                     && set_interval.is_none()
                     && max_agents.is_none()
                     && coordinator_interval.is_none()
@@ -1685,6 +1690,7 @@ fn main() -> Result<()> {
                     flip_verification_model.as_deref(),
                     chat_history,
                     chat_history_max,
+                    endpoint.as_deref(),
                 )
             }
         }

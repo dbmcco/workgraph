@@ -541,6 +541,9 @@ pub struct RoleModelConfig {
     /// Model name within the provider (e.g., "opus", "sonnet", "haiku", "gpt-4o")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Named endpoint override for this role
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// Model routing: maps each dispatch role to a model+provider.
@@ -622,6 +625,7 @@ impl ModelRoutingConfig {
             *slot = Some(RoleModelConfig {
                 provider: None,
                 model: Some(model.to_string()),
+                endpoint: None,
             });
         }
     }
@@ -635,6 +639,21 @@ impl ModelRoutingConfig {
             *slot = Some(RoleModelConfig {
                 provider: Some(provider.to_string()),
                 model: None,
+                endpoint: None,
+            });
+        }
+    }
+
+    /// Set the endpoint for a role.
+    pub fn set_endpoint(&mut self, role: DispatchRole, endpoint: &str) {
+        let slot = self.get_role_mut(role);
+        if let Some(cfg) = slot {
+            cfg.endpoint = Some(endpoint.to_string());
+        } else {
+            *slot = Some(RoleModelConfig {
+                provider: None,
+                model: None,
+                endpoint: Some(endpoint.to_string()),
             });
         }
     }
@@ -645,6 +664,7 @@ impl ModelRoutingConfig {
 pub struct ResolvedModel {
     pub model: String,
     pub provider: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl Config {
@@ -658,6 +678,17 @@ impl Config {
     ///
     /// Provider resolution follows the same cascade but only from [models].
     pub fn resolve_model_for_role(&self, role: DispatchRole) -> ResolvedModel {
+        let default_endpoint = self
+            .models
+            .get_role(DispatchRole::Default)
+            .and_then(|cfg| cfg.endpoint.clone());
+        let resolve_endpoint = |role: DispatchRole| -> Option<String> {
+            self.models
+                .get_role(role)
+                .and_then(|cfg| cfg.endpoint.clone())
+                .or_else(|| default_endpoint.clone())
+        };
+
         // 1. Check role-specific [models] config
         if let Some(role_cfg) = self.models.get_role(role)
             && let Some(ref model) = role_cfg.model
@@ -665,6 +696,7 @@ impl Config {
             return ResolvedModel {
                 model: model.clone(),
                 provider: role_cfg.provider.clone(),
+                endpoint: resolve_endpoint(role),
             };
         }
 
@@ -694,6 +726,7 @@ impl Config {
             return ResolvedModel {
                 model: model.clone(),
                 provider,
+                endpoint: resolve_endpoint(role),
             };
         }
 
@@ -712,6 +745,7 @@ impl Config {
             return ResolvedModel {
                 model: default_model.to_string(),
                 provider,
+                endpoint: resolve_endpoint(role),
             };
         }
 
@@ -722,6 +756,7 @@ impl Config {
             return ResolvedModel {
                 model: model.clone(),
                 provider: default_cfg.provider.clone(),
+                endpoint: resolve_endpoint(role),
             };
         }
 
@@ -732,7 +767,63 @@ impl Config {
                 .models
                 .get_role(DispatchRole::Default)
                 .and_then(|c| c.provider.clone()),
+            endpoint: resolve_endpoint(role),
         }
+    }
+
+    /// Apply a model + endpoint pair to this config in memory.
+    pub fn apply_model_endpoint(
+        &mut self,
+        model: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        if model.is_none() && endpoint.is_none() {
+            return Ok(Vec::new());
+        }
+
+        if let Some(url) = endpoint
+            && !(url.starts_with("http://") || url.starts_with("https://"))
+        {
+            anyhow::bail!("Endpoint must be an http:// or https:// URL (got: {})", url);
+        }
+
+        let effective_model = if endpoint.is_some() {
+            model.map(|m| {
+                if m.contains(':') {
+                    m.to_string()
+                } else {
+                    format!("local:{}", m)
+                }
+            })
+        } else {
+            model.map(|m| m.to_string())
+        };
+
+        let mut summary = Vec::new();
+
+        if let Some(url) = endpoint {
+            self.llm_endpoints.endpoints.retain(|e| e.name != "default");
+            for endpoint in &mut self.llm_endpoints.endpoints {
+                endpoint.is_default = false;
+            }
+            self.llm_endpoints.endpoints.push(EndpointConfig {
+                name: "default".to_string(),
+                provider: "local".to_string(),
+                url: Some(url.to_string()),
+                model: model.map(|m| m.to_string()),
+                api_key: None,
+                is_default: true,
+            });
+            summary.push(format!("default endpoint → {}", url));
+        }
+
+        if let Some(model) = effective_model {
+            self.agent.model = model.clone();
+            self.coordinator.model = Some(model.clone());
+            summary.push(format!("model → {}", model));
+        }
+
+        Ok(summary)
     }
 
     /// Check for legacy `agency.*_model` fields and emit deprecation warnings to stderr.
@@ -2144,10 +2235,134 @@ model = "haiku"
         config.models.triage = Some(RoleModelConfig {
             model: Some("routing-model".to_string()),
             provider: Some("openrouter".to_string()),
+            endpoint: None,
         });
         let resolved = config.resolve_model_for_role(DispatchRole::Triage);
         assert_eq!(resolved.model, "routing-model");
         assert_eq!(resolved.provider, Some("openrouter".to_string()));
+    }
+
+    #[test]
+    fn test_endpoint_cascades_from_default() {
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: None,
+            endpoint: Some("openrouter".to_string()),
+        });
+
+        let triage = config.resolve_model_for_role(DispatchRole::Triage);
+        assert_eq!(triage.endpoint.as_deref(), Some("openrouter"));
+
+        let evaluator = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(evaluator.endpoint.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn test_role_endpoint_overrides_default() {
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: None,
+            provider: None,
+            endpoint: Some("openrouter".to_string()),
+        });
+        config.models.evaluator = Some(RoleModelConfig {
+            model: None,
+            provider: None,
+            endpoint: Some("anthropic-direct".to_string()),
+        });
+
+        let triage = config.resolve_model_for_role(DispatchRole::Triage);
+        assert_eq!(triage.endpoint.as_deref(), Some("openrouter"));
+
+        let evaluator = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(evaluator.endpoint.as_deref(), Some("anthropic-direct"));
+    }
+
+    #[test]
+    fn test_set_endpoint() {
+        let mut config = Config::default();
+        config
+            .models
+            .set_endpoint(DispatchRole::Evaluator, "openrouter");
+        let role_cfg = config.models.evaluator.unwrap();
+        assert_eq!(role_cfg.endpoint.as_deref(), Some("openrouter"));
+        assert!(role_cfg.model.is_none());
+        assert!(role_cfg.provider.is_none());
+    }
+
+    #[test]
+    fn apply_model_endpoint_sets_default_endpoint_and_prefixed_model() {
+        let mut config = Config::default();
+        let summary = config
+            .apply_model_endpoint(Some("qwen3-coder"), Some("http://lambda01:8089"))
+            .unwrap();
+        assert!(summary.iter().any(|s| s.contains("http://lambda01:8089")));
+        assert!(summary.iter().any(|s| s.contains("local:qwen3-coder")));
+        assert_eq!(
+            config.coordinator.model.as_deref(),
+            Some("local:qwen3-coder")
+        );
+        assert_eq!(config.agent.model, "local:qwen3-coder");
+        let default_ep = config
+            .llm_endpoints
+            .endpoints
+            .iter()
+            .find(|e| e.is_default)
+            .expect("default endpoint written");
+        assert_eq!(default_ep.provider, "local");
+        assert_eq!(default_ep.url.as_deref(), Some("http://lambda01:8089"));
+        assert_eq!(default_ep.model.as_deref(), Some("qwen3-coder"));
+    }
+
+    #[test]
+    fn apply_model_endpoint_preserves_provider_prefix_when_given() {
+        let mut config = Config::default();
+        config
+            .apply_model_endpoint(Some("claude:opus"), None)
+            .unwrap();
+        assert_eq!(config.coordinator.model.as_deref(), Some("claude:opus"));
+        assert_eq!(config.agent.model, "claude:opus");
+    }
+
+    #[test]
+    fn apply_model_endpoint_rejects_non_http() {
+        let mut config = Config::default();
+        let err = config
+            .apply_model_endpoint(Some("x"), Some("lambda01"))
+            .expect_err("non-http rejected");
+        assert!(
+            format!("{:#}", err).contains("http://"),
+            "error should mention http(s)"
+        );
+    }
+
+    #[test]
+    fn apply_model_endpoint_replaces_default_entry() {
+        let mut config = Config::default();
+        config
+            .apply_model_endpoint(Some("m1"), Some("http://a:1"))
+            .unwrap();
+        config
+            .apply_model_endpoint(Some("m2"), Some("http://b:2"))
+            .unwrap();
+        let defaults: Vec<_> = config
+            .llm_endpoints
+            .endpoints
+            .iter()
+            .filter(|e| e.name == "default")
+            .collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].url.as_deref(), Some("http://b:2"));
+        assert_eq!(
+            config
+                .llm_endpoints
+                .endpoints
+                .iter()
+                .filter(|e| e.is_default)
+                .count(),
+            1
+        );
     }
 
     #[test]

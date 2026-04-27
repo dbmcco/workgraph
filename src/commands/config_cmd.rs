@@ -148,6 +148,9 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
                     if let Some(ref p) = default_cfg.provider {
                         println!("  default.provider = \"{}\"", p);
                     }
+                    if let Some(ref ep) = default_cfg.endpoint {
+                        println!("  default.endpoint = \"{}\"", ep);
+                    }
                 }
                 for role in DispatchRole::ALL {
                     if let Some(role_cfg) = config.models.get_role(*role) {
@@ -156,6 +159,9 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
                         }
                         if let Some(ref p) = role_cfg.provider {
                             println!("  {}.provider = \"{}\"", role, p);
+                        }
+                        if let Some(ref ep) = role_cfg.endpoint {
+                            println!("  {}.endpoint = \"{}\"", role, ep);
                         }
                     }
                 }
@@ -224,12 +230,24 @@ pub fn update(
     flip_verification_model: Option<&str>,
     chat_history: Option<bool>,
     chat_history_max: Option<usize>,
+    endpoint: Option<&str>,
 ) -> Result<()> {
     let mut config = match scope {
         ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
         ConfigScope::Local => Config::load(dir)?,
     };
     let mut changed = false;
+
+    let endpoint_handled_model = if endpoint.is_some() {
+        let summary = config.apply_model_endpoint(model, endpoint)?;
+        for line in &summary {
+            println!("Set {}", line);
+        }
+        changed = true;
+        true
+    } else {
+        false
+    };
 
     // Agent settings
     if let Some(exec) = executor {
@@ -238,7 +256,9 @@ pub fn update(
         changed = true;
     }
 
-    if let Some(m) = model {
+    if let Some(m) = model
+        && !endpoint_handled_model
+    {
         config.agent.model = m.to_string();
         println!("Set agent.model = \"{}\"", m);
         changed = true;
@@ -763,6 +783,7 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
             serde_json::json!({
                 "model": resolved.model,
                 "provider": resolved.provider,
+                "endpoint": resolved.endpoint,
             }),
         );
         for role in DispatchRole::ALL {
@@ -772,6 +793,7 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
                 serde_json::json!({
                     "model": resolved.model,
                     "provider": resolved.provider,
+                    "endpoint": resolved.endpoint,
                 }),
             );
         }
@@ -780,15 +802,19 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
         println!("Model Routing Configuration");
         println!("===========================");
         println!();
-        println!("  {:<20} {:<20} PROVIDER", "ROLE", "MODEL");
-        println!("  {}", "-".repeat(55));
+        println!(
+            "  {:<20} {:<20} {:<16} PROVIDER",
+            "ROLE", "MODEL", "ENDPOINT"
+        );
+        println!("  {}", "-".repeat(72));
 
         // Default
         let resolved = config.resolve_model_for_role(DispatchRole::Default);
         println!(
-            "  {:<20} {:<20} {}",
+            "  {:<20} {:<20} {:<16} {}",
             "default",
             resolved.model,
+            resolved.endpoint.as_deref().unwrap_or(""),
             resolved.provider.as_deref().unwrap_or("(not set)")
         );
 
@@ -799,9 +825,10 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
             let has_explicit = role_cfg.and_then(|c| c.model.as_ref()).is_some();
             let marker = if has_explicit { "" } else { " (inherited)" };
             println!(
-                "  {:<20} {:<20} {}{}",
+                "  {:<20} {:<20} {:<16} {}{}",
                 role.to_string(),
                 resolved.model,
+                resolved.endpoint.as_deref().unwrap_or(""),
                 resolved.provider.as_deref().unwrap_or("(not set)"),
                 marker,
             );
@@ -809,17 +836,19 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
         println!();
         println!("Use --set-model <role> <model> to override a role.");
         println!("Use --set-provider <role> <provider> to set a provider.");
+        println!("Use --set-endpoint <role> <endpoint-name> to bind an endpoint.");
     }
 
     Ok(())
 }
 
-/// Update model routing configuration (--set-model / --set-provider).
+/// Update model routing configuration (--set-model / --set-provider / --set-endpoint).
 pub fn update_model_routing(
     dir: &Path,
     scope: ConfigScope,
     set_model: Option<&[String]>,
     set_provider: Option<&[String]>,
+    set_endpoint: Option<&[String]>,
 ) -> Result<()> {
     use workgraph::config::DispatchRole;
 
@@ -849,6 +878,23 @@ pub fn update_model_routing(
         let provider = &args[1];
         config.models.set_provider(role, provider);
         println!("Set models.{}.provider = \"{}\"", role, provider);
+        changed = true;
+    }
+
+    if let Some(args) = set_endpoint {
+        if args.len() != 2 {
+            anyhow::bail!("--set-endpoint requires exactly 2 arguments: <role> <endpoint-name>");
+        }
+        let role: DispatchRole = args[0].parse()?;
+        let endpoint_name = &args[1];
+        if config.llm_endpoints.find_by_name(endpoint_name).is_none() {
+            eprintln!(
+                "Warning: endpoint '{}' is not configured. Add it with: wg endpoints add {}",
+                endpoint_name, endpoint_name
+            );
+        }
+        config.models.set_endpoint(role, endpoint_name);
+        println!("Set models.{}.endpoint = \"{}\"", role, endpoint_name);
         changed = true;
     }
 
@@ -941,6 +987,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -965,6 +1012,7 @@ mod tests {
             Some(60),
             None,
             Some("shell"),
+            None,
             None,
             None,
             None,
@@ -1043,6 +1091,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(result.is_ok());
 
@@ -1076,6 +1125,7 @@ mod tests {
             Some("creator-hash"),
             Some("haiku"),
             Some("Retire below 0.3 after 10 evals"),
+            None,
             None,
             None,
             None,

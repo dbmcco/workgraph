@@ -169,6 +169,68 @@ fn config_set_model() {
 }
 
 #[test]
+fn config_set_endpoint_url_with_model() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp);
+
+    let output = wg_ok(
+        &wg_dir,
+        &[
+            "config",
+            "--model",
+            "qwen3-coder",
+            "--endpoint",
+            "http://lambda01:8089",
+        ],
+    );
+    assert!(output.contains("http://lambda01:8089"));
+    assert!(output.contains("local:qwen3-coder"));
+
+    let config_text = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
+    assert!(config_text.contains("[[llm_endpoints.endpoints]]"));
+    assert!(config_text.contains("provider = \"local\""));
+    assert!(config_text.contains("url = \"http://lambda01:8089\""));
+    assert!(config_text.contains("model = \"qwen3-coder\""));
+    assert!(config_text.contains("local:qwen3-coder"));
+}
+
+#[test]
+fn config_models_set_endpoint_and_show_json() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp);
+
+    wg_ok(
+        &wg_dir,
+        &[
+            "config",
+            "--model",
+            "qwen3-coder",
+            "--endpoint",
+            "http://lambda01:8089",
+        ],
+    );
+
+    let output = wg_ok(
+        &wg_dir,
+        &["config", "--set-endpoint", "evaluator", "default"],
+    );
+    assert!(output.contains("models.evaluator.endpoint"));
+
+    let models = wg_ok(&wg_dir, &["--json", "config", "--models"]);
+    let json: serde_json::Value = serde_json::from_str(&models).unwrap_or_else(|e| {
+        panic!(
+            "Invalid JSON from config --models --json: {}\nOutput: {}",
+            e, models
+        )
+    });
+    assert_eq!(
+        json["evaluator"]["endpoint"].as_str(),
+        Some("default"),
+        "expected evaluator endpoint binding in model-routing JSON"
+    );
+}
+
+#[test]
 fn config_set_max_agents() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp);

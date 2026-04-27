@@ -1090,6 +1090,10 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
+        /// Rewrite the default LLM endpoint to this URL.
+        #[arg(long)]
+        endpoint: Option<String>,
+
         /// Set default interval in seconds
         #[arg(long)]
         set_interval: Option<u64>,
@@ -1257,6 +1261,10 @@ pub enum Commands {
         /// Set provider for a dispatch role: --set-provider <role> <provider>
         #[arg(long = "set-provider", num_args = 2, value_names = ["ROLE", "PROVIDER"])]
         set_provider: Option<Vec<String>>,
+
+        /// Set endpoint for a dispatch role: --set-endpoint <role> <endpoint-name>
+        #[arg(long = "set-endpoint", num_args = 2, value_names = ["ROLE", "ENDPOINT"])]
+        set_endpoint: Option<Vec<String>>,
 
         /// Set model for a dispatch role: --role-model <role>=<model>
         /// Equivalent to --set-model but uses key=value syntax.
