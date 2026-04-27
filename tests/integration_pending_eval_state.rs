@@ -410,6 +410,66 @@ fn test_system_dependents_unblock_on_pending_eval_source() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Bug-flip-and: `wg evaluate run` must accept PendingEval as a valid input
+// state. Otherwise every .evaluate-X / .flip-X task fails with the precondition
+// error "has status PendingEval — must be done or failed to evaluate" because
+// the dispatcher correctly fires those tasks while parent is still PendingEval
+// (per test_system_dependents_unblock_on_pending_eval_source).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_evaluate_run_accepts_pending_eval_source() {
+    // Parent is PendingEval (the eval-gated state).
+    // `wg evaluate run a` must NOT exit 1 with the precondition error
+    // 'has status PendingEval — must be done or failed to evaluate'.
+    // (It may still exit 1 later for missing agent / role / tradeoff, but the
+    // status precondition is what this test asserts.)
+    let tmp = TempDir::new().unwrap();
+    let a = make_task("a", Status::PendingEval);
+    let wg_dir = setup_workgraph(&tmp, vec![a]);
+
+    let out = wg_cmd(&wg_dir, &["evaluate", "run", "a"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("has status PendingEval"),
+        "wg evaluate run must not reject PendingEval as a precondition error.\nstderr: {}\nstdout: {}",
+        stderr,
+        stdout
+    );
+    assert!(
+        !stderr.contains("must be done or failed to evaluate"),
+        "wg evaluate run must accept PendingEval (treat as 'done but eval pending').\nstderr: {}\nstdout: {}",
+        stderr,
+        stdout
+    );
+}
+
+#[test]
+fn test_evaluate_run_flip_accepts_pending_eval_source() {
+    // Same contract for `--flip`: PendingEval is a valid input.
+    let tmp = TempDir::new().unwrap();
+    let a = make_task("a", Status::PendingEval);
+    let wg_dir = setup_workgraph(&tmp, vec![a]);
+
+    let out = wg_cmd(&wg_dir, &["evaluate", "run", "a", "--flip"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stderr.contains("has status PendingEval"),
+        "wg evaluate run --flip must not reject PendingEval as a precondition error.\nstderr: {}\nstdout: {}",
+        stderr,
+        stdout
+    );
+    assert!(
+        !stderr.contains("must be done or failed to evaluate"),
+        "wg evaluate run --flip must accept PendingEval.\nstderr: {}\nstdout: {}",
+        stderr,
+        stdout
+    );
+}
+
 #[test]
 fn test_pending_eval_is_non_terminal() {
     // Required invariant: PendingEval is NOT terminal. Downstream dependents

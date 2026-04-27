@@ -172,6 +172,16 @@ description = "With multiple chats present, plain number-key presses ('1', '2', 
 timeout_seconds = 90
 
 [[scenario]]
+name = "evaluate_accepts_pending_eval"
+script = "scenarios/evaluate_accepts_pending_eval.sh"
+owners = [
+    "bug-flip-and",
+    "smoke-gate-is",
+]
+description = "wg evaluate run (and --flip) MUST accept Status::PendingEval as a valid input state. Regression for the 2026-04-27 mass-fail: ~30 .flip-* / .evaluate-* tasks auto-failed with 'has status PendingEval — must be done or failed to evaluate' because the dispatcher correctly fires those tasks while parent is still PendingEval (per the eval-gated unblock contract) but evaluate.rs's precondition rejected it."
+timeout_seconds = 30
+
+[[scenario]]
 name = "tui_retire_chat_via_ctrl_w"
 script = "scenarios/tui_retire_chat_via_ctrl_w.sh"
 owners = [
