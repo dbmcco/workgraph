@@ -33,6 +33,12 @@ pub fn is_chat_task_id(s: &str) -> bool {
     s.starts_with(CHAT_PREFIX) || s.starts_with(LEGACY_COORDINATOR_PREFIX)
 }
 
+/// Returns true if this task ID is a legacy coordinator (`.coordinator-N` or bare `.coordinator`).
+/// Use this to apply distinct visual treatment during the deprecation window.
+pub fn is_legacy_coordinator_id(s: &str) -> bool {
+    s.starts_with(LEGACY_COORDINATOR_PREFIX) || s == ".coordinator"
+}
+
 /// Look up a chat task by numeric ID, trying `.chat-N` first then `.coordinator-N`.
 pub fn find_chat_task<'g>(
     graph: &'g WorkGraph,
@@ -99,5 +105,17 @@ mod tests {
         assert!(is_chat_loop_tag("chat-loop"));
         assert!(is_chat_loop_tag("coordinator-loop"));
         assert!(!is_chat_loop_tag("compact-loop"));
+    }
+
+    #[test]
+    fn detects_legacy_coordinator_id() {
+        assert!(is_legacy_coordinator_id(".coordinator-0"));
+        assert!(is_legacy_coordinator_id(".coordinator-3"));
+        assert!(is_legacy_coordinator_id(".coordinator-99"));
+        assert!(is_legacy_coordinator_id(".coordinator"));
+        assert!(!is_legacy_coordinator_id(".chat-0"));
+        assert!(!is_legacy_coordinator_id(".chat-3"));
+        assert!(!is_legacy_coordinator_id("coordinator-loop"));
+        assert!(!is_legacy_coordinator_id("regular-task"));
     }
 }

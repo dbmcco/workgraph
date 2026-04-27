@@ -12855,11 +12855,12 @@ impl VizApp {
         if entries.is_empty() {
             entries.push((0, String::new()));
         }
-        // Label = canonical task id. Per CLAUDE.md the legacy
-        // `coordinator`/`coord` role-noun is deprecated; chat tabs surface
-        // the same `.chat-N` id the user sees in `wg list` / `wg show`.
+        // Label = canonical task id for this graph: `.chat-N` for new tasks,
+        // `.coordinator-N` for legacy graphs that haven't been migrated yet.
+        // This lets the tab bar and other renderers apply distinct styling
+        // based on the prefix.
         for (cid, label) in entries.iter_mut() {
-            *label = workgraph::chat_id::format_chat_task_id(*cid);
+            *label = workgraph::chat_id::canonical_chat_task_id(&graph, *cid);
         }
         entries
     }
@@ -21048,6 +21049,88 @@ mod tui_chat_tests {
         // The numeric ids must come from the task ids, not positional indices.
         let cids: Vec<u32> = entries.iter().map(|(c, _)| *c).collect();
         assert_eq!(cids, vec![2, 3, 4], "cids should match the task-id numbers");
+    }
+
+    /// Legacy `.coordinator-N` tasks should keep their `.coordinator-N` label
+    /// (not be promoted to `.chat-N`), so the tab bar can apply muted styling.
+    #[test]
+    fn legacy_coordinator_labels_preserved_not_promoted_to_chat() {
+        let tmp = TempDir::new().unwrap();
+        let mut graph = WorkGraph::new();
+
+        // Old-style graph: .coordinator-3 with coordinator-loop tag.
+        for cid in [3u32, 5] {
+            let id = format!(".coordinator-{}", cid);
+            let title = format!("Coordinator {}", cid);
+            let mut task = make_task_with_status(&id, &title, Status::InProgress);
+            task.tags = vec!["coordinator-loop".to_string()];
+            graph.add_node(Node::Task(task));
+        }
+
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            VizLayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let app = build_test_app(&viz, &wg_dir);
+
+        let entries = app.list_coordinator_ids_and_labels();
+        let labels: Vec<String> = entries.iter().map(|(_, l)| l.clone()).collect();
+
+        // Labels must reflect the actual task IDs — `.coordinator-N`, NOT promoted to `.chat-N`.
+        for expected in [".coordinator-3", ".coordinator-5"] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "legacy label {:?} should appear as-is, got {:?}",
+                expected,
+                labels
+            );
+        }
+        // Must NOT silently promote to `.chat-N`.
+        for wrong in [".chat-3", ".chat-5"] {
+            assert!(
+                !labels.iter().any(|l| l == wrong),
+                "legacy .coordinator-N must not be promoted to {:?}, got {:?}",
+                wrong,
+                labels
+            );
+        }
+    }
+
+    /// Tab label color helper must return different colors for `.chat-N` vs `.coordinator-N`.
+    #[test]
+    fn tab_label_color_differs_for_chat_vs_coordinator() {
+        use ratatui::style::Color;
+        use super::super::chat_palette::chat_task_label_color;
+
+        let state_color = Color::Blue; // some state color
+
+        let chat_color = chat_task_label_color(".chat-3", state_color);
+        let coord_color = chat_task_label_color(".coordinator-3", state_color);
+
+        assert_eq!(chat_color, Color::Blue, ".chat-N should pass through state color");
+        assert_ne!(
+            coord_color, Color::Blue,
+            ".coordinator-N should not use the state color"
+        );
+        assert_ne!(
+            chat_color, coord_color,
+            "visual styles must differ between .chat-N and .coordinator-N"
+        );
     }
 }
 

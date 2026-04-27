@@ -170,9 +170,22 @@ fn is_internal_task(task: &Task) -> bool {
             .any(|t| t == "assignment" || t == "evaluation")
 }
 
-/// Returns true if the task is a coordinator task.
+/// Returns true if the task is a legacy coordinator task (`.coordinator-N` with `coordinator-loop` tag).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_coordinator_task(task: &Task) -> bool {
     task.tags.iter().any(|t| t == "coordinator-loop")
+}
+
+/// Returns true if the task is any chat agent (`.chat-N` or legacy `.coordinator-N`).
+pub(crate) fn is_chat_agent_task(task: &Task) -> bool {
+    task.tags
+        .iter()
+        .any(|t| t == "chat-loop" || t == "coordinator-loop")
+}
+
+/// Returns true if the task is a legacy coordinator (`.coordinator-N` prefix).
+pub(crate) fn is_legacy_coordinator_task(task: &Task) -> bool {
+    workgraph::chat_id::is_legacy_coordinator_id(&task.id)
 }
 
 /// Returns true if a pipeline task is actively running (not just existing/pending).

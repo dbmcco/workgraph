@@ -281,7 +281,8 @@ pub(crate) fn generate_ascii(
     let format_node = |id: &str| -> String {
         let task = task_map.get(id);
         let is_context = context_ids.contains(id);
-        let is_coordinator = task.is_some_and(|t| super::is_coordinator_task(t));
+        let is_chat_agent = task.is_some_and(|t| super::is_chat_agent_task(t));
+        let is_legacy_coord = task.is_some_and(|t| super::is_legacy_coordinator_task(t));
         let status = task.map(|t| status_label(&t.status)).unwrap_or("unknown");
 
         // Context nodes: dimmed, reduced detail (just ID and status, no tokens/phase/loop)
@@ -289,13 +290,17 @@ pub(crate) fn generate_ascii(
             return format!("{}{}  ({}){}", dim, id, status, reset);
         }
 
-        // Coordinator tasks: cyan color, "turn N" instead of loop info
-        let color = if is_coordinator && use_color {
-            "\x1b[36m" // cyan
+        // Chat agent tasks: cyan for current (.chat-N), dark gray for legacy (.coordinator-N)
+        let color = if is_chat_agent && use_color {
+            if is_legacy_coord {
+                "\x1b[90m" // dark gray — muted for legacy
+            } else {
+                "\x1b[36m" // cyan — accent for current
+            }
         } else {
             task.map(|t| status_color(&t.status)).unwrap_or("")
         };
-        let loop_info = if is_coordinator {
+        let loop_info = if is_chat_agent {
             task.map(|t| format!(" [turn {}]", t.loop_iteration))
                 .unwrap_or_default()
         } else {

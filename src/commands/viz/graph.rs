@@ -203,7 +203,8 @@ pub fn generate_graph_with_overrides(
         let effective_status = status_overrides.get(id).copied().unwrap_or(task.status);
         let status = status_label(&effective_status);
 
-        let is_coordinator = super::is_coordinator_task(task);
+        let is_chat_agent = super::is_chat_agent_task(task);
+        let is_legacy_coord = super::is_legacy_coordinator_task(task);
 
         // Context nodes: dimmed, reduced detail (just ID and status)
         let (line1, line2) = if is_context {
@@ -214,7 +215,7 @@ pub fn generate_graph_with_overrides(
                 .map(|a| format!(" {}", a.text))
                 .unwrap_or_default();
 
-            let loop_info = if is_coordinator {
+            let loop_info = if is_chat_agent {
                 format!(" [turn {}]", task.loop_iteration)
             } else if let Some(ref cfg) = task.cycle_config {
                 if cfg.max_iterations > 0 {
@@ -253,8 +254,12 @@ pub fn generate_graph_with_overrides(
         };
         let width = line1.len().max(line2.len());
 
-        let color = if is_coordinator && use_color {
-            "\x1b[36m" // cyan for coordinator
+        let color = if is_chat_agent && use_color {
+            if is_legacy_coord {
+                "\x1b[90m" // dark gray — muted for legacy .coordinator-N
+            } else {
+                "\x1b[36m" // cyan — accent for current .chat-N
+            }
         } else if is_context {
             dim
         } else {

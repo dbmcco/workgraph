@@ -81,3 +81,60 @@ pub fn thinking_style() -> Style {
 pub fn attachment_style() -> Style {
     Style::default().fg(METADATA).add_modifier(Modifier::ITALIC)
 }
+
+/// Map a chat agent task ID to its label color for tab bars and node labels.
+///
+/// Single entry point for the `.chat-N` vs `.coordinator-N` visual split.
+/// - `.chat-N` (current) → use `state_color` as-is (caller supplies blue/yellow/gray/red)
+/// - `.coordinator-N` (legacy) → always muted gray, ignoring state color
+pub fn chat_task_label_color(task_id: &str, state_color: Color) -> Color {
+    if workgraph::chat_id::is_legacy_coordinator_id(task_id) {
+        Color::Rgb(110, 110, 110)
+    } else {
+        state_color
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_task_gets_state_color() {
+        let blue = Color::Blue;
+        let result = chat_task_label_color(".chat-3", blue);
+        assert_eq!(result, Color::Blue, ".chat-N should pass through the state color");
+    }
+
+    #[test]
+    fn legacy_coordinator_gets_muted_color() {
+        let blue = Color::Blue;
+        let result = chat_task_label_color(".coordinator-3", blue);
+        assert_ne!(
+            result, Color::Blue,
+            ".coordinator-N should NOT use the accent/state color"
+        );
+        assert_eq!(
+            result,
+            Color::Rgb(110, 110, 110),
+            ".coordinator-N should be muted gray"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_coordinator_is_muted() {
+        let result = chat_task_label_color(".coordinator", Color::Yellow);
+        assert_eq!(result, Color::Rgb(110, 110, 110));
+    }
+
+    #[test]
+    fn chat_and_coordinator_styles_differ() {
+        let state_color = Color::Blue;
+        let chat_color = chat_task_label_color(".chat-1", state_color);
+        let coord_color = chat_task_label_color(".coordinator-1", state_color);
+        assert_ne!(
+            chat_color, coord_color,
+            ".chat-N and .coordinator-N must produce different colors"
+        );
+    }
+}

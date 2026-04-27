@@ -18,6 +18,7 @@ use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
 
 use crate::tui::markdown::markdown_to_lines;
+use super::chat_palette::chat_task_label_color;
 
 /// Minimum terminal width for side-by-side right panel layout.
 /// When the inspector is currently on the right and terminal shrinks below this,
@@ -1192,12 +1193,22 @@ fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let selected_id = app.selected_task_id().map(|s| s.to_string());
 
     // Precompute coordinator line indices for chat-to-coordinator visual link.
-    // When the Chat tab is active, coordinator task lines get a subtle cyan highlight.
+    // When the Chat tab is active, chat agent task lines get a subtle tint.
+    // Current .chat-N → dark cyan; legacy .coordinator-N → dark gray (muted).
     let chat_active = app.right_panel_visible && app.right_panel_tab == RightPanelTab::Chat;
     let coordinator_lines: HashSet<usize> = if chat_active {
         app.node_line_map
             .iter()
-            .filter(|(id, _)| id.starts_with(".coordinator"))
+            .filter(|(id, _)| workgraph::chat_id::is_chat_task_id(id))
+            .map(|(_, &line)| line)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let legacy_coordinator_lines: HashSet<usize> = if chat_active {
+        app.node_line_map
+            .iter()
+            .filter(|(id, _)| workgraph::chat_id::is_legacy_coordinator_id(id))
             .map(|(_, &line)| line)
             .collect()
     } else {
@@ -1333,12 +1344,18 @@ fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             }
         }
 
-        // Chat-to-coordinator visual link: apply a subtle cyan tint to coordinator
+        // Chat-to-coordinator visual link: subtle background tint for chat agent
         // task lines when the Chat tab is visible, connecting the two visually.
+        // Current .chat-N: dark cyan; legacy .coordinator-N: dark gray (muted).
         if coordinator_lines.contains(&orig_idx) {
             let last = text_lines.last_mut().unwrap();
-            // Subtle dark cyan background to mark the coordinator row.
-            *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(0, 40, 50)));
+            if legacy_coordinator_lines.contains(&orig_idx) {
+                // Legacy: dim gray background — visually de-emphasized
+                *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(35, 35, 35)));
+            } else {
+                // Current: subtle dark cyan — primary accent
+                *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(0, 40, 50)));
+            }
         }
 
         // Messages-to-user-board visual link: apply a subtle yellow tint to user
@@ -2905,6 +2922,9 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 snapshot_for_cid,
             );
             let state_color = tab_state.color();
+            // Effective color: legacy .coordinator-N tabs use muted gray regardless
+            // of chat state; current .chat-N tabs use the state color normally.
+            let effective_color = chat_task_label_color(label, state_color);
             // Tab content: "[N] ◉ Label ✕ "
             // hotkey(3=" [N]") + space+dot(2) + space+label + space+close(2)
             let label_width = label.len();
@@ -2949,32 +2969,33 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 col += hotkey_width;
             }
 
-            // Dot — colored by chat state (blue/yellow/gray/red).
-            // Active tab uses ◉ + bold; inactive uses ● in the same state color.
+            // Dot — colored by effective color (muted for legacy, state-color for current).
+            // Active tab uses ◉ + bold; inactive uses ● in the same color.
             let dot_glyph = if is_active { " ◉" } else { " ●" };
             let dot_style = if is_active {
                 Style::default()
-                    .fg(state_color)
+                    .fg(effective_color)
                     .add_modifier(Modifier::BOLD)
             } else {
                 // Inactive: dim the state color slightly so the active tab stands out.
                 let dim_color = match tab_state {
                     ChatTabState::SupervisorDown => Color::DarkGray,
-                    _ => state_color,
+                    _ => effective_color,
                 };
                 Style::default().fg(dim_color)
             };
             spans.push(Span::styled(dot_glyph, dot_style));
             col += 2; // " ◉" = space + dot
 
-            // Label — bright + bold + underlined for active; state-colored + dim for inactive.
+            // Label — bright + bold + underlined for active; effective-colored for inactive.
+            // Legacy .coordinator-N tabs use muted gray for both active and inactive.
             let label_style = if is_active {
                 Style::default()
                     .fg(Color::White)
-                    .bg(state_color)
+                    .bg(effective_color)
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
-                Style::default().fg(state_color)
+                Style::default().fg(effective_color)
             };
             spans.push(Span::styled(format!(" {}", label), label_style));
             col += 1 + label_width; // " " + label
@@ -12323,14 +12344,12 @@ mod tests {
 
         let mut graph = WorkGraph::new();
         for &cid in coordinator_ids {
-            let id = if cid == 0 {
-                ".coordinator".to_string()
-            } else {
-                format!(".coordinator-{}", cid)
-            };
-            let title = format!("Coordinator {}", cid);
+            // Use the current .chat-N format so tests exercise modern tab styling,
+            // not legacy .coordinator-N muted-gray behavior.
+            let id = format!(".chat-{}", cid);
+            let title = format!("Chat {}", cid);
             let mut task = make_task_with_status(&id, &title, Status::InProgress);
-            task.tags = vec!["coordinator-loop".to_string()];
+            task.tags = vec!["chat-loop".to_string()];
             graph.add_node(Node::Task(task));
         }
         let regular = make_task_with_status("regular", "Regular Task", Status::Open);
@@ -12481,6 +12500,71 @@ mod tests {
             Color::Yellow,
             "Inactive tab with active streaming file should be Yellow; got {:?}",
             color
+        );
+    }
+
+    #[test]
+    fn test_legacy_coordinator_tab_is_always_muted() {
+        // Legacy .coordinator-N tabs must render with muted gray (Rgb(110,110,110))
+        // even when the streaming file is non-empty. The deprecation treatment takes
+        // precedence over chat state.
+        use crate::tui::viz_viewer::state::{RightPanelTab, VizApp};
+        use workgraph::parser::save_graph;
+
+        let mut graph = WorkGraph::new();
+        // Create old-style .coordinator-1 task.
+        let mut task = make_task_with_status(".coordinator-1", "Coordinator 1", Status::InProgress);
+        task.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir.clone();
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.active_coordinator_id = 1;
+        app.chat.coordinator_active = true;
+
+        // Write streaming data for cid=1 — state would normally be Yellow for .chat-N.
+        workgraph::chat::write_streaming(&wg_dir, 1, "partial reply").unwrap();
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+
+        // Legacy tab must be muted gray, NOT Yellow, despite streaming state.
+        assert_eq!(
+            color,
+            Color::Rgb(110, 110, 110),
+            "Legacy .coordinator-N tab dot should be muted Rgb(110,110,110); got {:?}",
+            color
+        );
+        assert_ne!(
+            color,
+            Color::Yellow,
+            "Legacy .coordinator-N tab must NOT use the streaming Yellow color"
         );
     }
 
