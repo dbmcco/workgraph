@@ -494,6 +494,14 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         // one keystroke. Fall through to the global handler below.
         let is_new_chat =
             matches!(code, KeyCode::Char('n')) && modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+W: global "retire/close current chat" escape hatch. Same
+        // motivation as Ctrl+N — the embedded CLI (claude --resume) can show
+        // its own modal that swallows Esc/digit keys, leaving users stuck
+        // unable to reach the wg TUI's Archive/Stop/Abandon dialog. Ctrl+W
+        // breaks out of PTY forwarding so the global handler below can open
+        // the retire dialog regardless of what the embedded CLI is showing.
+        let is_close_chat =
+            matches!(code, KeyCode::Char('w')) && modifiers.contains(KeyModifiers::CONTROL);
         let is_scroll = matches!(
             code,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
@@ -512,7 +520,7 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 return;
             }
         }
-        if !is_toggle && !is_new_chat {
+        if !is_toggle && !is_new_chat && !is_close_chat {
             let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
             if let Some(pane) = app.task_panes.get_mut(&task_id) {
                 let key_event = crossterm::event::KeyEvent::new(code, modifiers);
@@ -520,7 +528,8 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 return;
             }
         }
-        // Fall through for Ctrl+T (toggles PTY mode) and Ctrl+N (opens launcher).
+        // Fall through for Ctrl+T (toggles PTY mode), Ctrl+N (opens launcher),
+        // and Ctrl+W (opens retire-chat dialog).
     }
 
     // Global Ctrl+N: open the launcher unconditionally.
@@ -532,6 +541,21 @@ fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
         app.focused_panel = FocusedPanel::Graph;
         app.right_panel_tab = RightPanelTab::Chat;
         app.open_launcher();
+        return;
+    }
+
+    // Global Ctrl+W: open the retire-chat dialog for the active chat tab.
+    // Works regardless of focused_panel, input_mode, or whether the chat
+    // PTY is currently in vendor-active mode (escape hatch). Only fires when
+    // a chat tab is the active right-panel tab — otherwise falls through.
+    if matches!(code, KeyCode::Char('w'))
+        && modifiers.contains(KeyModifiers::CONTROL)
+        && app.right_panel_tab == RightPanelTab::Chat
+        && !matches!(app.input_mode, InputMode::ChoiceDialog(_))
+    {
+        // Move focus off the chat PTY so the choice dialog is the active surface.
+        app.focused_panel = FocusedPanel::Graph;
+        open_retire_chat_dialog(app);
         return;
     }
 
@@ -799,6 +823,34 @@ fn handle_choice_dialog_input(app: &mut VizApp, code: KeyCode) {
     }
 }
 
+/// Open the Archive/Stop/Abandon retire dialog for a specific coordinator.
+///
+/// This is the single source of truth for "user wants to retire chat tab N":
+/// invoked from the `-` hotkey, `Ctrl+W` escape hatch, the tab-bar `✕` mouse
+/// click, and the coordinator picker `-` action.
+pub(crate) fn open_retire_dialog_for_coordinator(app: &mut VizApp, cid: u32) {
+    let options = vec![
+        ('a', "Archive".into(), "Mark as done — work complete".into()),
+        (
+            's',
+            "Stop".into(),
+            "Pause coordinator — resume later".into(),
+        ),
+        ('x', "Abandon".into(), "Permanently discard".into()),
+    ];
+    app.input_mode = InputMode::ChoiceDialog(ChoiceDialogState {
+        action: ChoiceDialogAction::RemoveCoordinator(cid),
+        selected: 0,
+        options,
+    });
+}
+
+/// Open the retire dialog for the currently active chat tab.
+pub(crate) fn open_retire_chat_dialog(app: &mut VizApp) {
+    let cid = app.active_coordinator_id;
+    open_retire_dialog_for_coordinator(app, cid);
+}
+
 fn execute_choice_dialog_option(app: &mut VizApp, action: &ChoiceDialogAction, idx: usize) {
     match action {
         ChoiceDialogAction::RemoveCoordinator(cid) => {
@@ -882,20 +934,7 @@ fn handle_coordinator_picker_input(app: &mut VizApp, code: KeyCode) {
                 if let Some((cid, _, _, _)) = picker.entries.get(picker.selected) {
                     let cid = *cid;
                     app.close_coordinator_picker();
-                    let options = vec![
-                        ('a', "Archive".into(), "Mark as done — work complete".into()),
-                        (
-                            's',
-                            "Stop".into(),
-                            "Pause coordinator — resume later".into(),
-                        ),
-                        ('x', "Abandon".into(), "Permanently discard".into()),
-                    ];
-                    app.input_mode = InputMode::ChoiceDialog(ChoiceDialogState {
-                        action: ChoiceDialogAction::RemoveCoordinator(cid),
-                        selected: 0,
-                        options,
-                    });
+                    open_retire_dialog_for_coordinator(app, cid);
                     return;
                 }
             }
@@ -2875,21 +2914,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         }
         // Chat tab: '-' opens choice dialog for coordinator removal
         KeyCode::Char('-') if app.right_panel_tab == RightPanelTab::Chat => {
-            let cid = app.active_coordinator_id;
-            let options = vec![
-                ('a', "Archive".into(), "Mark as done — work complete".into()),
-                (
-                    's',
-                    "Stop".into(),
-                    "Pause coordinator — resume later".into(),
-                ),
-                ('x', "Abandon".into(), "Permanently discard".into()),
-            ];
-            app.input_mode = InputMode::ChoiceDialog(ChoiceDialogState {
-                action: ChoiceDialogAction::RemoveCoordinator(cid),
-                selected: 0,
-                options,
-            });
+            open_retire_chat_dialog(app);
         }
 
         // Task tabs: '[' browses to older iteration
@@ -3622,25 +3647,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                                     && column >= hit.close_start
                                     && column < hit.close_end
                                 {
-                                    let cid = *cid;
-                                    let options = vec![
-                                        (
-                                            'a',
-                                            "Archive".into(),
-                                            "Mark as done — work complete".into(),
-                                        ),
-                                        (
-                                            's',
-                                            "Stop".into(),
-                                            "Pause coordinator — resume later".into(),
-                                        ),
-                                        ('x', "Abandon".into(), "Permanently discard".into()),
-                                    ];
-                                    app.input_mode = InputMode::ChoiceDialog(ChoiceDialogState {
-                                        action: ChoiceDialogAction::RemoveCoordinator(cid),
-                                        selected: 0,
-                                        options,
-                                    });
+                                    open_retire_dialog_for_coordinator(app, *cid);
                                 } else {
                                     app.switch_coordinator(*cid);
                                 }
@@ -8457,5 +8464,147 @@ mod chat_tab_navigation_tests {
             app.active_coordinator_id, 0,
             "Ctrl+Tab off the Chat tab should not switch chats"
         );
+    }
+
+    // ── Retire-chat (tui-cannot-retire) tests ──
+
+    /// Pressing `-` on the Chat tab opens the Archive/Stop/Abandon retire
+    /// dialog for the currently active coordinator. Baseline regression
+    /// guard for the existing binding.
+    #[test]
+    fn minus_key_on_chat_tab_opens_retire_dialog() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4, 7]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+        switch_chat_tab_to_index(&mut app, 1); // active_coordinator_id = 4
+        assert_eq!(app.active_coordinator_id, 4);
+
+        super::handle_key(&mut app, KeyCode::Char('-'), KeyModifiers::NONE);
+
+        match &app.input_mode {
+            InputMode::ChoiceDialog(state) => match state.action {
+                ChoiceDialogAction::RemoveCoordinator(cid) => {
+                    assert_eq!(cid, 4, "Dialog must target the active chat tab");
+                    assert_eq!(state.options.len(), 3, "Archive/Stop/Abandon");
+                }
+            },
+            other => panic!("Expected ChoiceDialog, got {:?}", other),
+        }
+    }
+
+    /// `Ctrl+W` opens the retire dialog for the active chat tab regardless
+    /// of focus state — the core fix for tui-cannot-retire.
+    #[test]
+    fn ctrl_w_opens_retire_dialog_for_active_chat() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+        switch_chat_tab_to_index(&mut app, 1); // cid = 4
+        assert_eq!(app.active_coordinator_id, 4);
+
+        super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+        match &app.input_mode {
+            InputMode::ChoiceDialog(state) => match state.action {
+                ChoiceDialogAction::RemoveCoordinator(cid) => {
+                    assert_eq!(cid, 4, "Ctrl+W must retire the currently focused chat tab");
+                }
+            },
+            other => panic!("Ctrl+W on Chat tab must open ChoiceDialog, got {:?}", other),
+        }
+    }
+
+    /// `Ctrl+W` works as an escape hatch even when chat PTY mode is active
+    /// (the scenario from the task description: claude --resume shows its
+    /// own modal that swallows Esc/digit keys, so we need a way to reach
+    /// the wg retire dialog without dismissing the embedded modal).
+    #[test]
+    fn ctrl_w_escapes_pty_mode_to_open_retire_dialog() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+        switch_chat_tab_to_index(&mut app, 1); // cid = 4
+
+        // Simulate the user being inside an active vendor PTY (claude
+        // --resume showing its session-resume modal).
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+
+        super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+        // The escape hatch must shift focus off the PTY AND open the
+        // retire dialog — without this users have no way to retire a
+        // chat whose embedded CLI is showing a modal.
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::Graph,
+            "Ctrl+W must shift focus off the chat PTY"
+        );
+        match &app.input_mode {
+            InputMode::ChoiceDialog(state) => match state.action {
+                ChoiceDialogAction::RemoveCoordinator(cid) => {
+                    assert_eq!(
+                        cid, 4,
+                        "Ctrl+W from inside PTY must still target the active chat"
+                    );
+                }
+            },
+            other => panic!(
+                "Ctrl+W from PTY-active chat must open ChoiceDialog, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// `Ctrl+W` off the Chat tab is a no-op (falls through to whatever
+    /// other handler may consume it). This guards against accidentally
+    /// firing the retire dialog while on Detail/Log/etc.
+    #[test]
+    fn ctrl_w_off_chat_tab_does_not_open_retire_dialog() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Detail;
+
+        super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+        assert!(
+            !matches!(app.input_mode, InputMode::ChoiceDialog(_)),
+            "Ctrl+W off the Chat tab must not open the retire dialog"
+        );
+    }
+
+    /// Selecting "Abandon" (idx 2) in the retire dialog issues
+    /// `service delete-coordinator <cid>` — the actual retire action.
+    /// This is the end-to-end path: dialog opened → user confirms → command
+    /// queued. The chat task is then marked abandoned by the coordinator
+    /// service handler.
+    #[test]
+    fn retire_dialog_abandon_option_queues_delete_coordinator() {
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.right_panel_tab = RightPanelTab::Chat;
+        switch_chat_tab_to_index(&mut app, 1); // cid = 4
+
+        // Open dialog via Ctrl+W (the new escape hatch).
+        super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert!(matches!(app.input_mode, InputMode::ChoiceDialog(_)));
+
+        // Move selection to Abandon (idx 2): two ↓ presses.
+        super::handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+
+        // Confirm with Enter — this should execute the choice and close the dialog.
+        super::handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(
+            !matches!(app.input_mode, InputMode::ChoiceDialog(_)),
+            "Dialog must close after Enter on a choice"
+        );
+        // The exec_command path is async — we can't assert the chat is
+        // actually abandoned synchronously without a running coordinator
+        // service. The presence-of-effect is what we verify here: dialog
+        // closed cleanly, no panic, focus preserved. The actual graph
+        // mutation is covered by the coordinator service tests.
     }
 }

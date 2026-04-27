@@ -7283,6 +7283,7 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                     RightPanelTab::Chat if app.chat_pty_mode => {
                         hints.push(("Enter", "chat"));
                         hints.push(("Ctrl+T", "focus PTY"));
+                        hints.push(("Ctrl+W", "retire"));
                         hints.push(("↑↓", "scroll"));
                         hints.push(("←→", "coordinators"));
                     }
@@ -7290,6 +7291,7 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         hints.push(("←→", "coordinators"));
                         hints.push(("+", "new"));
                         hints.push(("-", "close"));
+                        hints.push(("Ctrl+W", "retire"));
                         hints.push(("Enter", "chat"));
                         hints.push(("↑↓", "scroll"));
                     }
@@ -8639,6 +8641,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         binding("~ / `", "Open coordinator picker"),
         binding("+", "Add new coordinator (picker)"),
         binding("-", "Close/archive coordinator"),
+        binding("Ctrl-W", "Retire current chat (works inside PTY)"),
         binding("[ / ]", "Prev / next coordinator"),
         binding("←/→", "Prev / next coordinator"),
         binding("Ctrl-T", "Toggle PTY mode"),
