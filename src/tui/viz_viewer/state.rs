@@ -4382,6 +4382,12 @@ pub struct VizApp {
     // ── Chat state ──
     /// Active coordinator ID (the chat tab currently being viewed).
     pub active_coordinator_id: u32,
+    /// Ordered list of coordinator IDs shown as tabs. This is ephemeral TUI
+    /// state — closing a tab removes it here without touching the graph task.
+    pub active_tabs: Vec<u32>,
+    /// Coordinator IDs the user explicitly closed this session.
+    /// Prevents closed tabs from reappearing on graph refresh.
+    closed_tabs: std::collections::HashSet<u32>,
     /// Per-coordinator chat states. Coordinator 0 is always present.
     pub coordinator_chats: HashMap<u32, ChatState>,
     /// Backward-compatible accessor: mutable reference to the active coordinator's chat state.
@@ -4803,6 +4809,8 @@ impl VizApp {
                 editor: new_emacs_editor(),
             },
             active_coordinator_id: 0,
+            active_tabs: Vec::new(),
+            closed_tabs: std::collections::HashSet::new(),
             coordinator_chats: HashMap::new(),
             chat: ChatState::default(),
             history_depth_override,
@@ -4903,6 +4911,7 @@ impl VizApp {
         // so that the user's last-focused coordinator is preserved).
         app.restore_tui_state();
         app.ensure_user_coordinator();
+        app.sync_active_tabs_from_graph();
         app.load_agent_monitor();
         app.check_coordinator_status();
         app.update_service_health();
@@ -9028,6 +9037,8 @@ impl VizApp {
                 editor: new_emacs_editor(),
             },
             active_coordinator_id: 0,
+            active_tabs: Vec::new(),
+            closed_tabs: std::collections::HashSet::new(),
             coordinator_chats: HashMap::new(),
             chat: ChatState::default(),
             history_depth_override: None,
@@ -9139,6 +9150,7 @@ impl VizApp {
             self.load_stats();
         }
         self.load_agent_monitor();
+        self.sync_active_tabs_from_graph();
         self.last_refresh_display = chrono::Local::now().format("%H:%M:%S").to_string();
         self.last_refresh = Instant::now();
     }
@@ -12860,6 +12872,59 @@ impl VizApp {
             *label = workgraph::chat_id::canonical_chat_task_id(&graph, *cid);
         }
         entries
+    }
+
+    /// Return the active-tabs list as (id, label) pairs.
+    /// Filters to only IDs that still exist in the graph (abandoned/archived
+    /// tasks are dropped). New graph chats not yet in active_tabs are NOT
+    /// included here — use sync_active_tabs_from_graph for that.
+    pub fn active_tab_ids_and_labels(&self) -> Vec<(u32, String)> {
+        let current: std::collections::HashSet<u32> =
+            self.list_coordinator_ids().into_iter().collect();
+        self.active_tabs
+            .iter()
+            .filter(|&&id| current.contains(&id))
+            .map(|&id| (id, workgraph::chat_id::format_chat_task_id(id)))
+            .collect()
+    }
+
+    /// Sync active_tabs with the current graph state:
+    ///   - Add new chat IDs not in active_tabs and not in closed_tabs
+    ///     (in sorted order so the initial population is deterministic).
+    ///   - Remove tabs for chats that no longer exist (abandoned/archived).
+    pub fn sync_active_tabs_from_graph(&mut self) {
+        let sorted_ids = self.list_coordinator_ids(); // already sorted by cid
+        let current: std::collections::HashSet<u32> = sorted_ids.iter().copied().collect();
+        // Add newly-appeared chats in sorted order so the tab bar is stable
+        for &id in &sorted_ids {
+            if !self.active_tabs.contains(&id) && !self.closed_tabs.contains(&id) {
+                self.active_tabs.push(id);
+            }
+        }
+        // Drop tabs whose underlying tasks were abandoned/archived
+        self.active_tabs.retain(|id| current.contains(id));
+        // If the active coordinator was dropped, switch to first available tab
+        if !self.active_tabs.is_empty()
+            && !self.active_tabs.contains(&self.active_coordinator_id)
+        {
+            let next = self.active_tabs[0];
+            self.switch_coordinator(next);
+        }
+    }
+
+    /// Close a tab: remove from active_tabs without touching the underlying
+    /// graph task. The task status (in-progress, etc.) is preserved.
+    pub fn close_tab(&mut self, cid: u32) {
+        self.active_tabs.retain(|&id| id != cid);
+        self.closed_tabs.insert(cid);
+        if self.active_coordinator_id == cid {
+            if let Some(&next) = self.active_tabs.first() {
+                self.switch_coordinator(next);
+            } else {
+                // No tabs left — set to 0 (empty/welcome state)
+                self.active_coordinator_id = 0;
+            }
+        }
     }
 
     /// Get user board entries from the graph.

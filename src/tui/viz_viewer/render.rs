@@ -2863,7 +2863,7 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         .saturating_sub(search_bar_height);
 
     // Coordinator + user board tab bar — always visible so the user can discover [+]
-    let coordinator_entries = app.list_coordinator_ids_and_labels();
+    let coordinator_entries = app.active_tab_ids_and_labels();
     let user_board_entries = app.list_user_board_entries();
     let total_tab_count = coordinator_entries.len() + user_board_entries.len();
     let tab_bar_height: u16 = 1;
@@ -12385,6 +12385,7 @@ mod tests {
         app.workgraph_dir = wg_dir;
         app.right_panel_tab = RightPanelTab::Chat;
         app.active_coordinator_id = coordinator_ids[0];
+        app.sync_active_tabs_from_graph();
         (app, tmp)
     }
 
