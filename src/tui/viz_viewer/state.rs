@@ -1953,19 +1953,35 @@ struct PersistedTuiState {
     /// Which right panel tab was active.
     #[serde(default)]
     right_panel_tab: String,
+    /// Task IDs of all open tabs at last save, in display order.
+    #[serde(default)]
+    open_tabs: Vec<String>,
+    /// Task ID of the active tab (e.g. ".chat-3").
+    #[serde(default)]
+    active: String,
 }
 
 fn tui_state_path(workgraph_dir: &std::path::Path) -> std::path::PathBuf {
     workgraph_dir.join("tui-state.json")
 }
 
-fn save_tui_state(workgraph_dir: &std::path::Path, coordinator_id: u32, tab: &RightPanelTab) {
+fn save_tui_state(
+    workgraph_dir: &std::path::Path,
+    coordinator_id: u32,
+    tab: &RightPanelTab,
+    open_tabs: &[String],
+) {
+    let active = workgraph::chat_id::format_chat_task_id(coordinator_id);
     let state = PersistedTuiState {
         active_coordinator_id: coordinator_id,
         right_panel_tab: format!("{:?}", tab),
+        open_tabs: open_tabs.to_vec(),
+        active,
     };
     if let Ok(json) = serde_json::to_string(&state) {
-        let _ = std::fs::write(tui_state_path(workgraph_dir), json);
+        if std::fs::write(tui_state_path(workgraph_dir), &json).is_err() {
+            eprintln!("wg: warning: failed to persist TUI tab state");
+        }
     }
 }
 
@@ -9522,6 +9538,7 @@ impl VizApp {
                                 ToastSeverity::Info,
                             );
                         }
+                        self.persist_tab_state();
                     } else {
                         let err = result
                             .output
@@ -9548,6 +9565,7 @@ impl VizApp {
                         }
                         self.coordinator_chats.remove(&cid);
                         self.force_refresh();
+                        self.persist_tab_state();
                         self.push_toast(format!("Closed coordinator {}", cid), ToastSeverity::Info);
                     } else {
                         let err = result
@@ -9574,6 +9592,7 @@ impl VizApp {
                         }
                         self.coordinator_chats.remove(&cid);
                         self.force_refresh();
+                        self.persist_tab_state();
                         self.push_toast(
                             format!("Archived coordinator {}", cid),
                             ToastSeverity::Info,
@@ -11279,10 +11298,32 @@ impl VizApp {
             );
         }
         // Save TUI focus state.
+        let open_tabs: Vec<String> = self
+            .list_coordinator_ids_and_labels()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
         save_tui_state(
             &self.workgraph_dir,
             self.active_coordinator_id,
             &self.right_panel_tab,
+            &open_tabs,
+        );
+    }
+
+    /// Persist the current tab list and active tab to tui-state.json.
+    /// Best-effort: failure logs a warning but doesn't block operation.
+    pub fn persist_tab_state(&self) {
+        let open_tabs: Vec<String> = self
+            .list_coordinator_ids_and_labels()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        save_tui_state(
+            &self.workgraph_dir,
+            self.active_coordinator_id,
+            &self.right_panel_tab,
+            &open_tabs,
         );
     }
 
@@ -12086,6 +12127,7 @@ impl VizApp {
         self.chat_input_dismissed = self.chat.chat_input_dismissed;
 
         self.active_coordinator_id = target_id;
+        self.persist_tab_state();
 
         // Auto-enter PTY mode when switching to a native-executor
         // coordinator (Step 1 of nex-as-everything). Harmless no-op for
@@ -12109,27 +12151,48 @@ impl VizApp {
 
     /// Restore TUI focus state from the previous session's tui-state.json.
     /// Sets `active_coordinator_id` and `right_panel_tab` if the persisted
-    /// coordinator still exists in the graph.
+    /// coordinator still exists in the graph. Logs a toast if any saved tabs
+    /// refer to tasks that no longer exist.
     fn restore_tui_state(&mut self) {
-        if let Some(state) = load_tui_state(&self.workgraph_dir) {
-            let known_ids = self.list_coordinator_ids();
-            if known_ids.contains(&state.active_coordinator_id) {
-                self.active_coordinator_id = state.active_coordinator_id;
-                // Restore right panel tab.
-                self.right_panel_tab = match state.right_panel_tab.as_str() {
-                    "Chat" => RightPanelTab::Chat,
-                    "Detail" => RightPanelTab::Detail,
-                    "Log" => RightPanelTab::Log,
-                    "Messages" => RightPanelTab::Messages,
-                    "Agency" => RightPanelTab::Agency,
-                    "Config" => RightPanelTab::Config,
-                    "Files" => RightPanelTab::Files,
-                    "CoordLog" => RightPanelTab::CoordLog,
-                    "Firehose" => RightPanelTab::Firehose,
-                    "Output" => RightPanelTab::Output,
-                    "Dashboard" => RightPanelTab::Dashboard,
-                    _ => RightPanelTab::Chat,
-                };
+        let state = match load_tui_state(&self.workgraph_dir) {
+            Some(s) => s,
+            None => return,
+        };
+        let known_ids = self.list_coordinator_ids();
+        if known_ids.contains(&state.active_coordinator_id) {
+            self.active_coordinator_id = state.active_coordinator_id;
+            // Restore right panel tab.
+            self.right_panel_tab = match state.right_panel_tab.as_str() {
+                "Chat" => RightPanelTab::Chat,
+                "Detail" => RightPanelTab::Detail,
+                "Log" => RightPanelTab::Log,
+                "Messages" => RightPanelTab::Messages,
+                "Agency" => RightPanelTab::Agency,
+                "Config" => RightPanelTab::Config,
+                "Files" => RightPanelTab::Files,
+                "CoordLog" => RightPanelTab::CoordLog,
+                "Firehose" => RightPanelTab::Firehose,
+                "Output" => RightPanelTab::Output,
+                "Dashboard" => RightPanelTab::Dashboard,
+                _ => RightPanelTab::Chat,
+            };
+        }
+        // Check saved open_tabs against graph; warn about any that are gone.
+        if !state.open_tabs.is_empty() {
+            let missing: usize = state
+                .open_tabs
+                .iter()
+                .filter(|tab_id| {
+                    workgraph::chat_id::parse_chat_task_id(tab_id)
+                        .map(|cid| !known_ids.contains(&cid))
+                        .unwrap_or(true)
+                })
+                .count();
+            if missing > 0 {
+                self.push_toast(
+                    format!("Skipped {} missing tab(s) from previous session", missing),
+                    ToastSeverity::Warning,
+                );
             }
         }
     }
@@ -19752,7 +19815,7 @@ mod tui_chat_tests {
         let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1]);
 
         // Persist state pointing to coordinator 5 which doesn't exist in graph
-        save_tui_state(&wg_dir, 5, &RightPanelTab::Chat);
+        save_tui_state(&wg_dir, 5, &RightPanelTab::Chat, &[]);
 
         let mut app = build_test_app(&viz, &wg_dir);
         app.restore_tui_state();
@@ -19770,7 +19833,7 @@ mod tui_chat_tests {
         let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
 
         // Save with Log tab active
-        save_tui_state(&wg_dir, 0, &RightPanelTab::Log);
+        save_tui_state(&wg_dir, 0, &RightPanelTab::Log, &[]);
 
         let mut app = build_test_app(&viz, &wg_dir);
         app.restore_tui_state();
@@ -20265,13 +20328,20 @@ mod tui_chat_tests {
         let wg_dir = tmp.path().join(".workgraph");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
-        save_tui_state(&wg_dir, 3, &RightPanelTab::Messages);
+        save_tui_state(
+            &wg_dir,
+            3,
+            &RightPanelTab::Messages,
+            &[".chat-3".to_string()],
+        );
 
         let loaded = load_tui_state(&wg_dir);
         assert!(loaded.is_some());
         let state = loaded.unwrap();
         assert_eq!(state.active_coordinator_id, 3);
         assert_eq!(state.right_panel_tab, "Messages");
+        assert_eq!(state.open_tabs, vec![".chat-3"]);
+        assert_eq!(state.active, ".chat-3");
     }
 
     #[test]
@@ -20282,6 +20352,105 @@ mod tui_chat_tests {
 
         let loaded = load_tui_state(&wg_dir);
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn tui_state_open_tabs_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1, 2]);
+
+        // Save state with coordinator 1 active and tabs 0,1,2 open
+        let mut app = build_test_app(&viz, &wg_dir);
+        app.active_coordinator_id = 1;
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.save_all_chat_state();
+
+        // Reload and restore
+        let mut app2 = build_test_app(&viz, &wg_dir);
+        app2.restore_tui_state();
+
+        assert_eq!(app2.active_coordinator_id, 1, "Active coordinator restored");
+        // No missing-tab toasts because all coordinators still exist
+        let warnings: Vec<_> = app2
+            .toasts
+            .iter()
+            .filter(|t| t.message.contains("missing tab"))
+            .collect();
+        assert!(
+            warnings.is_empty(),
+            "No missing-tab toasts when all tabs still exist"
+        );
+    }
+
+    #[test]
+    fn tui_state_restore_warns_on_missing_tabs() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1]);
+
+        // Save state referencing a coordinator that no longer exists (cid 5 and 7)
+        save_tui_state(
+            &wg_dir,
+            0,
+            &RightPanelTab::Chat,
+            &[
+                ".chat-0".to_string(),
+                ".chat-5".to_string(),
+                ".chat-7".to_string(),
+            ],
+        );
+
+        // Restore into an app that only has coordinators 0 and 1
+        let mut app = build_test_app(&viz, &wg_dir);
+        app.restore_tui_state();
+
+        // Should emit a toast about skipped tabs
+        let warnings: Vec<_> = app
+            .toasts
+            .iter()
+            .filter(|t| t.message.contains("missing tab"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "Exactly one warning toast emitted");
+        assert!(
+            warnings[0].message.contains('2'),
+            "Toast mentions 2 missing tabs: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn tui_state_persist_written_on_switch() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1, 2]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        app.active_coordinator_id = 0;
+
+        // Remove any existing state file
+        let state_path = wg_dir.join("tui-state.json");
+        let _ = std::fs::remove_file(&state_path);
+
+        // Switch coordinator — should write tui-state.json
+        app.switch_coordinator(2);
+
+        let saved = load_tui_state(&wg_dir);
+        assert!(saved.is_some(), "tui-state.json written after switch");
+        assert_eq!(saved.unwrap().active_coordinator_id, 2);
+    }
+
+    #[test]
+    fn tui_state_empty_file_no_error() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+
+        // Write an empty file
+        let state_path = wg_dir.join("tui-state.json");
+        std::fs::write(&state_path, "").unwrap();
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        // Should not panic
+        app.restore_tui_state();
+        // Default state preserved
+        assert_eq!(app.active_coordinator_id, 0);
     }
 
     #[test]
