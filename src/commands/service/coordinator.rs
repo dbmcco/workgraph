@@ -1717,6 +1717,29 @@ exit $EXIT_CODE"#,
 
 /// Spawn agents on ready tasks, up to `slots_available`. Returns the number of
 /// agents successfully spawned.
+fn maybe_override_executor_for_task_route(
+    executor: &str,
+    task_provider: Option<&str>,
+    task_model: Option<&str>,
+) -> String {
+    if executor != "claude" {
+        return executor.to_string();
+    }
+
+    let inferred_provider = task_provider
+        .map(str::to_string)
+        .or_else(|| {
+            task_model.and_then(|model| workgraph::config::parse_model_spec(model).provider)
+        });
+
+    inferred_provider
+        .as_deref()
+        .map(workgraph::config::provider_to_executor)
+        .filter(|routed| *routed != "claude")
+        .unwrap_or(executor)
+        .to_string()
+}
+
 fn spawn_agents_for_ready_tasks(
     dir: &Path,
     graph: &workgraph::graph::WorkGraph,
@@ -1785,6 +1808,12 @@ fn spawn_agents_for_ready_tasks(
                 .map(|agent| agent.executor)
                 .unwrap_or_else(|| executor.to_string())
         };
+
+        let effective_executor = maybe_override_executor_for_task_route(
+            &effective_executor,
+            task.provider.as_deref(),
+            task.model.as_deref().or(model),
+        );
 
         // Pass coordinator model to spawn; spawn resolves the full hierarchy:
         // task.model > executor.model > coordinator.model > 'default'
@@ -3331,6 +3360,36 @@ mod tests {
 
         let would_skip = auto_assign && !is_system && !has_agent;
         assert!(!would_skip, "should not skip when auto_assign is disabled");
+    }
+
+    #[test]
+    fn test_task_route_promotes_default_claude_to_native_for_openrouter_model() {
+        let routed = maybe_override_executor_for_task_route(
+            "claude",
+            None,
+            Some("openrouter:minimax/minimax-m1"),
+        );
+        assert_eq!(routed, "native");
+    }
+
+    #[test]
+    fn test_task_route_promotes_default_claude_to_codex_for_codex_model() {
+        let routed = maybe_override_executor_for_task_route(
+            "claude",
+            None,
+            Some("codex:gpt-5-codex"),
+        );
+        assert_eq!(routed, "codex");
+    }
+
+    #[test]
+    fn test_task_route_keeps_explicit_nondefault_executor() {
+        let routed = maybe_override_executor_for_task_route(
+            "shell",
+            Some("openrouter"),
+            Some("openrouter:minimax/minimax-m1"),
+        );
+        assert_eq!(routed, "shell");
     }
 
     #[test]
