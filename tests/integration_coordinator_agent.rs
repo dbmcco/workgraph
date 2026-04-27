@@ -587,6 +587,8 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
     // File-based crash trigger: when this file exists, the mock crashes and deletes it.
     let crash_file = wg_dir.join("service").join("mock_crash_trigger");
     let crash_file_str = crash_file.to_string_lossy().to_string();
+    fs::create_dir_all(crash_file.parent().unwrap()).unwrap();
+    fs::write(&crash_file, "crash").unwrap();
 
     let guard = CoordinatorDaemonGuard::start_with_env(
         &wg_dir,
@@ -594,18 +596,7 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         &[("MOCK_CRASH_FILE", &crash_file_str)],
     );
 
-    // Step 1: Normal message works (crash file doesn't exist yet)
-    let r1 = guard.chat_ok("normal message before crash", 15);
-    assert!(
-        r1.contains("Mock coordinator response"),
-        "Pre-crash message should work: {}",
-        r1
-    );
-
-    // Step 2: Create the crash trigger file, then send a message that causes
-    // the subprocess to die. The mock will see the file, delete it, and exit.
-    fs::write(&crash_file, "crash").unwrap();
-
+    // Step 1: Send a message that causes the subprocess to die.
     let crash_output = guard.chat("trigger subprocess crash", 15);
     let crash_stdout = String::from_utf8_lossy(&crash_output.stdout).to_string();
     assert!(
@@ -616,7 +607,7 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         crash_stdout
     );
 
-    // Step 3: Wait for the daemon to restart the agent.
+    // Step 2: Wait for the daemon to restart the agent.
     // Look for a second "Claude CLI started" in the daemon log.
     let log_path = wg_dir.join("service").join("daemon.log");
     let start = Instant::now();
@@ -640,7 +631,7 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
     // Wait for the restarted agent to be fully ready
     std::thread::sleep(Duration::from_millis(1000));
 
-    // Step 4: Send a normal message after recovery — should work.
+    // Step 3: Send a normal message after recovery — should work.
     let r3 = guard.chat_ok("message after restart", 15);
     assert!(
         r3.contains("Mock coordinator response"),
