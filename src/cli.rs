@@ -50,6 +50,26 @@ pub enum Commands {
         endpoint: Option<String>,
     },
 
+    #[command(hide = true)]
+    SpawnTask {
+        task_id: String,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    #[command(hide = true)]
+    ClaudeHandler {
+        #[arg(long)]
+        chat: String,
+
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
     /// Bulk-reset a subgraph from one or more seed tasks
     Reset {
         /// First seed task
@@ -2563,6 +2583,8 @@ pub enum TelegramCommands {
 pub fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Init { .. } => "init",
+        Commands::SpawnTask { .. } => "spawn-task",
+        Commands::ClaudeHandler { .. } => "claude-handler",
         Commands::Reset { .. } => "reset",
         Commands::Rescue { .. } => "rescue",
         Commands::Insert { .. } => "insert",

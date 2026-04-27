@@ -306,6 +306,14 @@ fn main() -> Result<()> {
             model.as_deref(),
             endpoint.as_deref(),
         ),
+        Commands::SpawnTask {
+            task_id,
+            role,
+            dry_run,
+        } => commands::spawn_task::run(&workgraph_dir, &task_id, role.as_deref(), dry_run),
+        Commands::ClaudeHandler { chat, model } => {
+            commands::claude_handler::run(&workgraph_dir, &chat, model.as_deref())
+        }
         Commands::Reset {
             seed,
             seeds,
