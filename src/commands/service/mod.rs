@@ -797,6 +797,24 @@ pub(crate) struct DaemonConfig {
     settling_delay: Duration,
 }
 
+pub(crate) const COORDINATOR_RUNTIME_EXECUTOR_ENV: &str = "WG_COORDINATOR_RUNTIME_EXECUTOR";
+pub(crate) const COORDINATOR_MODEL_OVERRIDE_ENV: &str = "WG_COORDINATOR_MODEL_OVERRIDE";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoordinatorRuntimeIntent {
+    pub executor: String,
+    pub model: Option<String>,
+}
+
+impl CoordinatorRuntimeIntent {
+    fn from_daemon_config(daemon_cfg: &DaemonConfig) -> Self {
+        Self {
+            executor: daemon_cfg.executor.clone(),
+            model: daemon_cfg.model.clone(),
+        }
+    }
+}
+
 fn resolve_daemon_config(
     dir: &Path,
     cli_max_agents: Option<usize>,
@@ -1220,9 +1238,10 @@ pub fn run_daemon(
     // coordinator.coordinator_agent = false in config.toml.
     let enable_coordinator_agent = !no_coordinator_agent && config.coordinator.coordinator_agent;
     let coordinator_agent = if enable_coordinator_agent {
+        let runtime_intent = CoordinatorRuntimeIntent::from_daemon_config(&daemon_cfg);
         match coordinator_agent::CoordinatorAgent::spawn(
             &dir,
-            daemon_cfg.model.as_deref(),
+            runtime_intent,
             &logger,
             event_log.clone(),
         ) {

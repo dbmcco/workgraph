@@ -40,7 +40,10 @@ use workgraph::service::registry::AgentRegistry;
 
 use crate::commands::{graph_path, is_process_alive};
 
-use super::DaemonLogger;
+use super::{
+    COORDINATOR_MODEL_OVERRIDE_ENV, COORDINATOR_RUNTIME_EXECUTOR_ENV,
+    CoordinatorRuntimeIntent, DaemonLogger,
+};
 
 /// Maximum restarts allowed within the restart window before pausing.
 const MAX_RESTARTS_PER_WINDOW: usize = 3;
@@ -270,7 +273,7 @@ impl CoordinatorAgent {
     /// Returns an error if the Claude CLI is not available.
     pub fn spawn(
         dir: &Path,
-        model: Option<&str>,
+        runtime_intent: CoordinatorRuntimeIntent,
         logger: &DaemonLogger,
         event_log: SharedEventLog,
     ) -> Result<Self> {
@@ -284,7 +287,6 @@ impl CoordinatorAgent {
         let pid = Arc::new(Mutex::new(0u32));
 
         let dir = dir.to_path_buf();
-        let model = model.map(String::from);
         let logger = logger.clone();
         let alive_clone = alive.clone();
         let pid_clone = pid.clone();
@@ -295,7 +297,7 @@ impl CoordinatorAgent {
             .spawn(move || {
                 agent_thread_main(
                     &dir,
-                    model.as_deref(),
+                    &runtime_intent,
                     rx,
                     alive_clone,
                     pid_clone,
@@ -372,7 +374,7 @@ impl CoordinatorAgent {
 /// - Chat history rotation to prevent unbounded growth
 fn agent_thread_main(
     dir: &Path,
-    model: Option<&str>,
+    runtime_intent: &CoordinatorRuntimeIntent,
     rx: mpsc::Receiver<ChatRequest>,
     alive: Arc<Mutex<bool>>,
     pid: Arc<Mutex<u32>>,
@@ -397,7 +399,7 @@ fn agent_thread_main(
         }
 
         logger.info("Coordinator agent: launching subprocess via `wg spawn-task .coordinator-0 --role coordinator`");
-        let mut child = match spawn_handler_subprocess(dir, model, logger) {
+        let mut child = match spawn_handler_subprocess(dir, runtime_intent, logger) {
             Ok(child) => child,
             Err(e) => {
                 logger.error(&format!(
@@ -449,32 +451,62 @@ fn agent_thread_main(
                 }
             }
 
-            if let Some(status) = child.try_wait().unwrap_or(None) {
-                *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-                chat::clear_streaming(dir);
-                reconcile_pending_requests(
-                    dir,
-                    &mut last_observed_cursor,
-                    &mut pending_requests,
-                    &mut pending_ids,
-                    logger,
-                );
-                if let Some(req) = pending_requests.front() {
-                    let _ = chat::append_error(
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                    *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                    chat::clear_streaming(dir);
+                    reconcile_pending_requests(
                         dir,
-                        &format!(
-                            "The coordinator agent crashed and is being restarted.\n\nProcess status: {:?}",
-                            status
-                        ),
-                        &req.request_id,
+                        &mut last_observed_cursor,
+                        &mut pending_requests,
+                        &mut pending_ids,
+                        logger,
                     );
+                    if let Some(req) = pending_requests.front() {
+                        let _ = chat::append_error(
+                            dir,
+                            &format!(
+                                "The coordinator agent crashed and is being restarted.\n\nProcess status: {:?}",
+                                status
+                            ),
+                            &req.request_id,
+                        );
+                    }
+                    logger.warn(&format!(
+                        "Coordinator agent: handler subprocess exited with status {:?}, restarting",
+                        status
+                    ));
+                    break;
                 }
-                logger.warn(&format!(
-                    "Coordinator agent: handler subprocess exited with status {:?}, restarting",
-                    status
-                ));
-                break;
+                Ok(None) => {}
+                Err(e) => {
+                    *alive.lock().unwrap_or_else(|err| err.into_inner()) = false;
+                    *pid.lock().unwrap_or_else(|err| err.into_inner()) = 0;
+                    chat::clear_streaming(dir);
+                    reconcile_pending_requests(
+                        dir,
+                        &mut last_observed_cursor,
+                        &mut pending_requests,
+                        &mut pending_ids,
+                        logger,
+                    );
+                    if let Some(req) = pending_requests.front() {
+                        let _ = chat::append_error(
+                            dir,
+                            &format!(
+                                "The coordinator agent lost its subprocess state and is being restarted.\n\nPoll error: {}",
+                                e
+                            ),
+                            &req.request_id,
+                        );
+                    }
+                    logger.warn(&format!(
+                        "Coordinator agent: failed to poll handler subprocess ({}), restarting",
+                        e
+                    ));
+                    break;
+                }
             }
 
             if disconnected {
@@ -562,7 +594,7 @@ fn reconcile_pending_requests(
 
 fn spawn_handler_subprocess(
     dir: &Path,
-    model: Option<&str>,
+    runtime_intent: &CoordinatorRuntimeIntent,
     logger: &DaemonLogger,
 ) -> Result<Child> {
     let wg = std::env::current_exe().context("Failed to resolve current wg binary")?;
@@ -574,8 +606,12 @@ fn spawn_handler_subprocess(
         .arg("--role")
         .arg("coordinator");
 
-    if let Some(model) = model {
-        cmd.env("WG_COORDINATOR_MODEL_OVERRIDE", model);
+    cmd.env(
+        COORDINATOR_RUNTIME_EXECUTOR_ENV,
+        runtime_intent.executor.as_str(),
+    );
+    if let Some(model) = runtime_intent.model.as_deref() {
+        cmd.env(COORDINATOR_MODEL_OVERRIDE_ENV, model);
     }
 
     cmd.current_dir(dir.parent().unwrap_or(dir));
@@ -592,7 +628,8 @@ fn spawn_handler_subprocess(
     cmd.stderr(stderr_file);
 
     logger.info(&format!(
-        "Coordinator agent: spawning child command `wg spawn-task .coordinator-0 --role coordinator` (cwd={:?}, stderr={:?})",
+        "Coordinator agent: spawning child command `wg spawn-task .coordinator-0 --role coordinator` (executor={}, cwd={:?}, stderr={:?})",
+        runtime_intent.executor,
         dir.parent().unwrap_or(dir),
         stderr_path,
     ));
