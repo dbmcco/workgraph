@@ -68,9 +68,20 @@ fn resolve_native_client_config(workgraph_dir: &Path, model: &str) -> ResolvedNa
     let (legacy_provider, legacy_api_base, legacy_api_key, max_tokens) =
         resolve_legacy_native_executor_settings(workgraph_dir);
 
+    let named_endpoint = std::env::var("WG_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("WG_ENDPOINT_NAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .and_then(|name| config.llm_endpoints.find_by_name(&name));
+
     let provider = std::env::var("WG_LLM_PROVIDER")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| named_endpoint.map(|endpoint| endpoint.provider.clone()))
         .or(legacy_provider)
         .unwrap_or_else(|| {
             if model.contains('/') {
@@ -80,9 +91,8 @@ fn resolve_native_client_config(workgraph_dir: &Path, model: &str) -> ResolvedNa
             }
         });
 
-    let endpoint = config
-        .llm_endpoints
-        .find_for_provider(&provider)
+    let endpoint = named_endpoint
+        .or_else(|| config.llm_endpoints.find_for_provider(&provider))
         .or_else(|| config.llm_endpoints.find_default());
 
     let api_base = std::env::var("WG_ENDPOINT_URL")
@@ -346,6 +356,69 @@ max_tokens = 111
         match saved_provider {
             Some(value) => unsafe { std::env::set_var("WG_LLM_PROVIDER", value) },
             None => unsafe { std::env::remove_var("WG_LLM_PROVIDER") },
+        }
+        match saved_url {
+            Some(value) => unsafe { std::env::set_var("WG_ENDPOINT_URL", value) },
+            None => unsafe { std::env::remove_var("WG_ENDPOINT_URL") },
+        }
+        match saved_key {
+            Some(value) => unsafe { std::env::set_var("WG_API_KEY", value) },
+            None => unsafe { std::env::remove_var("WG_API_KEY") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn native_client_config_prefers_named_endpoint_from_spawn_env() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join("config.toml"),
+            r#"
+[llm_endpoints]
+[[llm_endpoints.endpoints]]
+name = "router-default"
+provider = "openrouter"
+url = "https://openrouter-default.example/v1"
+api_key = "sk-default"
+is_default = true
+
+[[llm_endpoints.endpoints]]
+name = "router-alt"
+provider = "openrouter"
+url = "https://openrouter-alt.example/v1"
+api_key = "sk-alt"
+is_default = false
+"#,
+        )
+        .unwrap();
+
+        let saved_provider = std::env::var("WG_LLM_PROVIDER").ok();
+        let saved_endpoint = std::env::var("WG_ENDPOINT").ok();
+        let saved_url = std::env::var("WG_ENDPOINT_URL").ok();
+        let saved_key = std::env::var("WG_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("WG_LLM_PROVIDER");
+            std::env::set_var("WG_ENDPOINT", "router-alt");
+            std::env::remove_var("WG_ENDPOINT_URL");
+            std::env::remove_var("WG_API_KEY");
+        }
+
+        let resolved = resolve_native_client_config(temp_dir.path(), "openrouter:qwen/qwen3");
+
+        assert_eq!(resolved.provider, "openrouter");
+        assert_eq!(
+            resolved.api_base.as_deref(),
+            Some("https://openrouter-alt.example/v1")
+        );
+        assert_eq!(resolved.api_key.as_deref(), Some("sk-alt"));
+
+        match saved_provider {
+            Some(value) => unsafe { std::env::set_var("WG_LLM_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("WG_LLM_PROVIDER") },
+        }
+        match saved_endpoint {
+            Some(value) => unsafe { std::env::set_var("WG_ENDPOINT", value) },
+            None => unsafe { std::env::remove_var("WG_ENDPOINT") },
         }
         match saved_url {
             Some(value) => unsafe { std::env::set_var("WG_ENDPOINT_URL", value) },
