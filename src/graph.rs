@@ -132,6 +132,11 @@ pub enum Status {
     Failed,
     Abandoned,
     PendingValidation,
+    /// Soft-done: agent called `wg done`, awaiting `.evaluate-X` to score the
+    /// task. On pass (≥ `eval_gate_threshold`) the task transitions to `Done`
+    /// and downstream dependents unblock. On fail, the existing
+    /// `auto_rescue_on_eval_fail` path runs (Failed + rescue task).
+    PendingEval,
     Incomplete,
 }
 
@@ -146,6 +151,7 @@ impl std::fmt::Display for Status {
             Status::Failed => write!(f, "failed"),
             Status::Abandoned => write!(f, "abandoned"),
             Status::PendingValidation => write!(f, "pending-validation"),
+            Status::PendingEval => write!(f, "pending-eval"),
             Status::Incomplete => write!(f, "incomplete"),
         }
     }
@@ -167,6 +173,7 @@ impl<'de> serde::Deserialize<'de> for Status {
             "failed" => Ok(Status::Failed),
             "abandoned" => Ok(Status::Abandoned),
             "pending-validation" => Ok(Status::PendingValidation),
+            "pending-eval" => Ok(Status::PendingEval),
             "incomplete" => Ok(Status::Incomplete),
             // Migration: pending-review is treated as done
             "pending-review" => Ok(Status::Done),
@@ -181,6 +188,7 @@ impl<'de> serde::Deserialize<'de> for Status {
                     "failed",
                     "abandoned",
                     "pending-validation",
+                    "pending-eval",
                     "incomplete",
                 ],
             )),
@@ -2274,6 +2282,19 @@ mod tests {
         assert!(Status::Failed.is_terminal());
         assert!(Status::Abandoned.is_terminal());
         assert!(!Status::PendingValidation.is_terminal());
+        // PendingEval is non-terminal — downstream dependents must wait until
+        // the eval flips it to Done (or Failed via auto-rescue).
+        assert!(!Status::PendingEval.is_terminal());
+    }
+
+    #[test]
+    fn test_pending_eval_status_round_trip() {
+        // Display + deserialize as the canonical kebab-case "pending-eval".
+        assert_eq!(Status::PendingEval.to_string(), "pending-eval");
+        let json = serde_json::to_string(&Status::PendingEval).unwrap();
+        assert_eq!(json, "\"pending-eval\"");
+        let parsed: Status = serde_json::from_str("\"pending-eval\"").unwrap();
+        assert_eq!(parsed, Status::PendingEval);
     }
 
     #[test]

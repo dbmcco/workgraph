@@ -203,6 +203,7 @@ fn format_notification(task: &Task, custom_message: Option<&str>) -> (String, St
         Status::Abandoned => "🗑️",
         Status::Waiting => "⏸️",
         Status::PendingValidation => "🔍",
+        Status::PendingEval => "🔍",
         Status::Incomplete => "🔁",
     };
 

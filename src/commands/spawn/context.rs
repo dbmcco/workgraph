@@ -449,6 +449,7 @@ pub(crate) fn build_graph_summary(
             Status::Blocked => blocked += 1,
             Status::Incomplete => open += 1,
             Status::Abandoned | Status::Waiting | Status::PendingValidation => {}
+            Status::PendingEval => in_progress += 1,
         }
     }
     parts.push(format!(

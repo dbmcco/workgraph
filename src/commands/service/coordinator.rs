@@ -863,6 +863,72 @@ fn migrate_pending_validation_tasks(graph: &mut workgraph::graph::WorkGraph) -> 
     !migrated.is_empty()
 }
 
+/// Resolve `PendingEval` tasks whose `.evaluate-X` scaffolding has finished.
+///
+/// The lifecycle is:
+/// ```text
+/// open → in-progress → pending-eval ─┬─ eval pass → done
+///                                    └─ eval fail → failed (auto-rescue may spawn replacement)
+/// ```
+///
+/// When a `PendingEval` task's matching `.evaluate-X` is terminal AND the
+/// task itself wasn't already flipped to Failed by `check_eval_gate`, this
+/// phase promotes it to Done so dependents unblock.
+///
+/// If the evaluator never scored above threshold, `check_eval_gate` is
+/// responsible for `run_eval_reject` (PendingEval → Failed) and creating a
+/// rescue. This phase only handles the success case.
+///
+/// Returns true if any task was promoted.
+fn resolve_pending_eval_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
+    let promotable: Vec<String> = graph
+        .tasks()
+        .filter(|t| t.status == Status::PendingEval)
+        .filter_map(|t| {
+            let eval_id = format!(".evaluate-{}", t.id);
+            let eval_status = graph.get_task(&eval_id).map(|et| et.status);
+            match eval_status {
+                // `.evaluate-X` exists and is terminal → eval ran. If it
+                // would have rejected, the source would already be Failed
+                // (handled by check_eval_gate). Since we still see it in
+                // PendingEval, the eval passed → promote to Done.
+                Some(s) if s.is_terminal() => Some(t.id.clone()),
+                // `.evaluate-X` missing entirely → eval never got scheduled
+                // (auto_evaluate disabled, paused, etc.). Promote so the task
+                // doesn't sit stuck forever.
+                None => Some(t.id.clone()),
+                // Eval is still in flight (Open / InProgress / Waiting / etc.)
+                // → keep waiting.
+                _ => None,
+            }
+        })
+        .collect();
+
+    if promotable.is_empty() {
+        return false;
+    }
+
+    for id in &promotable {
+        if let Some(task) = graph.get_task_mut(id) {
+            task.status = Status::Done;
+            if task.completed_at.is_none() {
+                task.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            task.log.push(workgraph::graph::LogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                actor: None,
+                user: Some(workgraph::current_user()),
+                message: "PendingEval → Done (evaluator passed; downstream unblocks)".to_string(),
+            });
+            eprintln!(
+                "[dispatcher] PendingEval resolved: '{}' → Done (eval passed)",
+                id
+            );
+        }
+    }
+    true
+}
+
 fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> bool {
     let mut modified = false;
 
@@ -4073,6 +4139,14 @@ pub fn coordinator_tick(
         // assumption per spec is that "if a user wanted to reject the work,
         // they would have run `wg reject` already."
         modified |= migrate_pending_validation_tasks(graph);
+
+        // Phase 2.46: PendingEval resolution.
+        // Tasks the agent reported done land in PendingEval until `.evaluate-X`
+        // scores them. When the evaluator finished and DIDN'T reject the task
+        // (check_eval_gate would have already flipped it to Failed and spawned
+        // a rescue), promote PendingEval → Done so downstream dependents
+        // unblock. See docs in src/commands/done.rs::pick_done_target_status.
+        modified |= resolve_pending_eval_tasks(graph);
 
         // Phase 2.5: Cycle iteration — reactivate cycles where all members are Done.
         {

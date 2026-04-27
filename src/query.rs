@@ -102,6 +102,12 @@ pub fn project_summary(graph: &WorkGraph) -> ProjectSummary {
             Status::Failed | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
                 // Failed, abandoned, and waiting tasks are not counted as open
             }
+            Status::PendingEval => {
+                // Soft-done: agent finished, awaiting eval. Count as in-progress
+                // for board display purposes — work is "in flight" until eval
+                // resolves it.
+                in_progress += 1;
+            }
         }
     }
 
@@ -309,21 +315,45 @@ pub fn ready_tasks(graph: &WorkGraph) -> Vec<&Task> {
             // to also be terminal — agency eval gates dependent unblocking.
             // System tasks (dot-prefixed) are exempt from this gate.
             task.after.iter().all(|blocker_id| {
-                let blocker_done = graph
-                    .get_task(blocker_id)
-                    .map(|t| t.status.is_terminal())
-                    .unwrap_or(false);
-                if !blocker_done {
-                    return false;
-                }
-                if task.id.starts_with('.') {
-                    // System tasks (e.g. .flip-X, .evaluate-X) skip eval gating.
-                    return true;
-                }
-                !is_eval_gate_pending(blocker_id, graph)
+                blocker_satisfied_for_dependent(blocker_id, graph, task.id.starts_with('.'))
             })
         })
         .collect()
+}
+
+/// Predicate: is `blocker_id` satisfied for a dependent task?
+///
+/// Handles the new `PendingEval` soft-done state:
+/// - System dependents (e.g. `.flip-X`, `.evaluate-X`) treat `PendingEval` as
+///   "the agent finished, output is captured" and proceed. Without this, the
+///   eval pipeline would deadlock because `.evaluate-X` cannot run until
+///   `X` is `Done` — but `X` cannot reach `Done` until `.evaluate-X` finishes.
+/// - Non-system dependents (regular work) treat `PendingEval` as still in
+///   flight and block until the dispatcher promotes the source to `Done`.
+fn blocker_satisfied_for_dependent(
+    blocker_id: &str,
+    graph: &WorkGraph,
+    dependent_is_system: bool,
+) -> bool {
+    let blocker = graph.get_task(blocker_id);
+    let blocker_terminal = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
+    let blocker_pending_eval = blocker
+        .map(|t| t.status == Status::PendingEval)
+        .unwrap_or(false);
+
+    if !blocker_terminal {
+        // The PendingEval bypass only fires for system dependents. Regular
+        // tasks must wait for the dispatcher to promote the source to Done.
+        if !(dependent_is_system && blocker_pending_eval) {
+            return false;
+        }
+    }
+    // Either the blocker is terminal, or the PendingEval bypass let us through.
+    if dependent_is_system {
+        // System tasks skip the eval gate too — they ARE the eval gate.
+        return true;
+    }
+    !is_eval_gate_pending(blocker_id, graph)
 }
 
 /// Check whether a single after dependency is satisfied (terminal).
@@ -364,14 +394,28 @@ pub fn is_blocker_satisfied(
 /// unblocking. Skip-callers should pass `dependent_is_system=true` when the
 /// dependent itself is a system task (dot-prefixed) — system tasks bypass
 /// eval gating to avoid `.evaluate-.evaluate-X` recursion.
+///
+/// Also handles `PendingEval`: a non-terminal soft-done state. System
+/// dependents treat it as terminal so the eval pipeline can run; non-system
+/// dependents block until the dispatcher promotes the source to `Done`.
 pub fn is_blocker_satisfied_with_eval_gate(
     blocker_id: &str,
     graph: &WorkGraph,
     workgraph_dir: Option<&Path>,
     dependent_is_system: bool,
 ) -> bool {
-    if !is_blocker_satisfied(blocker_id, graph, workgraph_dir) {
-        return false;
+    let satisfied = is_blocker_satisfied(blocker_id, graph, workgraph_dir);
+    if !satisfied {
+        // Allow system dependents to advance over a PendingEval source — the
+        // agent is done, only the eval has not scored yet.
+        if !(dependent_is_system
+            && graph
+                .get_task(blocker_id)
+                .map(|t| t.status == Status::PendingEval)
+                .unwrap_or(false))
+        {
+            return false;
+        }
     }
     if dependent_is_system {
         return true;
@@ -434,11 +478,10 @@ pub fn ready_tasks_cycle_aware<'a>(
             }
             let dependent_is_system = task.id.starts_with('.');
             task.after.iter().all(|blocker_id| {
-                // Normal check: predecessor is terminal.
-                // Non-existent blocker blocks (prevents premature dispatch).
-                let blocker_done = graph
-                    .get_task(blocker_id)
-                    .map(|t| t.status.is_terminal())
+                let blocker = graph.get_task(blocker_id);
+                let blocker_done = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
+                let blocker_pending_eval = blocker
+                    .map(|t| t.status == Status::PendingEval)
                     .unwrap_or(false);
                 if blocker_done {
                     // Eval gate: even when blocker is terminal, wait for
@@ -448,6 +491,12 @@ pub fn ready_tasks_cycle_aware<'a>(
                         return true;
                     }
                     return !is_eval_gate_pending(blocker_id, graph);
+                }
+                // PendingEval bypass for system dependents: `.flip-X` and
+                // `.evaluate-X` need to run on a soft-done source — without
+                // this the eval pipeline deadlocks itself.
+                if dependent_is_system && blocker_pending_eval {
+                    return true;
                 }
                 // Back-edge exemption: if this dependency edge is a structural
                 // back-edge in the cycle analysis, skip it. Only forward
@@ -553,6 +602,17 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
                         return true;
                     }
                     return !is_eval_gate_pending(blocker_id, graph);
+                }
+                // PendingEval bypass for system dependents: the agent finished
+                // (output captured) but the evaluator hasn't scored yet —
+                // `.flip-X` / `.evaluate-X` must run from this state.
+                if dependent_is_system
+                    && graph
+                        .get_task(blocker_id)
+                        .map(|t| t.status == Status::PendingEval)
+                        .unwrap_or(false)
+                {
+                    return true;
                 }
                 // Back-edge exemption: if this dependency edge is a structural
                 // back-edge in the cycle analysis, skip it. Only forward

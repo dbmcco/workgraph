@@ -113,6 +113,7 @@ pub fn run(
                 Status::Failed => "[F]",
                 Status::Abandoned => "[A]",
                 Status::Waiting | Status::PendingValidation => "[W]",
+                Status::PendingEval => "[E]",
                 Status::Incomplete => "[I]",
             };
             let pause_str = if task.paused { " [PAUSED]" } else { "" };

@@ -128,6 +128,12 @@ pub(crate) fn spawn_agent_inner(
                 task_id
             );
         }
+        Status::PendingEval => {
+            anyhow::bail!(
+                "Cannot spawn on task '{}': task is pending evaluation",
+                task_id
+            );
+        }
     }
 
     // Resolve context scope (config was loaded earlier for plan_spawn)

@@ -181,7 +181,10 @@ pub(crate) fn is_coordinator_task(task: &Task) -> bool {
 /// and `Waiting` mean the pipeline stage hasn't started yet and shouldn't be shown
 /// as an active indicator.
 fn is_pipeline_active(task: &Task) -> bool {
-    matches!(task.status, Status::InProgress | Status::PendingValidation)
+    matches!(
+        task.status,
+        Status::InProgress | Status::PendingValidation | Status::PendingEval
+    )
 }
 
 /// Determine the phase annotation for a parent task based on its related internal tasks.
@@ -434,6 +437,7 @@ pub fn generate_viz_output_from_graph(
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
             Status::Waiting | Status::PendingValidation => "waiting",
+            Status::PendingEval => "pending-eval",
             Status::Incomplete => "incomplete",
         }
     };

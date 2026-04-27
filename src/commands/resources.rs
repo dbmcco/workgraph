@@ -69,6 +69,12 @@ pub fn calculate_utilization(graph: &WorkGraph) -> Vec<ResourceUtilization> {
                     | Status::PendingValidation => {
                         // Failed/abandoned tasks don't count toward resource usage
                     }
+                    Status::PendingEval => {
+                        committed += cost;
+                        if cost > 0.0 {
+                            open_tasks.push(task.id.clone());
+                        }
+                    }
                 }
             }
         }

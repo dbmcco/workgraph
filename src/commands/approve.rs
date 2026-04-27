@@ -27,9 +27,13 @@ pub fn run(dir: &Path, id: &str) -> Result<()> {
             }
         };
 
-        if task.status != Status::PendingValidation {
+        if !matches!(
+            task.status,
+            Status::PendingValidation | Status::PendingEval
+        ) {
             error = Some(anyhow::anyhow!(
-                "Task '{}' is not pending validation (status: {:?}). Only pending-validation tasks can be approved.",
+                "Task '{}' is not awaiting approval (status: {:?}). Only pending-validation \
+                 and pending-eval tasks can be approved.",
                 id,
                 task.status
             ));
@@ -61,7 +65,7 @@ pub fn run(dir: &Path, id: &str) -> Result<()> {
         "approve",
         Some(id),
         std::env::var("WG_AGENT_ID").ok().as_deref(),
-        serde_json::json!({ "prev_status": "PendingValidation" }),
+        serde_json::json!({ "prev_status": "PendingValidation/PendingEval" }),
         config.log.rotation_threshold,
     );
 
@@ -141,7 +145,25 @@ mod tests {
         let result = run(dir_path, "t1");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not pending validation"));
+        assert!(err.contains("not awaiting approval"));
+    }
+
+    #[test]
+    fn test_approve_pending_eval_transitions_to_done() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_workgraph(
+            dir_path,
+            vec![make_task("t1", "Test task", Status::PendingEval)],
+        );
+
+        let result = run(dir_path, "t1");
+        assert!(result.is_ok(), "approve should accept PendingEval");
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Done);
     }
 
     #[test]

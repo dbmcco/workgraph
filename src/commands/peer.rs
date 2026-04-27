@@ -355,6 +355,7 @@ fn count_tasks_in_graph(graph_path: &Path) -> Result<TaskCounts> {
             | workgraph::graph::Status::Waiting
             | workgraph::graph::Status::PendingValidation
             | workgraph::graph::Status::Incomplete => {}
+            workgraph::graph::Status::PendingEval => counts.in_progress += 1,
         }
     }
 

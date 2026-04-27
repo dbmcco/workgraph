@@ -47,6 +47,11 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
             );
             return Ok(());
         }
+
+        // PendingEval is the new soft-done state: eval-gated rejection from
+        // this state is the primary path. External `wg fail` is also allowed
+        // (no special-case needed — the generic "anything non-terminal can be
+        // failed" branch below covers it).
     }
 
     let path = super::graph_path(dir);
@@ -91,6 +96,8 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
         if task.status == Status::Done && !eval_reject {
             return false;
         }
+        // PendingEval → Failed is allowed from both `wg fail` and the
+        // eval-reject path. Falls through to the generic mutation below.
 
         task.status = Status::Failed;
         task.retry_count += 1;

@@ -880,6 +880,7 @@ fn print_recursive_tree(
                 | Status::Abandoned
                 | Status::Waiting
                 | Status::PendingValidation => "\x1b[90m",
+                Status::PendingEval => "\x1b[38;5;154m", // chartreuse (xterm-256: 154 ~ light green)
                 Status::Incomplete => "\x1b[38;5;208m",
             }
         };
@@ -893,6 +894,7 @@ fn print_recursive_tree(
                 Status::Blocked => "blocked",
                 Status::Abandoned => "abandoned",
                 Status::Waiting | Status::PendingValidation => "waiting",
+                Status::PendingEval => "pending-eval",
                 Status::Incomplete => "incomplete",
             }
         };
@@ -1112,6 +1114,7 @@ fn print_timeline(
             Status::Blocked | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
                 "\x1b[90m"
             }
+            Status::PendingEval => "\x1b[38;5;154m",
             Status::Incomplete => "\x1b[38;5;208m",
         }
     };

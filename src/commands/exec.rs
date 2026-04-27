@@ -202,6 +202,9 @@ pub fn run_interactive(
         Status::PendingValidation => {
             anyhow::bail!("Task '{}' is pending validation", task_id)
         }
+        Status::PendingEval => {
+            anyhow::bail!("Task '{}' is pending evaluation", task_id)
+        }
     }
 
     // Resolve config + context scope

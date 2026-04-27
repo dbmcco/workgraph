@@ -1251,6 +1251,29 @@ fn run_smoke_gate(
     Ok(())
 }
 
+/// Decide the status that `wg done` should write for the given task id.
+///
+/// Returns `PendingEval` when the task is gated by an active `.evaluate-X`
+/// scaffolding task (the new default for routine work); the dispatcher will
+/// flip it to `Done` once the eval scores ≥ `eval_gate_threshold`. Returns
+/// `Done` for system tasks (dot-prefixed) and any task whose eval is missing
+/// or already terminal.
+fn pick_done_target_status(graph: &workgraph::graph::WorkGraph, id: &str) -> Status {
+    // System tasks (.evaluate-X, .flip-X, .assign-X, etc.) bypass the gate to
+    // avoid recursion: gating .evaluate-X on .evaluate-.evaluate-X would
+    // deadlock the eval pipeline.
+    if id.starts_with('.') {
+        return Status::Done;
+    }
+    let eval_id = format!(".evaluate-{}", id);
+    match graph.get_task(&eval_id) {
+        // Eval task exists and hasn't scored yet → soft-done (PendingEval).
+        Some(eval_task) if !eval_task.status.is_terminal() => Status::PendingEval,
+        // Eval task scored already (or doesn't exist) → straight to Done.
+        _ => Status::Done,
+    }
+}
+
 pub fn run(
     dir: &Path,
     id: &str,
@@ -1302,6 +1325,7 @@ fn run_inner(
     let blockers = query::after(&graph, id);
     if !blockers.is_empty() {
         let cycle_analysis = graph.compute_cycle_analysis();
+        let dependent_is_system = id.starts_with('.');
         let effective_blockers: Vec<_> = blockers
             .into_iter()
             .filter(|b| {
@@ -1310,7 +1334,16 @@ fn run_inner(
                     .task_to_cycle
                     .get(&b.id)
                     .is_some_and(|bc| cycle_analysis.task_to_cycle.get(id) == Some(bc));
-                !in_same_cycle
+                if in_same_cycle {
+                    return false;
+                }
+                // PendingEval bypass for system dependents: `.flip-X` /
+                // `.evaluate-X` ARE the eval pipeline — they must run on a
+                // soft-done source. See pick_done_target_status.
+                if dependent_is_system && b.status == Status::PendingEval {
+                    return false;
+                }
+                true
             })
             .collect();
         if !effective_blockers.is_empty() {
@@ -2170,7 +2203,13 @@ fn run_inner(
     });
 
     let id_owned = id.to_string();
+    let mut transitioned_to_pending_eval = false;
     let graph = modify_graph(&path, |graph| {
+        // Decide target status BEFORE taking a mutable borrow on the task —
+        // the eval gate check needs to read other nodes (`.evaluate-X`) from
+        // the same graph.
+        let target_status = pick_done_target_status(graph, &id_owned);
+
         let task = match graph.get_task_mut(&id_owned) {
             Some(t) => t,
             None => return false,
@@ -2182,8 +2221,11 @@ fn run_inner(
             return false;
         }
 
-        task.status = Status::Done;
+        task.status = target_status;
         task.completed_at = Some(Utc::now().to_rfc3339());
+        if target_status == Status::PendingEval {
+            transitioned_to_pending_eval = true;
+        }
 
         if converged_accepted && !task.tags.contains(&"converged".to_string()) {
             task.tags.push("converged".to_string());
@@ -2193,12 +2235,16 @@ fn run_inner(
             timestamp: Utc::now().to_rfc3339(),
             actor: task.assigned.clone(),
             user: Some(workgraph::current_user()),
-            message: if converged_accepted {
-                "Task marked as done (converged)".to_string()
-            } else if converged {
-                "Task marked as done (--converged ignored, cycle is forced)".to_string()
-            } else {
-                "Task marked as done".to_string()
+            message: match target_status {
+                Status::PendingEval => {
+                    "Task pending eval (agent reported done; awaiting `.evaluate-*` to score)"
+                        .to_string()
+                }
+                _ if converged_accepted => "Task marked as done (converged)".to_string(),
+                _ if converged => {
+                    "Task marked as done (--converged ignored, cycle is forced)".to_string()
+                }
+                _ => "Task marked as done".to_string(),
             },
         });
 
@@ -2282,6 +2328,11 @@ fn run_inner(
                 id, iter, max, id
             );
         }
+    } else if transitioned_to_pending_eval {
+        println!(
+            "Marked '{}' as pending-eval — awaiting `.evaluate-{}` to score before downstream tasks unblock",
+            id, id
+        );
     } else {
         println!("Marked '{}' as done", id);
     }

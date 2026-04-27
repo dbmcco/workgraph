@@ -235,6 +235,7 @@ fn parse_status(s: &str) -> Result<Status> {
         "waiting" => Status::Waiting,
         "incomplete" => Status::Incomplete,
         "pending-validation" | "pendingvalidation" => Status::PendingValidation,
+        "pending-eval" | "pendingeval" => Status::PendingEval,
         _ => anyhow::bail!("unknown status '{}'", s),
     };
     Ok(st)

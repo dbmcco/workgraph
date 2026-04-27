@@ -31,9 +31,13 @@ pub fn run(dir: &Path, id: &str, reason: &str) -> Result<()> {
             }
         };
 
-        if task.status != Status::PendingValidation {
+        if !matches!(
+            task.status,
+            Status::PendingValidation | Status::PendingEval
+        ) {
             error = Some(anyhow::anyhow!(
-                "Task '{}' is not pending validation (status: {:?}). Only pending-validation tasks can be rejected.",
+                "Task '{}' is not awaiting validation (status: {:?}). Only pending-validation \
+                 and pending-eval tasks can be rejected.",
                 id,
                 task.status
             ));
@@ -233,7 +237,26 @@ mod tests {
         let result = run(dir_path, "t1", "reason");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not pending validation"));
+        assert!(err.contains("not awaiting validation"));
+    }
+
+    #[test]
+    fn test_reject_pending_eval_reopens_task() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_workgraph(
+            dir_path,
+            vec![make_task("t1", "Test task", Status::PendingEval)],
+        );
+
+        let result = run(dir_path, "t1", "Eval failed");
+        assert!(result.is_ok(), "reject should accept PendingEval");
+
+        let path = graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Open);
+        assert_eq!(task.rejection_count, 1);
     }
 
     #[test]
