@@ -4258,7 +4258,7 @@ fn render_editor_word_wrap(
 /// - `app.log_pane.agent_output.full_text`: live agent stdout,
 ///   populated by `update_log_output()` from `agents/<id>/output.log`.
 fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    use ratatui::widgets::{Paragraph, Wrap};
+    use ratatui::widgets::Paragraph;
 
     if area.height == 0 || area.width == 0 {
         return;
@@ -4313,7 +4313,7 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.log_pane.viewport_height = body_area.height as usize;
 
     // Collect display lines for whichever view is active.
-    let lines: Vec<Line> = if app.log_pane.view_top {
+    let raw_lines: Vec<Line> = if app.log_pane.view_top {
         if app.log_pane.rendered_lines.is_empty() {
             vec![Line::from(Span::styled(
                 "(no log entries yet)",
@@ -4365,6 +4365,14 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .collect()
         }
     };
+
+    // Pre-wrap to visual lines at the body width so scroll math (auto-tail,
+    // PageUp/PageDown) operates in the same units as what's drawn. Without
+    // this, long agent responses that wrap to many visual lines push the
+    // tail off-screen below the viewport — the user sees "missing text"
+    // because logical line count under-counts visible lines after wrap.
+    let body_width = body_area.width as usize;
+    let lines: Vec<Line> = wrap_line_spans(&raw_lines, body_width);
     app.log_pane.total_wrapped_lines = lines.len();
 
     // Auto-tail: pin scroll to the bottom when enabled and there's overflow.
@@ -4374,9 +4382,11 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     let scroll_y = app.log_pane.scroll.min(lines.len().saturating_sub(1)) as u16;
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
+    // No `.wrap()` here: lines are already pre-wrapped to body_width above.
+    // Adding wrap on top would re-wrap visually-identical lines that happen
+    // to be exactly body_width wide (boundary cases) and re-introduce the
+    // logical-vs-visual scroll mismatch.
+    let para = Paragraph::new(lines).scroll((scroll_y, 0));
     frame.render_widget(para, body_area);
 }
 
@@ -14098,6 +14108,336 @@ mod tests {
         assert!(
             rendered.contains("UNIQUE_STREAM_MARKER_ALPHA"),
             "Log tab must render the stream event text on first draw. Rendered:\n{}",
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3: long single-line responses in the
+    /// Log pane must word-wrap to the pane width — every char must end up
+    /// on screen, distributed across multiple visual lines, not truncated
+    /// at the right edge or pushed off-screen below the viewport.
+    ///
+    /// Synthetic input: a 500-char single line of markers, rendered into a
+    /// generously-tall TestBackend. After wrapping, ALL markers must appear
+    /// in the buffer distributed across multiple rows.
+    #[test]
+    fn test_log_view_wraps_long_response() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 500-char response with a unique 4-char repeating pattern so that
+        // we can verify every chunk made it into the buffer.
+        // Pattern: 'A001 A002 A003 ...' — 5-char tokens, 100 of them = 500 chars.
+        let mut response = String::new();
+        for i in 0..100 {
+            if i > 0 {
+                response.push(' ');
+            }
+            response.push_str(&format!("A{:03}", i));
+        }
+        // response is now 4*100 + 99 spaces between = 499 chars — pad to 500.
+        let response = format!("{} ", response);
+        assert!(response.chars().count() >= 500);
+
+        // Build a minimal app — we only need draw_log_tab to render correctly,
+        // not the full draw() pipeline.
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        // Configure the log pane: NOT view_top, no stream events, agent output
+        // is the long synthetic response.
+        app.log_pane = LogPaneState::default();
+        app.log_pane.view_top = false;
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.agent_output.full_text = response.clone();
+
+        // Render direct to TestBackend at 80 wide × 40 high so that a 500-char
+        // line MUST wrap to several visual lines but should fit entirely
+        // within 40 rows (500/80 ≈ 7 wrapped lines + header = 8 used rows).
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        // ASSERTION 1: Every 5-char marker A000..A099 (truncated to 500 chars
+        // = 100 markers * 4 chars + 99 spaces, leading 100 markers up to A099)
+        // must be present somewhere in the rendered buffer. Find at least the
+        // first 95 markers (allow for partial last token at the 500-char cut).
+        let mut missing: Vec<String> = Vec::new();
+        for i in 0..95 {
+            let marker = format!("A{:03}", i);
+            if !rendered.contains(&marker) {
+                missing.push(marker);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Log view must word-wrap a 500-char response so every marker \
+             appears in the rendered buffer. Missing markers: {:?}\nRendered:\n{}",
+            missing,
+            rendered
+        );
+
+        // ASSERTION 2: Markers must be distributed across multiple rows
+        // (not all on a single row that got truncated). We expect roughly
+        // 80-col rows of content, so 500 chars wraps to ≥ 6 distinct rows
+        // containing markers.
+        let rows_with_markers: usize = rendered
+            .lines()
+            .filter(|line| {
+                (0..100).any(|i| line.contains(&format!("A{:03}", i)))
+            })
+            .count();
+        assert!(
+            rows_with_markers >= 5,
+            "Wrapped 500-char response must span ≥ 5 visual rows in 80-col \
+             pane; got {} rows. Rendered:\n{}",
+            rows_with_markers,
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3 (auto-tail variant): when the agent
+    /// output contains multiple long lines and the viewport is too small to
+    /// hold all wrapped visual lines, auto_tail must scroll so the LAST
+    /// wrapped visual line is visible at the bottom — NOT compute scroll in
+    /// logical lines (which mis-accounts for wrapping and pushes the tail
+    /// off-screen, the symptom the user reported as "missing a lot of text").
+    #[test]
+    fn test_log_view_auto_tail_pins_last_visual_line() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Build a response of N logical lines, each long enough to wrap to
+        // multiple visual lines in an 80-col pane. The LAST line carries a
+        // unique marker that auto_tail should pin to the bottom of the view.
+        let mut response = String::new();
+        for i in 0..5 {
+            // 200-char lines → 3 wrapped visual lines each at width ≈ 78.
+            let body: String = std::iter::repeat(format!("L{:02} ", i))
+                .take(40)
+                .collect::<String>();
+            response.push_str(&body);
+            response.push('\n');
+        }
+        // Append the unique tail marker that must be visible.
+        response.push_str("UNIQUE_TAIL_MARKER_OMEGA");
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.view_top = false;
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Small viewport: 10 rows total. 5 logical lines * ~3 visual lines
+        // each = 15 visual lines + tail; plus header = ~17 rows of content
+        // for a 10-row pane. With auto_tail, the LAST wrapped line (which
+        // contains the marker) MUST be in the rendered output.
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        assert!(
+            rendered.contains("UNIQUE_TAIL_MARKER_OMEGA"),
+            "auto_tail must pin the LAST wrapped visual line to the bottom \
+             of the viewport. The unique tail marker is missing — content \
+             scrolled off below the viewport because scroll math mistakes \
+             logical-line count for visual-line count after wrap. Rendered:\n{}",
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3 (multi-span / inline-code variant):
+    /// when an agent response contains styled inline-code spans (`foo`) that
+    /// straddle the right edge of the pane, the renderer must word-wrap the
+    /// multi-span line without dropping content. The user's pasted example
+    /// — "**`scripts/smoke/wave-1-smoke.sh`** — 5-scenario..." — was the last
+    /// thing rendered before the response was truncated mid-content.
+    #[test]
+    fn test_log_view_wraps_multi_span_inline_code() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Wrap;
+
+        // Build a response with multi-span styled lines that include inline
+        // code (`foo`). Use stream_events to exercise the path that builds
+        // single-span Lines, AND embed a multi-span Line via raw_lines path
+        // by populating rendered_lines (view_top mode).
+        // Easier: use agent_output with text containing many inline-code-like
+        // tokens so each visual line has plenty of content to lose.
+        let line1 = "**`scripts/smoke/wave-1-smoke.sh`** — 5-scenario assertion-driven smoke test that runs every codepath end-to-end.";
+        let line2 = "BULLET_TAIL_MARKER_GAMMA: this content must NOT be lost.";
+        let response = format!("{}\n{}", line1, line2);
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.view_top = false;
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Pane narrow enough to force the first line to wrap.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        // Both lines must be present — the second line must NOT be lost
+        // because the first wrapped past the pane width.
+        assert!(
+            rendered.contains("wave-1-smoke.sh"),
+            "First line of response must render. Rendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("BULLET_TAIL_MARKER_GAMMA"),
+            "Second line must NOT be lost when the first line wraps past \
+             pane width. This is the user-reported failure mode where text \
+             ends mid-content. Rendered:\n{}",
+            rendered
+        );
+
+        // Sanity: confirm the bug class is also gone with explicit wrap on a
+        // raw multi-span Line (which is what markdown_to_lines produces for
+        // bold + inline-code segments). Render a small Paragraph directly.
+        let multi_span = Line::from(vec![
+            Span::styled("**", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "scripts/smoke/wave-1-smoke.sh",
+                Style::default()
+                    .fg(Color::Indexed(252))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("**", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" — 5-scenario assertion-driven smoke test"),
+        ]);
+        // Pre-wrap exactly as draw_log_tab now does. Use a width wide enough
+        // that no single token must hard-break, so the wrapper has natural
+        // word boundaries to break at.
+        let wrapped = wrap_line_spans(std::slice::from_ref(&multi_span), 40);
+        // Concatenate WITHOUT a separator to confirm the wrapper preserves
+        // every char (no drops) — leading whitespace on continuation lines is
+        // trimmed (expected), so the joined text matches the original sans
+        // the inter-token break-point spaces.
+        let joined: String = wrapped
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("wave-1-smoke.sh"),
+            "wrap_line_spans must preserve inline-code segment intact when \
+             pane is wide enough for it; got:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("smoke test"),
+            "wrap_line_spans must preserve trailing content past the wrap \
+             point — NOT drop it; got:\n{}",
+            joined
+        );
+        // The wrap must produce more than one Line (input was wider than 40).
+        assert!(
+            wrapped.len() > 1,
+            "40-col wrap of a >40-col multi-span Line must produce ≥2 lines, \
+             got {} lines:\n{}",
+            wrapped.len(),
+            joined
+        );
+
+        // Quiet `Wrap` import warning if any test path needs it; not used here.
+        let _ = Wrap { trim: false };
+    }
+
+    /// Regression test for tui-log-view-3 (oversized-single-span variant):
+    /// a single span that is longer than the pane width must hard-break to
+    /// fit, distributing content across multiple visual rows. This catches
+    /// the failure mode where wrap drops trailing content because no word
+    /// boundary exists within the pane width.
+    #[test]
+    fn test_log_view_wraps_oversized_single_span() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 200-char URL-like span with no spaces, must hard-break inside a
+        // 60-col pane so all 200 chars end up on screen.
+        let url: String = std::iter::repeat('X').take(200).collect();
+        let head = "Z000_HEAD";
+        let tail = "Z999_TAIL";
+        let response = format!("{}{}{}", head, url, tail);
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.view_top = false;
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Pane narrow but tall — must fit ~4 wrapped visual lines.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        assert!(
+            rendered.contains(head),
+            "head marker must render at start of wrapped span. Rendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains(tail),
+            "tail marker must render at end — single oversized span must \
+             hard-break and preserve trailing content, NOT drop it. \
+             Rendered:\n{}",
             rendered
         );
     }
