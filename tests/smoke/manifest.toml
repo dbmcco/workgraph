@@ -76,6 +76,16 @@ description = "Open a chat and send 'hi'; expect a non-error coordinator respons
 timeout_seconds = 90
 
 [[scenario]]
+name = "nex_resume_oversized_journal_does_not_loop"
+script = "scenarios/nex_resume_oversized_journal_does_not_loop.sh"
+owners = [
+    "wg-nex-resume-311",
+    "smoke-gate-is",
+]
+description = "Resume a 500-msg journal against a 32k context window must truncate to fit and surface; HTTP 400 must NOT retry; 429 must back off. Regression bar for the autohaiku 311-msg lambda01 400-flood."
+timeout_seconds = 300
+
+[[scenario]]
 name = "tui_log_pane_renders_raw_stream"
 script = "scenarios/tui_log_pane_renders_raw_stream.sh"
 owners = [
