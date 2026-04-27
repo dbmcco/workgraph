@@ -405,6 +405,31 @@ fn coordinator_spawn_task_rejects_unsupported_executor() {
     );
 }
 
+/// Unsupported coordinator roles for this tranche should be rejected explicitly.
+#[test]
+fn coordinator_spawn_task_rejects_unsupported_role() {
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = init_workgraph(&tmp);
+
+    let output = wg_cmd(
+        &wg_dir,
+        &["spawn-task", ".coordinator-0", "--role", "agent", "--dry-run"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "Expected unsupported role to fail.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("unsupported coordinator role for this tranche"),
+        "Expected unsupported role error, got:\n{}",
+        stderr
+    );
+}
+
 /// Basic round-trip: send a message via `wg chat` → coordinator agent processes
 /// it via the mock claude → response appears in chat output.
 #[test]
