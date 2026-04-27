@@ -11,6 +11,8 @@
 //! **Real E2E tests** (marked `#[ignore]`) exercise the full flow with the
 //! actual Claude CLI and require it to be installed.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
