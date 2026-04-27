@@ -292,8 +292,10 @@ fn main() -> Result<()> {
         );
     }
 
-    // Track command usage (fire-and-forget, ignores errors)
-    workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
+    // Track user-facing command usage only; keep hidden subprocess surfaces out of help telemetry.
+    if !is_internal_command(&command) {
+        workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
+    }
 
     match command {
         Commands::Init {
