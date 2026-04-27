@@ -5436,10 +5436,7 @@ impl VizApp {
             },
             None => return,
         };
-        if let Some(cid) = selected_id
-            .strip_prefix(".coordinator-")
-            .and_then(|s| s.parse::<u32>().ok())
-        {
+        if let Some(cid) = workgraph::chat_id::parse_chat_task_id(&selected_id) {
             if cid != self.active_coordinator_id {
                 self.switch_coordinator(cid);
                 // Only switch to Chat tab when actually changing coordinators.

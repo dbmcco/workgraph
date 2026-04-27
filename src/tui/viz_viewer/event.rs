@@ -2218,18 +2218,29 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             app.toggle_archive_browser();
         }
 
-        // Enter: open detail view for the selected task.
-        // Agency tasks (.evaluate-*, .assign-*, .place-*, .flip-*, .create-*) drill
-        // through to fullscreen detail so their logs/scores are immediately visible.
+        // Enter: for chat tasks, open/focus the chat tab; for all other tasks,
+        // open the detail view. Agency tasks drill through to fullscreen detail.
         KeyCode::Enter => {
             if let Some(task_id) = app.selected_task_id().map(|s| s.to_string()) {
-                app.load_hud_detail_for_task(&task_id);
-                app.right_panel_visible = true;
-                app.right_panel_tab = RightPanelTab::Detail;
-                if is_agency_task_id(&task_id) {
-                    app.apply_layout_mode(super::state::LayoutMode::FullInspector);
+                if workgraph::chat_id::is_chat_task_id(&task_id) {
+                    // Chat node: Enter opens/focuses the chat tab.
+                    if let Some(cid) = workgraph::chat_id::parse_chat_task_id(&task_id) {
+                        if cid != app.active_coordinator_id {
+                            app.switch_coordinator(cid);
+                        }
+                        app.right_panel_tab = RightPanelTab::Chat;
+                        app.right_panel_visible = true;
+                        app.focused_panel = FocusedPanel::RightPanel;
+                    }
                 } else {
-                    app.focused_panel = FocusedPanel::RightPanel;
+                    app.load_hud_detail_for_task(&task_id);
+                    app.right_panel_visible = true;
+                    app.right_panel_tab = RightPanelTab::Detail;
+                    if is_agency_task_id(&task_id) {
+                        app.apply_layout_mode(super::state::LayoutMode::FullInspector);
+                    } else {
+                        app.focused_panel = FocusedPanel::RightPanel;
+                    }
                 }
             }
         }
@@ -4069,6 +4080,23 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                                     app.right_panel_tab = RightPanelTab::Messages;
                                     app.invalidate_messages_panel();
                                     app.load_messages_panel();
+                                } else if app
+                                    .selected_task_id()
+                                    .map(workgraph::chat_id::is_chat_task_id)
+                                    .unwrap_or(false)
+                                {
+                                    // Chat node: click opens/focuses the chat tab.
+                                    let cid = app
+                                        .selected_task_id()
+                                        .and_then(workgraph::chat_id::parse_chat_task_id);
+                                    if let Some(cid) = cid {
+                                        if cid != app.active_coordinator_id {
+                                            app.switch_coordinator(cid);
+                                        }
+                                        app.right_panel_tab = RightPanelTab::Chat;
+                                        app.right_panel_visible = true;
+                                        app.focused_panel = FocusedPanel::RightPanel;
+                                    }
                                 } else if let Some(line) = app.plain_lines.get(orig_line) {
                                     // Determine click region for tab switching.
                                     let chars: Vec<char> = line.chars().collect();
@@ -8593,5 +8621,312 @@ mod chat_tab_navigation_tests {
         assert!(app.active_tabs.is_empty(), "active_tabs must be empty");
         assert_eq!(app.active_coordinator_id, 0, "active coordinator resets to 0");
         // Must not have panicked — no crash
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests for open-chat discoverability paths ('+' button and graph node click)
+// ══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod chat_open_tests {
+    use super::*;
+    use crate::commands::viz::LayoutMode as VizLayoutMode;
+    use crate::commands::viz::ascii::generate_ascii;
+    use crate::tui::viz_viewer::state::CoordinatorPlusHit;
+    use ratatui::layout::Rect;
+    use std::collections::{HashMap, HashSet};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    /// Build a test app with one .chat-1 task and one regular task.
+    fn build_app_with_chat_node() -> (VizApp, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        let mut chat_task = make_task_with_status(".chat-1", "Chat 1", Status::InProgress);
+        chat_task.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(chat_task));
+        let regular = make_task_with_status("regular-task", "Regular Task", Status::Open);
+        graph.add_node(Node::Task(regular));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let graph_path = wg_dir.join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            VizLayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir;
+        app.active_coordinator_id = 0;
+        (app, tmp)
+    }
+
+    fn setup_for_graph_click(app: &mut VizApp) {
+        app.scroll.content_height = 100;
+        app.scroll.viewport_height = 20;
+        app.scroll.content_width = 200;
+        app.scroll.viewport_width = 80;
+        app.scroll.offset_y = 0;
+        app.scroll.offset_x = 0;
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 0,
+            width: 79,
+            height: 20,
+        };
+        app.last_graph_scrollbar_area = Rect {
+            x: 79,
+            y: 0,
+            width: 1,
+            height: 20,
+        };
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_coordinator_bar_area = Rect::default();
+        app.last_service_badge_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+    }
+
+    /// The [+] button on the coordinator tab bar opens the new-chat launcher.
+    #[test]
+    fn clicking_plus_button_on_coordinator_bar_opens_launcher() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        // Clear all conflicting hit areas.
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+        app.last_service_badge_area = Rect::default();
+        app.last_minimized_strip_area = Rect::default();
+        app.last_fullscreen_restore_area = Rect::default();
+        app.last_graph_area = Rect::default();
+        // Coordinator bar at row 0, width 40.
+        app.last_coordinator_bar_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 1,
+        };
+        // Place [+] at columns 10..13.
+        app.coordinator_plus_hit = CoordinatorPlusHit { start: 10, end: 13 };
+
+        // Click col 11, row 0 — inside the [+] button.
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 11);
+
+        assert!(
+            app.launcher.is_some(),
+            "Clicking [+] on coordinator bar should open the launcher"
+        );
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Chat,
+            "Clicking [+] should switch to Chat tab"
+        );
+    }
+
+    /// Clicking a .chat-N node in the graph viewer opens/focuses the chat tab.
+    #[test]
+    fn clicking_chat_node_in_graph_opens_chat_tab() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        setup_for_graph_click(&mut app);
+        app.right_panel_visible = false;
+        app.right_panel_tab = RightPanelTab::Detail;
+        app.active_coordinator_id = 0; // .chat-1 not yet active
+
+        let chat_line = *app
+            .node_line_map
+            .get(".chat-1")
+            .expect(".chat-1 must be in node_line_map");
+        let chat_text = app.plain_lines[chat_line].clone();
+        let text_col = chat_text
+            .chars()
+            .position(|c| c.is_alphanumeric())
+            .unwrap_or(1) as u16;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            chat_line as u16,
+            text_col,
+        );
+
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Chat,
+            "Clicking .chat-N node should switch to Chat tab"
+        );
+        assert!(
+            app.right_panel_visible,
+            "Clicking .chat-N node should make right panel visible"
+        );
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Clicking .chat-N node should focus right panel"
+        );
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "Clicking .chat-1 should activate coordinator 1"
+        );
+    }
+
+    /// Clicking a non-chat node does NOT switch to the Chat tab.
+    #[test]
+    fn clicking_non_chat_node_in_graph_does_not_open_chat_tab() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        setup_for_graph_click(&mut app);
+        app.right_panel_visible = true;
+        app.right_panel_tab = RightPanelTab::Log;
+
+        let reg_line = *app
+            .node_line_map
+            .get("regular-task")
+            .expect("regular-task must be in node_line_map");
+        let reg_text = app.plain_lines[reg_line].clone();
+        let text_col = reg_text
+            .chars()
+            .position(|c| c.is_alphanumeric())
+            .unwrap_or(0) as u16;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            reg_line as u16,
+            text_col,
+        );
+
+        assert_ne!(
+            app.right_panel_tab,
+            RightPanelTab::Chat,
+            "Clicking a regular task must not switch to Chat tab"
+        );
+    }
+
+    /// Clicking an already-active .chat-N node focuses the existing tab
+    /// without duplicating or resetting chat state.
+    #[test]
+    fn clicking_already_active_chat_node_focuses_existing_tab() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        setup_for_graph_click(&mut app);
+        app.active_coordinator_id = 1; // .chat-1 already active
+        app.right_panel_visible = false;
+        app.right_panel_tab = RightPanelTab::Detail;
+
+        let chat_line = *app
+            .node_line_map
+            .get(".chat-1")
+            .expect(".chat-1 must be in node_line_map");
+        let chat_text = app.plain_lines[chat_line].clone();
+        let text_col = chat_text
+            .chars()
+            .position(|c| c.is_alphanumeric())
+            .unwrap_or(1) as u16;
+
+        handle_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            chat_line as u16,
+            text_col,
+        );
+
+        assert_eq!(app.right_panel_tab, RightPanelTab::Chat);
+        assert!(app.right_panel_visible, "Panel should become visible");
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Focus should move to right panel"
+        );
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "Coordinator ID must remain 1 (was already active)"
+        );
+    }
+
+    /// Pressing Enter on a .chat-N node opens/focuses the chat tab.
+    #[test]
+    fn enter_key_on_chat_node_opens_chat_tab() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        app.focused_panel = FocusedPanel::Graph;
+        app.input_mode = InputMode::Normal;
+        app.right_panel_visible = false;
+        app.right_panel_tab = RightPanelTab::Log;
+        app.active_coordinator_id = 0;
+
+        let chat_idx = app
+            .task_order
+            .iter()
+            .position(|id| id == ".chat-1")
+            .expect(".chat-1 must be in task_order");
+        app.selected_task_idx = Some(chat_idx);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Chat,
+            "Enter on .chat-N should open Chat tab"
+        );
+        assert!(
+            app.right_panel_visible,
+            "Enter on .chat-N should make panel visible"
+        );
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Enter on .chat-N should focus right panel"
+        );
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "Enter on .chat-1 should switch active coordinator to 1"
+        );
+    }
+
+    /// Pressing Enter on a non-chat task opens the Detail tab (existing behavior).
+    #[test]
+    fn enter_key_on_non_chat_node_opens_detail_tab() {
+        let (mut app, _tmp) = build_app_with_chat_node();
+        app.focused_panel = FocusedPanel::Graph;
+        app.input_mode = InputMode::Normal;
+        app.right_panel_visible = false;
+        app.right_panel_tab = RightPanelTab::Log;
+
+        let reg_idx = app
+            .task_order
+            .iter()
+            .position(|id| id == "regular-task")
+            .expect("regular-task must be in task_order");
+        app.selected_task_idx = Some(reg_idx);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Detail,
+            "Enter on a regular task should open Detail tab"
+        );
+        assert!(
+            app.right_panel_visible,
+            "Enter on a regular task should make panel visible"
+        );
     }
 }
