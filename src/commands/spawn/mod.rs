@@ -875,6 +875,32 @@ mod tests {
     }
 
     #[test]
+    fn test_wrapper_reaps_target_dir() {
+        // worktree-target-dirs: the wrapper must remove the worktree's
+        // `target/` build cache at agent exit so multi-gigabyte cargo
+        // artifacts do not accumulate when the worktree is preserved by
+        // retention policy (failed/abandoned/blocked-on-merge tasks).
+        let temp_dir = TempDir::new().unwrap();
+        let unique_id = get_unique_id();
+        let task_id = format!("t{}", unique_id);
+        let mut task = make_task(&task_id, "Test Task");
+        task.exec = Some("echo hello".to_string());
+        setup_graph(temp_dir.path(), vec![task]);
+
+        let workgraph_dir = temp_dir.path().join(".workgraph");
+        run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
+
+        let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
+        let script = fs::read_to_string(&wrapper_path).unwrap();
+
+        assert!(
+            script.contains("rm -rf \"$WG_WORKTREE_PATH/target\""),
+            "Wrapper must reap target/ at exit so build artifacts don't \
+             accumulate in preserved worktrees"
+        );
+    }
+
+    #[test]
     fn test_wrapper_no_commit_convention_in_shell() {
         let temp_dir = TempDir::new().unwrap();
         let unique_id = get_unique_id();

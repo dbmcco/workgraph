@@ -2630,9 +2630,10 @@ fn main() -> Result<()> {
                 commands::dead_agents::run_check(&workgraph_dir, threshold, cli.json)
             }
         }
-        Commands::Sweep { dry_run } => {
-            commands::sweep::run(&workgraph_dir, dry_run, cli.json).map(|_| ())
-        }
+        Commands::Sweep {
+            dry_run,
+            reap_targets,
+        } => commands::sweep::run(&workgraph_dir, dry_run, reap_targets, cli.json).map(|_| ()),
         Commands::Migrate { cmd } => match cmd {
             MigrateCommands::ChatRename { dry_run } => {
                 commands::migrate::run_chat_rename(&workgraph_dir, dry_run, cli.json)

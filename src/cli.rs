@@ -1881,12 +1881,16 @@ pub enum Commands {
 
     /// Detect and recover orphaned in-progress tasks with dead agents
     #[command(
-        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nThis is safe to run anytime — it is idempotent."
+        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nWith --reap-targets, also removes cargo build artifacts from\nworktrees of agents that are no longer live (preserving source\nfiles and the worktree itself).\n\nThis is safe to run anytime — it is idempotent."
     )]
     Sweep {
         /// Only report orphaned tasks, don't fix them
         #[arg(long)]
         dry_run: bool,
+
+        /// Also remove `target/` build artifacts from dead-agent worktrees
+        #[arg(long)]
+        reap_targets: bool,
     },
 
     /// Run a one-shot graph migration (chat-rename, etc.)

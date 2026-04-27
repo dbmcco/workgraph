@@ -4096,6 +4096,22 @@ pub fn coordinator_tick(
         Err(e) => eprintln!("[dispatcher] Worktree sweep warning: {}", e),
     }
 
+    // Phase 1.2b: Target-dir reaper safety net.
+    //
+    // The agent wrapper reaps `target/` inline at exit, but kill -9, host OOM,
+    // or a failed wrapper invocation can leave ~16G of cargo build artifacts
+    // sitting in the worktree even though the agent is dead. This catches
+    // those cases. The retention policy still preserves the worktree itself
+    // for `wg retry`-in-place; we only delete the build cache.
+    match super::worktree::reap_dead_target_dirs(dir) {
+        Ok((0, _)) => {}
+        Ok((n, bytes)) => eprintln!(
+            "[dispatcher] Target-dir reap: cleared {} target/ dir(s), freed {} bytes",
+            n, bytes
+        ),
+        Err(e) => eprintln!("[dispatcher] Target-dir reap warning: {}", e),
+    }
+
     // Phase 1.3: Zero-output agent detection — kill agents that have been alive
     // for 5+ minutes with zero bytes in stream files (API call never returned).
     {

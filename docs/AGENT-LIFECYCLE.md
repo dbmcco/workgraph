@@ -304,8 +304,33 @@ fn create_agent_worktree(agent_id: &str, task_id: &str) -> Result<WorktreeInfo> 
    - Clean up any dangling filesystem links
 
 3. **Target Directory Cleanup**:
-   - Remove isolated cargo `target/` directory 
+   - Remove isolated cargo `target/` directory
    - Reclaim build artifacts and cached dependencies
+
+#### Target-Dir Reaper (`reap_dead_target_dirs`)
+
+Independent of full worktree removal, the **target reaper** clears `target/`
+build artifacts from worktrees whose owning agent is no longer live. This
+runs even when the retention policy preserves the worktree itself (failed,
+abandoned, or blocked-on-merge tasks):
+
+1. **Inline at agent exit** (happy path) — the agent wrapper script runs
+   `rm -rf "$WG_WORKTREE_PATH/target"` after the agent process exits.
+   Catches the common case where a build cache (~16 GB per cargo agent
+   on this project) accumulates and is no longer needed.
+2. **Coordinator periodic safety net** — every dispatcher tick calls
+   [`reap_dead_target_dirs`] after the cleanup-pending sweep. Walks
+   `.wg-worktrees/`, skips agents whose registry entry is `is_live`,
+   and reaps the `target/` of every dead-agent worktree it finds.
+   Catches kill -9, host OOM, or wrapper crashes that bypass step 1.
+3. **User-invoked sweep** — `wg sweep --reap-targets` runs the same
+   logic on demand and reports bytes freed. Idempotent and safe to run
+   anytime; obeys `--dry-run`.
+
+The reaper preserves source files and the `.git` pointer in the worktree
+so `wg retry`-in-place still works (cargo will rebuild on resume). Live
+agents (heartbeat fresh within `HEARTBEAT_LIVENESS_TIMEOUT_SECS`) are
+never touched.
 
 4. **Git Worktree Removal**:
    - Force-remove worktree: `git worktree remove --force`

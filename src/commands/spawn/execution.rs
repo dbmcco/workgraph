@@ -1428,6 +1428,17 @@ if [ -n "$WG_WORKTREE_PATH" ] && [ -n "$WG_BRANCH" ] && [ -n "$WG_PROJECT_ROOT" 
     # crashed or was killed before reaching wg done).
     touch "$WG_WORKTREE_PATH/.wg-cleanup-pending" 2>/dev/null || true
     echo "[wrapper] Task finished with status '$TASK_STATUS_FINAL' — marked worktree $WG_WORKTREE_PATH for sweep (coordinator will reap; override with: wg worktree archive $WG_AGENT_ID --remove)" >> "$OUTPUT_FILE"
+
+    # Reap build artifacts: target/ is huge (~16G/agent for cargo workspaces).
+    # Cargo will rebuild on `wg retry`, and successful tasks have their
+    # worktree fully removed by the coordinator sweep anyway. Doing this
+    # here covers the failed/abandoned/blocked-on-merge cases where the
+    # worktree itself is preserved by retention policy.
+    if [ -d "$WG_WORKTREE_PATH/target" ]; then
+        rm -rf "$WG_WORKTREE_PATH/target" 2>/dev/null \
+            && echo "[wrapper] Reaped target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE" \
+            || echo "[wrapper] WARNING: failed to reap target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE"
+    fi
 fi
 
 exit $EXIT_CODE

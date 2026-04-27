@@ -40,6 +40,8 @@ pub struct OrphanedTask {
 pub struct SweepResult {
     pub orphaned: Vec<OrphanedTask>,
     pub fixed: Vec<String>,
+    pub targets_reaped: usize,
+    pub bytes_freed: u64,
 }
 
 /// Detect orphaned in-progress tasks whose agents are dead or missing.
@@ -110,8 +112,23 @@ pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
 
 /// Run sweep: detect and fix orphaned tasks.
 /// If `dry_run` is true, only reports without modifying.
-pub fn run(dir: &Path, dry_run: bool, json: bool) -> Result<SweepResult> {
+/// If `reap_targets` is true, also removes `target/` build artifacts
+/// from worktrees of agents that are no longer live (skipped under
+/// `dry_run`).
+pub fn run(dir: &Path, dry_run: bool, reap_targets: bool, json: bool) -> Result<SweepResult> {
     let orphaned = find_orphaned_tasks(dir)?;
+
+    let (targets_reaped, bytes_freed) = if reap_targets && !dry_run {
+        match crate::commands::service::worktree::reap_dead_target_dirs(dir) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("Warning: target-dir reap failed: {}", e);
+                (0, 0)
+            }
+        }
+    } else {
+        (0, 0)
+    };
 
     if orphaned.is_empty() {
         if json {
@@ -119,14 +136,31 @@ pub fn run(dir: &Path, dry_run: bool, json: bool) -> Result<SweepResult> {
                 "orphaned_count": 0,
                 "fixed": [],
                 "dry_run": dry_run,
+                "targets_reaped": targets_reaped,
+                "bytes_freed": bytes_freed,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
+        } else if reap_targets {
+            if dry_run {
+                println!(
+                    "No orphaned tasks. Dry run: target reap skipped — re-run without --dry-run to reap."
+                );
+            } else if targets_reaped == 0 {
+                println!("No orphaned tasks found. No target/ dirs reaped.");
+            } else {
+                println!(
+                    "No orphaned tasks. Reaped target/ in {} dead worktree(s), freed {} bytes.",
+                    targets_reaped, bytes_freed
+                );
+            }
         } else {
             println!("No orphaned tasks found. Everything looks clean.");
         }
         return Ok(SweepResult {
             orphaned: vec![],
             fixed: vec![],
+            targets_reaped,
+            bytes_freed,
         });
     }
 
@@ -158,6 +192,8 @@ pub fn run(dir: &Path, dry_run: bool, json: bool) -> Result<SweepResult> {
         return Ok(SweepResult {
             orphaned,
             fixed: vec![],
+            targets_reaped,
+            bytes_freed,
         });
     }
 
@@ -202,6 +238,8 @@ pub fn run(dir: &Path, dry_run: bool, json: bool) -> Result<SweepResult> {
                 "assigned_agent": o.assigned_agent,
                 "reason": o.reason,
             })).collect::<Vec<_>>(),
+            "targets_reaped": targets_reaped,
+            "bytes_freed": bytes_freed,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -218,9 +256,25 @@ pub fn run(dir: &Path, dry_run: bool, json: bool) -> Result<SweepResult> {
                 println!("  {}", id);
             }
         }
+        if reap_targets {
+            println!();
+            if targets_reaped == 0 {
+                println!("Target reap: no dead-agent target/ dirs found.");
+            } else {
+                println!(
+                    "Target reap: cleared {} target/ dir(s), freed {} bytes.",
+                    targets_reaped, bytes_freed
+                );
+            }
+        }
     }
 
-    Ok(SweepResult { orphaned, fixed })
+    Ok(SweepResult {
+        orphaned,
+        fixed,
+        targets_reaped,
+        bytes_freed,
+    })
 }
 
 /// Reconciliation function for use inside the coordinator tick.
@@ -421,7 +475,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         setup_with_dead_agent(temp_dir.path());
 
-        let result = run(temp_dir.path(), false, false).unwrap();
+        let result = run(temp_dir.path(), false, false, false).unwrap();
 
         assert!(!result.fixed.is_empty(), "Should fix at least one task");
         assert!(
@@ -443,7 +497,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         setup_with_dead_agent(temp_dir.path());
 
-        let result = run(temp_dir.path(), true, false).unwrap();
+        let result = run(temp_dir.path(), true, false, false).unwrap();
 
         assert!(!result.orphaned.is_empty(), "Should detect orphans");
         assert!(result.fixed.is_empty(), "Dry run should not fix anything");
@@ -473,7 +527,7 @@ mod tests {
         )));
         save_graph(&graph, &gpath).unwrap();
 
-        let result = run(temp_dir.path(), false, false).unwrap();
+        let result = run(temp_dir.path(), false, false, false).unwrap();
         assert!(result.orphaned.is_empty());
         assert!(result.fixed.is_empty());
     }
@@ -522,11 +576,11 @@ mod tests {
         setup_with_dead_agent(temp_dir.path());
 
         // First sweep
-        let result1 = run(temp_dir.path(), false, false).unwrap();
+        let result1 = run(temp_dir.path(), false, false, false).unwrap();
         assert!(!result1.fixed.is_empty());
 
         // Second sweep — should find nothing
-        let result2 = run(temp_dir.path(), false, false).unwrap();
+        let result2 = run(temp_dir.path(), false, false, false).unwrap();
         assert!(result2.orphaned.is_empty());
         assert!(result2.fixed.is_empty());
     }
@@ -537,7 +591,37 @@ mod tests {
         setup_with_dead_agent(temp_dir.path());
 
         // Should not panic with json output
-        let result = run(temp_dir.path(), false, true).unwrap();
+        let result = run(temp_dir.path(), false, false, true).unwrap();
         assert!(!result.fixed.is_empty());
+    }
+
+    #[test]
+    fn test_sweep_reap_targets_flag_exposes_count() {
+        // worktree-target-dirs: --reap-targets surfaces dead-agent target/
+        // dirs and removes them via the wg sweep CLI. We don't try to
+        // construct a real worktree here (covered in worktree.rs unit
+        // tests); we just verify the plumbing returns a SweepResult with
+        // populated target_reaped/bytes_freed fields when invoked, and
+        // returns zero when there is nothing to reap.
+        let temp_dir = TempDir::new().unwrap();
+        save_graph(&WorkGraph::new(), &temp_dir.path().join("graph.jsonl")).unwrap();
+
+        // No worktrees, no orphaned tasks → should return zero counts.
+        let result = run(temp_dir.path(), false, true, false).unwrap();
+        assert_eq!(result.targets_reaped, 0);
+        assert_eq!(result.bytes_freed, 0);
+    }
+
+    #[test]
+    fn test_sweep_dry_run_skips_target_reap() {
+        // worktree-target-dirs: --dry-run + --reap-targets must NOT
+        // mutate the filesystem, even if real target/ dirs were present.
+        let temp_dir = TempDir::new().unwrap();
+        save_graph(&WorkGraph::new(), &temp_dir.path().join("graph.jsonl")).unwrap();
+        let result = run(temp_dir.path(), true, true, false).unwrap();
+        assert_eq!(
+            result.targets_reaped, 0,
+            "dry-run must not reap any target/ dirs"
+        );
     }
 }

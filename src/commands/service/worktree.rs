@@ -821,6 +821,107 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
     Ok(cleaned)
 }
 
+/// Remove the `target/` build-artifact directory inside a worktree.
+///
+/// Build artifacts (~16G/agent for this project) are not needed once the
+/// agent has exited — `cargo` will rebuild them on resume if the worktree
+/// is reused for `wg retry`. This is the per-worktree primitive used by both
+/// the agent-exit hook and the periodic reaper.
+///
+/// Returns the bytes freed (best-effort estimate from
+/// [`calculate_directory_size`]). Returns `Ok(0)` if `target/` does not exist.
+pub fn reap_target_dir(worktree_path: &Path) -> Result<u64> {
+    let target = worktree_path.join("target");
+    if !target.exists() {
+        return Ok(0);
+    }
+    let size = calculate_directory_size(&target).unwrap_or(0);
+    match fs::remove_dir_all(&target) {
+        Ok(()) => Ok(size),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => fix_permissions_and_remove_dir(&target)
+            .map(|_| size)
+            .with_context(|| format!("Failed to reap target dir at {:?}", target)),
+        Err(e) => {
+            Err(anyhow!(e)).with_context(|| format!("Failed to reap target dir at {:?}", target))
+        }
+    }
+}
+
+/// Reap `target/` directories from worktrees whose owning agent is NOT live.
+///
+/// Walks `.wg-worktrees/<agent-N>` and, for each agent whose registry entry
+/// is missing or not [`AgentEntry::is_live`], removes the worktree's
+/// `target/` directory. Source files, the `.git` pointer, and the worktree
+/// itself are preserved — only build artifacts are reaped.
+///
+/// This is the safety-net half of the target-reaper protocol (see
+/// `docs/AGENT-LIFECYCLE.md`). The happy-path reaper runs inline in the
+/// agent wrapper at exit; this function catches cases where the wrapper
+/// crashed or was killed before it could clean up (e.g. `kill -9`).
+///
+/// Returns `(worktrees_reaped, bytes_freed)`. Errors on individual worktrees
+/// are logged but do not abort the sweep.
+pub fn reap_dead_target_dirs(dir: &Path) -> Result<(usize, u64)> {
+    let project_root = dir
+        .parent()
+        .ok_or_else(|| anyhow!("Cannot determine project root from {:?}", dir))?;
+    let worktrees_dir = project_root.join(WORKTREES_DIR);
+
+    if !worktrees_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let registry = workgraph::service::registry::AgentRegistry::load(dir)?;
+    let mut count = 0usize;
+    let mut bytes_freed = 0u64;
+
+    for entry in fs::read_dir(&worktrees_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[reap-targets] read_dir entry error: {}", e);
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("agent-") {
+            continue;
+        }
+
+        // Live agents may be actively building — leave their target/ alone.
+        let is_alive = registry
+            .agents
+            .get(&name)
+            .map(|a| a.is_live(HEARTBEAT_LIVENESS_TIMEOUT_SECS))
+            .unwrap_or(false);
+        if is_alive {
+            continue;
+        }
+
+        let wt_path = entry.path();
+        if !wt_path.join("target").exists() {
+            continue;
+        }
+
+        match reap_target_dir(&wt_path) {
+            Ok(0) => {}
+            Ok(freed) => {
+                eprintln!(
+                    "[reap-targets] Removed target/ in {} ({} bytes freed)",
+                    name, freed
+                );
+                count += 1;
+                bytes_freed += freed;
+            }
+            Err(e) => {
+                eprintln!("[reap-targets] Failed for {}: {}", name, e);
+            }
+        }
+    }
+
+    Ok((count, bytes_freed))
+}
+
 /// Sweep worktrees marked `CLEANUP_PENDING_MARKER` by their agent wrappers.
 ///
 /// The agent wrapper touches this marker after its merge-back section runs
@@ -2647,6 +2748,184 @@ mod tests {
         let cleaned = cleanup_orphaned_worktrees(&wg_dir).unwrap();
         assert_eq!(cleaned, 0, "MUST NOT reap orphan with unfinished work");
         assert!(wt_path.exists(), "WIP must survive for retry");
+    }
+
+    // ---------- Target-dir reaper tests (worktree-target-dirs) ----------
+
+    /// Helper: create a fake `target/` dir with some byte content so we can
+    /// observe size accounting and removal.
+    fn populate_fake_target(worktree_path: &Path) -> u64 {
+        let target = worktree_path.join("target");
+        fs::create_dir_all(target.join("debug/build")).unwrap();
+        let payload = b"x".repeat(4096);
+        fs::write(target.join("debug/build/artifact.o"), &payload).unwrap();
+        fs::write(target.join("debug/.fingerprint"), &payload).unwrap();
+        payload.len() as u64 * 2
+    }
+
+    #[test]
+    fn reap_target_dir_removes_dir_and_reports_size() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+        let (wt_path, _branch) = create_test_worktree(&project, "agent-A", "task-A");
+
+        let written = populate_fake_target(&wt_path);
+        assert!(wt_path.join("target").exists());
+
+        let freed = reap_target_dir(&wt_path).unwrap();
+        assert!(
+            freed >= written,
+            "reported freed bytes {} should be >= written {}",
+            freed,
+            written
+        );
+        assert!(
+            !wt_path.join("target").exists(),
+            "target/ must be removed after reap"
+        );
+        // Source files (the worktree itself) must remain.
+        assert!(
+            wt_path.join("file.txt").exists(),
+            "source files must survive target reap"
+        );
+        assert!(
+            wt_path.join(".git").exists(),
+            ".git pointer must survive target reap"
+        );
+    }
+
+    #[test]
+    fn reap_target_dir_no_target_returns_zero() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+        let (wt_path, _branch) = create_test_worktree(&project, "agent-B", "task-B");
+
+        // No target/ to begin with.
+        assert!(!wt_path.join("target").exists());
+        let freed = reap_target_dir(&wt_path).unwrap();
+        assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn reap_dead_target_dirs_skips_live_agents() {
+        use workgraph::service::registry::AgentStatus;
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+        let wg_dir = project.join(".workgraph");
+        fs::create_dir_all(wg_dir.join("service")).unwrap();
+
+        // Live agent: registered with our own PID + fresh heartbeat.
+        let (live_wt, _) = create_test_worktree(&project, "agent-live", "task-live");
+        populate_fake_target(&live_wt);
+        register_agent(
+            &wg_dir,
+            "agent-live",
+            "task-live",
+            std::process::id(),
+            AgentStatus::Working,
+        );
+
+        // Dead agent: registered with a non-existent PID.
+        let (dead_wt, _) = create_test_worktree(&project, "agent-dead", "task-dead");
+        populate_fake_target(&dead_wt);
+        register_agent(
+            &wg_dir,
+            "agent-dead",
+            "task-dead",
+            999_999_999,
+            AgentStatus::Dead,
+        );
+
+        let (reaped, freed) = reap_dead_target_dirs(&wg_dir).unwrap();
+        assert_eq!(reaped, 1, "exactly one target/ should be reaped");
+        assert!(freed > 0, "should report bytes freed");
+
+        assert!(
+            live_wt.join("target").exists(),
+            "live agent's target/ MUST NOT be touched"
+        );
+        assert!(
+            !dead_wt.join("target").exists(),
+            "dead agent's target/ must be reaped"
+        );
+
+        // The worktrees themselves must survive.
+        assert!(live_wt.exists());
+        assert!(dead_wt.exists());
+    }
+
+    #[test]
+    fn reap_dead_target_dirs_handles_orphan_with_no_registry_entry() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+        let wg_dir = project.join(".workgraph");
+        fs::create_dir_all(wg_dir.join("service")).unwrap();
+        // Save an empty registry so load() succeeds.
+        workgraph::service::registry::AgentRegistry::default()
+            .save(&wg_dir)
+            .unwrap();
+
+        // Worktree with target/ but agent not registered (crashed before reg).
+        let (wt_path, _) = create_test_worktree(&project, "agent-orphan", "task-orphan");
+        populate_fake_target(&wt_path);
+
+        let (reaped, _freed) = reap_dead_target_dirs(&wg_dir).unwrap();
+        assert_eq!(reaped, 1, "orphan (no registry entry) is not live → reap");
+        assert!(!wt_path.join("target").exists());
+        assert!(wt_path.exists(), "worktree itself must remain");
+    }
+
+    #[test]
+    fn reap_dead_target_dirs_idempotent() {
+        use workgraph::service::registry::AgentStatus;
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+        let wg_dir = project.join(".workgraph");
+        fs::create_dir_all(wg_dir.join("service")).unwrap();
+
+        let (wt_path, _) = create_test_worktree(&project, "agent-dead", "task-dead");
+        populate_fake_target(&wt_path);
+        register_agent(
+            &wg_dir,
+            "agent-dead",
+            "task-dead",
+            999_999_999,
+            AgentStatus::Dead,
+        );
+
+        let (first, _) = reap_dead_target_dirs(&wg_dir).unwrap();
+        assert_eq!(first, 1);
+
+        // Running again is a no-op (no target/ left to reap).
+        let (second, second_bytes) = reap_dead_target_dirs(&wg_dir).unwrap();
+        assert_eq!(second, 0);
+        assert_eq!(second_bytes, 0);
+    }
+
+    #[test]
+    fn reap_dead_target_dirs_no_worktrees_dir() {
+        // If `.wg-worktrees` doesn't exist, reaper should return Ok((0, 0)).
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let wg_dir = project.join(".workgraph");
+        fs::create_dir_all(wg_dir.join("service")).unwrap();
+
+        let (reaped, freed) = reap_dead_target_dirs(&wg_dir).unwrap();
+        assert_eq!(reaped, 0);
+        assert_eq!(freed, 0);
     }
 }
 
