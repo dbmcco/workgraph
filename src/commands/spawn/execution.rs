@@ -56,7 +56,7 @@ fn resolve_endpoint_execution_config(
     let provider = hinted_provider.or_else(|| endpoint.map(|ep| ep.provider.clone()));
     let endpoint_name = endpoint.map(|ep| ep.name.clone());
     let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
-    let api_key = endpoint.and_then(|ep| ep.resolve_api_key().ok().flatten());
+    let api_key = endpoint.and_then(|ep| ep.resolve_api_key(None).ok().flatten());
     let provider_env_vars = endpoint
         .map(|ep| {
             workgraph::config::EndpointConfig::env_var_names_for_provider(&ep.provider)
@@ -390,9 +390,8 @@ pub(crate) fn spawn_agent_inner(
         {
             // Clear any cleanup-pending marker that the prior agent's
             // wrapper may have written so the next sweep doesn't reap it.
-            let marker = prior_path.join(
-                crate::commands::service::worktree::CLEANUP_PENDING_MARKER,
-            );
+            let marker =
+                prior_path.join(crate::commands::service::worktree::CLEANUP_PENDING_MARKER);
             if marker.exists() {
                 let _ = fs::remove_file(&marker);
             }
@@ -642,15 +641,14 @@ pub(crate) fn spawn_agent_inner(
         cmd.env("WG_MODEL", m);
     }
     {
-        let tier_str = task_tier
-            .as_deref()
-            .unwrap_or_else(|| {
-                match workgraph::config::DispatchRole::TaskAgent.default_tier() {
+        let tier_str =
+            task_tier.as_deref().unwrap_or_else(
+                || match workgraph::config::DispatchRole::TaskAgent.default_tier() {
                     workgraph::config::Tier::Fast => "fast",
                     workgraph::config::Tier::Standard => "standard",
                     workgraph::config::Tier::Premium => "premium",
-                }
-            });
+                },
+            );
         cmd.env("WG_TIER", tier_str);
     }
     if let Some(ref ep) = effective_endpoint {
@@ -997,9 +995,8 @@ fn build_inner_command(
             // Build a fresh-session fallback command (same as the full-mode
             // "claude" arm below) so the wrapper can retry if the session is
             // gone. Write prompt.txt alongside resume_message.txt.
-            let fallback = build_claude_fresh_command(
-                settings, exec_mode, output_dir, effective_model, vars,
-            )?;
+            let fallback =
+                build_claude_fresh_command(settings, exec_mode, output_dir, effective_model, vars)?;
 
             return Ok((resume_command, Some(fallback)));
         }
@@ -1262,7 +1259,10 @@ fn build_claude_fresh_command(
                 let prompt_file = output_dir.join("prompt.txt");
                 fs::write(&prompt_file, &prompt_template.template)
                     .with_context(|| format!("Failed to write prompt file: {:?}", prompt_file))?;
-                Ok(prompt_file_command(&prompt_file.to_string_lossy(), &claude_cmd))
+                Ok(prompt_file_command(
+                    &prompt_file.to_string_lossy(),
+                    &claude_cmd,
+                ))
             } else {
                 Ok(claude_cmd)
             }
@@ -1285,7 +1285,10 @@ fn build_claude_fresh_command(
                 let prompt_file = output_dir.join("prompt.txt");
                 fs::write(&prompt_file, &prompt_template.template)
                     .with_context(|| format!("Failed to write prompt file: {:?}", prompt_file))?;
-                Ok(prompt_file_command(&prompt_file.to_string_lossy(), &claude_cmd))
+                Ok(prompt_file_command(
+                    &prompt_file.to_string_lossy(),
+                    &claude_cmd,
+                ))
             } else {
                 Ok(claude_cmd)
             }
@@ -2766,7 +2769,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(fallback.is_none(), "Codex should not have a fallback command");
+        assert!(
+            fallback.is_none(),
+            "Codex should not have a fallback command"
+        );
         assert!(
             command.contains("cat "),
             "Expected prompt to be piped from a file: {}",

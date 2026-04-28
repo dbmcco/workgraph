@@ -599,7 +599,10 @@ mod tests {
 
         let g = load_graph(&path).unwrap();
         let t = g.get_task("t").unwrap();
-        assert!(t.assigned.is_none(), "--also-strip-meta must also clear assigned");
+        assert!(
+            t.assigned.is_none(),
+            "--also-strip-meta must also clear assigned"
+        );
         assert!(t.started_at.is_none());
         // meta tasks gone (regression check on existing strip behavior)
         assert!(g.get_task(".flip-t").is_none());

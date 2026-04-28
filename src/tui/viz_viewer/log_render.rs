@@ -209,13 +209,10 @@ fn high_level_label(event: &AgentStreamEvent) -> Option<String> {
     match (&event.kind, event.details.as_ref()) {
         (AgentStreamEventKind::ToolCall, Some(EventDetails::ToolCall { name, input })) => {
             let target = match name.as_str() {
-                "Bash" | "bash" => input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .map(|c| {
-                        let first = c.split_whitespace().next().unwrap_or("");
-                        format!("Running {}", first)
-                    }),
+                "Bash" | "bash" => input.get("command").and_then(|v| v.as_str()).map(|c| {
+                    let first = c.split_whitespace().next().unwrap_or("");
+                    format!("Running {}", first)
+                }),
                 "Read" => input
                     .get("file_path")
                     .and_then(|v| v.as_str())
@@ -355,12 +352,7 @@ pub fn render_wg_log_view(rendered_lines: &[String]) -> Vec<Line<'static>> {
     }
     rendered_lines
         .iter()
-        .map(|s| {
-            Line::from(Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Gray),
-            ))
-        })
+        .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))))
         .collect()
 }
 
@@ -586,10 +578,7 @@ fn format_tool_call_body(name: &str, input: &serde_json::Value) -> String {
         }
         "Write" => {
             // Show first few lines of content if present.
-            let content = input
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if content.is_empty() {
                 String::new()
             } else {

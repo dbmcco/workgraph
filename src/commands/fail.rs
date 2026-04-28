@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
@@ -19,14 +19,6 @@ pub fn run(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
 
 pub fn run_eval_reject(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
     run_inner(dir, id, reason, true)
-}
-
-struct FailResult {
-    retry_count: u32,
-    max_retries: Option<u32>,
-    agent_id: Option<String>,
-    cycle_reactivated: Vec<String>,
-    task_snapshot: Task,
 }
 
 fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> Result<()> {
@@ -181,30 +173,48 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
     }
 
     let config = workgraph::config::Config::load_or_default(dir);
-    let detail = match reason { Some(r) => serde_json::json!({ "reason": r }), None => serde_json::Value::Null };
-    let _ = workgraph::provenance::record(dir, "fail", Some(id), None, detail, config.log.rotation_threshold);
+    let detail = match reason {
+        Some(r) => serde_json::json!({ "reason": r }),
+        None => serde_json::Value::Null,
+    };
+    let _ = workgraph::provenance::record(
+        dir,
+        "fail",
+        Some(id),
+        None,
+        detail,
+        config.log.rotation_threshold,
+    );
 
     let reason_msg = reason.map(|r| format!(" ({})", r)).unwrap_or_default();
-    println!("Marked '{}' as failed{} (retry #{})", id, reason_msg, result.retry_count);
+    println!(
+        "Marked '{}' as failed{} (retry #{})",
+        id, reason_msg, retry_count
+    );
 
-    if let Some(max) = result.max_retries {
-        if result.retry_count >= max {
-            println!("  Warning: Max retries ({}) reached. Consider abandoning or increasing limit.", max);
+    if let Some(max) = max_retries {
+        if retry_count >= max {
+            println!(
+                "  Warning: Max retries ({}) reached. Consider abandoning or increasing limit.",
+                max
+            );
         } else {
-            println!("  Retries remaining: {}", max - result.retry_count);
+            println!("  Retries remaining: {}", max - retry_count);
         }
     }
 
-    if let Some(ref agent_id) = result.agent_id {
+    if let Some(ref agent_id) = agent_id_for_archive {
         match super::log::archive_agent(dir, id, agent_id) {
             Ok(archive_dir) => eprintln!("Agent archived to {}", archive_dir.display()),
             Err(e) => eprintln!("Warning: agent archive failed: {}", e),
         }
     }
 
-    match capture_task_output(dir, &result.task_snapshot) {
-        Ok(output_dir) => eprintln!("Output captured to {}", output_dir.display()),
-        Err(e) => eprintln!("Warning: output capture failed: {}", e),
+    if let Some(task) = graph.get_task(id) {
+        match capture_task_output(dir, task) {
+            Ok(output_dir) => eprintln!("Output captured to {}", output_dir.display()),
+            Err(e) => eprintln!("Warning: output capture failed: {}", e),
+        }
     }
 
     Ok(())

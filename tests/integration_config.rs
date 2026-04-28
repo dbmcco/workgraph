@@ -106,7 +106,7 @@ fn init_with_endpoint_and_model() {
         &[
             "init",
             "--model",
-            "qwen3-coder",
+            "local:qwen3-coder",
             "--endpoint",
             "http://lambda01:8089",
         ],
@@ -131,7 +131,7 @@ fn config_show_default() {
     let output = wg_ok(&wg_dir, &["config", "--show"]);
     assert!(output.contains("Workgraph Configuration"));
     assert!(output.contains("[agent]"));
-    assert!(output.contains("[coordinator]"));
+    assert!(output.contains("[dispatcher]"));
     assert!(output.contains("executor"));
 }
 
@@ -148,7 +148,7 @@ fn config_show_json() {
         )
     });
     assert!(json.get("agent").is_some());
-    assert!(json.get("coordinator").is_some());
+    assert!(json.get("dispatcher").is_some());
 }
 
 #[test]

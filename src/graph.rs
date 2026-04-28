@@ -1861,7 +1861,10 @@ fn reactivate_cycle(
     // worker, the worker calls `wg done`, repeat — burning tokens with no
     // user input. See task chat-agent-loops-2.
     if let Some(owner) = graph.get_task(config_owner_id)
-        && owner.tags.iter().any(|t| crate::chat_id::is_chat_loop_tag(t))
+        && owner
+            .tags
+            .iter()
+            .any(|t| crate::chat_id::is_chat_loop_tag(t))
     {
         return vec![];
     }
@@ -2160,7 +2163,10 @@ fn reactivate_cycle_on_failure(
     // (would re-Open a Failed chat task that the supervisor is about to
     // respawn anyway, racing the supervisor's own backoff).
     if let Some(owner) = graph.get_task(config_owner_id)
-        && owner.tags.iter().any(|t| crate::chat_id::is_chat_loop_tag(t))
+        && owner
+            .tags
+            .iter()
+            .any(|t| crate::chat_id::is_chat_loop_tag(t))
     {
         return vec![];
     }
@@ -2472,7 +2478,6 @@ mod tests {
         let impl_task = graph.get_task("api-impl").unwrap();
         assert_eq!(impl_task.after, vec!["api-design"]);
     }
-
 
     #[test]
     fn test_add_node_normalizes_before_into_after() {
@@ -3496,8 +3501,7 @@ mod tests {
     #[test]
     fn test_priority_serde_migration_from_named_enum() {
         // Old graph.jsonl entries with string-enum values must deserialize to u32
-        let json_critical =
-            r#"{"id":"t1","title":"T","status":"open","priority":"critical"}"#;
+        let json_critical = r#"{"id":"t1","title":"T","status":"open","priority":"critical"}"#;
         let task: Task = serde_json::from_str(json_critical).unwrap();
         assert_eq!(task.priority, PRIORITY_CRITICAL);
 

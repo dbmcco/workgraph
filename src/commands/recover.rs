@@ -333,8 +333,7 @@ fn apply_plan(dir: &Path, plan: &Plan, opts: &RecoverOptions) -> Result<()> {
                 if task.status != Status::Done && task.status != Status::Abandoned {
                     task.status = Status::Abandoned;
                     task.failure_reason = Some(
-                        "Auto-abandoned by `wg recover` so it regenerates from parent"
-                            .to_string(),
+                        "Auto-abandoned by `wg recover` so it regenerates from parent".to_string(),
                     );
                     task.log.push(LogEntry {
                         timestamp: now.clone(),
@@ -517,7 +516,10 @@ mod tests {
         let g = load_graph(graph_path(dp)).unwrap();
         // Nothing should have changed
         assert_eq!(g.get_task("user-a").unwrap().status, Status::Failed);
-        assert_eq!(g.get_task(".evaluate-user-a").unwrap().status, Status::Failed);
+        assert_eq!(
+            g.get_task(".evaluate-user-a").unwrap().status,
+            Status::Failed
+        );
     }
 
     #[test]
@@ -592,8 +594,14 @@ mod tests {
 
         let g = load_graph(graph_path(dp)).unwrap();
         assert_eq!(g.get_task("user-a").unwrap().status, Status::Open);
-        assert_eq!(g.get_task(".evaluate-user-a").unwrap().status, Status::Abandoned);
-        assert_eq!(g.get_task(".flip-user-a").unwrap().status, Status::Abandoned);
+        assert_eq!(
+            g.get_task(".evaluate-user-a").unwrap().status,
+            Status::Abandoned
+        );
+        assert_eq!(
+            g.get_task(".flip-user-a").unwrap().status,
+            Status::Abandoned
+        );
     }
 
     #[test]
@@ -775,7 +783,10 @@ mod tests {
         run(dp, opts).unwrap();
 
         let g = load_graph(graph_path(dp)).unwrap();
-        assert_eq!(g.get_task("user-a").unwrap().endpoint.as_deref(), Some("openrouter"));
+        assert_eq!(
+            g.get_task("user-a").unwrap().endpoint.as_deref(),
+            Some("openrouter")
+        );
     }
 
     #[test]

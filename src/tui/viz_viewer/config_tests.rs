@@ -28,6 +28,7 @@ mod tui_config_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         };
         let mut app = VizApp::from_viz_output_for_test(&viz);
         app.workgraph_dir = workgraph_dir.to_path_buf();
@@ -57,10 +58,7 @@ mod tui_config_tests {
 
     /// Find the index of a config entry by key.
     fn find_entry(app: &VizApp, key: &str) -> Option<usize> {
-        app.config_panel
-            .entries
-            .iter()
-            .position(|e| e.key == key)
+        app.config_panel.entries.iter().position(|e| e.key == key)
     }
 
     /// Load config from disk for verification.
@@ -320,7 +318,7 @@ mod tui_config_tests {
         let mut app = make_config_test_app(wg_dir);
 
         let mut config = workgraph::config::Config::default();
-        config.coordinator.executor = "claude".to_string();
+        config.coordinator.executor = Some("claude".to_string());
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -343,7 +341,10 @@ mod tui_config_tests {
         assert_eq!(app.config_panel.entries[idx].value, "amplifier");
 
         let disk_config = load_config(wg_dir);
-        assert_eq!(disk_config.coordinator.executor, "amplifier");
+        assert_eq!(
+            disk_config.coordinator.executor,
+            Some("amplifier".to_string())
+        );
     }
 
     #[test]
@@ -353,7 +354,7 @@ mod tui_config_tests {
         let mut app = make_config_test_app(wg_dir);
 
         let mut config = workgraph::config::Config::default();
-        config.coordinator.executor = "claude".to_string();
+        config.coordinator.executor = Some("claude".to_string());
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -572,7 +573,7 @@ mod tui_config_tests {
         // Start with a rich config
         let mut config = workgraph::config::Config::default();
         config.coordinator.max_agents = 3;
-        config.coordinator.executor = "claude".to_string();
+        config.coordinator.executor = Some("claude".to_string());
         config.agency.auto_evaluate = true;
         config.tui.show_token_counts = true;
         config.guardrails.max_child_tasks_per_agent = 25;
@@ -591,7 +592,7 @@ mod tui_config_tests {
         // Verify ALL config fields survived
         let disk_config = load_config(wg_dir);
         assert_eq!(disk_config.coordinator.max_agents, 7); // changed
-        assert_eq!(disk_config.coordinator.executor, "claude"); // unchanged
+        assert_eq!(disk_config.coordinator.executor, Some("claude".to_string())); // unchanged
         assert!(disk_config.agency.auto_evaluate); // unchanged
         assert!(disk_config.tui.show_token_counts); // unchanged
         assert_eq!(disk_config.guardrails.max_child_tasks_per_agent, 25); // unchanged
@@ -832,7 +833,10 @@ new_setting = "hello"
                 url: None,
                 model: None,
                 api_key: None,
+                api_key_file: None,
+                api_key_env: None,
                 is_default: true,
+                context_window: None,
             });
         config.save(wg_dir).unwrap();
 
@@ -865,7 +869,10 @@ new_setting = "hello"
                 url: None,
                 model: None,
                 api_key: None,
+                api_key_file: None,
+                api_key_env: None,
                 is_default: true,
+                context_window: None,
             });
         config
             .llm_endpoints
@@ -876,7 +883,10 @@ new_setting = "hello"
                 url: None,
                 model: None,
                 api_key: None,
+                api_key_file: None,
+                api_key_env: None,
                 is_default: false,
+                context_window: None,
             });
         config.save(wg_dir).unwrap();
 
@@ -1157,11 +1167,7 @@ new_setting = "hello"
                 .entries
                 .iter()
                 .any(|e| e.section == *section);
-            assert!(
-                has_section,
-                "Should have entries for section {:?}",
-                section
-            );
+            assert!(has_section, "Should have entries for section {:?}", section);
         }
     }
 

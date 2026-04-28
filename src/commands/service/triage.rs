@@ -11,7 +11,7 @@ use workgraph::config::Config;
 use workgraph::graph::{
     LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens,
 };
-use workgraph::parser::{load_graph, modify_graph};
+use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, modify_graph};
 use workgraph::profile;
 use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 use workgraph::service::{ProviderErrorKind, ProviderHealth, classify_error, extract_provider_id};
@@ -362,8 +362,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
     }
 
     // Circuit breaker: auto-pause tasks with repeated rapid agent deaths
-    let max_failures = config.coordinator.max_consecutive_failures;
-    let failure_window = config.coordinator.failure_window_seconds;
+    let max_failures = 3;
+    let failure_window = 600;
     for (_agent_id, task_id, _pid, _output_file, _reason) in &dead {
         if let Some(task) = graph.get_task_mut(task_id) {
             if task.status == Status::Open && !task.paused {
@@ -372,6 +372,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     task.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some("coordinator".to_string()),
+                        user: Some(workgraph::current_user()),
                         message: format!(
                             "Circuit breaker: auto-paused after {} agent deaths within {}s. \
                              Investigate and run `wg resume {}` when ready.",
@@ -477,7 +478,8 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
     // and the agent may have completed without triggering capture (e.g. wrapper
     // script marked it done but output capture wasn't invoked). This is a
     // best-effort safety net.
-    let graph = load_graph_locked(graph_path, &_triage_lock).context("Failed to reload graph for output capture")?;
+    let graph = load_graph_locked(graph_path, &_triage_lock)
+        .context("Failed to reload graph for output capture")?;
     for (_agent_id, task_id, _pid, _output_file, _reason) in &dead {
         if let Some(task) = graph.get_task(task_id)
             && matches!(task.status, Status::Done | Status::Failed)
@@ -1419,16 +1421,19 @@ mod tests {
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(30)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a1' (PID 100) process exited".to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(20)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a2' (PID 101) process exited".to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(10)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a3' (PID 102) process exited".to_string(),
                 },
             ],
@@ -1448,11 +1453,13 @@ mod tests {
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(30)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a1' (PID 100) process exited".to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(20)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a2' (PID 101) process exited".to_string(),
                 },
             ],
@@ -1472,16 +1479,19 @@ mod tests {
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(200)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a1' (PID 100) process exited".to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(190)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a2' (PID 101) process exited".to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(180)).to_rfc3339(),
                     actor: None,
+                    user: None,
                     message: "Task unclaimed: agent 'a3' (PID 102) process exited".to_string(),
                 },
             ],
@@ -1502,17 +1512,23 @@ mod tests {
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(30)).to_rfc3339(),
                     actor: Some("triage".to_string()),
-                    message: "Triage: restarting (agent 'a1' PID 100 died) — no progress".to_string(),
+                    user: None,
+                    message: "Triage: restarting (agent 'a1' PID 100 died) — no progress"
+                        .to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(20)).to_rfc3339(),
                     actor: Some("triage".to_string()),
-                    message: "Triage: restarting (agent 'a2' PID 101 died) — no progress".to_string(),
+                    user: None,
+                    message: "Triage: restarting (agent 'a2' PID 101 died) — no progress"
+                        .to_string(),
                 },
                 LogEntry {
                     timestamp: (now - chrono::Duration::seconds(10)).to_rfc3339(),
                     actor: Some("triage".to_string()),
-                    message: "Triage: restarting (agent 'a3' PID 102 died) — no progress".to_string(),
+                    user: None,
+                    message: "Triage: restarting (agent 'a3' PID 102 died) — no progress"
+                        .to_string(),
                 },
             ],
             ..Default::default()
@@ -1527,13 +1543,12 @@ mod tests {
             id: "t1".to_string(),
             title: "Test".to_string(),
             status: Status::Open,
-            log: vec![
-                LogEntry {
-                    timestamp: (now - chrono::Duration::seconds(10)).to_rfc3339(),
-                    actor: None,
-                    message: "Task unclaimed: agent 'a1' (PID 100) process exited".to_string(),
-                },
-            ],
+            log: vec![LogEntry {
+                timestamp: (now - chrono::Duration::seconds(10)).to_rfc3339(),
+                actor: None,
+                user: None,
+                message: "Task unclaimed: agent 'a1' (PID 100) process exited".to_string(),
+            }],
             ..Default::default()
         };
         // max_failures=0 disables the circuit breaker

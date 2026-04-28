@@ -6,12 +6,9 @@ use workgraph::function::{
     self, FunctionInput, InputType, PlanningConfig, TaskTemplate, TraceFunction,
 };
 use workgraph::graph::{Node, PRIORITY_DEFAULT, Status, Task};
-use workgraph::parser::{load_graph, modify_graph};
+use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, modify_graph};
 
 use super::graph_path;
-
-#[cfg(test)]
-use workgraph::parser::load_graph;
 
 /// Resolve a `--from` source to a TraceFunction.
 ///

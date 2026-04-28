@@ -88,7 +88,9 @@ pub(crate) fn build_task_context(
             let cycle = &ca.cycles[cycle_idx];
             let header_info = cycle.members.iter().find_map(|mid| {
                 graph.get_task(mid).and_then(|t| {
-                    t.cycle_config.as_ref().map(|cc| (t.loop_iteration, cc.max_iterations))
+                    t.cycle_config
+                        .as_ref()
+                        .map(|cc| (t.loop_iteration, cc.max_iterations))
                 })
             });
             if let Some((iter, max)) = header_info {

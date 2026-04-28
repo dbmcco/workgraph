@@ -250,8 +250,15 @@ pub(crate) fn handle_connection(
     daemon_cfg: &mut DaemonConfig,
     logger: &DaemonLogger,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream
+        .set_nonblocking(false)
+        .context("Failed to set IPC stream to blocking mode")?;
+    if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+        logger.warn(&format!("Failed to set IPC read timeout: {}", e));
+    }
+    if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(5))) {
+        logger.warn(&format!("Failed to set IPC write timeout: {}", e));
+    }
 
     // Clone stream for writing
     let mut write_stream = stream
@@ -555,18 +562,10 @@ fn handle_request(
                 "IPC SetChatExecutor: chat_id={}, executor={:?}, model={:?}",
                 chat_id, executor, model
             ));
-            handle_set_coordinator_executor(
-                dir,
-                chat_id,
-                executor.as_deref(),
-                model.as_deref(),
-            )
+            handle_set_coordinator_executor(dir, chat_id, executor.as_deref(), model.as_deref())
         }
         IpcRequest::DeleteChat { chat_id } => {
-            logger.info(&format!(
-                "IPC DeleteChat: chat_id={}",
-                chat_id
-            ));
+            logger.info(&format!("IPC DeleteChat: chat_id={}", chat_id));
             let resp = handle_delete_coordinator(dir, chat_id);
             if resp.ok {
                 delete_coordinator_ids.push(chat_id);
@@ -574,10 +573,7 @@ fn handle_request(
             resp
         }
         IpcRequest::ArchiveChat { chat_id } => {
-            logger.info(&format!(
-                "IPC ArchiveChat: chat_id={}",
-                chat_id
-            ));
+            logger.info(&format!("IPC ArchiveChat: chat_id={}", chat_id));
             let resp = handle_archive_coordinator(dir, chat_id);
             if resp.ok {
                 delete_coordinator_ids.push(chat_id);
@@ -585,10 +581,7 @@ fn handle_request(
             resp
         }
         IpcRequest::StopChat { chat_id } => {
-            logger.info(&format!(
-                "IPC StopChat: chat_id={}",
-                chat_id
-            ));
+            logger.info(&format!("IPC StopChat: chat_id={}", chat_id));
             let resp = handle_stop_coordinator(dir, chat_id);
             if resp.ok {
                 delete_coordinator_ids.push(chat_id);
@@ -596,10 +589,7 @@ fn handle_request(
             resp
         }
         IpcRequest::InterruptChat { chat_id } => {
-            logger.info(&format!(
-                "IPC InterruptChat: chat_id={}",
-                chat_id
-            ));
+            logger.info(&format!("IPC InterruptChat: chat_id={}", chat_id));
             // No graph changes — just signal the daemon to send SIGINT to the
             // chat agent's Claude CLI subprocess. The actual interrupt happens
             // in the daemon loop where coordinator_agents is accessible.
@@ -1043,7 +1033,7 @@ fn handle_reconfigure(
         }
         if !executor_overridden && daemon_cfg.model.is_some() {
             let mut coordinator_cfg = workgraph::config::CoordinatorConfig::default();
-            coordinator_cfg.executor = daemon_cfg.executor.clone();
+            coordinator_cfg.executor = Some(daemon_cfg.executor.clone());
             coordinator_cfg.model = daemon_cfg.model.clone();
             daemon_cfg.executor = coordinator_cfg.effective_executor();
         }
@@ -1464,14 +1454,18 @@ pub fn create_chat_in_graph(
     executor: Option<&str>,
 ) -> Result<u32> {
     let graph_path = crate::commands::graph_path(dir);
-    let mut graph = workgraph::parser::load_graph(&graph_path)
-        .with_context(|| "Failed to load graph")?;
+    let mut graph =
+        workgraph::parser::load_graph(&graph_path).with_context(|| "Failed to load graph")?;
 
     let config = workgraph::config::Config::load_or_default(dir);
     let max = config.coordinator.max_coordinators;
     let alive = graph
         .tasks()
-        .filter(|t| t.tags.iter().any(|tag| workgraph::chat_id::is_chat_loop_tag(tag)))
+        .filter(|t| {
+            t.tags
+                .iter()
+                .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+        })
         .filter(|t| !matches!(t.status, workgraph::graph::Status::Abandoned))
         .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
         .count();
@@ -1489,10 +1483,7 @@ pub fn create_chat_in_graph(
     let task = workgraph::graph::Task {
         id: workgraph::chat_id::format_chat_task_id(next_id),
         title,
-        description: Some(format!(
-            "Chat {} — persistent chat agent.",
-            next_id
-        )),
+        description: Some(format!("Chat {} — persistent chat agent.", next_id)),
         status: workgraph::graph::Status::InProgress,
         priority: PRIORITY_HIGH,
         tags: vec![workgraph::chat_id::CHAT_LOOP_TAG.to_string()],
@@ -2858,9 +2849,7 @@ poll_interval = 120
         assert!(resp.ok, "create_chat for bob should succeed");
 
         let graph = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
-        let coord = graph
-            .get_task(".chat-1")
-            .expect("second chat should exist");
+        let coord = graph.get_task(".chat-1").expect("second chat should exist");
         assert_eq!(coord.title, "Chat: bob");
 
         // Both chats should coexist
@@ -3035,7 +3024,11 @@ poll_interval = 120
         let skipped = data["skipped"].as_array().unwrap();
         // Two purged: chat-0 and coordinator-1. chat-2 is skipped (already archived).
         assert_eq!(purged.len(), 2, "expected 2 chats purged, got {:?}", purged);
-        assert_eq!(skipped.len(), 1, "chat-2 should be skipped (already archived)");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "chat-2 should be skipped (already archived)"
+        );
 
         // Reload graph and verify state.
         let g = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
@@ -3045,7 +3038,9 @@ poll_interval = 120
         assert!(t0.tags.contains(&"archived".to_string()));
         assert!(!t0.tags.iter().any(|t| t == "chat-loop"));
 
-        let t1 = g.get_task(".coordinator-1").expect("coordinator-1 task still exists");
+        let t1 = g
+            .get_task(".coordinator-1")
+            .expect("coordinator-1 task still exists");
         assert_eq!(t1.status, workgraph::graph::Status::Done);
         assert!(t1.tags.contains(&"archived".to_string()));
         assert!(!t1.tags.iter().any(|t| t == "coordinator-loop"));

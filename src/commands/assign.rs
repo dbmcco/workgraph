@@ -6,9 +6,6 @@ use workgraph::parser::{load_graph, modify_graph};
 
 use super::graph_path;
 
-#[cfg(test)]
-use workgraph::parser::load_graph;
-
 /// Record an evaluation against the assigner special agent's performance.
 ///
 /// When auto_evaluate is enabled and an assigner_agent is configured, this

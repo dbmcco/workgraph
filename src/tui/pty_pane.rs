@@ -1087,7 +1087,11 @@ mod tests {
     /// inside a single bordered pane.
     #[test]
     fn rendered_pty_output_does_not_double_lines() {
-        let lines = ["stocktake-assets", "content-review-poietic-life", "wg-visual-language-study"];
+        let lines = [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ];
 
         // Parser sized exactly to the rendering area — same as how
         // `pane.resize(area.height, area.width)` clamps things in

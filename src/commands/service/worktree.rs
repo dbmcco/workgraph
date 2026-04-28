@@ -638,6 +638,7 @@ pub fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Op
         .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
+    let worktree_canonical = worktree_path.canonicalize().ok();
     let worktree_str = worktree_path.to_string_lossy();
 
     // Porcelain output is blocks separated by blank lines.
@@ -648,7 +649,16 @@ pub fn find_branch_for_worktree(project_root: &Path, worktree_path: &Path) -> Op
             current_path = Some(path);
         } else if let Some(branch_ref) = line.strip_prefix("branch ") {
             if let Some(cp) = current_path
-                && cp == worktree_str.as_ref()
+                && (cp == worktree_str.as_ref()
+                    || worktree_canonical
+                        .as_ref()
+                        .and_then(|wt| {
+                            std::path::Path::new(cp)
+                                .canonicalize()
+                                .ok()
+                                .map(|cp| cp == *wt)
+                        })
+                        .unwrap_or(false))
             {
                 // Convert refs/heads/wg/agent-X/task-Y to wg/agent-X/task-Y
                 return Some(
@@ -725,9 +735,9 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
                 .get(&name)
                 .map(|a| a.task_id.clone())
                 .or_else(|| {
-                    branch_opt.as_deref().and_then(|b| {
-                        b.strip_prefix(&format!("wg/{}/", name)).map(str::to_string)
-                    })
+                    branch_opt
+                        .as_deref()
+                        .and_then(|b| b.strip_prefix(&format!("wg/{}/", name)).map(str::to_string))
                 });
             if !is_safe_to_reap(
                 graph.as_ref(),
@@ -838,9 +848,11 @@ pub fn reap_target_dir(worktree_path: &Path) -> Result<u64> {
     let size = calculate_directory_size(&target).unwrap_or(0);
     match fs::remove_dir_all(&target) {
         Ok(()) => Ok(size),
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => fix_permissions_and_remove_dir(&target)
-            .map(|_| size)
-            .with_context(|| format!("Failed to reap target dir at {:?}", target)),
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            fix_permissions_and_remove_dir(&target)
+                .map(|_| size)
+                .with_context(|| format!("Failed to reap target dir at {:?}", target))
+        }
         Err(e) => {
             Err(anyhow!(e)).with_context(|| format!("Failed to reap target dir at {:?}", target))
         }
@@ -2686,7 +2698,13 @@ mod tests {
         let (wt_a, branch_a) = create_test_worktree(&project_a, "agent-a", "task-a");
         fs::write(wt_a.join(CLEANUP_PENDING_MARKER), "").unwrap();
         write_graph_with_task_and_eval(&wg_dir_a, "task-a", Status::Done, Some(Status::Open));
-        register_agent(&wg_dir_a, "agent-a", "task-a", 999_999_991, AgentStatus::Done);
+        register_agent(
+            &wg_dir_a,
+            "agent-a",
+            "task-a",
+            999_999_991,
+            AgentStatus::Done,
+        );
         merge_branch_into_main(&project_a, &branch_a);
 
         assert_eq!(
@@ -2725,7 +2743,13 @@ mod tests {
             .unwrap();
         fs::write(wt_b.join(CLEANUP_PENDING_MARKER), "").unwrap();
         write_graph_with_task_and_eval(&wg_dir_b, "task-b", Status::Done, Some(Status::Done));
-        register_agent(&wg_dir_b, "agent-b", "task-b", 999_999_990, AgentStatus::Done);
+        register_agent(
+            &wg_dir_b,
+            "agent-b",
+            "task-b",
+            999_999_990,
+            AgentStatus::Done,
+        );
         // Branch has its own commit, NOT merged into main.
 
         assert_eq!(
@@ -2746,7 +2770,13 @@ mod tests {
         let (wt_c, branch_c) = create_test_worktree(&project_c, "agent-c", "task-c");
         fs::write(wt_c.join(CLEANUP_PENDING_MARKER), "").unwrap();
         write_graph_with_task_and_eval(&wg_dir_c, "task-c", Status::Done, Some(Status::Done));
-        register_agent(&wg_dir_c, "agent-c", "task-c", 999_999_989, AgentStatus::Done);
+        register_agent(
+            &wg_dir_c,
+            "agent-c",
+            "task-c",
+            999_999_989,
+            AgentStatus::Done,
+        );
         merge_branch_into_main(&project_c, &branch_c);
 
         assert_eq!(

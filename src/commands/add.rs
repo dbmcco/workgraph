@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::cron::{calculate_next_fire, parse_cron_expression};
-use workgraph::graph::{CycleConfig, Estimate, Node, PRIORITY_CRITICAL, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_IDLE, PRIORITY_LOW, PRIORITY_NORMAL, Priority, Status, Task, boost_priority, parse_delay};
+use workgraph::graph::{
+    CycleConfig, Estimate, Node, PRIORITY_CRITICAL, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_IDLE,
+    PRIORITY_LOW, PRIORITY_NORMAL, Priority, Status, Task, boost_priority, parse_delay,
+};
 use workgraph::parser::modify_graph;
 
-#[cfg(test)]
 use super::graph_path;
 
 /// Resolve a model input string to a fully-qualified `provider:model` format.
@@ -102,7 +104,10 @@ pub fn parse_priority(priority_str: Option<&str>) -> Priority {
                 "low" => PRIORITY_LOW,
                 "idle" => PRIORITY_IDLE,
                 _ => {
-                    eprintln!("Warning: Invalid priority '{}', using default ({})", s, PRIORITY_DEFAULT);
+                    eprintln!(
+                        "Warning: Invalid priority '{}', using default ({})",
+                        s, PRIORITY_DEFAULT
+                    );
                     PRIORITY_DEFAULT
                 }
             }
@@ -631,97 +636,19 @@ pub fn run(
             if workgraph::federation::parse_remote_ref(dep_id).is_some() {
                 continue; // Skip cross-repo deps
             }
-        }
-
-        // Generate ID if not provided
-        let task_id = match id {
-            Some(id) => {
-                if graph.get_node(id).is_some() {
-                    anyhow::bail!("Task with ID '{}' already exists", id);
-                }
-                id.to_string()
-            }
-            None => generate_id(title, graph),
-        };
-
-        // Validate after references (supports cross-repo peer:task-id syntax)
-        for blocker_id in after {
-            if blocker_id == &task_id {
-                anyhow::bail!("Task '{}' cannot block itself", task_id);
-            }
-            if workgraph::federation::parse_remote_ref(blocker_id).is_some() {
-                // Cross-repo dependency — validated at resolution time, not here
-            } else if graph.get_node(blocker_id).is_none() {
-                eprintln!(
-                    "Warning: blocker '{}' does not exist yet (will be treated as unresolved until created)",
-                    blocker_id
-                );
-                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
-                if let Some((suggestion, _)) =
-                    workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
-                {
-                    eprintln!("  → Did you mean '{}'?", suggestion);
-                }
-            }
-        }
-
-        let task = Task {
-            id: task_id.clone(),
-            title: title.to_string(),
-            description: description.map(String::from),
-            status: Status::Open,
-            assigned: assign.map(String::from),
-            estimate,
-            before: vec![],
-            after: after.to_vec(),
-            requires: vec![],
-            tags: tags.to_vec(),
-            skills: skills.to_vec(),
-            inputs: inputs.to_vec(),
-            deliverables: deliverables.to_vec(),
-            artifacts: vec![],
-            exec: None,
-            not_before: computed_not_before,
-            created_at: Some(Utc::now().to_rfc3339()),
-            started_at: None,
-            completed_at: None,
-            log,
-            retry_count: 0,
-            max_retries,
-            failure_reason: None,
-            model: model.map(String::from),
-            provider: provider.map(String::from),
-            verify: verify.map(String::from),
-            agent: None,
-            loop_iteration: 0,
-            cycle_failure_restarts: 0,
-            cycle_config,
-            ready_after: None,
-            paused,
-            visibility: visibility.to_string(),
-            context_scope: context_scope.map(String::from),
-            exec_mode: exec_mode.map(String::from),
-            token_usage: None,
-            session_id: None,
-            wait_condition: None,
-            checkpoint: None,
-            resurrection_count: 0,
-            last_resurrected_at: None,
-        };
-
-        graph.add_node(Node::Task(task));
-
-        // Maintain bidirectional consistency
-        for dep in after {
-            if workgraph::federation::parse_remote_ref(dep).is_some() {
-                continue;
-            }
-            if let Some(blocker) = graph.get_task_mut(dep)
-                && !blocker.before.contains(&task_id)
+            if let Some(dep_task) = graph.get_task_mut(dep_id)
+                && !dep_task.after.contains(&task_id)
             {
-                blocker.before.push(task_id.clone());
+                dep_task.after.push(task_id.clone());
+            }
+            // Maintain bidirectional consistency for the back-edge
+            if let Some(new_task) = graph.get_task_mut(&task_id)
+                && !new_task.before.contains(dep_id)
+            {
+                new_task.before.push(dep_id.clone());
             }
         }
+    }
 
     // Retroactive backlink repair: if any existing task references the newly
     // created task in its `after` list (a previously-phantom edge), add the
@@ -1221,6 +1148,32 @@ fn default_parent_after(graph: &workgraph::WorkGraph, after: &[String]) -> Vec<S
     }
 }
 
+/// Validate that a verify string is a syntactically valid shell command.
+fn validate_verify_command(cmd: &str) -> Result<()> {
+    let cmd_trimmed = cmd.trim();
+    if cmd_trimmed.is_empty() {
+        anyhow::bail!("Verify command cannot be empty");
+    }
+
+    let output = std::process::Command::new("bash")
+        .arg("-n")
+        .arg("-c")
+        .arg(cmd_trimmed)
+        .output()
+        .context("Failed to run bash syntax check on verify command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Verify command is not valid shell syntax:\n  {}\n\nError: {}",
+            cmd_trimmed,
+            stderr.trim(),
+        );
+    }
+
+    Ok(())
+}
+
 fn generate_id(title: &str, graph: &workgraph::WorkGraph) -> String {
     // Generate a slug from the title: take up to 3 non-numeric words,
     // plus any trailing numeric tokens (so "task 1" -> "task-1", not "task").
@@ -1308,7 +1261,9 @@ mod tests {
     fn verify_valid_command_accepted() {
         assert!(validate_verify_command("cargo test").is_ok());
         assert!(validate_verify_command("cargo test --lib").is_ok());
-        assert!(validate_verify_command("test -f output.txt && grep 'expected' output.txt").is_ok());
+        assert!(
+            validate_verify_command("test -f output.txt && grep 'expected' output.txt").is_ok()
+        );
         assert!(validate_verify_command("make check").is_ok());
         assert!(validate_verify_command("exit 0").is_ok());
         assert!(validate_verify_command("true").is_ok());

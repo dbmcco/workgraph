@@ -156,11 +156,9 @@ impl Default for VizOptions {
 /// Returns true if the task is an auto-generated internal task (assignment or evaluation).
 /// Chat (coordinator) tasks are exempt — always visible.
 fn is_internal_task(task: &Task) -> bool {
-    if task
-        .tags
-        .iter()
-        .any(|t| t == "coordinator-loop" || t == "chat-loop" || t == "user-board" || t == "evolution")
-    {
+    if task.tags.iter().any(|t| {
+        t == "coordinator-loop" || t == "chat-loop" || t == "user-board" || t == "evolution"
+    }) {
         return false;
     }
     workgraph::graph::is_system_task(&task.id)
@@ -363,12 +361,12 @@ fn add_parent_state_annotations(
             Status::PendingValidation => "[∴ validating]",
             _ => continue,
         };
-        let entry = annotations.entry(task.id.clone()).or_insert_with(|| {
-            AnnotationInfo {
+        let entry = annotations
+            .entry(task.id.clone())
+            .or_insert_with(|| AnnotationInfo {
                 text: String::new(),
                 dot_task_ids: Vec::new(),
-            }
-        });
+            });
         if !entry.text.contains(annotation) {
             if !entry.text.is_empty() {
                 entry.text.push(' ');
@@ -1534,8 +1532,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
 
         let empty: HashMap<String, AnnotationInfo> = HashMap::new();
-        let (_filtered, annots) =
-            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let (_filtered, annots) = filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
         let annot = annots
             .get("my-task")
             .expect("PendingEval parent must produce an evaluating annotation");
@@ -1565,8 +1562,7 @@ mod tests {
         graph.add_node(Node::Task(eval));
 
         let empty: HashMap<String, AnnotationInfo> = HashMap::new();
-        let (_filtered, annots) =
-            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let (_filtered, annots) = filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
         let annot = annots
             .get("my-task")
             .expect("PendingEval parent must produce an evaluating annotation");
@@ -1588,8 +1584,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
 
         let empty: HashMap<String, AnnotationInfo> = HashMap::new();
-        let (_filtered, annots) =
-            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let (_filtered, annots) = filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
         let annot = annots
             .get("my-task")
             .expect("PendingValidation parent must produce a validating annotation");
@@ -1609,8 +1604,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
 
         let empty: HashMap<String, AnnotationInfo> = HashMap::new();
-        let (_filtered, annots) =
-            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let (_filtered, annots) = filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
         assert!(!annots.contains_key("my-task"));
     }
 }

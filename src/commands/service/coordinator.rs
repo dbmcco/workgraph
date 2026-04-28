@@ -29,6 +29,46 @@ use workgraph::service::registry::AgentRegistry;
 use super::triage;
 use crate::commands::{graph_path, is_process_alive, kill_process_graceful, spawn};
 
+fn maybe_override_executor_for_task_route(
+    default_executor: &str,
+    task_provider: Option<&str>,
+    task_model: Option<&str>,
+) -> String {
+    if default_executor != "claude" {
+        return default_executor.to_string();
+    }
+    if let Some(provider) = task_provider {
+        return workgraph::config::provider_to_executor(provider).to_string();
+    }
+    if let Some(model) = task_model
+        && let Some(provider) = workgraph::config::parse_model_spec(model).provider
+    {
+        return workgraph::config::provider_to_executor(&provider).to_string();
+    }
+    default_executor.to_string()
+}
+
+fn resolve_ready_task_executor(
+    default_executor: &str,
+    task_provider: Option<&str>,
+    task_model: Option<&str>,
+    agent: Option<&agency::Agent>,
+) -> String {
+    let routed =
+        maybe_override_executor_for_task_route(default_executor, task_provider, task_model);
+    if routed != default_executor || task_provider.is_some() || task_model.is_some() {
+        return routed;
+    }
+    if let Some(agent) = agent {
+        return maybe_override_executor_for_task_route(
+            default_executor,
+            agent.preferred_provider.as_deref(),
+            agent.preferred_model.as_deref(),
+        );
+    }
+    default_executor.to_string()
+}
+
 /// Result of a single coordinator tick
 pub struct TickResult {
     /// Number of agents alive after the tick
@@ -562,10 +602,7 @@ fn evaluate_waiting_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -
                     message: format!("Failed: {}", reason),
                 });
                 modified = true;
-                eprintln!(
-                    "[dispatcher] Waiting task '{}' failed: {}",
-                    task_id, reason
-                );
+                eprintln!("[dispatcher] Waiting task '{}' failed: {}", task_id, reason);
             }
             continue;
         }
@@ -2729,17 +2766,20 @@ fn write_inline_artifacts(
     );
     let _ = fs::write(
         output_dir.join("prompt.txt"),
-        format!("[inline {} task — no LLM prompt; runs: {}]", executor, task_id),
+        format!(
+            "[inline {} task — no LLM prompt; runs: {}]",
+            executor, task_id
+        ),
     );
-    let wrapper = format!("#!/bin/bash\n# Auto-generated inline {} wrapper\n{}", executor, script);
+    let wrapper = format!(
+        "#!/bin/bash\n# Auto-generated inline {} wrapper\n{}",
+        executor, script
+    );
     let _ = fs::write(output_dir.join("run.sh"), &wrapper);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(
-            output_dir.join("run.sh"),
-            fs::Permissions::from_mode(0o755),
-        );
+        let _ = fs::set_permissions(output_dir.join("run.sh"), fs::Permissions::from_mode(0o755));
     }
 }
 
@@ -3371,13 +3411,13 @@ fn sort_tasks_by_priority_with_features<'a>(
     // Sort by effective priority descending (higher number = higher priority),
     // then by dispatch_count ascending (CFS-like fair share: prefer less-dispatched tasks)
     task_priorities.sort_by(|(a_task, a_prio), (b_task, b_prio)| {
-        b_prio.cmp(a_prio).then(a_task.dispatch_count.cmp(&b_task.dispatch_count))
+        b_prio
+            .cmp(a_prio)
+            .then(a_task.dispatch_count.cmp(&b_task.dispatch_count))
     });
 
     // Idle gate: only include idle (priority 0) tasks when no higher-priority tasks are in the set
-    let has_normal_or_higher = task_priorities
-        .iter()
-        .any(|(_, p)| *p >= PRIORITY_NORMAL);
+    let has_normal_or_higher = task_priorities.iter().any(|(_, p)| *p >= PRIORITY_NORMAL);
     if has_normal_or_higher {
         task_priorities.retain(|(_, p)| *p != PRIORITY_IDLE);
     }
@@ -3687,17 +3727,11 @@ fn spawn_agents_for_ready_tasks(
             );
             match spawn_shell_inline(dir, &task_id) {
                 Ok((agent_id, pid)) => {
-                    eprintln!(
-                        "[coordinator] Spawned shell {} (PID {})",
-                        agent_id, pid
-                    );
+                    eprintln!("[coordinator] Spawned shell {} (PID {})", agent_id, pid);
                     spawned += 1;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[coordinator] Failed to spawn shell for {}: {}",
-                        task_id, e
-                    );
+                    eprintln!("[coordinator] Failed to spawn shell for {}: {}", task_id, e);
                     record_spawn_failure(
                         &gp,
                         &task_id,
@@ -3741,10 +3775,7 @@ fn spawn_agents_for_ready_tasks(
                 );
                 match spawn_assign_inline(dir, &task_id) {
                     Ok((agent_id, pid)) => {
-                        eprintln!(
-                            "[dispatcher] Spawned assignment {} (PID {})",
-                            agent_id, pid
-                        );
+                        eprintln!("[dispatcher] Spawned assignment {} (PID {})", agent_id, pid);
                         record_dispatch(&gp, &task_id);
                         spawned += 1;
                     }
@@ -4626,8 +4657,12 @@ mod tests {
     fn test_inline_eval_script_without_special_agent_skips_record() {
         // When there is no resolved special agent, the script must NOT
         // emit a `wg evaluate record` line at all (success or failure branch).
-        let script =
-            build_inline_eval_script("wg evaluate run my-source", "evaluate-my-source", "/tmp/out.log", None);
+        let script = build_inline_eval_script(
+            "wg evaluate run my-source",
+            "evaluate-my-source",
+            "/tmp/out.log",
+            None,
+        );
 
         assert!(
             !script.contains("wg evaluate record"),
@@ -5990,11 +6025,8 @@ mod tests {
 
     #[test]
     fn test_task_route_promotes_default_claude_to_codex_for_codex_model() {
-        let routed = maybe_override_executor_for_task_route(
-            "claude",
-            None,
-            Some("codex:gpt-5-codex"),
-        );
+        let routed =
+            maybe_override_executor_for_task_route("claude", None, Some("codex:gpt-5-codex"));
         assert_eq!(routed, "codex");
     }
 
@@ -6336,8 +6368,11 @@ mod tests {
         let g = load_graph(&gp).unwrap();
         let t = g.get_task("test-task").unwrap();
         assert_eq!(t.spawn_failures, 5);
-        assert_eq!(t.status, Status::Incomplete,
-            "Circuit breaker should mark task Incomplete (not Failed) — evaluator decides failure");
+        assert_eq!(
+            t.status,
+            Status::Incomplete,
+            "Circuit breaker should mark task Incomplete (not Failed) — evaluator decides failure"
+        );
 
         // No failure_reason set — circuit breaker logs evidence but doesn't auto-fail
         assert!(
@@ -6359,9 +6394,7 @@ mod tests {
             "Expected circuit breaker log entry"
         );
         assert!(
-            t.log
-                .iter()
-                .any(|e| e.message.contains("evaluator review")),
+            t.log.iter().any(|e| e.message.contains("evaluator review")),
             "Circuit breaker log should mention evaluator review"
         );
     }
@@ -6703,7 +6736,11 @@ mod tests {
         ];
 
         let sorted = sort_tasks_by_priority_with_features(&graph, tasks, &config);
-        assert_eq!(sorted.len(), 1, "Idle should be excluded when Normal is present");
+        assert_eq!(
+            sorted.len(),
+            1,
+            "Idle should be excluded when Normal is present"
+        );
         assert_eq!(sorted[0].id, "task-normal");
 
         // Case 2: Only Idle ready → Idle included
@@ -6713,7 +6750,11 @@ mod tests {
         let tasks2: Vec<&Task> = vec![graph2.get_task("task-idle").unwrap()];
 
         let sorted2 = sort_tasks_by_priority_with_features(&graph2, tasks2, &config);
-        assert_eq!(sorted2.len(), 1, "Idle should be dispatched when nothing else is ready");
+        assert_eq!(
+            sorted2.len(),
+            1,
+            "Idle should be dispatched when nothing else is ready"
+        );
         assert_eq!(sorted2[0].id, "task-idle");
 
         // Case 3: Idle + Low ready (no Normal+) → both included
@@ -6733,7 +6774,11 @@ mod tests {
         ];
 
         let sorted3 = sort_tasks_by_priority_with_features(&graph3, tasks3, &config);
-        assert_eq!(sorted3.len(), 2, "Idle included when only Low tasks present");
+        assert_eq!(
+            sorted3.len(),
+            2,
+            "Idle included when only Low tasks present"
+        );
         assert_eq!(sorted3[0].id, "task-low");
         assert_eq!(sorted3[1].id, "task-idle");
     }
@@ -6913,8 +6958,10 @@ mod tests {
             "chat-loop tagged tasks must be daemon-managed (bug A regression)"
         );
 
-        let chat_legacy =
-            task_with_tags(".coordinator-0", &[workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG]);
+        let chat_legacy = task_with_tags(
+            ".coordinator-0",
+            &[workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG],
+        );
         assert!(
             is_daemon_managed(&chat_legacy),
             "legacy coordinator-loop tag still daemon-managed"

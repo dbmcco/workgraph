@@ -153,6 +153,7 @@ pub enum AnimationKind {
     EdgeChange,
     /// A previously hidden task was revealed (e.g. toggling system task visibility).
     /// Currently unused (revealed tasks appear immediately without animation),
+    FadeOut,
     /// but kept for the render fade-in path that references it.
     #[allow(dead_code)]
     Revealed,
@@ -280,7 +281,7 @@ fn flash_color_for_status(status: &Status) -> (u8, u8, u8) {
         Status::Abandoned => (140, 100, 160), // muted purple
         Status::Waiting | Status::PendingValidation => (60, 160, 220), // blue
         Status::PendingEval => (140, 230, 80), // chartreuse: between yellow (in-progress) and green (done)
-        Status::Incomplete => (255, 165, 0),  // orange
+        Status::Incomplete => (255, 165, 0),   // orange
     }
 }
 
@@ -292,6 +293,7 @@ fn flash_color_for_kind(kind: AnimationKind) -> (u8, u8, u8) {
         AnimationKind::ContentChange => (160, 160, 200), // soft blue-gray
         AnimationKind::Assignment => (200, 120, 220), // magenta
         AnimationKind::EdgeChange => (100, 180, 200), // teal
+        AnimationKind::FadeOut => (120, 120, 140), // soft gray-blue
         AnimationKind::Revealed => (120, 120, 140), // soft gray-blue
         AnimationKind::AnnotationClick => (255, 180, 220), // bright pink
     }
@@ -936,11 +938,7 @@ impl FilterPicker {
     /// Number of visible items (filtered list + optional custom row).
     pub fn visible_count(&self) -> usize {
         let base = self.filtered_indices.len();
-        if self.allow_custom {
-            base + 1
-        } else {
-            base
-        }
+        if self.allow_custom { base + 1 } else { base }
     }
 
     /// Whether the selected index points to the custom row.
@@ -976,7 +974,6 @@ impl FilterPicker {
         let max_offset = self.visible_count().saturating_sub(1);
         self.scroll_offset = (self.scroll_offset + n).min(max_offset);
     }
-
 
     /// Get the currently selected item's (id, description), or None if custom.
     pub fn selected_item(&self) -> Option<&(String, String)> {
@@ -2931,24 +2928,20 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
                         }
                     }
                     "tool_use" => {
-                        let name =
-                            block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                         let input = block
                             .get("input")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
                         let detail = match name {
-                            "Bash" => input
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|c| {
-                                    let c = c.trim();
-                                    if c.len() > 120 {
-                                        format!("{}…", &c[..c.floor_char_boundary(120)])
-                                    } else {
-                                        c.to_string()
-                                    }
-                                }),
+                            "Bash" => input.get("command").and_then(|v| v.as_str()).map(|c| {
+                                let c = c.trim();
+                                if c.len() > 120 {
+                                    format!("{}…", &c[..c.floor_char_boundary(120)])
+                                } else {
+                                    c.to_string()
+                                }
+                            }),
                             "Read" | "Write" => input
                                 .get("file_path")
                                 .and_then(|v| v.as_str())
@@ -2981,17 +2974,11 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
                         });
                     }
                     "thinking" => {
-                        let text = block
-                            .get("thinking")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let text = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
                         let text = text.trim();
                         if !text.is_empty() {
                             let truncated = if text.len() > 200 {
-                                format!(
-                                    "{}…",
-                                    &text[..text.floor_char_boundary(200)]
-                                )
+                                format!("{}…", &text[..text.floor_char_boundary(200)])
                             } else {
                                 text.to_string()
                             };
@@ -3011,7 +2998,11 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
             if events.len() == 1 {
                 events.into_iter().next()
             } else if events.len() > 1 {
-                let combined = events.iter().map(|e| e.summary.as_str()).collect::<Vec<_>>().join("\n");
+                let combined = events
+                    .iter()
+                    .map(|e| e.summary.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 Some(AgentStreamEvent {
                     kind: events[0].kind.clone(),
                     agent_id: default_agent_id.to_string(),
@@ -3058,10 +3049,7 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
                         .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let content = block
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     let truncated = if content.len() > 200 {
                         format!("{}…", &content[..content.floor_char_boundary(200)])
                     } else {
@@ -3107,10 +3095,7 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
             None
         }
         "system" => {
-            let subtype = val
-                .get("subtype")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
             match subtype {
                 "init" | "rate_limit_event" => None,
                 _ => {
@@ -3138,23 +3123,20 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
         }
         "tool_call" => {
             let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
-            let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-            let input = val
-                .get("input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let is_error = val
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let input = val.get("input").cloned().unwrap_or(serde_json::Value::Null);
             let detail = match name {
-                "Bash" | "bash" => input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .map(|c| {
-                        let c = c.trim();
-                        if c.len() > 120 {
-                            format!("{}…", &c[..c.floor_char_boundary(120)])
-                        } else {
-                            c.to_string()
-                        }
-                    }),
+                "Bash" | "bash" => input.get("command").and_then(|v| v.as_str()).map(|c| {
+                    let c = c.trim();
+                    if c.len() > 120 {
+                        format!("{}…", &c[..c.floor_char_boundary(120)])
+                    } else {
+                        c.to_string()
+                    }
+                }),
                 "Read" | "Write" | "Edit" => input
                     .get("file_path")
                     .and_then(|v| v.as_str())
@@ -3165,17 +3147,14 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
                     .map(|p| p.to_string()),
                 _ => None,
             };
-            let output_preview = val
-                .get("output")
-                .and_then(|v| v.as_str())
-                .map(|o| {
-                    let o = o.trim();
-                    if o.len() > 100 {
-                        format!("{}…", &o[..o.floor_char_boundary(100)])
-                    } else {
-                        o.to_string()
-                    }
-                });
+            let output_preview = val.get("output").and_then(|v| v.as_str()).map(|o| {
+                let o = o.trim();
+                if o.len() > 100 {
+                    format!("{}…", &o[..o.floor_char_boundary(100)])
+                } else {
+                    o.to_string()
+                }
+            });
             let call_summary = match detail {
                 Some(d) => format!("⌁ {} → {}", name, d),
                 None => format!("⌁ {}", name),
@@ -4642,6 +4621,10 @@ pub struct VizApp {
     pub task_snapshots: HashMap<String, TaskSnapshot>,
     /// Animation mode (from config: normal/fast/slow/reduced/off).
     pub animation_mode: AnimationMode,
+    /// Animation mode to restore when toggling animations back on.
+    pub pre_off_animation_mode: AnimationMode,
+    /// Short status notification rendered by legacy controls.
+    pub notification: Option<(String, Instant)>,
     /// Active slide animation on the inspector panel (for Alt+arrow view cycling).
     pub slide_animation: Option<SlideAnimation>,
     /// Cached: name length threshold for inline vs above-line display.
@@ -4967,6 +4950,8 @@ impl VizApp {
             next_fade_cleanup: None,
             task_snapshots: HashMap::new(),
             animation_mode,
+            pre_off_animation_mode: animation_mode,
+            notification: None,
             slide_animation: None,
             message_name_threshold: config.tui.message_name_threshold,
             message_indent: config.tui.message_indent,
@@ -5182,9 +5167,8 @@ impl VizApp {
                     // Schedule a force-refresh to clean up ghost lines after
                     // fade-out animations expire.
                     if !self.fading_out_lines.is_empty() {
-                        self.next_fade_cleanup = Some(
-                            now + std::time::Duration::from_secs_f64(duration + 0.1),
-                        );
+                        self.next_fade_cleanup =
+                            Some(now + std::time::Duration::from_secs_f64(duration + 0.1));
                     }
 
                     // Splice fading-out ghost lines back into the line arrays
@@ -5205,9 +5189,7 @@ impl VizApp {
                                     id.clone(),
                                     Animation {
                                         start: now,
-                                        flash_color: flash_color_for_kind(
-                                            AnimationKind::NewTask,
-                                        ),
+                                        flash_color: flash_color_for_kind(AnimationKind::NewTask),
                                         kind: AnimationKind::NewTask,
                                     },
                                 );
@@ -5266,10 +5248,8 @@ impl VizApp {
                                 // Check forward
                                 if old_idx + delta < old_task_order.len() {
                                     let candidate = &old_task_order[old_idx + delta];
-                                    if let Some(pos) = self
-                                        .task_order
-                                        .iter()
-                                        .position(|id| id == candidate)
+                                    if let Some(pos) =
+                                        self.task_order.iter().position(|id| id == candidate)
                                     {
                                         return Some(pos);
                                     }
@@ -5277,10 +5257,8 @@ impl VizApp {
                                 // Check backward
                                 if delta <= old_idx {
                                     let candidate = &old_task_order[old_idx - delta];
-                                    if let Some(pos) = self
-                                        .task_order
-                                        .iter()
-                                        .position(|id| id == candidate)
+                                    if let Some(pos) =
+                                        self.task_order.iter().position(|id| id == candidate)
                                     {
                                         return Some(pos);
                                     }
@@ -7047,7 +7025,7 @@ impl VizApp {
         if self.chat.awaiting_response() || self.right_panel_tab == RightPanelTab::Chat {
             self.check_coordinator_status();
             self.poll_chat_messages();
-            if self.chat.awaiting_response {
+            if self.chat.awaiting_response() {
                 self.poll_thinking_tokens();
                 self.poll_streaming_text();
             }
@@ -7198,6 +7176,10 @@ impl VizApp {
         self.fs_change_pending.load(Ordering::Relaxed)
             || self.last_refresh.elapsed() >= self.refresh_interval
     }
+
+    fn poll_thinking_tokens(&mut self) {}
+
+    fn poll_streaming_text(&mut self) {}
 
     /// Whether any time-based UI elements are active and need periodic redraws
     /// (animations, fading notifications, scrollbar timeouts, etc.).
@@ -7470,7 +7452,7 @@ impl VizApp {
                                 Status::Abandoned => 5,
                                 Status::Waiting | Status::PendingValidation => 3,
                                 Status::PendingEval => 0, // visible like in-progress
-                                Status::Incomplete => 1, // high priority like failed
+                                Status::Incomplete => 1,  // high priority like failed
                             };
                             (t.id.clone(), priority)
                         })
@@ -8027,9 +8009,9 @@ impl VizApp {
                         Status::Open | Status::Blocked | Status::Waiting => {
                             "scheduled (no score yet)"
                         }
-                        Status::InProgress
-                        | Status::PendingValidation
-                        | Status::PendingEval => "running…",
+                        Status::InProgress | Status::PendingValidation | Status::PendingEval => {
+                            "running…"
+                        }
                         Status::Done => "done (no score recorded)",
                         Status::Failed => "failed (no score recorded)",
                         Status::Abandoned => "abandoned (no score recorded)",
@@ -8733,10 +8715,7 @@ impl VizApp {
         let mut config = Config::load_or_default(&self.workgraph_dir);
         config.tui.detail_tail_lines = new_val;
         let _ = config.save(&self.workgraph_dir);
-        self.notification = Some((
-            format!("Tail preview: {} lines", new_val),
-            Instant::now(),
-        ));
+        self.notification = Some((format!("Tail preview: {} lines", new_val), Instant::now()));
     }
 
     /// Toggle collapse state of a section by name.
@@ -9484,6 +9463,7 @@ impl VizApp {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            detail_tail_lines: 0,
             detail_section_header_lines: Vec::new(),
             right_panel_visible: false,
             focused_panel: FocusedPanel::Graph,
@@ -9558,6 +9538,8 @@ impl VizApp {
             next_fade_cleanup: None,
             task_snapshots: HashMap::new(),
             animation_mode: AnimationMode::Normal,
+            pre_off_animation_mode: AnimationMode::Normal,
+            notification: None,
             slide_animation: None,
             message_name_threshold: 8,
             message_indent: 2,
@@ -10029,10 +10011,7 @@ impl VizApp {
                                 );
                             }
                         } else {
-                            self.push_toast(
-                                "New chat created".to_string(),
-                                ToastSeverity::Info,
-                            );
+                            self.push_toast("New chat created".to_string(), ToastSeverity::Info);
                         }
                         self.persist_tab_state();
                     } else {
@@ -13041,7 +13020,11 @@ impl VizApp {
         // Find a non-archived chat task whose title matches (new or legacy)
         let existing_coord: Option<u32> = graph.as_ref().and_then(|g| {
             g.tasks()
-                .filter(|t| t.tags.iter().any(|tag| workgraph::chat_id::is_chat_loop_tag(tag)))
+                .filter(|t| {
+                    t.tags
+                        .iter()
+                        .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+                })
                 .filter(|t| !matches!(t.status, workgraph::graph::Status::Abandoned))
                 .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
                 .filter(|t| t.title == expected_title || t.title == legacy_expected_title)
@@ -13061,7 +13044,9 @@ impl VizApp {
             // No chat for this user — check if ANY chat agents exist
             let any_exist = graph.as_ref().is_some_and(|g| {
                 g.tasks().any(|t| {
-                    t.tags.iter().any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+                    t.tags
+                        .iter()
+                        .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
                         && !matches!(t.status, workgraph::graph::Status::Abandoned)
                         && !t.tags.iter().any(|tag| tag == "archived")
                 })
@@ -13341,7 +13326,11 @@ impl VizApp {
         };
         let mut entries: Vec<(u32, String)> = graph
             .tasks()
-            .filter(|t| t.tags.iter().any(|tag| workgraph::chat_id::is_chat_loop_tag(tag)))
+            .filter(|t| {
+                t.tags
+                    .iter()
+                    .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+            })
             .filter(|t| !matches!(t.status, Status::Abandoned))
             .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
             .filter_map(|t| {
@@ -13398,9 +13387,7 @@ impl VizApp {
         // Drop tabs whose underlying tasks were abandoned/archived
         self.active_tabs.retain(|id| current.contains(id));
         // If the active coordinator was dropped, switch to first available tab
-        if !self.active_tabs.is_empty()
-            && !self.active_tabs.contains(&self.active_coordinator_id)
-        {
+        if !self.active_tabs.is_empty() && !self.active_tabs.contains(&self.active_coordinator_id) {
             let next = self.active_tabs[0];
             self.switch_coordinator(next);
         }
@@ -14767,8 +14754,7 @@ impl VizApp {
     /// wizard inline (design doc §7.1).
     pub fn run_settings_setup_hint(&mut self) {
         self.settings_panel.notice = Some(
-            "Run `wg setup` in a terminal to launch the interactive setup wizard."
-                .to_string(),
+            "Run `wg setup` in a terminal to launch the interactive setup wizard.".to_string(),
         );
     }
 
@@ -16454,8 +16440,8 @@ mod hud_tests {
                 output_file: "output.log".to_string(),
                 model: Some("openrouter/minimax".to_string()),
                 completed_at: None,
-            worktree_path: None,
-        },
+                worktree_path: None,
+            },
         );
         registry.save(_tmp.path()).unwrap();
 
@@ -17181,11 +17167,8 @@ mod hud_tests {
         let mut graph = WorkGraph::new();
         let mut parent = make_task_with_status("my-task", "My Task", Status::PendingEval);
         parent.description = Some("Test description".to_string());
-        let mut eval = make_task_with_status(
-            ".evaluate-my-task",
-            "Evaluate my-task",
-            Status::Failed,
-        );
+        let mut eval =
+            make_task_with_status(".evaluate-my-task", "Evaluate my-task", Status::Failed);
         eval.tags = vec!["evaluation".to_string(), "agency".to_string()];
         eval.after = vec!["my-task".to_string()];
         graph.add_node(Node::Task(parent));
@@ -20757,10 +20740,7 @@ mod task_counts_active_tests {
         app.load_stats_from_graph(&graph);
 
         // 2 InProgress + 2 PendingValidation + 1 PendingEval = 5 active.
-        let active_count = graph
-            .tasks()
-            .filter(|t| t.status.is_active())
-            .count();
+        let active_count = graph.tasks().filter(|t| t.status.is_active()).count();
         assert_eq!(active_count, 5, "fixture sanity check");
         assert_eq!(
             app.task_counts.in_progress, active_count,
@@ -20792,10 +20772,7 @@ mod task_counts_active_tests {
         app.load_stats_from_graph(&graph);
         app.update_vitals();
 
-        let active_count = graph
-            .tasks()
-            .filter(|t| t.status.is_active())
-            .count();
+        let active_count = graph.tasks().filter(|t| t.status.is_active()).count();
         assert_eq!(
             app.vitals.running, active_count,
             "vitals.running ({}) must match active task count ({})",
@@ -22369,17 +22346,22 @@ mod tui_chat_tests {
     /// Tab label color helper must return different colors for `.chat-N` vs `.coordinator-N`.
     #[test]
     fn tab_label_color_differs_for_chat_vs_coordinator() {
-        use ratatui::style::Color;
         use super::super::chat_palette::chat_task_label_color;
+        use ratatui::style::Color;
 
         let state_color = Color::Blue; // some state color
 
         let chat_color = chat_task_label_color(".chat-3", state_color);
         let coord_color = chat_task_label_color(".coordinator-3", state_color);
 
-        assert_eq!(chat_color, Color::Blue, ".chat-N should pass through state color");
+        assert_eq!(
+            chat_color,
+            Color::Blue,
+            ".chat-N should pass through state color"
+        );
         assert_ne!(
-            coord_color, Color::Blue,
+            coord_color,
+            Color::Blue,
             ".coordinator-N should not use the state color"
         );
         assert_ne!(
@@ -22924,7 +22906,10 @@ mod filter_picker_tests {
                 ("claude:opus".into(), "Most capable".into()),
                 ("claude:sonnet".into(), "Balanced".into()),
                 ("claude:haiku".into(), "Fastest".into()),
-                ("openrouter:anthropic/claude".into(), "Via OpenRouter".into()),
+                (
+                    "openrouter:anthropic/claude".into(),
+                    "Via OpenRouter".into(),
+                ),
                 ("openai:gpt-4o".into(), "OpenAI GPT-4o".into()),
             ],
             true,
@@ -23175,12 +23160,12 @@ mod agent_stream_tests {
 
     #[test]
     fn test_log_view_renders_agent_stream_events_for_inprogress_task() {
+        use crate::commands::viz::ascii::generate_ascii;
+        use crate::commands::viz::{LayoutMode, VizOutput};
         use std::collections::{HashMap, HashSet};
         use workgraph::graph::{Node, Status, WorkGraph};
         use workgraph::parser::save_graph;
         use workgraph::test_helpers::make_task_with_status;
-        use crate::commands::viz::ascii::generate_ascii;
-        use crate::commands::viz::{LayoutMode, VizOutput};
 
         let mut graph = WorkGraph::new();
         let mut task = make_task_with_status("my-task", "My Task", Status::InProgress);
@@ -23240,9 +23225,11 @@ mod agent_stream_tests {
             app.log_pane.stream_events[0].kind,
             AgentStreamEventKind::TextOutput
         );
-        assert!(app.log_pane.stream_events[0]
-            .summary
-            .contains("Starting implementation"));
+        assert!(
+            app.log_pane.stream_events[0]
+                .summary
+                .contains("Starting implementation")
+        );
         assert_eq!(
             app.log_pane.stream_events[1].kind,
             AgentStreamEventKind::ToolCall
@@ -23252,9 +23239,11 @@ mod agent_stream_tests {
             app.log_pane.stream_events[2].kind,
             AgentStreamEventKind::ToolResult
         );
-        assert!(app.log_pane.stream_events[2]
-            .summary
-            .contains("Build succeeded"));
+        assert!(
+            app.log_pane.stream_events[2]
+                .summary
+                .contains("Build succeeded")
+        );
         assert_eq!(
             app.log_pane.stream_events[3].kind,
             AgentStreamEventKind::Thinking
@@ -23267,18 +23256,14 @@ mod agent_stream_tests {
     /// per-task Log "four view modes" feature.
     #[test]
     fn test_log_view_cycles_through_four_modes() {
-        use crate::commands::viz::{LayoutMode, VizOutput};
         use crate::commands::viz::ascii::generate_ascii;
+        use crate::commands::viz::{LayoutMode, VizOutput};
         use std::collections::{HashMap, HashSet};
         use workgraph::graph::{Node, Status, WorkGraph};
         use workgraph::test_helpers::make_task_with_status;
 
         let mut graph = WorkGraph::new();
-        graph.add_node(Node::Task(make_task_with_status(
-            "t",
-            "T",
-            Status::Open,
-        )));
+        graph.add_node(Node::Task(make_task_with_status("t", "T", Status::Open)));
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
         let viz: VizOutput = generate_ascii(
@@ -23428,6 +23413,7 @@ mod dot_task_toggle_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         }
     }
 
@@ -23445,6 +23431,7 @@ mod dot_task_toggle_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         }
     }
 
@@ -23496,17 +23483,14 @@ mod dot_task_toggle_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
             &HashMap::new(),
+            &HashMap::new(),
         );
 
-        let regular_tasks: Vec<_> = graph
-            .tasks()
-            .filter(|t| !t.id.starts_with('.'))
-            .collect();
+        let regular_tasks: Vec<_> = graph.tasks().filter(|t| !t.id.starts_with('.')).collect();
         let regular_ids: HashSet<&str> = regular_tasks.iter().map(|t| t.id.as_str()).collect();
 
         let viz_regular = generate_ascii(
@@ -23516,10 +23500,10 @@ mod dot_task_toggle_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -23585,11 +23569,7 @@ mod dot_task_toggle_tests {
         app.center_on_best_target();
 
         assert_eq!(app.scroll.offset_y, 0, "scroll should reset to top");
-        assert_eq!(
-            app.selected_task_idx,
-            Some(0),
-            "should select first task"
-        );
+        assert_eq!(app.selected_task_idx, Some(0), "should select first task");
     }
 
     #[test]
@@ -23614,6 +23594,7 @@ mod dot_task_toggle_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         };
 
         let mut app = VizApp::from_viz_output_for_test(&viz);
@@ -23859,9 +23840,7 @@ mod dot_task_toggle_tests {
         app.plain_lines = app
             .lines
             .iter()
-            .map(|l| {
-                String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default()
-            })
+            .map(|l| String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default())
             .collect();
         app.update_scroll_bounds();
 
@@ -23880,9 +23859,7 @@ mod dot_task_toggle_tests {
         app.plain_lines = app
             .lines
             .iter()
-            .map(|l| {
-                String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default()
-            })
+            .map(|l| String::from_utf8(strip_ansi_escapes::strip(l.as_bytes())).unwrap_or_default())
             .collect();
         app.update_scroll_bounds();
 
@@ -23961,6 +23938,7 @@ mod dot_task_toggle_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         };
         let mut app = VizApp::from_viz_output_for_test(&viz);
 

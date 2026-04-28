@@ -22,6 +22,82 @@ use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
 use workgraph::models::ModelRegistry;
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeClientConfig {
+    provider: String,
+    api_base: Option<String>,
+    api_key: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+fn resolve_native_client_config(workgraph_dir: &Path, model: &str) -> NativeClientConfig {
+    let config = Config::load_or_default(workgraph_dir);
+    let raw_config = std::fs::read_to_string(workgraph_dir.join("config.toml"))
+        .ok()
+        .and_then(|s| toml::from_str::<toml::Value>(&s).ok());
+
+    let model_provider = workgraph::config::parse_model_spec(model)
+        .provider
+        .map(|p| workgraph::config::provider_to_native_provider(&p).to_string());
+    let legacy_provider = raw_config
+        .as_ref()
+        .and_then(|v| v.get("native_executor"))
+        .and_then(|v| v.get("provider"))
+        .and_then(toml::Value::as_str)
+        .map(String::from);
+    let provider = std::env::var("WG_LLM_PROVIDER")
+        .ok()
+        .or(model_provider)
+        .or(legacy_provider)
+        .unwrap_or_else(|| "oai-compat".to_string());
+
+    let endpoint = std::env::var("WG_ENDPOINT")
+        .ok()
+        .and_then(|name| config.llm_endpoints.find_by_name(&name))
+        .or_else(|| config.llm_endpoints.find_for_provider(&provider))
+        .or_else(|| config.llm_endpoints.find_default());
+
+    let api_base = std::env::var("WG_ENDPOINT_URL")
+        .ok()
+        .or_else(|| endpoint.and_then(|ep| ep.url.clone()))
+        .or_else(|| {
+            raw_config
+                .as_ref()
+                .and_then(|v| v.get("native_executor"))
+                .and_then(|v| v.get("api_base"))
+                .and_then(toml::Value::as_str)
+                .map(String::from)
+        });
+
+    let api_key = std::env::var("WG_API_KEY")
+        .ok()
+        .or_else(|| endpoint.and_then(|ep| ep.resolve_api_key(Some(workgraph_dir)).ok().flatten()))
+        .or_else(|| {
+            raw_config
+                .as_ref()
+                .and_then(|v| v.get("native_executor"))
+                .and_then(|v| v.get("api_key"))
+                .and_then(toml::Value::as_str)
+                .map(String::from)
+        });
+
+    let max_tokens = raw_config
+        .as_ref()
+        .and_then(|v| v.get("native_executor"))
+        .and_then(|v| v.get("max_tokens"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u32::try_from(v).ok());
+
+    NativeClientConfig {
+        provider,
+        api_base,
+        api_key,
+        max_tokens,
+    }
+}
+
 /// Run the native executor agent loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run(

@@ -18,7 +18,7 @@ pub enum ParseError {
 }
 
 /// RAII guard for file locks - automatically releases lock on drop
-struct FileLock {
+pub struct FileLock {
     #[cfg(unix)]
     file: File,
 }
@@ -200,8 +200,8 @@ pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
 fn save_graph_inner<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
     let path = path.as_ref();
 
-/// Save a graph to disk without acquiring any lock.
-fn save_graph_inner(graph: &WorkGraph, path: &Path) -> Result<(), ParseError> {
+    // Write to a temporary file in the same directory, then atomically rename.
+    // This ensures a crash mid-write leaves the original file intact.
     let parent = path.parent().unwrap_or(Path::new("."));
     let tmp_path = parent.join(format!(".graph.tmp.{}", std::process::id()));
 
@@ -251,6 +251,29 @@ pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), Pars
     // Lock is automatically released when _lock goes out of scope
 }
 
+/// Acquire the graph file's exclusive lock. Compatibility API for callers that
+/// need to hold the lock across several parser operations.
+pub fn lock_graph_file<P: AsRef<Path>>(path: P) -> Result<FileLock, ParseError> {
+    FileLock::acquire(get_lock_path(path.as_ref()))
+}
+
+/// Load a graph while the caller holds the graph lock.
+pub fn load_graph_locked<P: AsRef<Path>>(
+    path: P,
+    _lock: &FileLock,
+) -> Result<WorkGraph, ParseError> {
+    load_graph_inner(path.as_ref())
+}
+
+/// Save a graph while the caller holds the graph lock.
+pub fn save_graph_locked<P: AsRef<Path>>(
+    graph: &WorkGraph,
+    path: P,
+    _lock: &FileLock,
+) -> Result<(), ParseError> {
+    save_graph_inner(graph, path.as_ref())
+}
+
 /// Atomically load, modify, and save a graph file.
 ///
 /// The file lock is held for the entire load-modify-save cycle, preventing
@@ -278,6 +301,25 @@ where
     }
     Ok(graph)
     // Lock is automatically released when _lock goes out of scope
+}
+
+/// Atomically load, modify, and save a graph while holding the file lock.
+///
+/// This preserves the older `mutate_graph` API for callers/tests that need a
+/// typed closure result while using the same lock and atomic-write path as
+/// [`modify_graph`].
+pub fn mutate_graph<F, T, E>(path: impl AsRef<Path>, f: F) -> Result<T, E>
+where
+    F: FnOnce(&mut WorkGraph) -> Result<T, E>,
+    E: From<ParseError>,
+{
+    let path = path.as_ref();
+    let lock_path = get_lock_path(path);
+    let _lock = FileLock::acquire(&lock_path).map_err(E::from)?;
+    let mut graph = load_graph_inner(path).map_err(E::from)?;
+    let result = f(&mut graph)?;
+    save_graph_inner(&graph, path).map_err(E::from)?;
+    Ok(result)
 }
 
 #[cfg(test)]

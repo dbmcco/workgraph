@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status};
@@ -97,9 +97,6 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
                 ));
                 return false;
             }
-            Status::Done => anyhow::bail!("Task '{}' is already done", id),
-            Status::Failed => anyhow::bail!("Cannot claim task '{}': task is Failed. Use 'wg retry' to retry it.", id),
-            Status::Abandoned => anyhow::bail!("Cannot claim task '{}': task is Abandoned", id),
         }
 
         prev_status = format!("{:?}", task.status);
@@ -134,7 +131,10 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
 
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
-        dir, "claim", Some(id), actor,
+        dir,
+        "claim",
+        Some(id),
+        actor,
         serde_json::json!({ "prev_status": prev_status, "prev_assigned": prev_assigned }),
         config.log.rotation_threshold,
     );
@@ -241,7 +241,10 @@ pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
 
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
-        dir, "unclaim", Some(id), prev_assigned.as_deref(),
+        dir,
+        "unclaim",
+        Some(id),
+        prev_assigned.as_deref(),
         serde_json::json!({ "prev_assigned": prev_assigned }),
         config.log.rotation_threshold,
     );

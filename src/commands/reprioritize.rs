@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use workgraph::graph::{PRIORITY_DEFAULT, PRIORITY_CRITICAL, PRIORITY_HIGH, PRIORITY_IDLE, PRIORITY_LOW};
+use workgraph::graph::{
+    PRIORITY_CRITICAL, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_IDLE, PRIORITY_LOW,
+};
 use workgraph::parser::modify_graph;
 
 use super::add::parse_priority;

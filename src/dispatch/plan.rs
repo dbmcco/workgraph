@@ -213,8 +213,7 @@ pub fn plan_spawn(
     // `agency-still-picks` tracked: `wg init -x codex` was being silently
     // rewritten to native because the agency-level override sat in
     // resolve_executor's precedence step 3 and shadowed step 4).
-    let (executor, executor_source) =
-        enforce_model_compat(executor, executor_source, &model);
+    let (executor, executor_source) = enforce_model_compat(executor, executor_source, &model);
 
     // ----- 3. Endpoint (executor-scoped) -----
     let (endpoint, endpoint_source) = if executor.needs_endpoint() {
@@ -232,10 +231,7 @@ pub fn plan_spawn(
             )
         }
     } else {
-        (
-            None,
-            format!("none (executor={})", executor.as_str()),
-        )
+        (None, format!("none (executor={})", executor.as_str()))
     };
 
     // ----- 4. Env -----
@@ -243,7 +239,10 @@ pub fn plan_spawn(
     // because they come from the same `executor` + `model` resolved above.
     // The spawn-execution layer adds wrapper-internal vars on top.
     let mut env = HashMap::new();
-    env.insert("WG_EXECUTOR_TYPE".to_string(), executor.as_str().to_string());
+    env.insert(
+        "WG_EXECUTOR_TYPE".to_string(),
+        executor.as_str().to_string(),
+    );
     env.insert("WG_MODEL".to_string(), model.raw.clone());
 
     let provenance = SpawnProvenance {
@@ -394,7 +393,10 @@ mod tests {
     fn test_executor_floor_is_honored() {
         let mut config = Config::default();
         config.coordinator.executor = Some("claude".to_string());
-        config.llm_endpoints.endpoints.push(openrouter_default_endpoint());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(openrouter_default_endpoint());
 
         let mut task = base_task("t1");
         task.model = Some("opus".to_string());
@@ -415,7 +417,10 @@ mod tests {
         let mut config = Config::default();
         config.coordinator.executor = Some("claude".to_string());
         // Even with a global default endpoint configured, claude must not get one.
-        config.llm_endpoints.endpoints.push(openrouter_default_endpoint());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(openrouter_default_endpoint());
 
         let task = base_task("t1");
         let plan = plan_spawn(&task, &config, None, Some("opus")).unwrap();
@@ -441,7 +446,10 @@ mod tests {
         let mut config = Config::default();
         config.coordinator.executor = Some("native".to_string());
         config.coordinator.model = Some("openrouter:deepseek/deepseek-v3.2".to_string());
-        config.llm_endpoints.endpoints.push(openrouter_default_endpoint());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(openrouter_default_endpoint());
 
         let task = base_task("t1");
         let plan = plan_spawn(&task, &config, None, None).unwrap();
@@ -461,7 +469,10 @@ mod tests {
         // Sanity: the chosen executor matches the local [dispatcher] override.
         assert_eq!(plan.executor, ExecutorKind::Native);
         assert!(plan.provenance.executor_source.contains("[dispatcher]"));
-        assert_eq!(plan.endpoint.as_ref().map(|e| e.name.as_str()), Some("openrouter"));
+        assert_eq!(
+            plan.endpoint.as_ref().map(|e| e.name.as_str()),
+            Some("openrouter")
+        );
 
         // The log line is what gets printed on every spawn — render it and
         // verify each field is mentioned.

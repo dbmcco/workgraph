@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -284,7 +284,12 @@ fn unpause_task(graph: &mut WorkGraph, task_id: &str, action: &str) {
 /// All tasks and their edges are written together into the same graph
 /// object before the caller saves — guaranteeing a single, atomic write.
 /// Idempotent: skips tasks that already have scaffold siblings.
-fn scaffold_eval_for_unpaused(dir: &Path, graph: &mut WorkGraph, task_ids: &[String], action: &str) {
+fn scaffold_eval_for_unpaused(
+    dir: &Path,
+    graph: &mut WorkGraph,
+    task_ids: &[String],
+    action: &str,
+) {
     let config = workgraph::config::Config::load_or_default(dir);
 
     // Collect (id, title) pairs, filtering out system tasks

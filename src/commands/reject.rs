@@ -31,10 +31,7 @@ pub fn run(dir: &Path, id: &str, reason: &str) -> Result<()> {
             }
         };
 
-        if !matches!(
-            task.status,
-            Status::PendingValidation | Status::PendingEval
-        ) {
+        if !matches!(task.status, Status::PendingValidation | Status::PendingEval) {
             error = Some(anyhow::anyhow!(
                 "Task '{}' is not awaiting validation (status: {:?}). Only pending-validation \
                  and pending-eval tasks can be rejected.",

@@ -536,14 +536,6 @@ pub struct CoordinatorState {
     /// Session cost tracking for OpenRouter cost caps
     #[serde(default)]
     pub cost_tracking: SessionCostTracking,
-    /// Per-coordinator model override. When set, the coordinator agent uses this
-    /// model instead of the daemon-wide default. Persists across daemon restarts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
-    /// Per-coordinator executor override. When set, the coordinator agent uses this
-    /// executor instead of the daemon-wide default. Persists across daemon restarts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executor_override: Option<String>,
 }
 
 impl CoordinatorState {
@@ -837,6 +829,55 @@ WantedBy=default.target
     println!("  journalctl --user -u {unit_name} -f");
 
     Ok(())
+}
+
+pub(crate) const COORDINATOR_RUNTIME_EXECUTOR_ENV: &str = "WG_COORDINATOR_RUNTIME_EXECUTOR";
+pub(crate) const COORDINATOR_MODEL_OVERRIDE_ENV: &str = "WG_COORDINATOR_MODEL_OVERRIDE";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoordinatorRuntimeIntent {
+    pub executor: String,
+    pub model: Option<String>,
+}
+
+impl CoordinatorRuntimeIntent {
+    fn from_daemon_config(daemon_cfg: &DaemonConfig) -> Self {
+        Self {
+            executor: daemon_cfg.executor.clone(),
+            model: daemon_cfg.model.clone(),
+        }
+    }
+}
+
+fn resolve_daemon_config(
+    dir: &Path,
+    cli_max_agents: Option<usize>,
+    cli_executor: Option<&str>,
+    cli_interval: Option<u64>,
+    cli_model: Option<&str>,
+) -> DaemonConfig {
+    let config = Config::load_merged(dir).unwrap_or_else(|_| Config::load_or_default(dir));
+    let state = CoordinatorState::load(dir).unwrap_or_default();
+    let executor = cli_executor
+        .map(str::to_string)
+        .or_else(|| state.executor_override.clone())
+        .unwrap_or_else(|| config.coordinator.effective_executor());
+    let model = cli_model
+        .map(str::to_string)
+        .or_else(|| state.model_override.clone())
+        .or_else(|| config.coordinator.model.clone());
+
+    DaemonConfig {
+        max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
+        executor,
+        poll_interval: Duration::from_secs(
+            cli_interval.unwrap_or(config.coordinator.poll_interval),
+        ),
+        model,
+        provider: config.coordinator.provider.clone(),
+        paused: state.paused,
+        settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
+    }
 }
 
 /// Run a single coordinator tick (debug/testing command)
@@ -2067,8 +2108,6 @@ pub fn run_daemon(
         poll_interval: daemon_cfg.poll_interval.as_secs(),
         executor: daemon_cfg.executor.clone(),
         model: daemon_cfg.model.clone(),
-        executor_override: previous_coord_state.executor_override,
-        model_override: previous_coord_state.model_override,
         ticks: 0,
         last_tick: None,
         agents_alive: 0,
@@ -2257,51 +2296,54 @@ pub fn run_daemon(
         }
     };
 
-    let _graph_watcher: Option<workgraph::service::graph_watcher::GraphWatcher> =
-        if config.coordinator.graph_watch_enabled && graph_pipe_write_fd >= 0 {
-            let debounce_ms = config.coordinator.graph_watch_debounce_ms;
-            let graph_file = super::graph_path(&dir);
-            let pipe_w = graph_pipe_write_fd;
-            match workgraph::service::graph_watcher::GraphWatcher::start(
-                &graph_file,
-                Duration::from_millis(debounce_ms),
-                move || {
-                    // Best-effort wake: write one byte. EAGAIN means the pipe
-                    // is already non-empty (a previous wake hasn't been drained
-                    // yet) which is fine — that wake is still pending.
-                    let byte: u8 = 1;
-                    unsafe {
-                        libc::write(pipe_w, std::ptr::from_ref(&byte).cast::<libc::c_void>(), 1);
-                    }
-                },
-            ) {
-                Ok(watcher) => {
-                    logger.info(&format!(
+    let _graph_watcher: Option<workgraph::service::graph_watcher::GraphWatcher> = if config
+        .coordinator
+        .graph_watch_enabled
+        && graph_pipe_write_fd >= 0
+    {
+        let debounce_ms = config.coordinator.graph_watch_debounce_ms;
+        let graph_file = super::graph_path(&dir);
+        let pipe_w = graph_pipe_write_fd;
+        match workgraph::service::graph_watcher::GraphWatcher::start(
+            &graph_file,
+            Duration::from_millis(debounce_ms),
+            move || {
+                // Best-effort wake: write one byte. EAGAIN means the pipe
+                // is already non-empty (a previous wake hasn't been drained
+                // yet) which is fine — that wake is still pending.
+                let byte: u8 = 1;
+                unsafe {
+                    libc::write(pipe_w, std::ptr::from_ref(&byte).cast::<libc::c_void>(), 1);
+                }
+            },
+        ) {
+            Ok(watcher) => {
+                logger.info(&format!(
                         "Graph watcher active on {} (debounce={}ms, primary trigger; safety_interval={}s)",
                         graph_file.display(),
                         debounce_ms,
                         daemon_cfg.poll_interval.as_secs(),
                     ));
-                    Some(watcher)
-                }
-                Err(e) => {
-                    logger.warn(&format!(
-                        "Graph watcher init failed ({}); falling back to safety-timer polling at {}s",
-                        e,
-                        daemon_cfg.poll_interval.as_secs(),
-                    ));
-                    None
-                }
+                Some(watcher)
             }
-        } else {
-            if !config.coordinator.graph_watch_enabled {
-                logger.info(&format!(
+            Err(e) => {
+                logger.warn(&format!(
+                    "Graph watcher init failed ({}); falling back to safety-timer polling at {}s",
+                    e,
+                    daemon_cfg.poll_interval.as_secs(),
+                ));
+                None
+            }
+        }
+    } else {
+        if !config.coordinator.graph_watch_enabled {
+            logger.info(&format!(
                     "Graph watcher disabled (coordinator.graph_watch_enabled = false); using safety-timer polling at {}s",
                     daemon_cfg.poll_interval.as_secs(),
                 ));
-            }
-            None
-        };
+        }
+        None
+    };
 
     // Urgent wake: when a UserChat IPC arrives, tick immediately without settling delay.
     // This flag bypasses both the settling delay and the paused state, because
@@ -3582,7 +3624,12 @@ pub fn run_create_coordinator(
 /// Delete a coordinator session via IPC
 #[cfg(unix)]
 pub fn run_delete_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
-    let response = send_request(dir, &IpcRequest::DeleteChat { chat_id: coordinator_id })?;
+    let response = send_request(
+        dir,
+        &IpcRequest::DeleteChat {
+            chat_id: coordinator_id,
+        },
+    )?;
 
     if !response.ok {
         let msg = response
@@ -3673,7 +3720,12 @@ pub fn run_set_coordinator_executor(
 /// Archive a coordinator session via IPC (mark as Done)
 #[cfg(unix)]
 pub fn run_archive_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
-    let response = send_request(dir, &IpcRequest::ArchiveChat { chat_id: coordinator_id })?;
+    let response = send_request(
+        dir,
+        &IpcRequest::ArchiveChat {
+            chat_id: coordinator_id,
+        },
+    )?;
 
     if !response.ok {
         let msg = response
@@ -3703,7 +3755,12 @@ pub fn run_archive_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -
 /// Stop a coordinator session via IPC (kill agent, reset to Open)
 #[cfg(unix)]
 pub fn run_stop_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
-    let response = send_request(dir, &IpcRequest::StopChat { chat_id: coordinator_id })?;
+    let response = send_request(
+        dir,
+        &IpcRequest::StopChat {
+            chat_id: coordinator_id,
+        },
+    )?;
 
     if !response.ok {
         let msg = response
@@ -3815,8 +3872,7 @@ fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
     let graph_path = crate::commands::graph_path(dir);
     let mut purged: Vec<u32> = Vec::new();
     workgraph::parser::modify_graph(&graph_path, |graph| {
-        let mut chat_ids: std::collections::BTreeSet<u32> =
-            std::collections::BTreeSet::new();
+        let mut chat_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         for task in graph.tasks() {
             let has_chat_tag = task
                 .tags
@@ -3873,7 +3929,12 @@ fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
 /// Interrupt a coordinator's current generation via IPC (sends SIGINT, does NOT kill).
 #[cfg(unix)]
 pub fn run_interrupt_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
-    let response = send_request(dir, &IpcRequest::InterruptChat { chat_id: coordinator_id })?;
+    let response = send_request(
+        dir,
+        &IpcRequest::InterruptChat {
+            chat_id: coordinator_id,
+        },
+    )?;
 
     if !response.ok {
         let msg = response

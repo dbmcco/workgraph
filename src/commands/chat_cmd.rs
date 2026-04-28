@@ -95,9 +95,7 @@ pub fn resolve_chat_id(graph: &WorkGraph, reference: &str) -> Option<u32> {
             .strip_prefix("chat: ")
             .map(|rest| rest == want)
             .unwrap_or(false);
-        if matches_suffix
-            && let Some(id) = chat_id::parse_chat_task_id(&task.id)
-        {
+        if matches_suffix && let Some(id) = chat_id::parse_chat_task_id(&task.id) {
             return Some(id);
         }
     }
@@ -188,13 +186,7 @@ fn run_create_via_ipc(
     executor: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    crate::commands::service::run_create_coordinator(
-        dir,
-        name,
-        model,
-        executor,
-        json,
-    )
+    crate::commands::service::run_create_coordinator(dir, name, model, executor, json)
 }
 
 #[cfg(not(unix))]
@@ -215,9 +207,7 @@ fn run_create_direct(
     executor: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let next_id = crate::commands::service::ipc::create_chat_in_graph(
-        dir, name, model, executor,
-    )?;
+    let next_id = crate::commands::service::ipc::create_chat_in_graph(dir, name, model, executor)?;
     let task_id = chat_id::format_chat_task_id(next_id);
     if json {
         let v = serde_json::json!({
@@ -247,8 +237,8 @@ fn run_create_direct(
 
 /// `wg chat list` — show all chat entities with truthful status.
 pub fn run_list(dir: &Path, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
 
     let daemon_running = service_is_running(dir);
     let supervised = supervised_chat_ids(dir);
@@ -293,10 +283,7 @@ pub fn run_list(dir: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<6}  {:<14}  {:<24}  {}",
-        "ID", "STATUS", "TASK", "TITLE"
-    );
+    println!("{:<6}  {:<14}  {:<24}  {}", "ID", "STATUS", "TASK", "TITLE");
     for (cid, t, s) in rows {
         let suffix = if matches!(s, ChatRuntimeStatus::Dormant) && !daemon_running {
             " — service stopped"
@@ -321,8 +308,8 @@ pub fn run_list(dir: &Path, json: bool) -> Result<()> {
 
 /// `wg chat show` — detailed view of a single chat entity.
 pub fn run_show(dir: &Path, reference: &str, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
 
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
@@ -366,7 +353,10 @@ pub fn run_show(dir: &Path, reference: &str, json: bool) -> Result<()> {
     if let Some(m) = model_override {
         println!("  model    : {}", m);
     }
-    println!("  service  : {}", if daemon_running { "running" } else { "stopped" });
+    println!(
+        "  service  : {}",
+        if daemon_running { "running" } else { "stopped" }
+    );
     Ok(())
 }
 
@@ -381,17 +371,14 @@ pub fn run_show(dir: &Path, reference: &str, json: bool) -> Result<()> {
 /// the message up via the standard chat loop. When down, the message
 /// queues until the daemon (re)starts.
 pub fn run_send(dir: &Path, reference: &str, message: &str, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
 
     // Make sure the chat dir exists (chat::append_inbox_for creates parent
     // dirs, but we want a stable filesystem location for non-running chats).
-    let request_id = format!(
-        "wg-chat-send-{}",
-        chrono::Utc::now().timestamp_millis()
-    );
+    let request_id = format!("wg-chat-send-{}", chrono::Utc::now().timestamp_millis());
     let inbox_id = workgraph::chat::append_inbox_for(dir, cid, message, &request_id)
         .with_context(|| format!("Failed to append to chat {} inbox", cid))?;
 
@@ -426,8 +413,8 @@ pub fn run_send(dir: &Path, reference: &str, message: &str, json: bool) -> Resul
 /// `wg chat stop` — SIGTERM the live handler (chat entity stays in graph).
 /// Requires the daemon (the supervisor owns the handler).
 pub fn run_stop(dir: &Path, reference: &str, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
     if !service_is_running(dir) {
@@ -444,8 +431,8 @@ pub fn run_stop(dir: &Path, reference: &str, json: bool) -> Result<()> {
 /// `wg chat resume` — ask the supervisor to (re)spawn the handler.
 /// Requires the daemon. Errors clearly when down.
 pub fn run_resume(dir: &Path, reference: &str, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
     if !service_is_running(dir) {
@@ -500,8 +487,8 @@ pub fn run_resume(dir: &Path, reference: &str, json: bool) -> Result<()> {
 /// `wg chat archive` — mark Done + tag 'archived'. Reversible-ish (archived
 /// chats can still be inspected; their dirs are moved to .archive/).
 pub fn run_archive(dir: &Path, reference: &str, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
     if service_is_running(dir) {
@@ -554,8 +541,8 @@ fn archive_chat_direct(dir: &Path, cid: u32, json: bool) -> Result<()> {
 
 /// `wg chat delete` — abandon the graph task and remove the chat dir.
 pub fn run_delete(dir: &Path, reference: &str, yes: bool, json: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
 
@@ -628,8 +615,8 @@ fn delete_chat_direct(dir: &Path, cid: u32, json: bool) -> Result<()> {
 /// non-TTY) falls back to streaming the outbox to stderr. The CLI
 /// fallback is read-only — to send a message use `wg chat send`.
 pub fn run_attach(dir: &Path, reference: &str, force_cli: bool) -> Result<()> {
-    let graph = workgraph::parser::load_graph(&graph_path(dir))
-        .with_context(|| "Failed to load graph")?;
+    let graph =
+        workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
 
@@ -715,8 +702,7 @@ mod tests {
         run_send(dir, &cid.to_string(), "hi from test", true).unwrap();
 
         // Inbox file exists and has one message
-        let inbox = workgraph::chat::chat_dir_for_ref(dir, &cid.to_string())
-            .join("inbox.jsonl");
+        let inbox = workgraph::chat::chat_dir_for_ref(dir, &cid.to_string()).join("inbox.jsonl");
         let contents = std::fs::read_to_string(&inbox).expect("inbox file written");
         assert!(
             contents.contains("hi from test"),
@@ -755,7 +741,10 @@ mod tests {
 
         // Build the in-memory representation list_truthfully would emit.
         let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
-        for task in g.tasks().filter(|t| t.tags.iter().any(|x| chat_id::is_chat_loop_tag(x))) {
+        for task in g
+            .tasks()
+            .filter(|t| t.tags.iter().any(|x| chat_id::is_chat_loop_tag(x)))
+        {
             let status = classify_chat_task(task, false, &[]);
             assert_eq!(
                 status,

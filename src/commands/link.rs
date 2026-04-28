@@ -3,15 +3,12 @@
 //! `wg link A B` — A depends on B (A comes after B)
 //! `wg unlink A B` — removes the dependency from A to B
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use workgraph::graph::Status;
 use workgraph::parser::modify_graph;
 
-#[cfg(test)]
 use super::graph_path;
-#[cfg(test)]
-use workgraph::parser::load_graph;
 
 /// Link: make `task_id` depend on `dependency_id` (task comes after dependency).
 pub fn run_link(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
@@ -19,9 +16,10 @@ pub fn run_link(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
         anyhow::bail!("A task cannot depend on itself");
     }
 
-    let linked = super::mutate_workgraph(dir, |graph| {
-        graph.get_task_or_err(task_id)?;
-        graph.get_task_or_err(dependency_id)?;
+    let path = graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
 
     let mut error: Option<anyhow::Error> = None;
     let mut already_linked = false;
@@ -101,9 +99,10 @@ pub fn run_link(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
 
 /// Unlink: remove the dependency of `task_id` on `dependency_id`.
 pub fn run_unlink(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
-    let removed = super::mutate_workgraph(dir, |graph| {
-        graph.get_task_or_err(task_id)?;
-        graph.get_task_or_err(dependency_id)?;
+    let path = graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
 
     let mut error: Option<anyhow::Error> = None;
     let mut not_linked = false;

@@ -124,15 +124,29 @@ fn wg_ok_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> String 
 /// Initialise a fresh workgraph in a temp directory and return the .workgraph path.
 fn init_workgraph(tmp: &TempDir) -> PathBuf {
     let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init", "--executor", "shell"]);
+    wg_ok(&wg_dir, &["init", "--model", "claude:opus"]);
     wg_dir
 }
 
 /// Write config.toml to enable the coordinator agent.
 fn enable_coordinator_agent(wg_dir: &Path) {
     let config_path = wg_dir.join("config.toml");
-    let config = "[coordinator]\ncoordinator_agent = true\n";
+    let config = "[dispatcher]\ncoordinator_agent = true\n";
     fs::write(&config_path, config).unwrap();
+}
+
+fn create_primary_chat(wg_dir: &Path) {
+    wg_ok(
+        wg_dir,
+        &[
+            "chat",
+            "create",
+            "--name",
+            "coordinator",
+            "--executor",
+            "claude",
+        ],
+    );
 }
 
 /// Stop the daemon, ignoring errors (best-effort cleanup).
@@ -211,6 +225,7 @@ fn wait_for_coordinator_agent(wg_dir: &Path) {
         }
         if let Ok(content) = fs::read_to_string(&log_path)
             && (content.contains("Claude CLI started")
+                || content.contains("Coordinator agent 0 spawned successfully")
                 || content.contains("Coordinator agent spawned successfully"))
         {
             return;
@@ -375,6 +390,7 @@ impl<'a> CoordinatorDaemonGuard<'a> {
     /// Start with additional env vars (e.g., MOCK_CRASH_FILE for crash tests).
     fn start_with_env(wg_dir: &'a Path, mock: &MockClaude, extra_env: &[(&str, &str)]) -> Self {
         enable_coordinator_agent(wg_dir);
+        create_primary_chat(wg_dir);
 
         let mut env_vars: Vec<(String, String)> = vec![("PATH".to_string(), mock.path_env())];
         for &(key, val) in extra_env {
@@ -489,15 +505,15 @@ fn coordinator_spawn_task_dry_run_primary() {
     );
 }
 
-/// Unsupported coordinator executors should be rejected explicitly.
+/// Native coordinator executors should route through the nex handler.
 #[test]
-fn coordinator_spawn_task_rejects_unsupported_executor() {
+fn coordinator_spawn_task_routes_native_executor() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
 
     fs::write(
         wg_dir.join("config.toml"),
-        "[coordinator]\ncoordinator_agent = true\nexecutor = \"native\"\nmodel = \"openrouter:minimax/minimax-m1\"\n",
+        "[dispatcher]\ncoordinator_agent = true\nexecutor = \"native\"\nmodel = \"openrouter:minimax/minimax-m1\"\n",
     )
     .unwrap();
 
@@ -511,24 +527,25 @@ fn coordinator_spawn_task_rejects_unsupported_executor() {
             "--dry-run",
         ],
     );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     assert!(
-        !output.status.success(),
-        "Expected unsupported executor to fail.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success(),
+        "Expected native coordinator dry-run to succeed.\nstdout: {}\nstderr: {}",
+        stdout,
         stderr
     );
     assert!(
-        stderr.contains("unsupported coordinator executor"),
-        "Expected unsupported executor error, got:\n{}",
-        stderr
+        stdout.contains("wg nex"),
+        "Expected dry-run to route through nex, got:\n{}",
+        stdout
     );
 }
 
-/// Unsupported coordinator roles for this tranche should be rejected explicitly.
+/// Coordinator role overrides should still resolve to the chat handler path.
 #[test]
-fn coordinator_spawn_task_rejects_unsupported_role() {
+fn coordinator_spawn_task_role_override_routes_to_handler() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
 
@@ -542,18 +559,19 @@ fn coordinator_spawn_task_rejects_unsupported_role() {
             "--dry-run",
         ],
     );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     assert!(
-        !output.status.success(),
-        "Expected unsupported role to fail.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success(),
+        "Expected role override dry-run to succeed.\nstdout: {}\nstderr: {}",
+        stdout,
         stderr
     );
     assert!(
-        stderr.contains("unsupported coordinator role for this tranche"),
-        "Expected unsupported role error, got:\n{}",
-        stderr
+        stdout.contains("wg claude-handler"),
+        "Expected dry-run to route through claude-handler, got:\n{}",
+        stdout
     );
 }
 
@@ -605,6 +623,7 @@ fn coordinator_agent_uses_claude_handler_subprocess() {
 fn claude_handler_rejects_duplicate_coordinator_session_owner() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
+    create_primary_chat(&wg_dir);
     let mock = MockClaude::new();
     let path_env = mock.path_env();
     let env_vars = [("PATH", path_env.as_str())];
@@ -615,7 +634,8 @@ fn claude_handler_rejects_duplicate_coordinator_session_owner() {
         &env_vars,
     ));
 
-    let lock_path = wg_dir.join("chat").join(".handler.pid");
+    let chat_dir = workgraph::chat::chat_dir_for_ref(&wg_dir, "coordinator-0");
+    let lock_path = workgraph::session_lock::SessionLock::lock_path(&chat_dir);
     let lock_contents = wait_for_lock_owner_pid(&lock_path, first.id());
 
     assert!(
@@ -870,6 +890,7 @@ fn coordinator_agent_fallback_when_unavailable() {
     let wg_dir = init_workgraph(&tmp);
     let _guard = RealDaemonGuard { wg_dir: &wg_dir };
     enable_coordinator_agent(&wg_dir);
+    create_primary_chat(&wg_dir);
 
     // Start daemon WITHOUT mock claude on PATH — claude binary won't be found.
     // Use an empty dir as PATH prefix that doesn't contain `claude`.
@@ -1021,6 +1042,7 @@ impl Drop for RealDaemonGuard<'_> {
 /// Start a daemon with the real Claude CLI as coordinator agent.
 fn start_real_coordinator_daemon(wg_dir: &Path) {
     enable_coordinator_agent(wg_dir);
+    create_primary_chat(wg_dir);
     let output = wg_cmd(
         wg_dir,
         &["service", "start", "--interval", "600", "--max-agents", "0"],

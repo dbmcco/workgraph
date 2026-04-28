@@ -434,7 +434,7 @@ fn key_label(code: KeyCode, modifiers: KeyModifiers) -> String {
     }
 }
 
-fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     // Help overlay intercepts all keys when shown
     if app.show_help {
         match code {
@@ -1106,8 +1106,7 @@ pub(super) fn handle_launcher_mouse_click(app: &mut VizApp, row: u16, column: u1
                     launcher.model_picker.selected = *filtered_idx;
                 }
                 LauncherListHit::Custom => {
-                    launcher.model_picker.selected =
-                        launcher.model_picker.filtered_indices.len();
+                    launcher.model_picker.selected = launcher.model_picker.filtered_indices.len();
                     launcher.model_picker.enter_custom();
                 }
             }
@@ -3005,9 +3004,7 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
             }
         }
         // Chat tab: '~' or '`' opens coordinator picker (switch-to list)
-        KeyCode::Char('~') | KeyCode::Char('`')
-            if app.right_panel_tab == RightPanelTab::Chat =>
-        {
+        KeyCode::Char('~') | KeyCode::Char('`') if app.right_panel_tab == RightPanelTab::Chat => {
             app.open_coordinator_picker();
         }
         // Chat tab: '+' opens the coordinator launcher pane (add new)
@@ -3574,8 +3571,8 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     if matches!(app.input_mode, InputMode::Launcher)
         && (matches!(kind, MouseEventKind::ScrollUp) || matches!(kind, MouseEventKind::ScrollDown))
     {
-        let in_model_list = app.launcher_model_list_area.height > 0
-            && app.launcher_model_list_area.contains(pos);
+        let in_model_list =
+            app.launcher_model_list_area.height > 0 && app.launcher_model_list_area.contains(pos);
         let in_endpoint_list = app.launcher_endpoint_list_area.height > 0
             && app.launcher_endpoint_list_area.contains(pos);
         if let Some(launcher) = app.launcher.as_mut() {
@@ -4944,10 +4941,8 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     }
                     KeyCode::Enter => {
                         if let Some(item) = picker.selected_item() {
-                            let idx_in_choices = _choices
-                                .iter()
-                                .position(|c| c == &item.0)
-                                .unwrap_or(0);
+                            let idx_in_choices =
+                                _choices.iter().position(|c| c == &item.0).unwrap_or(0);
                             app.config_panel.choice_index = idx_in_choices;
                         }
                         app.config_panel.choice_picker = None;
@@ -4957,8 +4952,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Up | KeyCode::Char('k') => {
                         picker.prev();
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -4967,8 +4961,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Down | KeyCode::Char('j') => {
                         picker.next();
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -4977,8 +4970,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Left | KeyCode::Char('h') => {
                         picker.prev();
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -4987,8 +4979,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Right | KeyCode::Char('l') => {
                         picker.next();
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -4997,8 +4988,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
                         picker.type_char(c);
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -5007,8 +4997,7 @@ fn handle_config_edit_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModif
                     KeyCode::Backspace => {
                         picker.backspace();
                         if let Some(item) = picker.selected_item() {
-                            if let Some(idx_in_choices) =
-                                _choices.iter().position(|c| c == &item.0)
+                            if let Some(idx_in_choices) = _choices.iter().position(|c| c == &item.0)
                             {
                                 app.config_panel.choice_index = idx_in_choices;
                             }
@@ -7525,7 +7514,10 @@ mod scrollbar_tests {
         FilterPicker, LauncherListHit, LauncherSection, LauncherState, filter_models_for_executor,
     };
 
-    fn make_launcher(executors: Vec<(&str, &str, bool)>, models: Vec<(&str, &str)>) -> LauncherState {
+    fn make_launcher(
+        executors: Vec<(&str, &str, bool)>,
+        models: Vec<(&str, &str)>,
+    ) -> LauncherState {
         let executor_list: Vec<(String, String, bool)> = executors
             .into_iter()
             .map(|(n, d, a)| (n.to_string(), d.to_string(), a))
@@ -7844,7 +7836,10 @@ mod scrollbar_tests {
             height: 1,
         };
         handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 28, 16);
-        assert!(app.launcher.is_none(), "[Cancel] click should close launcher");
+        assert!(
+            app.launcher.is_none(),
+            "[Cancel] click should close launcher"
+        );
         assert_eq!(app.input_mode, InputMode::Normal);
     }
 
@@ -8021,7 +8016,10 @@ mod scrollbar_tests {
         assert!(after_more > after_down, "more downs should keep advancing");
         handle_launcher_input(&mut app, KeyCode::Up, KeyModifiers::empty());
         let after_up = app.launcher.as_ref().unwrap().model_picker.selected;
-        assert!(after_up < after_more, "keyboard up should move selection back");
+        assert!(
+            after_up < after_more,
+            "keyboard up should move selection back"
+        );
     }
 
     /// Test: after rendering the launcher, the [Launch] button hit area
@@ -8448,11 +8446,7 @@ mod chat_tab_navigation_tests {
         // test (which would set `chat_pty_forwards_stdin = true` and
         // swallow all subsequent keystrokes).
         let config_path = wg_dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[coordinator]\nexecutor = \"shell\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config_path, "[coordinator]\nexecutor = \"shell\"\n").unwrap();
 
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
@@ -8752,7 +8746,10 @@ mod chat_tab_navigation_tests {
         app.right_panel_tab = RightPanelTab::Chat;
         switch_chat_tab_to_index(&mut app, 1); // active = cid 4
         assert_eq!(app.active_coordinator_id, 4);
-        assert!(app.active_tabs.contains(&4), "tab 4 should be in active_tabs before close");
+        assert!(
+            app.active_tabs.contains(&4),
+            "tab 4 should be in active_tabs before close"
+        );
 
         // Close the tab — must NOT modify the graph task
         app.close_tab(4);
@@ -8764,7 +8761,8 @@ mod chat_tab_navigation_tests {
         // The underlying task still exists in the graph with its original status.
         let graph_path = app.workgraph_dir.join("graph.jsonl");
         let graph = workgraph::parser::load_graph(&graph_path).unwrap();
-        let task = graph.get_task(".coordinator-4")
+        let task = graph
+            .get_task(".coordinator-4")
             .expect("close_tab must NOT abandon/delete the graph task");
         assert_eq!(
             task.status,
@@ -8911,7 +8909,10 @@ mod chat_tab_navigation_tests {
 
         super::handle_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
 
-        assert_eq!(app.active_tabs, tabs_before, "Ctrl+W off Chat tab must not change tabs");
+        assert_eq!(
+            app.active_tabs, tabs_before,
+            "Ctrl+W off Chat tab must not change tabs"
+        );
         assert!(!matches!(app.input_mode, InputMode::ChoiceDialog(_)));
     }
 
@@ -8925,7 +8926,10 @@ mod chat_tab_navigation_tests {
         app.close_tab(0);
 
         assert!(app.active_tabs.is_empty(), "active_tabs must be empty");
-        assert_eq!(app.active_coordinator_id, 0, "active coordinator resets to 0");
+        assert_eq!(
+            app.active_coordinator_id, 0,
+            "active coordinator resets to 0"
+        );
         // Must not have panicked — no crash
     }
 
@@ -8957,8 +8961,16 @@ mod chat_tab_navigation_tests {
         app.input_mode = InputMode::Normal;
         // Seed two fake matches so next_match() has something to cycle through.
         app.fuzzy_matches = vec![
-            FuzzyLineMatch { line_idx: 0, score: 100, char_positions: vec![] },
-            FuzzyLineMatch { line_idx: 1, score: 90, char_positions: vec![] },
+            FuzzyLineMatch {
+                line_idx: 0,
+                score: 100,
+                char_positions: vec![],
+            },
+            FuzzyLineMatch {
+                line_idx: 1,
+                score: 90,
+                char_positions: vec![],
+            },
         ];
         app.current_match = Some(0);
         super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);

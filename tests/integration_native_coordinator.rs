@@ -414,10 +414,7 @@ mod per_provider_key_resolution {
     }
     impl EnvSnapshot {
         fn new(vars: &[&'static str]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|v| (*v, std::env::var(v).ok()))
-                .collect();
+            let saved = vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
             for v in vars {
                 unsafe { std::env::remove_var(v) };
             }
@@ -1794,14 +1791,13 @@ fn no_env_var_credential_lookups_in_credential_path() {
                     // path. Any NEW credential-path code must not
                     // re-introduce env vars.
                     let preceding: Vec<&str> = contents.lines().take(lineno).collect();
-                    let in_legacy =
-                        preceding.iter().rev().take(40).any(|l| {
-                            l.contains("pub fn from_env")
-                                || l.contains("fn resolve_api_key()")
-                                || l.contains("fn resolve_api_key_from_dir")
-                                || l.contains("fn resolve_openai_api_key")
-                                || l.contains("fn resolve_openai_api_key_from_dir")
-                        });
+                    let in_legacy = preceding.iter().rev().take(40).any(|l| {
+                        l.contains("pub fn from_env")
+                            || l.contains("fn resolve_api_key()")
+                            || l.contains("fn resolve_api_key_from_dir")
+                            || l.contains("fn resolve_openai_api_key")
+                            || l.contains("fn resolve_openai_api_key_from_dir")
+                    });
                     if !in_legacy {
                         panic!(
                             "Banned env-var lookup '{}' found in credential path:\n  \

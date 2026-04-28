@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use workgraph::config::Config;
 use workgraph::graph::{
-    CycleConfig, LogEntry, LoopGuard, PRIORITY_DEFAULT, Priority, Status, Task, TokenUsage, format_tokens,
-    parse_token_usage_live,
+    CycleConfig, LogEntry, LoopGuard, PRIORITY_DEFAULT, Priority, Status, Task, TokenUsage,
+    format_tokens, parse_token_usage_live,
 };
 use workgraph::query::build_reverse_index;
 use workgraph::service::AgentRegistry;
@@ -917,10 +917,17 @@ fn print_human_readable(details: &TaskDetails) {
         println!();
         println!("Evaluations:");
         for eval in &details.evaluations {
-            println!("  Score: {:.2}  Source: {}  {}", eval.score, eval.source, eval.timestamp);
+            println!(
+                "  Score: {:.2}  Source: {}  {}",
+                eval.score, eval.source, eval.timestamp
+            );
             // Show key dimensions inline
             if let Some(cf) = eval.dimensions.get("constraint_fidelity") {
-                let flag = if *cf < 0.5 { " \x1b[33m⚠ unanchored constraints\x1b[0m" } else { "" };
+                let flag = if *cf < 0.5 {
+                    " \x1b[33m⚠ unanchored constraints\x1b[0m"
+                } else {
+                    ""
+                };
                 println!("    constraint_fidelity: {:.2}{}", cf, flag);
             }
             if let Some(f) = eval.dimensions.get("intent_fidelity") {
@@ -1297,8 +1304,8 @@ mod tests {
                 output_file: "output.log".to_string(),
                 model: Some("openrouter/minimax".to_string()),
                 completed_at: None,
-            worktree_path: None,
-        },
+                worktree_path: None,
+            },
         );
         registry.save(temp_dir.path()).unwrap();
 
@@ -1623,10 +1630,7 @@ mod tests {
             "should detect at least one uncommitted file: {:?}",
             state.uncommitted_files
         );
-        assert!(
-            !state.merged_to_main,
-            "branch is not merged into main"
-        );
+        assert!(!state.merged_to_main, "branch is not merged into main");
         assert!(state.path.contains(".wg-worktrees"));
 
         // Tasks without a worktree return None

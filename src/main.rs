@@ -508,11 +508,7 @@ fn rewrite_config_reset_argv(args: Vec<String>) -> Vec<String> {
     let mut i = 0;
     let mut rewrote = false;
     while i < args.len() {
-        if !rewrote
-            && i + 1 < args.len()
-            && args[i] == "config"
-            && args[i + 1] == "reset"
-        {
+        if !rewrote && i + 1 < args.len() && args[i] == "config" && args[i + 1] == "reset" {
             out.push("config".to_string());
             out.push("--reset".to_string());
             rewrote = true;
@@ -1681,22 +1677,16 @@ fn main() -> Result<()> {
                         executor.as_deref(),
                         cli.json,
                     ),
-                    ChatCommands::List => {
-                        commands::chat_cmd::run_list(&workgraph_dir, cli.json)
-                    }
+                    ChatCommands::List => commands::chat_cmd::run_list(&workgraph_dir, cli.json),
                     ChatCommands::Show { chat } => {
                         commands::chat_cmd::run_show(&workgraph_dir, &chat, cli.json)
                     }
-                    ChatCommands::Attach { chat, cli: force_cli } => {
-                        commands::chat_cmd::run_attach(&workgraph_dir, &chat, force_cli)
-                    }
+                    ChatCommands::Attach {
+                        chat,
+                        cli: force_cli,
+                    } => commands::chat_cmd::run_attach(&workgraph_dir, &chat, force_cli),
                     ChatCommands::Send { chat, message } => {
-                        commands::chat_cmd::run_send(
-                            &workgraph_dir,
-                            &chat,
-                            &message,
-                            cli.json,
-                        )
+                        commands::chat_cmd::run_send(&workgraph_dir, &chat, &message, cli.json)
                     }
                     ChatCommands::Stop { chat } => {
                         commands::chat_cmd::run_stop(&workgraph_dir, &chat, cli.json)
@@ -2331,7 +2321,6 @@ fn main() -> Result<()> {
             install_global,
             force,
             max_coordinators,
-            endpoint,
             no_reload,
             reset,
             reset_route,
@@ -2379,11 +2368,7 @@ fn main() -> Result<()> {
                             // Default: merged (lints both global and local).
                             commands::config_cmd::LintTarget::Merged
                         };
-                        return commands::config_cmd::lint_config(
-                            &workgraph_dir,
-                            target,
-                            cli.json,
-                        );
+                        return commands::config_cmd::lint_config(&workgraph_dir, target, cli.json);
                     }
                 }
             }
@@ -2399,8 +2384,7 @@ fn main() -> Result<()> {
 
             // Handle --reset (also reachable as positional `wg config reset`)
             if reset {
-                let reset_scope =
-                    scope.unwrap_or(commands::config_cmd::ConfigScope::Global);
+                let reset_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Global);
                 return commands::config_cmd::reset_to_route(
                     &workgraph_dir,
                     reset_scope,
@@ -2817,17 +2801,6 @@ fn main() -> Result<()> {
                 max_agents,
                 executor.as_deref(),
                 interval,
-                model.as_deref(),
-                cli.json,
-            ),
-            ServiceCommands::SetExecutor {
-                id,
-                executor,
-                model,
-            } => commands::service::run_set_executor(
-                &workgraph_dir,
-                id,
-                executor.as_deref(),
                 model.as_deref(),
                 cli.json,
             ),

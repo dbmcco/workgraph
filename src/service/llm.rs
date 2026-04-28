@@ -598,7 +598,10 @@ mod tests {
     fn test_role_has_explicit_override_detects_user_config() {
         let mut config = Config::default();
         // No per-role config → not explicit (cascade-only).
-        assert!(!role_has_explicit_override(&config, DispatchRole::Evaluator));
+        assert!(!role_has_explicit_override(
+            &config,
+            DispatchRole::Evaluator
+        ));
 
         // Setting a per-role provider counts as explicit.
         config

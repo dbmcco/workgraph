@@ -23,7 +23,7 @@
 //!   the daemon main thread and the agent thread.
 
 use anyhow::{Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -41,8 +41,8 @@ use workgraph::service::registry::AgentRegistry;
 use crate::commands::{graph_path, is_process_alive};
 
 use super::{
-    COORDINATOR_MODEL_OVERRIDE_ENV, COORDINATOR_RUNTIME_EXECUTOR_ENV,
-    CoordinatorRuntimeIntent, DaemonLogger,
+    COORDINATOR_MODEL_OVERRIDE_ENV, COORDINATOR_RUNTIME_EXECUTOR_ENV, CoordinatorRuntimeIntent,
+    DaemonLogger,
 };
 
 /// Maximum restarts allowed within the restart window before pausing.
@@ -287,6 +287,7 @@ pub fn new_event_log() -> SharedEventLog {
 /// A chat message to be injected into the coordinator agent.
 pub struct ChatRequest {
     pub request_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -374,13 +375,9 @@ impl CoordinatorAgent {
         if let Some(m) = model {
             chat_task.model = Some(m.to_string());
         }
-        let supervisor_plan = workgraph::dispatch::plan_spawn(
-            &chat_task,
-            &supervisor_config,
-            Some(executor),
-            model,
-        )
-        .context("plan_spawn for coordinator agent supervisor failed")?;
+        let supervisor_plan =
+            workgraph::dispatch::plan_spawn(&chat_task, &supervisor_config, Some(executor), model)
+                .context("plan_spawn for coordinator agent supervisor failed")?;
         // Post-Phase-7, ALL supported executors are backed by a
         // handler subprocess that reads the inbox directly:
         //   native → wg nex --chat
@@ -463,9 +460,12 @@ impl CoordinatorAgent {
     ///
     /// Returns Ok(()) if the message was queued. The response will be
     /// written to the chat outbox asynchronously.
-    pub fn send_message(&self, request_id: String, _message: String) -> Result<()> {
+    pub fn send_message(&self, request_id: String, message: String) -> Result<()> {
         self.tx
-            .send(ChatRequest { request_id })
+            .send(ChatRequest {
+                request_id,
+                message,
+            })
             .map_err(|_| anyhow::anyhow!("Coordinator agent thread has exited"))
     }
 
@@ -731,10 +731,14 @@ fn subprocess_coordinator_loop(
                     if let Some(t) = g.get_task(&rid) {
                         let is_archived = t.tags.iter().any(|x| x == "archived");
                         let is_done = matches!(t.status, workgraph::graph::Status::Done);
-                        let is_abandoned =
-                            matches!(t.status, workgraph::graph::Status::Abandoned);
-                        if is_archived || (is_done && !t.tags.iter().any(|x|
-                            workgraph::chat_id::is_chat_loop_tag(x))) || is_abandoned
+                        let is_abandoned = matches!(t.status, workgraph::graph::Status::Abandoned);
+                        if is_archived
+                            || (is_done
+                                && !t
+                                    .tags
+                                    .iter()
+                                    .any(|x| workgraph::chat_id::is_chat_loop_tag(x)))
+                            || is_abandoned
                         {
                             logger.info(&format!(
                                 "Coordinator-{}: chat task {} is archived/Done/Abandoned — exiting supervisor (no respawn).",
@@ -861,6 +865,12 @@ fn subprocess_coordinator_loop(
             "Coordinator-{}: nex subprocess running (pid {})",
             coordinator_id, child_pid
         ));
+        if effective_exec == "claude" {
+            logger.info(&format!(
+                "Coordinator-{}: claude-handler supervisor child started (pid {})",
+                coordinator_id, child_pid
+            ));
+        }
 
         // Drain stdout/stderr to the daemon log in background threads —
         // without this, the child's pipes fill and it blocks.
@@ -910,8 +920,7 @@ fn subprocess_coordinator_loop(
                 // enumerate_chat_supervisors_for_boot. Without this gate the
                 // supervisor burns LLM tokens in a tight loop whenever no
                 // consumer is connected.
-                let idle_threshold =
-                    std::time::Duration::from_secs(CHAT_IDLE_THRESHOLD_SECS);
+                let idle_threshold = std::time::Duration::from_secs(CHAT_IDLE_THRESHOLD_SECS);
                 if chat::chat_session_is_idle(dir, coordinator_id, idle_threshold) {
                     logger.info(&format!(
                         "Coordinator-{}: idle (no consumer + empty inbox for {}s) — exiting supervisor (no respawn).",
@@ -1449,10 +1458,7 @@ mod tests {
             title: "Chat 7".to_string(),
             ..Default::default()
         }));
-        assert_eq!(
-            resolve_chat_task_id(&graph, 7),
-            Some(".chat-7".to_string())
-        );
+        assert_eq!(resolve_chat_task_id(&graph, 7), Some(".chat-7".to_string()));
     }
 
     #[test]
@@ -1485,10 +1491,7 @@ mod tests {
             title: "Coordinator 3".to_string(),
             ..Default::default()
         }));
-        assert_eq!(
-            resolve_chat_task_id(&graph, 3),
-            Some(".chat-3".to_string())
-        );
+        assert_eq!(resolve_chat_task_id(&graph, 3), Some(".chat-3".to_string()));
     }
 
     /// Stale `.coordinator-N` self-archive (parent task bullet 3): when neither

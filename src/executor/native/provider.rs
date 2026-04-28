@@ -334,8 +334,11 @@ pub fn create_provider_ext(
     // from the matched endpoint's config — NEVER fall back to implicit
     // provider env vars (ANTHROPIC_API_KEY etc). See create_provider_ext
     // doc comment for the workgraph credential contract.
-    let endpoint_key =
-        endpoint.and_then(|ep| ep.resolve_api_key_strict(Some(workgraph_dir)).ok().flatten());
+    let endpoint_key = endpoint.and_then(|ep| {
+        ep.resolve_api_key_strict(Some(workgraph_dir))
+            .ok()
+            .flatten()
+    });
     let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
     let endpoint_context_window = endpoint.and_then(|ep| ep.context_window);
     let endpoint_name_owned: Option<String> = endpoint.map(|ep| ep.name.clone());

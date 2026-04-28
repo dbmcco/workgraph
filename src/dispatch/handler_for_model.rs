@@ -98,10 +98,7 @@ mod tests {
 
     #[test]
     fn test_local_prefix_routes_to_native() {
-        assert_eq!(
-            handler_for_model("local:qwen3-coder"),
-            ExecutorKind::Native
-        );
+        assert_eq!(handler_for_model("local:qwen3-coder"), ExecutorKind::Native);
     }
 
     #[test]
@@ -114,10 +111,7 @@ mod tests {
 
     #[test]
     fn test_oai_compat_prefix_routes_to_native() {
-        assert_eq!(
-            handler_for_model("oai-compat:gpt-5"),
-            ExecutorKind::Native
-        );
+        assert_eq!(handler_for_model("oai-compat:gpt-5"), ExecutorKind::Native);
         // "openai" is the legacy alias.
         assert_eq!(handler_for_model("openai:gpt-5"), ExecutorKind::Native);
     }

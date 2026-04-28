@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
-use workgraph::config_defaults::{config_for_route, RouteParams, SetupRoute};
+use workgraph::config_defaults::{RouteParams, SetupRoute, config_for_route};
 
 /// Default content for .workgraph/.gitignore
 const GITIGNORE_CONTENT: &str = r#"# Workgraph gitignore
@@ -82,8 +82,8 @@ pub fn run_with_route(
                 model: model.map(|s| s.to_string()),
             };
             let cfg = config_for_route(r, params);
-            let toml = toml::to_string_pretty(&cfg)
-                .map_err(|e| anyhow::anyhow!("serialize: {}", e))?;
+            let toml =
+                toml::to_string_pretty(&cfg).map_err(|e| anyhow::anyhow!("serialize: {}", e))?;
             println!("# wg init --dry-run (route: {})", r.as_name());
             println!("# Would create: {}", dir.display());
             println!("# Would write the following config.toml:");
@@ -507,12 +507,7 @@ pub fn run(
         other => other,
     };
     let _ = workgraph::launcher_history::record_use(
-        &workgraph::launcher_history::HistoryEntry::new(
-            canonical_executor,
-            model,
-            endpoint,
-            "cli",
-        ),
+        &workgraph::launcher_history::HistoryEntry::new(canonical_executor, model, endpoint, "cli"),
     );
 
     Ok(())
@@ -583,18 +578,6 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
 /// Write an endpoint + model into the project's `config.toml` on init.
 /// Thin wrapper around `Config::apply_model_endpoint` so init shares the
 /// same semantics as `wg config -m/-e`.
-fn apply_model_endpoint(dir: &Path, model: Option<&str>, endpoint: Option<&str>) -> Result<()> {
-    let mut config = workgraph::config::Config::load(dir).unwrap_or_default();
-    let summary = config
-        .apply_model_endpoint(model, endpoint)
-        .context("apply model/endpoint")?;
-    for line in &summary {
-        println!("{}", line);
-    }
-    config.save(dir).context("Failed to save config.toml")?;
-    Ok(())
-}
-
 fn apply_model_endpoint(dir: &Path, model: Option<&str>, endpoint: Option<&str>) -> Result<()> {
     let mut config = workgraph::config::Config::load(dir).unwrap_or_default();
     let summary = config
@@ -842,8 +825,14 @@ mod tests {
     fn test_endpoint_rejects_non_http() {
         let tmp = TempDir::new().unwrap();
         let wg_dir = tmp.path().join(".wg");
-        let err = run(&wg_dir, true, Some("shell"), None, Some("definitely-not-a-url"))
-            .expect_err("non-http endpoint should be rejected");
+        let err = run(
+            &wg_dir,
+            true,
+            Some("shell"),
+            None,
+            Some("definitely-not-a-url"),
+        )
+        .expect_err("non-http endpoint should be rejected");
         // anyhow context wraps the inner bail, so format with `{:#}` to get the chain.
         let chain = format!("{:#}", err);
         assert!(

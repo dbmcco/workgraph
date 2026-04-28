@@ -1,15 +1,14 @@
 //! Edit command for modifying existing tasks
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use workgraph::cycle::{EdgeAddResult, check_edge_addition};
 use workgraph::graph::{CycleConfig, parse_delay};
 use workgraph::parser::modify_graph;
 
+use super::graph_path;
 #[cfg(test)]
 use workgraph::parser::{load_graph, save_graph};
-#[cfg(test)]
-use super::graph_path;
 
 /// Edit a task's fields
 #[allow(clippy::too_many_arguments)]
@@ -187,8 +186,14 @@ pub fn run(
             }
         };
 
-        {
-            let task = graph.get_task_mut_or_err(task_id)?;
+        // Update title
+        if let Some(new_title) = title {
+            let old = task.title.clone();
+            task.title = new_title.to_string();
+            field_changes.push(serde_json::json!({"field": "title", "old": old, "new": new_title}));
+            println!("Updated title: {}", new_title);
+            changed = true;
+        }
 
         // Update description
         if let Some(new_description) = description {
@@ -207,17 +212,21 @@ pub fn run(
                 task.after.push(dep.clone());
                 println!("Added after: {}", dep);
                 changed = true;
+            } else {
+                println!("Already blocked by: {}", dep);
             }
+        }
 
-            if let Some(new_description) = description {
-                let old = task.description.clone();
-                task.description = Some(new_description.to_string());
-                field_changes.push(
-                    serde_json::json!({"field": "description", "old": old, "new": new_description}),
-                );
-                println!("Updated description");
+        // Remove after dependencies
+        for dep in remove_after {
+            if let Some(pos) = task.after.iter().position(|x| x == dep) {
+                task.after.remove(pos);
+                println!("Removed after: {}", dep);
                 changed = true;
+            } else {
+                println!("Not blocked by: {}", dep);
             }
+        }
 
         // Add tags
         for tag in add_tag {
@@ -366,10 +375,10 @@ pub fn run(
                 }
             }
 
-            for tag in add_tag {
-                if !task.tags.contains(tag) {
-                    task.tags.push(tag.clone());
-                    println!("Added tag: {}", tag);
+            if no_converge {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.no_converge = true;
+                    println!("Set no-converge on cycle");
                     changed = true;
                 } else {
                     error = Some(anyhow::anyhow!(
@@ -378,11 +387,10 @@ pub fn run(
                     return false;
                 }
             }
-
-            for tag in remove_tag {
-                if let Some(pos) = task.tags.iter().position(|x| x == tag) {
-                    task.tags.remove(pos);
-                    println!("Removed tag: {}", tag);
+            if no_restart_on_failure {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.restart_on_failure = false;
+                    println!("Disabled restart-on-failure for cycle");
                     changed = true;
                 } else {
                     error = Some(anyhow::anyhow!(
@@ -391,23 +399,10 @@ pub fn run(
                     return false;
                 }
             }
-
-            if let Some(new_model) = model {
-                task.model = Some(new_model.to_string());
-                println!("Updated model: {}", new_model);
-                changed = true;
-            }
-
-            if let Some(new_provider) = provider {
-                task.provider = Some(new_provider.to_string());
-                println!("Updated provider: {}", new_provider);
-                changed = true;
-            }
-
-            for skill in add_skill {
-                if !task.skills.contains(skill) {
-                    task.skills.push(skill.clone());
-                    println!("Added skill: {}", skill);
+            if let Some(max) = max_failure_restarts {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.max_failure_restarts = Some(max);
+                    println!("Set max-failure-restarts: {}", max);
                     changed = true;
                 } else {
                     error = Some(anyhow::anyhow!(
@@ -416,14 +411,18 @@ pub fn run(
                     return false;
                 }
             }
+        }
 
-            for skill in remove_skill {
-                if let Some(pos) = task.skills.iter().position(|x| x == skill) {
-                    task.skills.remove(pos);
-                    println!("Removed skill: {}", skill);
+        // Update visibility
+        if let Some(vis) = visibility {
+            match vis {
+                "internal" | "public" | "peer" => {
+                    let old = task.visibility.clone();
+                    task.visibility = vis.to_string();
+                    field_changes
+                        .push(serde_json::json!({"field": "visibility", "old": old, "new": vis}));
+                    println!("Updated visibility: {}", vis);
                     changed = true;
-                } else {
-                    println!("Does not have skill: {}", skill);
                 }
                 _ => {
                     error = Some(anyhow::anyhow!(
@@ -433,6 +432,7 @@ pub fn run(
                     return false;
                 }
             }
+        }
 
         // Update context scope
         if let Some(scope) = context_scope {
@@ -585,12 +585,20 @@ pub fn run(
         }
     }
 
-            let task = graph.get_task_mut_or_err(task_id)?;
-            if task.agent.is_some() {
-                task.agent = None;
-                println!("Cleared agent assignment (dependencies changed, will re-assign when ready)");
-            }
+    // Maintain bidirectional consistency: update `blocks` on referenced tasks
+    let task_id_owned = task_id.to_string();
+    for dep in add_after {
+        if let Some(blocker) = graph.get_task_mut(dep)
+            && !blocker.before.contains(&task_id_owned)
+        {
+            blocker.before.push(task_id_owned.clone());
         }
+    }
+    for dep in remove_after {
+        if let Some(blocker) = graph.get_task_mut(dep) {
+            blocker.before.retain(|b| b != &task_id_owned);
+        }
+    }
 
     // Return whether changes were made
     changed

@@ -103,7 +103,11 @@ mod tests {
     fn chat_task_gets_state_color() {
         let blue = Color::Blue;
         let result = chat_task_label_color(".chat-3", blue);
-        assert_eq!(result, Color::Blue, ".chat-N should pass through the state color");
+        assert_eq!(
+            result,
+            Color::Blue,
+            ".chat-N should pass through the state color"
+        );
     }
 
     #[test]
@@ -111,7 +115,8 @@ mod tests {
         let blue = Color::Blue;
         let result = chat_task_label_color(".coordinator-3", blue);
         assert_ne!(
-            result, Color::Blue,
+            result,
+            Color::Blue,
             ".coordinator-N should NOT use the accent/state color"
         );
         assert_eq!(

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use workgraph::graph::{PRIORITY_DEFAULT, Status, Task, TokenUsage, WorkGraph, format_token_display};
+use workgraph::graph::{
+    PRIORITY_DEFAULT, Status, Task, TokenUsage, WorkGraph, format_token_display,
+};
 
 use super::ascii::visible_len;
 
@@ -249,7 +251,10 @@ pub fn generate_graph_with_overrides(
 
             (
                 display_id,
-                format!("{}{}{}{}{}", status, token_info, priority_info, phase, loop_info),
+                format!(
+                    "{}{}{}{}{}",
+                    status, token_info, priority_info, phase, loop_info
+                ),
             )
         };
         let width = line1.len().max(line2.len());

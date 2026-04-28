@@ -99,17 +99,17 @@ pub fn run(dir: &Path, task_id: &str, actor: Option<&str>, dry_run: bool) -> Res
 
     // Run the command
     println!("Executing: {}", exec_cmd);
-    let output = Command::new("sh").arg("-c").arg(&exec_cmd)
-        .output().context("Failed to execute command")?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&exec_cmd)
+        .output()
+        .context("Failed to execute command")?;
     let success = output.status.success();
-    if !output.stdout.is_empty() { println!("{}", String::from_utf8_lossy(&output.stdout)); }
-    if !output.stderr.is_empty() { eprintln!("{}", String::from_utf8_lossy(&output.stderr)); }
-
-    if !stdout.is_empty() {
-        println!("{}", stdout);
+    if !output.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
     }
-    if !stderr.is_empty() {
-        eprintln!("{}", stderr);
+    if !output.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
     // Update status atomically (task may have been modified by exec command)

@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
-use workgraph::smoke::{self, Manifest as SmokeManifest, ScenarioOutcome};
 use workgraph::config::{Config, CoordinatorConfig};
 use workgraph::graph::{
     LogEntry, Node, Status, create_user_board_task, evaluate_cycle_iteration, parse_token_usage,
@@ -12,6 +11,7 @@ use workgraph::graph::{Task, parse_delay};
 use workgraph::parser::modify_graph;
 use workgraph::query;
 use workgraph::service::registry::AgentRegistry;
+use workgraph::smoke::{self, Manifest as SmokeManifest, ScenarioOutcome};
 
 // Import evaluate module for LLM verification
 use crate::commands::evaluate;
@@ -1306,14 +1306,9 @@ fn run_inner(
     full_smoke: bool,
     skip_smoke: bool,
 ) -> Result<()> {
-    // Phase 1: Read-only pre-checks and verify command (no lock held).
-    // The verify command can take up to 120s — must NOT run under flock.
-    {
-        let (graph, _) = super::load_workgraph(dir)?;
+    let (mut graph, path) = super::load_workgraph_mut(dir)?;
 
-        let task = graph
-            .get_task(id)
-            .ok_or_else(|| anyhow::anyhow!("Task '{}' not found in workgraph", id))?;
+    let task = graph.get_task_mut_or_err(id)?;
 
     if task.status == Status::Done {
         println!("Task '{}' is already done", id);
@@ -1363,6 +1358,7 @@ fn run_inner(
                 blocker_list.join("\n")
             );
         }
+    }
 
     // Git hygiene check for agents: warn about uncommitted changes.
     // Skipped entirely for chat-loop tasks (chat-agent-loops bug B) — see
@@ -1505,10 +1501,8 @@ fn run_inner(
             // Block agents from using --skip-verify
             if is_agent {
                 anyhow::bail!(
-                    "Cannot mark '{}' as done: blocked by {} unresolved task(s):\n{}",
-                    id,
-                    effective_blockers.len(),
-                    blocker_list.join("\n")
+                    "Agents cannot use --skip-verify. The verify command must pass:\n  {}",
+                    verify_cmd,
                 );
             }
             eprintln!("Warning: skipping verify command: {}", verify_cmd);
@@ -2049,127 +2043,66 @@ fn run_inner(
             .map(|c| c.no_converge)
             .unwrap_or(false);
 
-        // Compute converged_accepted (immutable graph access).
-        let converged_accepted = if converged {
-            let own_no_converge = graph
-                .get_task(id)
-                .and_then(|t| t.cycle_config.as_ref())
-                .map(|c| c.no_converge)
-                .unwrap_or(false);
+        let own_guard = graph
+            .get_task(id)
+            .and_then(|t| t.cycle_config.as_ref())
+            .and_then(|c| c.guard.as_ref())
+            .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
+            .unwrap_or(false);
 
-            let own_guard = graph
-                .get_task(id)
-                .and_then(|t| t.cycle_config.as_ref())
-                .and_then(|c| c.guard.as_ref())
-                .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
-                .unwrap_or(false);
-
-            let (cycle_guard, cycle_no_converge) = if !own_guard && !own_no_converge {
-                let ca = graph.compute_cycle_analysis();
-                ca.task_to_cycle
-                    .get(id)
-                    .map(|&idx| {
-                        let cycle = &ca.cycles[idx];
-                        let guard = cycle.members.iter().any(|mid| {
-                            graph
-                                .get_task(mid)
-                                .and_then(|t| t.cycle_config.as_ref())
-                                .and_then(|c| c.guard.as_ref())
-                                .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
-                                .unwrap_or(false)
-                        });
-                        let no_conv = cycle.members.iter().any(|mid| {
-                            graph
-                                .get_task(mid)
-                                .and_then(|t| t.cycle_config.as_ref())
-                                .map(|c| c.no_converge)
-                                .unwrap_or(false)
-                        });
-                        (guard, no_conv)
-                    })
-                    .unwrap_or((false, false))
-            } else {
-                (false, false)
-            };
-
-            let has_guard = own_guard || cycle_guard;
-            let has_no_converge = own_no_converge || cycle_no_converge;
-
-            if has_no_converge {
-                eprintln!(
-                    "Warning: --converged ignored for '{}' because the cycle is configured with --no-converge.\n         \
-                     All iterations must run.",
-                    id
-                );
-                false
-            } else if has_guard {
-                eprintln!(
-                    "Warning: --converged ignored for '{}' because a cycle guard is set.\n         \
-                     Only the guard condition determines convergence.",
-                    id
-                );
-                false
-            } else {
-                true
-            }
+        // Check 2: the task is a non-header member of a cycle whose header
+        // has a non-trivial guard or no_converge. This covers workers trying
+        // to converge a cycle they don't own.
+        let (cycle_guard, cycle_no_converge) = if !own_guard && !own_no_converge {
+            let ca = graph.compute_cycle_analysis();
+            ca.task_to_cycle
+                .get(id)
+                .map(|&idx| {
+                    let cycle = &ca.cycles[idx];
+                    let guard = cycle.members.iter().any(|mid| {
+                        graph
+                            .get_task(mid)
+                            .and_then(|t| t.cycle_config.as_ref())
+                            .and_then(|c| c.guard.as_ref())
+                            .map(|g| !matches!(g, workgraph::graph::LoopGuard::Always))
+                            .unwrap_or(false)
+                    });
+                    let no_conv = cycle.members.iter().any(|mid| {
+                        graph
+                            .get_task(mid)
+                            .and_then(|t| t.cycle_config.as_ref())
+                            .map(|c| c.no_converge)
+                            .unwrap_or(false)
+                    });
+                    (guard, no_conv)
+                })
+                .unwrap_or((false, false))
         } else {
-            false
+            (false, false)
         };
 
-        // Mutate the task
-        let task = graph.get_task_mut_or_err(id)?;
+        let has_guard = own_guard || cycle_guard;
+        let has_no_converge = own_no_converge || cycle_no_converge;
 
-        task.status = Status::Done;
-        task.completed_at = Some(Utc::now().to_rfc3339());
-
-        if converged_accepted && !task.tags.contains(&"converged".to_string()) {
-            task.tags.push("converged".to_string());
+        if has_no_converge {
+            eprintln!(
+                "Warning: --converged ignored for '{}' because the cycle is configured with --no-converge.\n         \
+                 All iterations must run.",
+                id
+            );
+            false
+        } else if has_guard {
+            eprintln!(
+                "Warning: --converged ignored for '{}' because a cycle guard is set.\n         \
+                 Only the guard condition determines convergence.",
+                id
+            );
+            false
+        } else {
+            true
         }
-
-        task.log.push(LogEntry {
-            timestamp: Utc::now().to_rfc3339(),
-            actor: task.assigned.clone(),
-            message: if converged_accepted {
-                "Task marked as done (converged)".to_string()
-            } else if converged {
-                "Task marked as done (--converged ignored, cycle is forced)".to_string()
-            } else {
-                "Task marked as done".to_string()
-            },
-        });
-
-        // Extract token usage from agent output.log if available
-        if task.token_usage.is_none()
-            && let Ok(registry) = AgentRegistry::load(dir)
-            && let Some(agent) = registry.get_agent_by_task(id)
-        {
-            let output_path = std::path::Path::new(&agent.output_file);
-            let abs_path = if output_path.is_absolute() {
-                output_path.to_path_buf()
-            } else {
-                dir.parent().unwrap_or(dir).join(output_path)
-            };
-            if let Some(usage) = parse_token_usage(&abs_path) {
-                task.token_usage = Some(usage);
-            }
-        }
-
-        // Evaluate structural cycle iteration
-        let id_owned = id.to_string();
-        let cycle_analysis = graph.compute_cycle_analysis();
-        let cycle_reactivated = evaluate_cycle_iteration(graph, &id_owned, &cycle_analysis);
-
-        let task_snapshot = graph
-            .get_task(id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Task '{}' disappeared from graph", id))?;
-
-        Ok(Some((cycle_reactivated, task_snapshot)))
-    })?;
-
-    let Some((cycle_reactivated, task_snapshot)) = result else {
-        println!("Task '{}' is already done", id);
-        return Ok(());
+    } else {
+        false
     };
 
     // --- Worktree merge-back (stigmergic) ---
@@ -2187,10 +2120,9 @@ fn run_inner(
                 push_outcome,
             } => {
                 let suffix = match &push_outcome {
-                    PushOutcome::PushedAndDeleted => format!(
-                        " — pushed origin/main, deleted origin/{}",
-                        wt.branch
-                    ),
+                    PushOutcome::PushedAndDeleted => {
+                        format!(" — pushed origin/main, deleted origin/{}", wt.branch)
+                    }
                     PushOutcome::PushedNotDeleted { delete_error } => format!(
                         " — pushed origin/main, branch delete failed: {}",
                         delete_error
@@ -2436,7 +2368,9 @@ fn run_inner(
     }
 
     // Archive agent conversation (prompt + output) for provenance
-    if let Some(ref agent_id) = task_snapshot.assigned {
+    if let Some(task) = graph.get_task(id)
+        && let Some(ref agent_id) = task.assigned
+    {
         match super::log::archive_agent(dir, id, agent_id) {
             Ok(archive_dir) => {
                 eprintln!("Agent archived to {}", archive_dir.display());
@@ -2448,25 +2382,32 @@ fn run_inner(
     }
 
     // Capture task output (git diff, artifacts, log) for evaluation.
-    match capture_task_output(dir, &task_snapshot) {
-        Ok(output_dir) => {
-            eprintln!("Output captured to {}", output_dir.display());
-        }
-        Err(e) => {
-            eprintln!("Warning: output capture failed: {}", e);
+    // When auto_evaluate is enabled, the coordinator creates an evaluation task
+    // in the graph that becomes ready once this task is done; the captured output
+    // feeds that evaluator.
+    if let Some(task) = graph.get_task(id) {
+        match capture_task_output(dir, task) {
+            Ok(output_dir) => {
+                eprintln!("Output captured to {}", output_dir.display());
+            }
+            Err(e) => {
+                eprintln!("Warning: output capture failed: {}", e);
+            }
         }
     }
 
     // Soft validation nudge: if no log entry mentions validation, print a tip.
-    let has_validation = task_snapshot
-        .log
-        .iter()
-        .any(|entry| entry.message.to_lowercase().contains("validat"));
-    if !has_validation {
-        eprintln!(
-            "Tip: Log validation steps before wg done (e.g., wg log {} \"Validated: tests pass\")",
-            id
-        );
+    if let Some(task) = graph.get_task(id) {
+        let has_validation = task
+            .log
+            .iter()
+            .any(|entry| entry.message.to_lowercase().contains("validat"));
+        if !has_validation {
+            eprintln!(
+                "Tip: Log validation steps before wg done (e.g., wg log {} \"Validated: tests pass\")",
+                id
+            );
+        }
     }
 
     Ok(())
@@ -4096,12 +4037,7 @@ mod tests {
         git(&project_path, &["commit", "-m", "initial"]);
         git(
             &project_path,
-            &[
-                "remote",
-                "add",
-                "origin",
-                remote.path().to_str().unwrap(),
-            ],
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
         );
         git(&project_path, &["push", "-u", "origin", "main"]);
 
@@ -4134,13 +4070,11 @@ mod tests {
 
     #[test]
     fn test_done_pushes_main_and_deletes_branch_on_clean_merge() {
-        let (_remote, _project, project_path, branch) =
-            make_repo_with_remote("clean-merge");
+        let (_remote, _project, project_path, branch) = make_repo_with_remote("clean-merge");
         let wt = make_wt(&project_path, &branch);
 
         // Capture origin/main before the merge.
-        let (_, before_sha) =
-            git_capture(&project_path, &["rev-parse", "origin/main"]);
+        let (_, before_sha) = git_capture(&project_path, &["rev-parse", "origin/main"]);
         let before_sha = before_sha.trim().to_string();
 
         // Run the merge path.
@@ -4162,8 +4096,7 @@ mod tests {
         }
 
         // origin/main must have advanced.
-        let (_, after_sha) =
-            git_capture(&project_path, &["rev-parse", "origin/main"]);
+        let (_, after_sha) = git_capture(&project_path, &["rev-parse", "origin/main"]);
         let after_sha = after_sha.trim().to_string();
         assert_ne!(
             before_sha, after_sha,
@@ -4171,8 +4104,7 @@ mod tests {
         );
 
         // Local main HEAD == origin/main.
-        let (_, local_main) =
-            git_capture(&project_path, &["rev-parse", "main"]);
+        let (_, local_main) = git_capture(&project_path, &["rev-parse", "main"]);
         assert_eq!(
             local_main.trim(),
             after_sha,
@@ -4190,8 +4122,7 @@ mod tests {
 
     #[test]
     fn test_done_succeeds_when_remote_unavailable() {
-        let (remote, _project, project_path, branch) =
-            make_repo_with_remote("remote-unavailable");
+        let (remote, _project, project_path, branch) = make_repo_with_remote("remote-unavailable");
 
         // Point `origin` at an unreachable URL. We do this *after* the
         // initial setup so the project is in a realistic post-spawn state.
@@ -4237,10 +4168,7 @@ mod tests {
         }
 
         // Local main must still have the squash commit.
-        let (ok, log) = git_capture(
-            &project_path,
-            &["log", "main", "--oneline", "-1"],
-        );
+        let (ok, log) = git_capture(&project_path, &["log", "main", "--oneline", "-1"]);
         assert!(ok, "git log on main failed");
         assert!(
             log.contains("remote-unavailable"),

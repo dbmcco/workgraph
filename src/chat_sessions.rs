@@ -290,8 +290,9 @@ pub fn fork_session(
 
 /// Register a chat session the way the daemon needs it.
 ///
-/// Installs THREE aliases for the session's UUID:
+/// Installs FOUR aliases for the session's UUID:
 ///   * `chat-<N>` — the new canonical alias for the session.
+///   * `.chat-<N>` — the graph task id used by `wg spawn-task`.
 ///   * `coordinator-<N>` — legacy alias kept for backward compat
 ///     (old subprocesses and IPC clients that still use it).
 ///   * `<N>` (bare numeric) — the path that the legacy
@@ -312,6 +313,7 @@ pub fn fork_session(
 pub fn register_coordinator_session(workgraph_dir: &Path, n: u32) -> Result<String> {
     let _ = migrate_numeric_coord_dir(workgraph_dir, n);
     let new_canonical = format!("chat-{}", n);
+    let task_alias = format!(".chat-{}", n);
     let legacy_canonical = format!("coordinator-{}", n);
 
     // Find or create the session. Check new alias first, then legacy,
@@ -320,6 +322,8 @@ pub fn register_coordinator_session(workgraph_dir: &Path, n: u32) -> Result<Stri
     // points to …" errors (steady-state on restart).
     let reg = load(workgraph_dir).unwrap_or_default();
     let uuid = if let Some((uuid, _)) = find_by_alias(&reg, &new_canonical) {
+        uuid
+    } else if let Some((uuid, _)) = find_by_alias(&reg, &task_alias) {
         uuid
     } else if let Some((uuid, _)) = find_by_alias(&reg, &legacy_canonical) {
         uuid
@@ -335,7 +339,12 @@ pub fn register_coordinator_session(workgraph_dir: &Path, n: u32) -> Result<Stri
     // Register all three aliases. Swallow "already points to same session"
     // errors (steady-state on restart); propagate unexpected errors.
     let numeric_alias = n.to_string();
-    for alias in [new_canonical.as_str(), legacy_canonical.as_str(), numeric_alias.as_str()] {
+    for alias in [
+        new_canonical.as_str(),
+        task_alias.as_str(),
+        legacy_canonical.as_str(),
+        numeric_alias.as_str(),
+    ] {
         match add_alias(workgraph_dir, &uuid, alias) {
             Ok(()) => {}
             Err(e) => {
@@ -606,8 +615,7 @@ pub fn archive_session(workgraph_dir: &Path, reference: &str) -> Result<String> 
         fs::create_dir_all(&archive)
             .with_context(|| format!("create archive dir {:?}", archive))?;
         let dst = archive.join(&uuid);
-        fs::rename(&src, &dst)
-            .with_context(|| format!("move {:?} -> {:?}", src, dst))?;
+        fs::rename(&src, &dst).with_context(|| format!("move {:?} -> {:?}", src, dst))?;
     }
     Ok(uuid)
 }
@@ -1051,10 +1059,11 @@ mod tests {
     fn daemon_style_coordinator_registration_creates_both_paths() {
         // Regression test for the "TUI chat never replies" bug.
         //
-        // When the daemon starts a chat session, it registers THREE
+        // When the daemon starts a chat session, it registers FOUR
         // aliases — `chat-N` (new canonical), `coordinator-N` (legacy
-        // backward-compat), and bare `N` (legacy numeric path used by
-        // `chat::append_inbox_for` via the IPC `UserChat` handler).
+        // backward-compat), `.chat-N` (graph task id used by spawn-task),
+        // and bare `N` (legacy numeric path used by `chat::append_inbox_for`
+        // via the IPC `UserChat` handler).
         // All must resolve to the same underlying UUID dir.
         let dir = tempdir().unwrap();
         let wg = dir.path();
@@ -1069,8 +1078,9 @@ mod tests {
         let uuid_again = register_coordinator_session(wg, 0).unwrap();
         assert_eq!(uuid, uuid_again, "register must be idempotent");
 
-        // All three aliases resolve to the same UUID.
+        // All four aliases resolve to the same UUID.
         assert_eq!(resolve_ref(wg, "chat-0").unwrap(), uuid);
+        assert_eq!(resolve_ref(wg, ".chat-0").unwrap(), uuid);
         assert_eq!(resolve_ref(wg, "coordinator-0").unwrap(), uuid);
         assert_eq!(resolve_ref(wg, "0").unwrap(), uuid);
 
@@ -1080,8 +1090,13 @@ mod tests {
         // Round-trip: a write through the numeric alias lands at
         // the same file as a read through the named alias.
         let write_dir = crate::chat::chat_dir_for_ref(wg, "0");
+        let read_dir_task_id = crate::chat::chat_dir_for_ref(wg, ".chat-0");
         let read_dir_legacy = crate::chat::chat_dir_for_ref(wg, "coordinator-0");
         let read_dir_new = crate::chat::chat_dir_for_ref(wg, "chat-0");
+        assert_eq!(
+            write_dir, read_dir_task_id,
+            "numeric alias must resolve to same dir as .chat-0"
+        );
         assert_eq!(
             write_dir, read_dir_legacy,
             "numeric alias must resolve to same dir as coordinator-0"

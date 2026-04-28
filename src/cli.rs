@@ -4845,7 +4845,10 @@ pub fn command_name(cmd: &Commands) -> &'static str {
 
 /// Returns true when the command is an internal hidden subprocess surface.
 pub fn is_internal_command(cmd: &Commands) -> bool {
-    matches!(cmd, Commands::SpawnTask { .. } | Commands::ClaudeHandler { .. })
+    matches!(
+        cmd,
+        Commands::SpawnTask { .. } | Commands::ClaudeHandler { .. }
+    )
 }
 
 /// Returns true if the command supports `--json` output.

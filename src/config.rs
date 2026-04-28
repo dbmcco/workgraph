@@ -666,6 +666,9 @@ pub struct TuiConfig {
     /// Set to 0 to disable session boundaries.
     #[serde(default = "default_session_gap_minutes")]
     pub session_gap_minutes: u32,
+    /// Number of preview lines shown for collapsed detail sections.
+    #[serde(default)]
+    pub detail_tail_lines: usize,
 }
 
 fn default_tui_layout() -> String {
@@ -725,6 +728,7 @@ impl Default for TuiConfig {
             show_running_system_tasks: false,
             show_keys: false,
             session_gap_minutes: default_session_gap_minutes(),
+            detail_tail_lines: 0,
         }
     }
 }
@@ -1821,7 +1825,11 @@ pub fn deprecated_executor_warnings_for_toml(content: &str) -> Vec<String> {
     };
     let mut out = Vec::new();
     let surfaces: &[(&str, &[&str], &[&str])] = &[
-        ("agent.executor", &["agent", "executor"], &["agent", "model"]),
+        (
+            "agent.executor",
+            &["agent", "executor"],
+            &["agent", "model"],
+        ),
         (
             "coordinator.executor",
             &["coordinator", "executor"],
@@ -2320,9 +2328,7 @@ impl Config {
         //    (metacognition, compactors, etc.) always resolve via their tier so they stay
         //    on cheap models even when the project sets a high-capability agent.model.
         let skip_tier = self.agent_model_is_local && role == DispatchRole::TaskAgent;
-        if !skip_tier
-            && let Some(mut resolved) = self.resolve_tier(role.default_tier())
-        {
+        if !skip_tier && let Some(mut resolved) = self.resolve_tier(role.default_tier()) {
             // Allow role/default provider to override registry provider
             if let Some(p) = resolve_provider(role) {
                 resolved.provider = Some(p);
@@ -2767,7 +2773,10 @@ pub struct AgentConfig {
     /// prefix. Kept for one release with a deprecation warning when set
     /// explicitly in config.toml. Skipped on serialize when it holds the
     /// default value, so freshly-written configs no longer carry the key.
-    #[serde(default = "default_executor", skip_serializing_if = "is_default_executor")]
+    #[serde(
+        default = "default_executor",
+        skip_serializing_if = "is_default_executor"
+    )]
     pub executor: String,
 
     /// Model to use (e.g., "opus-4-5", "sonnet", "haiku")
@@ -2869,13 +2878,6 @@ pub struct CoordinatorConfig {
     /// Default: "30m". Set to empty string to disable.
     #[serde(default = "default_agent_timeout")]
     pub agent_timeout: String,
-
-    /// Whether spawned agents should execute from per-agent git worktrees.
-    /// When enabled, code-writing tasks get isolated worktrees under
-    /// `.wg-worktrees/<agent-id>/`, while graph/meta tasks continue to run
-    /// against the shared repository root.
-    #[serde(default)]
-    pub worktree_isolation: bool,
 
     /// Settling delay in milliseconds after a GraphChanged event before the
     /// coordinator tick fires. During burst graph construction (rapid task
@@ -3323,7 +3325,6 @@ impl Default for CoordinatorConfig {
             provider: None,
             default_context_scope: None,
             agent_timeout: default_agent_timeout(),
-            worktree_isolation: false,
             settling_delay_ms: default_settling_delay_ms(),
             coordinator_agent: default_coordinator_agent(),
             compactor_interval: default_compactor_interval(),
@@ -3371,68 +3372,6 @@ pub struct ProjectConfig {
     /// Default skills for new actors
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_skills: Vec<String>,
-}
-
-/// Recognized provider prefixes for `provider:model` specs.
-pub const KNOWN_PROVIDERS: &[&str] = &[
-    "claude",
-    "openrouter",
-    "oai-compat",
-    "openai",
-    "codex",
-    "gemini",
-    "ollama",
-    "llamacpp",
-    "vllm",
-    "local",
-    "native",
-];
-
-/// Parsed representation of a `provider:model` string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelSpec {
-    pub provider: Option<String>,
-    pub model_id: String,
-}
-
-/// Parse a model spec into provider and model ID parts.
-///
-/// If the prefix before `:` is not a known provider, the entire string is
-/// treated as a bare model ID so legacy model names continue to work.
-pub fn parse_model_spec(spec: &str) -> ModelSpec {
-    if let Some((prefix, rest)) = spec.split_once(':')
-        && KNOWN_PROVIDERS.contains(&prefix)
-    {
-        return ModelSpec {
-            provider: Some(prefix.to_string()),
-            model_id: rest.to_string(),
-        };
-    }
-
-    ModelSpec {
-        provider: None,
-        model_id: spec.to_string(),
-    }
-}
-
-/// Map a model provider prefix to the executor that can service it.
-pub fn provider_to_executor(provider: &str) -> &'static str {
-    match provider {
-        "claude" => "claude",
-        "codex" => "codex",
-        _ => "native",
-    }
-}
-
-/// Map a provider prefix to the internal provider name used by the native executor.
-pub fn provider_to_native_provider(provider: &str) -> &str {
-    match provider {
-        "claude" => "anthropic",
-        "openrouter" => "openrouter",
-        "openai" | "oai-compat" | "codex" | "gemini" | "native" => "openai",
-        "ollama" | "llamacpp" | "vllm" | "local" => "local",
-        other => other,
-    }
 }
 
 fn default_executor() -> String {
@@ -4079,7 +4018,8 @@ impl Config {
                 c.compaction_token_threshold
             ));
         }
-        if (c.compaction_threshold_ratio - default_compaction_threshold_ratio()).abs() > f64::EPSILON
+        if (c.compaction_threshold_ratio - default_compaction_threshold_ratio()).abs()
+            > f64::EPSILON
         {
             out.push(format!(
                 "config key `coordinator.compaction_threshold_ratio = {}` is deprecated and ignored \
@@ -7819,10 +7759,7 @@ delegate_model = "haiku"
             1200
         );
         assert_eq!(config.native_executor.delegate.delegate_max_turns, 15);
-        assert_eq!(
-            config.native_executor.delegate.delegate_model,
-            "haiku"
-        );
+        assert_eq!(config.native_executor.delegate.delegate_model, "haiku");
     }
 
     #[test]
@@ -8123,9 +8060,21 @@ executor = "native"
             warnings
         );
         let msg = &warnings[0];
-        assert!(msg.contains("Deprecated"), "expected 'Deprecated' in {}", msg);
-        assert!(msg.contains("[coordinator]"), "expected legacy name in {}", msg);
-        assert!(msg.contains("[dispatcher]"), "expected canonical name in {}", msg);
+        assert!(
+            msg.contains("Deprecated"),
+            "expected 'Deprecated' in {}",
+            msg
+        );
+        assert!(
+            msg.contains("[coordinator]"),
+            "expected legacy name in {}",
+            msg
+        );
+        assert!(
+            msg.contains("[dispatcher]"),
+            "expected canonical name in {}",
+            msg
+        );
         assert!(
             msg.contains("/tmp/global.toml"),
             "expected file path in {}",
@@ -8140,185 +8089,5 @@ executor = "native"
             "second pass must not re-warn after migration, got {:?}",
             warnings2
         );
-    }
-
-    #[test]
-    fn test_coordinator_worktree_isolation_defaults_false() {
-        let config = Config::default();
-        assert!(!config.coordinator.worktree_isolation);
-    }
-
-    #[test]
-    fn test_coordinator_worktree_isolation_toml_round_trip() {
-        let config: Config = toml::from_str(
-            r#"
-[coordinator]
-worktree_isolation = true
-"#,
-        )
-        .unwrap();
-        assert!(config.coordinator.worktree_isolation);
-    }
-
-    #[test]
-    fn test_parse_model_spec_recognizes_provider_prefix() {
-        let spec = parse_model_spec("openrouter:minimax/minimax-m1");
-        assert_eq!(spec.provider.as_deref(), Some("openrouter"));
-        assert_eq!(spec.model_id, "minimax/minimax-m1");
-    }
-
-    #[test]
-    fn test_parse_model_spec_preserves_bare_model_names() {
-        let spec = parse_model_spec("deepseek-coder-v2:16b");
-        assert!(spec.provider.is_none());
-        assert_eq!(spec.model_id, "deepseek-coder-v2:16b");
-    }
-
-    #[test]
-    fn test_coordinator_effective_executor_infers_native_from_model_prefix() {
-        let mut config = Config::default();
-        config.coordinator.model = Some("openrouter:minimax/minimax-m1".to_string());
-        assert_eq!(config.coordinator.effective_executor(), "native");
-    }
-
-    #[test]
-    fn test_coordinator_effective_executor_infers_codex_from_model_prefix() {
-        let mut config = Config::default();
-        config.coordinator.model = Some("codex:gpt-5-codex".to_string());
-        assert_eq!(config.coordinator.effective_executor(), "codex");
-    }
-
-    #[test]
-    fn test_coordinator_effective_executor_preserves_custom_executor() {
-        let mut config = Config::default();
-        config.coordinator.executor = "amplifier".to_string();
-        config.coordinator.model = Some("openrouter:minimax/minimax-m1".to_string());
-        assert_eq!(config.coordinator.effective_executor(), "amplifier");
-    }
-
-    #[test]
-    fn test_find_for_provider_prefers_default_endpoint() {
-        let endpoints = EndpointsConfig {
-            endpoints: vec![
-                EndpointConfig {
-                    name: "first-openai".to_string(),
-                    provider: "openai".to_string(),
-                    url: None,
-                    model: None,
-                    api_key: Some("sk-first".to_string()),
-                    is_default: false,
-                },
-                EndpointConfig {
-                    name: "default-openai".to_string(),
-                    provider: "openai".to_string(),
-                    url: Some("https://api.openai.com/v1".to_string()),
-                    model: None,
-                    api_key: Some("sk-default".to_string()),
-                    is_default: true,
-                },
-            ],
-        };
-
-        let endpoint = endpoints.find_for_provider("openai").unwrap();
-        assert_eq!(endpoint.name, "default-openai");
-        assert_eq!(endpoint.api_key.as_deref(), Some("sk-default"));
-    }
-
-    #[test]
-    fn test_find_default_falls_back_to_first_endpoint() {
-        let endpoints = EndpointsConfig {
-            endpoints: vec![EndpointConfig {
-                name: "only".to_string(),
-                provider: "openrouter".to_string(),
-                url: Some("https://openrouter.ai/api/v1".to_string()),
-                model: None,
-                api_key: None,
-                is_default: false,
-            }],
-        };
-
-        let endpoint = endpoints.find_default().unwrap();
-        assert_eq!(endpoint.name, "only");
-    }
-
-    #[test]
-    fn test_find_by_name_returns_named_endpoint() {
-        let endpoints = EndpointsConfig {
-            endpoints: vec![
-                EndpointConfig {
-                    name: "anthropic-direct".to_string(),
-                    provider: "anthropic".to_string(),
-                    url: Some("https://api.anthropic.com".to_string()),
-                    model: None,
-                    api_key: None,
-                    is_default: false,
-                },
-                EndpointConfig {
-                    name: "openrouter-default".to_string(),
-                    provider: "openrouter".to_string(),
-                    url: Some("https://openrouter.ai/api/v1".to_string()),
-                    model: None,
-                    api_key: None,
-                    is_default: true,
-                },
-            ],
-        };
-
-        assert_eq!(
-            endpoints.find_by_name("anthropic-direct").unwrap().provider,
-            "anthropic"
-        );
-        assert!(endpoints.find_by_name("missing").is_none());
-    }
-
-    #[test]
-    fn test_endpoint_resolve_api_key_prefers_inline_key() {
-        let endpoint = EndpointConfig {
-            name: "openrouter".to_string(),
-            provider: "openrouter".to_string(),
-            url: None,
-            model: None,
-            api_key: Some(" sk-inline ".to_string()),
-            is_default: false,
-        };
-
-        let key = endpoint.resolve_api_key().unwrap();
-        assert_eq!(key.as_deref(), Some("sk-inline"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_endpoint_resolve_api_key_falls_back_to_provider_env() {
-        let saved = std::env::var("OPENAI_API_KEY").ok();
-        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-env-openai") };
-
-        let endpoint = EndpointConfig {
-            name: "openai".to_string(),
-            provider: "openai".to_string(),
-            url: None,
-            model: None,
-            api_key: None,
-            is_default: false,
-        };
-
-        let key = endpoint.resolve_api_key().unwrap();
-        assert_eq!(key.as_deref(), Some("sk-env-openai"));
-
-        match saved {
-            Some(value) => unsafe { std::env::set_var("OPENAI_API_KEY", value) },
-            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
-        }
-    }
-
-    #[test]
-    fn test_provider_to_native_provider_mapping() {
-        assert_eq!(provider_to_native_provider("claude"), "anthropic");
-        assert_eq!(provider_to_native_provider("openrouter"), "openrouter");
-        assert_eq!(provider_to_native_provider("openai"), "openai");
-        assert_eq!(provider_to_native_provider("oai-compat"), "openai");
-        assert_eq!(provider_to_native_provider("codex"), "openai");
-        assert_eq!(provider_to_native_provider("gemini"), "openai");
-        assert_eq!(provider_to_native_provider("local"), "local");
-        assert_eq!(provider_to_native_provider("ollama"), "local");
     }
 }

@@ -40,7 +40,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -224,12 +224,13 @@ pub fn run(
                 .and_then(|_| stdin.flush())
             {
                 logger.error(&format!("claude-handler: stdin write failed: {}", e));
-                let _ = chat::append_outbox_ref(
+                let _ = chat::append_error_ref(
                     workgraph_dir,
                     chat_ref,
                     "The coordinator encountered an error sending to Claude. Restarting.",
                     &request_id,
                 );
+                advance_coordinator_cursor(workgraph_dir, coordinator_id, inbox_cursor, &logger);
                 return Err(anyhow::anyhow!("stdin write failed: {}", e));
             }
 
@@ -268,6 +269,12 @@ pub fn run(
                     ) {
                         logger.error(&format!("claude-handler: outbox write failed: {}", e));
                     }
+                    advance_coordinator_cursor(
+                        workgraph_dir,
+                        coordinator_id,
+                        inbox_cursor,
+                        &logger,
+                    );
                 }
                 Some(_) => {
                     logger.warn("claude-handler: empty response");
@@ -277,15 +284,54 @@ pub fn run(
                         "The coordinator processed your message but produced no response text.",
                         &request_id,
                     );
+                    advance_coordinator_cursor(
+                        workgraph_dir,
+                        coordinator_id,
+                        inbox_cursor,
+                        &logger,
+                    );
                 }
                 None => {
-                    logger.warn("claude-handler: response timeout");
-                    let _ = chat::append_outbox_ref(
-                        workgraph_dir,
-                        chat_ref,
-                        "The coordinator timed out processing your message.",
-                        &request_id,
-                    );
+                    if let Some(status) = wait_for_child_exit(&mut child, Duration::from_secs(1)) {
+                        logger.error(&format!(
+                            "claude-handler: Claude CLI crashed while processing {}: {}",
+                            request_id, status
+                        ));
+                        let _ = chat::append_error_ref(
+                            workgraph_dir,
+                            chat_ref,
+                            &format!(
+                                "The coordinator crashed while processing your message (Claude CLI exited {}). Restarting.",
+                                status
+                            ),
+                            &request_id,
+                        );
+                        advance_coordinator_cursor(
+                            workgraph_dir,
+                            coordinator_id,
+                            inbox_cursor,
+                            &logger,
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Claude CLI exited while processing {}: {}",
+                            request_id,
+                            status
+                        ));
+                    } else {
+                        logger.warn("claude-handler: response timeout");
+                        let _ = chat::append_outbox_ref(
+                            workgraph_dir,
+                            chat_ref,
+                            "The coordinator timed out processing your message.",
+                            &request_id,
+                        );
+                        advance_coordinator_cursor(
+                            workgraph_dir,
+                            coordinator_id,
+                            inbox_cursor,
+                            &logger,
+                        );
+                    }
                 }
             }
 
@@ -337,9 +383,43 @@ fn last_answered_inbox_id(workgraph_dir: &Path, chat_ref: &str) -> u64 {
 /// `build_coordinator_context`. Otherwise `None` — the handler runs
 /// as a plain chat session with no graph-state injection.
 fn parse_coordinator_id(chat_ref: &str) -> Option<u32> {
-    chat_ref
-        .strip_prefix("coordinator-")
-        .and_then(|s| s.parse::<u32>().ok())
+    for prefix in ["coordinator-", "chat-", ".chat-"] {
+        if let Some(n) = chat_ref.strip_prefix(prefix) {
+            return n.parse::<u32>().ok();
+        }
+    }
+    chat_ref.parse::<u32>().ok()
+}
+
+fn advance_coordinator_cursor(
+    workgraph_dir: &Path,
+    coordinator_id: Option<u32>,
+    cursor: u64,
+    logger: &HandlerLogger,
+) {
+    if let Some(cid) = coordinator_id
+        && let Err(e) = chat::write_coordinator_cursor_for(workgraph_dir, cid, cursor)
+    {
+        logger.warn(&format!(
+            "claude-handler: failed to write coordinator cursor for {}: {}",
+            cid, e
+        ));
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Build the system prompt. For `coordinator-N` sessions we load the
