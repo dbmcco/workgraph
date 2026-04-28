@@ -3637,7 +3637,29 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 
     // Streaming indicator / progressive text when awaiting response.
-    if app.chat.awaiting_response() {
+    //
+    // Suppress the streaming-text branch when the most recent message is
+    // already a coordinator response. In that case the agent has finished
+    // its turn (its content was just appended to `chat.messages`) and the
+    // `streaming_text` buffer is stale — the .streaming dotfile may still
+    // hold the same text the agent just flushed to outbox because the
+    // file-clear happens after the outbox-append, opening a race window
+    // (task fix-pty-output). Rendering both produces a visible duplicate
+    // block. The next poll will repopulate `streaming_text` from the file
+    // once the agent's next turn (or the file-clear) has actually run.
+    let last_is_coordinator_response = app
+        .chat
+        .messages
+        .last()
+        .map(|m| {
+            matches!(
+                m.role,
+                super::state::ChatRole::Coordinator
+                    | super::state::ChatRole::SystemError
+            )
+        })
+        .unwrap_or(false);
+    if app.chat.awaiting_response() && !last_is_coordinator_response {
         if app.chat.streaming_text.is_empty() {
             // No streaming text yet — show animated lightning-wave with elapsed time.
             let elapsed = app
@@ -12437,6 +12459,187 @@ mod tests {
             "blockquote bar `▎` present — transcript format regressed to stderr-style markers that markdown treats as blockquotes.\nBuffer:\n{}",
             rendered
         );
+    }
+
+    /// Repro for the "PTY output doubled" bug (task fix-pty-output).
+    ///
+    /// The user reported a screenshot showing the same multi-line list of
+    /// review-session task IDs printed twice inside a single bordered
+    /// pane. The root cause is the chat tab's two-source rendering: the
+    /// `.streaming` dotfile (live transcript) AND the outbox-derived
+    /// finalized message can briefly contain the same content, and
+    /// `streaming_text` is only cleared when *all* pending requests are
+    /// retired. With multiple in-flight requests (user typed two messages
+    /// fast), retiring just one keeps the streaming text alive while the
+    /// finalized message is already in `chat.messages` — both render,
+    /// producing a duplicate.
+    ///
+    /// Pin the contract: after a coordinator response is appended to
+    /// `chat.messages`, `streaming_text` MUST be cleared regardless of
+    /// remaining pending requests. The next streaming chunk for a new
+    /// in-flight response will repopulate it from the file.
+    #[test]
+    fn streaming_text_does_not_double_finalized_message() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        let body = "Your review-session tasks:\n\
+                    - stocktake-assets\n\
+                    - content-review-poietic-life\n\
+                    - wg-visual-language-study";
+
+        // User typed M1, then M2 quickly while M1's response was still
+        // streaming. The agent finalizes the M1 response (writes outbox)
+        // but the .streaming dotfile hasn't been cleared yet — both
+        // sources carry the same text. After `poll_chat_messages`
+        // ingests the outbox entry into `chat.messages`, *one* request
+        // is retired, but `pending_request_ids` is non-empty (rid2 still
+        // in flight), so the legacy code path leaves `streaming_text`
+        // populated and the chat pane renders it twice.
+        let user_msg = ChatMessage {
+            role: ChatRole::User,
+            text: "list my reviews".to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: Some("erik".to_string()),
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+        let coord_msg = ChatMessage {
+            role: ChatRole::Coordinator,
+            text: body.to_string(),
+            full_text: Some(body.to_string()),
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+
+        let mut pending = std::collections::HashSet::new();
+        pending.insert("rid2".to_string()); // rid1 was just retired by poll_chat_messages
+        app.chat = ChatState {
+            messages: vec![user_msg, coord_msg],
+            streaming_text: body.to_string(),
+            pending_request_ids: pending,
+            awaiting_since: Some(std::time::Instant::now()),
+            ..ChatState::default()
+        };
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        for needle in [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ] {
+            let n = rendered.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "task id {:?} appeared {} times in chat pane render — expected 1.\n\
+                 Doubling = the bug from fix-pty-output reproduces.\n\
+                 Rendered:\n{}",
+                needle, n, rendered
+            );
+        }
+    }
+
+    /// Width-variation cover for fix-pty-output: the duplicate-suppression
+    /// must hold whether or not the streamed lines wrap. At a narrow width
+    /// each task id wraps to two visual rows; at a wide width none do.
+    #[test]
+    fn streaming_text_doubling_fix_holds_across_widths() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for &width in &[40_u16, 80, 120] {
+            let (viz, _) = build_hud_test_graph();
+            let mut app = VizApp::from_viz_output_for_test(&viz);
+            let body = "Your review-session tasks:\n\
+                        - stocktake-assets\n\
+                        - content-review-poietic-life\n\
+                        - wg-visual-language-study";
+            let coord_msg = ChatMessage {
+                role: ChatRole::Coordinator,
+                text: body.to_string(),
+                full_text: Some(body.to_string()),
+                attachments: vec![],
+                edited: false,
+                inbox_id: None,
+                user: None,
+                target_task: None,
+                msg_timestamp: None,
+                read_at: None,
+                msg_queue_id: None,
+            };
+            let mut pending = std::collections::HashSet::new();
+            pending.insert("rid2".to_string());
+            app.chat = ChatState {
+                messages: vec![coord_msg],
+                streaming_text: body.to_string(),
+                pending_request_ids: pending,
+                awaiting_since: Some(std::time::Instant::now()),
+                ..ChatState::default()
+            };
+
+            let backend = TestBackend::new(width, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_chat_tab(frame, &mut app, area);
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let mut rendered = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    rendered.push_str(buffer[(x, y)].symbol());
+                }
+                rendered.push('\n');
+            }
+
+            // At width 40 lines may wrap; we count distinctive sub-tokens
+            // that are short enough to never split mid-word at any tested
+            // width.
+            for needle in ["stocktake", "poietic-life", "language-study"] {
+                let n = rendered.matches(needle).count();
+                assert_eq!(
+                    n, 1,
+                    "[width {}] {:?} appeared {} times — expected 1.\nRendered:\n{}",
+                    width, needle, n, rendered
+                );
+            }
+        }
     }
 
     #[test]

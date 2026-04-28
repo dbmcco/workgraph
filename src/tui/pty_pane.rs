@@ -1044,6 +1044,277 @@ mod tests {
         }
     }
 
+    /// Render the parser screen via tui-term + ratatui TestBackend at the
+    /// given dimensions. Returns the buffer text with each row joined by '\n'
+    /// and trailing whitespace per row trimmed.
+    fn render_to_text(parser: &Arc<Mutex<vt100::Parser>>, rows: u16, cols: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let p = parser.lock().unwrap();
+                let widget = tui_term::widget::PseudoTerminal::new(p.screen());
+                frame.render_widget(widget, frame.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            if y > area.top() {
+                out.push('\n');
+            }
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
+                if symbol.is_empty() {
+                    continue;
+                }
+                line.push_str(symbol);
+            }
+            out.push_str(line.trim_end());
+        }
+        out
+    }
+
+    /// Repro for the "PTY output doubled" bug: feed multi-line chat-agent-shaped
+    /// content into a vt100 parser sized to fit, render via PseudoTerminal,
+    /// and assert each input line appears exactly once in the rendered cells.
+    /// The user's screenshot shows three review-session task IDs printed twice
+    /// inside a single bordered pane.
+    #[test]
+    fn rendered_pty_output_does_not_double_lines() {
+        let lines = ["stocktake-assets", "content-review-poietic-life", "wg-visual-language-study"];
+
+        // Parser sized exactly to the rendering area — same as how
+        // `pane.resize(area.height, area.width)` clamps things in
+        // `draw_chat_tab`.
+        for &cols in &[40_u16, 80, 120] {
+            let parser = Arc::new(Mutex::new(vt100::Parser::new(
+                10,
+                cols,
+                DEFAULT_SCROLLBACK_LINES,
+            )));
+            {
+                let mut p = parser.lock().unwrap();
+                for line in &lines {
+                    p.process(line.as_bytes());
+                    p.process(b"\r\n");
+                }
+            }
+            let rendered = render_to_text(&parser, 10, cols);
+            for line in &lines {
+                let n = rendered.matches(line).count();
+                assert_eq!(
+                    n, 1,
+                    "line {:?} appeared {} times at width {} — expected 1.\nrendered:\n{}",
+                    line, n, cols, rendered
+                );
+            }
+        }
+    }
+
+    /// The chat-tab PTY pane calls `pane.resize(area.height, area.width)`
+    /// every frame. The implementation clamps to a 10×40 minimum (to keep
+    /// vt100::Parser out of panic-prone tiny grids). If the visible area
+    /// is *smaller* than 10×40, only the top of the parser is rendered —
+    /// not duplicated. This test pins that contract: a 5-row visible area
+    /// with content that fits in 5 rows shows each line exactly once and
+    /// nothing leaks from the bottom 5 rows of the (clamped) parser grid.
+    #[test]
+    fn render_area_smaller_than_parser_minimum_does_not_double() {
+        // Parser at the clamp minimum (10×40), but only 5 rows of visible
+        // area. Content is 3 lines — well within both dimensions.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            10,
+            40,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(b"stocktake-assets\r\n");
+            p.process(b"content-review-poietic-life\r\n");
+            p.process(b"wg-visual-language-study\r\n");
+        }
+        let rendered = render_to_text(&parser, 5, 40);
+        for line in [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ] {
+            let n = rendered.matches(line).count();
+            assert_eq!(
+                n, 1,
+                "rendering 5 visible rows of a 10-row parser should not double {:?} \
+                 (got {} occurrences). Rendered:\n{}",
+                line, n, rendered
+            );
+        }
+    }
+
+    /// Cursor save / restore (DECSC / DECRC) is emitted by TUI children
+    /// (claude, vendor CLIs) when redrawing dynamic regions. After the
+    /// child has printed multi-line content, then issues
+    /// `save → cursor-up → re-print → restore`, the SAME bytes feed the
+    /// parser twice but the second pass overwrites the first — the on-
+    /// screen content is the second pass only, no doubling. Pin the
+    /// invariant: re-printing identical content via cursor positioning
+    /// does not produce two copies in the rendered cells.
+    #[test]
+    fn cursor_reprint_does_not_double_content() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            10,
+            80,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(b"stocktake-assets\r\n");
+            p.process(b"content-review-poietic-life\r\n");
+            p.process(b"wg-visual-language-study\r\n");
+            // Move cursor up 3 rows back to the top of the printed block
+            // and re-print the same content (mimics a TUI redraw).
+            p.process(b"\x1b[3A\r");
+            p.process(b"stocktake-assets\r\n");
+            p.process(b"content-review-poietic-life\r\n");
+            p.process(b"wg-visual-language-study\r\n");
+        }
+        let rendered = render_to_text(&parser, 10, 80);
+        for line in [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ] {
+            let n = rendered.matches(line).count();
+            assert_eq!(
+                n, 1,
+                "cursor-up + reprint of {:?} should overwrite, not double \
+                 ({} occurrences). Rendered:\n{}",
+                line, n, rendered
+            );
+        }
+    }
+
+    /// Streaming chat-agent output that arrives as small chunks (token by
+    /// token) and uses `\r\n` line breaks must not produce duplicate
+    /// rendered lines, even at a width where individual chunks may
+    /// straddle row boundaries. The user described "streaming chat-agent
+    /// output at a width where wrapping kicks in" as a likely repro shape.
+    #[test]
+    fn streamed_chunks_with_newlines_do_not_double() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            10,
+            80,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        // Stream a numbered list as small chunks (mimics LLM token streaming).
+        let chunks: &[&[u8]] = &[
+            b"Your review-session tasks:\r\n",
+            b"- ",
+            b"stocktake-assets",
+            b"\r\n",
+            b"- ",
+            b"content-review-poietic-life",
+            b"\r\n",
+            b"- ",
+            b"wg-visual-language-study",
+            b"\r\n",
+        ];
+        {
+            let mut p = parser.lock().unwrap();
+            for c in chunks {
+                p.process(c);
+            }
+        }
+        let rendered = render_to_text(&parser, 10, 80);
+        for needle in [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ] {
+            let n = rendered.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "streamed chunked content {:?} appeared {} times — expected 1.\n\
+                 Rendered:\n{}",
+                needle, n, rendered
+            );
+        }
+    }
+
+    /// Re-rendering the same parser state multiple times (frame ticks while
+    /// the embedded child is idle) must NOT cause content to drift or
+    /// duplicate. Without this guarantee, every redraw would have to be
+    /// idempotent at the byte level — and any bug that mutates parser state
+    /// during render would surface here.
+    #[test]
+    fn repeated_render_is_idempotent() {
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            10,
+            80,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(b"alpha\r\nbeta\r\ngamma\r\n");
+        }
+        let first = render_to_text(&parser, 10, 80);
+        let second = render_to_text(&parser, 10, 80);
+        let third = render_to_text(&parser, 10, 80);
+        assert_eq!(first, second, "re-render produced different output");
+        assert_eq!(second, third, "third render diverged");
+        assert_eq!(first.matches("alpha").count(), 1);
+        assert_eq!(first.matches("beta").count(), 1);
+        assert_eq!(first.matches("gamma").count(), 1);
+    }
+
+    /// Resize-while-rendering: the chat tab calls `pane.resize(h, w)` every
+    /// frame; if the area is unchanged, the resize is a no-op, but if the
+    /// embedded child reflows on SIGWINCH the parser may pick up a
+    /// re-printed copy of recent output. Verify that a resize after content
+    /// has been printed does not duplicate it inside the render buffer at
+    /// either width.
+    #[test]
+    fn render_after_resize_does_not_double_lines() {
+        // Prime parser at the original size with multi-line content.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            10,
+            80,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(b"stocktake-assets\r\n");
+            p.process(b"content-review-poietic-life\r\n");
+            p.process(b"wg-visual-language-study\r\n");
+        }
+
+        // Caller resizes — narrower (wrap kicks in) then wider (no wrap).
+        for &(rows, cols) in &[(10_u16, 40_u16), (10, 80), (10, 120)] {
+            {
+                let mut p = parser.lock().unwrap();
+                p.screen_mut().set_size(rows, cols);
+            }
+            let rendered = render_to_text(&parser, rows, cols);
+            for line in [
+                "stocktake-assets",
+                "content-review-poietic-life",
+                "wg-visual-language-study",
+            ] {
+                let n = rendered.matches(line).count();
+                assert_eq!(
+                    n, 1,
+                    "after resize to {}x{}, line {:?} appeared {} times — expected 1.\n\
+                     rendered:\n{}",
+                    rows, cols, line, n, rendered
+                );
+            }
+        }
+    }
+
     #[test]
     fn scroll_to_top_and_bottom() {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(

@@ -11758,10 +11758,20 @@ impl VizApp {
         {
             self.chat.pending_request_ids.remove(&first);
         }
-        // If all requests are now answered, clear streaming state.
+        // Clear streaming_text whenever a new finalized response arrives —
+        // its content is now carried by the just-appended ChatMessage and
+        // leaving the streaming buffer populated would render the same
+        // text twice (once from messages, once from the streaming-while-
+        // awaiting block in draw_chat_tab). The next poll will re-read the
+        // .streaming dotfile if the agent has started a new turn.
+        // Why: previously streaming_text was only cleared when *all*
+        // pending_request_ids were retired, which produced a visible
+        // duplicate block when the user had typed two messages quickly
+        // and the first response landed while the second was still in
+        // flight (task fix-pty-output).
+        self.chat.streaming_text.clear();
         if self.chat.pending_request_ids.is_empty() {
             self.chat.awaiting_since = None;
-            self.chat.streaming_text.clear();
         }
 
         // Reorder deferred user messages to after the newly arrived coordinator
