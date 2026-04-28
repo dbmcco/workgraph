@@ -1,12 +1,136 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
-use workgraph::graph::{CycleConfig, Estimate, Node, Status, Task, parse_delay};
-#[cfg(test)]
-use workgraph::parser::load_graph;
+use workgraph::cron::{calculate_next_fire, parse_cron_expression};
+use workgraph::graph::{CycleConfig, Estimate, Node, PRIORITY_CRITICAL, PRIORITY_DEFAULT, PRIORITY_HIGH, PRIORITY_IDLE, PRIORITY_LOW, PRIORITY_NORMAL, Priority, Status, Task, boost_priority, parse_delay};
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
+
+/// Resolve a model input string to a fully-qualified `provider:model` format.
+///
+/// Handles four forms (in priority order):
+/// 1. Already valid `provider:model` → pass through
+/// 2. Matches a `[[model_registry]]` entry by ID → use registry provider + model
+/// 3. `provider/model` format (e.g., `minimax/minimax-m2.7`) → `openrouter:provider/model`
+/// 4. Bare short name (e.g., `minimax-m2.7`) → resolve against model cache → `openrouter:resolved_id`
+fn resolve_model_input(model: &str, workgraph_dir: &Path) -> Result<String> {
+    // If it already passes strict validation, it's fine
+    if workgraph::config::parse_model_spec_strict(model).is_ok() {
+        return Ok(model.to_string());
+    }
+
+    // Check config model_registry before falling back to OpenRouter catalog.
+    if let Ok(config) = workgraph::config::Config::load_merged(workgraph_dir)
+        && let Some(entry) = config.registry_lookup(model)
+    {
+        let prefix = workgraph::config::native_provider_to_prefix(&entry.provider);
+        let full_spec = format!("{}:{}", prefix, entry.model);
+        if workgraph::config::parse_model_spec_strict(&full_spec).is_ok() {
+            eprintln!(
+                "Resolved model '{}' → '{}' (from model_registry)",
+                model, full_spec
+            );
+            return Ok(full_spec);
+        }
+    }
+
+    // Check if it has a `/` but no recognized provider prefix → assume OpenRouter format
+    let spec = workgraph::config::parse_model_spec(model);
+    if spec.provider.is_none() && model.contains('/') {
+        // Looks like "provider/model" format (e.g., "minimax/minimax-m2.7")
+        let candidate = format!("openrouter:{}", model);
+        // Validate that this parses correctly
+        if workgraph::config::parse_model_spec_strict(&candidate).is_ok() {
+            eprintln!("Resolved model '{}' → '{}'", model, candidate);
+            return Ok(candidate);
+        }
+    }
+
+    // Bare short name — try to resolve against the model cache
+    let resolution =
+        workgraph::executor::native::openai_client::resolve_short_model_name(model, workgraph_dir);
+
+    if let Some(resolved_id) = resolution.resolved {
+        let full_spec = format!("openrouter:{}", resolved_id);
+        eprintln!("Resolved model '{}' → '{}'", model, full_spec);
+        return Ok(full_spec);
+    }
+
+    // Resolution failed — provide helpful error
+    if !resolution.suggestions.is_empty() {
+        let suggestions_str = resolution
+            .suggestions
+            .iter()
+            .map(|s| format!("    - openrouter:{}", s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!(
+            "Could not resolve model '{}'. Did you mean one of:\n{}\n  \
+             Hint: run `wg models search {}` to find valid alternatives.",
+            model,
+            suggestions_str,
+            model,
+        );
+    }
+
+    // No cache or no suggestions — fall back to strict validation error message
+    if let Err(e) = workgraph::config::parse_model_spec_strict(model) {
+        anyhow::bail!(
+            "Invalid --model format: {}\n  \
+             Hint: run `wg models fetch` to populate the model cache for short-name resolution.",
+            e,
+        );
+    }
+
+    Ok(model.to_string())
+}
+
+/// Parse a priority string into a Priority enum value.
+/// Accepts named levels (critical, high, normal, low, idle) or defaults to Normal if invalid.
+pub fn parse_priority(priority_str: Option<&str>) -> Priority {
+    match priority_str {
+        Some(s) => {
+            if let Ok(n) = s.parse::<u32>() {
+                return n;
+            }
+            match s.to_lowercase().as_str() {
+                "critical" => PRIORITY_CRITICAL,
+                "high" => PRIORITY_HIGH,
+                "normal" => PRIORITY_NORMAL,
+                "low" => PRIORITY_LOW,
+                "idle" => PRIORITY_IDLE,
+                _ => {
+                    eprintln!("Warning: Invalid priority '{}', using default ({})", s, PRIORITY_DEFAULT);
+                    PRIORITY_DEFAULT
+                }
+            }
+        }
+        None => PRIORITY_DEFAULT,
+    }
+}
+
+/// Calculate the final priority for a task, applying automatic boost for urgent/triage tags.
+///
+/// If the task has "urgent" or "triage" tags, boost the priority by one level:
+/// - Normal -> High
+/// - High -> Critical
+/// - Low -> Normal
+/// - Idle -> Low
+/// - Critical stays Critical (can't go higher)
+pub fn calculate_final_priority(base_priority: Priority, tags: &[String]) -> Priority {
+    let has_urgent_tag = tags.iter().any(|tag| {
+        let tag_lower = tag.to_lowercase();
+        tag_lower == "urgent" || tag_lower == "triage"
+    });
+
+    if has_urgent_tag {
+        boost_priority(base_priority)
+    } else {
+        base_priority
+    }
+}
 
 /// Parse a guard expression string into a LoopGuard.
 /// Formats: 'task:<id>=<status>' or 'always'
@@ -61,6 +185,10 @@ pub fn run(
     model: Option<&str>,
     provider: Option<&str>,
     verify: Option<&str>,
+    verify_timeout: Option<&str>,
+    validation: Option<&str>,
+    validator_agent: Option<&str>,
+    validator_model: Option<&str>,
     max_iterations: Option<u32>,
     cycle_guard: Option<&str>,
     cycle_delay: Option<&str>,
@@ -69,14 +197,39 @@ pub fn run(
     max_failure_restarts: Option<u32>,
     visibility: &str,
     context_scope: Option<&str>,
+    exec: Option<&str>,
+    timeout: Option<&str>,
     exec_mode: Option<&str>,
     paused: bool,
+    no_place: bool,
+    place_near: &[String],
+    place_before: &[String],
     delay: Option<&str>,
     not_before: Option<&str>,
+    allow_phantom: bool,
+    independent: bool,
+    no_tier_escalation: bool,
+    iteration_config: Option<workgraph::agency::IterationConfig>,
+    priority: Option<&str>,
+    cron: Option<&str>,
+    subtask: bool,
 ) -> Result<()> {
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
     }
+
+    // Validate --subtask: requires WG_TASK_ID (must be called from within an agent context)
+    let subtask_parent_id = if subtask {
+        let parent_id = std::env::var("WG_TASK_ID").map_err(|_| {
+            anyhow::anyhow!(
+                "--subtask requires an active task context (WG_TASK_ID must be set). \
+                 This flag is designed for agents to delegate blocking child tasks."
+            )
+        })?;
+        Some(parent_id)
+    } else {
+        None
+    };
 
     // Validate visibility
     match visibility {
@@ -94,15 +247,56 @@ pub fn run(
             .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
+    // Validate timeout if provided
+    if let Some(t) = timeout {
+        parse_delay(t).ok_or_else(|| {
+            anyhow::anyhow!("Invalid timeout '{}'. Use format: 30s, 5m, 1h, 4h, 1d", t)
+        })?;
+    }
+
+    // Auto-set exec_mode to "shell" when --exec is provided (unless --exec-mode is explicit)
+    let effective_exec_mode = if exec.is_some() && exec_mode.is_none() {
+        Some("shell")
+    } else {
+        exec_mode
+    };
+
     // Validate exec_mode if provided
-    if let Some(mode) = exec_mode {
-        match mode {
-            "full" | "light" | "bare" | "shell" => {}
-            _ => anyhow::bail!(
-                "Invalid exec_mode '{}'. Valid values: full, light, bare, shell",
-                mode
-            ),
-        }
+    if let Some(mode) = effective_exec_mode {
+        mode.parse::<workgraph::config::ExecMode>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
+
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg add \"...\" --model {}:MODEL",
+            suggested_provider,
+        );
+    }
+
+    // Resolve and validate model: short names are resolved against the model cache,
+    // then the result must be in provider:model format.
+    let resolved_model_str: Option<String>;
+    if let Some(m) = model {
+        resolved_model_str = Some(resolve_model_input(m, dir)?);
+    } else {
+        resolved_model_str = None;
+    }
+    let model = resolved_model_str.as_deref();
+
+    // Record model override in launcher history
+    if let Some(m) = model {
+        let _ = workgraph::launcher_history::record_use(
+            &workgraph::launcher_history::HistoryEntry::new("claude", Some(m), None, "cli"),
+        );
+    }
+
+    let path = graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
     }
 
     // --- Autopoietic guardrails ---
@@ -126,7 +320,6 @@ pub fn run(
         }
     }
 
-    // Pre-compute values that don't need graph access
     let estimate = if hours.is_some() || cost.is_some() {
         Some(Estimate { hours, cost })
     } else {
@@ -193,38 +386,250 @@ pub fn run(
         None
     };
 
-    if let Some(verify_cmd) = verify {
-        validate_verify_command(verify_cmd)?;
+    // --verify is deprecated: error out with migration guidance
+    if verify.is_some() {
+        anyhow::bail!(
+            "--verify is deprecated and no longer accepted.\n\
+             Put validation criteria in the task description under a ## Validation section:\n\
+             \n\
+             wg add \"My task\" -d \"## Validation\\n- [ ] cargo test passes\"\n\
+             \n\
+             The agency evaluator (auto_evaluate + FLIP) reads the ## Validation section and \
+             scores the agent's output against it."
+        );
     }
+
+    // --validation / --validator-agent / --validator-model are deprecated no-ops.
+    // The hard-gate flag was removed; validation criteria belong in the task
+    // description's `## Validation` section, where the agency evaluator reads them.
+    if validation.is_some() || validator_agent.is_some() || validator_model.is_some() {
+        eprintln!(
+            "Warning: --validation, --validator-agent, and --validator-model are deprecated \
+             and ignored. Put validation criteria in a `## Validation` section of the task \
+             description; the agency evaluator scores against it."
+        );
+    }
+    // Drop the values so they don't get persisted on the task.
+    let validation: Option<&str> = None;
+    let validator_agent: Option<&str> = None;
+    let validator_model: Option<&str> = None;
 
     let log = if paused {
         vec![workgraph::graph::LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: None,
+            user: Some(workgraph::current_user()),
             message: "Task paused".to_string(),
         }]
     } else {
         vec![]
     };
 
-    // Atomic graph mutation (flock held across read-modify-write)
-    let task_id = super::mutate_workgraph(dir, |graph| {
-        // 2. Task depth limit (enforced when --after is specified)
-        if !after.is_empty() {
-            let max_depth = guardrails.max_task_depth;
-            let max_parent_depth = after
-                .iter()
-                .map(|parent_id| graph.task_depth(parent_id))
-                .max()
-                .unwrap_or(0);
-            let new_depth = max_parent_depth + 1;
-            if new_depth > max_depth {
-                anyhow::bail!(
-                    "Task would be at depth {} (max: {}). \
-                     Consider creating tasks at the current level instead.",
-                    new_depth,
-                    max_depth
+    // Atomic load-modify-save under file lock
+    let mut error: Option<anyhow::Error> = None;
+    let mut task_id_out = String::new();
+    let max_depth = guardrails.max_task_depth;
+
+    let _graph = modify_graph(&path, |graph| {
+    // For --subtask, don't add implicit --after on the parent (child must be immediately ready).
+    // The parent→child relationship is expressed via the parent's wait condition, not via after edges.
+    let effective_after = if subtask {
+        after.to_vec()
+    } else {
+        default_parent_after(graph, after)
+    };
+
+    // 2. Task depth limit (enforced when --after is specified)
+    if !effective_after.is_empty() {
+        // The new task's depth = max(depth of each parent) + 1
+        let max_parent_depth = effective_after
+            .iter()
+            .map(|parent_id| graph.task_depth(parent_id))
+            .max()
+            .unwrap_or(0);
+        let new_depth = max_parent_depth + 1;
+        if new_depth > max_depth {
+            error = Some(anyhow::anyhow!(
+                "Task would be at depth {} (max: {}). \
+                 Consider creating tasks at the current level instead.",
+                new_depth,
+                max_depth
+            ));
+            return false;
+        }
+    }
+
+    // Generate ID if not provided
+    let task_id = match id {
+        Some(id) => {
+            if graph.get_node(id).is_some() {
+                error = Some(anyhow::anyhow!("Task with ID '{}' already exists", id));
+                return false;
+            }
+            id.to_string()
+        }
+        None => generate_id(title, graph),
+    };
+
+    // Validate after references (supports cross-repo peer:task-id syntax)
+    for blocker_id in &effective_after {
+        if blocker_id == &task_id {
+            error = Some(anyhow::anyhow!("Task '{}' cannot block itself", task_id));
+            return false;
+        }
+        if workgraph::federation::parse_remote_ref(blocker_id).is_some() {
+            // Cross-repo dependency — validated at resolution time, not here
+        } else if graph.get_node(blocker_id).is_none() {
+            if paused || allow_phantom {
+                // Deferred validation: paused tasks validate at publish time,
+                // --allow-phantom is an explicit opt-in for forward references
+                eprintln!(
+                    "Warning: dependency '{}' does not exist yet (will be validated at publish time)",
+                    blocker_id
                 );
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
+                {
+                    eprintln!("  → Did you mean '{}'?", suggestion);
+                }
+            } else {
+                // Strict validation: hard error for non-paused tasks
+                let mut msg = format!("Dependency '{}' does not exist.", blocker_id);
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(blocker_id, all_ids.iter().copied(), 3)
+                {
+                    msg.push_str(&format!("\n  → Did you mean '{}'?", suggestion));
+                }
+                msg.push_str("\n  Hint: Use --paused to defer validation, or --allow-phantom to allow forward references.");
+                error = Some(anyhow::anyhow!("{}", msg));
+                return false;
+            }
+        }
+    }
+
+    // Handle cron scheduling
+    let (cron_schedule, cron_enabled, next_cron_fire) = if let Some(cron_expr) = cron {
+        // Validate the cron expression
+        match parse_cron_expression(cron_expr) {
+            Ok(schedule) => {
+                // Calculate next fire time from now
+                let next_fire = calculate_next_fire(&schedule, Utc::now());
+                let next_fire_str = next_fire.map(|dt| dt.to_rfc3339());
+                (Some(cron_expr.to_string()), true, next_fire_str)
+            }
+            Err(e) => {
+                error = Some(anyhow::anyhow!("Invalid cron expression '{}': {}", cron_expr, e));
+                return false;
+            }
+        }
+    } else {
+        (None, false, None)
+    };
+
+    let task = Task {
+        id: task_id.clone(),
+        title: title.to_string(),
+        description: description.map(String::from),
+        status: Status::Open,
+        priority: calculate_final_priority(parse_priority(priority), tags),
+        assigned: assign.map(String::from),
+        estimate: estimate.clone(),
+        before: vec![],
+        after: effective_after.clone(),
+        requires: vec![],
+        tags: tags.to_vec(),
+        skills: skills.to_vec(),
+        inputs: inputs.to_vec(),
+        deliverables: deliverables.to_vec(),
+        artifacts: vec![],
+        exec: exec.map(String::from),
+        timeout: timeout.map(String::from),
+        not_before: computed_not_before.clone(),
+        created_at: Some(Utc::now().to_rfc3339()),
+        started_at: None,
+        completed_at: None,
+        log: log.clone(),
+        retry_count: 0,
+        max_retries,
+        failure_reason: None,
+        model: model.map(String::from),
+        provider: provider.map(String::from),
+        endpoint: None,
+        verify: verify.map(String::from),
+        verify_timeout: verify_timeout.map(String::from),
+        agent: None,
+        loop_iteration: 0,
+        last_iteration_completed_at: None,
+        cycle_failure_restarts: 0,
+        cycle_config: cycle_config.clone(),
+        ready_after: None,
+        paused,
+        visibility: visibility.to_string(),
+        context_scope: context_scope.map(String::from),
+        exec_mode: effective_exec_mode.map(String::from),
+        token_usage: None,
+        session_id: None,
+        wait_condition: None,
+        checkpoint: None,
+        triage_count: 0,
+        resurrection_count: 0,
+        last_resurrected_at: None,
+        validation: validation.map(String::from),
+        validation_commands: vec![],
+        validator_agent: validator_agent.map(String::from),
+        validator_model: validator_model.map(String::from),
+        gate_attempts: 0,
+        test_required: false,
+        rejection_count: 0,
+        max_rejections: None,
+        verify_failures: 0,
+        rescue_count: 0,
+        spawn_failures: 0,
+        dispatch_count: 0,
+        tier: None,
+        no_tier_escalation,
+        tried_models: vec![],
+        superseded_by: vec![],
+        supersedes: None,
+        unplaced: no_place || subtask,
+        place_near: place_near.to_vec(),
+        place_before: place_before.to_vec(),
+        independent,
+        iteration_round: 0,
+        iteration_anchor: None,
+        iteration_parent: None,
+        iteration_config,
+        cron_schedule,
+        cron_enabled,
+        last_cron_fire: None,
+        next_cron_fire,
+    };
+
+    // Add task to graph
+    graph.add_node(Node::Task(task));
+
+    // Maintain bidirectional consistency: update `blocks` on referenced blocker tasks
+    // (skip cross-repo refs — those live in a different graph)
+    for dep in &effective_after {
+        if workgraph::federation::parse_remote_ref(dep).is_some() {
+            continue; // Cross-repo dep; can't update remote graph's blocks field
+        }
+        if let Some(blocker) = graph.get_task_mut(dep)
+            && !blocker.before.contains(&task_id)
+        {
+            blocker.before.push(task_id.clone());
+        }
+    }
+
+    // Auto-create back-edges when --max-iterations is set and --after deps exist.
+    // For each --after dep, add the new task's ID to the dep's after list,
+    // forming a structural cycle that the SCC detector will find.
+    if max_iterations.is_some() && !effective_after.is_empty() {
+        for dep_id in &effective_after {
+            if workgraph::federation::parse_remote_ref(dep_id).is_some() {
+                continue; // Skip cross-repo deps
             }
         }
 
@@ -318,29 +723,43 @@ pub fn run(
             }
         }
 
-        // Auto-create back-edges when --max-iterations is set and --after deps exist.
-        if max_iterations.is_some() && !after.is_empty() {
-            for dep_id in after {
-                if workgraph::federation::parse_remote_ref(dep_id).is_some() {
-                    continue;
+    // Retroactive backlink repair: if any existing task references the newly
+    // created task in its `after` list (a previously-phantom edge), add the
+    // missing `before` backlink on the new task to restore bidirectional consistency.
+    {
+        let referencing_ids: Vec<String> = graph
+            .tasks()
+            .filter(|t| t.id != task_id && t.after.contains(&task_id))
+            .map(|t| t.id.clone())
+            .collect();
+        for ref_id in referencing_ids {
+            if let Some(new_task) = graph.get_task_mut(&task_id)
+                && !new_task.before.contains(&ref_id) {
+                    new_task.before.push(ref_id);
                 }
-                if let Some(dep_task) = graph.get_task_mut(dep_id)
-                    && !dep_task.after.contains(&task_id)
-                {
-                    dep_task.after.push(task_id.clone());
-                }
-                if let Some(new_task) = graph.get_task_mut(&task_id)
-                    && !new_task.before.contains(dep_id)
-                {
-                    new_task.before.push(dep_id.clone());
-                }
-            }
         }
+    }
 
-        Ok(task_id)
-    })?;
+    task_id_out = task_id;
+    true
+    })
+    .context("Failed to save graph")?;
 
-    super::notify_graph_changed(dir);
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    let task_id = task_id_out;
+    if paused {
+        // Draft tasks can't be dispatched until published. Notify the daemon
+        // (so TUIs can refresh) but don't wake it for dispatch — that would
+        // produce a no-op tick.
+        super::notify_graph_changed(dir);
+    } else {
+        // Published-immediately: kick the dispatcher so the user sees agent
+        // activity within sub-second.
+        super::notify_kick(dir);
+    }
     super::notify_new_task_focus(dir, &task_id);
 
     let mut detail = serde_json::json!({ "title": title });
@@ -356,7 +775,85 @@ pub fn run(
         config.log.rotation_threshold,
     );
 
-    if paused {
+    // --subtask: set wait condition on parent task so it blocks until child completes
+    if let Some(ref parent_id) = subtask_parent_id {
+        let child_id = task_id.clone();
+        let parent_id = parent_id.clone();
+        let mut wait_error: Option<anyhow::Error> = None;
+
+        modify_graph(&path, |graph| {
+            let parent = match graph.get_task(&parent_id) {
+                Some(t) => t,
+                None => {
+                    wait_error = Some(anyhow::anyhow!(
+                        "Parent task '{}' not found (WG_TASK_ID is stale?)", parent_id
+                    ));
+                    return false;
+                }
+            };
+
+            if parent.status != Status::InProgress {
+                wait_error = Some(anyhow::anyhow!(
+                    "Cannot set subtask wait on parent '{}': status is '{}', expected 'in-progress'",
+                    parent_id, parent.status
+                ));
+                return false;
+            }
+
+            let parent = graph.get_task_mut(&parent_id).expect("verified above");
+            parent.status = Status::Waiting;
+            parent.wait_condition = Some(workgraph::graph::WaitSpec::Any(vec![
+                workgraph::graph::WaitCondition::TaskStatus {
+                    task_id: child_id.clone(),
+                    status: Status::Done,
+                },
+                workgraph::graph::WaitCondition::TaskStatus {
+                    task_id: child_id.clone(),
+                    status: Status::Failed,
+                },
+            ]));
+            parent.log.push(workgraph::graph::LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: parent.assigned.clone(),
+                user: Some(workgraph::current_user()),
+                message: format!(
+                    "Agent parked. Waiting for subtask '{}' to complete.",
+                    child_id
+                ),
+            });
+
+            true
+        })
+        .context("Failed to set subtask wait condition on parent")?;
+
+        if let Some(e) = wait_error {
+            return Err(e);
+        }
+
+        // Update agent status to Parked if there's an assigned agent
+        if let Ok(mut registry) = workgraph::service::registry::AgentRegistry::load_locked(dir) {
+            for agent in registry.registry.agents.values_mut() {
+                if agent.task_id == parent_id && agent.is_alive() {
+                    agent.status = workgraph::service::registry::AgentStatus::Parked;
+                    if agent.completed_at.is_none() {
+                        agent.completed_at = Some(Utc::now().to_rfc3339());
+                    }
+                }
+            }
+            let _ = registry.save();
+        }
+
+        super::notify_graph_changed(dir);
+
+        println!("Added subtask: {} ({})", title, task_id);
+        println!(
+            "  Parent '{}' is now waiting for subtask to complete.",
+            parent_id
+        );
+        println!(
+            "  You should now exit cleanly. The coordinator will re-spawn you when the subtask finishes."
+        );
+    } else if paused {
         println!("Added task (draft): {} ({})", title, task_id);
         println!(
             "  Task is paused (draft mode). When ready, run: wg publish {}",
@@ -365,7 +862,7 @@ pub fn run(
     } else {
         println!("Added task: {} ({})", title, task_id);
     }
-    if id.is_none() {
+    if id.is_none() && subtask_parent_id.is_none() {
         println!("  Use --after {} to depend on this task", task_id);
     }
     super::print_service_hint(dir);
@@ -393,11 +890,42 @@ pub fn run_remote(
     model: Option<&str>,
     provider: Option<&str>,
     verify: Option<&str>,
+    verify_timeout: Option<&str>,
+    cron: Option<&str>,
 ) -> Result<()> {
     use workgraph::federation::{check_peer_service, resolve_peer};
 
     if title.trim().is_empty() {
         anyhow::bail!("Task title cannot be empty");
+    }
+
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg add \"...\" --model {}:MODEL",
+            suggested_provider,
+        );
+    }
+
+    // Resolve and validate model: short names are resolved against the model cache,
+    // then the result must be in provider:model format.
+    let resolved_model_str: Option<String>;
+    if let Some(m) = model {
+        resolved_model_str = Some(resolve_model_input(m, local_workgraph_dir)?);
+    } else {
+        resolved_model_str = None;
+    }
+    let model = resolved_model_str.as_deref();
+
+    // --verify is deprecated: error out with migration guidance
+    if verify.is_some() {
+        anyhow::bail!(
+            "--verify is deprecated and no longer accepted.\n\
+             Put validation criteria in a ## Validation section of the task description; \
+             the agency evaluator scores against it."
+        );
     }
 
     // Resolve peer reference to a concrete .workgraph directory
@@ -424,7 +952,9 @@ pub fn run_remote(
             deliverables: deliverables.to_vec(),
             model: model.map(String::from),
             verify: verify.map(String::from),
+            verify_timeout: verify_timeout.map(String::from),
             origin: Some(origin),
+            cron: cron.map(String::from),
         };
 
         let response = super::service::send_request(&resolved.workgraph_dir, &request)?;
@@ -460,6 +990,8 @@ pub fn run_remote(
             model,
             provider,
             verify,
+            verify_timeout,
+            cron,
             &origin,
         )?;
         println!(
@@ -485,9 +1017,12 @@ fn add_task_directly(
     model: Option<&str>,
     provider: Option<&str>,
     verify: Option<&str>,
+    verify_timeout: Option<&str>,
+    cron: Option<&str>,
     origin: &str,
 ) -> Result<String> {
     use workgraph::graph::{Node, Status, Task};
+    use workgraph::parser::modify_graph as modify_graph_inner;
 
     let graph_path = super::graph_path(peer_workgraph_dir);
     if !graph_path.exists() {
@@ -497,15 +1032,45 @@ fn add_task_directly(
         );
     }
 
-    let task_id = workgraph::parser::mutate_graph(&graph_path, |graph| {
+    let mut error: Option<anyhow::Error> = None;
+    let mut task_id_out = String::new();
+
+    let _graph = modify_graph_inner(&graph_path, |graph| {
         let task_id = match id {
             Some(id) => {
                 if graph.get_node(id).is_some() {
-                    anyhow::bail!("Task with ID '{}' already exists in peer", id);
+                    error = Some(anyhow::anyhow!(
+                        "Task with ID '{}' already exists in peer",
+                        id
+                    ));
+                    return false;
                 }
                 id.to_string()
             }
             None => generate_id(title, graph),
+        };
+
+        // Handle cron scheduling
+        let (cron_schedule, cron_enabled, next_cron_fire) = if let Some(cron_expr) = cron {
+            // Validate the cron expression
+            match parse_cron_expression(cron_expr) {
+                Ok(schedule) => {
+                    // Calculate next fire time from now
+                    let next_fire = calculate_next_fire(&schedule, chrono::Utc::now());
+                    let next_fire_str = next_fire.map(|dt| dt.to_rfc3339());
+                    (Some(cron_expr.to_string()), true, next_fire_str)
+                }
+                Err(e) => {
+                    error = Some(anyhow::anyhow!(
+                        "Invalid cron expression '{}': {}",
+                        cron_expr,
+                        e
+                    ));
+                    return false;
+                }
+            }
+        } else {
+            (None, false, None)
         };
 
         let task = Task {
@@ -513,6 +1078,7 @@ fn add_task_directly(
             title: title.to_string(),
             description: description.map(String::from),
             status: Status::Open,
+            priority: calculate_final_priority(PRIORITY_DEFAULT, tags),
             assigned: None,
             estimate: None,
             before: vec![],
@@ -524,6 +1090,7 @@ fn add_task_directly(
             deliverables: deliverables.to_vec(),
             artifacts: vec![],
             exec: None,
+            timeout: None,
             not_before: None,
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             started_at: None,
@@ -534,9 +1101,12 @@ fn add_task_directly(
             failure_reason: None,
             model: model.map(String::from),
             provider: provider.map(String::from),
+            endpoint: None,
             verify: verify.map(String::from),
+            verify_timeout: verify_timeout.map(String::from),
             agent: None,
             loop_iteration: 0,
+            last_iteration_completed_at: None,
             cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
@@ -548,8 +1118,38 @@ fn add_task_directly(
             session_id: None,
             wait_condition: None,
             checkpoint: None,
+            triage_count: 0,
             resurrection_count: 0,
             last_resurrected_at: None,
+            validation: None,
+            validation_commands: vec![],
+            validator_agent: None,
+            validator_model: None,
+            gate_attempts: 0,
+            test_required: false,
+            rejection_count: 0,
+            max_rejections: None,
+            verify_failures: 0,
+            rescue_count: 0,
+            spawn_failures: 0,
+            dispatch_count: 0,
+            tier: None,
+            no_tier_escalation: false,
+            tried_models: vec![],
+            superseded_by: vec![],
+            supersedes: None,
+            unplaced: false,
+            place_near: vec![],
+            place_before: vec![],
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
+            cron_schedule,
+            cron_enabled,
+            last_cron_fire: None,
+            next_cron_fire,
         };
 
         graph.add_node(Node::Task(task));
@@ -563,8 +1163,16 @@ fn add_task_directly(
             }
         }
 
-        Ok(task_id)
-    })?;
+        task_id_out = task_id;
+        true
+    })
+    .context("Failed to save peer graph")?;
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    let task_id = task_id_out;
 
     // Record provenance in the peer's workgraph
     let config = workgraph::config::Config::load_or_default(peer_workgraph_dir);
@@ -596,41 +1204,21 @@ fn count_agent_created_tasks(dir: &Path, agent_id: &str) -> u32 {
         .count() as u32
 }
 
-/// Validate that a --verify string is a valid shell command.
-/// Runs `bash -n -c "CMD"` to syntax-check without executing.
-fn validate_verify_command(cmd: &str) -> Result<()> {
-    use std::process::Command;
-
-    let cmd_trimmed = cmd.trim();
-    if cmd_trimmed.is_empty() {
-        anyhow::bail!("Verify command cannot be empty");
+fn default_parent_after(graph: &workgraph::WorkGraph, after: &[String]) -> Vec<String> {
+    if !after.is_empty() {
+        return after.to_vec();
     }
 
-    // Syntax check: bash -n parses without executing
-    let output = Command::new("bash")
-        .arg("-n")
-        .arg("-c")
-        .arg(cmd_trimmed)
-        .output()
-        .context("Failed to run bash syntax check on verify command")?;
+    let Ok(current_task_id) = std::env::var("WG_TASK_ID") else {
+        return vec![];
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Verify command is not valid shell syntax:\n  {}\n\n\
-             Error: {}\n\
-             The --verify flag requires a shell command that will be run with `sh -c`.\n\
-             Examples of valid verify commands:\n  \
-             cargo test\n  \
-             cargo test --lib\n  \
-             test -f output.txt && grep 'expected' output.txt\n  \
-             make check",
-            cmd_trimmed,
-            stderr.trim(),
-        );
+    match graph.get_task(&current_task_id) {
+        Some(task) if !task.tags.iter().any(|tag| tag == "coordinator-loop") => {
+            vec![current_task_id]
+        }
+        _ => vec![],
     }
-
-    Ok(())
 }
 
 fn generate_id(title: &str, graph: &workgraph::WorkGraph) -> String {
@@ -695,8 +1283,15 @@ fn generate_id(title: &str, graph: &workgraph::WorkGraph) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use workgraph::WorkGraph;
     use workgraph::graph::{LoopGuard, Node, Status, Task};
+    use workgraph::parser::{load_graph, save_graph};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     /// Helper: create a minimal task with the given ID for inserting into a WorkGraph.
     fn stub_task(id: &str) -> Task {
@@ -1053,7 +1648,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -1063,9 +1662,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -1096,7 +1707,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -1106,9 +1721,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot be empty"));
@@ -1139,7 +1766,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -1149,9 +1780,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         );
         assert!(result.is_err());
         assert!(
@@ -1164,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn nonexistent_blocker_warns_but_succeeds() {
+    fn nonexistent_blocker_rejected_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
         std::fs::create_dir_all(dir_path).unwrap();
@@ -1172,7 +1815,7 @@ mod tests {
         let graph = WorkGraph::new();
         workgraph::parser::save_graph(&graph, &path).unwrap();
 
-        // Should succeed (with a warning to stderr) — nonexistent blockers are allowed
+        // Should fail by default — strict validation rejects phantom dependencies
         let result = run(
             dir_path,
             "My task",
@@ -1189,7 +1832,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -1199,9 +1846,143 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
+            false,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("does not exist"),
+            "Expected 'does not exist' error for phantom dependency"
+        );
+    }
+
+    #[test]
+    fn nonexistent_blocker_allowed_with_allow_phantom() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+        let graph = WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        // Should succeed with --allow-phantom
+        let result = run(
+            dir_path,
+            "My task",
+            None,
+            None,
+            &["nonexistent".to_string()],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
             false,
             None,
+            "internal",
             None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            true,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn nonexistent_blocker_allowed_when_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+        let graph = WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &path).unwrap();
+
+        // Should succeed with paused=true (deferred validation)
+        let result = run(
+            dir_path,
+            "My task",
+            None,
+            None,
+            &["nonexistent".to_string()],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            None,
+            None,
+            true, // paused
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            false, // allow_phantom=false, but paused=true defers validation
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         );
         assert!(result.is_ok());
     }
@@ -1236,7 +2017,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -1246,9 +2031,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         );
         assert!(result.is_ok());
 
@@ -1273,6 +2070,583 @@ mod tests {
             b.before.contains(&"dep-task".to_string()),
             "blocker-b.before should contain dep-task, got: {:?}",
             b.before
+        );
+    }
+
+    // ── resolve_model_input tests ──────────────────────────────────────
+
+    #[test]
+    fn resolve_model_input_valid_provider_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = resolve_model_input("openrouter:minimax/minimax-m2.7", dir.path()).unwrap();
+        assert_eq!(result, "openrouter:minimax/minimax-m2.7");
+    }
+
+    #[test]
+    fn resolve_model_input_slash_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = resolve_model_input("minimax/minimax-m2.7", dir.path()).unwrap();
+        assert_eq!(result, "openrouter:minimax/minimax-m2.7");
+    }
+
+    #[test]
+    fn resolve_model_input_short_name_with_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = serde_json::json!({
+            "fetched_at": "2026-04-01T00:00:00Z",
+            "models": [
+                {"id": "minimax/minimax-m2.7", "name": "Minimax M2.7"},
+                {"id": "anthropic/claude-sonnet-4-6", "name": "Sonnet"},
+            ]
+        });
+        std::fs::write(dir.path().join("model_cache.json"), cache.to_string()).unwrap();
+
+        let result = resolve_model_input("minimax-m2.7", dir.path()).unwrap();
+        assert_eq!(result, "openrouter:minimax/minimax-m2.7");
+    }
+
+    #[test]
+    fn resolve_model_input_short_name_no_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No cache — should fail with helpful error
+        let result = resolve_model_input("minimax-m2.7", dir.path());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("wg models fetch"),
+            "Error should suggest fetching: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn resolve_model_input_claude_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = resolve_model_input("claude:opus", dir.path()).unwrap();
+        assert_eq!(result, "claude:opus");
+    }
+
+    #[test]
+    fn resolve_model_input_prefers_model_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_content = r#"
+[[model_registry]]
+id = "qwen3-coder-30b"
+provider = "openai"
+model = "qwen3-coder-30b"
+tier = "standard"
+endpoint = "lambda01-local"
+context_window = 32768
+"#;
+        std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let cache = serde_json::json!({
+            "fetched_at": "2026-04-01T00:00:00Z",
+            "models": [
+                {"id": "qwen/qwen3-coder-30b-a3b-instruct", "name": "Qwen3 Coder 30B"},
+            ]
+        });
+        std::fs::write(dir.path().join("model_cache.json"), cache.to_string()).unwrap();
+
+        let result = resolve_model_input("qwen3-coder-30b", dir.path()).unwrap();
+        // Serialized models now emit "oai-compat:" prefix (the internal
+        // provider tag "openai" → user-facing prefix "oai-compat" via
+        // native_provider_to_prefix). The legacy "openai:" form still
+        // parses correctly; we just don't emit it any more.
+        assert_eq!(result, "oai-compat:qwen3-coder-30b");
+    }
+
+    #[test]
+    fn resolve_model_input_falls_back_to_openrouter_when_not_in_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_content = r#"
+[[model_registry]]
+id = "some-other-model"
+provider = "openai"
+model = "some-other-model"
+tier = "standard"
+"#;
+        std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let cache = serde_json::json!({
+            "fetched_at": "2026-04-01T00:00:00Z",
+            "models": [
+                {"id": "minimax/minimax-m2.7", "name": "Minimax M2.7"},
+            ]
+        });
+        std::fs::write(dir.path().join("model_cache.json"), cache.to_string()).unwrap();
+
+        let result = resolve_model_input("minimax-m2.7", dir.path()).unwrap();
+        assert_eq!(result, "openrouter:minimax/minimax-m2.7");
+    }
+
+    #[test]
+    fn test_add_with_exec_sets_shell_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = dir.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let graph_path = wg_dir.join("graph.jsonl");
+        save_graph(&WorkGraph::new(), &graph_path).unwrap();
+
+        let result = run(
+            &wg_dir,
+            "Run script",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,  // verify
+            None,  // verify_timeout
+            None,  // validation
+            None,  // validator_agent
+            None,  // validator_model
+            None,  // max_iterations
+            None,  // cycle_guard
+            None,  // cycle_delay
+            false, // no_converge
+            false, // no_restart_on_failure
+            None,  // max_failure_restarts
+            "internal",
+            None,                     // context_scope
+            Some("echo hello world"), // exec
+            None,                     // timeout
+            None,                     // exec_mode (should auto-set to shell)
+            false,                    // paused
+            true,                     // no_place
+            &[],
+            &[],
+            None,
+            None,
+            false, // allow_phantom
+            false, // independent
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
+        );
+        assert!(result.is_ok(), "wg add --exec should succeed: {:?}", result);
+
+        let graph = load_graph(&graph_path).unwrap();
+        let task = graph.get_task("run-script").unwrap();
+        assert_eq!(task.exec.as_deref(), Some("echo hello world"));
+        assert_eq!(
+            task.exec_mode.as_deref(),
+            Some("shell"),
+            "exec_mode should auto-set to 'shell' when --exec is provided"
+        );
+    }
+
+    #[test]
+    fn test_add_with_exec_respects_explicit_exec_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = dir.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let graph_path = wg_dir.join("graph.jsonl");
+        save_graph(&WorkGraph::new(), &graph_path).unwrap();
+
+        let result = run(
+            &wg_dir,
+            "Run with bare",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            Some("echo hi"), // exec
+            None,            // timeout
+            Some("bare"),    // explicit exec_mode overrides auto-shell
+            false,
+            true,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
+        );
+        assert!(result.is_ok());
+
+        let graph = load_graph(&graph_path).unwrap();
+        let task = graph.get_task("run-with-bare").unwrap();
+        assert_eq!(task.exec.as_deref(), Some("echo hi"));
+        assert_eq!(
+            task.exec_mode.as_deref(),
+            Some("bare"),
+            "explicit --exec-mode should override auto-shell"
+        );
+    }
+
+    #[test]
+    fn test_add_with_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = dir.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        let graph_path = wg_dir.join("graph.jsonl");
+        save_graph(&WorkGraph::new(), &graph_path).unwrap();
+
+        let result = run(
+            &wg_dir,
+            "Timed task",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            Some("python3 long.py"), // exec
+            Some("4h"),              // timeout
+            None,
+            false,
+            true,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
+        );
+        assert!(result.is_ok());
+
+        let graph = load_graph(&graph_path).unwrap();
+        let task = graph.get_task("timed-task").unwrap();
+        assert_eq!(task.timeout.as_deref(), Some("4h"));
+    }
+
+    #[test]
+    fn default_parent_after_uses_current_task_for_non_coordinator() {
+        let _guard = env_lock().lock().unwrap();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(stub_task("parent-task")));
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+        let result = default_parent_after(&graph, &[]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert_eq!(result, vec!["parent-task".to_string()]);
+    }
+
+    #[test]
+    fn default_parent_after_skips_coordinator_task() {
+        let _guard = env_lock().lock().unwrap();
+        let mut coordinator = stub_task("coordinator-task");
+        coordinator.tags.push("coordinator-loop".to_string());
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(coordinator));
+
+        unsafe { std::env::set_var("WG_TASK_ID", "coordinator-task") };
+        let result = default_parent_after(&graph, &[]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn default_parent_after_preserves_explicit_after() {
+        let _guard = env_lock().lock().unwrap();
+        let graph = WorkGraph::new();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+        let result = default_parent_after(&graph, &["explicit-parent".to_string()]);
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert_eq!(result, vec!["explicit-parent".to_string()]);
+    }
+
+    // ---- subtask tests ----
+
+    #[test]
+    fn subtask_requires_wg_task_id() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+        save_graph(&WorkGraph::new(), &path).unwrap();
+
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        let result = run(
+            dir_path,
+            "Child task",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,
+            None,
+            true, // subtask
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("WG_TASK_ID"),
+            "Should fail when WG_TASK_ID not set"
+        );
+    }
+
+    #[test]
+    fn subtask_creates_child_and_sets_wait_condition() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+
+        let mut parent = stub_task("parent-task");
+        parent.status = Status::InProgress;
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(parent));
+        save_graph(&graph, &path).unwrap();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+
+        let result = run(
+            dir_path,
+            "Research subtask",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,
+            None,
+            true, // subtask
+        );
+
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(
+            result.is_ok(),
+            "subtask creation should succeed: {:?}",
+            result
+        );
+
+        let graph = load_graph(&path).unwrap();
+
+        let child = graph.get_task("research-subtask").unwrap();
+        assert_eq!(child.status, Status::Open);
+        assert!(child.after.is_empty());
+        assert!(child.unplaced);
+
+        let parent = graph.get_task("parent-task").unwrap();
+        assert_eq!(parent.status, Status::Waiting);
+        assert!(parent.wait_condition.is_some());
+
+        use workgraph::graph::{WaitCondition, WaitSpec};
+        match parent.wait_condition.as_ref().unwrap() {
+            WaitSpec::Any(conditions) => {
+                assert_eq!(conditions.len(), 2);
+                assert!(conditions.contains(&WaitCondition::TaskStatus {
+                    task_id: "research-subtask".to_string(),
+                    status: Status::Done,
+                }));
+                assert!(conditions.contains(&WaitCondition::TaskStatus {
+                    task_id: "research-subtask".to_string(),
+                    status: Status::Failed,
+                }));
+            }
+            other => panic!("Expected WaitSpec::Any, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn subtask_fails_if_parent_not_in_progress() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        let path = super::graph_path(dir_path);
+
+        let parent = stub_task("parent-task");
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(parent));
+        save_graph(&graph, &path).unwrap();
+
+        unsafe { std::env::set_var("WG_TASK_ID", "parent-task") };
+
+        let result = run(
+            dir_path,
+            "Child task",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,
+            None,
+            true, // subtask
+        );
+
+        unsafe { std::env::remove_var("WG_TASK_ID") };
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("in-progress"),
+            "Should fail when parent is not in-progress"
         );
     }
 }

@@ -9,6 +9,7 @@ use std::path::Path;
 use workgraph::agency::{Evaluation, load_all_evaluations_or_warn};
 use workgraph::config::Config;
 use workgraph::graph::{Status, Task};
+use workgraph::parser::modify_graph;
 use workgraph::runs::{self, RunMeta};
 
 /// Options controlling which tasks to reset.
@@ -33,6 +34,7 @@ struct ReplayOutput {
 }
 
 pub fn run(dir: &Path, opts: &ReplayOptions, json: bool) -> Result<()> {
+    let (graph, graph_path) = super::load_workgraph_mut(dir)?;
     let config = Config::load_or_default(dir);
 
     // Phase 1-3: Read-only analysis (no lock held — just determining what to reset)
@@ -201,18 +203,23 @@ pub fn run(dir: &Path, opts: &ReplayOptions, json: bool) -> Result<()> {
     };
     runs::snapshot(dir, &run_id, &meta)?;
 
-    // Phase 5: Atomic reset (flock held across read-modify-write)
-    super::mutate_workgraph(dir, |graph| {
+    // Phase 5: Reset selected tasks
+    // Use modify_graph for atomic load+mutate+save
+    let model_clone = opts.model.clone();
+    modify_graph(&graph_path, |graph| {
+        let mut modified = false;
         for task_id in &reset_ids {
             if let Some(task) = graph.get_task_mut(task_id) {
                 reset_task(task);
-                if let Some(ref model) = opts.model {
+                if let Some(ref model) = model_clone {
                     task.model = Some(model.clone());
                 }
+                modified = true;
             }
         }
-        Ok(())
-    })?;
+        modified
+    })
+    .context("Failed to modify graph after replay")?;
     super::notify_graph_changed(dir);
 
     // Phase 6: Record provenance

@@ -243,7 +243,7 @@ fn archive_produces_operation_log_entry() {
     task.completed_at = Some("2024-01-01T00:00:00Z".to_string());
     let (_dir, wg_dir) = setup_wg(vec![task, make_task("t2", "Open task", Status::Open)]);
 
-    wg_ok(&wg_dir, &["archive"]);
+    wg_ok(&wg_dir, &["archive", "--yes"]);
 
     let entries = provenance::read_all_operations(&wg_dir).unwrap();
     let archive_ops = ops_with_op(&entries, "archive");
@@ -431,6 +431,7 @@ fn rotation_triggers_under_high_volume() {
             op: "bulk_test".to_string(),
             task_id: Some(format!("t{}", i)),
             actor: None,
+            user: None,
             detail: serde_json::json!({ "index": i }),
         };
         provenance::append_operation(&wg_dir, &entry, threshold).unwrap();
@@ -472,6 +473,7 @@ fn rotated_zstd_files_can_be_read_back() {
             op: "readback_test".to_string(),
             task_id: Some(format!("task-{}", i)),
             actor: Some("test-actor".to_string()),
+            user: None,
             detail: serde_json::json!({ "n": i }),
         };
         provenance::append_operation(&wg_dir, &entry, threshold).unwrap();
@@ -529,6 +531,7 @@ fn concurrent_writes_to_operation_log() {
                         op: "concurrent_write".to_string(),
                         task_id: Some(format!("t{}-{}", tid, i)),
                         actor: Some(format!("thread-{}", tid)),
+                        user: None,
                         detail: serde_json::Value::Null,
                     };
                     // Use large threshold to avoid rotation complicating things
@@ -797,14 +800,14 @@ fn coherency_after_archive_and_gc() {
     fs::create_dir_all(&wg_dir).unwrap();
     fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
 
-    // Add tasks, complete one, abandon another
+    // Add tasks, complete one, fail another, keep one open
     wg_ok(
         &wg_dir,
         &["add", "Done task", "--id", "done-task", "--immediate"],
     );
     wg_ok(
         &wg_dir,
-        &["add", "Abandon task", "--id", "abandon-task", "--immediate"],
+        &["add", "Fail task", "--id", "fail-task", "--immediate"],
     );
     wg_ok(
         &wg_dir,
@@ -812,12 +815,12 @@ fn coherency_after_archive_and_gc() {
     );
 
     wg_ok(&wg_dir, &["done", "done-task"]);
-    wg_ok(&wg_dir, &["abandon", "abandon-task"]);
+    wg_ok(&wg_dir, &["fail", "fail-task", "--reason", "test"]);
 
-    // Archive done tasks
-    wg_ok(&wg_dir, &["archive"]);
+    // Archive done tasks (archives Done + Abandoned, but not Failed)
+    wg_ok(&wg_dir, &["archive", "--yes"]);
 
-    // GC abandoned tasks
+    // GC failed tasks
     wg_ok(&wg_dir, &["gc"]);
 
     // Archived and gc'd tasks should NOT be in graph
@@ -827,8 +830,8 @@ fn coherency_after_archive_and_gc() {
         "done-task should be archived"
     );
     assert!(
-        graph.get_task("abandon-task").is_none(),
-        "abandon-task should be gc'd"
+        graph.get_task("fail-task").is_none(),
+        "fail-task should be gc'd"
     );
     assert!(
         graph.get_task("keep-task").is_some(),
@@ -841,7 +844,7 @@ fn coherency_after_archive_and_gc() {
 
     assert!(ops.contains(&"add_task"));
     assert!(ops.contains(&"done"));
-    assert!(ops.contains(&"abandon"));
+    assert!(ops.contains(&"fail"));
     assert!(ops.contains(&"archive"));
     assert!(ops.contains(&"gc"));
 }
@@ -925,7 +928,7 @@ fn multiple_tasks_archive_produces_multiple_entries() {
     wg_ok(&wg_dir, &["add", "Done B", "--id", "done-b", "--immediate"]);
     wg_ok(&wg_dir, &["done", "done-a"]);
     wg_ok(&wg_dir, &["done", "done-b"]);
-    wg_ok(&wg_dir, &["archive"]);
+    wg_ok(&wg_dir, &["archive", "--yes"]);
 
     let entries = provenance::read_all_operations(&wg_dir).unwrap();
     let archive_ops = ops_with_op(&entries, "archive");

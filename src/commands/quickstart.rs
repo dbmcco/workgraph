@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-const QUICKSTART_TEXT: &str = r#"
+const QUICKSTART_TEXT: &str = r###"
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                         WORKGRAPH AGENT QUICKSTART                           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -12,6 +12,7 @@ GETTING STARTED
   wg agency init              # Bootstrap roles, tradeoffs, and a default agent
   wg service start            # Start the coordinator
   wg add "My first task"      # Add work — the service dispatches automatically
+  wg status                   # Quick one-screen overview of your project
 
 SKILL & BUNDLE SETUP (required for agents to use wg)
 ─────────────────────────────────────────
@@ -44,6 +45,20 @@ AGENCY SETUP
   • Agent     — a role+tradeoff pairing (default: Careful Programmer)
   • Config    — enables auto_assign and auto_evaluate
 
+  Additional agency toggles:
+    wg config --auto-place true      # Auto-place new tasks in the graph
+    wg config --auto-create true     # Auto-invoke creator agent for new primitives
+
+  Placement: when auto_place is enabled, the assignment step also decides
+  dependency edges for each task (merged into the .assign-* LLM call).
+
+  Model registry: each dispatch role has a tier-based model default. View and
+  configure per-role models:
+    wg config --models                # Show all role→model assignments
+    wg config --set-model <role> <m>  # Set model for a role (e.g., evolver opus)
+    wg config --registry              # Show registered models and tiers
+    wg config --tier <tier>=<model>   # Change which model a tier uses
+
   You can also set up manually:
     wg role add "Name" --outcome "What it produces" --skill skill-name
     wg tradeoff add "Name" --accept "Slow" --reject "Untested"
@@ -73,9 +88,41 @@ SERVICE MODE (recommended for parallel work)
   the coordinator handles this.
 
   wg service status           # Check if running, see last tick
+  wg service restart          # Graceful stop then start
+  wg service pause            # Pause coordinator (no new spawns, running agents continue)
+  wg service resume           # Resume coordinator
+  wg service freeze           # SIGSTOP all agents and pause service
+  wg service thaw             # SIGCONT agents and resume service
   wg agents                   # Who's working on what
+  wg agents kill <agent-id>   # SIGTERM agent process; task stays open for respawn
+  wg agents kill <agent-id> --force   # SIGKILL immediately
+  wg kill <agent-id>          # Kill agent + pause its task (prevents re-dispatch)
+  wg kill <agent-id> --redispatch  # Kill agent, leave task open for re-dispatch
+  wg kill --all               # Kill all agents + pause their tasks
   wg list                     # What's done, what's pending
   wg tui                      # Interactive dashboard
+
+  Multi-chat sessions:
+
+  wg service create-chat          # Create a new chat session
+  wg service stop-chat <n>        # Stop a chat session
+  wg service archive-chat <n>     # Archive a chat session
+  wg service delete-chat <n>      # Delete a chat session
+
+  Chat with the chat agent:
+
+  wg chat "message"               # Send a message to the chat agent
+  wg chat -i                      # Interactive REPL mode
+  wg chat --attachment file.txt   # Attach a file to the message
+  wg chat --coordinator 1         # Target a specific chat session (legacy flag)
+  wg chat --history               # Show chat history
+  wg chat --clear                 # Clear chat history
+
+  Advanced service tools:
+
+  wg screencast                       # Render TUI event traces into screencasts
+  wg tui-dump                         # Dump TUI screen contents (requires running wg tui)
+  wg server                           # Multi-user server setup automation
 
 MANUAL MODE (no service running)
 ─────────────────────────────────────────
@@ -91,6 +138,31 @@ DISCOVERING & ADDING WORK
   wg show <task-id>           # View task details and context
   wg add "Title" -d "Desc"    # Add new task
   wg add "X" --after Y        # Add task blocked by another
+  wg edit <task-id>           # Edit title, description, deps, model, tags, etc.
+
+  Provider-specific models (use provider:model format):
+
+  wg add "X" --model openrouter:google/gemini-2.5-flash
+
+  Per-task timeout and scheduling:
+
+  wg add "X" --timeout 30m             # Task agent killed after 30 minutes
+  wg add "X" --cron "0 0 9 * * *"      # Recurring task (6-field cron: sec min hour day month dow)
+
+  Skills, inputs, and deliverables:
+
+  wg add "X" --skill rust --input src/lib.rs --deliverable report.md
+
+  Suppress implicit dependency on the creating task:
+
+  wg add "X" --independent              # No --after on the creating task
+
+  Execution modes control the agent's capabilities:
+
+  wg add "X" --exec-mode full    # Default: full agent with all tools
+  wg add "X" --exec-mode light   # Read-only tools (research/review tasks)
+  wg add "X" --exec-mode bare    # Only wg CLI (coordination-only tasks)
+  wg add "X" --exec-mode shell   # Shell command, no LLM (use with wg exec --set)
 
   Context scopes control how much context the coordinator injects into the
   agent's prompt when dispatching a task:
@@ -100,12 +172,91 @@ DISCOVERING & ADDING WORK
   wg add "X" --context-scope graph  # Task + transitive dependency chain
   wg add "X" --context-scope full   # Everything: full graph state
 
+  Scheduling — delay dispatch or set an absolute start time:
+
+  wg add "X" --delay 1h              # Ready after 1 hour
+  wg add "X" --not-before 2026-04-01T09:00:00Z  # ISO 8601 timestamp
+
+  Placement hints — control where tasks land in the graph:
+
+  wg add "X" --no-place             # Skip auto-placement, dispatch immediately
+  wg add "X" --place-near task-a    # Place near related tasks
+  wg add "X" --place-before task-b  # Place before specific tasks
+
 TASK STATE COMMANDS
 ─────────────────────────────────────────
   wg done <task-id>           # Mark task complete (loop fires if present)
   wg done <task-id> --converged  # Complete and STOP the loop
   wg fail <task-id> --reason  # Mark failed (can be retried)
+  wg retry <task-id>          # Retry a failed/incomplete task (resets to open)
   wg abandon <task-id>        # Give up permanently
+  wg pause <task-id>          # Pause task (coordinator skips it until resumed)
+  wg wait <task-id> --until "condition"  # Park task until condition is met
+  wg resume <task-id>         # Resume a paused/waiting task
+  wg unclaim <task-id>        # Release a claimed task (back to open)
+  wg incomplete <task-id> --reason "..." # Mark incomplete (retryable — needs another pass)
+  wg requeue <task-id> --reason "..."  # Requeue in-progress task for triage
+
+  Wait conditions:
+    --until "task:dep-a=done"   # Wait for another task to reach a status
+    --until "timer:5m"          # Wait for a timer (e.g., 5m, 1h, 2d)
+    --until "message"           # Wait for a message to arrive
+    --until "human-input"       # Wait for a human message
+    --until "file:path/to/file" # Wait for a file to change
+
+  wg reschedule <task-id> --after 24   # Ready after 24 hours from now
+  wg reschedule <task-id> --at <ISO>   # Ready at a specific timestamp
+
+  Dependency edge management:
+    wg add-dep <task> <dependency>     # Add a dependency: task waits for dependency
+    wg rm-dep <task> <dependency>      # Remove a dependency edge
+
+VALIDATION (## Validation section in task description)
+─────────────────────────────────────────
+  Put validation criteria in a ## Validation section of each code task's description.
+  The agency evaluator (auto_evaluate + FLIP) reads this section and scores the
+  agent's output against it — no CLI flag needed.
+
+  wg add "Task" -d "## Validation\n- [ ] cargo test passes"
+  wg done <task-id>           # Agency evaluator scores against the ## Validation section
+
+  Include concrete acceptance criteria as a checklist. The evaluator routes
+  work to `pending-validation` when fidelity is low (FLIP score), where
+  `wg approve` / `wg reject` provide the human review path.
+
+INCOMPLETE STATUS (retryable work)
+─────────────────────────────────────────
+  Use 'incomplete' when an agent's work landed but isn't quite right and
+  should be retried rather than failed:
+
+  wg incomplete <task-id> --reason "Tests pass but edge case X not handled"
+
+  Incomplete vs Failed:
+    incomplete = retryable, work needs another pass (rendered orange)
+    failed     = hard failure, abandon or escalate
+
+  Incomplete vs pending-validation:
+    pending-validation = awaiting evaluation (hasn't been judged yet)
+    incomplete         = evaluated and found wanting (needs redo)
+
+  Incomplete tasks automatically retry (up to max_incomplete_retries, default 3).
+  Each retry gets a fresh agent with prior attempt's diff + eval rationale.
+  After exhausting retries, the task transitions to Failed.
+  Use 'wg retry <task>' to manually force another attempt.
+  Configure: wg config --max-incomplete-retries N --incomplete-retry-delay "30s"
+
+MESSAGING
+─────────────────────────────────────────
+  Inter-agent and task-scoped messaging:
+
+  wg msg send <task-id> "message"    # Send a message to a task
+  wg msg list <task-id>              # List all messages for a task
+  wg msg read <task-id>              # Read unread messages (marks as read)
+  wg msg poll <task-id>              # Poll for new messages (exit code 0/1)
+
+  Agents MUST check messages before and after working on a task. Unreplied
+  messages mean the task is not complete. Use --agent <id> with read/poll
+  to filter by your agent identity.
 
 CONTEXT & ARTIFACTS
 ─────────────────────────────────────────
@@ -132,16 +283,20 @@ CYCLES (repeating workflows)
     wg add "Commit changes" --after cleanup-code
     wg add "Verify build" --after commit-changes
 
-    # 3. Close the loop with a back-edge + iteration cap
-    wg add "Cleanup code" --after verify-build --max-iterations 5
+    # 3. Close the loop: edit the FIRST task to add a back-edge + iteration cap
+    wg edit cleanup-code --add-after verify-build --max-iterations 5
 
     This creates: cleanup → commit → verify → cleanup (up to 5 iterations)
+
+    NOTE: Do NOT use 'wg add "Cleanup code" --after verify-build' here — that
+    creates a NEW task instead of adding a back-edge to the existing one.
+    Always use 'wg edit <id> --add-after <last-task>' to close cycles.
 
   ANOTHER EXAMPLE — write/review cycle:
 
     wg add "Write draft"
     wg add "Review draft" --after write-draft
-    wg add "Write draft" --after review-draft --max-iterations 3
+    wg edit write-draft --add-after review-draft --max-iterations 3
 
   INSPECTING CYCLES:
 
@@ -157,11 +312,69 @@ CYCLES (repeating workflows)
   This stops the loop/cycle. Using plain 'wg done' causes the cycle to
   iterate again. Only use plain 'wg done' if you want the next iteration.
 
+  ADVANCED CYCLE OPTIONS:
+
+    wg add "X" --after Y --max-iterations 5 --no-converge
+      # Force all iterations to run — agents cannot signal early stop
+
+    wg add "X" --after Y --max-iterations 10 --no-restart-on-failure
+      # Don't restart the cycle if an iteration fails
+
+    wg add "X" --after Y --max-iterations 10 --max-failure-restarts 1
+      # Allow at most 1 failure-triggered restart (default: 3)
+
   KEY RULES:
   • One cycle, not N copies of tasks — let the iteration mechanism repeat
   • Use --max-iterations to prevent runaway loops (always set a cap)
   • Each agent in the cycle sees its loop_iteration count via wg show
   • Check for convergence: if nothing changed, use --converged to stop
+
+SHELL EXECUTION
+─────────────────────────────────────────
+  Run tasks as shell commands instead of LLM agents:
+
+  wg exec --set build-task "cargo build --release"  # Set shell command
+  wg exec build-task                                 # Run it (claim + exec + done/fail)
+  wg exec --dry-run build-task                       # Preview without running
+  wg exec --clear build-task                         # Remove the shell command
+
+  Use with --exec-mode shell on task creation for fully automated steps.
+
+COMPACT, SWEEP & CHECKPOINT
+─────────────────────────────────────────
+  wg compact                    # Distill graph state into context.md
+  wg sweep                      # Detect and recover orphaned in-progress tasks
+  wg sweep --dry-run            # Preview what sweep would fix
+  wg checkpoint <task-id> -s "Progress summary"  # Save checkpoint
+  wg checkpoint <task-id> --list                 # List checkpoints for a task
+  wg stats                      # Show time counters and agent statistics
+
+RECOVERY (hung agents, failed tasks, mass failures)
+─────────────────────────────────────────
+  Hung worker agent (CPU=0%, no progress)?
+    wg retry <task-id>          # Kills assigned agent, resets task to open,
+                                # increments attempt counter; dispatcher respawns
+    wg retry <task-id> --reason "stalled at 0% CPU 20min"
+    wg retry <task-id> --fresh  # Discard prior worktree, start over from main
+
+  Lower-level building block (`wg retry` calls this internally):
+    wg agents kill <agent-id>          # SIGTERM agent; task stays open for respawn
+    wg agents kill <agent-id> --force  # SIGKILL immediately
+
+  Failed task — single retry:
+    wg retry <task-id>                # Resets failed/incomplete to open
+
+  Mass failure (credit exhaustion, model outage):
+    wg recover                  # Dry-run: show recovery plan
+    wg recover --yes            # Apply: retry user tasks, abandon followups so
+                                #   agency pipeline regenerates them fresh
+    wg recover --filter id-prefix=tui- --yes
+    wg recover --set-model openrouter:anthropic/claude-sonnet-4-6 --yes
+
+  Dispatcher reconciliation (automatic; no command needed):
+    Every dispatcher tick, in-progress tasks whose assigned agent is dead
+    (registry status=Dead OR PID exited) get reset to open and re-dispatched.
+    `wg retry` triggers this immediately rather than waiting for the tick.
 
 HOUSEKEEPING
 ─────────────────────────────────────────
@@ -172,6 +385,21 @@ HOUSEKEEPING
   wg gc --dry-run               # Preview what would be removed
   wg gc --include-done          # Also remove done tasks (default: only failed+abandoned)
   wg gc --older 7d              # Only gc tasks older than 7 days
+  wg cleanup orphaned           # Clean up orphaned worktrees
+  wg cleanup recovery-branches  # Clean up old recovery branches
+  wg cleanup nightly            # Comprehensive nightly cleanup
+  wg metrics                    # Display cleanup and monitoring metrics
+
+DISCOVERY & PUBLISHING
+─────────────────────────────────────────
+  wg discover                       # Show tasks completed in the last 24h
+  wg discover --since 7d            # Completed in the last 7 days
+  wg discover --with-artifacts      # Include artifact paths in output
+
+  wg publish <task-id>              # Publish a draft task (validates deps, resumes subgraph)
+  wg publish <task-id> --only       # Publish just this task (skip subgraph propagation)
+
+  wg reclaim <task-id> --from <actor> --to <actor>  # Reclaim task from dead agent
 
 GROWING THE GRAPH
 ─────────────────────────────────────────
@@ -206,6 +434,7 @@ TIPS
 • Run 'wg log' BEFORE starting work to track progress
 • Use 'wg context' to understand what dependencies produced
 • Check 'wg blocked <task-id>' if a task isn't appearing in ready list
+• Use 'wg why-blocked <task-id>' for the full transitive blocking chain
 
 EXECUTORS & MODELS
 ─────────────────────────────────────────
@@ -216,15 +445,52 @@ EXECUTORS & MODELS
 
   Set a default model for all agents:
 
-  wg service start --model anthropic/claude-sonnet-4   # CLI override
-  # Or in .workgraph/config.toml under [coordinator]: model = "anthropic/claude-sonnet-4"
+  wg service start --model anthropic:claude-sonnet-4-6   # CLI override
+  # Or in .workgraph/config.toml under [coordinator]: model = "anthropic:claude-sonnet-4-6"
 
   Per-task model selection (overrides the default):
 
-  wg add "Fast task" --model google/gemini-2.5-flash
-  wg add "Heavy task" --model anthropic/claude-opus-4
+  wg add "Fast task" --model openrouter:google/gemini-2.5-flash
+  wg add "Heavy task" --model opus
+
+  Model format: use provider:model (e.g., openrouter:deepseek/deepseek-v3.2).
+  Short names (opus, sonnet, haiku) are also accepted.
 
   Model hierarchy: task --model > executor model > coordinator model > 'default'
+
+MODEL REGISTRY & API KEYS
+─────────────────────────────────────────
+  Model registry — manage models and per-role routing:
+
+  wg model list                  # Show all models (built-in + user-defined)
+  wg model add <id> --tier <t>  # Add/update a model in the registry
+  wg model remove <id>          # Remove a model from the registry
+  wg model set-default <id>     # Set the default dispatch model
+  wg model routing              # Show per-role model routing
+  wg model set <role> <model>   # Set model for a specific dispatch role
+
+  Browse and search models from OpenRouter:
+
+  wg models list                 # List models from local registry
+  wg models search <query>       # Search OpenRouter by name/description
+  wg models remote               # List all models available on OpenRouter
+  wg models add <id>             # Add a model from OpenRouter to local registry
+  wg models set-default <id>     # Set default model
+  wg models init                 # Initialize models.yaml with defaults
+
+  Endpoint management (for OpenRouter, custom hosts, etc.):
+
+  wg endpoints list              # List all configured endpoints
+  wg endpoints add               # Add a new endpoint
+  wg endpoints remove <name>     # Remove an endpoint
+  wg endpoints set-default <name>  # Set default endpoint
+  wg endpoints test <name>       # Test endpoint connectivity
+
+  API key management:
+
+  wg key set <provider>          # Configure an API key for a provider
+  wg key check <provider>        # Validate API key availability
+  wg key list                    # Show key status for all providers
 
 REUSABLE FUNCTIONS
 ─────────────────────────────────────────
@@ -251,10 +517,16 @@ CONFIGURATION
 ─────────────────────────────────────────
   wg config --show                    # Show current configuration
   wg config --list                    # Show merged config with source annotations
-  wg config --global --model opus     # Write to global ~/.workgraph/config.toml
-  wg config --local --model sonnet    # Write to local .workgraph/config.toml
+  wg config --merged                  # Show effective merged config
+  wg config init --global             # Write minimal canonical ~/.wg/config.toml
+  wg config init --local --bare       # Write minimal canonical .wg/config.toml
+  wg config init --route openrouter --global   # Write openrouter-route config
+  wg config --global --model opus     # Update key in global ~/.wg/config.toml
+  wg config --local --model sonnet    # Update key in local .wg/config.toml
   wg config --creator-agent <hash>    # Set agent used for task creation
   wg config --creator-model <model>   # Set model used for task creation
+  wg migrate config --dry-run         # Preview what `wg migrate config` would change
+  wg migrate config --all             # Rewrite stale global+local configs to canonical
 
 TRACE, RUNS & REPLAY
 ─────────────────────────────────────────
@@ -280,6 +552,13 @@ ANALYSIS
   wg bottlenecks                      # Tasks blocking the most downstream work
   wg critical-path                    # Longest dependency chain
   wg forecast                         # Completion date estimate from velocity
+  wg velocity                         # Task completion rate per week
+  wg aging                            # Task age distribution (stale work detection)
+  wg workload                         # Agent workload balance
+  wg coordinate                       # Coordination status: ready, in-progress, parallel opportunities
+  wg impact <task-id>                 # What tasks depend on this one (downstream impact)
+  wg plan --hours 8                   # Plan work that fits within a time budget
+  wg cost <task-id>                   # Calculate cost including dependencies
 
 DEAD AGENT DETECTION
 ─────────────────────────────────────────
@@ -304,7 +583,46 @@ EVALUATION & MONITORING
   wg evaluate show                    # View evaluation history
   wg watch                            # Stream workgraph events as JSON lines
   wg watch --task <id>                # Stream events for a specific task
-"#;
+
+NOTIFICATION & COMMUNICATION
+─────────────────────────────────────────
+  Telegram (human escalation):
+
+  wg telegram send "message"          # Send a message to the configured chat
+  wg telegram ask "question"          # Send and wait for reply
+  wg telegram poll                    # Poll for replies
+  wg telegram status                  # Show Telegram configuration status
+
+  Matrix (team notifications):
+
+  wg matrix                           # Matrix integration commands
+  wg notify                           # Send task notification to Matrix room
+
+RESOURCE MANAGEMENT
+─────────────────────────────────────────
+  wg resource add                     # Add a new resource
+  wg resource list                    # List all resources
+  wg resources                        # Show resource utilization (committed vs available)
+
+PROVIDER PROFILES
+─────────────────────────────────────────
+  wg profile list                     # List available provider profiles
+  wg profile show                     # Show current profile and model mappings
+  wg profile set <name>               # Set the active provider profile
+  wg profile refresh                  # Refresh model data from OpenRouter
+
+USER BOARDS
+─────────────────────────────────────────
+  wg user init                        # Create a user conversation board
+  wg user list                        # List all user boards
+  wg user archive                     # Archive active board and create successor
+
+COST & SPENDING
+─────────────────────────────────────────
+  wg spend                            # Show token usage and cost summaries
+  wg spend --today                    # Show only today's spend
+  wg openrouter                       # OpenRouter cost monitoring
+"###;
 
 fn json_output() -> serde_json::Value {
     serde_json::json!({
@@ -313,7 +631,8 @@ fn json_output() -> serde_json::Value {
             "wg setup",
             "wg agency init",
             "wg service start",
-            "wg add \"My first task\""
+            "wg add \"My first task\"",
+            "wg status"
         ],
         "skill_bundle_setup": {
             "description": "Spawned agents need the right skill or bundle installed to understand wg commands.",
@@ -342,7 +661,21 @@ fn json_output() -> serde_json::Value {
                 "wg tradeoff add \"Name\" --accept \"...\" --reject \"...\"",
                 "wg agent create \"Name\" --role <hash> --tradeoff <hash>",
                 "wg config --auto-assign true --auto-evaluate true"
-            ]
+            ],
+            "placement": {
+                "description": "When auto_place is enabled, the assignment step also decides dependency edges for each task (merged into the .assign-* LLM call).",
+                "enable": "wg config --auto-place true"
+            },
+            "auto_create": {
+                "description": "When auto_create is enabled, the coordinator invokes the creator agent to discover and add new primitives when the store needs expansion.",
+                "enable": "wg config --auto-create true"
+            },
+            "model_registry": {
+                "show_models": "wg config --models",
+                "set_model": "wg config --set-model <role> <model>",
+                "show_registry": "wg config --registry",
+                "set_tier": "wg config --tier <tier>=<model>"
+            }
         },
         "modes": {
             "service": {
@@ -350,7 +683,16 @@ fn json_output() -> serde_json::Value {
                 "start": "wg service start --max-agents 5",
                 "workflow": "Add tasks with dependencies → coordinator spawns agents on ready tasks",
                 "warning": "Do NOT manually wg spawn or wg claim while the service is running",
-                "monitor": ["wg service status", "wg agents", "wg list", "wg tui"]
+                "monitor": ["wg service status", "wg agents", "wg list", "wg tui"],
+                "control": {
+                    "pause": "wg service pause (no new spawns, running agents continue)",
+                    "resume": "wg service resume",
+                    "freeze": "wg service freeze (SIGSTOP all agents + pause)",
+                    "thaw": "wg service thaw (SIGCONT agents + resume)"
+                },
+                "kill_agent": "wg kill <agent-id> (pauses task by default)",
+                "kill_agent_redispatch": "wg kill <agent-id> --redispatch (leave task open)",
+                "kill_all": "wg kill --all (pauses all tasks)"
             },
             "manual": {
                 "description": "For when no service is running. You claim and work tasks yourself.",
@@ -361,8 +703,10 @@ fn json_output() -> serde_json::Value {
             "discovery": {
                 "list": "List all tasks",
                 "show": "View task details and context",
-                "add": "Add a new task (supports --context-scope clean/task/graph/full)",
-                "ready": "See tasks available to work on (manual mode)"
+                "add": "Add a new task (supports --context-scope, --exec-mode, --model provider:model, --delay, --not-before, --no-place, --place-near, --place-before, --cron, --timeout, --skill, --independent)",
+                "edit": "Edit an existing task (title, description, deps, model, tags, etc.)",
+                "ready": "See tasks available to work on (manual mode)",
+                "status": "Quick one-screen status overview"
             },
             "work": {
                 "claim": "Claim a task for work (manual mode only)",
@@ -374,14 +718,81 @@ fn json_output() -> serde_json::Value {
                 "done": "Mark task complete",
                 "done_converged": "Complete task and stop loop (wg done <id> --converged)",
                 "fail": "Mark failed (can be retried)",
-                "abandon": "Give up permanently"
+                "retry": "Retry a failed task (resets to open)",
+                "abandon": "Give up permanently",
+                "pause": "Pause task (coordinator skips it until resumed)",
+                "wait": "Park task until condition met (wg wait <id> --until \"condition\")",
+                "resume": "Resume a paused/waiting task",
+                "reschedule": "Set not_before timestamp (wg reschedule <id> --after 24)",
+                "unclaim": "Release a claimed task back to open",
+                "requeue": "Requeue in-progress task for triage (wg requeue <id> --reason \"...\")"
+            },
+            "dependencies": {
+                "add_dep": "Add a dependency edge (wg add-dep <task> <dependency>)",
+                "rm_dep": "Remove a dependency edge (wg rm-dep <task> <dependency>)"
+            }
+        },
+        "validation": {
+            "description": "Validation criteria live in a ## Validation section of the task description; the agency evaluator (auto_evaluate + FLIP) scores the agent's output against it.",
+            "create": "wg add \"task\" -d \"## Validation\\n- [ ] criteria here\"",
+            "note": "Include a ## Validation section in descriptions with concrete acceptance criteria. Low-FLIP results route to pending-validation for human review (wg approve / wg reject)."
+        },
+        "messaging": {
+            "description": "Inter-agent and task-scoped messaging. Agents must check messages before and after working.",
+            "send": "wg msg send <task-id> \"message\"",
+            "list": "wg msg list <task-id>",
+            "read": "wg msg read <task-id>",
+            "poll": "wg msg poll <task-id>",
+            "agent_filter": "Use --agent <id> with read/poll to filter by agent identity"
+        },
+        "wait_conditions": {
+            "description": "Park a task until a condition is met.",
+            "task": "wg wait <id> --until \"task:dep-a=done\"",
+            "timer": "wg wait <id> --until \"timer:5m\"",
+            "message": "wg wait <id> --until \"message\"",
+            "human-input": "wg wait <id> --until \"human-input\"",
+            "file": "wg wait <id> --until \"file:path/to/file\""
+        },
+        "discovery_publishing": {
+            "discover": "wg discover",
+            "discover_since": "wg discover --since 7d",
+            "discover_artifacts": "wg discover --with-artifacts",
+            "publish": "wg publish <task-id>",
+            "publish_only": "wg publish <task-id> --only",
+            "reclaim": "wg reclaim <task-id> --from <actor> --to <actor>"
+        },
+        "exec_modes": {
+            "description": "Control agent capabilities per task.",
+            "modes": {
+                "full": "Default: full agent with all tools",
+                "light": "Read-only tools (research/review tasks)",
+                "bare": "Only wg CLI (coordination-only tasks)",
+                "shell": "Shell command, no LLM (use with wg exec --set)"
+            },
+            "usage": "wg add \"task\" --exec-mode <mode>"
+        },
+        "scheduling": {
+            "delay": "wg add \"task\" --delay 1h",
+            "not_before": "wg add \"task\" --not-before 2026-04-01T09:00:00Z",
+            "cron": "wg add \"task\" --cron \"0 0 9 * * *\" (6-field: sec min hour day month dow)",
+            "timeout": "wg add \"task\" --timeout 30m (per-task timeout)",
+            "independent": "wg add \"task\" --independent (suppress implicit --after)",
+            "placement": {
+                "no_place": "wg add \"task\" --no-place (skip auto-placement)",
+                "place_near": "wg add \"task\" --place-near task-a",
+                "place_before": "wg add \"task\" --place-before task-b"
             }
         },
         "cycles": {
             "description": "Structural cycles model repeating workflows via after back-edges with CycleConfig.",
-            "create": "wg add \"Write\" --after review --max-iterations 3",
+            "create": "wg edit write --add-after review --max-iterations 3",
             "inspect": ["wg show <task-id>", "wg cycles"],
-            "convergence": "IMPORTANT: Use 'wg done <task-id> --converged' to stop a cycle when work is complete. Plain 'wg done' causes the cycle to iterate again."
+            "convergence": "IMPORTANT: Use 'wg done <task-id> --converged' to stop a cycle when work is complete. Plain 'wg done' causes the cycle to iterate again.",
+            "advanced": {
+                "no_converge": "wg add \"X\" --after Y --max-iterations 5 --no-converge (force all iterations)",
+                "no_restart_on_failure": "wg add \"X\" --after Y --max-iterations 10 --no-restart-on-failure",
+                "max_failure_restarts": "wg add \"X\" --after Y --max-iterations 10 --max-failure-restarts 1"
+            }
         },
         "growing_the_graph": {
             "ethos": "The graph is a shared medium. You are not isolated — you are part of a living system. Your job is not just to complete your task, but to leave the system better than you found it.",
@@ -398,14 +809,74 @@ fn json_output() -> serde_json::Value {
             "If no coordinator: ready → claim → work → done",
             "Run 'wg log' BEFORE starting work to track progress",
             "Use 'wg context' to understand what dependencies produced",
-            "Check 'wg blocked <task-id>' if a task isn't appearing in ready list"
+            "Check 'wg blocked <task-id>' if a task isn't appearing in ready list",
+            "Use 'wg why-blocked <task-id>' for the full transitive blocking chain"
         ],
         "executors_and_models": {
             "switch_executor": "wg config --coordinator-executor amplifier",
-            "set_model_cli": "wg service start --model anthropic/claude-sonnet-4",
-            "set_model_config": "[coordinator] model = \"anthropic/claude-sonnet-4\"",
-            "per_task_model": "wg add \"task\" --model google/gemini-2.5-flash",
+            "set_model_cli": "wg service start --model anthropic:claude-sonnet-4-6",
+            "set_model_config": "[coordinator] model = \"anthropic:claude-sonnet-4-6\"",
+            "per_task_model": "wg add \"task\" --model openrouter:google/gemini-2.5-flash",
+            "model_format": "provider:model (e.g., openrouter:deepseek/deepseek-v3.2). Short names (opus, sonnet, haiku) also accepted.",
             "hierarchy": "task --model > executor model > coordinator model > 'default'"
+        },
+        "model_registry": {
+            "model": {
+                "list": "wg model list",
+                "add": "wg model add <id> --tier <tier>",
+                "remove": "wg model remove <id>",
+                "set_default": "wg model set-default <id>",
+                "routing": "wg model routing",
+                "set_role": "wg model set <role> <model>"
+            },
+            "models": {
+                "list": "wg models list",
+                "search": "wg models search <query>",
+                "remote": "wg models remote",
+                "add": "wg models add <id>",
+                "set_default": "wg models set-default <id>",
+                "init": "wg models init"
+            }
+        },
+        "endpoints": {
+            "list": "wg endpoints list",
+            "add": "wg endpoints add",
+            "remove": "wg endpoints remove <name>",
+            "set_default": "wg endpoints set-default <name>",
+            "test": "wg endpoints test <name>"
+        },
+        "api_keys": {
+            "set": "wg key set <provider>",
+            "check": "wg key check <provider>",
+            "list": "wg key list"
+        },
+        "shell_execution": {
+            "set_command": "wg exec --set <task> \"command\"",
+            "run": "wg exec <task>",
+            "dry_run": "wg exec --dry-run <task>",
+            "clear": "wg exec --clear <task>"
+        },
+        "compact_sweep_checkpoint": {
+            "compact": "wg compact",
+            "sweep": "wg sweep",
+            "sweep_dry_run": "wg sweep --dry-run",
+            "checkpoint": "wg checkpoint <task> -s \"summary\"",
+            "checkpoint_list": "wg checkpoint <task> --list",
+            "stats": "wg stats"
+        },
+        "multi_coordinator": {
+            "create": "wg service create-coordinator",
+            "stop": "wg service stop-coordinator <n>",
+            "archive": "wg service archive-coordinator <n>",
+            "delete": "wg service delete-coordinator <n>"
+        },
+        "chat": {
+            "send": "wg chat \"message\"",
+            "interactive": "wg chat -i",
+            "attachment": "wg chat --attachment file.txt",
+            "coordinator": "wg chat --coordinator 1",
+            "history": "wg chat --history",
+            "clear": "wg chat --clear"
         },
         "housekeeping": {
             "archive": "wg archive",
@@ -414,7 +885,11 @@ fn json_output() -> serde_json::Value {
             "gc": "wg gc",
             "gc_dry_run": "wg gc --dry-run",
             "gc_include_done": "wg gc --include-done",
-            "gc_older": "wg gc --older 7d"
+            "gc_older": "wg gc --older 7d",
+            "cleanup_orphaned": "wg cleanup orphaned",
+            "cleanup_branches": "wg cleanup recovery-branches",
+            "cleanup_nightly": "wg cleanup nightly",
+            "metrics": "wg metrics"
         },
         "functions": {
             "description": "Reusable workflow patterns extracted from completed tasks.",
@@ -441,8 +916,7 @@ fn json_output() -> serde_json::Value {
             "list": "wg config --list (merged config with source annotations)",
             "global": "wg config --global (target ~/.workgraph/config.toml)",
             "local": "wg config --local (target .workgraph/config.toml)",
-            "creator_agent": "wg config --creator-agent <hash>",
-            "creator_model": "wg config --creator-model <model>"
+            "creator_agent": "wg config --creator-agent <hash>"
         },
         "context_scopes": {
             "description": "Control how much context the coordinator injects into agent prompts.",
@@ -479,7 +953,14 @@ fn json_output() -> serde_json::Value {
             "structure": "wg structure (entry points, dead ends, fan-out)",
             "bottlenecks": "wg bottlenecks (tasks blocking the most downstream work)",
             "critical_path": "wg critical-path (longest dependency chain)",
-            "forecast": "wg forecast (completion date from velocity)"
+            "forecast": "wg forecast (completion date from velocity)",
+            "velocity": "wg velocity (task completion rate per week)",
+            "aging": "wg aging (task age distribution)",
+            "workload": "wg workload (agent workload balance)",
+            "coordinate": "wg coordinate (coordination status: ready, in-progress, parallel opportunities)",
+            "impact": "wg impact <task-id> (downstream impact analysis)",
+            "plan": "wg plan --hours 8 (plan work within a budget)",
+            "cost": "wg cost <task-id> (calculate cost including dependencies)"
         },
         "dead_agents": {
             "detect": "wg dead-agents",
@@ -499,6 +980,42 @@ fn json_output() -> serde_json::Value {
             "evaluate_show": "wg evaluate show",
             "watch": "wg watch",
             "watch_task": "wg watch --task <id>"
+        },
+        "notification": {
+            "telegram": {
+                "send": "wg telegram send \"message\"",
+                "ask": "wg telegram ask \"question\"",
+                "poll": "wg telegram poll",
+                "status": "wg telegram status"
+            },
+            "matrix": "wg matrix",
+            "notify": "wg notify"
+        },
+        "resources": {
+            "add": "wg resource add",
+            "list": "wg resource list",
+            "utilization": "wg resources"
+        },
+        "profiles": {
+            "list": "wg profile list",
+            "show": "wg profile show",
+            "set": "wg profile set <name>",
+            "refresh": "wg profile refresh"
+        },
+        "user_boards": {
+            "init": "wg user init",
+            "list": "wg user list",
+            "archive": "wg user archive"
+        },
+        "cost_spending": {
+            "spend": "wg spend",
+            "spend_today": "wg spend --today",
+            "openrouter": "wg openrouter"
+        },
+        "advanced_service": {
+            "screencast": "wg screencast",
+            "tui_dump": "wg tui-dump",
+            "server": "wg server"
         }
     })
 }
@@ -821,8 +1338,11 @@ mod tests {
             "MANUAL MODE",
             "DISCOVERING & ADDING WORK",
             "TASK STATE COMMANDS",
+            "VALIDATION (## Validation section in task description)",
+            "MESSAGING",
             "CONTEXT & ARTIFACTS",
             "CYCLES",
+            "DISCOVERY & PUBLISHING",
             "HOUSEKEEPING",
             "GROWING THE GRAPH",
             "TIPS",
@@ -835,9 +1355,185 @@ mod tests {
             "DEAD AGENT DETECTION",
             "PEER WORKGRAPHS",
             "EVALUATION & MONITORING",
+            "NOTIFICATION & COMMUNICATION",
+            "RESOURCE MANAGEMENT",
+            "PROVIDER PROFILES",
+            "USER BOARDS",
+            "COST & SPENDING",
         ];
         for section in &required_sections {
             assert!(text.contains(section), "Missing section: {}", section);
         }
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_wait_command() {
+        assert!(QUICKSTART_TEXT.contains("wg wait"));
+        assert!(QUICKSTART_TEXT.contains("--until"));
+        assert!(QUICKSTART_TEXT.contains("task:dep-a=done"));
+        assert!(QUICKSTART_TEXT.contains("timer:5m"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_messaging() {
+        assert!(QUICKSTART_TEXT.contains("MESSAGING"));
+        assert!(QUICKSTART_TEXT.contains("wg msg send"));
+        assert!(QUICKSTART_TEXT.contains("wg msg read"));
+        assert!(QUICKSTART_TEXT.contains("wg msg poll"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_validation() {
+        assert!(QUICKSTART_TEXT.contains("VALIDATION"));
+        // Quickstart must describe the agency-evaluator path (## Validation
+        // section) and must NOT advertise the removed --validation flag.
+        assert!(QUICKSTART_TEXT.contains("## Validation"));
+        assert!(!QUICKSTART_TEXT.contains("--validation"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_discover_publish() {
+        assert!(QUICKSTART_TEXT.contains("DISCOVERY & PUBLISHING"));
+        assert!(QUICKSTART_TEXT.contains("wg discover"));
+        assert!(QUICKSTART_TEXT.contains("wg publish"));
+        assert!(QUICKSTART_TEXT.contains("wg reclaim"));
+    }
+
+    #[test]
+    fn test_json_output_has_new_command_sections() {
+        let output = json_output();
+        assert!(output.get("validation").is_some());
+        assert!(output.get("messaging").is_some());
+        assert!(output.get("wait_conditions").is_some());
+        assert!(output.get("discovery_publishing").is_some());
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_notification() {
+        assert!(QUICKSTART_TEXT.contains("NOTIFICATION & COMMUNICATION"));
+        assert!(QUICKSTART_TEXT.contains("wg telegram send"));
+        assert!(QUICKSTART_TEXT.contains("wg telegram ask"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_resources() {
+        assert!(QUICKSTART_TEXT.contains("RESOURCE MANAGEMENT"));
+        assert!(QUICKSTART_TEXT.contains("wg resource add"));
+        assert!(QUICKSTART_TEXT.contains("wg resources"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_profiles() {
+        assert!(QUICKSTART_TEXT.contains("PROVIDER PROFILES"));
+        assert!(QUICKSTART_TEXT.contains("wg profile list"));
+        assert!(QUICKSTART_TEXT.contains("wg profile set"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_user_boards() {
+        assert!(QUICKSTART_TEXT.contains("USER BOARDS"));
+        assert!(QUICKSTART_TEXT.contains("wg user init"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_cost_spending() {
+        assert!(QUICKSTART_TEXT.contains("COST & SPENDING"));
+        assert!(QUICKSTART_TEXT.contains("wg spend"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_unclaim_requeue() {
+        assert!(QUICKSTART_TEXT.contains("wg unclaim"));
+        assert!(QUICKSTART_TEXT.contains("wg requeue"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_dep_management() {
+        assert!(QUICKSTART_TEXT.contains("wg add-dep"));
+        assert!(QUICKSTART_TEXT.contains("wg rm-dep"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_cleanup() {
+        assert!(QUICKSTART_TEXT.contains("wg cleanup orphaned"));
+        assert!(QUICKSTART_TEXT.contains("wg cleanup nightly"));
+        assert!(QUICKSTART_TEXT.contains("wg metrics"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_recovery_section() {
+        assert!(QUICKSTART_TEXT.contains("RECOVERY"));
+        assert!(QUICKSTART_TEXT.contains("wg agents kill"));
+        assert!(QUICKSTART_TEXT.contains("Hung worker agent"));
+        assert!(QUICKSTART_TEXT.contains("--reason"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_extended_analysis() {
+        assert!(QUICKSTART_TEXT.contains("wg velocity"));
+        assert!(QUICKSTART_TEXT.contains("wg aging"));
+        assert!(QUICKSTART_TEXT.contains("wg workload"));
+        assert!(QUICKSTART_TEXT.contains("wg coordinate"));
+        assert!(QUICKSTART_TEXT.contains("wg impact"));
+        assert!(QUICKSTART_TEXT.contains("wg plan"));
+        assert!(QUICKSTART_TEXT.contains("wg cost"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_advanced_service() {
+        assert!(QUICKSTART_TEXT.contains("wg screencast"));
+        assert!(QUICKSTART_TEXT.contains("wg tui-dump"));
+        assert!(QUICKSTART_TEXT.contains("wg server"));
+    }
+
+    #[test]
+    fn test_quickstart_text_provider_model_format() {
+        assert!(QUICKSTART_TEXT.contains("provider:model"));
+        assert!(QUICKSTART_TEXT.contains("openrouter:google/gemini-2.5-flash"));
+        // Deprecated --provider flag should NOT appear
+        assert!(!QUICKSTART_TEXT.contains("--provider openrouter"));
+    }
+
+    #[test]
+    fn test_quickstart_text_contains_cron_timeout() {
+        assert!(QUICKSTART_TEXT.contains("--cron"));
+        assert!(QUICKSTART_TEXT.contains("--timeout"));
+        assert!(QUICKSTART_TEXT.contains("--independent"));
+    }
+
+    #[test]
+    fn test_json_output_has_new_sections_apr12() {
+        let output = json_output();
+        assert!(output.get("notification").is_some());
+        assert!(output.get("resources").is_some());
+        assert!(output.get("profiles").is_some());
+        assert!(output.get("user_boards").is_some());
+        assert!(output.get("cost_spending").is_some());
+        assert!(output.get("advanced_service").is_some());
+
+        // Check analysis has new fields
+        let analysis = output.get("analysis").unwrap();
+        assert!(analysis.get("velocity").is_some());
+        assert!(analysis.get("aging").is_some());
+        assert!(analysis.get("workload").is_some());
+        assert!(analysis.get("coordinate").is_some());
+        assert!(analysis.get("impact").is_some());
+        assert!(analysis.get("plan").is_some());
+        assert!(analysis.get("cost").is_some());
+
+        // Check housekeeping has cleanup
+        let hk = output.get("housekeeping").unwrap();
+        assert!(hk.get("cleanup_orphaned").is_some());
+        assert!(hk.get("metrics").is_some());
+
+        // Check executors has model_format
+        let em = output.get("executors_and_models").unwrap();
+        assert!(em.get("model_format").is_some());
+        // No deprecated provider field
+        assert!(em.get("per_task_provider").is_none());
+
+        // Check commands has dependencies section
+        let commands = output.get("commands").unwrap();
+        assert!(commands.get("dependencies").is_some());
     }
 }

@@ -1,0 +1,175 @@
+<!--
+  Workgraph Hero — embeddable snippet
+
+  Dependencies (add to <head>):
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.9.0/dist/bundle/asciinema-player.css">
+
+  Dependencies (add before </body>):
+    <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.9.0/dist/bundle/asciinema-player.min.js"></script>
+
+  Cast files required in assets/casts/:
+    - interaction.cast  (~2.5 MB raw)
+
+  Annotation files (loaded alongside cast files):
+    - interaction.annotations.json
+
+  Player JS+CSS: ~350 KB (CDN-cached)
+-->
+
+<style>
+.wg-hero { max-width: 960px; margin: 0 auto; padding: 2rem 1rem; }
+.wg-hero * { box-sizing: border-box; }
+.wg-hero-title { text-align: center; margin-bottom: 0.5rem; font-size: 1.5rem; font-weight: 600; }
+.wg-hero-subtitle { text-align: center; color: #8b949e; margin-bottom: 1.5rem; font-size: 0.95rem; }
+
+.wg-player-wrap {
+  background: #161b22; border: 1px solid #30363d; border-top: none;
+  border-radius: 0 0 8px 8px; overflow: hidden; position: relative;
+}
+.wg-scene-desc {
+  padding: 0.75rem 1rem; background: #161b22;
+  border-top: 1px solid #30363d; font-size: 0.85rem; color: #8b949e;
+  display: flex; align-items: center; gap: 0.75rem;
+}
+.wg-scene-desc .wg-pattern {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: #58a6ff; font-size: 0.75rem;
+  background: rgba(88, 166, 255, 0.1);
+  padding: 0.15rem 0.5rem; border-radius: 3px; white-space: nowrap;
+}
+
+.wg-progress { height: 2px; background: #30363d; position: relative; overflow: hidden; }
+.wg-progress-fill { height: 100%; background: #58a6ff; width: 0%; transition: width 0.5s linear; }
+
+.wg-annotation {
+  padding: 0.6rem 1rem; background: #0d1117; border-top: 1px solid #30363d;
+  display: flex; align-items: center; gap: 0.75rem; min-height: 2.5rem;
+}
+.wg-annotation-phase {
+  font-family: 'SF Mono', 'Fira Code', monospace; color: #3fb950; font-size: 0.7rem;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  background: rgba(63, 185, 80, 0.1); padding: 0.15rem 0.5rem; border-radius: 3px;
+  white-space: nowrap; flex-shrink: 0;
+}
+.wg-annotation-text { font-size: 0.82rem; color: #e6edf3; line-height: 1.4; transition: opacity 0.25s ease; }
+.wg-annotation-text.fading { opacity: 0; }
+
+@media (max-width: 640px) {
+  .wg-hero { padding: 1rem 0.5rem; }
+  .wg-hero-title { font-size: 1.2rem; }
+  .wg-scene-desc { flex-direction: column; gap: 0.35rem; font-size: 0.8rem; }
+  .wg-annotation { flex-direction: column; gap: 0.35rem; padding: 0.5rem 0.75rem; }
+}
+</style>
+
+<section class="wg-hero" id="wg-hero-landing">
+  <h1 class="wg-hero-title" style="font-size: 2rem; margin-bottom: 0.75rem;">workgraph</h1>
+  <p class="wg-hero-subtitle" style="font-size: 1.1rem; max-width: 640px; margin: 0 auto 0.5rem;">
+    For teams and individuals who coordinate humans and AI agents on complex projects.
+  </p>
+  <p class="wg-hero-subtitle" style="font-size: 0.95rem; margin-bottom: 2rem;">
+    No external server, no account — just a <code style="color: #58a6ff; background: rgba(88,166,255,0.1); padding: 0.1rem 0.4rem; border-radius: 3px;">.workgraph/</code> directory and a local service.
+  </p>
+</section>
+
+<section class="wg-hero" id="wg-hero-demos">
+  <h2 class="wg-hero-title">See it in action</h2>
+  <p class="wg-hero-subtitle">Real workgraph sessions — from prompt to parallel agents to done</p>
+
+  <div class="wg-player-wrap" style="border-radius: 8px; border-top: 1px solid #30363d;">
+    <div id="wg-player-interaction"></div>
+    <div class="wg-progress"><div class="wg-progress-fill" id="wg-progress-fill"></div></div>
+    <div class="wg-annotation" id="wg-annotation">
+      <span class="wg-annotation-phase" id="wg-annotation-phase"></span>
+      <span class="wg-annotation-text" id="wg-annotation-text"></span>
+    </div>
+    <div class="wg-scene-desc" id="wg-scene-desc">
+      <span class="wg-pattern">coordinator interaction</span>
+      <span>From CLI to TUI — prompt the coordinator, watch agents work, add requirements mid-flight</span>
+    </div>
+  </div>
+</section>
+
+<script>
+(function() {
+  'use strict';
+
+  var CAST_BASE = 'assets/casts/';
+  var CAST_SRC = CAST_BASE + 'interaction.cast';
+  var ANNOT_SRC = CAST_BASE + 'interaction.annotations.json';
+  var DURATION = 60;
+
+  var player = null;
+  var annotations = null;
+  var progressTimer = null;
+  var annotationTimer = null;
+  var lastAnnotIdx = -1;
+
+  var OPTS = { fit: 'width', autoPlay: false, loop: true, speed: 1, idleTimeLimit: 1, theme: 'dracula', fontSize: '0.85em', terminalLineHeight: 1.2 };
+
+  function loadAnnotations() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', ANNOT_SRC, true);
+    xhr.onload = function() {
+      if (xhr.status === 200) try { annotations = JSON.parse(xhr.responseText).annotations; } catch(e) { annotations = []; }
+    };
+    xhr.send();
+  }
+
+  function findAnnotation(time) {
+    if (!annotations) return null;
+    for (var i = 0; i < annotations.length; i++) {
+      if (time >= annotations[i].start && time < annotations[i].end) return { index: i, data: annotations[i] };
+    }
+    return null;
+  }
+
+  function updateAnnotation() {
+    if (!player) return;
+    var time; try { time = player.getCurrentTime(); } catch(e) { return; }
+    if (time === undefined || time === null) return;
+    var result = findAnnotation(time);
+    var phaseEl = document.getElementById('wg-annotation-phase');
+    var textEl = document.getElementById('wg-annotation-text');
+    if (!result) {
+      if (lastAnnotIdx !== -1) {
+        lastAnnotIdx = -1;
+        textEl.classList.add('fading');
+        setTimeout(function() { phaseEl.textContent = ''; textEl.textContent = ''; textEl.classList.remove('fading'); }, 250);
+      }
+      return;
+    }
+    if (result.index !== lastAnnotIdx) {
+      lastAnnotIdx = result.index;
+      textEl.classList.add('fading');
+      setTimeout(function() {
+        phaseEl.textContent = result.data.phase || '';
+        textEl.textContent = result.data.text;
+        textEl.classList.remove('fading');
+      }, 250);
+    }
+  }
+
+  function startAnnotationSync() {
+    if (annotationTimer) clearInterval(annotationTimer);
+    lastAnnotIdx = -1;
+    updateAnnotation();
+    annotationTimer = setInterval(updateAnnotation, 250);
+  }
+
+  function startProgress() {
+    if (progressTimer) clearInterval(progressTimer);
+    var fill = document.getElementById('wg-progress-fill');
+    progressTimer = setInterval(function() {
+      if (!player) return;
+      var time; try { time = player.getCurrentTime(); } catch(e) { return; }
+      if (time === undefined || time === null) return;
+      fill.style.width = Math.min(100, (time / DURATION) * 100) + '%';
+    }, 200);
+  }
+
+  loadAnnotations();
+  player = AsciinemaPlayer.create(CAST_SRC, document.getElementById('wg-player-interaction'), OPTS);
+  setTimeout(function() { player.play(); startProgress(); startAnnotationSync(); }, 500);
+})();
+</script>

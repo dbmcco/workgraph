@@ -6,8 +6,19 @@
 //! Features:
 //! - Store agent info: id, pid, task_id, executor type, started_at, last_heartbeat, status, output_file
 //! - Atomic file operations via write-to-temp-then-rename
-//! - Optional file locking for concurrent access
+//! - File locking via `load_locked()` for all write paths
 //! - Auto-increment agent IDs (agent-1, agent-2, etc.)
+//!
+//! # Lock hierarchy
+//!
+//! When multiple locks must be held, acquire them in this order to prevent deadlocks:
+//!
+//! 1. **Graph lock** (`graph.lock`) — acquired per-call by `load_graph()`/`save_graph()`
+//! 2. **Registry lock** (`.workgraph/service/.registry.lock`) — held via `LockedRegistry`
+//!
+//! The graph lock is acquired and released within each `load_graph()`/`save_graph()` call,
+//! so it is safe to hold the registry lock while calling graph operations. Never acquire
+//! the registry lock from within a graph lock callback.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -34,6 +45,8 @@ pub enum AgentStatus {
     Stopping,
     /// Agent voluntarily parked via `wg wait` (exited cleanly, task is Waiting)
     Parked,
+    /// Agent is frozen via SIGSTOP (process stopped but in memory)
+    Frozen,
     /// Agent has completed its task
     Done,
     /// Agent failed
@@ -67,6 +80,15 @@ pub struct AgentEntry {
     /// When the agent finished (ISO 8601), set on transition to Done/Failed/Dead
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// Absolute path to the agent's worktree directory.
+    ///
+    /// Recorded by spawn so the target-dir reaper can detect when a
+    /// `wg retry`-in-place agent is occupying a worktree whose original
+    /// owner (per directory name) shows as dead. Without this, the
+    /// reaper would yank `target/` from under an actively-building retry
+    /// agent — see `reaper-edge-case`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
 }
 
 impl AgentEntry {
@@ -76,6 +98,35 @@ impl AgentEntry {
             self.status,
             AgentStatus::Starting | AgentStatus::Working | AgentStatus::Idle
         )
+    }
+
+    /// Strict liveness check — the agent is considered *live* if and
+    /// only if ALL of the following hold:
+    ///
+    /// 1. The status is alive (`Starting | Working | Idle`), AND
+    /// 2. The underlying process exists (PID is valid and running), AND
+    /// 3. The last heartbeat is fresh (within `heartbeat_timeout_secs`).
+    ///
+    /// This is the invariant used by worktree cleanup paths: a worktree
+    /// is safe to remove only when its owning agent is **not** live by
+    /// this definition. The status-only `is_alive()` check is too loose
+    /// because an agent can crash with the registry still reporting
+    /// `Working` — leaving its worktree incorrectly protected forever.
+    /// Conversely, just-process-alive is also too loose because a
+    /// zombie/orphan process can exist with stale heartbeat long after
+    /// real work stopped.
+    pub fn is_live(&self, heartbeat_timeout_secs: u64) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+        if !super::is_process_alive(self.pid) {
+            return false;
+        }
+        match self.seconds_since_heartbeat() {
+            Some(secs) if secs >= 0 && (secs as u64) <= heartbeat_timeout_secs => true,
+            // Invalid timestamp, future-dated heartbeat, or stale: not live.
+            _ => false,
+        }
     }
 
     /// Calculate uptime in seconds from started_at to now
@@ -311,10 +362,65 @@ impl AgentRegistry {
             output_file: output_file.to_string(),
             model: model.map(std::string::ToString::to_string),
             completed_at: None,
+            worktree_path: None,
         };
 
         self.agents.insert(agent_id.clone(), entry);
         agent_id
+    }
+
+    /// Record the worktree path the agent runs in. Idempotent — overwrites.
+    ///
+    /// Called by spawn after `register_agent_*` so the target-dir reaper
+    /// can answer "is this worktree currently occupied?" by walking the
+    /// registry, regardless of which agent ID gave the worktree its
+    /// directory name (relevant for `wg retry`-in-place: the new agent
+    /// runs in the prior agent's worktree).
+    pub fn set_worktree_path(&mut self, agent_id: &str, worktree_path: &Path) -> bool {
+        if let Some(agent) = self.agents.get_mut(agent_id) {
+            agent.worktree_path = Some(worktree_path.to_string_lossy().to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return true if any agent in the registry is currently *live* and
+    /// claims the given worktree path.
+    ///
+    /// "Live" uses [`AgentEntry::is_live`] (status + process + heartbeat).
+    /// Path comparison canonicalizes both sides when possible, falling
+    /// back to lexical equality otherwise (so missing-on-disk paths still
+    /// match string-equal entries).
+    ///
+    /// This is the primitive that lets the target-dir reaper protect
+    /// `wg retry`-in-place worktrees: agent-806 may be running inside
+    /// `agent-772/`, and only this lookup catches that.
+    pub fn is_worktree_occupied(
+        &self,
+        worktree_path: &Path,
+        heartbeat_timeout_secs: u64,
+    ) -> bool {
+        let target_canon = worktree_path.canonicalize().ok();
+        let target_lex = worktree_path.to_string_lossy().to_string();
+        for agent in self.agents.values() {
+            let Some(ref wt) = agent.worktree_path else {
+                continue;
+            };
+            if !agent.is_live(heartbeat_timeout_secs) {
+                continue;
+            }
+            let agent_path = Path::new(wt);
+            let agent_canon = agent_path.canonicalize().ok();
+            let matches = match (target_canon.as_ref(), agent_canon.as_ref()) {
+                (Some(a), Some(b)) => a == b,
+                _ => *wt == target_lex,
+            };
+            if matches {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get an agent by ID
@@ -361,6 +467,11 @@ impl AgentRegistry {
     /// Get agent by task ID (returns first match)
     pub fn get_agent_by_task(&self, task_id: &str) -> Option<&AgentEntry> {
         self.agents.values().find(|a| a.task_id == task_id)
+    }
+
+    /// Get mutable agent by task ID (returns first match)
+    pub fn get_agent_by_task_mut(&mut self, task_id: &str) -> Option<&mut AgentEntry> {
+        self.agents.values_mut().find(|a| a.task_id == task_id)
     }
 
     /// Update heartbeat for an agent
@@ -520,6 +631,112 @@ mod tests {
         let registry = AgentRegistry::new();
         assert!(registry.agents.is_empty());
         assert_eq!(registry.next_agent_id, 1);
+    }
+
+    #[test]
+    fn test_is_live_requires_all_three_invariants() {
+        // Unix: use a PID that cannot exist (the reaper's PID-0 trick:
+        // on Linux pid 0 is invalid for `kill(pid, 0)`, returning ESRCH.
+        // We use a more portable approach — pick a PID very unlikely to
+        // be alive, then verify the check fails.
+
+        // Case 1: status Done + fresh heartbeat + any PID → NOT live
+        // (is_alive() fails first)
+        let entry = AgentEntry {
+            id: "agent-test".to_string(),
+            pid: std::process::id(), // our own PID — definitely alive
+            task_id: "t".to_string(),
+            executor: "claude".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            last_heartbeat: Utc::now().to_rfc3339(),
+            status: AgentStatus::Done,
+            output_file: "/tmp/out".to_string(),
+            model: None,
+            completed_at: None,
+            worktree_path: None,
+        };
+        assert!(!entry.is_live(300), "Done status should not be live");
+
+        // Case 2: status Working + fresh heartbeat + own PID → LIVE
+        let entry = AgentEntry {
+            id: "agent-test".to_string(),
+            pid: std::process::id(),
+            task_id: "t".to_string(),
+            executor: "claude".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            last_heartbeat: Utc::now().to_rfc3339(),
+            status: AgentStatus::Working,
+            output_file: "/tmp/out".to_string(),
+            model: None,
+            completed_at: None,
+            worktree_path: None,
+        };
+        assert!(
+            entry.is_live(300),
+            "Working status + own PID + fresh heartbeat should be live"
+        );
+
+        // Case 3: status Working + own PID + STALE heartbeat → NOT live
+        // (3600 seconds ago, timeout 300)
+        let stale_heartbeat = (Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        let entry = AgentEntry {
+            id: "agent-test".to_string(),
+            pid: std::process::id(),
+            task_id: "t".to_string(),
+            executor: "claude".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            last_heartbeat: stale_heartbeat,
+            status: AgentStatus::Working,
+            output_file: "/tmp/out".to_string(),
+            model: None,
+            completed_at: None,
+            worktree_path: None,
+        };
+        assert!(
+            !entry.is_live(300),
+            "stale heartbeat should fail liveness even if status+process ok"
+        );
+
+        // Case 4: status Working + fresh heartbeat + DEFINITELY DEAD PID → NOT live
+        // PID 0x7FFF_FFFE is extremely unlikely to be in use (near PID_MAX)
+        let entry = AgentEntry {
+            id: "agent-test".to_string(),
+            pid: 0x7FFF_FFFE,
+            task_id: "t".to_string(),
+            executor: "claude".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            last_heartbeat: Utc::now().to_rfc3339(),
+            status: AgentStatus::Working,
+            output_file: "/tmp/out".to_string(),
+            model: None,
+            completed_at: None,
+            worktree_path: None,
+        };
+        assert!(
+            !entry.is_live(300),
+            "dead PID should fail liveness even if status+heartbeat ok"
+        );
+
+        // Case 5: timeout of 0 → even a just-written heartbeat may fail.
+        // Use a heartbeat 1 second ago with timeout 0 → not live.
+        let past = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let entry = AgentEntry {
+            id: "agent-test".to_string(),
+            pid: std::process::id(),
+            task_id: "t".to_string(),
+            executor: "claude".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            last_heartbeat: past,
+            status: AgentStatus::Working,
+            output_file: "/tmp/out".to_string(),
+            model: None,
+            completed_at: None,
+            worktree_path: None,
+        };
+        assert!(
+            !entry.is_live(0),
+            "timeout=0 should reject even 1-second-old heartbeat"
+        );
     }
 
     #[test]
@@ -943,5 +1160,193 @@ mod tests {
 
         // Should saturate at MAX, not wrap to 0
         assert_eq!(registry.next_agent_id, u32::MAX);
+    }
+
+    #[test]
+    fn test_locked_registry_blocks_concurrent_access() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Pre-create the service directory
+        std::fs::create_dir_all(temp_dir.path().join("service")).unwrap();
+
+        let path = Arc::new(temp_dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let path2 = Arc::clone(&path);
+        let barrier2 = Arc::clone(&barrier);
+
+        // Thread 1: acquire lock, hold it for 200ms
+        let t1 = std::thread::spawn(move || {
+            let locked = AgentRegistry::load_locked(&path2).unwrap();
+            barrier2.wait(); // signal that lock is held
+            std::thread::sleep(Duration::from_millis(200));
+            drop(locked); // release lock
+        });
+
+        // Thread 2: wait for thread 1 to hold lock, then try to acquire
+        let t2 = std::thread::spawn(move || {
+            barrier.wait(); // wait for thread 1 to hold lock
+            let start = Instant::now();
+            let _locked = AgentRegistry::load_locked(&path).unwrap();
+            let waited = start.elapsed();
+            // Should have blocked for at least ~150ms (thread 1 held lock for 200ms)
+            assert!(
+                waited >= Duration::from_millis(100),
+                "Second lock acquisition should have blocked, but only waited {:?}",
+                waited
+            );
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_agent_registration() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("service")).unwrap();
+
+        let path = Arc::new(temp_dir.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let path1 = Arc::clone(&path);
+        let barrier1 = Arc::clone(&barrier);
+        let path2 = Arc::clone(&path);
+        let barrier2 = Arc::clone(&barrier);
+
+        // Two threads concurrently register agents
+        let t1 = std::thread::spawn(move || {
+            barrier1.wait();
+            let mut locked = AgentRegistry::load_locked(&path1).unwrap();
+            let id = locked.register_agent(1001, "task-a", "claude", "/tmp/a.log");
+            locked.save().unwrap();
+            id
+        });
+
+        let t2 = std::thread::spawn(move || {
+            barrier2.wait();
+            let mut locked = AgentRegistry::load_locked(&path2).unwrap();
+            let id = locked.register_agent(1002, "task-b", "claude", "/tmp/b.log");
+            locked.save().unwrap();
+            id
+        });
+
+        let id1 = t1.join().unwrap();
+        let id2 = t2.join().unwrap();
+
+        // Both agents should be registered with distinct IDs
+        assert_ne!(id1, id2, "Agent IDs must be unique");
+
+        let registry = AgentRegistry::load(temp_dir.path()).unwrap();
+        assert_eq!(registry.agents.len(), 2, "Both agents should be registered");
+        assert!(registry.agents.contains_key(&id1));
+        assert!(registry.agents.contains_key(&id2));
+    }
+
+    /// Verify active_count counts agents consistently across all executor types
+    /// (claude worker / claude inline / shell) — no executor-based filtering.
+    /// This is the same logic the TUI and `wg service status` use.
+    #[test]
+    fn test_set_worktree_path_persists() {
+        let mut registry = AgentRegistry::new();
+        registry.register_agent(std::process::id(), "task-1", "claude", "/tmp/a.log");
+        let path = std::path::PathBuf::from("/tmp/wt/agent-1");
+        assert!(registry.set_worktree_path("agent-1", &path));
+        assert_eq!(
+            registry.get_agent("agent-1").unwrap().worktree_path.as_deref(),
+            Some("/tmp/wt/agent-1")
+        );
+        assert!(!registry.set_worktree_path("agent-missing", &path));
+    }
+
+    #[test]
+    fn test_is_worktree_occupied_matches_live_agent_regardless_of_id() {
+        let mut registry = AgentRegistry::new();
+        // Original owner (dead) — gave the worktree dir its name.
+        registry.register_agent(0x7FFF_FFFE, "task-x", "claude", "/tmp/a.log");
+        // Retry occupant (live) with a different agent ID.
+        registry.register_agent(std::process::id(), "task-x", "claude", "/tmp/b.log");
+
+        let path = std::path::PathBuf::from("/tmp/wt/agent-1");
+
+        // Wire BOTH agents to the same worktree path. agent-1 is dead
+        // (PID 0x7FFF_FFFE), agent-2 is live (our PID).
+        registry.set_worktree_path("agent-1", &path);
+        registry.set_worktree_path("agent-2", &path);
+
+        assert!(
+            registry.is_worktree_occupied(&path, 300),
+            "live agent-2 must protect the worktree even though agent-1 is dead"
+        );
+
+        // Mark agent-2 dead too — now the worktree is unoccupied.
+        registry
+            .get_agent_mut("agent-2")
+            .unwrap()
+            .status = AgentStatus::Dead;
+        assert!(
+            !registry.is_worktree_occupied(&path, 300),
+            "no live agent → worktree is not occupied"
+        );
+    }
+
+    #[test]
+    fn test_is_worktree_occupied_false_when_no_agents_record_path() {
+        let mut registry = AgentRegistry::new();
+        registry.register_agent(std::process::id(), "task-1", "claude", "/tmp/a.log");
+        // No set_worktree_path call.
+        let path = std::path::PathBuf::from("/tmp/wt/agent-1");
+        assert!(
+            !registry.is_worktree_occupied(&path, 300),
+            "an agent without a recorded worktree_path cannot occupy a worktree"
+        );
+    }
+
+    /// Verify active_count counts agents consistently across all executor types
+    /// (claude, eval/assign, shell) — no executor-based filtering.
+    /// This is the same logic the TUI and `wg service status` use.
+    #[test]
+    fn test_active_count_mixed_executor_types() {
+        let mut registry = AgentRegistry::new();
+
+        // Regular task agents (claude executor)
+        registry.register_agent(100, "implement-feature", "claude", "/tmp/1.log");
+        registry.register_agent(101, "fix-bug", "claude", "/tmp/2.log");
+
+        // Dot-task agents (inline eval/assign/flip — also "claude" executor;
+        // they run on claude CLI via run_lightweight_llm_call).
+        registry.register_agent(200, ".assign-implement-feature", "claude", "/tmp/3.log");
+        registry.register_agent(201, ".evaluate-fix-bug", "claude", "/tmp/4.log");
+        registry.register_agent(202, ".flip-fix-bug", "claude", "/tmp/5.log");
+
+        // Shell executor agent
+        registry.register_agent(300, "run-tests", "shell", "/tmp/6.log");
+
+        // All 6 agents are Working (default status after register)
+        assert_eq!(registry.active_count(), 6, "all executors counted equally");
+
+        // Mark some dot-task agents as done (they're short-lived)
+        registry.set_status("agent-3", AgentStatus::Done);
+        registry.set_status("agent-5", AgentStatus::Done);
+
+        // Now 4 alive: 3 claude + 1 shell
+        assert_eq!(registry.active_count(), 4);
+
+        // Mark a claude worker agent as dead
+        registry.set_status("agent-2", AgentStatus::Dead);
+        assert_eq!(registry.active_count(), 3);
+
+        // Idle agents count as alive too
+        registry.set_status("agent-6", AgentStatus::Idle);
+        assert_eq!(
+            registry.active_count(),
+            3,
+            "idle agents are counted as alive"
+        );
     }
 }

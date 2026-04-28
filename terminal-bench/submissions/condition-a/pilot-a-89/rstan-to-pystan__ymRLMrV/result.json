@@ -1,0 +1,115 @@
+{
+    "id": "82d4b17a-d1fd-4ae4-87a7-6ffd5e2545d9",
+    "task_name": "rstan-to-pystan",
+    "trial_name": "rstan-to-pystan__ymRLMrV",
+    "trial_uri": "file:///home/erik/workgraph/terminal-bench/results/pilot-a-89/pilot-a-89/rstan-to-pystan__ymRLMrV",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "rstan-to-pystan"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "1404a5a663c5ad348382a3374bf1ac11e28c2d10de5af6630ddd5ab69ff8f2e3",
+    "config": {
+        "task": {
+            "path": "rstan-to-pystan",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "rstan-to-pystan__ymRLMrV",
+        "trials_dir": "results/pilot-a-89/pilot-a-89",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "wg.adapter:ConditionAAgent",
+            "model_name": "openrouter/minimax/minimax-m2.7",
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "kwargs": {
+                "max_turns": 50,
+                "temperature": 0.0
+            },
+            "env": {}
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "suppress_override_warnings": false,
+            "mounts_json": null,
+            "env": {},
+            "kwargs": {}
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "job_id": "7ceffaa2-6d5b-4e7a-a652-b4a32c33c0ca"
+    },
+    "agent_info": {
+        "name": "workgraph-condition-a",
+        "version": "0.2.0",
+        "model_info": {
+            "name": "minimax/minimax-m2.7",
+            "provider": "openrouter"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 60530,
+        "n_cache_tokens": null,
+        "n_output_tokens": 3273,
+        "cost_usd": 0.0,
+        "rollout_details": null,
+        "metadata": {
+            "condition": "A",
+            "turns": 13,
+            "root_task_id": "tb-f1e48921",
+            "model": "openrouter:minimax/minimax-m2.7",
+            "actual_model": null,
+            "termination_type": "timeout",
+            "elapsed_s": 293.416274889998,
+            "docker_agent_loop": true
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-04-07T01:03:00.870807Z",
+    "finished_at": "2026-04-07T01:08:18.972249Z",
+    "environment_setup": {
+        "started_at": "2026-04-07T01:03:00.872355Z",
+        "finished_at": "2026-04-07T01:03:01.692890Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-04-07T01:03:01.692900Z",
+        "finished_at": "2026-04-07T01:03:02.008059Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-04-07T01:03:02.008152Z",
+        "finished_at": "2026-04-07T01:07:55.431015Z"
+    },
+    "verifier": {
+        "started_at": "2026-04-07T01:07:55.431130Z",
+        "finished_at": "2026-04-07T01:08:08.133953Z"
+    }
+}

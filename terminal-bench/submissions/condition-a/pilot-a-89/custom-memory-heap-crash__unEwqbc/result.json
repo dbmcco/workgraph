@@ -1,0 +1,115 @@
+{
+    "id": "cb4aab8b-be75-497e-adeb-c793e66bab94",
+    "task_name": "custom-memory-heap-crash",
+    "trial_name": "custom-memory-heap-crash__unEwqbc",
+    "trial_uri": "file:///home/erik/workgraph/terminal-bench/results/pilot-a-89/pilot-a-89/custom-memory-heap-crash__unEwqbc",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "custom-memory-heap-crash"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "fba0e3be977223b1f8c182da8411663258f83b3563dd5dcd12beae87762ccabf",
+    "config": {
+        "task": {
+            "path": "custom-memory-heap-crash",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "custom-memory-heap-crash__unEwqbc",
+        "trials_dir": "results/pilot-a-89/pilot-a-89",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "wg.adapter:ConditionAAgent",
+            "model_name": "openrouter/minimax/minimax-m2.7",
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "kwargs": {
+                "max_turns": 50,
+                "temperature": 0.0
+            },
+            "env": {}
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "suppress_override_warnings": false,
+            "mounts_json": null,
+            "env": {},
+            "kwargs": {}
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "job_id": "7ceffaa2-6d5b-4e7a-a652-b4a32c33c0ca"
+    },
+    "agent_info": {
+        "name": "workgraph-condition-a",
+        "version": "0.2.0",
+        "model_info": {
+            "name": "minimax/minimax-m2.7",
+            "provider": "openrouter"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 234019,
+        "n_cache_tokens": null,
+        "n_output_tokens": 13154,
+        "cost_usd": 0.0,
+        "rollout_details": null,
+        "metadata": {
+            "condition": "A",
+            "turns": 19,
+            "root_task_id": "tb-b6787774",
+            "model": "openrouter:minimax/minimax-m2.7",
+            "actual_model": null,
+            "termination_type": "natural_stop",
+            "elapsed_s": 379.8635883349998,
+            "docker_agent_loop": true
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-04-06T23:46:13.657849Z",
+    "finished_at": "2026-04-06T23:55:50.237967Z",
+    "environment_setup": {
+        "started_at": "2026-04-06T23:46:13.659175Z",
+        "finished_at": "2026-04-06T23:46:14.481888Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-04-06T23:46:14.481898Z",
+        "finished_at": "2026-04-06T23:46:14.841455Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-04-06T23:46:14.841583Z",
+        "finished_at": "2026-04-06T23:52:34.710987Z"
+    },
+    "verifier": {
+        "started_at": "2026-04-06T23:52:34.711052Z",
+        "finished_at": "2026-04-06T23:55:39.776620Z"
+    }
+}

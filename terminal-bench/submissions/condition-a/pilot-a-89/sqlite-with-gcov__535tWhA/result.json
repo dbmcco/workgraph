@@ -1,0 +1,115 @@
+{
+    "id": "0ecc94d4-5bfc-4731-9633-380774b0408a",
+    "task_name": "sqlite-with-gcov",
+    "trial_name": "sqlite-with-gcov__535tWhA",
+    "trial_uri": "file:///home/erik/workgraph/terminal-bench/results/pilot-a-89/pilot-a-89/sqlite-with-gcov__535tWhA",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "sqlite-with-gcov"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "5901f1d2fc3b9b97ab1b215461175a59f0568e224b67caa6f4cbbc38f6f33a04",
+    "config": {
+        "task": {
+            "path": "sqlite-with-gcov",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "sqlite-with-gcov__535tWhA",
+        "trials_dir": "results/pilot-a-89/pilot-a-89",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "wg.adapter:ConditionAAgent",
+            "model_name": "openrouter/minimax/minimax-m2.7",
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "kwargs": {
+                "max_turns": 50,
+                "temperature": 0.0
+            },
+            "env": {}
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "suppress_override_warnings": false,
+            "mounts_json": null,
+            "env": {},
+            "kwargs": {}
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "job_id": "7ceffaa2-6d5b-4e7a-a652-b4a32c33c0ca"
+    },
+    "agent_info": {
+        "name": "workgraph-condition-a",
+        "version": "0.2.0",
+        "model_info": {
+            "name": "minimax/minimax-m2.7",
+            "provider": "openrouter"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 32150,
+        "n_cache_tokens": null,
+        "n_output_tokens": 573,
+        "cost_usd": 0.0,
+        "rollout_details": null,
+        "metadata": {
+            "condition": "A",
+            "turns": 9,
+            "root_task_id": "tb-49ba78af",
+            "model": "openrouter:minimax/minimax-m2.7",
+            "actual_model": null,
+            "termination_type": "timeout",
+            "elapsed_s": 183.02862116000324,
+            "docker_agent_loop": true
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-04-07T01:04:10.946241Z",
+    "finished_at": "2026-04-07T01:08:19.418258Z",
+    "environment_setup": {
+        "started_at": "2026-04-07T01:04:10.960326Z",
+        "finished_at": "2026-04-07T01:04:11.762110Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-04-07T01:04:11.762122Z",
+        "finished_at": "2026-04-07T01:04:12.094963Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-04-07T01:04:12.095036Z",
+        "finished_at": "2026-04-07T01:07:15.129659Z"
+    },
+    "verifier": {
+        "started_at": "2026-04-07T01:07:15.129736Z",
+        "finished_at": "2026-04-07T01:08:08.786577Z"
+    }
+}

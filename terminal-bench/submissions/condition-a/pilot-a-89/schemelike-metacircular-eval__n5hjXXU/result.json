@@ -1,0 +1,115 @@
+{
+    "id": "171c8eeb-5cfc-45a2-8a92-f48daf0ec12f",
+    "task_name": "schemelike-metacircular-eval",
+    "trial_name": "schemelike-metacircular-eval__n5hjXXU",
+    "trial_uri": "file:///home/erik/workgraph/terminal-bench/results/pilot-a-89/pilot-a-89/schemelike-metacircular-eval__n5hjXXU",
+    "task_id": {
+        "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+        "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+        "path": "schemelike-metacircular-eval"
+    },
+    "source": "terminal-bench",
+    "task_checksum": "1a22feed1eb95a28db822ff01af36ae16aa219e54ac6a4884fa55a045138607a",
+    "config": {
+        "task": {
+            "path": "schemelike-metacircular-eval",
+            "git_url": "https://github.com/laude-institute/terminal-bench-2.git",
+            "git_commit_id": "69671fbaac6d67a7ef0dfec016cc38a64ef7a77c",
+            "name": null,
+            "ref": null,
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench"
+        },
+        "trial_name": "schemelike-metacircular-eval__n5hjXXU",
+        "trials_dir": "results/pilot-a-89/pilot-a-89",
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": null,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": null,
+            "import_path": "wg.adapter:ConditionAAgent",
+            "model_name": "openrouter/minimax/minimax-m2.7",
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "kwargs": {
+                "max_turns": 50,
+                "temperature": 0.0
+            },
+            "env": {}
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "suppress_override_warnings": false,
+            "mounts_json": null,
+            "env": {},
+            "kwargs": {}
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "job_id": "7ceffaa2-6d5b-4e7a-a652-b4a32c33c0ca"
+    },
+    "agent_info": {
+        "name": "workgraph-condition-a",
+        "version": "0.2.0",
+        "model_info": {
+            "name": "minimax/minimax-m2.7",
+            "provider": "openrouter"
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 96035,
+        "n_cache_tokens": null,
+        "n_output_tokens": 5472,
+        "cost_usd": 0.0,
+        "rollout_details": null,
+        "metadata": {
+            "condition": "A",
+            "turns": 19,
+            "root_task_id": "tb-36278808",
+            "model": "openrouter:minimax/minimax-m2.7",
+            "actual_model": null,
+            "termination_type": "llm_error",
+            "elapsed_s": 98.19060811099916,
+            "docker_agent_loop": true
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-04-07T00:06:09.573325Z",
+    "finished_at": "2026-04-07T00:08:14.666165Z",
+    "environment_setup": {
+        "started_at": "2026-04-07T00:06:09.583964Z",
+        "finished_at": "2026-04-07T00:06:10.370889Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-04-07T00:06:10.370898Z",
+        "finished_at": "2026-04-07T00:06:10.700446Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-04-07T00:06:10.700540Z",
+        "finished_at": "2026-04-07T00:07:48.900287Z"
+    },
+    "verifier": {
+        "started_at": "2026-04-07T00:07:48.900361Z",
+        "finished_at": "2026-04-07T00:08:04.254566Z"
+    }
+}

@@ -19,8 +19,114 @@ When a human (or a planner task) says one of these words, you should know exactl
 | **map-reduce** | Data-parallel diamond: planner → N workers → reducer | Workers do the same kind of work on different data |
 | **scaffold** | Platform task → [stream tasks…] | Shared infrastructure first, then parallel features |
 | **diamond with specialists** | Planner forks to role-matched workers, synthesizer joins | The power pattern — combines structure + agency |
+| **chatroom** | `prep → [perspectives…] → discussion → synthesis` | Deliberation via messages; perspectives interact |
 
 If the request doesn't map to one of these, it's probably a **composition** — see §6.
+
+---
+
+## 1b. Task Lifecycle
+
+Every task moves through a state machine. Understanding the states and transitions is essential for working effectively with the graph.
+
+### Status states
+
+| Status | Meaning |
+|--------|---------|
+| **Open** | Ready to be claimed/dispatched (all `--after` deps are done) |
+| **Blocked** | Waiting for upstream dependencies to complete |
+| **InProgress** | An agent has claimed the task and is working on it |
+| **PendingValidation** | Agent called `wg done`, but the task has a `--verify` criterion requiring external validation |
+| **Done** | Completed successfully |
+| **Failed** | Agent called `wg fail` or validation failed |
+| **Abandoned** | Manually abandoned via `wg abandon` |
+| **Waiting** | Paused — waiting for an external event or manual intervention |
+
+### Validation flow (PendingValidation)
+
+Tasks created with `--verify` go through an extra validation gate:
+
+```
+InProgress → wg done → PendingValidation → wg approve → Done
+                                          → wg reject  → Open (re-dispatched)
+```
+
+- `wg approve <task-id>` — transitions PendingValidation → Done
+- `wg reject <task-id> --reason "..."` — reopens the task for re-dispatch (clears assignment)
+- After `max_rejections` (default: 3), `wg reject` transitions the task to Failed instead of Open
+
+### Retry workflow
+
+Failed, incomplete, *and hung in-progress* tasks can be retried with a single command:
+
+```bash
+wg retry <task-id>                          # any state → Open
+wg retry <task-id> --reason "stalled 20min" # log a reason on the task
+wg retry <task-id> --fresh                  # also discard the prior worktree
+```
+
+Behavior by source status:
+
+| Source state | What `wg retry` does |
+|---|---|
+| Failed / Incomplete | Resets to Open, clears `failure_reason`, `assigned`, `session_id`. |
+| **In-progress (hung agent)** | SIGTERMs the assigned agent (5s grace → SIGKILL), marks the agent Dead in the registry, increments `retry_count`, resets the task to Open. The dispatcher's reconciler then respawns a fresh agent on its next tick. |
+| Done / Open / Abandoned / Blocked | Errors — these are not retryable states. |
+
+- Retry count is tracked (`retry_count`). Set `max_retries` to limit attempts.
+- Previous failure reasons and logs are preserved for the next agent to learn from.
+- The dispatcher re-dispatches the task automatically after retry.
+- Idempotent: re-running while the previous retry is still mid-transition is safe.
+
+### Killing a hung worker without retrying
+
+If you want to terminate a worker without immediately resetting its task (e.g., to inspect state first), use the lower-level building block:
+
+```bash
+wg agents kill <agent-id>          # SIGTERM; task stays open for respawn
+wg agents kill <agent-id> --force  # SIGKILL immediately
+```
+
+This is what `wg retry` calls internally for the in-progress case. It's a no-op if the agent is already dead or absent from the registry. Compare with `wg kill <agent-id>`, which *also* pauses the task to prevent re-dispatch.
+
+### Cascade abandon
+
+When a task is abandoned (`wg abandon`), its **system tasks** (IDs starting with `.`, such as `.evaluate-*` and `.verify-*`) are automatically cascade-abandoned. Normal dependent tasks are NOT cascade-abandoned — they remain blocked until the situation is resolved.
+
+### Task supersession
+
+When abandoning a task that's been replaced by a better approach:
+
+```bash
+wg abandon old-task --superseded-by new-task-a,new-task-b --reason "Replaced with better approach"
+```
+
+The `superseded_by` field creates a traceable link from the old task to its replacements.
+
+### Placement flow
+
+When `auto_place` is enabled (`wg config --auto-place true`), placement analysis is merged into the assignment step. Rather than creating separate `.place-*` tasks, the dispatcher performs placement analysis inline when building `.assign-*` tasks for ready unassigned work:
+
+```
+wg add "New task" → Open state → dispatcher creates .assign-<task-id>
+                                → assignment agent analyzes graph context
+                                  (including placement when auto_place is on)
+                                → determines optimal dependencies, wiring,
+                                  and agent assignment
+                                → task is assigned and ready for dispatch
+```
+
+The assignment agent examines the current graph structure and the task's description to decide:
+- Which existing tasks should be `--after` dependencies (when auto_place is on)
+- The best agent identity to assign
+- Whether the task needs specific context scope or exec mode
+
+If `auto_place` is disabled, tasks are added directly in Open state and the user must wire dependencies manually with `--after`.
+
+You can also control placement via CLI flags on `wg add`:
+- `--no-place` — skip automatic placement entirely; make the task immediately available
+- `--place-near <IDS>` — hint: place near these tasks (comma-separated)
+- `--place-before <IDS>` — hint: place before these tasks (comma-separated)
 
 ---
 
@@ -70,7 +176,59 @@ wg add "UX review" --id ux-review --after artifact
 wg add "Summarize reviews" --id summary --after sec-review,perf-review,ux-review
 ```
 
-### 2.4 Loop — iterate until convergence
+### 2.4 Chat Room — deliberation via messages
+
+Use when a question needs multiple perspectives that interact with each other, not just independent reviews. Agents discuss via `wg msg` on a shared task.
+
+**Three phases:**
+
+**1. Preparation** — research tasks run in parallel:
+```bash
+wg add "Research: prior art" --id prep-prior-art
+wg add "Research: user impact" --id prep-user-impact
+wg add "Research: technical constraints" --id prep-tech
+```
+
+**2. Discussion** — a single task where agents post positions via messages:
+```bash
+wg add "Discussion: which approach to use?" --id discuss-approach \
+  --after prep-prior-art,prep-user-impact,prep-tech \
+  -d "Chat room discussion. Participants read prep artifacts via wg context,
+then post positions via: wg msg send discuss-approach 'My position: ...'
+Read and respond to others' messages before marking done."
+```
+
+**3. Synthesis** — extract a decision from the discussion:
+```bash
+wg add "Synthesize decision" --id synth-approach \
+  --after discuss-approach \
+  -d "Read discussion messages (wg msg list discuss-approach).
+Produce: decision + rationale + dissenting views + action items."
+```
+
+**Rules:**
+- **Preparation is not optional.** Agents without research produce shallow positions. Each prep task should produce a structured findings document.
+- **5-8 participants** is the sweet spot. Fewer loses diversity; more creates noise.
+- **The synthesis task is mandatory.** Without it, the discussion is interesting but not actionable.
+- **Messages, not artifacts.** Unlike scatter-gather (independent artifacts), chat room agents interact through `wg msg send` / `wg msg list` on the discussion task.
+
+**How participants interact:**
+```bash
+# Read preparation context
+wg context discuss-approach
+
+# Read what others have said
+wg msg list discuss-approach
+
+# Post your position
+wg msg send discuss-approach "Position: X because Y. Re @agent-3's concern about Z: ..."
+```
+
+**When to use chatroom vs. scatter-gather:**
+- **Scatter-gather:** independent assessments that don't need to interact (security review + perf review + UX review)
+- **Chat room:** positions that should respond to each other (design decisions, strategy, prioritization)
+
+### 2.5 Loop — iterate until convergence
 
 Use for iterative refinement: draft → review → revise, repeat.
 
@@ -88,6 +246,11 @@ wg add "Revise draft" --id revise --after review
 - Use plain `wg done review` to let the cycle continue iterating.
 - Any cycle member can signal convergence — it stops the entire cycle.
 
+**Additional cycle flags:**
+- `--no-converge` — force all iterations to run (agents cannot signal convergence early)
+- `--no-restart-on-failure` — disable automatic cycle restart when a member fails (restart is on by default)
+- `--max-failure-restarts <N>` — cap the number of failure-triggered cycle restarts (default: 3)
+
 **Checking iteration state:**
 ```bash
 wg show <task-id>    # shows loop_iteration and cycle membership
@@ -96,7 +259,7 @@ wg cycles            # see all cycles and their current state
 
 Previous iterations' logs and artifacts are preserved. Review them with `wg log <task-id> --list` and `wg context <task-id>` to build on prior work rather than starting fresh.
 
-### 2.5 The Critical Structural Rule
+### 2.6 The Critical Structural Rule
 
 > **Same files = sequential edges. NEVER parallelize shared-file mutations.**
 
@@ -124,9 +287,9 @@ wg role add "Implementer" --outcome "Working, tested code for assigned module" -
 wg role add "Integrator" --outcome "Cohesive merged output with conflicts resolved" --skill integration
 
 # Create agents from roles
-wg agent create "Planner" --role <architect-hash> --motivation <motivation-hash>
-wg agent create "Worker" --role <implementer-hash> --motivation <motivation-hash>
-wg agent create "Synthesizer" --role <integrator-hash> --motivation <motivation-hash>
+wg agent create "Planner" --role <architect-hash> --tradeoff <tradeoff-hash>
+wg agent create "Worker" --role <implementer-hash> --tradeoff <tradeoff-hash>
+wg agent create "Synthesizer" --role <integrator-hash> --tradeoff <tradeoff-hash>
 
 # Assign agents to tasks
 wg assign planner <planner-agent>
@@ -165,8 +328,8 @@ wg assign integrate <integrator-agent>
 
 | Violation | Symptom | Fix |
 |-----------|---------|-----|
-| Too few roles | Low scores on specialized tasks | `wg evolve --strategy gap-analysis` |
-| Too many roles | Roles with zero assignments | `wg evolve --strategy retirement` |
+| Too few roles | Low scores on specialized tasks | `wg evolve run --strategy gap-analysis` |
+| Too many roles | Roles with zero assignments | `wg evolve run --strategy retirement` |
 
 Check coverage:
 ```bash
@@ -219,7 +382,7 @@ wg context write-tests
 - Use `wg log` to leave progress traces — they become context for dependent tasks
 - Use `wg artifact` to mark outputs — they appear in `wg context` for successors
 - Always check `wg context <your-task>` before starting work — it shows what predecessors produced
-- **You are expected to create tasks** when you discover work. Bugs, missing docs, needed refactors — create them with `wg add`. The coordinator dispatches automatically.
+- **You are expected to create tasks** when you discover work. Bugs, missing docs, needed refactors — create them with `wg add`. The dispatcher dispatches automatically.
 
 ### 4.1.1 Discovery — see what's new
 
@@ -262,6 +425,8 @@ Send messages to tasks being worked on by other agents. This enables real-time c
 # Send a message to another task's agent
 wg msg send <task-id> "Hey, I found this is related to your work: ..."
 wg msg send <task-id> "FYI: I changed the API signature in src/api.rs"
+wg msg send <task-id> --from agent-3 "Message with explicit sender"
+wg msg send <task-id> --priority urgent "Blocking issue found"
 
 # Check for messages on your task
 wg msg list <task-id>
@@ -273,12 +438,51 @@ wg msg read <task-id> --agent $WG_AGENT_ID
 wg msg poll <task-id> --agent $WG_AGENT_ID
 ```
 
+**The `--agent` flag and cursor semantics:**
+
+`wg msg read` uses a per-agent read cursor. Each agent has an independent position in the message stream — reading advances *that agent's* cursor without affecting other readers. The `--agent` flag defaults to the `WG_AGENT_ID` environment variable (set automatically for spawned agents), or `"user"` when unset. This means:
+
+- Multiple agents can read the same task's messages independently
+- Each agent only sees messages posted *after* its last read
+- `wg msg poll` checks for new messages without advancing the cursor (useful for conditional logic)
+
 **When to send messages:**
 - You discover your work affects another in-progress task
 - You find a bug or pattern relevant to another agent's work
 - You need to coordinate shared resource access (e.g., a shared config file)
 
 **Messages are persistent** — they survive agent restarts and are visible to future agents who work on the same task.
+
+**Workflow expectation:** Agents should check for messages at task start, at natural breakpoints during work, and before marking a task done. Unreplied messages at completion time indicate incomplete work.
+
+### 4.1.4 Human-in-the-Loop via User Boards
+
+For scenarios requiring human input or approval, use **user boards** (`wg user`) — per-user conversation spaces that persist across sessions:
+
+```bash
+# Initialize a user board (creates .user-<NAME> task)
+wg user init                        # defaults to current user ($WG_USER)
+wg user init --name alice           # explicit user name
+
+# List all user boards
+wg user list
+
+# Archive and rotate a board
+wg user archive                     # archives current board, creates successor
+```
+
+User boards provide a dedicated channel for human-agent communication. Agents can send messages to the user's board, and the user can respond asynchronously.
+
+**Alternative: `wg wait --until human-input`**
+
+When an agent needs to pause until a human responds, use `wg wait` instead of polling:
+
+```bash
+# Park the task until a human posts a message
+wg wait <task-id> --until "human-input" --checkpoint "Waiting for approval on design"
+```
+
+The dispatcher evaluates waiting conditions each tick and automatically resumes the task when a human message arrives. This is more efficient than polling `wg msg read` in a loop and frees the agent slot for other work while waiting.
 
 ### 4.2 After Code Changes: Rebuild
 
@@ -290,7 +494,18 @@ cargo install --path .
 
 This updates the global `wg` binary. Forgetting this step is a common source of "why isn't this working" bugs. Do it after every code change.
 
-### 4.3 Convergence Signaling
+### 4.3 Worktree Isolation
+
+When the dispatcher spawns agents, each agent works in an isolated [git worktree](WORKTREE-ISOLATION.md). This means:
+
+- Each agent has its own working tree — no shared file conflicts
+- Agents can build, test, and commit independently
+- Worktrees share the same `.git` object store, so branches are visible across agents
+- Worktrees are created under `.wg-worktrees/` and cleaned up after task completion
+
+This eliminates the "parallel file conflict" problem at the git level. However, you should still serialize tasks that modify the same logical files (via `--after`) to avoid merge conflicts at commit time.
+
+### 4.4 Convergence Signaling
 
 Use `wg done --converged` to stop a loop. Use plain `wg done` to iterate.
 
@@ -304,7 +519,7 @@ wg done review
 
 The `--converged` flag tags the cycle header. This prevents further iterations even if `--max-iterations` hasn't been reached. Any cycle member can signal convergence for the entire cycle.
 
-### 4.4 Evolve — the feedback loop
+### 4.5 Evolve — the feedback loop
 
 After work accumulates, evaluate and evolve roles:
 
@@ -319,14 +534,14 @@ wg evaluate record --task my-task --score 0.85 --source "manual"
 wg evaluate show --task my-task
 
 # Preview evolution proposals
-wg evolve --dry-run
+wg evolve run --dry-run
 
 # Apply evolution
-wg evolve --strategy all
+wg evolve run --strategy all
 ```
 
 **Single-loop learning:** task failed → retry with different agent (`wg retry`).
-**Double-loop learning:** task type keeps failing → change the role itself (`wg evolve --strategy mutation`).
+**Double-loop learning:** task type keeps failing → change the role itself (`wg evolve run --strategy mutation`).
 
 Escalate from single to double loop when the same task type fails repeatedly.
 
@@ -342,8 +557,8 @@ Escalate from single to double loop when the same task type fails repeatedly.
 | **Missing loop-back on refine** | Review identifies issues but there's no path back to fix them | Add a revise task in the cycle with a back-edge to the cycle header |
 | **Unbounded loop** | Cycle without `--max-iterations` → runs forever | Always set `--max-iterations` on cycle headers |
 | **Monolithic task** | One giant task with no decomposition → no parallelism, no feedback | Break into diamond or pipeline |
-| **Over-specialization** | Too many roles → coordination overhead exceeds benefit | `wg evolve --strategy retirement` |
-| **Under-specialization** | Generalist role for all tasks → poor quality | `wg evolve --strategy gap-analysis` |
+| **Over-specialization** | Too many roles → coordination overhead exceeds benefit | `wg evolve run --strategy retirement` |
+| **Under-specialization** | Generalist role for all tasks → poor quality | `wg evolve run --strategy gap-analysis` |
 | **Skipping evaluation** | No feedback signal → no evolution → performance plateau | Enable `--auto-evaluate` or run `wg evaluate run` manually |
 
 ---
@@ -374,28 +589,42 @@ wg service start --max-agents 4   # limit parallel agents
 
 ### Coordinator tick
 
-Each tick: reap zombies → clean dead agents → count alive → find ready tasks → spawn agents.
+Each tick runs these phases in order:
+
+1. Process chat inbox → clean dead agents → zero-output detection → auto-checkpoint
+2. Graph maintenance: cycle iteration, cycle failure restart, waiting task evaluation, message-triggered resurrection
+3. Agency scaffolding: auto-assign, auto-evaluate, FLIP verification, auto-evolve, auto-create
+4. Find ready tasks → spawn agents
 
 Ticks happen on two triggers:
 - **Immediate:** any graph change (`wg done`, `wg add`, etc.) triggers a tick via IPC
 - **Poll:** safety-net every 60 seconds catches missed events
 
-### Pause/resume
+See [AGENT-SERVICE.md](AGENT-SERVICE.md) for the full step-by-step tick breakdown.
+
+### Pause/resume/freeze
 
 ```bash
 wg service pause    # running agents continue, no new spawns
 wg service resume   # resume + immediate tick
+wg service freeze   # SIGSTOP all agents + pause dispatcher
+wg service thaw     # SIGCONT all agents + resume dispatcher
 ```
 
 ### Monitoring
 
 ```bash
-wg service status              # daemon and coordinator state
+wg service status              # daemon and dispatcher state
 wg agents                      # all agents with status
+wg agents --alive              # only alive agents
+wg agents --working            # only working agents
+wg agents --dead               # only dead agents
 wg list --status in-progress   # tasks being worked on
-wg tui                         # interactive dashboard
+wg tui                         # interactive dashboard (equiv. to wg viz --all --tui)
+wg tui --no-mouse              # TUI without mouse capture (useful in tmux)
 wg status                      # one-screen summary
 wg analyze                     # comprehensive health report
+wg watch                       # stream workgraph events as JSON lines
 ```
 
 #### TUI views and keybindings
@@ -414,40 +643,56 @@ wg analyze                     # comprehensive health report
 `wg viz` renders the graph as an ASCII diagram. It accepts optional task IDs to focus on specific subgraphs:
 
 ```bash
-wg viz                          # full graph
+wg viz                          # active trees only (default)
+wg viz --all                    # all tasks including fully-done trees
 wg viz my-task                  # only the subgraph containing my-task
 wg viz --show-internal          # include assign-*/evaluate-* meta-tasks
 wg viz --no-tui                 # static output (no interactive TUI)
+wg viz --status open            # filter by status
+wg viz --tag my-tag             # filter by tag (AND semantics with multiple --tag)
+wg viz --critical-path          # highlight the critical path in red
+wg viz --layout tree            # classic DFS layout (default: diamond)
+wg viz --dot                    # output Graphviz DOT format
+wg viz --mermaid                # output Mermaid diagram format
+wg viz --graph                  # 2D spatial graph with box-drawing characters
 ```
 
-### Executor types
+### Picking a model (and endpoint)
 
-The coordinator spawns agents via an executor. Two built-in executors:
+The user-facing primitives are **model** and **endpoint**. Pass a `provider:model` spec and (when the model needs it) an endpoint URL — wg derives which handler subprocess to spawn from the model's provider prefix:
 
-| Executor | What it does | When to use |
-|----------|-------------|-------------|
-| **claude** | Pipes prompt into `claude --print` (Anthropic CLI) | Default — Claude Code agents |
-| **amplifier** | Pipes prompt into `amplifier run --mode single` | OpenRouter-backed models, multi-provider setups |
+| Model spec example                          | Handler            | Wire protocol  | Endpoint required          |
+|---------------------------------------------|--------------------|----------------|----------------------------|
+| `claude:opus` (or bare `opus`/`sonnet`)     | claude CLI         | Anthropic      | no (CLI auths itself)      |
+| `codex:gpt-5`                               | codex CLI          | OAI-compat     | no (CLI auths itself)      |
+| `local:qwen3-coder`                         | nex (in-process)   | OAI-compat     | yes (`-e <url>`)           |
+| `openrouter:anthropic/claude-opus-4-6`      | nex (in-process)   | OAI-compat     | optional                   |
+| `oai-compat:gpt-5`                          | nex (in-process)   | OAI-compat     | yes                        |
 
 ```bash
-wg config --coordinator-executor claude      # default
-wg config --coordinator-executor amplifier   # switch to amplifier
+wg config -m claude:opus                                  # claude handler
+wg config -m local:qwen3-coder -e http://127.0.0.1:8088   # nex handler against local server
+wg config -m openrouter:anthropic/claude-opus-4-6         # nex handler against openrouter
 ```
 
+The legacy `--executor` / `-x` CLI flag and `[agent].executor` / `[dispatcher].executor` config keys are deprecated. They still work for one release with a deprecation warning, but the model spec is the single source of truth — see `src/dispatch/handler_for_model.rs`. After the deprecation window, `executor` is removed entirely.
+
 Spawned agents receive environment variables indicating their runtime context:
-- `WG_EXECUTOR_TYPE` — the executor that spawned them (e.g., `claude`, `amplifier`)
-- `WG_MODEL` — the effective model selected for this agent
 - `WG_TASK_ID` — the task ID being worked on
+- `WG_AGENT_ID` — the agent registry ID (e.g., `agent-7`)
+- `WG_EXECUTOR_TYPE` — the resolved handler kind (e.g., `claude`, `native`, `codex`)
+- `WG_MODEL` — the effective model selected for this agent (set only when a model is resolved)
+- `WG_USER` — the current user identity
+- `WG_WORKTREE_PATH` / `WG_BRANCH` / `WG_PROJECT_ROOT` — worktree isolation paths (set when worktree isolation is active)
 
 ### Configuration
 
 ```toml
 # .workgraph/config.toml
-[coordinator]
+[dispatcher]
 max_agents = 4
-poll_interval = 60
-executor = "claude"
-model = "opus"
+poll_interval = 5
+model = "claude:opus"  # provider:model — handler is implied (claude CLI)
 
 [agent]
 heartbeat_timeout = 5   # minutes before agent is considered dead
@@ -455,6 +700,8 @@ heartbeat_timeout = 5   # minutes before agent is considered dead
 [agency]
 auto_evaluate = false
 auto_assign = false
+auto_place = false          # placement analysis merged into assignment step
+auto_create = false         # auto-invoke creator agent for primitive store expansion
 assigner_model = "haiku"    # lightweight model for assignment (default via wg agency init)
 evaluator_model = "haiku"   # lightweight model for evaluation (default via wg agency init)
 ```
@@ -465,7 +712,7 @@ Model resolution follows a priority chain (highest wins):
 
 1. `task.model` — per-task override set via `wg add --model` or `wg edit --model`
 2. Executor config model — model field in the executor's config
-3. `coordinator.model` — from `[coordinator]` in config.toml or CLI `--model`
+3. `dispatcher.model` — from `[dispatcher]` in config.toml or CLI `--model` (legacy `[coordinator]` accepted)
 4. Executor default — if no model is resolved, no model flag is passed and the executor uses its own default
 
 For agency meta-tasks (assignment, evaluation, evolution), dedicated model settings apply:
@@ -478,16 +725,54 @@ wg add "Simple fix" --model haiku      # cheap model for simple work
 wg add "Complex design" --model opus   # strong model for hard work
 ```
 
+### Provider selection
+
+Use the `provider:model` format in `--model` to route tasks to a specific provider:
+
+```bash
+wg add "My task" --model openrouter:haiku
+wg edit my-task --model anthropic:opus
+```
+
+Supported providers: `anthropic`, `openai`, `openrouter`, `local`. The legacy `--provider` flag still works but is deprecated.
+
+### Execution modes
+
+Control the agent's toolset with `--exec-mode`:
+
+| Mode | What the agent gets | When to use |
+|------|-------------------|-------------|
+| `full` | All tools (default) | Implementation, integration |
+| `light` | Read-only tools | Research, review, analysis |
+| `bare` | Only `wg` CLI | Graph-only orchestration |
+| `shell` | No LLM — runs task `exec` command | Scripts, builds, non-AI work |
+
+```bash
+wg add "Research X" --exec-mode light
+wg add "Run tests" --exec-mode shell
+wg edit my-task --exec-mode bare
+```
+
+### Task scheduling
+
+Delay a task's availability with `--delay` or `--not-before`:
+
+```bash
+wg add "Follow-up check" --delay 1h        # available 1 hour from now
+wg add "Deploy" --not-before 2026-03-20T09:00:00Z  # ISO 8601 timestamp
+wg edit my-task --delay 30m
+```
+
 ### Context scopes
 
 Control how much context is assembled into an agent's prompt with `--context-scope`:
 
 | Scope | What's included | When to use |
 |-------|----------------|-------------|
-| `clean` | Task description only — no dependency context, no graph state | Independent tasks, fresh starts |
-| `task` | Task description + direct predecessor artifacts/logs | Most work — default |
-| `graph` | Task + transitive dependency chain | Deep multi-step pipelines |
-| `full` | Everything: full graph state, all logs, all artifacts | Debugging, recovery, complex integration |
+| `clean` | Core task info only (title, description, dependency context) — no workflow instructions | Independent tasks, fresh starts |
+| `task` | + workflow sections, tags/skills, downstream awareness | Most work — default |
+| `graph` | + project description, subgraph summary (1-hop neighborhood) | Integration, cross-component review |
+| `full` | + system awareness preamble, full graph summary, CLAUDE.md content | Meta-tasks, workflow design |
 
 ```bash
 wg add "Leaf task" --context-scope clean    # minimal prompt
@@ -495,9 +780,97 @@ wg add "Integration" --context-scope graph  # needs full chain
 wg edit my-task --context-scope full        # override for debugging
 ```
 
-Scope is resolved at dispatch time by the coordinator. If not set on the task, the role's default scope is used (if the task has an assigned agent with a role that specifies a default scope), otherwise `task` is the implicit default.
+Scope is resolved at dispatch time by the dispatcher. If not set on the task, the role's default scope is used (if the task has an assigned agent with a role that specifies a default scope), otherwise `task` is the implicit default.
 
 ---
+
+## 7b. Operational Commands
+
+These commands support ongoing project health and agent lifecycle management.
+
+### Compaction
+
+`wg compact` distills the current graph state into a `context.md` summary. When running as a service, the dispatcher drives compaction via a `.compact-0` cycle task — this is the chat agent's self-introspection loop.
+
+```bash
+wg compact              # generate context.md from graph state
+```
+
+### Sweep
+
+`wg sweep` detects and recovers orphaned in-progress tasks — tasks claimed by agents that are no longer running. By default it fixes them (unclaims and reopens). Use `--dry-run` to preview without changes.
+
+```bash
+wg sweep                # detect AND fix orphaned tasks (idempotent)
+wg sweep --dry-run      # report only, don't fix
+```
+
+### Checkpoint
+
+`wg checkpoint` saves a checkpoint for context preservation during long-running tasks. The dispatcher also auto-checkpoints alive agents when turn/time thresholds are met.
+
+```bash
+wg checkpoint <task-id> --summary "Completed auth module, starting tests"
+wg checkpoint <task-id> --summary "Progress so far" --file src/auth.rs --file src/tests.rs
+wg checkpoint <task-id> --list   # list existing checkpoints
+```
+
+The `--summary` flag is required (a ~500-token summary of progress). Optionally list `--file` for files modified since the last checkpoint.
+
+### Stats
+
+`wg stats` shows time counters and agent statistics.
+
+```bash
+wg stats                # project-wide stats
+```
+
+### Wait
+
+`wg wait` parks a task in `Waiting` status until a condition is met. The dispatcher checks waiting conditions each tick (step 2.7) and automatically resumes satisfied tasks.
+
+```bash
+wg wait <task-id> --until "task:dep-a=done"       # wait for another task to reach a status
+wg wait <task-id> --until "timer:5m"              # wait for a duration (e.g. 5m, 2h, 30s)
+wg wait <task-id> --until "message"               # wait for any message on the task
+wg wait <task-id> --until "human-input"           # wait specifically for a human message
+wg wait <task-id> --until "file:path/to/file"     # wait for a file to change
+wg wait <task-id> --until "task:dep-a=done" --checkpoint "Progress so far"
+```
+
+### Reclaim
+
+`wg reclaim` transfers a task from a dead or unresponsive agent to a new one:
+
+```bash
+wg reclaim <task-id> --from <old-agent> --to <new-agent>
+```
+
+### Why-Blocked
+
+`wg why-blocked` shows the full transitive dependency chain explaining why a task is blocked:
+
+```bash
+wg why-blocked <task-id>
+```
+
+### Match
+
+`wg match` finds agents capable of performing a task based on skill requirements:
+
+```bash
+wg match <task-id>
+```
+
+### Chat
+
+Send messages to a chat agent with `wg chat`. Useful for multi-chat setups:
+
+```bash
+wg chat "Deploy when ready"
+wg chat --attachment report.md "Review this"      # attach a file
+wg chat --chat my-coord "Target a specific chat agent"
+```
 
 ## 8. Manual Operation
 
@@ -714,7 +1087,7 @@ Agents should leave the system better than they found it. Beyond completing your
 
 ### 12.1 The Philosophy
 
-A task description is a hypothesis. When you start working, you discover truth: missing prerequisites, unexpected complexity, bugs in adjacent code, documentation gaps. Rather than ignoring these discoveries or trying to fix everything yourself, encode them as new tasks. The coordinator will dispatch them to the right agent at the right time.
+A task description is a hypothesis. When you start working, you discover truth: missing prerequisites, unexpected complexity, bugs in adjacent code, documentation gaps. Rather than ignoring these discoveries or trying to fix everything yourself, encode them as new tasks. The dispatcher will dispatch them to the right agent at the right time.
 
 ```bash
 # Found a bug while implementing a feature

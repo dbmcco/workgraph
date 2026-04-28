@@ -44,11 +44,50 @@ wg --help
 
 ### 1. Global config (once, after install)
 
+A fresh install with no `~/.wg/config.toml` already runs `claude:opus` via the
+`claude` CLI handler — built-in defaults cover the common case. The first
+time you want to commit choices to disk you have three options:
+
 ```bash
-wg setup    # interactive wizard — executor, model, agency defaults
+wg setup                            # interactive wizard — pick one of 5 named routes
+wg config init --global             # non-interactive: minimal canonical claude-cli config
+wg config init --global --route openrouter   # non-interactive: openrouter route
 ```
 
-Writes `~/.workgraph/config.toml`. Configures your executor (claude/amplifier), default model, whether to auto-assign agents and auto-evaluate, and which lightweight model to use for assignment/evaluation (haiku recommended).
+Writes `~/.wg/config.toml`. Pick one of 5 smooth routes — each produces a complete, working config (model + tiers + endpoint when applicable) end-to-end:
+
+| Route | Default model spec | Use case |
+|-------|--------------------|----------|
+| `claude-cli` | `claude:opus` | Local `claude` CLI login (no API key in config) |
+| `codex-cli` | `codex:gpt-5` | Local `codex` CLI login |
+| `openrouter` | `openrouter:<model>` | One API key, every major provider |
+| `local` | `local:<model>` | Ollama / vLLM / llama.cpp on `localhost` |
+| `nex-custom` | `oai-compat:<model>` | Bring your own OAI-compatible URL + key + model |
+
+You don't pick an executor — wg derives the handler from the model spec's provider prefix (`claude:*` → claude CLI, `codex:*` → codex CLI, everything else → in-process nex). The `nex` (a.k.a. `native`) handler is the in-process OAI-compatible HTTP client; three of the five routes use it under the hood.
+
+Non-interactive use:
+
+```bash
+wg setup --route claude-cli --yes
+wg setup --route openrouter --api-key-env OPENROUTER_API_KEY --yes
+wg setup --route local --url http://localhost:11434/v1 --model qwen3:4b --yes
+wg setup --route nex-custom --url https://my.endpoint/v1 --api-key-env MY_KEY --model my-model --yes
+
+# Preview without writing
+wg setup --route claude-cli --dry-run
+```
+
+Switch routes later with `wg config reset --route <name>` (always backs up the existing config first; `--keep-keys` preserves existing endpoint entries).
+
+If you have an old config from a previous wg release with deprecated keys
+(`agent.executor`, retired compactor knobs) or stale model strings
+(`openrouter:anthropic/claude-sonnet-4` instead of `…-sonnet-4-6`), run:
+
+```bash
+wg migrate config --dry-run    # preview changes
+wg migrate config --all        # rewrite global + local; backs up to .pre-migrate.<timestamp>
+```
 
 ### 2. Initialize a project
 
@@ -75,11 +114,27 @@ wg add "Implement auth" \
   --skill security \
   --deliverable src/auth.rs
 
-# Task with per-task model override
+# Task with per-task model override (use provider:model for non-default providers)
 wg add "Quick formatting fix" --model haiku
+wg add "Use GPT for this" --model openai:gpt-4o
+
+# Execution weight controls what the agent can do
+wg add "Quick lint fix" --exec-mode shell       # no LLM, just runs shell command
+wg add "Research task" --exec-mode light         # read-only tools
+wg add "Full implementation" --exec-mode full    # default: all tools
 
 # Task requiring review before completion
 wg add "Security audit" --verify "All findings documented with severity ratings"
+
+# Scheduling: delay or absolute time gate
+wg add "Follow-up check" --delay 1h             # becomes ready 1h after deps complete
+wg add "Deploy window" --not-before 2026-03-20T09:00:00Z  # ISO 8601
+
+# Placement hints and paused creation
+wg add "Related work" --place-near auth-task    # hint: place near related task
+wg add "Urgent fix" --place-before deploy-task  # hint: place before this task
+wg add "Standalone" --no-place                  # skip automatic placement
+wg add "Draft idea" --paused                    # created but not dispatched
 
 # Task with visibility for cross-org sharing
 wg add "Public API design" --visibility public
@@ -96,6 +151,9 @@ wg edit my-task --title "Better title"
 wg edit my-task --add-after other-task
 wg edit my-task --remove-tag stale --add-tag urgent
 wg edit my-task --model opus
+wg edit my-task --exec-mode light
+wg edit my-task --verify "cargo test passes"
+wg edit my-task --delay 30m --not-before 2026-03-20T09:00:00Z
 wg edit my-task --add-skill security --remove-skill docs
 ```
 
@@ -112,7 +170,7 @@ wg agent create "Erik" \
 # AI agent
 wg agent create "Claude Coder" \
   --role <role-hash> \
-  --motivation <motivation-hash> \
+  --tradeoff <tradeoff-hash> \
   --capabilities coding,testing,docs
 ```
 
@@ -131,20 +189,21 @@ wg done set-up-ci-pipeline       # unblocks deploy-to-staging
 
 ### 7. Verification workflow
 
-Tasks created with `--verify` require human approval before completion:
+Tasks created with `--verify` go through a validation gate before completion. When an agent calls `wg done`, the task transitions to `PendingValidation` instead of `Done`:
 
 ```bash
 # Create a task that needs review
 wg add "Security audit" --verify "All findings documented with severity ratings"
 
-# Agent works on it, then marks it done
+# Agent works on it, then marks it done — status becomes PendingValidation
 wg done security-audit
 
-# The verify field is recorded for human reviewers to check
-wg show security-audit
+# Reviewer approves or rejects
+wg approve security-audit                          # transitions to Done
+wg reject security-audit --reason "Missing CVE references"  # reopens for rework
 ```
 
-The verify criteria are stored on the task for auditing and review purposes.
+Rejected tasks reopen for the agent to address feedback. After too many rejections (default: 3), the task is failed automatically. See [docs/COMMANDS.md](docs/COMMANDS.md) for full details.
 
 ## Using with AI Coding Assistants
 
@@ -187,7 +246,7 @@ Add the core instruction to your agent's system prompt or `AGENTS.md`:
 Use workgraph (`wg`) for task coordination. Run `wg quickstart` to orient yourself.
 
 As a top-level agent, use service mode — do not manually claim tasks:
-- `wg service start` to start the coordinator
+- `wg service start` to start the dispatcher
 - `wg add "Task" --after dep` to define work
 - `wg list` / `wg agents` to monitor progress
 
@@ -199,7 +258,7 @@ See `wg --help` for all commands.
 
 The skill teaches agents to:
 - Run `wg quickstart` at session start to orient themselves
-- Act as a coordinator: start the service, define tasks, monitor progress
+- Act as a dispatcher: start the service, define tasks, monitor progress
 - Let the service handle claiming and spawning — not do it manually
 - Use manual mode only as a fallback when working alone without the service
 
@@ -279,7 +338,7 @@ That's it. The daemon watches your task graph and auto-spawns agents on ready ta
 Monitor what's happening:
 
 ```bash
-wg service status    # daemon info, agent summary, coordinator state
+wg service status    # daemon info, agent summary, dispatcher state
 wg agents            # list all agents
 wg tui               # interactive dashboard
 ```
@@ -296,15 +355,13 @@ wg service stop --kill-agents  # stop daemon and all agents
 The service reads from `.workgraph/config.toml`:
 
 ```toml
-[coordinator]
+[dispatcher]           # legacy alias [coordinator] still accepted
 max_agents = 4         # max parallel agents (default: 4)
-poll_interval = 60     # seconds between safety-net ticks (default: 60)
-executor = "claude"    # executor for spawned agents (default: "claude")
-model = "opus"         # model override for all spawned agents (optional)
+poll_interval = 5      # seconds between safety-net ticks (default: 5)
+model = "claude:opus"  # provider:model — handler is implied (claude CLI here)
 
 [agent]
-executor = "claude"
-model = "opus"         # default model (default: "opus")
+model = "claude:opus"  # default model (handler implied from prefix)
 heartbeat_timeout = 5  # minutes before agent is considered dead (default: 5)
 
 [agency]
@@ -320,24 +377,39 @@ Set config values with:
 
 ```bash
 wg config --max-agents 8
-wg config --model sonnet
+wg config --model claude:sonnet
 wg config --poll-interval 120
-wg config --executor shell
+# wg config --executor shell  # DEPRECATED — pass `provider:model` to --model instead
 
 # Agency settings
 wg config --auto-evaluate true
 wg config --auto-assign true
+wg config --auto-place true           # automatic task placement
+wg config --auto-create true          # automatic task creation
 wg config --assigner-model haiku
 wg config --evaluator-model opus
 wg config --evolver-model opus
 
-# Creator tracking (recorded on tasks created by the coordinator)
+# Creator tracking (recorded on tasks created by the dispatcher)
 wg config --creator-agent <agent-hash>
 wg config --creator-model opus
 
 # Triage settings
 wg config --auto-triage true
 wg config --triage-model haiku
+
+# Eval gate and FLIP settings
+wg config --eval-gate-threshold 0.7
+wg config --flip-enabled true
+
+# Model registry and routing
+wg config --registry                  # show model registry
+wg config --registry-add --id my-model --provider openrouter --reg-model my-model --reg-tier standard  # add to registry
+wg config --set-model default sonnet  # set default dispatch model
+wg config --set-model evaluator opus  # per-role model routing
+
+# Multi-chat
+wg config --max-coordinators 3
 
 # Inspect merged config (shows source: global, local, or default)
 wg config --list
@@ -348,7 +420,7 @@ wg config --local           # show/set project config only (.workgraph/config.to
 CLI flags on `wg service start` override config.toml:
 
 ```bash
-wg service start --max-agents 8 --executor shell --interval 120 --model haiku
+wg service start --max-agents 8 --interval 120 --model claude:haiku
 ```
 
 ### Managing the service
@@ -359,11 +431,20 @@ wg service start --max-agents 8 --executor shell --interval 120 --model haiku
 | `wg service stop` | Stop daemon (agents continue independently) |
 | `wg service stop --kill-agents` | Stop daemon and kill all running agents |
 | `wg service stop --force` | Immediately SIGKILL the daemon |
-| `wg service status` | Show daemon PID, uptime, agent summary, coordinator state |
+| `wg service status` | Show daemon PID, uptime, agent summary, dispatcher state |
 | `wg service reload` | Re-read config.toml without restarting |
-| `wg service pause` | Pause coordinator (running agents continue, no new spawns) |
+| `wg service restart` | Graceful stop then start |
+| `wg service pause` | Pause dispatcher (running agents continue, no new spawns) |
 | `wg service resume` | Resume coordinator (immediate tick) |
+| `wg service freeze` | SIGSTOP all running agents and pause coordinator |
+| `wg service thaw` | SIGCONT all frozen agents and resume coordinator |
 | `wg service install` | Generate a systemd user service file |
+| `wg service tick` | Run a single coordinator tick (debug) |
+| `wg service create-coordinator` | Create a new coordinator session |
+| `wg service stop-coordinator` | Stop a running coordinator session |
+| `wg service archive-coordinator` | Archive a coordinator session |
+| `wg service delete-coordinator` | Delete a coordinator session |
+| `wg service interrupt-coordinator` | Interrupt a coordinator's current generation |
 
 Reload lets you change settings at runtime:
 
@@ -403,7 +484,7 @@ wg dead-agents --cleanup   # mark dead and unclaim their tasks
 wg dead-agents --remove    # remove dead agents from registry
 wg dead-agents --purge     # remove all dead agents and clean up
 wg dead-agents --delete-dirs  # also delete agent working directories
-wg dead-agents --threshold 10m  # custom staleness threshold
+wg dead-agents --threshold 10   # custom staleness threshold (minutes)
 ```
 
 **Smart triage:** When a dead agent is detected, the coordinator can automatically triage the situation using an LLM. Triage reads the agent's output log and decides whether the task was actually completed (mark done), still running (leave alone), or needs to be restarted (re-spawn). Enable it with:
@@ -422,25 +503,48 @@ Models are selected in priority order:
 1. Task's `model` property (set with `wg add --model` or `wg edit --model`) — highest priority
 2. Executor config model (model field in the executor's config file)
 3. `coordinator.model` in config.toml (or `--model` on `wg spawn` / `wg service start`)
-4. Executor default (if no model is resolved, no `--model` flag is passed)
+4. Handler default (if no model is resolved, no `--model` flag is passed)
 
 ```bash
 # Set model per-task at creation
-wg add "Simple fix" --model haiku
-wg add "Complex design" --model opus
+wg add "Simple fix" --model claude:haiku
+wg add "Complex design" --model claude:opus
 
 # Change model on an existing task
-wg edit my-task --model sonnet
+wg edit my-task --model claude:sonnet
 
-# Override at spawn time
-wg spawn my-task --executor claude --model haiku
+# Override at spawn time (--executor is deprecated; the model spec implies the handler)
+wg spawn my-task --model claude:haiku
 
 # Set coordinator default (applies to all auto-spawned agents)
-wg config --model sonnet
+wg config --model claude:sonnet
 wg service reload
 ```
 
 **Cost tips:** Use **haiku** for simple formatting/linting, **sonnet** for typical coding, **opus** for complex reasoning and architecture.
+
+**Alternative providers:** Workgraph supports [OpenRouter](https://openrouter.ai/) and any OpenAI-compatible API. Configure an endpoint with `wg endpoints add` and use full model IDs like `deepseek/deepseek-chat-v3`. See [docs/guides/openrouter-setup.md](docs/guides/openrouter-setup.md) for details.
+
+### Model registry
+
+Manage the model registry and per-role routing:
+
+```bash
+wg model list                      # show all models (built-in + user-defined)
+wg model add my-model --provider openrouter --model-id deepseek/deepseek-chat-v3
+wg model remove my-model
+wg model set-default sonnet        # set default dispatch model
+wg model routing                   # show per-role model routing
+wg model set --role evaluator opus # set model for a specific dispatch role
+```
+
+### API key management
+
+```bash
+wg key set anthropic               # configure a provider's API key
+wg key check                       # validate key availability
+wg key list                        # show key status for all providers
+```
 
 ### The TUI
 
@@ -450,13 +554,21 @@ Launch the interactive terminal dashboard:
 wg tui [--refresh-rate 2000]  # default: 2000ms refresh
 ```
 
-The TUI has three views:
+The TUI has three main views plus a rich inspector panel:
 
 **Dashboard** — split-pane showing tasks (left) and agents (right) with status bars.
 
-**Graph Explorer** — tree view of the dependency graph with task status and active agent indicators.
+**Graph Explorer** — tree view of the dependency graph with task status and active agent indicators. Touch drag-to-pan is supported for mobile terminals (Termux).
 
 **Log Viewer** — real-time tailing of agent output with auto-scroll.
+
+**Inspector panel** — nine tabbed views accessible via `Alt+Left`/`Alt+Right` (with slide animation): Chat, Detail, Log, Messages, Agency, Config, Files, Coordinator Log, and Firehose. The Firehose tab is a combined live stream of all agent activity. Resize the inspector with `i` (cycle through 1/3 → 1/2 → 2/3 → full) and `I` (shrink back).
+
+**Status bar features:**
+- Service health badge — colored dot (green/yellow/red) with tap-to-inspect showing service state, stuck tasks, and control actions
+- Token display — shows novel vs cached input split per task
+- Lifecycle indicators — Unicode symbols for agency phases (⊳ assigning, ∴ evaluating, validating, verifying) rendered in pink
+- Markdown rendering with syntax highlighting (pulldown-cmark + syntect) in detail views
 
 #### Keybindings
 
@@ -513,7 +625,7 @@ wg service status
 **Common issues:**
 
 - **"Socket already exists"** — A previous daemon didn't clean up. Check if it's still running with `wg service status`, then `wg service stop` or manually remove the stale socket.
-- **Agents not spawning** — Check `wg service status` for coordinator state. Verify `max_agents` isn't already reached with `wg agents --alive`. Ensure there are tasks in `wg ready`.
+- **Agents not spawning** — Check `wg service status` for dispatcher state. Verify `max_agents` isn't already reached with `wg agents --alive`. Ensure there are tasks in `wg ready`.
 - **Agent marked dead prematurely** — Increase `heartbeat_timeout` in config.toml if agents do long-running work without heartbeating.
 - **Config changes not taking effect** — Run `wg service reload` after editing `config.toml`. CLI flag overrides on `wg service start` take precedence over the file.
 - **Daemon won't start** — Check if another daemon is already running. Look at `.workgraph/service/state.json` for stale PID info.
@@ -529,16 +641,16 @@ wg service status
 
 ## Agency system
 
-The agency system gives agents composable identities — a **role** (what it does) paired with a **motivation** (why it acts that way). Instead of every spawned agent being a generic assistant, the agency system lets you define specialized agents that are evaluated and evolved over time.
+The agency system gives agents composable identities — a **role** (what it does) paired with a **tradeoff** (why it acts that way). Instead of every spawned agent being a generic assistant, the agency system lets you define specialized agents that are evaluated and evolved over time.
 
 ### Quick start
 
 ```bash
-# Seed built-in starter roles and motivations
+# Seed built-in starter roles and tradeoffs
 wg agency init
 
 # Create an agent pairing
-wg agent create "Careful Coder" --role <role-hash> --motivation <motivation-hash>
+wg agent create "Careful Coder" --role <role-hash> --tradeoff <tradeoff-hash>
 
 # Assign the agent identity to a task
 wg assign my-task <agent-hash>
@@ -549,14 +661,20 @@ wg assign my-task <agent-hash>
 ### What it does
 
 1. **Roles** define skills and desired outcomes ("Programmer" → working, tested code)
-2. **Motivations** define trade-offs and constraints ("Careful" → prioritizes reliability, rejects untested code)
-3. **Agents** pair one role + one motivation into a named identity
+2. **Tradeoffs** define trade-offs and constraints ("Careful" → prioritizes reliability, rejects untested code)
+3. **Agents** pair one role + one tradeoff into a named identity
 4. **Assignment** binds an agent to a task — its identity is injected at spawn time
 5. **Evaluation** scores completed tasks across four dimensions:
    - `wg evaluate run <task>` — trigger LLM-based evaluation
    - `wg evaluate record --task <id> --score <n> --source <tag>` — record external signals (CI, peer review)
    - `wg evaluate show` — view evaluation history
-6. **Evolution** uses performance data to create new roles/motivations and retire weak ones
+6. **Evolution** uses performance data to create new roles/tradeoffs and retire weak ones
+
+### FLIP pipeline
+
+FLIP (Fidelity via Latent Intent Probing) is an independent second-opinion scoring system. After a task completes, an LLM reconstructs what the task must have been from only the agent's output, then a comparison scores how well the output matched the actual task description. Low FLIP scores (below threshold) automatically trigger verification tasks where a stronger model independently checks the work.
+
+The full agency loop: **eval → FLIP → verify → evolve**. Evaluation grades quality, FLIP grades fidelity, verification catches low-confidence results, and evolution uses performance data to improve agent identities.
 
 ### Automation
 
@@ -575,9 +693,9 @@ When the coordinator ticks, it automatically creates `assign-{task}` and `evalua
 ### Evolution
 
 ```bash
-wg evolve                              # full evolution cycle
-wg evolve --strategy mutation --budget 3  # targeted changes
-wg evolve --dry-run                    # preview without applying
+wg evolve run                              # full evolution cycle
+wg evolve run --strategy mutation --budget 3  # targeted changes
+wg evolve run --dry-run                    # preview without applying
 ```
 
 ### Federation
@@ -587,7 +705,7 @@ Share agency entities across projects:
 ```bash
 wg agency remote add partner /path/to/other/project/.workgraph/agency
 wg agency scan partner              # see what they have
-wg agency pull partner              # import their roles, motivations, agents
+wg agency pull partner              # import their roles, tradeoffs, agents
 wg agency push partner              # export yours to them
 ```
 
@@ -604,6 +722,37 @@ wg peer status                      # quick health check of all peers
 ```
 
 See [docs/AGENCY.md](docs/AGENCY.md) for the full agency system documentation.
+
+## Communication
+
+Agents and humans can exchange messages on tasks using `wg msg`:
+
+```bash
+# Send a message to a task (any agent working on it will see it)
+wg msg send my-task "The API schema changed — use v2 endpoints"
+
+# Read messages as an agent
+wg msg read my-task --agent $WG_AGENT_ID
+```
+
+For interactive conversation with the coordinator agent, use `wg chat`:
+
+```bash
+wg chat "What's the status of the auth refactor?"
+wg chat -i                                       # interactive REPL mode
+wg chat "Here's the spec" --attachment spec.pdf   # attach a file
+wg chat --coordinator 2 "Status?"                 # target a specific coordinator
+wg chat --history                                 # show chat history
+wg chat --clear                                   # clear chat history
+```
+
+See [docs/COMMANDS.md](docs/COMMANDS.md) for full messaging options.
+
+## Agent isolation
+
+When the service spawns multiple agents concurrently, each agent operates in its own [git worktree](https://git-scm.com/docs/git-worktree) to avoid file conflicts. Each worktree has an independent working tree and index while sharing the same repository, so agents can build, test, and commit without interfering with each other.
+
+See [docs/WORKTREE-ISOLATION.md](docs/WORKTREE-ISOLATION.md) for the full design and implementation details.
 
 ## Graph locking
 
@@ -670,6 +819,13 @@ wg add "Write draft" --id write --after review \
 
 # Delay between iterations
 wg edit write --cycle-delay "5m"
+
+# Force all iterations (agents cannot signal --converged)
+wg edit write --no-converge
+
+# Control failure behavior
+wg edit write --no-restart-on-failure            # don't restart cycle on failure
+wg edit write --max-failure-restarts 5           # cap failure-triggered restarts
 ```
 
 When a cycle completes an iteration (all members reach `done`), the cycle header and all members are reset to `open` with `loop_iteration` incremented.
@@ -695,15 +851,6 @@ wg cycles              # List detected cycles, their status, and iteration count
 wg cycles --json       # Machine-readable cycle information
 wg show <task-id>      # Shows cycle membership and current iteration on a task
 wg viz                 # Cycle edges appear as dashed lines in graph output
-```
-
-### Migrating from loops_to
-
-If you have existing graphs using the old `loops_to` edge system, migrate them:
-
-```bash
-wg migrate-loops --dry-run   # Preview what would change
-wg migrate-loops             # Convert loops_to edges to structural cycles
 ```
 
 ## Trace & sharing
@@ -772,9 +919,9 @@ wg trace show <task-id> --animate    # animated replay of execution over time
 
 ## Key concepts
 
-**Tasks** have a status (`open`, `in-progress`, `done`, `failed`, `abandoned`, `blocked`) and can block other tasks. Tasks can carry a per-task `model` override, an `agent` identity assignment, a `visibility` field (`internal`, `public`, `peer`) controlling what information is shared during trace exports, and a `context_scope` (`clean`, `task`, `graph`, `full`) controlling how much context the agent receives at dispatch.
+**Tasks** have a status (`open`, `in-progress`, `done`, `failed`, `abandoned`, `blocked`, `pending-validation`, `waiting`) and can block other tasks. Tasks can carry a per-task `model` override (with optional `provider`), an `agent` identity assignment, a `visibility` field (`internal`, `public`, `peer`) controlling what information is shared during trace exports, a `context_scope` (`clean`, `task`, `graph`, `full`) controlling how much context the agent receives at dispatch, and an `exec_mode` (`full`, `light`, `bare`, `shell`) controlling the agent's tool access.
 
-**Agents** are humans or AIs that do work. They can be AI agents (with a role and motivation that shape their behavior) or human agents (with contact info and a human executor like Matrix or email). All agents share the same identity model: capabilities, trust levels, rate, and capacity.
+**Agents** are humans or AIs that do work. They can be AI agents (with a role and tradeoff that shape their behavior) or human agents (with contact info and a human executor like Matrix or email). All agents share the same identity model: capabilities, trust levels, rate, and capacity.
 
 **The graph** is tasks connected by dependency edges (the `after` field). A task is waiting until all its dependencies reach a terminal status. Concurrent writes are protected by flock-based file locking.
 
@@ -782,7 +929,7 @@ wg trace show <task-id> --animate    # animated replay of execution over time
 
 **Trajectories**: For AI agents, `wg trajectory <task>` suggests the best order to claim related tasks, minimizing context switches.
 
-**Agency**: Composable agent identities (role + motivation) that are assigned to tasks, evaluated after completion, and evolved over time based on performance data.
+**Agency**: Composable agent identities (role + tradeoff) that are assigned to tasks, evaluated after completion, and evolved over time based on performance data.
 
 ## Query and analysis
 
@@ -813,13 +960,6 @@ wg analyze            # comprehensive health report (all of the above)
 wg watch              # real-time event stream (for external adapters)
 wg trace show <id>    # execution history of a task
 wg trace export       # export trace data for sharing
-wg func extract <id>  # extract workflow pattern into reusable template
-wg func extract --generative <id>... # compare traces → generative function
-wg func apply <id>    # create tasks from a function template
-wg func make-adaptive <id>  # upgrade to adaptive (adds trace memory)
-wg func bootstrap     # bootstrap the extraction meta-function
-wg func list          # list available function templates
-wg func show <id>     # inspect a function template
 ```
 
 See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference including `viz`, `plan`, `coordinate`, `archive`, `reschedule`, and more.
@@ -829,9 +969,19 @@ See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference includin
 ```bash
 wg log <id> "message"     # add progress notes to a task
 wg artifact <id> path     # record a file produced by a task
+wg compact                # distill graph state into context.md
+wg sweep                  # detect and recover orphaned in-progress tasks
+wg checkpoint <id> -s "progress summary"  # save checkpoint for long tasks
+wg stats                  # show time counters and agent statistics
+wg exec <id>              # execute a task's shell command (claim + run + done/fail)
+wg model list             # model registry management (see Model registry section)
+wg key list               # API key status (see API key management section)
 wg viz --mermaid          # generate Mermaid flowchart output
 wg viz --graph            # 2D spatial layout with box-drawing characters
 wg archive                # archive completed tasks
+wg screencast             # render TUI event traces into asciinema screencasts
+wg server                 # multi-user server setup automation
+wg tui-dump               # dump current TUI screen contents (requires running tui)
 wg check                  # check graph for cycles and issues
 wg trajectory <id>        # optimal task claim order for agents
 wg runs list              # list run snapshots
@@ -856,13 +1006,12 @@ Configuration is in `.workgraph/config.toml`:
 
 ```toml
 [agent]
-executor = "claude"
-model = "opus"
+model = "claude:opus"  # provider:model — handler is implied
 interval = 10
 
 [coordinator]
 max_agents = 4
-poll_interval = 60
+poll_interval = 5
 
 [agency]
 auto_evaluate = false
@@ -871,6 +1020,8 @@ auto_assign = false
 [project]
 name = "My Project"
 ```
+
+See [Service > Configuration](#configuration) for the full set of options including agency automation, FLIP, eval gates, model routing, and multi-coordinator settings.
 
 Agency data lives in `.workgraph/agency/`, with federation config and functions alongside:
 
@@ -882,19 +1033,88 @@ Agency data lives in `.workgraph/agency/`, with federation config and functions 
   functions/               # Trace functions (workflow templates)
     <name>.yaml
   agency/
-    roles/                 # Role YAML files (keyed by content-hash)
-    motivations/           # Motivation YAML files
-    agents/                # Agent YAML files (role+motivation pairings)
+    primitives/
+      components/          # Skill components (atomic capabilities)
+      outcomes/            # Desired outcomes
+      tradeoffs/           # Tradeoff definitions
+    cache/
+      roles/               # Composed roles (component_ids + outcome_id)
+      agents/              # Agent definitions (role + tradeoff pairs)
+    assignments/           # Task-to-agent assignment records
     evaluations/           # Evaluation records (JSON)
-    evolver-skills/        # Strategy-specific skill documents for evolution
+    org-evaluations/       # Organization-level evaluation records
+    evolution_runs/        # Evolution run history
+    evolver-skills/        # Strategy-specific guidance documents
+    coordinator-prompt/    # Coordinator prompt files
+    deferred/              # Deferred evolution operations
+    creator_state.json     # Creator agent state
 ```
+
+## Terminal-Bench evaluation
+
+We evaluated workgraph's impact on agent performance using [Terminal-Bench 2.0](https://terminal-bench.org), a benchmark of 89 real-world terminal tasks with binary pass/fail verification.
+
+**Model:** Minimax M2.7 via OpenRouter | **Tasks:** 89 | **Trials:** 3 per condition
+
+| Condition | Description | Pass Rate | 95% CI |
+|-----------|-------------|-----------|--------|
+| **A** (control) | Bare agent: bash + file tools | 52.3% | [43.4, 61.6] |
+| **B** (stigmergic) | A + workgraph tools + graph context | 51.4% | [42.0, 60.4] |
+| **C** (enhanced) | B + skill injection + planning | 49.0% | [39.4, 58.2] |
+
+**Result:** No statistically significant difference between conditions (all pairwise p > 0.3). Workgraph showed modest gains on medium-difficulty tasks (+9pp) offset by losses on easy tasks (-16pp) where bookkeeping overhead introduced friction. Hard tasks remained beyond the model's reach regardless of scaffolding.
+
+Full analysis: [`terminal-bench/results/analysis.md`](terminal-bench/results/analysis.md) | Blog post: [`terminal-bench/BLOG.md`](terminal-bench/BLOG.md)
+
+To reproduce:
+```bash
+# Install the adapter
+pip install -e terminal-bench/
+
+# Run all conditions (requires OPENROUTER_API_KEY)
+bash terminal-bench/reproduce.sh
+
+# Analyze results
+python3 terminal-bench/results/analyze.py
+```
+
+## Testing
+
+Run the wave-1 integration smoke test after any wave-1 task lands.
+
+**This MUST be run live against real endpoints — no stubs, no mocks, no
+special bypass.** The earlier version of this smoke silently passed because
+it relied on a fake LLM and ran the daemon with `--no-coordinator-agent`,
+which is exactly how the `wg nex` 404 reached the user on the first 'hi' in
+TUI chat. Live scenarios cover the user's literal reproduction:
+
+```bash
+# Full suite — runs scenarios 1-7 (offline + live)
+bash scripts/smoke/wave-1-smoke.sh
+
+# Skip slow daemon/TUI scenarios (and the live ones)
+bash scripts/smoke/wave-1-smoke.sh --quick
+
+# Skip live scenarios (6, 7) but keep offline ones — for sandboxed CI
+bash scripts/smoke/wave-1-smoke.sh --offline
+```
+
+If a live endpoint is unreachable, scenario 6/7 print a LOUD banner —
+`*** NEX SMOKE SKIPPED — endpoint unreachable ***` — that is greppable in
+output and impossible to miss. Set `WG_SMOKE_FAIL_ON_SKIP=1` to promote
+loud skips to fail in CI. Set `WG_SMOKE_KEEP_SCRATCH=1` to preserve the
+per-scenario scratch dirs for post-mortem inspection.
+
+Live scenarios point at `https://lambda01.tail334fe6.ts.net:30000` with
+model `qwen3-coder` by default; override via `WG_LIVE_NEX_ENDPOINT` and
+`WG_LIVE_NEX_MODEL`.
 
 ## More docs
 
 - [docs/COMMANDS.md](docs/COMMANDS.md) - Complete command reference
 - [docs/AGENT-GUIDE.md](docs/AGENT-GUIDE.md) - Deep dive on agent operation
 - [docs/AGENT-SERVICE.md](docs/AGENT-SERVICE.md) - Service architecture and coordinator lifecycle
-- [docs/AGENCY.md](docs/AGENCY.md) - Agency system: roles, motivations, evaluation, evolution
+- [docs/AGENCY.md](docs/AGENCY.md) - Agency system: roles, tradeoffs, evaluation, evolution
 - [docs/LOGGING.md](docs/LOGGING.md) - Provenance logging and the operations log
 - [docs/DEV.md](docs/DEV.md) - Developer notes
 - [docs/KEY_DOCS.md](docs/KEY_DOCS.md) - Documentation inventory and status

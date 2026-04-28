@@ -91,7 +91,9 @@ fn status_color(status: &Status, is_archived: bool) -> &'static str {
         Status::Open => "white",       // Ready to pick up
         Status::Failed => "salmon",    // Red-ish - needs attention
         Status::Abandoned => "lightgray", // Grayed out
-        Status::Waiting => "lightskyblue", // Parked
+        Status::Waiting | Status::PendingValidation => "lightskyblue", // Parked
+        Status::PendingEval => "chartreuse", // Soft-done: between yellow (in-progress) and green (done)
+        Status::Incomplete => "orange",
     }
 }
 

@@ -11,7 +11,7 @@ The following terms have precise meanings throughout this manual. They are defin
 | *Term* | *Definition* |
 | --- | --- |
 | *task* | The fundamental unit of work. Has an ID, title, status, and may have dependencies, skills, inputs, deliverables, and other metadata. Tasks are nodes in the graph. |
-| *status* | The lifecycle state of a task. One of: _open_ (available for work), _in-progress_ (claimed by an agent), _done_ (completed successfully), _failed_ (attempted and failed; retryable), _abandoned_ (permanently dropped), or _blocked_ (explicit, rarely used). The three _terminal_ statuses are done, failed, and abandoned—a terminal task no longer blocks its dependents. |
+| *status* | The lifecycle state of a task. One of eight values: _open_ (available for work), _in-progress_ (claimed by an agent), _done_ (completed successfully), _failed_ (attempted and failed; retryable), _abandoned_ (permanently dropped), _blocked_ (explicit, rarely used), _pending-validation_ (awaiting review after `wg done` on a task with `verify` criteria), or _waiting_ (parked by `wg wait` until a condition is met). The three _terminal_ statuses are done, failed, and abandoned—a terminal task no longer blocks its dependents. PendingValidation and Waiting are non-terminal intermediate states. |
 | *dependency* | A directed edge between tasks expressed via the `after` field. Task B depends on task A means B cannot be ready until A reaches a terminal status. |
 | *after* | The authoritative dependency list on a task. `task.after = ["dep"]` means the task comes after `dep`. A task is _waiting_ (in the derived sense) when any entry in its `after` list is non-terminal. In the CLI, specified via `--after` (alias: `--blocked-by`). |
 | *before* | The computed inverse of `after`, maintained for bidirectional traversal. If B is after A, then A's `before` list includes B. Not checked by the scheduler—purely a convenience index. |
@@ -27,7 +27,7 @@ The following terms have precise meanings throughout this manual. They are defin
 | *function* | A parameterized workflow template extracted from completed traces via `wg func extract`. Captures task structure, dependencies, and structural cycles. Applied via `wg func apply` to create new task graphs. Stored as YAML in `.workgraph/functions/`. |
 | *replay* | Re-execution of previously completed or failed work. `wg replay` creates an immutable snapshot, then selectively resets tasks based on criteria. Supports `--plan-only` for previewing. |
 | *role* | An agency entity defining _what_ an agent does. Contains a description, skills, and a desired outcome. Identified by a content-hash of its identity-defining fields. |
-| *motivation* | An agency entity defining _why_ an agent acts the way it does. Contains a description, acceptable trade-offs, and unacceptable trade-offs. Identified by a content-hash of its identity-defining fields. |
+| *motivation (tradeoff)* | An agency entity defining _why_ an agent acts the way it does. Contains a description, acceptable trade-offs, and unacceptable trade-offs. Identified by a content-hash of its identity-defining fields. Called _tradeoff_ in the CLI (`wg tradeoff`); the older name _motivation_ is accepted as an alias. |
 | *agent* | The unified identity in the agency system—a named pairing of a role and a motivation. Identified by a content-hash of `(role_id, motivation_id)`. |
 | *agency* | The collective system of roles, motivations, and agents. Also refers to the storage directory (`.workgraph/agency/`). |
 | *content-hash ID* | A SHA-256 hash of an entity's identity-defining fields. Deterministic, deduplicating, and immutable. Displayed as 8-character hex prefixes. |
@@ -47,7 +47,7 @@ The following terms have precise meanings throughout this manual. They are defin
 | *evaluation source* | A freeform string tag on each evaluation identifying its origin. Default: `"llm"` (internal auto-evaluator). Conventions: `"outcome:<metric>"` for external outcome data, `"ci:<suite>"` for CI results, `"vx:<peer-id>"` for peer evaluations. The evolver reads all evaluations regardless of source. |
 | *performance record* | A running tally on each agent, role, and motivation: task count, average score, and evaluation references with context IDs. |
 | *evolution* | The process of improving agency entities based on evaluation data. Triggered manually via `wg evolve`. |
-| *strategy* | An evolution approach: _mutation_, _crossover_, _gap analysis_, _retirement_, _motivation tuning_, or _all_. |
+| *strategy* | An evolution approach: _mutation_, _crossover_, _gap analysis_, _retirement_, _tradeoff tuning_, or _all_. |
 | *lineage* | Evolutionary history on every role, motivation, and agent. Records parent IDs, generation number, creator identity, and timestamp. |
 | *generation* | Steps from a manually-created ancestor. Generation 0 = human-created. Each evolution increments by one. |
 | *synergy matrix* | A performance cross-reference of every (role, motivation) pair, showing average score and evaluation count. |
@@ -57,8 +57,22 @@ The following terms have precise meanings throughout this manual. They are defin
 | *wrapper script* | The `run.sh` generated for each spawned agent. Runs the executor, captures output, and handles post-exit fallback logic. |
 | *federation* | The system for sharing agency entities across workgraph projects. Operations: _scan_ (discover), _pull_ (import), _push_ (export). Named remotes stored in `.workgraph/federation.yaml`. Content-hash IDs make deduplication automatic. |
 | *remote* | A named reference to another workgraph project's agency store, used for federation. Managed via `wg agency remote add/list/remove`. |
+| *provider* | The LLM provider backing a task or agent: `anthropic`, `openai`, `openrouter`, or `local`. Set per-task via `--provider` on `wg add`/`wg edit`, or per-agent via `wg config`. The coordinator resolves providers through the same priority chain as models. |
+| *exec-mode* | Controls the execution weight of an agent dispatched for a task. Four values: _full_ (default—complete tool access), _light_ (read-only tools), _bare_ (only `wg` CLI), _shell_ (no LLM—runs the task's `exec` field directly). Set via `--exec-mode` on `wg add`/`wg edit`. |
+| *placement* | The coordinator's automatic positioning of newly created tasks in the dependency graph. Controlled by placement hints: `--no-place` (skip placement—make the task immediately available), `--place-near <IDS>` (place near specified tasks), `--place-before <IDS>` (insert before specified tasks). Automatic placement is configured via `wg config --auto-place`. |
+| *multi-coordinator* | Support for running multiple coordinator sessions within a single service daemon. Each coordinator manages an independent scheduling context. Managed via `wg service create-coordinator`, `stop-coordinator`, `archive-coordinator`, and `delete-coordinator`. The maximum number of concurrent coordinators is set via `wg config --max-coordinators`. |
+| *compaction* | The process of distilling graph state into a condensed summary (`context.md`). Triggered via `wg compact`. In the service daemon, compaction runs as the `.compact-0` task—a structural cycle where the coordinator introspects its own state. |
+| *sweep* | Detection and recovery of orphaned in-progress tasks whose agents have died. `wg sweep` scans for tasks claimed by agents whose PIDs no longer exist and offers to reclaim them. |
+| *checkpoint* | A snapshot of an agent's progress during long-running tasks. `wg checkpoint` saves the current state so that if the agent is interrupted, a replacement can resume from the checkpoint rather than starting over. |
 | *event stream* | A real-time feed of graph mutations produced by `wg watch`. Events are typed (`task.created`, `task.completed`, `evaluation.recorded`, etc.) and filterable by category or task ID. Enables external adapters to observe and react without polling. |
 | *adapter* | An external tool that translates between an external system's vocabulary and workgraph's ingestion points. The generic pattern: observe (via `wg watch`) → translate → ingest (via `wg` CLI) → react. A conceptual pattern, not a formal type. |
+| *dispatch role* | A named system function with its own model and provider assignment. Roles include _default_, _task_agent_, _evaluator_, _assigner_, _evolver_, _triage_, _verification_, _compactor_, _placer_, and others. Managed via `wg model routing` and `wg model set`. Enables cost-optimized model allocation: cheap models for routine roles, capable models for complex work. |
+| *peer* | A registered reference to another workgraph project for cross-repo communication. Managed via `wg peer add/remove/list/status`. Tasks can be created in a peer's graph via `wg add --repo <peer-name>`. Distinct from federation (which shares agency identities)—peer communication shares _work_. |
+| *agency import* | Importing agency primitives (roles, motivations) from external sources via `wg agency import`. Supports local CSV files, remote URLs (`--url`), and configured upstream bureaus (`--upstream`). Change detection via manifest hashing prevents redundant imports. |
+| *user board* | A per-user conversation surface (`.user-NAME` task) for persistent human-in-the-loop communication. Created via `wg user init`, listed with `wg user list`, and archived with `wg user archive`. Each board is a task with a message queue—the coordinator reopens it when new messages arrive, enabling asynchronous dialogue between the human and the system. |
+| *provider profile* | A named preset that maps model tiers (haiku, sonnet, opus) to specific provider/model combinations. Managed via `wg profile set`, `wg profile show`, and `wg profile list`. Profiles simplify model configuration: instead of setting each dispatch role's model individually, activate a profile and all roles resolve through its tier mappings. `wg profile refresh` updates rankings from OpenRouter. |
+| *spend* | Token usage and estimated cost tracking. `wg spend` summarizes cumulative input/output tokens, cached tokens, and estimated USD cost across all agents. `--today` filters to the current day. The data is derived from agent output logs that capture API usage metadata. |
+| *requeue* | Returning an in-progress task to open status for re-dispatch. `wg requeue --reason "..."` resets the task and records the reason—typically used when a task's dependency has failed and fix tasks have been created, allowing the requeued task to be dispatched after the fixes land. Distinct from `wg retry` (which handles failed tasks) and dead-agent triage (which is automatic). |
 
 
 ---
@@ -95,21 +109,29 @@ When an agent is dispatched to a task, its role and motivation are resolved—sk
 
 Human agents participate in the same model. The only difference is the *executor*: AI agents use `claude` (or another LLM backend); human agents use `matrix`, `email`, `shell`, or another human-facing channel. Human agents don’t need roles or motivations—they bring their own judgment. But both human and AI agents are tracked, evaluated, and coordinated uniformly. The system does not distinguish between them in its bookkeeping; only the dispatch mechanism differs.
 
+AI tasks can also specify a *provider*—`anthropic`, `openai`, `openrouter`, or `local`—and an *exec-mode* that controls the agent’s level of autonomy: `full` (complete tool access), `light` (read-only), `bare` (CLI only), or `shell` (no LLM). These per-task controls let you match the execution environment to the work: a sensitive review task might use a different provider and a read-only exec-mode, while an implementation task uses the default.
+
 Because identities are content-hashed, they travel well. Agency entities—roles, motivations, and their evaluation histories—can be shared across projects through federation, carrying lineage and performance data intact. A proven architect role in one project can be pulled into another without re-creation; the content-hash guarantees it is the same entity everywhere.
 
 ## The Core Loop
 
 Workgraph operates through a cycle that applies at every scale, from a single task to a multi-week project:
 
-```
-    ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+<figure>
+<div data-align="center">
+<pre><code>┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
     │  Define   │────▶│ Dispatch  │────▶│ Execute  │────▶│ Complete │
-    │   work    │     │  agents   │     │   task   │     │  & learn │
+    │   work    │     │  agents   │     │   task   │     │  &amp; learn │
     └──────────┘     └──────────┘     └──────────┘     └──────────┘
           ▲                                                   │
           └───────────────────────────────────────────────────┘
                         unblocked tasks, new work
-    ```
+    </code></pre>
+</div>
+<figcaption><p>The heartbeat of a workgraph project.</p></figcaption>
+</figure>
+
+<span id="fig-core-loop"></span>
 
 **Define work.** Add tasks to the graph with their dependencies, skills, deliverables, and time estimates. The graph is the plan. Modifying it is cheap—add a task, change a dependency, split a bloated task into subtasks. The graph adapts as understanding evolves.
 
@@ -125,15 +147,21 @@ This is the basic heartbeat. Most projects run on this loop alone.
 
 The agency system extends the core loop with a second, slower cycle of improvement:
 
-```
-    ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+<figure>
+<div data-align="center">
+<pre><code>┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
     │  Assign  │────▶│ Execute  │────▶│ Evaluate │────▶│  Evolve  │
     │ identity │     │   task   │     │ results  │     │  agency  │
     └──────────┘     └──────────┘     └──────────┘     └──────────┘
           ▲                                                   │
           └───────────────────────────────────────────────────┘
                       improved identities feed back
-    ```
+    </code></pre>
+</div>
+<figcaption><p>The agency improvement cycle.</p></figcaption>
+</figure>
+
+<span id="fig-agency-loop"></span>
 
 **Assign identity.** Before a task is dispatched, an agent identity is bound to it—either manually or through an auto-assign system where a dedicated assigner agent evaluates the available agents and picks the best fit. *Assignment* sets identity; it is distinct from *claiming*, which sets execution state.
 
@@ -149,7 +177,27 @@ Each step in this cycle can be manual or automated. A project might start with m
 
 The task graph and the agency are complementary systems with a clean separation. The graph defines *what* needs to happen and *in what order*. The agency defines *who* does it and *how they approach it*. Neither depends on the other for basic operation: you can run workgraph without the agency (every agent is generic), and you can define agency entities without a graph (though they have nothing to do). The power is in the combination.
 
-The coordinator sits at the intersection. It reads the graph to find ready work, reads the agency to resolve agent identities, dispatches the work, and—when evaluation is enabled—closes the feedback loop by scoring results and feeding data back into the agency. The graph is the skeleton; the agency is the musculature; the coordinator is the nervous system.
+The coordinator sits at the intersection. It reads the graph to find ready work, reads the agency to resolve agent identities, dispatches the work, and—when evaluation is enabled—closes the feedback loop by scoring results and feeding data back into the agency. A single service daemon can host multiple coordinator sessions, enabling parallel workstreams within the same project. The graph is the skeleton; the agency is the musculature; the coordinator is the nervous system.
+
+Several additional mechanisms extend this core architecture:
+
+- **Waiting and checkpointing.** An agent can park a task in *waiting* status (`wg wait`) until a condition is met—another task reaching a state, a timer expiring, a message arriving, or a human signal. The coordinator evaluates waiting conditions each tick and resumes satisfied tasks automatically. Separately, `wg checkpoint` lets a running agent save a progress snapshot so that a replacement agent can resume from that point if the original is interrupted.
+
+- **FLIP (Fidelity via Latent Intent Probing).** After a task completes and is evaluated, an independent FLIP assessment reconstructs what the task's prompt *must have been* from the agent's output alone, then scores how well the output matched the actual task description. Low FLIP scores automatically trigger verification tasks dispatched to a stronger model. The full agency pipeline is: evaluate → FLIP → verify → evolve.
+
+- **Eval gate.** A configurable threshold (`eval_gate_threshold`) that automatically rejects (fails) a completed task if its evaluation score falls below the minimum. This creates a quality floor: work that does not meet the bar is sent back rather than accepted.
+
+- **Multi-coordinator sessions.** A single daemon can host multiple coordinator sessions, each managing an independent scheduling context—for example, one coordinator for feature work and another for maintenance.
+
+- **Compaction and sweep.** Long-running projects accumulate state. `wg compact` distills the current graph into a condensed `context.md` summary for future agent prompts. `wg sweep` detects orphaned in-progress tasks whose agents have died without cleanup.
+
+- **Auto-triage.** When a spawned agent dies, the coordinator can automatically triage the outcome using a fast LLM, classifying the result as *done* (work was complete), *continue* (inject recovery context and re-dispatch), or *restart* (begin fresh).
+
+- **Exec-mode.** Each task can specify an execution weight—`full` (all tools), `light` (read-only), `bare` (CLI only), or `shell` (no LLM)—controlling how much autonomy the agent has within its executor.
+
+- **User boards.** Each human participant can have a persistent conversation board (`wg user init`), enabling asynchronous dialogue with the coordinator and agents. User boards are tasks with message queues—the coordinator reopens them when messages arrive, creating a natural human-in-the-loop channel.
+
+- **Provider profiles and cost tracking.** `wg profile` manages named presets that map model tiers to specific provider/model combinations, simplifying configuration across dispatch roles. `wg spend` tracks token usage and estimated costs across all agents, and `wg openrouter` provides OpenRouter-specific cost monitoring.
 
 Workgraph is not a closed system. External tools—CI pipelines, portfolio trackers, peer organizations—can observe the graph through a real-time event stream and inject information back through several channels: recording evaluations with external source tags, importing trace data from peers, adding tasks, or updating state directly. Each task carries a *visibility* field (`internal`, `public`, or `peer`) that controls what information crosses organizational boundaries when traces are exported. This boundary discipline makes collaboration possible without exposing internal deliberation.
 
@@ -167,56 +215,89 @@ Workgraph models work as a directed graph. Tasks are nodes. Dependencies are edg
 
 A task is the atom of work. It has an identity, a lifecycle, and a body of metadata that guides both human and machine execution. Here is the anatomy:
 
-| *Field* | *Purpose* |
-| --- | --- |
-| `id` | A slug derived from the title at creation time. The permanent key—used in every edge, every command, every reference. Once set, it never changes. |
-| `title` | Human-readable name. Can be updated without breaking references. |
-| `description` | The body: acceptance criteria, context, constraints. What an agent (human or AI) needs to understand the work. |
-| `status` | Lifecycle state. One of six values—see below. |
-| `estimate` | Optional cost and hours. Used by budget fitting and forecasting. |
-| `tags` | Flat labels for filtering and grouping. |
-| `skills` | Required capabilities—matched against agent capabilities at dispatch time. |
-| `inputs` | Paths or references the task needs to read. |
-| `deliverables` | Expected outputs—what the task should produce. |
-| `artifacts` | Actual outputs recorded after completion. |
-| `exec` | A shell command for automated execution via the shell executor. |
-| `model` | Preferred AI model (haiku, sonnet, opus). Overrides coordinator and agent defaults. |
-| `verify` | Verification criteria—if set, the task requires review before it can be marked done. |
-| `agent` | Content-hash ID binding an agency agent identity to this task. |
-| `visibility` | Controls what information crosses organizational boundaries during trace exports. One of `internal` (default—organization only), `public` (sanitized sharing without agent output or logs), or `peer` (richer detail for trusted peers, including evaluations and patterns). |
-| `context_scope` | Controls how much context the agent receives in its prompt. One of `clean` (bare executor), `task` (default—workflow commands and graph patterns), `graph` (adds project description and 1-hop neighborhood), or `full` (adds complete graph summary and CLAUDE.md). Each tier is a strict superset of the one below. Overrides role and coordinator defaults when set. |
-| `log` | Append-only progress entries with timestamps and optional actor attribution. |
+|                |                                                                                                                                                                                                                                                                              |
+|:---------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Field**      | **Purpose**                                                                                                                                                                                                                                                                  |
+| `id`           | A slug derived from the title at creation time. The permanent key—used in every edge, every command, every reference. Once set, it never changes.                                                                                                                            |
+| `title`        | Human-readable name. Can be updated without breaking references.                                                                                                                                                                                                             |
+| `description`  | The body: acceptance criteria, context, constraints. What an agent (human or AI) needs to understand the work.                                                                                                                                                               |
+| `status`       | Lifecycle state. One of eight values—see below.                                                                                                                                                                                                                              |
+| `estimate`     | Optional cost and hours. Used by budget fitting and forecasting.                                                                                                                                                                                                             |
+| `tags`         | Flat labels for filtering and grouping.                                                                                                                                                                                                                                      |
+| `skills`       | Required capabilities—matched against agent capabilities at dispatch time.                                                                                                                                                                                                   |
+| `inputs`       | Paths or references the task needs to read.                                                                                                                                                                                                                                  |
+| `deliverables` | Expected outputs—what the task should produce.                                                                                                                                                                                                                               |
+| `artifacts`    | Actual outputs recorded after completion.                                                                                                                                                                                                                                    |
+| `exec`         | A shell command for automated execution via the shell executor.                                                                                                                                                                                                              |
+| `model`        | Preferred AI model (haiku, sonnet, opus). Overrides coordinator and agent defaults.                                                                                                                                                                                          |
+| `provider`     | LLM provider for this task (`anthropic`, `openai`, `openrouter`, `local`). Overrides coordinator and agent defaults.                                                                                                                                                         |
+| `exec_mode`    | Execution weight controlling the agent's tool access. One of `full` (default—complete tool access), `light` (read-only tools), `bare` (only `wg` CLI), or `shell` (no LLM—runs the `exec` field directly).                                                                  |
+| `verify`       | Verification criteria—if set, the task requires review before it can be marked done.                                                                                                                                                                                         |
+| `agent`        | Content-hash ID binding an agency agent identity to this task.                                                                                                                                                                                                               |
+| `visibility`   | Controls what information crosses organizational boundaries during trace exports. One of `internal` (default—organization only), `public` (sanitized sharing without agent output or logs), or `peer` (richer detail for trusted peers, including evaluations and patterns). |
+| `context_scope`| Controls how much context the agent receives in its prompt. One of `clean` (bare executor), `task` (default—workflow commands and graph patterns), `graph` (adds project description and 1-hop neighborhood), or `full` (adds complete graph summary and CLAUDE.md). Each tier is a strict superset of the one below. Overrides role and coordinator defaults when set. |
+| `delay`        | Duration to wait before the task becomes ready (e.g., `30s`, `5m`, `1h`, `1d`). Set via `--delay` on `wg add`/`wg edit`.                                                                                                                                                    |
+| `not_before`   | Absolute ISO 8601 timestamp before which the task will not be dispatched. Set via `--not-before` on `wg add`/`wg edit`.                                                                                                                                                      |
+| `log`          | Append-only progress entries with timestamps and optional actor attribution.                                                                                                                                                                                                 |
+
+Task fields. Every field except `id`, `title`, and `status` is optional.
+
+<span id="task-fields"></span>
 
 Tasks are not just descriptions of work—they are self-contained dispatch packets. An agent spawned for a task receives the description, the inputs, the skills, the log history, and the artifacts of completed dependencies. Everything needed to begin work is encoded on the node itself or reachable through its edges.
 
 ## Status and Lifecycle
 
-A task moves through six statuses. Most follow the happy path; some take detours.
+A task moves through eight statuses. Most follow the happy path; some take detours.
 
-```
-         ┌──────────────────────────────────────┐
+<figure>
+<pre><code>┌──────────────────────────────────────┐
          │              Open                     │
          │   (available for work or re-work)     │
          └──────┬──────────────────▲─────────────┘
                 │                  │
            claim│             retry│ / cycle re-activation
-                │                  │
+                │                  │        ▲ reject
          ┌──────▼──────────────────┴─────────────┐
          │           InProgress                   │
          │        (agent working)                 │
-         └──────┬─────────┬──────────┬───────────┘
-                │         │          │
-           done │    fail │     abandon│
-                │         │          │
-         ┌──────▼───┐ ┌──▼──────┐ ┌─▼──────────┐
-         │   Done   │ │ Failed  │ │ Abandoned   │
-         │ terminal │ │terminal │ │  terminal   │
-         └──────────┘ └─────────┘ └─────────────┘
+         └──┬──────┬─────────┬──────────┬────────┘
+            │      │         │          │
+            │ done │    fail │     abandon│
+            │      │         │          │
+            │      │  ┌──────▼──────┐ ┌─▼──────────┐
+            │      │  │   Failed    │ │ Abandoned   │
+            │      │  │  terminal   │ │  terminal   │
+            │      │  └─────────────┘ └─────────────┘
+            │      │
+       wait │      │  (no --verify)          (has --verify)
+            │      ├──────────────────┐─────────────────┐
+            │      │                  │                  │
+            │ ┌────▼─────┐    ┌──────▼─────────────┐    │
+            │ │   Done   │    │ PendingValidation   │    │
+            │ │ terminal │    │ (awaiting review)   │    │
+            │ └──────────┘    └───────┬─────────────┘    │
+            │                   approve│                  │
+            │                  ┌───────▼────┐             │
+            │                  │    Done    │             │
+            │                  │  terminal  │             │
+            │                  └────────────┘             │
+            │                                             │
+         ┌──▼──────────────────────────────────────┐
+         │  Waiting (parked by wg wait — resumed   │
+         │  when condition is met or wg resume)    │
+         └──────────────────────▲──────────────────┘
+                                │ resume
+                            (→ InProgress)
 
          ┌──────────────────────────────────────┐
          │  Blocked (explicit, rarely used)      │
          └──────────────────────────────────────┘
-```
+</code></pre>
+<figcaption><p>Task state machine. The eight statuses include three terminals (Done, Failed, Abandoned) that unblock dependents, plus PendingValidation and Waiting as non-terminal intermediate states.</p></figcaption>
+</figure>
+
+<span id="state-machine"></span>
 
 **Open** is the starting state. A task is open when it has been created and is potentially available for work—though it may not yet be *ready* (a distinction explored below).
 
@@ -224,7 +305,11 @@ A task moves through six statuses. Most follow the happy path; some take detours
 
 **Done**, **Failed**, and **Abandoned** are the three *terminal* statuses. A terminal task will not progress further without explicit intervention—retry, manual re-open, or cycle re-activation. The crucial design choice: all three terminal statuses unblock dependents. A failed upstream does not freeze the graph. The downstream task gets dispatched and can decide for itself what to do about a failed dependency—inspect the failure reason, skip the work, or adapt.
 
-**Blocked** exists as an explicit status but is rarely used. In practice, a task is *waiting* when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
+**PendingValidation** is entered when an agent calls `wg done` on a task that has `verify` criteria. The task is not yet terminal—it awaits external review. `wg approve` transitions it to Done; `wg reject` transitions it back to Open for re-dispatch (with the assignment cleared). After `max_rejections` (default: 3), rejection transitions the task to Failed instead.
+
+**Waiting** means an agent has voluntarily parked the task via `wg wait`. The task is not terminal and will not be re-dispatched. It resumes (returning to InProgress) when its wait condition is met—a timer elapses, a dependent task reaches a target status, a message arrives, or a file changes—or when a human runs `wg resume`.
+
+**Blocked** exists as an explicit status but is rarely used. In practice, a task is *blocked* when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
 
 ## Terminal Statuses Unblock: A Design Choice
 
@@ -240,8 +325,8 @@ The alternative—frozen pipelines waiting for human intervention—violates the
 
 Dependencies are directed edges expressing temporal ordering. Task B depends on task A means: B cannot be ready until A reaches a terminal status. This is expressed by placing A’s ID in B’s `after` list—B comes *after* A.
 
-```
-    after edge (authoritative)
+<figure>
+<pre><code>after edge (authoritative)
     ─────────────────────────────►
 
     ┌─────────┐    after     ┌─────────┐    after     ┌─────────┐
@@ -250,7 +335,11 @@ Dependencies are directed edges expressing temporal ordering. Task B depends on 
 
     Read as: build is after design. deploy is after build.
     Equivalently: design is before build. build is before deploy.
-```
+</code></pre>
+<figcaption><p>Dependency edges. <code>after</code> is authoritative; <code>before</code> is its computed inverse.</p></figcaption>
+</figure>
+
+<span id="dependency-edges"></span>
 
 The `after` list is the source of truth. The `before` list is its inverse, maintained for bidirectional traversal—if B is after A, then A’s `before` list includes B. The scheduler never reads `before`; it only checks `after`. The inverse is a convenience index for commands like `wg impact` and `wg bottlenecks` that need to traverse the graph forward from a task to its dependents.
 
@@ -288,11 +377,18 @@ A structural cycle is a set of tasks whose `after` edges form a cycle. If task A
 
 Each cycle has a *header*: the entry point, identified as the task with predecessors outside the cycle. The header carries a `CycleConfig` that controls iteration:
 
-| *Field* | *Purpose* |
-| --- | --- |
-| `max_iterations` | Hard cap on how many times the cycle can iterate. Mandatory—no unbounded cycles. |
-| `guard` | A condition that must be true for the cycle to iterate. Optional—if absent, the cycle iterates unconditionally (up to `max_iterations`). |
-| `delay` | Optional duration (e.g., `"30s"`, `"5m"`, `"1h"`) to wait before the next iteration. Sets the header's `ready_after` timestamp. |
+|                  |                                                                                                                                          |
+|:-----------------|:-----------------------------------------------------------------------------------------------------------------------------------------|
+| **Field**        | **Purpose**                                                                                                                              |
+| `max_iterations` | Hard cap on how many times the cycle can iterate. Mandatory—no unbounded cycles.                                                         |
+| `guard`          | A condition that must be true for the cycle to iterate. Optional—if absent, the cycle iterates unconditionally (up to `max_iterations`). |
+| `delay`          | Optional duration (e.g., `"30s"`, `"5m"`, `"1h"`) to wait before the next iteration. Sets the header’s `ready_after` timestamp.          |
+| `no_converge`    | When set, agents cannot signal early convergence via `--converged`. All iterations (up to `max_iterations`) are forced to run. Set via `--no-converge` on `wg add`/`wg edit`. |
+| `restart_on_failure` | Whether to automatically restart the cycle when a member fails (default: true). Disabled via `--no-restart-on-failure`. The `max_failure_restarts` field caps the number of failure-triggered restarts (default: 3). |
+
+CycleConfig fields on the cycle header task. Every configured cycle requires a `max_iterations` cap.
+
+<span id="cycle-config-fields"></span>
 
 The critical insight: the cycle header receives a *back-edge exemption* in the readiness check. Normally, a task is waiting when any of its `after` predecessors is non-terminal. But the header’s predecessors within the cycle (the back-edges) are exempt—this allows the header to become ready on the first iteration even though its cycle predecessors have not yet completed. Non-header tasks in the cycle still wait for their predecessors normally, so the cycle executes in order from the header through the body.
 
@@ -314,8 +410,8 @@ If no guard is specified, the cycle behaves as `Always`—it iterates on every c
 
 Consider a three-task review cycle:
 
-```
-    ┌─────────────┐    after     ┌───────────────┐    after     ┌───────────────┐
+<figure>
+<pre><code>┌─────────────┐    after     ┌───────────────┐    after     ┌───────────────┐
     │ write-draft │◄─────────────│ review-draft  │◄─────────────│ revise-draft  │
     └─────────────┘              └───────────────┘              └───────────────┘
           ▲                                                            │
@@ -328,7 +424,11 @@ Consider a three-task review cycle:
 
     write-draft has CycleConfig: max_iterations=5,
     guard=task:review-draft=failed
-```
+</code></pre>
+<figcaption><p>A structural cycle. All edges are <code>after</code> edges. The back-edge from <code>write-draft</code> to <code>revise-draft</code> creates the cycle.</p></figcaption>
+</figure>
+
+<span id="review-loop"></span>
 
 The cycle is detected automatically: `write-draft` → `review-draft` → `revise-draft` → `write-draft`. The header is `write-draft` (it has external predecessors or is the entry point). Its `CycleConfig` sets `max_iterations: 5` and a guard condition.
 
@@ -381,7 +481,7 @@ This is a safety property. A guard condition with a logic error could iterate in
 
 The iteration cap is a ceiling, not a target. In practice, iterative work often converges before the maximum is reached—a refine agent determines the output is stable, a review cycle approves on the third pass instead of the fifth, a monitoring check finds the system healthy. Running all remaining iterations after convergence wastes compute and delays downstream work.
 
-Any agent working on a cycle member can signal convergence by running `wg done --converged`. This marks the task as done and adds a `"converged"` tag to the *cycle header* (regardless of which member the agent completes). When the cycle evaluator checks whether to iterate, it sees the tag on the header and stops—the cycle does not iterate, regardless of guard conditions or remaining iterations. Downstream tasks proceed immediately.
+Any agent working on a cycle member can signal convergence by running `wg done <task-id> --converged`. This marks the task as done and adds a `"converged"` tag to the *cycle header* (regardless of which member the agent completes). When the cycle evaluator checks whether to iterate, it sees the tag on the header and stops—the cycle does not iterate, regardless of guard conditions or remaining iterations. Downstream tasks proceed immediately.
 
 The convergence tag is durable but not permanent. Running `wg retry` on a converged task clears the tag along with resetting the task to open, so the cycle can iterate again if needed. This means convergence is an agent’s assertion about *this* iteration’s outcome, not a permanent lock on the cycle structure.
 
@@ -397,11 +497,21 @@ This creates pacing between iterations. A monitoring cycle that checks system he
 
 Sometimes you need to stop a cycle—or any task—without destroying its state. The `paused` flag provides this control.
 
-`wg pause` sets the flag. The task retains its status, its cycle iteration count, its log entries—everything. But the scheduler will not dispatch it. It is invisible to `ready_tasks()`.
+`wg pause <task>` sets the flag. The task retains its status, its cycle iteration count, its log entries—everything. But the scheduler will not dispatch it. It is invisible to `ready_tasks()`.
 
-`wg resume` clears the flag. The task re-enters the readiness calculation. If it meets all four readiness conditions, it becomes available for dispatch on the next coordinator tick.
+`wg resume <task>` clears the flag. The task re-enters the readiness calculation. If it meets all four readiness conditions, it becomes available for dispatch on the next coordinator tick.
 
 Pausing is orthogonal to status. You can pause an open task to hold it. You can pause a task mid-cycle to halt iteration without losing state. When you resume, the cycle picks up where it left off.
+
+## Placement Hints
+
+When a new task is added, the coordinator can automatically position it in the dependency graph through *placement*—an optional feature controlled by `wg config --auto-place`. Placement hints on `wg add` guide this positioning:
+
+- `--no-place` skips automatic placement entirely, leaving the task with only the dependencies explicitly specified via `--after`.
+- `--place-near <IDS>` suggests placing the task near the specified tasks in the graph—useful for grouping related work.
+- `--place-before <IDS>` suggests inserting the task before the specified tasks, adding dependency edges so those tasks come after the new one.
+
+Placement is a convenience, not a constraint. All dependency edges it creates are ordinary `after` edges, visible in the graph and editable with `wg edit`. If placement produces an undesirable result, adjust the edges manually.
 
 ## Emergent Patterns
 
@@ -411,8 +521,8 @@ The dependency edges (`after`/`before`) and structural cycles are the only primi
 
 One task is before several children. When the parent completes, all children become ready simultaneously and can execute in parallel.
 
-```
-                  ┌──────────┐
+<figure>
+<pre><code>┌──────────┐
                   │  design  │
                   └────┬─────┘
                ┌───────┼───────┐
@@ -421,14 +531,18 @@ One task is before several children. When the parent completes, all children bec
           │build-ui│ │build│ │build- │
           │        │ │-api │ │worker │
           └────────┘ └─────┘ └───────┘
-```
+</code></pre>
+<figcaption><p>Fan-out: one parent completes, enabling parallel children.</p></figcaption>
+</figure>
+
+<span id="fan-out"></span>
 
 ### Fan-In (Reduce)
 
 Several tasks are before a single aggregator. The aggregator becomes ready only when all of its predecessors are terminal.
 
-```
-          ┌────────┐ ┌─────┐ ┌───────┐
+<figure>
+<pre><code>┌────────┐ ┌─────┐ ┌───────┐
           │build-ui│ │build│ │build- │
           │        │ │-api │ │worker │
           └───┬────┘ └──┬──┘ └──┬────┘
@@ -437,7 +551,11 @@ Several tasks are before a single aggregator. The aggregator becomes ready only 
                   ┌───────────┐
                   │ integrate │
                   └───────────┘
-```
+</code></pre>
+<figcaption><p>Fan-in: multiple parents must all complete before the child is ready.</p></figcaption>
+</figure>
+
+<span id="fan-in"></span>
 
 Combined, fan-out and fan-in produce the *map/reduce pattern*: a coordinator task fans out parallel work, then an aggregator task fans in the results. This is not a built-in primitive. It arises naturally from the shape of the dependency edges.
 
@@ -459,8 +577,8 @@ Applying a function with `wg func apply` reverses the process. It takes a functi
 
 A *seed task* is a task whose primary purpose is to bootstrap a subgraph—it fans out into subtasks that did not exist before it ran. The seed does not do the “real” work itself; it analyzes a problem, decomposes it into concrete steps, and creates the tasks that perform those steps. Once the seed completes, the graph has new structure that the coordinator dispatches.
 
-```
-    Before seed runs:           After seed runs:
+<figure>
+<pre><code>Before seed runs:           After seed runs:
 
     ┌──────────┐                ┌──────────┐
     │   seed   │                │   seed   │ (done)
@@ -475,7 +593,11 @@ A *seed task* is a task whose primary purpose is to bootstrap a subgraph—it fa
                               ┌────────────┐
                               │ integrate  │
                               └────────────┘
-```
+</code></pre>
+<figcaption><p>A seed task creates structure. The graph before execution has one node; the graph after has many.</p></figcaption>
+</figure>
+
+<span id="seed-task"></span>
 
 The seed pattern is common in practice:
 
@@ -499,7 +621,7 @@ Workgraph provides several analysis tools that read the graph structure and comp
 
 **Bottlenecks.** Tasks that transitively block the most downstream work. A bottleneck is not necessarily on the critical path—it might block many short chains rather than one long one. `wg bottlenecks` ranks tasks by the count of transitive dependents, providing recommendations for tasks that should be prioritized.
 
-**Impact.** Given a specific task, what depends on it? `wg impact` traces both direct and transitive dependents, computing the total hours at risk if the task is delayed or fails.
+**Impact.** Given a specific task, what depends on it? `wg impact <task>` traces both direct and transitive dependents, computing the total hours at risk if the task is delayed or fails.
 
 **Cost.** The total estimated cost of a task including all its transitive dependencies, computed with cycle detection to avoid double-counting shared ancestors in diamond patterns.
 
@@ -513,9 +635,13 @@ These tools share a common pattern: they traverse the graph using `after` edges 
 
 The graph is stored as JSONL—one JSON object per line, one node per object. A graph file might look like this:
 
-```
-jsonl
-```
+<figure>
+<pre><code>{\&quot;kind\&quot;:\&quot;task\&quot;,\&quot;id\&quot;:\&quot;write-draft\&quot;,\&quot;title\&quot;:\&quot;Write draft\&quot;,\&quot;status\&quot;:\&quot;open\&quot;,\&quot;after\&quot;:[\&quot;revise-draft\&quot;],\&quot;cycle_config\&quot;:{\&quot;max_iterations\&quot;:5,\&quot;guard\&quot;:{\&quot;TaskStatus\&quot;:{\&quot;task\&quot;:\&quot;review-draft\&quot;,\&quot;status\&quot;:\&quot;failed\&quot;}}}}\n{\&quot;kind\&quot;:\&quot;task\&quot;,\&quot;id\&quot;:\&quot;review-draft\&quot;,\&quot;title\&quot;:\&quot;Review draft\&quot;,\&quot;status\&quot;:\&quot;open\&quot;,\&quot;after\&quot;:[\&quot;write-draft\&quot;]}\n{\&quot;kind\&quot;:\&quot;task\&quot;,\&quot;id\&quot;:\&quot;revise-draft\&quot;,\&quot;title\&quot;:\&quot;Revise\&quot;,\&quot;status\&quot;:\&quot;open\&quot;,\&quot;after\&quot;:[\&quot;review-draft\&quot;]}\n{\&quot;kind\&quot;:\&quot;task\&quot;,\&quot;id\&quot;:\&quot;publish\&quot;,\&quot;title\&quot;:\&quot;Publish\&quot;,\&quot;status\&quot;:\&quot;open\&quot;,\&quot;after\&quot;:[\&quot;revise-draft\&quot;]}
+</code></pre>
+<figcaption><p>A graph file in JSONL format. Each line is a self-contained node.</p></figcaption>
+</figure>
+
+<span id="jsonl-example"></span>
 
 JSONL has three virtues for this purpose. It is human-readable—you can inspect and edit it with any text editor. It is version-control-friendly—adding or modifying a task changes one line, producing clean diffs. And it supports atomic writes with file locking—concurrent processes cannot corrupt the graph because every write acquires an exclusive lock, rewrites the file, and releases.
 
@@ -549,7 +675,7 @@ It carries three identity-defining fields:
 
 - **Desired outcome.** What good output looks like. This is the standard against which the agent’s work will be evaluated—not a vague aspiration, but a crisp definition of success.
 
-A role also carries mutable operational fields that do not affect its identity: a *name* (a human-readable label like “Programmer” or “Architect“), a *performance* record (aggregated evaluation scores), *lineage* metadata (evolutionary history), and an optional *context scope* default (`clean`, `task`, `graph`, or `full`). When an agent with this role is dispatched, the role’s context scope is used as a fallback if the task does not specify one (see the resolution priority chain in <a href="#sec-coordination" class="ref">[sec-coordination]</a>). The name is for humans. The identity is for the system.
+A role also carries mutable operational fields that do not affect its identity: a *name* (a human-readable label like “Programmer” or “Architect”), a *performance* record (aggregated evaluation scores), *lineage* metadata (evolutionary history), and an optional *context scope* default (`clean`, `task`, `graph`, or `full`). When an agent with this role is dispatched, the role’s context scope is used as a fallback if the task does not specify one (see the resolution priority chain in *Section 4*). The name is for humans. The identity is for the system.
 
 Consider two roles: one describes a code reviewer who checks for correctness, testing gaps, and style violations; the other describes an architect who evaluates structural decisions and dependency management. They may share some skills, but their descriptions and desired outcomes differ, so they produce different content-hash IDs—different identities, different agents, different behaviors when paired with the same motivation.
 
@@ -573,7 +699,11 @@ The distinction between acceptable and unacceptable trade-offs is not decorative
 
 An agent is the unified identity in the agency system. For AI agents, it is the named pairing of exactly one role and exactly one motivation:
 
+<div align="center">
+
 <span class="box"> **agent**   $=$   **role**   $\times$   **motivation**</span>
+
+</div>
 
 The agent’s content-hash ID is computed from `(role_id, motivation_id)`. Nothing else enters the hash. This means the agent is entirely determined by its constituents: if you know the role and the motivation, you know the agent.
 
@@ -605,11 +735,16 @@ This is not a theoretical nicety. When the coordinator dispatches a task, the ag
 
 Every role, motivation, and agent is identified by a SHA-256 hash of its identity-defining fields. The hash is computed from canonical YAML serialization of those fields, ensuring determinism across platforms and implementations.
 
-| *Entity* | *Hashed fields* |
-| --- | --- |
-| Role | description + skills + desired outcome |
+|            |                                                               |
+|:-----------|:--------------------------------------------------------------|
+| **Entity** | **Hashed fields**                                             |
+| Role       | description + skills + desired outcome                        |
 | Motivation | description + acceptable trade-offs + unacceptable trade-offs |
-| Agent | role ID + motivation ID |
+| Agent      | role ID + motivation ID                                       |
+
+Identity-defining fields for content-hash computation.
+
+<span id="hash-fields"></span>
 
 Three properties follow from content-hashing:
 
@@ -685,14 +820,19 @@ Both types are evaluated using the same rubric. But human agent evaluations are 
 
 ## Composition in Practice
 
-To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates four starter roles and four starter motivations:
+To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates starter roles and starter motivations from a bundled CSV. Alternatively, `wg agency import` supports importing primitives from a local CSV file (`wg agency import path/to/file.csv`), a remote URL (`wg agency import --url <URL>`), or a configured upstream bureau (`wg agency import --upstream`). The `--dry-run` flag previews what would be imported. Change detection via manifest hashing ensures repeated imports skip already-imported entities. The default starter set includes four roles and four motivations:
 
-| *Starter Roles* | *Starter Motivations* |
-| --- | --- |
-| Programmer | Careful |
-| Reviewer | Fast |
-| Documenter | Thorough |
-| Architect | Balanced |
+|                   |                         |
+|:------------------|:------------------------|
+| **Starter Roles** | **Starter Motivations** |
+| Programmer        | Careful                 |
+| Reviewer          | Fast                    |
+| Documenter        | Thorough                |
+| Architect         | Balanced                |
+
+The sixteen possible pairings from four roles and four motivations.
+
+<span id="starter-agency"></span>
 
 A “Programmer” paired with “Careful” produces an agent that writes methodical, tested code and treats untested output as a hard constraint violation. The same “Programmer” paired with “Fast” produces an agent that ships quickly and accepts less documentation as a reasonable trade-off. A “Reviewer” with “Thorough” examines every edge case and refuses to approve incomplete coverage. A “Reviewer” with “Balanced” weighs thoroughness against schedule pressure and accepts pragmatic compromises.
 
@@ -716,11 +856,11 @@ An agency built in one project is not confined to that project. The federation s
 
 Federation operates through named *remotes*: references to another project’s agency store, managed via `wg agency remote add`, `wg agency remote list`, and `wg agency remote remove`. Remotes are stored in `.workgraph/federation.yaml`. Once a remote is configured, three operations become available.
 
-**Scanning.** `wg agency scan` lists the roles, motivations, and agents in a remote store without modifying anything. This is reconnaissance—you see what exists before deciding what to import.
+**Scanning.** `wg agency scan <remote>` lists the roles, motivations, and agents in a remote store without modifying anything. This is reconnaissance—you see what exists before deciding what to import.
 
-**Pulling.** `wg agency pull` copies entities from the remote store into the local project. Roles, motivations, agents, and their evaluation records are all transferred. You can filter by entity type (`--roles-only`, `--motivations-only`) or by specific entity IDs. A `--dry-run` flag previews the operation without writing.
+**Pulling.** `wg agency pull <remote>` copies entities from the remote store into the local project. Roles, motivations, agents, and their evaluation records are all transferred. You can filter by entity type (`--roles-only`, `--motivations-only`) or by specific entity IDs. A `--dry-run` flag previews the operation without writing.
 
-**Pushing.** `wg agency push` is the symmetric operation—it copies local entities to the remote store. The same filtering and dry-run options apply.
+**Pushing.** `wg agency push <remote>` is the symmetric operation—it copies local entities to the remote store. The same filtering and dry-run options apply.
 
 Content-hash IDs make federation natural. Because identity is determined by content, the same role has the same ID in every project. When you pull a role that already exists locally, the system recognizes the collision and skips the duplicate. There is no mapping table, no namespace negotiation, no manual reconciliation. Identity deduplication is a mathematical consequence of content-hashing.
 
@@ -732,9 +872,18 @@ Federation preserves lineage across project boundaries. An entity pulled from a 
 
 The practical effect is that organizations can maintain a shared pool of proven agent identities. A team that has evolved an effective “Reviewer” role over dozens of evaluations can push it to a shared remote. Other teams pull it, pair it with their own motivations, and immediately benefit from that evolutionary history. The performance data travels with the entity, so the receiving team can see *why* the role is considered effective before deciding to adopt it.
 
+## Automation: Auto-Create and Auto-Place
+
+Two configuration options streamline the agency pipeline for projects that want minimal manual intervention:
+
+- `auto_create` (set via `wg config --auto-create`) tells the coordinator to automatically create agent identities for new tasks based on the available roles and motivations. Without it, agents must be explicitly created and assigned.
+- `auto_place` (set via `wg config --auto-place`) enables automatic placement of newly added tasks in the dependency graph. The coordinator uses heuristics to position the task near related work, respecting any placement hints (`--place-near`, `--place-before`) provided at creation time.
+
+Both options interact with the existing `auto_assign` pipeline: when all three are enabled, a new task is automatically placed, assigned an agent identity, and dispatched—the full lifecycle from creation to execution requires no manual intervention beyond the initial `wg add`.
+
 ## Configuration: Creator Identity
 
-The agency configuration supports two settings that control the identity recorded on newly created entities: `creator_agent` and `creator_model`. These are set via `wg config --creator-agent` and `wg config --creator-model`. When configured, new roles, motivations, and agents created by the system record these values in their metadata, providing provenance for entities created programmatically (e.g., by the evolver or by automated workflows).
+The agency configuration supports two settings that control the identity recorded on newly created entities: `creator_agent` and `creator_model`. These are set via `wg config --creator-agent <agent-hash>` and `wg config --creator-model <model>`. When configured, new roles, motivations, and agents created by the system record these values in their metadata, providing provenance for entities created programmatically (e.g., by the evolver or by automated workflows).
 
 ## Cross-References
 
@@ -762,36 +911,54 @@ One detail matters more than it might seem: agents spawned by the daemon are *de
 
 ## The Coordinator Tick
 
-The coordinator’s heartbeat is the *tick*—a single pass through the scheduling logic. Two things trigger ticks: IPC events (immediate, reactive) and a background poll timer (a safety net that catches manual edits to the graph file). The poll interval defaults to 60 seconds and is configurable via `config.toml` or `wg service reload --poll-interval N`.
+The coordinator's heartbeat is the *tick*—a single pass through the scheduling logic. Two things trigger ticks: IPC events (immediate, reactive) and a background poll timer (a safety net that catches manual edits to the graph file). The poll interval defaults to 60 seconds and is configurable via `config.toml` or `wg service reload --poll-interval N`.
 
 Each tick has six phases:
 
-1.  **Reap zombies.** Even though agents run in their own sessions, they remain children of the daemon process. When an agent exits, it becomes a zombie until the parent calls `waitpid`. The tick begins by reaping all zombies so that subsequent PID checks return accurate results.
+1. **Reap zombies.** Even though agents run in their own sessions, they remain children of the daemon process. When an agent exits, it becomes a zombie until the parent calls `waitpid`. The tick begins by reaping all zombies so that subsequent PID checks return accurate results.
 
-2.  **Clean up dead agents and count slots.** The coordinator walks the agent registry and checks each alive agent’s PID. If the process is gone, the agent is dead. Dead agents have their tasks unclaimed—the task status reverts to open, ready for re-dispatch. The coordinator then counts truly alive agents (not just registry entries, but processes with running PIDs) and compares against `max_agents`. If all slots are full, the tick ends early.
+2. **Clean up dead agents and count slots.** The coordinator walks the agent registry and checks each alive agent's PID. If the process is gone, the agent is dead. Dead agents have their tasks unclaimed—the task status reverts to open, ready for re-dispatch. The coordinator then counts truly alive agents (not just registry entries, but processes with running PIDs) and compares against `max_agents`. If all slots are full, the tick ends early.
 
-3.  **Build auto-assign meta-tasks.** If `auto_assign` is enabled in the agency configuration, the coordinator scans for ready tasks that have no agent identity bound to them. For each, it creates an `assign-{task-id}` meta-task that the original task is after. This meta-task, when dispatched, will spawn an assigner agent that inspects the agency’s roster and picks the best fit. The meta-task is tagged `"assignment"` to prevent recursive auto-assignment—the coordinator never creates an assignment task for an assignment task.
+3. **Build auto-assign meta-tasks.** If `auto_assign` is enabled in the agency configuration, the coordinator scans for ready tasks that have no agent identity bound to them. For each, it creates an `assign-{task-id}` meta-task that the original task is after. This meta-task, when dispatched, will spawn an assigner agent that inspects the agency's roster and picks the best fit. The meta-task is tagged `"assignment"` to prevent recursive auto-assignment—the coordinator never creates an assignment task for an assignment task.
 
-4.  **Build auto-evaluate meta-tasks.** If `auto_evaluate` is enabled, the coordinator creates `evaluate-{task-id}` meta-tasks that are after each work task. When the work task reaches a terminal status, the evaluation task becomes ready. Evaluation tasks use the shell executor to run `wg evaluate run`, which spawns a separate evaluator to score the work. Tasks assigned to human agents are skipped—the system does not presume to evaluate human judgment. Meta-tasks tagged `"evaluation"`, `"assignment"`, or `"evolution"` are excluded to prevent infinite regress.
+4. **Build auto-evaluate meta-tasks.** If `auto_evaluate` is enabled, the coordinator creates `evaluate-{task-id}` meta-tasks that are after each work task. When the work task reaches a terminal status, the evaluation task becomes ready. Evaluation tasks use the shell executor to run `wg evaluate run`, which spawns a separate evaluator to score the work. Tasks assigned to human agents are skipped—the system does not presume to evaluate human judgment. Meta-tasks tagged `"evaluation"`, `"assignment"`, or `"evolution"` are excluded to prevent infinite regress.
 
-5.  **Save graph and find ready tasks.** If the auto-assign or auto-evaluate phases modified the graph (adding meta-tasks, adjusting dependencies), the coordinator saves it before proceeding. Then it computes the set of ready tasks. If no tasks are ready, the tick ends. If all tasks in the graph are terminal, the coordinator logs that the project is complete.
+4.5. **FLIP verification.** If `flip_verification_threshold` is configured, the coordinator scans for tasks with FLIP scores below the threshold and creates `.verify-flip-{task-id}` verification tasks dispatched to a stronger model (Opus by default).
 
-6.  **Spawn agents.** For each ready task, up to the number of available slots, the coordinator dispatches an agent. This is where the dispatch cycle—the core of the system—begins.
+4.6. **Auto-evolve.** If `auto_evolve` is enabled, the coordinator triggers agent evolution when evaluation data warrants it.
+
+4.7. **Auto-create.** If `auto_create` is enabled, the coordinator invokes the creator agent to expand the primitive store (roles, tradeoffs) when enough tasks have completed since the last invocation (threshold: `auto_create_threshold`, default: 20).
+
+5. **Save graph and find ready tasks.** If previous phases modified the graph (adding meta-tasks, adjusting dependencies), the coordinator saves it before proceeding. Then it computes the set of ready tasks. If no tasks are ready, the tick ends. If all tasks in the graph are terminal, the coordinator logs that the project is complete. A global zero-output backoff check also runs here: if the backoff is active (from phase 1.3), spawning is skipped entirely.
+
+6. **Spawn agents.** For each ready task, up to the number of available slots, the coordinator dispatches an agent. This is where the dispatch cycle—the core of the system—begins.
 
 ```
-  ┌──────────────────────────────────────────────────┐
-  │                   TICK LOOP                       │
-  │                                                   │
-  │  1. reap_zombies()                                │
-  │  2. cleanup_dead_agents → count alive slots       │
-  │  3. build_auto_assign_tasks    (if enabled)       │
-  │  4. build_auto_evaluate_tasks  (if enabled)       │
-  │  5. save graph → find ready tasks                 │
-  │  6. spawn_agents_for_ready_tasks(slots_available) │
-  │                                                   │
-  │  Triggered by: IPC graph_changed │ poll timer     │
-  └──────────────────────────────────────────────────┘
-  ```
+┌───────────────────────────────────────────────────────┐
+│                      TICK LOOP                        │
+│                                                       │
+│  0.  process_chat_inbox()                             │
+│  1.  cleanup_dead_agents → count alive slots          │
+│  1.3 zero_output_detection (circuit breaker)          │
+│  1.5 auto_checkpoint_alive_agents                     │
+│  2.  load graph                                       │
+│  2.5 cycle_iteration_evaluation                       │
+│  2.6 cycle_failure_restart                            │
+│  2.7 wait_resume_evaluation                           │
+│  2.8 message_triggered_resurrection                   │
+│  3.  build_auto_assign_tasks       (if enabled)       │
+│  4.  build_auto_evaluate_tasks     (if enabled)       │
+│  4.5 build_flip_verification_tasks (if enabled)       │
+│  4.6 auto_evolve                   (if enabled)       │
+│  4.7 auto_create                   (if enabled)       │
+│  5.  save graph → find ready tasks                    │
+│  6.  spawn_agents_for_ready_tasks(slots_available)    │
+│                                                       │
+│  Triggered by: IPC graph_changed │ poll timer         │
+└───────────────────────────────────────────────────────┘
+```
+
+*The phases of a coordinator tick.*
 
 ## The Dispatch Cycle
 
@@ -799,81 +966,78 @@ Dispatch is the act of selecting a ready task and spawning an agent for it. It i
 
 For each ready task, the coordinator proceeds as follows:
 
-**Resolve the executor.** If the task has an `exec` field (a shell command), the executor is `shell`—no AI agent needed. Otherwise, the coordinator checks whether the task has an assigned agent identity. If it does, it looks up that agent’s `executor` field (which might be `claude`, `shell`, or a custom executor). If no agent is assigned, the coordinator falls back to the service-level default executor (typically `claude`).
+**Resolve the executor and exec-mode.** If the task has an `exec` field (a shell command), the executor is `shell`—no AI agent needed. Otherwise, the coordinator checks whether the task has an assigned agent identity. If it does, it looks up that agent's `executor` field (which might be `claude`, `shell`, or a custom executor). If no agent is assigned, the coordinator falls back to the service-level default executor (typically `claude`).
 
-**Resolve the model.** Model selection follows a priority chain: the task’s own `model` field takes precedence, then the coordinator’s configured model, then the agent identity’s model preference. This lets you pin specific tasks to specific models—a cheap model for routine evaluation tasks, a capable one for complex implementation.
+The task's `exec_mode` field further controls execution weight: `full` (default—complete tool access), `light` (read-only tools, suitable for analysis and review tasks), `bare` (only `wg` CLI commands, no file editing), or `shell` (no LLM—runs the task's `exec` field directly, like the shell executor). Exec-mode and executor are complementary: the executor determines *which backend* runs the task; exec-mode determines *how much autonomy* the agent has within that backend.
 
-**Build context from dependencies.** The coordinator reads each terminal dependency’s artifacts (file paths recorded by the previous agent) and recent log entries. This context is injected into the prompt so the new agent knows what upstream work produced and what decisions were made. The agent does not start from a blank slate—it inherits the trail of work that came before it.
+**Resolve the model and provider.** Model selection uses a *dispatch role routing* system. Every system function—task agents, evaluators, assigners, evolvers, triage, verifiers, compactors, placers—has its own configurable model and provider assignment, managed via `wg model routing` and `wg model set`. The task's own `model` field overrides the routing table for work tasks. Models can be specified using the unified `provider/model-name` format (e.g., `openrouter/meta-llama/llama-3.3-70b-instruct`) or as bare model names with a separate `--provider` flag. Provider options include `anthropic`, `openai`, `openrouter`, or `local`. This architecture lets you assign cheap, fast models to routine roles (evaluation, triage, assignment) while reserving capable models for complex work and evolution.
 
-**Resolve the context scope.** The coordinator determines how much surrounding context the agent receives by resolving a *context scope* through a priority chain: the task’s own `context_scope` field takes precedence, then the assigned role’s default context scope, then the coordinator’s configured scope, then the default of `task`. The four levels are cumulative—each tier includes everything from the tier below:
+**Build context from dependencies.** The coordinator reads each terminal dependency's artifacts (file paths recorded by the previous agent) and recent log entries. This context is injected into the prompt so the new agent knows what upstream work produced and what decisions were made. The agent does not start from a blank slate—it inherits the trail of work that came before it.
+
+**Resolve the context scope.** The coordinator determines how much surrounding context the agent receives by resolving a *context scope* through a priority chain: the task's own `context_scope` field takes precedence, then the assigned role's default context scope, then the coordinator's configured scope, then the default of `task`. The four levels are cumulative—each tier includes everything from the tier below:
 
 - **Clean.** Bare executor: the agent receives its identity, the task description, upstream dependency context, and any cycle/loop info. No workflow instructions, no graph patterns, no system awareness. Used for tightly-scoped tasks where extra context is noise.
-
 - **Task.** The standard default. Adds workflow commands (`wg done`, `wg fail`, `wg log`, `wg artifact`), graph patterns (pipeline, diamond, scatter-gather), reusable function hints, downstream consumer awareness, and the ethos section that encourages autopoietic behavior.
-
 - **Graph.** Adds the project description from `config.toml` and a 1-hop neighborhood summary showing immediate graph context (neighboring tasks and their statuses).
+- **Full.** Adds a system awareness preamble (explaining the agency, cycles, functions), the complete graph summary, and the project's CLAUDE.md content.
 
-- **Full.** Adds a system awareness preamble (explaining the agency, cycles, functions), the complete graph summary, and the project’s CLAUDE.md content.
+**Render the prompt.** The executor's prompt template is filled with template variables: `{{task_id}}`, `{{task_title}}`, `{{task_description}}`, `{{task_context}}`, `{{task_identity}}`. The identity block—the agent's role, motivation, skills, and operational parameters—comes from resolving the assigned agent's role and motivation from agency storage. Skills are resolved at this point: file skills read from disk, URL skills fetch via HTTP, inline skills expand in place. The prompt sections are assembled according to the resolved context scope. The rendered prompt is written to a file in the agent's output directory.
 
-**Render the prompt.** The executor’s prompt template is filled with template variables: `{{task_id}}`, `{{task_title}}`, `{{task_description}}`, `{{task_context}}`, `{{task_identity}}`. The identity block—the agent’s role, motivation, skills, and operational parameters—comes from resolving the assigned agent’s role and motivation from agency storage. Skills are resolved at this point: file skills read from disk, URL skills fetch via HTTP, inline skills expand in place. The prompt sections are assembled according to the resolved context scope. The rendered prompt is written to a file in the agent’s output directory.
-
-For tasks that are part of a structural cycle, the rendered prompt carries additional context: the current `loop_iteration` (which pass this is) and a note about the `--converged` flag. This informs the agent that it can signal `wg done --converged` to stop the cycle early—preventing further iteration even if `max_iterations` hasn’t been reached and guard conditions are met. The `"converged"` tag is placed on the cycle header regardless of which member the agent completes. The cycle evaluator checks for this tag before re-opening members for the next iteration. This mechanism exists because cycles that run to `max_iterations` when the work has already stabilized waste compute and agent time. Convergence is the agent’s way of saying “the work is stable, no more iterations needed.” A subsequent `wg retry` clears the convergence tag, allowing the cycle to resume.
+For tasks that are part of a structural cycle, the rendered prompt carries additional context: the current `loop_iteration` (which pass this is) and a note about the `--converged` flag. This informs the agent that it can signal `wg done <task-id> --converged` to stop the cycle early—preventing further iteration even if `max_iterations` hasn't been reached and guard conditions are met. The `"converged"` tag is placed on the cycle header regardless of which member the agent completes. The cycle evaluator checks for this tag before re-opening members for the next iteration. This mechanism exists because cycles that run to `max_iterations` when the work has already stabilized waste compute and agent time. Convergence is the agent's way of saying "the work is stable, no more iterations needed." A subsequent `wg retry` clears the convergence tag, allowing the cycle to resume.
 
 **Generate the wrapper script.** The coordinator writes a `run.sh` that:
-
 - Unsets `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` environment variables so the spawned agent starts a clean session.
-
 - Pipes the prompt file into the executor command (e.g., `cat prompt.txt | claude --print --verbose --output-format stream-json`).
-
 - Captures all output to `output.log`.
-
 - After the executor exits, checks whether the task is still in-progress. If the agent already called `wg done` or `wg fail`, the wrapper does nothing. If the task is still in-progress and the executor exited cleanly, the wrapper calls `wg done`. If it exited with an error, the wrapper calls `wg fail`. This safety net ensures tasks never get stuck in-progress after an agent dies silently.
 
-**Claim the task.** Before spawning the process, the coordinator atomically sets the task’s status to in-progress and records the agent ID in the `assigned` field. The graph is saved to disk at this point. If two coordinators somehow ran simultaneously, the second would find the task already claimed and skip it. The ordering is deliberate: claim first, spawn second. If the spawn fails, the coordinator rolls back the claim—reopening the task so it can be dispatched again.
+**Claim the task.** Before spawning the process, the coordinator atomically sets the task's status to in-progress and records the agent ID in the `assigned` field. The graph is saved to disk at this point. If two coordinators somehow ran simultaneously, the second would find the task already claimed and skip it. The ordering is deliberate: claim first, spawn second. If the spawn fails, the coordinator rolls back the claim—reopening the task so it can be dispatched again.
 
 **Fork the detached process.** The wrapper script is launched via `bash run.sh` with stdin, stdout, and stderr redirected. The `setsid()` call places the agent in its own session. The coordinator records the PID in the agent registry.
 
 **Register in the agent registry.** The agent registry (`.workgraph/agents/registry.json`) tracks every spawned agent: ID, PID, task, executor, start time, heartbeat, status. The coordinator uses this registry to monitor agents across ticks.
 
 ```
-  Ready task
-      │
-      ▼
-  Resolve executor ─── shell (has exec field)
-      │                     │
-      │ (claude/custom)     ▼
-      ▼               Run shell command
-  Resolve model
-      │
-      ▼
-  Build dependency context
-      │
-      ▼
-  Render prompt + identity
-      │
-      ▼
-  Generate wrapper script (run.sh)
-      │
-      ▼
-  CLAIM TASK (status → in-progress)
-      │
-      ▼
-  Save graph to disk
-      │
-      ▼
-  Fork detached process (setsid)
-      │
-      ▼
-  Register in agent registry
-  ```
+Ready task
+    │
+    ▼
+Resolve executor ─── shell (has exec field)
+    │                     │
+    │ (claude/custom)     ▼
+    ▼               Run shell command
+Resolve model
+    │
+    ▼
+Build dependency context
+    │
+    ▼
+Render prompt + identity
+    │
+    ▼
+Generate wrapper script (run.sh)
+    │
+    ▼
+CLAIM TASK (status → in-progress)
+    │
+    ▼
+Save graph to disk
+    │
+    ▼
+Fork detached process (setsid)
+    │
+    ▼
+Register in agent registry
+```
+
+*The dispatch cycle, from ready task to running agent.*
 
 ## The Wrapper Script
 
 The wrapper script deserves its own discussion because it solves a subtle problem: what happens when an agent dies without reporting its status?
 
-An agent is expected to call `wg done` when it finishes or `wg fail --reason "..."` when it cannot complete the work. But agents crash. They get OOM-killed. Their SSH connections drop. The Claude CLI segfaults. In all these cases, the task would remain in-progress forever without the wrapper.
+An agent is expected to call `wg done <task-id>` when it finishes or `wg fail <task-id> --reason "..."` when it cannot complete the work. But agents crash. They get OOM-killed. Their SSH connections drop. The Claude CLI segfaults. In all these cases, the task would remain in-progress forever without the wrapper.
 
-The wrapper runs the executor command, captures its exit code, then checks the task’s current status via `wg show`. If the task is still in-progress—meaning the agent never called `wg done` or `wg fail`—the wrapper steps in. A clean exit (code 0) triggers `wg done`; a non-zero exit triggers `wg fail` with the exit code as the reason.
+The wrapper runs the executor command, captures its exit code, then checks the task's current status via `wg show`. If the task is still in-progress—meaning the agent never called `wg done` or `wg fail`—the wrapper steps in. A clean exit (code 0) triggers `wg done`; a non-zero exit triggers `wg fail` with the exit code as the reason.
 
 This two-layer design (agent self-reports, wrapper as fallback) means the system tolerates both well-behaved and badly-behaved agents. A good agent calls `wg done` partway through the wrapper execution, and when the wrapper later checks, it finds the task already done and does nothing. A crashing agent leaves the task in-progress, and the wrapper picks up the pieces.
 
@@ -881,7 +1045,7 @@ This two-layer design (agent self-reports, wrapper as fallback) means the system
 
 The `max_agents` parameter is the single throttle on concurrency. When you start the service with `--max-agents 5`, the coordinator will never have more than five agents running simultaneously. Each tick counts truly alive agents (verifying PIDs, not just trusting the registry) and only spawns into available slots.
 
-This is a global cap, not per-task. Five agents might all be working on independent tasks in a fan-out pattern, or they might be serialized through a linear chain with only one active at a time. The coordinator does not reason about the graph’s topology when deciding how many agents to spawn—it simply fills available slots with ready tasks, first-come-first-served.
+This is a global cap, not per-task. Five agents might all be working on independent tasks in a fan-out pattern, or they might be serialized through a linear chain with only one active at a time. The coordinator does not reason about the graph's topology when deciding how many agents to spawn—it simply fills available slots with ready tasks, first-come-first-served.
 
 You can change `max_agents` without restarting the daemon. `wg service reload --max-agents 10` sends a `Reconfigure` IPC message; the coordinator picks up the new value on the next tick. This lets you scale up when a fan-out creates many parallel tasks, then scale back down when work converges.
 
@@ -889,13 +1053,13 @@ You can change `max_agents` without restarting the daemon. `wg service reload --
 
 Parallelism in workgraph arises naturally from the graph structure. A *fan-out* (map) pattern occurs when one task is before several children: the parent completes, all children become ready simultaneously, and the coordinator spawns agents for each (up to `max_agents`). A *fan-in* (reduce) pattern occurs when several tasks are before a single aggregator: the aggregator only becomes ready when all its predecessors are terminal, and then a single agent handles the synthesis.
 
-These patterns are not built-in primitives. They emerge from dependency edges. A project plan that says “write five sections, then compile the manual” naturally produces a fan-out of five writer tasks followed by a fan-in to a compiler task. The coordinator handles this without any special configuration—`max_agents` determines how many of the five writers run concurrently.
+These patterns are not built-in primitives. They emerge from dependency edges. A project plan that says "write five sections, then compile the manual" naturally produces a fan-out of five writer tasks followed by a fan-in to a compiler task. The coordinator handles this without any special configuration—`max_agents` determines how many of the five writers run concurrently.
 
 ## Auto-Assign
 
-When the agency system is active and `auto_assign` is enabled in configuration, the coordinator automates the binding of agent identities to tasks. Without auto-assign, a human must run `wg assign` for each task. With it, the coordinator handles matching.
+When the agency system is active and `auto_assign` is enabled in configuration, the coordinator automates the binding of agent identities to tasks. Without auto-assign, a human must run `wg assign <task-id> <agent-hash>` for each task. With it, the coordinator handles matching.
 
-The mechanism is indirect. The coordinator does not contain matching logic itself. Instead, it creates a blocking `assign-{task-id}` meta-task for each unassigned ready task. This meta-task is dispatched like any other—an assigner agent (itself an agency entity with its own role and motivation) is spawned to evaluate the available agents and pick the best fit. The assigner reads the agency roster via `wg agent list`, compares capabilities to task requirements, considers performance history, and calls `wg assign` followed by `wg done assign-{task-id}`.
+The mechanism is indirect. The coordinator does not contain matching logic itself. Instead, it creates a blocking `assign-{task-id}` meta-task for each unassigned ready task. This meta-task is dispatched like any other—an assigner agent (itself an agency entity with its own role and motivation) is spawned to evaluate the available agents and pick the best fit. The assigner reads the agency roster via `wg agent list`, compares capabilities to task requirements, considers performance history, and calls `wg assign <task-id> <agent-hash>` followed by `wg done assign-{task-id}`.
 
 The result is a two-phase dispatch: first the assigner runs, binding an identity to the task. The assignment task completes, unblocking the original task. On the next tick, the original task is ready again—now with an agent identity attached—and the coordinator dispatches it normally.
 
@@ -905,29 +1069,27 @@ Meta-tasks tagged `"assignment"`, `"evaluation"`, or `"evolution"` are excluded 
 
 When `auto_evaluate` is enabled, the coordinator creates evaluation meta-tasks for completed work. For every non-meta-task in the graph, an `evaluate-{task-id}` task is created that is after the original. When the original task reaches a terminal status (done or failed), the evaluation task becomes ready and is dispatched.
 
-Evaluation tasks use the shell executor to run `wg evaluate run`, which spawns a separate evaluator that reads the task definition, artifacts, and output logs, then scores the work on four dimensions: correctness (40% weight), completeness (30%), efficiency (15%), and style adherence (15%). The scores propagate to the agent, its role, and its motivation, building the performance data that drives evolution (see §5).
+Evaluation tasks use the shell executor to run `wg evaluate run <task-id>`, which spawns a separate evaluator that reads the task definition, artifacts, and output logs, then scores the work on four dimensions: correctness (40% weight), completeness (30%), efficiency (15%), and style adherence (15%). The scores propagate to the agent, its role, and its motivation, building the performance data that drives evolution (see §5).
 
 Two exclusions apply. Tasks assigned to human agents are not auto-evaluated—the system does not presume to score human work. And tasks that are themselves meta-tasks (tagged `"evaluation"`, `"assignment"`, or `"evolution"`) are excluded to prevent evaluation of evaluations.
 
-Failed tasks also get evaluated. When a task’s status is failed, the coordinator removes the predecessor from the evaluation task so it becomes ready immediately. This is deliberate: failure modes carry signal. An agent that fails consistently on certain kinds of tasks reveals information about its role-motivation pairing that the evolution system can act on.
+Failed tasks also get evaluated. When a task's status is failed, the coordinator removes the predecessor from the evaluation task so it becomes ready immediately. This is deliberate: failure modes carry signal. An agent that fails consistently on certain kinds of tasks reveals information about its role-motivation pairing that the evolution system can act on.
 
-Evaluations created by auto-evaluate carry a `source` field set to `"llm"`, identifying them as internal assessments from the LLM evaluator. External evaluations can be recorded via `wg evaluate record --task --source --score <0.0-1.0>`, where the source tag is a freeform string—`"outcome:sharpe"`, `"ci:test-suite"`, `"vx:peer-123"`, or any label meaningful to the project. The evolver reads all evaluations regardless of source (see §5), enabling it to weigh internal quality assessments against external outcome data when proposing improvements to the agency.
+Evaluations created by auto-evaluate carry a `source` field set to `"llm"`, identifying them as internal assessments from the LLM evaluator. External evaluations can be recorded via `wg evaluate record --task <id> --source <tag> --score <0.0-1.0>`, where the source tag is a freeform string—`"outcome:sharpe"`, `"ci:test-suite"`, `"vx:peer-123"`, or any label meaningful to the project. The evolver reads all evaluations regardless of source (see §5), enabling it to weigh internal quality assessments against external outcome data when proposing improvements to the agency.
 
 ## Dead Agent Detection and Triage
 
-Every tick, the coordinator checks whether each agent’s process is still alive. A dead agent—one whose PID no longer exists—triggers cleanup: the agent’s task is unclaimed (status reverts to open), and the agent is marked dead in the registry.
+Every tick, the coordinator checks whether each agent's process is still alive. A dead agent—one whose PID no longer exists—triggers cleanup: the agent's task is unclaimed (status reverts to open), and the agent is marked dead in the registry.
 
 But simple restart is wasteful when the agent made significant progress before dying. This is where *triage* comes in.
 
-When `auto_triage` is enabled in the agency configuration, the coordinator does not immediately unclaim a dead agent’s task. Instead, it reads the agent’s output log and sends it to a fast, cheap LLM (defaulting to Haiku) with a structured prompt. The triage model classifies the result into one of three verdicts:
+When `auto_triage` is enabled in the agency configuration, the coordinator does not immediately unclaim a dead agent's task. Instead, it reads the agent's output log and sends it to a fast, cheap LLM (defaulting to Haiku) with a structured prompt. The triage model classifies the result into one of three verdicts:
 
-- **Done.** The work appears complete—the agent just didn’t call `wg done` before dying. The task is marked done, and cycle iteration is evaluated.
-
+- **Done.** The work appears complete—the agent just didn't call `wg done` before dying. The task is marked done, and cycle iteration is evaluated.
 - **Continue.** Significant progress was made. The task is reopened with recovery context injected into its description: a summary of what was accomplished, with instructions to continue from where the previous agent left off rather than starting over.
-
 - **Restart.** Little or no meaningful progress. The task is reopened cleanly for a fresh attempt.
 
-Both “continue” and “restart” respect `max_retries`. If the retry count exceeds the limit, the task is marked failed rather than reopened. The triage model runs synchronously with a configurable timeout (default 30 seconds), so it does not block the coordinator for long.
+Both "continue" and "restart" respect `max_retries`. If the retry count exceeds the limit, the task is marked failed rather than reopened. The triage model runs synchronously with a configurable timeout (default 30 seconds), so it does not block the coordinator for long.
 
 This three-way classification turns agent death from a binary event (restart or give up) into a nuanced recovery mechanism. A task that was 90% complete when the agent was OOM-killed does not lose its progress.
 
@@ -937,20 +1099,95 @@ The daemon listens on a Unix socket (`.workgraph/service/daemon.sock`) for JSON-
 
 The full set of IPC commands:
 
-| *Command* | *Effect* |
-| --- | --- |
-| `graph_changed` | Schedules an immediate coordinator tick. The fast path for reactive dispatch. |
-| `spawn` | Directly spawns an agent for a specific task, bypassing the coordinator's scheduling. |
-| `agents` | Returns the list of all registered agents with their status, PID, and uptime. |
-| `kill` | Terminates a running agent by PID (graceful SIGTERM, then SIGKILL if forced). |
-| `status` | Returns the coordinator's current state: tick count, agents alive, tasks ready. |
-| `shutdown` | Stops the daemon. Running agents continue independently by default; `kill_agents` terminates them. |
-| `pause` | Suspends the coordinator. No new agents are spawned, but running agents continue. |
-| `resume` | Resumes the coordinator and triggers an immediate tick. |
-| `reconfigure` | Updates `max_agents`, `executor`, `poll_interval`, or `model` at runtime without restart. |
-| `heartbeat` | Records a heartbeat for an agent (used for liveness tracking). |
+| **Command**   | **Effect**                                                                                         |
+|:--------------|:---------------------------------------------------------------------------------------------------|
+| `graph_changed` | Schedules an immediate coordinator tick. The fast path for reactive dispatch.                    |
+| `spawn`       | Directly spawns an agent for a specific task, bypassing the coordinator's scheduling.              |
+| `agents`      | Returns the list of all registered agents with their status, PID, and uptime.                      |
+| `kill`        | Terminates a running agent by PID (graceful SIGTERM, then SIGKILL if forced).                      |
+| `status`      | Returns the coordinator's current state: tick count, agents alive, tasks ready.                     |
+| `shutdown`    | Stops the daemon. Running agents continue independently by default; `kill_agents` terminates them. |
+| `pause`       | Suspends the coordinator. No new agents are spawned, but running agents continue.                  |
+| `resume`      | Resumes the coordinator and triggers an immediate tick.                                            |
+| `reconfigure` | Updates `max_agents`, `executor`, `poll_interval`, or `model` at runtime without restart.          |
+| `heartbeat`   | Records a heartbeat for an agent (used for liveness tracking).                                     |
+| `freeze`      | SIGSTOP all running agents and pause the coordinator.                                              |
+| `thaw`        | SIGCONT all frozen agents and resume the coordinator.                                              |
+| `add_task`    | Create a task (supports cross-repo dispatch via peers).                                            |
+| `query_task`  | Query a task's status (supports cross-repo query via peers).                                       |
+| `send_message`| Send a message to a task's message queue.                                                          |
+| `user_chat`   | Send a chat message to the coordinator agent.                                                      |
+| `create_coordinator` | Create a new coordinator instance.                                                           |
+| `delete_coordinator` | Delete a coordinator instance.                                                               |
+| `archive_coordinator` | Archive a coordinator (mark as Done).                                                       |
+| `stop_coordinator` | Stop a coordinator (kill agent, reset to Open).                                                |
+| `interrupt_coordinator` | Interrupt a coordinator's current generation (SIGINT, does not kill).                     |
+| `list_coordinators` | List all active coordinators.                                                                 |
 
 The `reconfigure` command is particularly useful for live tuning. If a fan-out creates twenty parallel tasks and you only have five slots, you can bump `max_agents` to ten without stopping anything. When the fan-out completes and work converges, scale back down.
+
+## Multi-Coordinator Sessions
+
+A single service daemon can host multiple coordinator sessions, each managing an independent scheduling context. This enables parallel workstreams within the same project—for example, one coordinator handling feature development while another handles maintenance tasks.
+
+Coordinator sessions are managed via service subcommands:
+
+- `wg service create-coordinator` creates a new session.
+- `wg service stop-coordinator` stops a running session (kills its agent and resets to open).
+- `wg service archive-coordinator` archives a completed session (marks it done).
+- `wg service delete-coordinator` removes a session entirely.
+
+The maximum number of concurrent coordinators is configured via `wg config --max-coordinators`. The `wg chat --coordinator <ID>` flag targets messages to a specific coordinator session. Coordinators share context across sessions—completed work and decisions from one coordinator's scope are visible to agents dispatched by another, preventing duplication and enabling continuity across workstreams.
+
+## Peer Communication
+
+Workgraph projects can communicate across repository boundaries through the *peer* system. `wg peer add <name> <path>` registers another workgraph instance as a named peer. Tasks can be created in a peer's graph via `wg add "title" --repo <peer-name>`, enabling cross-repo task dispatch without leaving the local CLI.
+
+`wg peer list` shows all configured peers with their service status (whether the peer's daemon is running). `wg peer status` performs a quick health check across all peers. This is distinct from agency federation (which shares identities and evaluations)—peer communication shares *work* across project boundaries.
+
+## Compaction, Sweep, and Checkpoint
+
+Three maintenance commands support long-running projects:
+
+**Compaction.** `wg compact` distills the current graph state into a condensed summary file (`context.md`), providing a snapshot of project status, recent decisions, and key patterns. Within the service daemon, compaction runs as the `.compact-0` task—a structural cycle where the coordinator periodically introspects its own state and produces a compressed context for future agent prompts.
+
+**Sweep.** `wg sweep` detects orphaned in-progress tasks—tasks claimed by agents whose processes have died without triggering normal cleanup. It scans the agent registry, checks PIDs, and offers to reclaim or reset affected tasks. Sweep is a manual recovery tool for cases where the coordinator's normal dead-agent detection misses something (e.g., after a system reboot).
+
+**Checkpoint.** `wg checkpoint` lets a running agent save a progress snapshot during a long-running task. If the agent is interrupted—OOM-killed, timed out, or manually stopped—a replacement agent can resume from the checkpoint rather than starting from scratch. Checkpoints are stored alongside the task's artifacts and injected into the recovery context.
+
+## Service Restart and Coordinator Persistence
+
+`wg service restart` performs a graceful stop-then-start cycle. Running agents continue undisturbed (they are detached processes), but the coordinator re-reads configuration and starts fresh. This is the standard way to pick up configuration changes that `wg service reload` cannot apply.
+
+Coordinator tasks are preserved across restarts. When the daemon starts, it discovers existing coordinator tasks (those tagged `"coordinator-loop"`) and resumes them rather than creating new ones. This means the TUI, which depends on coordinator tasks for discovery, does not lose track of active coordinator sessions after a restart. Only truly legacy meta-tasks (archive, registry-refresh, and user tasks) are cleaned up during startup.
+
+## User Boards
+
+Humans need a persistent channel for asynchronous communication with the coordinator and agents. *User boards* provide this. `wg user init` creates a per-user conversation board—a `.user-NAME` task with a message queue. The coordinator treats user boards specially: when a new message arrives on a board, the coordinator reopens it so the next agent can address the message.
+
+User boards enable the human-in-the-loop pattern without requiring the human to be present at dispatch time. A human can send a message to a board, go offline, and the coordinator will process it on the next tick. Messages can include task creation requests, status inquiries, or design feedback that the coordinator translates into graph operations.
+
+`wg user list` shows all boards (active and archived). `wg user archive` archives the current board and creates a fresh successor, preserving the conversation history while starting a clean thread. Boards are lightweight—they are regular tasks with a messaging convention, not a separate subsystem.
+
+## Provider Profiles and Cost Tracking
+
+Managing model and provider assignments across many dispatch roles can be tedious. *Provider profiles* simplify this with named presets.
+
+`wg profile set <name>` activates a profile that maps model tiers (`haiku`, `sonnet`, `opus`) to specific provider/model combinations. For example, an `openrouter-budget` profile might map `haiku` to a cheap OpenRouter model, `sonnet` to a mid-range one, and `opus` to a capable reasoning model. `wg profile show` displays the active profile and its resolved model mappings. `wg profile list` shows all available profiles. `wg profile refresh` updates model rankings from OpenRouter's leaderboard API.
+
+Profiles interact with the dispatch role routing system: when a profile is active, roles that request a tier (e.g., `haiku` for triage, `opus` for evolution) resolve through the profile's mappings. Per-task and per-role overrides still take precedence—profiles are defaults, not mandates.
+
+Two commands provide visibility into cost:
+
+- `wg spend` summarizes token usage and estimated costs across all agents. It reads API usage metadata from agent output logs and computes cumulative input, output, and cached token counts with USD estimates. The `--today` flag filters to the current day. The `--json` flag produces machine-readable output for integration with budgeting tools.
+
+- `wg openrouter` provides OpenRouter-specific cost monitoring when using OpenRouter as a provider. `wg openrouter status` shows API key status and usage. `wg openrouter session` shows session-level cost summaries. `wg openrouter set-limit` configures cost caps to prevent runaway spending.
+
+## Requeue
+
+Sometimes a task is in-progress but its environment has changed—a dependency was re-evaluated, a fix task was created for a problem the agent will encounter, or the task needs to wait for new prerequisites. `wg requeue <task-id> --reason "..."` returns the task from in-progress to open status, recording the reason for the change. The task becomes eligible for re-dispatch on the next coordinator tick.
+
+Requeue is distinct from `wg retry` (which resets a *failed* task) and from the coordinator's automatic dead-agent triage (which handles agents that crash). Requeue is an intentional, human- or agent-initiated action to pause and reschedule in-progress work—typically because the task should wait for other work to land first.
 
 ## Observing the System
 
@@ -964,15 +1201,15 @@ Events can be filtered. The `--event` flag accepts categories—`task_state` for
 
 `wg watch` is one side of a broader integration architecture. External systems interact with workgraph through five ingestion points, each corresponding to a different kind of information flow:
 
-| *Point* | *Command* | *What flows* |
-| --- | --- | --- |
-| Evaluation | `wg evaluate record` | Scores with source tags — external outcome data enters the agency's performance records. |
-| Task | `wg add` | New work items — an external system can inject tasks with dependencies, skills, and descriptions. |
-| Context | `wg trace import` | Peer exports and knowledge artifacts — enriching agent prompts with cross-boundary data. |
-| State | `wg done`, `wg fail`, `wg log` | Status changes and progress events — an external system can mark work complete or record observations. |
-| Observation | `wg watch` | The event stream _out_ — external systems observe what is happening without polling. |
+| **Point**   | **Command**                      | **What flows**                                                                                               |
+|:------------|:---------------------------------|:-------------------------------------------------------------------------------------------------------------|
+| Evaluation  | `wg evaluate record`            | Scores with source tags — external outcome data enters the agency's performance records.                     |
+| Task        | `wg add`                        | New work items — an external system can inject tasks with dependencies, skills, and descriptions.            |
+| Context     | `wg trace import`               | Peer exports and knowledge artifacts — enriching agent prompts with cross-boundary data.                     |
+| State       | `wg done`, `wg fail`, `wg log`  | Status changes and progress events — an external system can mark work complete or record observations.       |
+| Observation | `wg watch`                      | The event stream *out* — external systems observe what is happening without polling.                         |
 
-The generic adapter follows a four-step pattern: *observe* the graph via `wg watch`, *translate* external data into workgraph’s vocabulary, *ingest* via the appropriate CLI command, and *react* by triggering external actions. A CI adapter might observe `task.completed` events, run a test suite, and record the result via `wg evaluate record --source "ci:tests"`. A portfolio manager might observe agent completions, measure real-world outcomes, and feed scores back as external evaluations. The adapter pattern is deliberately simple—each integration is a small loop of observe, translate, ingest, react—because the ingestion points are stable CLI commands, not a bespoke API.
+The generic adapter follows a four-step pattern: *observe* the graph via `wg watch`, *translate* external data into workgraph's vocabulary, *ingest* via the appropriate CLI command, and *react* by triggering external actions. A CI adapter might observe `task.completed` events, run a test suite, and record the result via `wg evaluate record --source "ci:tests"`. A portfolio manager might observe agent completions, measure real-world outcomes, and feed scores back as external evaluations. The adapter pattern is deliberately simple—each integration is a small loop of observe, translate, ingest, react—because the ingestion points are stable CLI commands, not a bespoke API.
 
 ### The Operations Log and Trace
 
@@ -980,13 +1217,13 @@ Every mutation to the graph—task creation, status change, evaluation, agent sp
 
 The trace system builds on this foundation. `wg trace show` reconstructs the history of a task or subtree by reading the operations log and replaying state transitions. `wg trace show --animate` takes this further: it reconstructs temporal snapshots of the graph at each mutation, then plays them back in the terminal as an interactive animation—tasks transitioning between statuses over time, a visual record of how work flowed through the graph. You can pause, step forward and backward through snapshots, and adjust playback speed.
 
-`wg trace export --visibility` produces a filtered, shareable snapshot of the trace. The visibility parameter controls what crosses organizational boundaries: `internal` exports everything, `public` sanitizes the export (task structure without agent output, logs, or evaluations), and `peer` provides richer detail for trusted peers (including evaluations with notes stripped). The corresponding `wg trace import` ingests a peer’s export, namespacing imported tasks to avoid ID collisions and tagging evaluations with their origin for provenance tracking. These exports use the `visibility` field on each task (see §2) to determine what is included at each zone level.
+`wg trace export --visibility <zone>` produces a filtered, shareable snapshot of the trace. The visibility parameter controls what crosses organizational boundaries: `internal` exports everything, `public` sanitizes the export (task structure without agent output, logs, or evaluations), and `peer` provides richer detail for trusted peers (including evaluations with notes stripped). The corresponding `wg trace import` ingests a peer's export, namespacing imported tasks to avoid ID collisions and tagging evaluations with their origin for provenance tracking. These exports use the `visibility` field on each task (see §2) to determine what is included at each zone level.
 
 These capabilities—watch, trace, export, import—form a layered system. The operations log is the ground truth. The watch stream is its real-time face. The trace commands are its analytical tools. And the export/import mechanism is how organizational memory crosses boundaries.
 
 ## Custom Executors
 
-Executors are defined as TOML files in `.workgraph/executors/`. Each specifies a command, arguments, environment variables, a prompt template, a working directory, and an optional timeout. The default `claude` executor pipes a prompt file into the Claude CLI with `--print` and `--output-format stream-json`. The default `shell` executor runs a bash command from the task’s `exec` field.
+Executors are defined as TOML files in `.workgraph/executors/`. Each specifies a command, arguments, environment variables, a prompt template, a working directory, and an optional timeout. The default `claude` executor pipes a prompt file into the Claude CLI with `--print` and `--output-format stream-json`. The default `shell` executor runs a bash command from the task's `exec` field.
 
 Custom executors enable integration with any tool. An executor for a different LLM provider, a code execution sandbox, a notification system—any process that can be launched from a shell command can serve as an executor. The prompt template supports the same `{{task_id}}`, `{{task_title}}`, `{{task_description}}`, `{{task_context}}`, and `{{task_identity}}` variables as the built-in executors.
 
@@ -998,7 +1235,7 @@ The coordinator can be paused via `wg service pause`. In the paused state, no ne
 
 `wg service resume` lifts the pause and triggers an immediate tick.
 
-For debugging and testing, `wg service tick` runs a single coordinator tick without the daemon. This lets you step through the scheduling logic one tick at a time, observing what the coordinator would do. And `wg spawn --executor claude` dispatches a single task manually, bypassing the daemon entirely.
+For debugging and testing, `wg service tick` runs a single coordinator tick without the daemon. This lets you step through the scheduling logic one tick at a time, observing what the coordinator would do. And `wg spawn <task-id> --executor claude` dispatches a single task manually, bypassing the daemon entirely.
 
 ## The Full Picture
 
@@ -1014,7 +1251,7 @@ The three agents run concurrently. The two assigners examine the agency roster a
 
 Work proceeds. Agents call `wg log` to record progress, `wg artifact` to register output files, and `wg done` when finished. Each `wg done` triggers another tick. Completed tasks unblock their dependents. The coordinator spawns new agents as slots open. If an agent crashes, the next tick detects the dead PID, triages the output, and either marks the task done, injects recovery context and reopens it, or restarts it cleanly.
 
-The graph drains. Tasks move from open through in-progress to done. Evaluation tasks score completed work. Eventually the coordinator finds no ready tasks and all tasks terminal. It logs: “All tasks complete.” The daemon continues running, waiting for new tasks. The operator adds more work with `wg add`, the graph_changed signal fires, and the cycle begins again.
+The graph drains. Tasks move from open through in-progress to done. Evaluation tasks score completed work. Eventually the coordinator finds no ready tasks and all tasks terminal. It logs: "All tasks complete." The daemon continues running, waiting for new tasks. The operator adds more work with `wg add`, the graph_changed signal fires, and the cycle begins again.
 
 This is coordination: a loop that converts a plan into action, one tick at a time.
 
@@ -1034,12 +1271,13 @@ Evaluation is the act of scoring a completed task. It answers a concrete questio
 
 The evaluator is itself an LLM agent. It receives the full context of the work: the task definition (title, description, deliverables), the agent’s identity (role and motivation), any artifacts the agent produced, log entries from execution, and timing data (when the task started and finished). From this, it scores four dimensions:
 
-| *Dimension* | *Weight* | *What it measures* |
-| --- | --- | --- |
-| Correctness | 40% | Does the output satisfy the task's requirements and the role's desired outcome? |
-| Completeness | 30% | Were all aspects of the task addressed? Are deliverables present? |
-| Efficiency | 15% | Was the work done without unnecessary steps, bloat, or wasted effort? |
-| Style adherence | 15% | Were project conventions followed? Were the motivation's constraints respected? |
+|                 |            |                                                                                 |
+|-----------------|------------|---------------------------------------------------------------------------------|
+| **Dimension**   | **Weight** | **What it measures**                                                            |
+| Correctness     | 40%        | Does the output satisfy the task’s requirements and the role’s desired outcome? |
+| Completeness    | 30%        | Were all aspects of the task addressed? Are deliverables present?               |
+| Efficiency      | 15%        | Was the work done without unnecessary steps, bloat, or wasted effort?           |
+| Style adherence | 15%        | Were project conventions followed? Were the motivation’s constraints respected? |
 
 The weights are deliberate. Correctness dominates because wrong output is worse than incomplete output. Completeness follows because partial work still has value. Efficiency and style adherence matter but are secondary—a correct, complete solution with poor style is more useful than an elegant, incomplete one.
 
@@ -1105,7 +1343,7 @@ Trends answer the question that aggregate scores cannot: is this entity getting 
 
 Evolution is the process of improving agency entities based on accumulated evaluation data. Where evaluation extracts signal from individual tasks, evolution acts on the aggregate—reading the full performance picture and proposing structural changes to roles and motivations.
 
-Evolution is triggered manually by running `wg evolve`. This is a deliberate design choice. The system accumulates evaluation data automatically (via the coordinator’s auto-evaluate feature), but the decision to act on that data belongs to the human. Evolution is powerful enough to reshape the agency’s identity space. It should not run unattended.
+Evolution is triggered manually by running `wg evolve run`. This is a deliberate design choice. The system accumulates evaluation data automatically (via the coordinator’s auto-evaluate feature), but the decision to act on that data belongs to the human. Evolution is powerful enough to reshape the agency’s identity space. It should not run unattended. Deferred operations (such as self-mutations requiring human review) are managed via `wg evolve review`.
 
 ### The evolver agent
 
@@ -1125,15 +1363,15 @@ Six strategies define the space of evolutionary operations:
 
 **Retirement.** Remove consistently poor-performing entities. This is pruning—clearing out identities that evaluation has shown to be ineffective. Retired entities are not deleted; they are renamed to `.yaml.retired` and preserved for audit.
 
-**Motivation tuning.** Adjust the trade-offs on an existing motivation. Tighten a constraint that evaluations show is being violated. Relax one that is unnecessarily restrictive. This is a targeted form of mutation specific to the motivation’s acceptable and unacceptable trade-off lists.
+**Tradeoff tuning.** Adjust the trade-offs on an existing tradeoff (motivation). Tighten a constraint that evaluations show is being violated. Relax one that is unnecessarily restrictive. This is a targeted form of mutation specific to the motivation’s acceptable and unacceptable trade-off lists.
 
 **All.** Use every strategy as appropriate. The evolver reads the full performance picture and proposes whatever mix of operations it deems most impactful. This is the default.
 
-Each strategy can be selected individually via `wg evolve --strategy mutation` or combined as the default `all`. Strategy-specific guidance documents in the evolver-skills directory give the evolver detailed procedures for each approach.
+Each strategy can be selected individually via `wg evolve run --strategy mutation` or combined as the default `all`. Strategy-specific guidance documents in the evolver-skills directory give the evolver detailed procedures for each approach.
 
 ### Mechanics
 
-When `wg evolve` runs, the following sequence executes:
+When `wg evolve run` executes, the following sequence runs:
 
 1.  All roles, motivations, and evaluations are loaded. Human-agent evaluations are filtered out—they would pollute the signal, since human performance does not reflect the effectiveness of a role-motivation prompt.
 
@@ -1163,7 +1401,7 @@ Evolution is powerful. The guardrails are proportional.
 
 **Retired entities are preserved, not deleted.** The `.yaml.retired` suffix removes them from active duty but keeps them on disk for audit, rollback, or lineage inspection.
 
-**Dry run.** `wg evolve --dry-run` renders the full evolver prompt and shows it without executing. You see exactly what the evolver would see. This is the first thing to run when experimenting with evolution.
+**Dry run.** `wg evolve run --dry-run` renders the full evolver prompt and shows it without executing. You see exactly what the evolver would see. This is the first thing to run when experimenting with evolution.
 
 **Budget limits.** `--budget N` caps the number of operations applied per run. Start small—two or three operations—review the results, iterate. The evolver may propose ten changes, but you decide how many land.
 
@@ -1173,13 +1411,13 @@ Evolution is powerful. The guardrails are proportional.
 
 Every role, motivation, and agent tracks its evolutionary history through a lineage record: parent IDs, generation number, creator identity, and timestamp.
 
-Generation zero entities are the seeds—created by humans via `wg role add`, `wg motivation add`, or `wg agency init`. They have no parents. Their `created_by` field reads `"human"`.
+Generation zero entities are the seeds—created by humans via `wg role add`, `wg tradeoff add`, or `wg agency init`. They have no parents. Their `created_by` field reads `"human"`.
 
 Generation one entities are the first children of evolution. A mutation from a generation-zero role produces a generation-one role with a single parent. A crossover of two generation-zero roles produces a generation-one role with two parents. Each subsequent evolution increments from the highest parent’s generation.
 
 The `created_by` field on evolved entities records the evolver run ID: `"evolver-run-20260115-143022"`. Combined with the run reports saved in `evolution_runs/`, this creates a complete audit trail: you can trace any entity to the exact evolution run that created it, see what performance data the evolver was working from, and read the rationale for the change.
 
-Lineage commands—`wg role lineage`, `wg motivation lineage`, `wg agent lineage`—walk the chain. Agent lineage is the most interesting: it shows not just the agent’s own history but the lineage of its constituent role and motivation, revealing the full evolutionary tree that converged to produce that particular identity.
+Lineage commands—`wg role lineage`, `wg tradeoff lineage`, `wg agent lineage`—walk the chain. Agent lineage is the most interesting: it shows not just the agent’s own history but the lineage of its constituent role and motivation, revealing the full evolutionary tree that converged to produce that particular identity.
 
 ## The Autopoietic Loop
 
@@ -1231,7 +1469,7 @@ Agency entities—roles, motivations, agents, and their evaluation histories—c
 
 What this means for evolution is concrete. A role that has been evaluated across three projects carries a richer performance record than one evaluated in a single project. The evolver sees a broader sample. A role that scores well on code tasks in one project but poorly on documentation tasks in another presents a clearer picture than either project could provide alone. Federation does not change the evolutionary mechanisms—it enriches the data they act on.
 
-The sharing boundary is controlled by task visibility. Every task carries a `visibility` field: `internal` (the default—nothing crosses organizational boundaries), `public` (sanitized for open sharing—task structure without agent output or logs), or `peer` (richer detail for trusted peers—includes evaluations and workflow patterns). Trace exports (`wg trace export --visibility`) filter according to this field. The result is a structured, shareable view of work product—enough for a peer to learn from without exposing internal operational detail.
+The sharing boundary is controlled by task visibility. Every task carries a `visibility` field: `internal` (the default—nothing crosses organizational boundaries), `public` (sanitized for open sharing—task structure without agent output or logs), or `peer` (richer detail for trusted peers—includes evaluations and workflow patterns). Trace exports (`wg trace export --visibility <zone>`) filter according to this field. The result is a structured, shareable view of work product—enough for a peer to learn from without exposing internal operational detail.
 
 ### Functions: organizational routines
 
@@ -1247,11 +1485,11 @@ But the human hand is always on the wheel. Evolution is a manual trigger, not an
 
 **When to evolve.** Wait until you have at least five to ten evaluations per role before running evolution. Fewer than that, and the evolver is working from noise rather than signal. `wg agency stats` shows evaluation counts and trends—use it to judge readiness.
 
-**Start with dry run.** Always run `wg evolve --dry-run` first. Read the prompt. Understand what the evolver sees. This also serves as a diagnostic: if the performance summary looks thin, you need more evaluations before evolving.
+**Start with dry run.** Always run `wg evolve run --dry-run` first. Read the prompt. Understand what the evolver sees. This also serves as a diagnostic: if the performance summary looks thin, you need more evaluations before evolving.
 
 **Use budgets.** `--budget 2` or `--budget 3` for early runs. Review each operation’s rationale. As you build confidence in the evolver’s judgment, you can increase the budget or omit it.
 
-**Targeted strategies.** If you know what the problem is—roles scoring low on a specific dimension, motivations with constraints that are too strict—use a targeted strategy. `--strategy mutation` for improving existing entities. `--strategy motivation-tuning` for adjusting trade-offs. `--strategy gap-analysis` when tasks are going unmatched.
+**Targeted strategies.** If you know what the problem is—roles scoring low on a specific dimension, motivations with constraints that are too strict—use a targeted strategy. `--strategy mutation` for improving existing entities. `--strategy tradeoff-tuning` for adjusting trade-offs. `--strategy gap-analysis` when tasks are going unmatched.
 
 **Seed, then evolve.** `wg agency init` creates four starter roles and four starter motivations. These are generic seeds—competent but not specialized. Run them through a few task cycles, accumulate evaluations, then evolve. The starters are generation zero. Evolution produces generation one, two, and beyond—each generation shaped by the actual work your project requires.
 
@@ -1259,7 +1497,7 @@ But the human hand is always on the wheel. Evolution is a manual trigger, not an
 
 **Lineage as audit.** When an agent produces unexpectedly good or bad work, trace its lineage. Which evolution run created its role? What performance data informed that mutation? The lineage chain, combined with evolution run reports, makes every identity decision traceable.
 
-**Mix internal and external signals.** Do not evolve on internal evaluations alone if external outcome data is available. Record CI results, production metrics, or user feedback via `wg evaluate record --source`. The evolver is most effective when it sees both “the code was well-written” and “the code worked in practice“—the gap between the two is where the most useful mutations live.
+**Mix internal and external signals.** Do not evolve on internal evaluations alone if external outcome data is available. Record CI results, production metrics, or user feedback via `wg evaluate record --source <tag>`. The evolver is most effective when it sees both “the code was well-written” and “the code worked in practice“—the gap between the two is where the most useful mutations live.
 
 **Pull before evolving.** If you maintain multiple workgraph projects or collaborate with peers, run `wg agency pull` before `wg evolve`. Federation imports evaluation data from remote stores, giving the evolver a broader performance picture. A role evaluated across three projects is a more reliable signal than one evaluated in one.
 

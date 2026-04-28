@@ -339,6 +339,13 @@ fn evaluator_prompt_no_hardcoded_text_when_agent_configured() {
         artifact_diff: None,
         evaluator_identity: Some(&identity),
         downstream_tasks: &[],
+        flip_score: None,
+        verify_status: None,
+        verify_findings: None,
+        resolved_outcome_name: None,
+        child_tasks: &[],
+        constraint_fidelity_score: None,
+        constraint_fidelity_unanchored: None,
     };
     let full_prompt = render_evaluator_prompt(&input);
 
@@ -375,6 +382,13 @@ fn evaluator_prompt_falls_back_to_hardcoded_when_no_agent() {
         artifact_diff: None,
         evaluator_identity: None,
         downstream_tasks: &[],
+        flip_score: None,
+        verify_status: None,
+        verify_findings: None,
+        resolved_outcome_name: None,
+        child_tasks: &[],
+        constraint_fidelity_score: None,
+        constraint_fidelity_unanchored: None,
     };
     let prompt = render_evaluator_prompt(&input);
 

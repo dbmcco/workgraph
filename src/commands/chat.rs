@@ -53,6 +53,7 @@ pub fn run_send(
     message: &str,
     timeout_secs: Option<u64>,
     attachment_paths: &[String],
+    coordinator_id: u32,
 ) -> Result<()> {
     // Validate message size
     if message.len() > MAX_MESSAGE_SIZE {
@@ -63,7 +64,7 @@ pub fn run_send(
         );
     }
     let msg = if message.len() > MAX_MESSAGE_SIZE {
-        &message[..MAX_MESSAGE_SIZE]
+        &message[..message.floor_char_boundary(MAX_MESSAGE_SIZE)]
     } else {
         message
     };
@@ -106,6 +107,7 @@ pub fn run_send(
             message: full_message,
             request_id: request_id.clone(),
             attachments: attachments.clone(),
+            chat_id: Some(coordinator_id),
         },
     )
     .context("Failed to connect to service. Is it running? Start with: wg service start")?;
@@ -118,7 +120,7 @@ pub fn run_send(
     }
 
     // Wait for the coordinator's response (poll outbox)
-    match chat::wait_for_response(dir, &request_id, timeout)? {
+    match chat::wait_for_response_for(dir, coordinator_id, &request_id, timeout)? {
         Some(response) => {
             println!("{}", response.content);
         }
@@ -138,7 +140,7 @@ pub fn run_send(
 }
 
 /// Run interactive chat REPL.
-pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
+pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>, coordinator_id: u32) -> Result<()> {
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
     // Verify service is running before entering the REPL
@@ -184,7 +186,7 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
                 "Warning: Message truncated to {}KB",
                 MAX_MESSAGE_SIZE / 1024
             );
-            &trimmed[..MAX_MESSAGE_SIZE]
+            &trimmed[..trimmed.floor_char_boundary(MAX_MESSAGE_SIZE)]
         } else {
             trimmed
         };
@@ -198,6 +200,7 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
                 message: msg.to_string(),
                 request_id: request_id.clone(),
                 attachments: vec![],
+                chat_id: Some(coordinator_id),
             },
         ) {
             Ok(resp) => resp,
@@ -219,7 +222,7 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
         }
 
         // Wait for response
-        match chat::wait_for_response(dir, &request_id, timeout)? {
+        match chat::wait_for_response_for(dir, coordinator_id, &request_id, timeout)? {
             Some(response) => {
                 eprintln!();
                 println!("coordinator> {}", response.content);
@@ -238,12 +241,53 @@ pub fn run_interactive(dir: &Path, timeout_secs: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-/// Display chat history (interleaved inbox + outbox by timestamp).
-pub fn run_history(dir: &Path, json: bool) -> Result<()> {
-    let history = chat::read_history(dir)?;
+/// Display chat history for a coordinator.
+///
+/// Resolution order:
+/// 1. Check which executor backs this coordinator (per `coordinator.effective_executor`).
+/// 2. Ask `vendor_history::locate` for the canonical transcript file.
+///    Native → `chat/<ref>/conversation.jsonl`, claude → newest session
+///    in `~/.claude/projects/<slug>/`, codex → newest rollout in
+///    `~/.codex/sessions/…` whose `session_meta.payload.cwd` matches.
+/// 3. Parse + print / emit JSON.
+/// 4. If the vendor file doesn't exist yet (fresh session) fall back
+///    to the legacy daemon-coordinator inbox/outbox so history written
+///    before PTY mode existed still shows up.
+pub fn run_history(
+    dir: &Path,
+    json: bool,
+    coordinator_id: u32,
+    history_depth: Option<usize>,
+) -> Result<()> {
+    let chat_ref = coordinator_id.to_string();
+    let chat_dir = workgraph::chat::chat_dir_for_ref(dir, &chat_ref);
+    let config = workgraph::config::Config::load_or_default(dir);
+    let executor = config.coordinator.effective_executor();
+
+    if let Some(hist) = workgraph::vendor_history::locate(&executor, dir, &chat_ref, &chat_dir) {
+        let turns = workgraph::vendor_history::read_turns(&hist)?;
+        print_vendor_turns(&turns, &executor, hist.path(), json, history_depth)?;
+        return Ok(());
+    }
+
+    // Fallback: legacy daemon-coordinator inbox+outbox history. Kept
+    // so pre-PTY workgraphs still render chat history without
+    // surprises.
+    let history = chat::read_history_for(dir, coordinator_id)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&history)?);
+        let to_serialize = match history_depth {
+            Some(n) => history
+                .into_iter()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>(),
+            None => history,
+        };
+        println!("{}", serde_json::to_string_pretty(&to_serialize)?);
         return Ok(());
     }
 
@@ -252,11 +296,17 @@ pub fn run_history(dir: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    for msg in &history {
-        // Extract time portion from ISO timestamp for compact display
+    let display_msgs: &[_] = match history_depth {
+        Some(n) => {
+            let skip = history.len().saturating_sub(n);
+            &history[skip..]
+        }
+        None => &history,
+    };
+
+    for msg in display_msgs {
         let time = if let Some(t_pos) = msg.timestamp.find('T') {
             let time_part = &msg.timestamp[t_pos + 1..];
-            // Take HH:MM:SS
             if time_part.len() >= 8 {
                 &time_part[..8]
             } else {
@@ -279,10 +329,161 @@ pub fn run_history(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Clear all chat history.
-pub fn run_clear(dir: &Path) -> Result<()> {
-    chat::clear(dir)?;
-    println!("Chat history cleared.");
+fn print_vendor_turns(
+    turns: &[workgraph::vendor_history::Turn],
+    executor: &str,
+    path: &std::path::Path,
+    json: bool,
+    history_depth: Option<usize>,
+) -> Result<()> {
+    let slice: &[_] = match history_depth {
+        Some(n) => {
+            let skip = turns.len().saturating_sub(n);
+            &turns[skip..]
+        }
+        None => turns,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(slice)?);
+        return Ok(());
+    }
+
+    if slice.is_empty() {
+        println!("No chat history ({}).", executor);
+        println!("  source: {}", path.display());
+        return Ok(());
+    }
+
+    eprintln!("# executor: {}  source: {}", executor, path.display());
+    for turn in slice {
+        let time = turn
+            .timestamp
+            .as_deref()
+            .and_then(|ts| ts.find('T').map(|i| &ts[i + 1..]))
+            .map(|rest| if rest.len() >= 8 { &rest[..8] } else { rest })
+            .unwrap_or("--:--:--");
+        println!("[{}] {}: {}", time, turn.role, turn.text);
+    }
+    Ok(())
+}
+
+/// Clear chat history for a specific coordinator.
+pub fn run_clear(dir: &Path, coordinator_id: u32) -> Result<()> {
+    chat::clear_for(dir, coordinator_id)?;
+    println!("Chat history cleared for coordinator {}.", coordinator_id);
+    Ok(())
+}
+
+/// Force-rotate chat files to archive for a specific coordinator.
+pub fn run_rotate(dir: &Path, coordinator_id: u32) -> Result<()> {
+    let rotated_ipc = chat::force_rotate_for(dir, coordinator_id)?;
+    let rotated_tui = chat::force_rotate_tui_history_for(dir, coordinator_id)?;
+
+    if rotated_ipc || rotated_tui {
+        println!(
+            "Chat files rotated to archive for coordinator {}.",
+            coordinator_id
+        );
+        let archives = chat::list_archives_for(dir, coordinator_id)?;
+        println!("{} archived file(s) total.", archives.len());
+    } else {
+        println!(
+            "No chat files to rotate for coordinator {}.",
+            coordinator_id
+        );
+    }
+
+    // Also run retention cleanup
+    let cleaned = chat::cleanup_archives_for(dir, coordinator_id)?;
+    if cleaned > 0 {
+        println!("Cleaned up {} expired archive(s).", cleaned);
+    }
+
+    Ok(())
+}
+
+/// Clean up expired archived chat files for a specific coordinator.
+pub fn run_cleanup(dir: &Path, coordinator_id: u32) -> Result<()> {
+    let cleaned = chat::cleanup_archives_for(dir, coordinator_id)?;
+    if cleaned > 0 {
+        println!(
+            "Cleaned up {} expired archive(s) for coordinator {}.",
+            cleaned, coordinator_id
+        );
+    } else {
+        println!(
+            "No expired archives to clean up for coordinator {}.",
+            coordinator_id
+        );
+    }
+    Ok(())
+}
+
+/// Compact chat history into a context summary for a specific coordinator.
+/// Share context from one coordinator to another.
+///
+/// Reads the source coordinator's compacted context summary and writes it
+/// as clearly-labeled imported context for the target coordinator.
+pub fn run_share(dir: &Path, from_id: u32, to_id: u32) -> Result<()> {
+    if from_id == to_id {
+        anyhow::bail!(
+            "Source and target coordinator must be different (both are {})",
+            from_id
+        );
+    }
+
+    // Look up coordinator label from graph
+    let graph_path = dir.join("graph.jsonl");
+    let from_label = if graph_path.exists() {
+        let graph = workgraph::parser::load_graph(&graph_path)?;
+        coordinator_label_from_graph(&graph, from_id)
+    } else {
+        None
+    };
+    let label_str = from_label.as_deref().unwrap_or("Unknown");
+
+    let content = chat::share_context(dir, from_id, to_id, Some(label_str))?;
+
+    eprintln!(
+        "Shared context from coordinator {} ({}) → coordinator {}",
+        from_id, label_str, to_id
+    );
+    eprintln!("({} bytes of imported context)", content.len());
+    eprintln!("The target coordinator will consume this on its next turn.");
+
+    Ok(())
+}
+
+/// Resolve chat agent label from the graph (accepts both `.chat-N` and `.coordinator-N`).
+fn coordinator_label_from_graph(graph: &workgraph::graph::WorkGraph, cid: u32) -> Option<String> {
+    if let Some(t) = workgraph::chat_id::find_chat_task(graph, cid) {
+        return Some(t.title.clone());
+    }
+    if cid == 0
+        && let Some(t) = graph.get_task(".coordinator")
+    {
+        return Some(t.title.clone());
+    }
+    None
+}
+
+pub fn run_compact(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
+    use workgraph::service::chat_compactor;
+
+    let output_path = chat_compactor::run_chat_compaction(dir, coordinator_id)?;
+
+    if json {
+        let result = serde_json::json!({
+            "path": output_path.display().to_string(),
+            "coordinator_id": coordinator_id,
+            "status": "ok",
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Chat compacted → {}", output_path.display());
+    }
+
     Ok(())
 }
 
@@ -324,8 +525,8 @@ mod tests {
     fn test_run_history_empty() {
         let (_tmp, dir) = setup();
         // Should not error on empty history
-        run_history(&dir, false).unwrap();
-        run_history(&dir, true).unwrap();
+        run_history(&dir, false, 0, None).unwrap();
+        run_history(&dir, true, 0, None).unwrap();
     }
 
     #[test]
@@ -336,7 +537,7 @@ mod tests {
         chat::append_outbox(&dir, "hi there", "req-1").unwrap();
 
         // Should not error
-        run_history(&dir, false).unwrap();
+        run_history(&dir, false, 0, None).unwrap();
     }
 
     #[test]
@@ -347,7 +548,7 @@ mod tests {
         chat::append_outbox(&dir, "hi there", "req-1").unwrap();
 
         // Should not error
-        run_history(&dir, true).unwrap();
+        run_history(&dir, true, 0, None).unwrap();
     }
 
     #[test]
@@ -357,7 +558,7 @@ mod tests {
         chat::append_inbox(&dir, "msg", "r1").unwrap();
         chat::append_outbox(&dir, "resp", "r1").unwrap();
 
-        run_clear(&dir).unwrap();
+        run_clear(&dir, 0).unwrap();
 
         let history = chat::read_history(&dir).unwrap();
         assert!(history.is_empty());
@@ -366,7 +567,7 @@ mod tests {
     #[test]
     fn test_send_empty_message_fails() {
         let (_tmp, dir) = setup();
-        let result = run_send(&dir, "  ", None, &[]);
+        let result = run_send(&dir, "  ", None, &[], 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty"));
     }

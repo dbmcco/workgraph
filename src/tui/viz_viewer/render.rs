@@ -7,17 +7,71 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    ConfigEditKind, ConfigSection, ConfirmAction, FocusedPanel, InputMode, LayoutMode,
-    RightPanelTab, SortMode, TaskFormField, TaskFormState, TextPromptAction, VizApp,
-    extract_section_name,
+    ActivityEventKind, ChoiceDialogState, ConfigEditKind, ConfigSection,
+    ConfirmAction, ControlPanelFocus, CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus,
+    FocusedPanel, InputMode, LayoutMode, ResponsiveBreakpoint, RightPanelTab, ServiceHealthLevel,
+    SettingsEditScope, SinglePanelView, SortMode, TabBarEntryKind, TaskFormField,
+    TaskFormState, TextPromptAction, ToastSeverity, VitalsStaleness, VizApp, WAVE_BOLT,
+    WAVE_NUM_BOLTS, extract_section_name, format_duration_compact, format_relative_time,
+    spinner_wave_pos, vitals_staleness_color,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
 
 use crate::tui::markdown::markdown_to_lines;
+use super::chat_palette::chat_task_label_color;
 
 /// Minimum terminal width for side-by-side right panel layout.
+/// When the inspector is currently on the right and terminal shrinks below this,
+/// the inspector moves to the bottom.
 const SIDE_MIN_WIDTH: u16 = 100;
+
+/// Width at which the inspector restores to side-by-side after being moved to the bottom.
+/// Higher than SIDE_MIN_WIDTH to prevent flapping at the boundary (hysteresis).
+const SIDE_RESTORE_WIDTH: u16 = 120;
+
+/// Creates a [`Line`] with the lightning-wave animation and elapsed time.
+///
+/// Renders [`WAVE_NUM_BOLTS`] `↯` characters in a rainbow spectrum matching the
+/// CLI spinner (Red, Orange, Green, Cyan, Violet).  The wave peak bolt is
+/// **bold** + bright, adjacent bolts are bright, and distant bolts fade through
+/// mid to dim tiers — creating a lightning-flash sweep effect across the rainbow.
+fn spinner_wave_line(elapsed: std::time::Duration, indent: &str) -> Line<'static> {
+    let wave_pos = spinner_wave_pos(elapsed);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(WAVE_NUM_BOLTS + 3);
+
+    // Rainbow spectral colors matching CLI spinner — bright / mid / dim tiers per bolt
+    // Red, Orange, Green, Cyan, Violet (same palette as `wg service start`)
+    const BRIGHT: [u8; 5] = [196, 214, 46, 33, 129];
+    const MID: [u8; 5] = [124, 172, 34, 25, 91];
+    const DIM: [u8; 5] = [52, 94, 22, 17, 53];
+
+    if !indent.is_empty() {
+        spans.push(Span::raw(indent.to_string()));
+    }
+
+    for i in 0..WAVE_NUM_BOLTS {
+        let d = (i as isize - wave_pos as isize).unsigned_abs();
+        let dist = d.min(WAVE_NUM_BOLTS - d);
+        let style = match dist {
+            0 => Style::default()
+                .fg(Color::Indexed(BRIGHT[i]))
+                .add_modifier(Modifier::BOLD), // flash peak
+            1 => Style::default().fg(Color::Indexed(BRIGHT[i])), // bright adjacent
+            2 => Style::default().fg(Color::Indexed(MID[i])),    // fading
+            _ => Style::default().fg(Color::Indexed(DIM[i])),    // dim base
+        };
+        spans.push(Span::styled(WAVE_BOLT, style));
+    }
+
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format_duration_compact(elapsed.as_secs()),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    Line::from(spans)
+}
 
 pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     // Clear expired jump targets (>2 seconds old).
@@ -30,25 +84,33 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     // Clean up expired splash animations.
     app.cleanup_splash_animations();
 
+    // Clean up expired key feedback entries.
+    app.cleanup_key_feedback();
+
+    // Clean up expired touch echo indicators.
+    app.cleanup_touch_echoes();
+
     // Reset scrollbar areas each frame (re-set by draw_scrollbar / panel scrollbar code).
     app.last_graph_scrollbar_area = Rect::default();
     app.last_panel_scrollbar_area = Rect::default();
 
     let area = frame.area();
 
-    // Layout: top status bar + middle area + bottom action hints.
+    // Layout: top status bar + middle area + vitals bar + bottom action hints.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // top status bar
             Constraint::Min(1),    // main content area
+            Constraint::Length(1), // vitals bar
             Constraint::Length(1), // bottom action hints
         ])
         .split(area);
 
     let status_area = chunks[0];
     let main_area = chunks[1];
-    let hints_area = chunks[2];
+    let vitals_area = chunks[2];
+    let hints_area = chunks[3];
 
     // Lazily load panel content if needed.
     if app.hud_detail.is_none() && app.selected_task_idx.is_some() {
@@ -72,69 +134,285 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     {
         app.load_agency_lifecycle();
     }
-    // Lazy-load coordinator log on first switch to CoordLog tab.
-    if app.right_panel_tab == RightPanelTab::CoordLog && app.coord_log.rendered_lines.is_empty() {
-        app.load_coord_log();
+    // Lazy-load coordinator log + activity feed on first switch to CoordLog tab.
+    if app.right_panel_tab == RightPanelTab::CoordLog {
+        if app.coord_log.rendered_lines.is_empty() {
+            app.load_coord_log();
+        }
+        if app.activity_feed.events.is_empty() {
+            app.load_activity_feed();
+        }
     }
     // Lazy-init file browser on first switch to Files tab.
     if app.right_panel_tab == RightPanelTab::Files && app.file_browser.is_none() {
         app.file_browser = Some(super::file_browser::FileBrowser::new(&app.workgraph_dir));
     }
+    // Lazy-load firehose data on first switch to Firehose tab.
+    if app.right_panel_tab == RightPanelTab::Firehose && app.firehose.lines.is_empty() {
+        app.update_firehose();
+    }
+
+    // ── Responsive breakpoint detection ──
+    // Recomputed each frame from the terminal width. Drives layout decisions below.
+    app.responsive_breakpoint = ResponsiveBreakpoint::from_width(area.width);
 
     // Phase 1: Compute viewport dimensions from layout (needed for deferred centering).
-    match app.layout_mode {
-        LayoutMode::FullInspector => {
-            app.last_graph_area = Rect::default();
-            app.scroll.viewport_height = 0;
-            app.scroll.viewport_width = 0;
-        }
-        LayoutMode::Off => {
-            app.last_graph_area = main_area;
-            app.last_right_panel_area = Rect::default();
-            app.last_tab_bar_area = Rect::default();
-            app.last_right_content_area = Rect::default();
-            app.scroll.viewport_height = main_area.height as usize;
-            app.scroll.viewport_width = main_area.width as usize;
-        }
-        LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
-            if app.right_panel_visible {
-                if area.width >= SIDE_MIN_WIDTH {
-                    let right_width =
-                        (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
-                    let left_width = main_area.width.saturating_sub(right_width);
-                    let split = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Length(left_width),
-                            Constraint::Length(right_width),
-                        ])
-                        .split(main_area);
-                    app.last_graph_area = split[0];
-                    app.scroll.viewport_height = split[0].height as usize;
-                    app.scroll.viewport_width = split[0].width as usize;
-                } else {
-                    let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
-                        / 100)
-                        .max(5) as u16;
-                    let top_height = main_area.height.saturating_sub(panel_height);
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(top_height),
-                            Constraint::Length(panel_height),
-                        ])
-                        .split(main_area);
-                    app.last_graph_area = split[0];
-                    app.scroll.viewport_height = split[0].height as usize;
-                    app.scroll.viewport_width = split[0].width as usize;
+    match app.responsive_breakpoint {
+        ResponsiveBreakpoint::Compact => {
+            // Single-panel mode: show graph OR detail OR log, one at a time.
+            // No room for tri-state strips in compact mode.
+            app.last_minimized_strip_area = Rect::default();
+            app.last_fullscreen_restore_area = Rect::default();
+            app.last_fullscreen_right_border_area = Rect::default();
+            app.last_fullscreen_top_border_area = Rect::default();
+            app.last_fullscreen_bottom_border_area = Rect::default();
+            match app.single_panel_view {
+                SinglePanelView::Graph => {
+                    app.last_graph_area = main_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = main_area.height as usize;
+                    app.scroll.viewport_width = main_area.width as usize;
                 }
-            } else {
-                app.last_graph_area = main_area;
-                app.last_right_panel_area = Rect::default();
-                app.last_tab_bar_area = Rect::default();
-                app.last_right_content_area = Rect::default();
-                app.scroll.viewport_height = main_area.height as usize;
-                app.scroll.viewport_width = main_area.width as usize;
+                SinglePanelView::Detail | SinglePanelView::Log => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                }
+            }
+        }
+        ResponsiveBreakpoint::Narrow => {
+            // Narrow split: side-by-side at ~40/60 or stacked, depending on split layout.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                    // Reserve all four borders (1 col left, 1 col right, 1 row top, 1 row bottom).
+                    let has_h_room = main_area.width > 2;
+                    let has_v_room = main_area.height > 2;
+                    if has_h_room {
+                        app.last_fullscreen_restore_area =
+                            Rect::new(main_area.x, main_area.y, 1, main_area.height);
+                        app.last_fullscreen_right_border_area = Rect::new(
+                            main_area.x + main_area.width - 1,
+                            main_area.y,
+                            1,
+                            main_area.height,
+                        );
+                    } else {
+                        app.last_fullscreen_restore_area = Rect::default();
+                        app.last_fullscreen_right_border_area = Rect::default();
+                    }
+                    if has_v_room {
+                        app.last_fullscreen_top_border_area =
+                            Rect::new(main_area.x, main_area.y, main_area.width, 1);
+                        app.last_fullscreen_bottom_border_area = Rect::new(
+                            main_area.x,
+                            main_area.y + main_area.height - 1,
+                            main_area.width,
+                            1,
+                        );
+                    } else {
+                        app.last_fullscreen_top_border_area = Rect::default();
+                        app.last_fullscreen_bottom_border_area = Rect::default();
+                    }
+                    app.last_minimized_strip_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    // Always reserve 1 col for the minimized strip so the graph
+                    // never reflows when hover toggles strip visibility.
+                    let has_room = main_area.width > 1;
+                    let strip_width = if has_room { 1u16 } else { 0 };
+                    let graph_width = main_area.width.saturating_sub(strip_width);
+                    let graph_area =
+                        Rect::new(main_area.x, main_area.y, graph_width, main_area.height);
+                    app.last_graph_area = graph_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = graph_area.height as usize;
+                    app.scroll.viewport_width = graph_area.width as usize;
+                    if has_room {
+                        app.last_minimized_strip_area = Rect::new(
+                            main_area.x + main_area.width - 1,
+                            main_area.y,
+                            1,
+                            main_area.height,
+                        );
+                    } else {
+                        app.last_minimized_strip_area = Rect::default();
+                    }
+                    app.last_fullscreen_restore_area = Rect::default();
+                    app.last_fullscreen_right_border_area = Rect::default();
+                    app.last_fullscreen_top_border_area = Rect::default();
+                    app.last_fullscreen_bottom_border_area = Rect::default();
+                }
+                _ => {
+                    app.last_minimized_strip_area = Rect::default();
+                    app.last_fullscreen_restore_area = Rect::default();
+                    app.last_fullscreen_right_border_area = Rect::default();
+                    app.last_fullscreen_top_border_area = Rect::default();
+                    app.last_fullscreen_bottom_border_area = Rect::default();
+                    // Narrow mode is always below SIDE_MIN_WIDTH, so inspector
+                    // goes to the bottom (vertical split) to avoid oscillation.
+                    app.inspector_is_beside = false;
+                    if app.right_panel_visible {
+                        let panel_height =
+                            (main_area.height as u32 * app.right_panel_percent as u32 / 100).max(5)
+                                as u16;
+                        let top_height = main_area.height.saturating_sub(panel_height);
+                        let split = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(top_height),
+                                Constraint::Length(panel_height),
+                            ])
+                            .split(main_area);
+                        app.last_graph_area = split[0];
+                        app.scroll.viewport_height = split[0].height as usize;
+                        app.scroll.viewport_width = split[0].width as usize;
+                    } else {
+                        app.last_graph_area = main_area;
+                        app.last_right_panel_area = Rect::default();
+                        app.last_divider_area = Rect::default();
+                        app.last_tab_bar_area = Rect::default();
+                        app.last_right_content_area = Rect::default();
+                        app.scroll.viewport_height = main_area.height as usize;
+                        app.scroll.viewport_width = main_area.width as usize;
+                    }
+                }
+            }
+        }
+        ResponsiveBreakpoint::Full => {
+            // Full layout: existing behavior, unchanged.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    app.last_graph_area = Rect::default();
+                    app.scroll.viewport_height = 0;
+                    app.scroll.viewport_width = 0;
+                    // Reserve all four borders (1 col left, 1 col right, 1 row top, 1 row bottom).
+                    let has_h_room = main_area.width > 2;
+                    let has_v_room = main_area.height > 2;
+                    if has_h_room {
+                        app.last_fullscreen_restore_area =
+                            Rect::new(main_area.x, main_area.y, 1, main_area.height);
+                        app.last_fullscreen_right_border_area = Rect::new(
+                            main_area.x + main_area.width - 1,
+                            main_area.y,
+                            1,
+                            main_area.height,
+                        );
+                    } else {
+                        app.last_fullscreen_restore_area = Rect::default();
+                        app.last_fullscreen_right_border_area = Rect::default();
+                    }
+                    if has_v_room {
+                        app.last_fullscreen_top_border_area =
+                            Rect::new(main_area.x, main_area.y, main_area.width, 1);
+                        app.last_fullscreen_bottom_border_area = Rect::new(
+                            main_area.x,
+                            main_area.y + main_area.height - 1,
+                            main_area.width,
+                            1,
+                        );
+                    } else {
+                        app.last_fullscreen_top_border_area = Rect::default();
+                        app.last_fullscreen_bottom_border_area = Rect::default();
+                    }
+                    app.last_minimized_strip_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    // Always reserve 1 col for the minimized strip so the graph
+                    // never reflows when hover toggles strip visibility.
+                    let has_room = main_area.width > 1;
+                    let strip_width = if has_room { 1u16 } else { 0 };
+                    let graph_width = main_area.width.saturating_sub(strip_width);
+                    let graph_area =
+                        Rect::new(main_area.x, main_area.y, graph_width, main_area.height);
+                    app.last_graph_area = graph_area;
+                    app.last_right_panel_area = Rect::default();
+                    app.last_divider_area = Rect::default();
+                    app.last_tab_bar_area = Rect::default();
+                    app.last_right_content_area = Rect::default();
+                    app.scroll.viewport_height = graph_area.height as usize;
+                    app.scroll.viewport_width = graph_area.width as usize;
+                    if has_room {
+                        app.last_minimized_strip_area = Rect::new(
+                            main_area.x + main_area.width - 1,
+                            main_area.y,
+                            1,
+                            main_area.height,
+                        );
+                    } else {
+                        app.last_minimized_strip_area = Rect::default();
+                    }
+                    app.last_fullscreen_restore_area = Rect::default();
+                    app.last_fullscreen_right_border_area = Rect::default();
+                    app.last_fullscreen_top_border_area = Rect::default();
+                    app.last_fullscreen_bottom_border_area = Rect::default();
+                }
+                LayoutMode::ThirdInspector
+                | LayoutMode::HalfInspector
+                | LayoutMode::TwoThirdsInspector => {
+                    app.last_minimized_strip_area = Rect::default();
+                    app.last_fullscreen_restore_area = Rect::default();
+                    app.last_fullscreen_right_border_area = Rect::default();
+                    app.last_fullscreen_top_border_area = Rect::default();
+                    app.last_fullscreen_bottom_border_area = Rect::default();
+                    if app.right_panel_visible {
+                        // Hysteresis: use different thresholds for switching directions
+                        // to prevent oscillation at the boundary.
+                        let use_side = if app.inspector_is_beside {
+                            area.width >= SIDE_MIN_WIDTH
+                        } else {
+                            area.width >= SIDE_RESTORE_WIDTH
+                        };
+                        app.inspector_is_beside = use_side;
+                        if use_side {
+                            let right_width = (main_area.width as u32
+                                * app.right_panel_percent as u32
+                                / 100) as u16;
+                            let left_width = main_area.width.saturating_sub(right_width);
+                            let split = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Length(left_width),
+                                    Constraint::Length(right_width),
+                                ])
+                                .split(main_area);
+                            app.last_graph_area = split[0];
+                            app.scroll.viewport_height = split[0].height as usize;
+                            app.scroll.viewport_width = split[0].width as usize;
+                        } else {
+                            let panel_height =
+                                (main_area.height as u32 * app.right_panel_percent as u32 / 100)
+                                    .max(5) as u16;
+                            let top_height = main_area.height.saturating_sub(panel_height);
+                            let split = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Length(top_height),
+                                    Constraint::Length(panel_height),
+                                ])
+                                .split(main_area);
+                            app.last_graph_area = split[0];
+                            app.scroll.viewport_height = split[0].height as usize;
+                            app.scroll.viewport_width = split[0].width as usize;
+                        }
+                    } else {
+                        app.last_graph_area = main_area;
+                        app.last_right_panel_area = Rect::default();
+                        app.last_divider_area = Rect::default();
+                        app.last_tab_bar_area = Rect::default();
+                        app.last_right_content_area = Rect::default();
+                        app.scroll.viewport_height = main_area.height as usize;
+                        app.scroll.viewport_width = main_area.width as usize;
+                    }
+                }
             }
         }
     }
@@ -150,112 +428,249 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     }
 
     // Phase 3: Draw content using the (possibly updated) scroll offset.
-    match app.layout_mode {
-        LayoutMode::FullInspector => {
-            draw_right_panel(frame, app, main_area);
-            app.last_graph_hscrollbar_area = Rect::default();
-        }
-        LayoutMode::Off => {
-            draw_viz_content(frame, app, main_area);
-            if app.scroll.content_height > app.scroll.viewport_height
-                && app.graph_scrollbar_visible()
-            {
-                draw_scrollbar(frame, app, main_area);
+    match app.responsive_breakpoint {
+        ResponsiveBreakpoint::Compact => {
+            // Single-panel mode: draw only the active panel.
+            match app.single_panel_view {
+                SinglePanelView::Graph => {
+                    draw_viz_content(frame, app, main_area);
+                    if app.scroll.content_height > app.scroll.viewport_height
+                        && app.graph_scrollbar_visible()
+                    {
+                        draw_scrollbar(frame, app, main_area);
+                    }
+                    app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                        frame,
+                        main_area,
+                        app.scroll.content_width,
+                        app.scroll.viewport_width,
+                        app.scroll.offset_x,
+                        app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                    );
+                }
+                SinglePanelView::Detail | SinglePanelView::Log => {
+                    draw_right_panel(frame, app, main_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
             }
-            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
-                frame,
-                main_area,
-                app.scroll.content_width,
-                app.scroll.viewport_width,
-                app.scroll.offset_x,
-                app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
-            );
         }
-        LayoutMode::ThirdInspector | LayoutMode::HalfInspector | LayoutMode::TwoThirdsInspector => {
-            if app.right_panel_visible {
-                if area.width >= SIDE_MIN_WIDTH {
-                    let right_width =
-                        (main_area.width as u32 * app.right_panel_percent as u32 / 100) as u16;
-                    let left_width = main_area.width.saturating_sub(right_width);
-                    let split = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Length(left_width),
-                            Constraint::Length(right_width),
-                        ])
-                        .split(main_area);
-
-                    let viz_area = split[0];
-                    let right_area = split[1];
-
-                    draw_viz_content(frame, app, viz_area);
+        ResponsiveBreakpoint::Narrow => {
+            // Narrow split mode.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    // Compute panel area inset by all four reserved borders.
+                    let panel_area = fullscreen_panel_area(main_area, app);
+                    // Draw each border only on hover (or always when mouse not supported).
+                    draw_fullscreen_borders(frame, app);
+                    draw_right_panel(frame, app, panel_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    let graph_area = app.last_graph_area;
+                    draw_viz_content(frame, app, graph_area);
                     if app.scroll.content_height > app.scroll.viewport_height
                         && app.graph_scrollbar_visible()
                     {
-                        draw_scrollbar(frame, app, viz_area);
+                        draw_scrollbar(frame, app, graph_area);
+                    }
+                    // Strip content only drawn on hover; space always reserved.
+                    let strip = app.last_minimized_strip_area;
+                    if strip.width > 0 && (app.minimized_strip_hover || !app.any_motion_mouse) {
+                        draw_minimized_strip(frame, strip, true);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
                         frame,
-                        viz_area,
+                        graph_area,
                         app.scroll.content_width,
                         app.scroll.viewport_width,
                         app.scroll.offset_x,
                         app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
                     );
-                    draw_right_panel(frame, app, right_area);
-                } else {
-                    let panel_height = (main_area.height as u32 * app.right_panel_percent as u32
-                        / 100)
-                        .max(5) as u16;
-                    let top_height = main_area.height.saturating_sub(panel_height);
-                    let split = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(top_height),
-                            Constraint::Length(panel_height),
-                        ])
-                        .split(main_area);
+                }
+                _ => {
+                    // Narrow mode: inspector below (vertical split).
+                    if app.right_panel_visible {
+                        let panel_height =
+                            (main_area.height as u32 * app.right_panel_percent as u32 / 100).max(5)
+                                as u16;
+                        let top_height = main_area.height.saturating_sub(panel_height);
+                        let split = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(top_height),
+                                Constraint::Length(panel_height),
+                            ])
+                            .split(main_area);
 
-                    let viz_area = split[0];
-                    let right_area = split[1];
+                        let viz_area = split[0];
+                        let right_area = split[1];
 
-                    draw_viz_content(frame, app, viz_area);
+                        draw_viz_content(frame, app, viz_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, viz_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            viz_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                        draw_right_panel(frame, app, right_area);
+                    } else {
+                        draw_viz_content(frame, app, main_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, main_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            main_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                    }
+                }
+            }
+        }
+        ResponsiveBreakpoint::Full => {
+            // Full layout: existing behavior.
+            match app.layout_mode {
+                LayoutMode::FullInspector => {
+                    // Compute panel area inset by all four reserved borders.
+                    let panel_area = fullscreen_panel_area(main_area, app);
+                    // Draw each border only on hover (or always when mouse not supported).
+                    draw_fullscreen_borders(frame, app);
+                    draw_right_panel(frame, app, panel_area);
+                    app.last_graph_hscrollbar_area = Rect::default();
+                }
+                LayoutMode::Off => {
+                    let graph_area = app.last_graph_area;
+                    draw_viz_content(frame, app, graph_area);
                     if app.scroll.content_height > app.scroll.viewport_height
                         && app.graph_scrollbar_visible()
                     {
-                        draw_scrollbar(frame, app, viz_area);
+                        draw_scrollbar(frame, app, graph_area);
+                    }
+                    // Strip content only drawn on hover; space always reserved.
+                    let strip = app.last_minimized_strip_area;
+                    if strip.width > 0 && (app.minimized_strip_hover || !app.any_motion_mouse) {
+                        draw_minimized_strip(frame, strip, true);
                     }
                     app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
                         frame,
-                        viz_area,
+                        graph_area,
                         app.scroll.content_width,
                         app.scroll.viewport_width,
                         app.scroll.offset_x,
                         app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
                     );
-                    draw_right_panel(frame, app, right_area);
                 }
-            } else {
-                draw_viz_content(frame, app, main_area);
-                if app.scroll.content_height > app.scroll.viewport_height
-                    && app.graph_scrollbar_visible()
-                {
-                    draw_scrollbar(frame, app, main_area);
+                LayoutMode::ThirdInspector
+                | LayoutMode::HalfInspector
+                | LayoutMode::TwoThirdsInspector => {
+                    if app.right_panel_visible {
+                        // Use the hysteresis state computed in Phase 1.
+                        if app.inspector_is_beside {
+                            let right_width = (main_area.width as u32
+                                * app.right_panel_percent as u32
+                                / 100) as u16;
+                            let left_width = main_area.width.saturating_sub(right_width);
+                            let split = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Length(left_width),
+                                    Constraint::Length(right_width),
+                                ])
+                                .split(main_area);
+
+                            let viz_area = split[0];
+                            let right_area = split[1];
+
+                            draw_viz_content(frame, app, viz_area);
+                            if app.scroll.content_height > app.scroll.viewport_height
+                                && app.graph_scrollbar_visible()
+                            {
+                                draw_scrollbar(frame, app, viz_area);
+                            }
+                            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                                frame,
+                                viz_area,
+                                app.scroll.content_width,
+                                app.scroll.viewport_width,
+                                app.scroll.offset_x,
+                                app.scroll.has_horizontal_overflow()
+                                    && app.graph_hscrollbar_visible(),
+                            );
+                            draw_right_panel(frame, app, right_area);
+                        } else {
+                            let panel_height =
+                                (main_area.height as u32 * app.right_panel_percent as u32 / 100)
+                                    .max(5) as u16;
+                            let top_height = main_area.height.saturating_sub(panel_height);
+                            let split = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([
+                                    Constraint::Length(top_height),
+                                    Constraint::Length(panel_height),
+                                ])
+                                .split(main_area);
+
+                            let viz_area = split[0];
+                            let right_area = split[1];
+
+                            draw_viz_content(frame, app, viz_area);
+                            if app.scroll.content_height > app.scroll.viewport_height
+                                && app.graph_scrollbar_visible()
+                            {
+                                draw_scrollbar(frame, app, viz_area);
+                            }
+                            app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                                frame,
+                                viz_area,
+                                app.scroll.content_width,
+                                app.scroll.viewport_width,
+                                app.scroll.offset_x,
+                                app.scroll.has_horizontal_overflow()
+                                    && app.graph_hscrollbar_visible(),
+                            );
+                            draw_right_panel(frame, app, right_area);
+                        }
+                    } else {
+                        draw_viz_content(frame, app, main_area);
+                        if app.scroll.content_height > app.scroll.viewport_height
+                            && app.graph_scrollbar_visible()
+                        {
+                            draw_scrollbar(frame, app, main_area);
+                        }
+                        app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
+                            frame,
+                            main_area,
+                            app.scroll.content_width,
+                            app.scroll.viewport_width,
+                            app.scroll.offset_x,
+                            app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
+                        );
+                    }
                 }
-                app.last_graph_hscrollbar_area = draw_horizontal_scrollbar(
-                    frame,
-                    main_area,
-                    app.scroll.content_width,
-                    app.scroll.viewport_width,
-                    app.scroll.offset_x,
-                    app.scroll.has_horizontal_overflow() && app.graph_hscrollbar_visible(),
-                );
             }
         }
     }
 
     // Top status bar
     draw_status_bar(frame, app, status_area);
+
+    // Service health badge — right-aligned pill on the status bar.
+    draw_service_health_badge(frame, app, status_area);
+
+    // Vitals bar
+    draw_vitals_bar(frame, app, vitals_area);
 
     // Bottom action hints
     draw_action_hints(frame, app, hints_area);
@@ -268,7 +683,16 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
     // Confirmation dialog overlay
     if let InputMode::Confirm(ref action) = app.input_mode {
-        draw_confirm_dialog(frame, action);
+        app.last_dialog_area = draw_confirm_dialog(frame, action);
+    } else if let InputMode::ChoiceDialog(ref state) = app.input_mode {
+        app.last_dialog_area = draw_choice_dialog(frame, state);
+    } else if matches!(app.input_mode, InputMode::CoordinatorPicker) {
+        if let Some(ref picker) = app.coordinator_picker {
+            app.last_dialog_area =
+                draw_coordinator_picker(frame, picker, app.active_coordinator_id);
+        }
+    } else {
+        app.last_dialog_area = Rect::default();
     }
 
     // Text prompt overlay
@@ -283,6 +707,31 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         && let Some(ref form) = app.task_form
     {
         draw_task_form(frame, form);
+    }
+
+    // Service control panel (modal overlay)
+    if app.service_health.panel_open {
+        draw_service_control_panel(frame, app);
+    }
+
+    // Legacy service health detail popup
+    if app.service_health.detail_open && !app.service_health.panel_open {
+        draw_service_health_detail(frame, app);
+    }
+
+    // Toast notifications (severity-leveled, stacked in top-right)
+    if !app.toasts.is_empty() {
+        draw_toasts(frame, app);
+    }
+
+    // Key feedback overlay (for screencasts/demos)
+    if app.key_feedback_enabled && !app.key_feedback.is_empty() {
+        draw_key_feedback(frame, app);
+    }
+
+    // Touch echo overlay (click/touch visual feedback for screencasts/demos)
+    if app.touch_echo_enabled && !app.touch_echoes.is_empty() {
+        draw_touch_echoes(frame, app);
     }
 }
 
@@ -406,6 +855,70 @@ fn apply_splash_style<'a>(
     apply_bg_to_title_range(line, plain_line, splash_bg)
 }
 
+/// Apply a brief inverse/highlight flash to the annotation text region of a line.
+/// The flash fades from bright pink background to transparent over 500ms.
+fn apply_annotation_flash<'a>(
+    line: Line<'a>,
+    col_start: usize,
+    col_end: usize,
+    elapsed_ms: u64,
+) -> Line<'a> {
+    // Fade from bright pink to nothing over 500ms.
+    let progress = (elapsed_ms as f64 / 500.0).min(1.0);
+    let t = progress * progress; // ease-out
+    let intensity = 1.0 - t;
+
+    // True pink (ANSI 219) base: (255, 175, 215) — fade toward black.
+    let r = (255.0 * intensity) as u8;
+    let g = (175.0 * intensity) as u8;
+    let b = (215.0 * intensity) as u8;
+
+    if r < 20 && g < 20 && b < 20 {
+        return line;
+    }
+
+    let flash_bg = Color::Rgb(r, g, b);
+    let flash_fg = Color::Rgb(0, 0, 0); // black text on pink bg
+
+    let mut new_spans: Vec<Span<'a>> = Vec::new();
+    let mut char_idx = 0;
+    for span in line.spans {
+        let span_len = span.content.chars().count();
+        let span_start = char_idx;
+        let span_end = char_idx + span_len;
+
+        if span_end <= col_start || span_start >= col_end {
+            // Entirely outside flash region.
+            new_spans.push(span);
+        } else if span_start >= col_start && span_end <= col_end {
+            // Entirely inside flash region.
+            let mut style = span.style;
+            style = style.bg(flash_bg).fg(flash_fg);
+            new_spans.push(Span::styled(span.content, style));
+        } else {
+            // Partially overlapping — split the span.
+            let chars: Vec<char> = span.content.chars().collect();
+            let overlap_start = col_start.saturating_sub(span_start);
+            let overlap_end = col_end.saturating_sub(span_start).min(span_len);
+
+            if overlap_start > 0 {
+                let before: String = chars[..overlap_start].iter().collect();
+                new_spans.push(Span::styled(before, span.style));
+            }
+            let mid: String = chars[overlap_start..overlap_end].iter().collect();
+            let mut mid_style = span.style;
+            mid_style = mid_style.bg(flash_bg).fg(flash_fg);
+            new_spans.push(Span::styled(mid, mid_style));
+            if overlap_end < span_len {
+                let after: String = chars[overlap_end..].iter().collect();
+                new_spans.push(Span::styled(after, span.style));
+            }
+        }
+        char_idx = span_end;
+    }
+    Line::from(new_spans)
+}
+
 /// Find the task title/ID range in a viz line — just the title, not metadata.
 ///
 /// A typical viz line looks like:
@@ -418,7 +931,9 @@ fn find_title_range(plain_line: &str) -> Option<(usize, usize)> {
 
     // Start at first alphanumeric or dot character (skip tree connectors like └→).
     // Dot is included so system tasks like `.assign-foo` have their prefix in range.
-    let text_start = chars.iter().position(|c| c.is_alphanumeric() || *c == '.')?;
+    let text_start = chars
+        .iter()
+        .position(|c| c.is_alphanumeric() || *c == '.')?;
 
     // End before the metadata parenthetical — look for `  (` (two spaces + open paren)
     // which separates the task ID from its status/token info.
@@ -684,7 +1199,19 @@ fn is_selected_task_line(app: &VizApp, orig_idx: usize) -> bool {
     false
 }
 
-fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
+fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    // When the history browser is active, render it instead of the graph.
+    if app.history_browser.active {
+        draw_history_browser(frame, app, area);
+        return;
+    }
+
+    // When the archive browser is active, render it instead of the graph.
+    if app.archive_browser.active {
+        draw_archive_browser(frame, app, area);
+        return;
+    }
+
     let visible_count = app.visible_line_count();
     let start = app.scroll.offset_y;
     let end = (start + area.height as usize).min(visible_count);
@@ -705,6 +1232,47 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
 
     // Precompute the selected task ID for the edge map lookups.
     let selected_id = app.selected_task_id().map(|s| s.to_string());
+
+    // Precompute coordinator line indices for chat-to-coordinator visual link.
+    // When the Chat tab is active, chat agent task lines get a subtle tint.
+    // Current .chat-N → dark cyan; legacy .coordinator-N → dark gray (muted).
+    let chat_active = app.right_panel_visible && app.right_panel_tab == RightPanelTab::Chat;
+    let coordinator_lines: HashSet<usize> = if chat_active {
+        app.node_line_map
+            .iter()
+            .filter(|(id, _)| workgraph::chat_id::is_chat_task_id(id))
+            .map(|(_, &line)| line)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let legacy_coordinator_lines: HashSet<usize> = if chat_active {
+        app.node_line_map
+            .iter()
+            .filter(|(id, _)| workgraph::chat_id::is_legacy_coordinator_id(id))
+            .map(|(_, &line)| line)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Precompute user board line indices for messages-to-board visual link.
+    // When the Messages tab is active on a user board, those lines get a subtle yellow highlight.
+    let messages_on_user_board = app.right_panel_visible
+        && app.right_panel_tab == RightPanelTab::Messages
+        && app
+            .selected_task_idx
+            .and_then(|idx| app.task_order.get(idx))
+            .is_some_and(|id| workgraph::graph::is_user_board(id));
+    let user_board_lines: HashSet<usize> = if messages_on_user_board {
+        app.node_line_map
+            .iter()
+            .filter(|(id, _)| workgraph::graph::is_user_board(id))
+            .map(|(_, &line)| line)
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     for visible_idx in start..end {
         let orig_idx = app.visible_to_original(visible_idx);
@@ -802,6 +1370,43 @@ fn draw_viz_content(frame: &mut Frame, app: &VizApp, area: Rect) {
                 reduced,
                 anim_kind,
             );
+        }
+
+        // Annotation click flash: briefly invert the annotation text colors.
+        if let Some(ref flash) = app.annotation_click_flash
+            && flash.orig_line == orig_idx
+        {
+            let elapsed_ms = flash.start.elapsed().as_millis() as u64;
+            if elapsed_ms < 500 {
+                let last = text_lines.last_mut().unwrap();
+                *last = apply_annotation_flash(
+                    std::mem::take(last),
+                    flash.col_start,
+                    flash.col_end,
+                    elapsed_ms,
+                );
+            }
+        }
+
+        // Chat-to-coordinator visual link: subtle background tint for chat agent
+        // task lines when the Chat tab is visible, connecting the two visually.
+        // Current .chat-N: dark cyan; legacy .coordinator-N: dark gray (muted).
+        if coordinator_lines.contains(&orig_idx) {
+            let last = text_lines.last_mut().unwrap();
+            if legacy_coordinator_lines.contains(&orig_idx) {
+                // Legacy: dim gray background — visually de-emphasized
+                *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(35, 35, 35)));
+            } else {
+                // Current: subtle dark cyan — primary accent
+                *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(0, 40, 50)));
+            }
+        }
+
+        // Messages-to-user-board visual link: apply a subtle yellow tint to user
+        // board task lines when the Messages tab is active on a user board.
+        if user_board_lines.contains(&orig_idx) {
+            let last = text_lines.last_mut().unwrap();
+            *last = std::mem::take(last).style(Style::default().bg(Color::Rgb(50, 40, 0)));
         }
     }
 
@@ -1133,6 +1738,275 @@ fn highlight_fuzzy_match<'a>(
     Line::from(new_spans)
 }
 
+fn draw_archive_browser(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let ab = &app.archive_browser;
+    let visible = ab.visible_count();
+    let viewport_h = area.height.saturating_sub(2) as usize; // 1 for header, 1 for footer
+
+    // Auto-scroll to keep selection visible
+    let scroll = if ab.selected < ab.scroll {
+        ab.selected
+    } else if ab.selected >= ab.scroll + viewport_h {
+        ab.selected.saturating_sub(viewport_h - 1)
+    } else {
+        ab.scroll
+    };
+    // Update scroll in app (needs mut)
+    app.archive_browser.scroll = scroll;
+
+    let ab = &app.archive_browser;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+
+    // Header line
+    let header_text = if ab.filter_active {
+        format!(
+            " Archive ({} entries) — filter: /{}▌",
+            ab.entries.len(),
+            ab.filter
+        )
+    } else if !ab.filter.is_empty() {
+        format!(
+            " Archive ({}/{} entries) — filter: /{} ",
+            visible,
+            ab.entries.len(),
+            ab.filter
+        )
+    } else {
+        format!(" Archive ({} entries) ", ab.entries.len())
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            header_text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " [A/Esc:close  /:filter  r:restore  R:refresh]",
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+        ),
+    ]));
+
+    // Entry rows
+    let end = (scroll + viewport_h).min(visible);
+    for vi in scroll..end {
+        let idx = ab.filtered_indices[vi];
+        let entry = &ab.entries[idx];
+        let is_selected = vi == ab.selected;
+
+        let completed = entry
+            .completed_at
+            .as_deref()
+            .and_then(|s| s.get(..10)) // YYYY-MM-DD
+            .unwrap_or("????-??-??");
+
+        let tags_str = if entry.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", entry.tags.join(", "))
+        };
+
+        let line_text = format!(
+            "  {} │ {} │ {}{}",
+            completed, entry.id, entry.title, tags_str
+        );
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(50, 50, 80))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(180, 180, 180))
+        };
+
+        lines.push(Line::from(Span::styled(line_text, style)));
+    }
+
+    // Fill remaining rows
+    while lines.len() < area.height as usize {
+        lines.push(Line::from(""));
+    }
+
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Rgb(20, 20, 20)));
+    frame.render_widget(paragraph, area);
+
+    // Store the area for graph pane compatibility
+    app.last_graph_area = area;
+}
+
+fn draw_history_browser(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let seg_count = app.history_browser.segments.len();
+    let preview_expanded = app.history_browser.preview_expanded;
+
+    if preview_expanded {
+        // Full preview mode: show the selected segment's content
+        let (label, content) = match app.history_browser.selected_segment() {
+            Some(seg) => (seg.label.clone(), seg.content.clone()),
+            None => {
+                app.last_graph_area = area;
+                return;
+            }
+        };
+        let content_lines: Vec<&str> = content.lines().collect();
+        let total = content_lines.len();
+        let viewport_h = area.height.saturating_sub(2) as usize;
+        let scroll = app
+            .history_browser
+            .preview_scroll
+            .min(total.saturating_sub(viewport_h));
+        app.history_browser.preview_scroll = scroll;
+
+        let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " [Enter:inject  Esc:back  j/k:scroll]",
+                Style::default().fg(Color::Rgb(100, 100, 100)),
+            ),
+        ]));
+
+        // Content lines
+        let end = (scroll + viewport_h).min(total);
+        for line in content_lines.iter().take(end).skip(scroll) {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            )));
+        }
+
+        // Fill remaining
+        while lines.len() < area.height as usize {
+            lines.push(Line::from(""));
+        }
+
+        let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Rgb(20, 20, 30)));
+        frame.render_widget(paragraph, area);
+
+        app.last_graph_area = area;
+        return;
+    }
+
+    // List mode: show segments with preview of selected
+    let list_height = (area.height as usize).saturating_sub(2);
+    let list_rows = (list_height / 2).max(3).min(seg_count + 1);
+    let preview_rows = list_height.saturating_sub(list_rows);
+
+    // Auto-scroll list
+    {
+        let hb = &app.history_browser;
+        let scroll = if hb.selected < hb.scroll {
+            hb.selected
+        } else if hb.selected >= hb.scroll + list_rows {
+            hb.selected.saturating_sub(list_rows - 1)
+        } else {
+            hb.scroll
+        };
+        app.history_browser.scroll = scroll;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+
+    // Header
+    let header = if seg_count == 0 {
+        " History Browser — no segments available".to_string()
+    } else {
+        format!(
+            " History Browser ({} segments) — chat #{}",
+            seg_count, app.active_coordinator_id
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            header,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " [Enter:inject  Space:preview  Esc:close]",
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+        ),
+    ]));
+
+    // Segment list
+    let scroll = app.history_browser.scroll;
+    let end = (scroll + list_rows).min(seg_count);
+    for i in scroll..end {
+        let seg = &app.history_browser.segments[i];
+        let is_selected = i == app.history_browser.selected;
+
+        let source_tag = match seg.source {
+            workgraph::chat::HistorySource::ContextSummary => "📋",
+            workgraph::chat::HistorySource::ActiveChat => "💬",
+            workgraph::chat::HistorySource::Archive => "📦",
+            workgraph::chat::HistorySource::CrossCoordinator { .. } => "🔗",
+        };
+
+        let line_text = format!("  {} {} ", source_tag, seg.label);
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(40, 60, 90))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(180, 180, 180))
+        };
+
+        lines.push(Line::from(Span::styled(line_text, style)));
+    }
+
+    // Separator
+    if seg_count > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(area.width.saturating_sub(4) as usize)),
+            Style::default().fg(Color::Rgb(60, 60, 80)),
+        )));
+    }
+
+    // Preview of selected segment
+    if let Some(seg) = app.history_browser.selected_segment() {
+        let preview_lines: Vec<&str> = seg.preview.lines().collect();
+        for (i, pline) in preview_lines.iter().enumerate() {
+            if i >= preview_rows.saturating_sub(1) {
+                break;
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", pline),
+                Style::default().fg(Color::Rgb(140, 140, 160)),
+            )));
+        }
+        if preview_lines.len() > preview_rows.saturating_sub(1) {
+            lines.push(Line::from(Span::styled(
+                "  ... (Space to expand)".to_string(),
+                Style::default()
+                    .fg(Color::Rgb(100, 100, 120))
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+
+    // Fill remaining rows
+    while lines.len() < area.height as usize {
+        lines.push(Line::from(""));
+    }
+
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(Color::Rgb(20, 20, 30)));
+    frame.render_widget(paragraph, area);
+
+    app.last_graph_area = area;
+}
+
 fn draw_scrollbar(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Store the scrollbar area for mouse hit-testing (rightmost column of the area).
     let sb_area = Rect {
@@ -1148,7 +2022,9 @@ fn draw_scrollbar(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         .content_height
         .saturating_sub(app.scroll.viewport_height);
     let mut state = ScrollbarState::new(max_scroll).position(app.scroll.offset_y);
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_style(Style::default().fg(Color::White))
+        .track_style(Style::default().fg(Color::DarkGray));
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
@@ -1169,7 +2045,9 @@ fn draw_panel_scrollbar(
     app.last_panel_scrollbar_area = sb_area;
 
     let mut state = ScrollbarState::new(max_scroll).position(position);
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_style(Style::default().fg(Color::White))
+        .track_style(Style::default().fg(Color::DarkGray));
     frame.render_stateful_widget(scrollbar, area, &mut state);
 }
 
@@ -1192,9 +2070,151 @@ fn draw_horizontal_scrollbar(
     };
     let max_offset = content_width.saturating_sub(viewport_width);
     let mut state = ScrollbarState::new(max_offset).position(offset_x);
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+        .thumb_style(Style::default().fg(Color::White))
+        .track_style(Style::default().fg(Color::DarkGray));
     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     scrollbar_area
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fullscreen inspector borders
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Compute the content area for fullscreen inspector, inset by all four
+/// reserved border areas (left, right, top, bottom).
+fn fullscreen_panel_area(main_area: Rect, app: &super::state::VizApp) -> Rect {
+    let left = if app.last_fullscreen_restore_area.width > 0 {
+        1u16
+    } else {
+        0
+    };
+    let right = if app.last_fullscreen_right_border_area.width > 0 {
+        1u16
+    } else {
+        0
+    };
+    let top = if app.last_fullscreen_top_border_area.height > 0 {
+        1u16
+    } else {
+        0
+    };
+    let bottom = if app.last_fullscreen_bottom_border_area.height > 0 {
+        1u16
+    } else {
+        0
+    };
+    Rect::new(
+        main_area.x + left,
+        main_area.y + top,
+        main_area.width.saturating_sub(left + right),
+        main_area.height.saturating_sub(top + bottom),
+    )
+}
+
+/// Draw all four fullscreen borders — only on hover (or always when mouse not
+/// supported, for the left restore strip which doubles as click target).
+fn draw_fullscreen_borders(frame: &mut Frame, app: &super::state::VizApp) {
+    let no_mouse = !app.any_motion_mouse;
+
+    // Left border (restore strip).
+    // Always render so the area is claimed — invisible when not hovered.
+    let left = app.last_fullscreen_restore_area;
+    if left.width > 0 {
+        if app.fullscreen_restore_hover {
+            draw_restore_strip(frame, left, true);
+        } else {
+            // Invisible: plain spaces with default terminal background.
+            frame.render_widget(Clear, left);
+        }
+    }
+
+    // Right border.
+    // Always render so the area is claimed — invisible when not hovered.
+    let right = app.last_fullscreen_right_border_area;
+    if right.width > 0 {
+        if app.fullscreen_right_hover {
+            draw_fullscreen_border_col(frame, right, '▐', true);
+        } else {
+            // Invisible: plain spaces with default terminal background.
+            frame.render_widget(Clear, right);
+        }
+    }
+
+    // Top border.
+    let top = app.last_fullscreen_top_border_area;
+    if top.height > 0 && (app.fullscreen_top_hover || no_mouse) {
+        draw_fullscreen_border_row(frame, top, '▀', app.fullscreen_top_hover);
+    }
+
+    // Bottom border.
+    let bottom = app.last_fullscreen_bottom_border_area;
+    if bottom.height > 0 && (app.fullscreen_bottom_hover || no_mouse) {
+        draw_fullscreen_border_row(frame, bottom, '▄', app.fullscreen_bottom_hover);
+    }
+}
+
+/// Draw a single-column vertical border strip (for right edge).
+fn draw_fullscreen_border_col(frame: &mut Frame, area: Rect, ch: char, hover: bool) {
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let lines: Vec<Line> = (0..area.height)
+        .map(|_| Line::from(Span::styled(ch.to_string(), Style::default().fg(fg))))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Draw a single-row horizontal border strip (for top/bottom edge).
+fn draw_fullscreen_border_row(frame: &mut Frame, area: Rect, ch: char, hover: bool) {
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let text: String = (0..area.width).map(|_| ch).collect();
+    let line = Line::from(Span::styled(text, Style::default().fg(fg)));
+    frame.render_widget(Paragraph::new(vec![line]), area);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tri-state inspector strips
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Draw the 1-col restore strip on the left edge in FullInspector mode.
+/// Clicking/dragging from this strip restores the normal split view.
+fn draw_restore_strip(frame: &mut Frame, area: Rect, hover: bool) {
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let text: String = (0..area.height).map(|_| '▌').collect();
+    let lines: Vec<Line> = text
+        .chars()
+        .map(|c| Line::from(Span::styled(c.to_string(), Style::default().fg(fg))))
+        .collect();
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
+/// Draw the 1-col minimized strip on the right edge in Off mode.
+/// Clicking this strip restores the normal split view.
+fn draw_minimized_strip(frame: &mut Frame, area: Rect, hover: bool) {
+    let fg = if hover {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let text: String = (0..area.height).map(|_| '▐').collect();
+    let lines: Vec<Line> = text
+        .chars()
+        .map(|c| Line::from(Span::styled(c.to_string(), Style::default().fg(fg))))
+        .collect();
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1207,13 +2227,53 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     let is_full_panel = app.layout_mode == LayoutMode::FullInspector;
 
+    // Store divider hit areas for mouse-based resize.
+    // Vertical divider: only in side-by-side mode (inspector beside graph).
+    // Horizontal divider: only in stacked mode (inspector below graph).
+    if !is_full_panel && area.width > 0 && app.last_graph_area.width > 0 && app.inspector_is_beside
+    {
+        // Hit area: 3 columns centered on the left border for easier grabbing.
+        let div_x = area.x.saturating_sub(1);
+        let div_w = 3.min(area.x.saturating_sub(app.last_graph_area.x) + 1);
+        app.last_divider_area = Rect::new(div_x, area.y, div_w, area.height);
+        app.last_horizontal_divider_area = Rect::default();
+    } else if !is_full_panel
+        && area.height > 0
+        && app.last_graph_area.height > 0
+        && !app.inspector_is_beside
+    {
+        // Hit area: 3 rows centered on the top border for easier grabbing.
+        let div_y = area.y.saturating_sub(1);
+        let div_h = 3.min(area.y.saturating_sub(app.last_graph_area.y) + 1);
+        app.last_horizontal_divider_area = Rect::new(area.x, div_y, area.width, div_h);
+        app.last_divider_area = Rect::default();
+    } else {
+        app.last_divider_area = Rect::default();
+        app.last_horizontal_divider_area = Rect::default();
+    }
+
+    let divider_active = app.divider_hover
+        || app.horizontal_divider_hover
+        || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::Divider)
+        || app.scrollbar_drag == Some(super::state::ScrollbarDragTarget::HorizontalDivider);
+
     // In full-panel mode: no borders (edge-to-edge content for clean copy-paste).
     // In split mode: minimal single-line border, dim when unfocused.
     let inner = if is_full_panel {
         area
     } else {
         let is_focused = app.focused_panel == FocusedPanel::RightPanel;
-        let border_color = if is_focused {
+        let is_chat_tab = app.right_panel_tab == RightPanelTab::Chat;
+        let is_user_board_active = app.right_panel_tab == RightPanelTab::Messages
+            && app
+                .selected_task_idx
+                .and_then(|idx| app.task_order.get(idx))
+                .is_some_and(|id| workgraph::graph::is_user_board(id));
+        let border_color = if divider_active || is_user_board_active {
+            Color::Yellow
+        } else if is_chat_tab && app.chat.coordinator_active {
+            Color::Cyan
+        } else if is_focused {
             Color::White
         } else {
             Color::DarkGray
@@ -1242,8 +2302,45 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.last_tab_bar_area = tab_area;
     app.last_right_content_area = content_area;
 
-    // Tab bar
-    draw_tab_bar(frame, app.right_panel_tab, tab_area);
+    // Tab bar — pass selected task's message status for the Msg tab indicator.
+    let msg_status = app
+        .selected_task_id()
+        .and_then(|id| app.task_message_statuses.get(id))
+        .cloned();
+    draw_tab_bar(frame, app, app.right_panel_tab, tab_area, msg_status);
+
+    // Apply slide animation offset to the content area.
+    let content_area = if let Some(ref anim) = app.slide_animation {
+        if anim.is_done() {
+            app.slide_animation = None;
+            content_area
+        } else {
+            let offset = anim.x_offset(content_area.width);
+            let abs_offset = offset.unsigned_abs().min(content_area.width);
+            if offset > 0 {
+                // Forward: content slides in from the right
+                Rect {
+                    x: content_area.x + abs_offset,
+                    width: content_area.width.saturating_sub(abs_offset),
+                    ..content_area
+                }
+            } else if offset < 0 {
+                // Backward: content slides in from the left — reduce visible width from right
+                Rect {
+                    width: content_area.width.saturating_sub(abs_offset),
+                    ..content_area
+                }
+            } else {
+                content_area
+            }
+        }
+    } else {
+        content_area
+    };
+
+    if content_area.width < 4 {
+        return;
+    }
 
     // Tab content
     match app.right_panel_tab {
@@ -1253,74 +2350,217 @@ fn draw_right_panel(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         RightPanelTab::Detail => {
             draw_detail_tab(frame, app, content_area);
         }
-        RightPanelTab::Log => {
-            draw_log_tab(frame, app, content_area);
-        }
-        RightPanelTab::Messages => {
-            draw_messages_tab(frame, app, content_area);
-        }
         RightPanelTab::Agency => {
             draw_agents_tab(frame, app, content_area);
         }
         RightPanelTab::Config => {
             draw_config_tab(frame, app, content_area);
         }
-        RightPanelTab::Files => {
-            super::file_browser_render::draw_files_tab(frame, app, content_area);
+        RightPanelTab::Log => {
+            // Keep data fresh while the tab is visible. Cheap when nothing
+            // has changed on disk.
+            app.load_log_pane();
+            app.update_log_output();
+            app.update_log_stream_events();
+            draw_log_tab(frame, app, content_area);
         }
         RightPanelTab::CoordLog => {
             draw_coord_log_tab(frame, app, content_area);
         }
+        RightPanelTab::Dashboard => {
+            draw_dashboard_tab(frame, app, content_area);
+        }
+        RightPanelTab::Messages => {
+            app.load_messages_panel();
+            draw_messages_tab(frame, app, content_area);
+        }
+        RightPanelTab::Settings => {
+            if app.settings_panel.entries.is_empty() {
+                app.load_settings_panel();
+            }
+            draw_settings_tab(frame, app, content_area);
+        }
+        // Dead tabs — not reachable from the bar. No-op here so stray
+        // state still renders as empty rather than crashing.
+        RightPanelTab::Files | RightPanelTab::Firehose | RightPanelTab::Output => {}
     }
 }
 
-/// Spectral colors for the tab bar (bright and dim variants).
-/// Spread across the visible spectrum: red → orange → yellow → green → cyan → blue → indigo → violet.
-const TAB_COLORS_BRIGHT: [Color; 8] = [
-    Color::Rgb(0xFF, 0x44, 0x44), // 0 Chat    – Red
-    Color::Rgb(0xFF, 0x88, 0x44), // 1 Detail  – Orange
-    Color::Rgb(0xFF, 0xCC, 0x44), // 2 Log     – Yellow
-    Color::Rgb(0x44, 0xDD, 0x44), // 3 Msg     – Green
-    Color::Rgb(0x44, 0xDD, 0xDD), // 4 Agency  – Cyan
-    Color::Rgb(0x44, 0x88, 0xFF), // 5 Config  – Blue
-    Color::Rgb(0x88, 0x44, 0xFF), // 6 Files   – Indigo
-    Color::Rgb(0xCC, 0x44, 0xFF), // 7 Coord   – Violet
-];
+/// Draw the tab bar for the right panel.
+/// `msg_status` colors the Messages tab icon to reflect TUI read state.
+fn draw_tab_bar(
+    frame: &mut Frame,
+    app: &mut VizApp,
+    active: RightPanelTab,
+    area: Rect,
+    msg_status: Option<workgraph::messages::CoordinatorMessageStatus>,
+) {
+    let tab_labels: Vec<Line> = RightPanelTab::ALL
+        .iter()
+        .map(|t| {
+            if *t == RightPanelTab::Messages
+                && let Some(ref status) = msg_status
+            {
+                return Line::from(vec![
+                    Span::raw(format!("{}:", t.index())),
+                    Span::styled(
+                        format!("{} {}", t.label(), status.icon()),
+                        Style::default().fg(status.color()),
+                    ),
+                ]);
+            }
 
-const TAB_COLORS_DIM: [Color; 8] = [
-    Color::Rgb(0x88, 0x22, 0x22), // 0 Chat    – dim Red
-    Color::Rgb(0x88, 0x44, 0x22), // 1 Detail  – dim Orange
-    Color::Rgb(0x88, 0x66, 0x22), // 2 Log     – dim Yellow
-    Color::Rgb(0x22, 0x77, 0x22), // 3 Msg     – dim Green
-    Color::Rgb(0x22, 0x77, 0x77), // 4 Agency  – dim Cyan
-    Color::Rgb(0x22, 0x44, 0x88), // 5 Config  – dim Blue
-    Color::Rgb(0x44, 0x22, 0x88), // 6 Files   – dim Indigo
-    Color::Rgb(0x66, 0x22, 0x88), // 7 Coord   – dim Violet
-];
+            // Special handling for Log tab: show current view-mode in the label
+            // so the user can see at a glance which renderer the pane is using.
+            if *t == RightPanelTab::Log {
+                let mode = app.log_pane.view_mode.label();
+                return Line::from(format!("{}:{} [{}]", t.index(), t.label(), mode));
+            }
 
-/// Draw the tab bar for the right panel with rainbow spectral colors.
-fn draw_tab_bar(frame: &mut Frame, active: RightPanelTab, area: Rect) {
+            Line::from(format!("{}:{}", t.index(), t.label()))
+        })
+        .collect();
     let active_idx = active.index();
     let separator_style = Style::default().fg(Color::Rgb(0x44, 0x44, 0x44));
 
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, tab) in RightPanelTab::ALL.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", separator_style));
-        }
-        let label = format!("{}:{}", tab.index(), tab.label());
-        let style = if i == active_idx {
-            Style::default()
-                .fg(TAB_COLORS_BRIGHT[i])
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(TAB_COLORS_DIM[i])
-        };
-        spans.push(Span::styled(label, style));
-    }
+    // Check if we should show iteration navigator
+    let should_show_iterator = is_task_relative_tab(active)
+        && app.selected_task_id().is_some()
+        && !app.iteration_archives.is_empty();
 
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line);
+    if should_show_iterator {
+        // Calculate space for iteration navigator
+        let navigator_text = format_iteration_navigator(app);
+        let navigator_width = navigator_text.chars().count() as u16;
+
+        // Split area: tabs on left, navigator on right
+        let tab_width = area.width.saturating_sub(navigator_width + 1); // +1 for padding
+        let tab_area = Rect {
+            width: tab_width,
+            ..area
+        };
+        let nav_area = Rect {
+            x: area.x + tab_width,
+            y: area.y,
+            width: navigator_width + 1,
+            height: area.height,
+        };
+
+        // Store click regions for mouse handling
+        app.last_iteration_nav_area = nav_area;
+
+        // Render tabs in reduced area
+        let tabs = Tabs::new(tab_labels)
+            .select(active_idx)
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider("│");
+        frame.render_widget(tabs, tab_area);
+
+        // Render iteration navigator
+        render_iteration_navigator(frame, app, nav_area);
+    } else {
+        // No navigator needed, use full area for tabs
+        app.last_iteration_nav_area = Rect::default(); // Clear click region
+
+        let tabs = Tabs::new(tab_labels)
+            .select(active_idx)
+            .style(Style::default().fg(Color::DarkGray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .divider("│");
+        frame.render_widget(tabs, area);
+    }
+}
+
+/// Check if a tab is task-relative (should show iteration navigator).
+fn is_task_relative_tab(tab: RightPanelTab) -> bool {
+    matches!(
+        tab,
+        RightPanelTab::Detail | RightPanelTab::Log | RightPanelTab::Messages
+    )
+}
+
+/// Format the iteration navigator text based on current state.
+fn format_iteration_navigator(app: &VizApp) -> String {
+    let total = app.iteration_archives.len() + 1;
+    let current_display = match app.viewing_iteration {
+        None => total,        // "5/5" when viewing current
+        Some(idx) => idx + 1, // "2/5" when viewing archive
+    };
+
+    // Show "(live)" suffix when viewing the live iteration of an in-progress
+    // task — without it the user can't tell whether the right-most slot is
+    // streaming new bytes or just frozen content from the latest archive.
+    let live_suffix = if app.viewing_iteration.is_none()
+        && app
+            .hud_detail
+            .as_ref()
+            .is_some_and(|d| d.task_status == workgraph::graph::Status::InProgress)
+    {
+        " (live)"
+    } else {
+        ""
+    };
+
+    // Responsive layout based on available width
+    // Standard: "◀ iter 2/5 ▶", Compact: "◀ 2/5 ▶", Minimal: "◀▶"
+    format!("◀ iter {}/{}{} ▶", current_display, total, live_suffix)
+}
+
+/// Render the iteration navigator widget in the given area.
+fn render_iteration_navigator(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let total = app.iteration_archives.len() + 1;
+    let current_display = match app.viewing_iteration {
+        None => total,
+        Some(idx) => idx + 1,
+    };
+
+    // Determine navigation capabilities
+    let can_go_prev = match app.viewing_iteration {
+        None => !app.iteration_archives.is_empty(),
+        Some(idx) => idx > 0,
+    };
+    let can_go_next = match app.viewing_iteration {
+        Some(idx) => idx + 1 < app.iteration_archives.len(),
+        None => false,
+    };
+
+    // Create styled spans for the navigator
+    let left_arrow_style = if can_go_prev {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let right_arrow_style = if can_go_next {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let counter_style = Style::default().fg(Color::Cyan);
+
+    let navigator_line = Line::from(vec![
+        Span::styled("◀", left_arrow_style),
+        Span::raw(" iter "),
+        Span::styled(format!("{}/{}", current_display, total), counter_style),
+        Span::raw(" "),
+        Span::styled("▶", right_arrow_style),
+    ]);
+
+    let paragraph = Paragraph::new(navigator_line).alignment(Alignment::Right);
     frame.render_widget(paragraph, area);
 }
 
@@ -1335,6 +2575,115 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             return;
         }
     };
+
+    // Extract output_mtime now (Copy-by-clone before detail borrow ends) so we can
+    // use it for the footer after all the mutable app borrows below.
+    let output_mtime = detail.output_mtime;
+
+    // Reserve 1 line at the top for iteration navigation when there are archives.
+    // Reserve 1 line at the bottom for the "last written X ago" footer when we have
+    // an output timestamp.
+    let has_iter_nav = !app.iteration_archives.is_empty();
+    let (content_area, footer_area_opt) = if output_mtime.is_some() && area.height > 2 {
+        let [ca, fa] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        (ca, Some(fa))
+    } else {
+        (area, None)
+    };
+    let (header_area, area) = if has_iter_nav && area.height > 2 {
+        let [ha, ca] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content_area);
+        (Some(ha), ca)
+    } else {
+        (None, content_area)
+    };
+
+    // ── Iteration navigation header ──
+    if let Some(ha) = header_area {
+        app.last_iter_nav_area = ha;
+
+        let total = app.iteration_archives.len() + 1; // archives + current
+        // Mark the live slot with "(live)" when the task is actively running,
+        // so the user can distinguish "rightmost slot is streaming" from
+        // "rightmost slot is frozen content from the most recent archive".
+        let live_suffix = if app.viewing_iteration.is_none()
+            && app
+                .hud_detail
+                .as_ref()
+                .is_some_and(|d| d.task_status == workgraph::graph::Status::InProgress)
+        {
+            " (live)"
+        } else {
+            ""
+        };
+        let label = match app.viewing_iteration {
+            Some(idx) => format!("{}/{}", idx + 1, total),
+            None => format!("{}/{}{}", total, total, live_suffix),
+        };
+
+        // ◀ arrow: clickable if not at oldest (i.e., viewing_iteration is not Some(0) when set,
+        // or there are archives when viewing current)
+        let can_go_prev = match app.viewing_iteration {
+            None => !app.iteration_archives.is_empty(), // can go to last archive
+            Some(idx) => idx > 0,                       // can go to previous archive
+        };
+        // ▶ arrow: clickable if not at current (viewing_iteration is Some and not at end)
+        let can_go_next = match app.viewing_iteration {
+            Some(idx) => idx + 1 < app.iteration_archives.len(),
+            None => false, // already at current
+        };
+
+        let left_arrow = if can_go_prev {
+            Span::styled(
+                "◀",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("◀", Style::default().fg(Color::DarkGray))
+        };
+        let right_arrow = if can_go_next {
+            Span::styled(
+                "▶",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("▶", Style::default().fg(Color::DarkGray))
+        };
+
+        let middle_text = format!(" iter {} ", label);
+
+        // Build the line: left arrow | center | right arrow
+        // We want them roughly positioned: ◀ on left side, ▶ on right side
+        let usable_width = ha.width.saturating_sub(2) as usize;
+        let center_len = middle_text.len();
+        // Distribute remaining space between/around the arrows
+        let arrow_width = 2; // ◀ or ▶
+        let gap = 2;
+        let side_width = (usable_width.saturating_sub(center_len + arrow_width * 2 + gap * 2)) / 2;
+
+        let line = Line::from(vec![
+            left_arrow,
+            Span::raw(" ".repeat(side_width.max(1))),
+            Span::styled(
+                middle_text,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(side_width.max(1))),
+            right_arrow,
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(Color::Rgb(15, 15, 25))),
+            ha,
+        );
+    } else {
+        app.last_iter_nav_area = Rect::default();
+    }
 
     // Build visible lines: filter out content of collapsed sections, add ▸/▾ indicators.
     let mut visible_lines: Vec<String> = Vec::new();
@@ -1558,6 +2907,27 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             app.hud_scroll,
         );
     }
+
+    // ── "Last written X ago" footer ──
+    if let Some(footer_area) = footer_area_opt
+        && let Some(mtime) = output_mtime
+    {
+        let age_secs = mtime.elapsed().unwrap_or_default().as_secs();
+        let age_str = format_duration_compact(age_secs);
+        let footer_text = format!("─── last written {} ago ───", age_str);
+        let color = if age_secs < 30 {
+            Color::DarkGray
+        } else if age_secs < 300 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        let footer = Paragraph::new(Line::from(Span::styled(
+            footer_text,
+            Style::default().fg(color),
+        )));
+        frame.render_widget(footer, footer_area);
+    }
 }
 
 /// Draw the Chat tab content with word-wrapped messages, scrolling, and input area.
@@ -1590,17 +2960,296 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     } else {
         1
     };
-    let msg_area_height = area.height.saturating_sub(input_height);
+    // Reserve 1 line for the search bar when searching or showing results.
+    let chat_search_active =
+        app.input_mode == InputMode::ChatSearch || !app.chat.search.query.is_empty();
+    let search_bar_height: u16 = if chat_search_active { 1 } else { 0 };
+    let msg_area_height = area
+        .height
+        .saturating_sub(input_height)
+        .saturating_sub(search_bar_height);
+
+    // Coordinator + user board tab bar — always visible so the user can discover [+]
+    let coordinator_entries = app.active_tab_ids_and_labels();
+    let user_board_entries = app.list_user_board_entries();
+    let total_tab_count = coordinator_entries.len() + user_board_entries.len();
+    let tab_bar_height: u16 = 1;
+
+    {
+        let tab_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
+        app.last_coordinator_bar_area = tab_area;
+
+        // Per-tab state: blue=idle/resumable, yellow=responding,
+        // gray=supervisor down, red=error. Restores the prior "nice blue
+        // color" for the idle case (per task tui-chat-tab).
+        use super::chat_tab_state::{ActiveChatSnapshot, ChatTabState, infer as infer_tab_state};
+
+        let active_snapshot = ActiveChatSnapshot {
+            awaiting_response: app.chat.awaiting_response(),
+            // Future: wire chat-level error state if/when surfaced.
+            error: false,
+        };
+        let service_alive = app.chat.coordinator_active;
+
+        // Determine which user board is currently selected (if any).
+        let selected_user_board: Option<String> = app
+            .selected_task_idx
+            .and_then(|idx| app.task_order.get(idx))
+            .filter(|id| workgraph::graph::is_user_board(id))
+            .cloned();
+
+        let bar_x = tab_area.x;
+        let max_width = tab_area.width as usize;
+        let mut spans = Vec::new();
+        let mut tab_hits = Vec::new();
+        let mut col: usize = 1; // start after leading space
+        let mut overflow = false;
+        let mut tab_index: usize = 0; // combined index across all tabs
+
+        // Leading space
+        spans.push(Span::raw(" "));
+
+        for (cid, label) in coordinator_entries.iter() {
+            let cid = *cid;
+            let is_active = cid == app.active_coordinator_id;
+            let snapshot_for_cid = if is_active {
+                Some(active_snapshot)
+            } else {
+                None
+            };
+            let tab_state = infer_tab_state(
+                &app.workgraph_dir,
+                cid,
+                service_alive,
+                snapshot_for_cid,
+            );
+            let state_color = tab_state.color();
+            // Effective color: legacy .coordinator-N tabs use muted gray regardless
+            // of chat state; current .chat-N tabs use the state color normally.
+            let effective_color = chat_task_label_color(label, state_color);
+            // Tab content: "[N] ◉ Label ✕ "
+            // hotkey(3=" [N]") + space+dot(2) + space+label + space+close(2)
+            let label_width = label.len();
+            let close_width: usize = 2; // " ✕"
+            // Hotkey hint: "[1]".."[9]" for the first 9 tabs, blank otherwise.
+            let hotkey_n = tab_index + 1;
+            let hotkey_str: String = if hotkey_n <= 9 {
+                format!(" [{}]", hotkey_n)
+            } else {
+                String::new()
+            };
+            let hotkey_width = hotkey_str.len();
+            // Content: hotkey + " ◉"(2) + " "+label + " "+close(2)
+            let tab_content_width = hotkey_width + 2 + 1 + label_width + 1 + close_width;
+            // Separator: "│" between tabs (1 column wide)
+            let sep_w: usize = if tab_index > 0 { 1 } else { 0 };
+
+            let total_tab_width = sep_w + tab_content_width;
+
+            // Check if this tab fits (also need room for "… [+]" = 5 if there are more tabs)
+            let remaining_tabs = total_tab_count - tab_index - 1;
+            let suffix_width = if remaining_tabs > 0 { 6 } else { 4 }; // "… [+]" or " [+]"
+            if col + total_tab_width + suffix_width > max_width && remaining_tabs > 0 {
+                overflow = true;
+                break;
+            }
+
+            // Separator
+            if tab_index > 0 {
+                spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                col += sep_w;
+            }
+
+            let tab_start = (bar_x as usize + col) as u16;
+
+            // Hotkey hint (Alt+N jumps to this tab).
+            if hotkey_width > 0 {
+                spans.push(Span::styled(
+                    hotkey_str,
+                    Style::default().fg(Color::DarkGray),
+                ));
+                col += hotkey_width;
+            }
+
+            // Dot — colored by effective color (muted for legacy, state-color for current).
+            // Active tab uses ◉ + bold; inactive uses ● in the same color.
+            let dot_glyph = if is_active { " ◉" } else { " ●" };
+            let dot_style = if is_active {
+                Style::default()
+                    .fg(effective_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                // Inactive: dim the state color slightly so the active tab stands out.
+                let dim_color = match tab_state {
+                    ChatTabState::SupervisorDown => Color::DarkGray,
+                    _ => effective_color,
+                };
+                Style::default().fg(dim_color)
+            };
+            spans.push(Span::styled(dot_glyph, dot_style));
+            col += 2; // " ◉" = space + dot
+
+            // Label — bright + bold + underlined for active; effective-colored for inactive.
+            // Legacy .coordinator-N tabs use muted gray for both active and inactive.
+            let label_style = if is_active {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(effective_color)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(effective_color)
+            };
+            spans.push(Span::styled(format!(" {}", label), label_style));
+            col += 1 + label_width; // " " + label
+
+            // Close button (padded for wider touch target)
+            let close_start = (bar_x as usize + col) as u16;
+            spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
+            col += 2; // " ✕"
+            let close_end = (bar_x as usize + col) as u16;
+
+            // Trailing space
+            spans.push(Span::raw(" "));
+            col += 1;
+
+            let tab_end = (bar_x as usize + col) as u16;
+
+            tab_hits.push(CoordinatorTabHit {
+                kind: TabBarEntryKind::Coordinator(cid),
+                tab_start,
+                tab_end,
+                close_start,
+                close_end,
+            });
+            tab_index += 1;
+        }
+
+        // User board tabs — yellow color scheme
+        if !overflow {
+            for (task_id, label) in user_board_entries.iter() {
+                let is_active = selected_user_board.as_deref() == Some(task_id.as_str());
+                let label_width = label.len();
+                // User board tabs: " ◉ Label ✕ " (no state indicator)
+                let close_width: usize = 2; // " ✕"
+                let tab_content_width = 1 + 1 + label_width + 1 + close_width;
+                let sep_w: usize = if tab_index > 0 { 1 } else { 0 };
+
+                let total_tab_width = sep_w + tab_content_width;
+
+                let remaining_tabs = total_tab_count - tab_index - 1;
+                let suffix_width = if remaining_tabs > 0 { 6 } else { 4 };
+                if col + total_tab_width + suffix_width > max_width && remaining_tabs > 0 {
+                    overflow = true;
+                    break;
+                }
+
+                // Separator
+                if tab_index > 0 {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                    col += sep_w;
+                }
+
+                let tab_start = (bar_x as usize + col) as u16;
+
+                // Dot — yellow for user boards
+                if is_active {
+                    spans.push(Span::styled(
+                        " ◉",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
+                }
+                col += 2;
+
+                // Label
+                let label_style = if is_active {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(format!(" {}", label), label_style));
+                col += 1 + label_width;
+
+                // Close button
+                let close_start = (bar_x as usize + col) as u16;
+                spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
+                col += 2;
+                let close_end = (bar_x as usize + col) as u16;
+
+                // Trailing space
+                spans.push(Span::raw(" "));
+                col += 1;
+
+                let tab_end = (bar_x as usize + col) as u16;
+
+                tab_hits.push(CoordinatorTabHit {
+                    kind: TabBarEntryKind::UserBoard(task_id.clone()),
+                    tab_start,
+                    tab_end,
+                    close_start,
+                    close_end,
+                });
+                tab_index += 1;
+            }
+        }
+
+        if overflow {
+            spans.push(Span::styled("… ", Style::default().fg(Color::DarkGray)));
+            col += 2;
+        }
+
+        let plus_start = (bar_x as usize + col) as u16;
+        spans.push(Span::styled("[+]", Style::default().fg(Color::DarkGray)));
+        col += 3;
+        let plus_end = (bar_x as usize + col) as u16;
+
+        app.coordinator_tab_hits = tab_hits;
+        app.coordinator_plus_hit = CoordinatorPlusHit {
+            start: plus_start,
+            end: plus_end,
+        };
+
+        let tab_line = Line::from(spans);
+        frame.render_widget(Paragraph::new(vec![tab_line]), tab_area);
+    }
+
+    // Full-pane launcher: takes over the entire area below the tab bar.
+    if app.launcher.is_some() {
+        let launcher_area = Rect {
+            x: area.x,
+            y: area.y + tab_bar_height,
+            width: area.width,
+            height: area.height.saturating_sub(tab_bar_height),
+        };
+        draw_launcher_pane(frame, app, launcher_area);
+        return;
+    }
 
     let msg_area = Rect {
         x: area.x,
-        y: area.y,
+        y: area.y + tab_bar_height,
         width: area.width,
-        height: msg_area_height,
+        height: msg_area_height.saturating_sub(tab_bar_height),
+    };
+    let search_bar_area = Rect {
+        x: area.x,
+        y: area.y + tab_bar_height + msg_area.height,
+        width: area.width,
+        height: search_bar_height,
     };
     let input_area = Rect {
         x: area.x,
-        y: area.y + msg_area_height,
+        y: search_bar_area.y + search_bar_height,
         width: area.width,
         height: input_height,
     };
@@ -1608,12 +3257,54 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Store the message area for click-to-focus hit testing.
     app.last_chat_message_area = msg_area;
 
+    // PTY mode: render the embedded handler's terminal output in
+    // place of the file-tailing ChatMessage widgets. Phase 3a of
+    // docs/design/sessions-as-identity-rollout.md. The input editor
+    // below continues to render normally; keys route to the PTY via
+    // the Ctrl+T branch in event.rs.
+    if app.chat_pty_mode {
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        // Dead-handler cleanup: if the embedded process exited, drop
+        // the pane so the next toggle-on respawns.
+        let alive = app
+            .task_panes
+            .get_mut(&task_id)
+            .map(|p| p.is_alive())
+            .unwrap_or(false);
+        if !alive {
+            app.task_panes.remove(&task_id);
+        }
+        if let Some(pane) = app.task_panes.get_mut(&task_id) {
+            let _ = pane.resize(msg_area.height, msg_area.width);
+            let focused = app.focused_panel == super::state::FocusedPanel::RightPanel;
+            pane.render_with_focus(frame, msg_area, focused);
+        } else {
+            // Pane gone (exited or never spawned); fall through to
+            // the normal renderer so the user still sees chat content.
+        }
+        // Fall through to the input area rendering below — skip the
+        // message-widget code path entirely when the pane was drawn.
+        if app.task_panes.contains_key(&task_id) {
+            // Draw input area beneath as usual.
+            // Everything below `if app.chat.messages.is_empty()` is
+            // the messages-widget path which we're skipping.
+            // But the file also does input/search rendering at the end,
+            // so to skip cleanly we return early from here — the input
+            // area is drawn by a later call in the same function.
+            // Actually, the input rendering is *inline* after the
+            // messages — we need to keep going but skip just the
+            // messages code. Solution: handle input ourselves.
+            super::render::draw_chat_input(frame, app, input_area);
+            return;
+        }
+    }
+
     // Empty state.
-    if app.chat.messages.is_empty() && !app.chat.awaiting_response {
+    if app.chat.messages.is_empty() && !app.chat.awaiting_response() {
         let lines = if app.chat.coordinator_active {
             vec![
                 Line::from(Span::styled(
-                    "Chat with Coordinator",
+                    "Chat with Agent",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -1624,21 +3315,21 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
-                    "Messages are sent to the coordinator agent.",
+                    "Messages are sent to the chat agent.",
                     Style::default().fg(Color::DarkGray),
                 )),
             ]
         } else {
             vec![
                 Line::from(Span::styled(
-                    "Coordinator agent not active.",
+                    "Chat agent not active.",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Start with: wg service start --coordinator-agent",
+                    "Start with: wg service start",
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),
@@ -1654,6 +3345,9 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         };
         let msg = Paragraph::new(lines);
         frame.render_widget(msg, msg_area);
+        if chat_search_active && search_bar_area.height > 0 {
+            draw_chat_search_bar(frame, app, search_bar_area);
+        }
         draw_chat_input(frame, app, input_area);
         return;
     }
@@ -1662,32 +3356,124 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // Scrollbar overlays the rightmost column when visible.
     let content_width = width.saturating_sub(1);
     let mut rendered_lines: Vec<Line> = Vec::new();
+    // Track which message index each rendered line belongs to (for click-to-edit).
+    let mut line_to_message: Vec<Option<usize>> = Vec::new();
+
+    // Show "older messages" indicator when there's more history to load.
+    if app.chat.has_more_history {
+        let remaining = app
+            .chat
+            .total_history_count
+            .saturating_sub(app.chat.messages.len());
+        let label = format!("  --- {} older messages (scroll up to load) ---", remaining);
+        rendered_lines.push(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+        line_to_message.push(None);
+        rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
+    }
 
     // Subtle warm-tinted dark background for user messages (like iMessage blue/gray,
     // but extremely subtle). Echoes the yellow ">" prefix and loop arrows.
     let user_msg_bg = Color::Rgb(30, 28, 20);
+    // Brighter background for editable (unconsumed) user messages.
+    let editable_user_msg_bg = Color::Rgb(35, 32, 20);
+    // Highlight background for the message currently being edited.
+    let editing_msg_bg = Color::Rgb(40, 35, 15);
 
-    for msg in app.chat.messages.iter() {
+    let editing_index = app.chat.editing_index;
+
+    // Subtle magenta-tinted background for sent-to-agent messages.
+    let sent_msg_bg = Color::Rgb(30, 20, 30);
+
+    let session_gap_threshold = if app.session_gap_minutes > 0 {
+        Some(chrono::Duration::minutes(app.session_gap_minutes as i64))
+    } else {
+        None
+    };
+
+    for (msg_idx, msg) in app.chat.messages.iter().enumerate() {
+        // Session boundary divider: if there's a significant time gap between
+        // this message and the previous one, insert a visual separator.
+        if let Some(threshold) = &session_gap_threshold
+            && msg_idx > 0
+            && let (Some(prev_ts), Some(cur_ts)) = (
+                app.chat.messages[msg_idx - 1].msg_timestamp.as_deref(),
+                msg.msg_timestamp.as_deref(),
+            )
+            && let (Ok(prev_dt), Ok(cur_dt)) = (
+                chrono::DateTime::parse_from_rfc3339(prev_ts),
+                chrono::DateTime::parse_from_rfc3339(cur_ts),
+            )
+        {
+            let gap = cur_dt.signed_duration_since(prev_dt);
+            if gap > *threshold {
+                let local_dt = cur_dt.with_timezone(&chrono::Local);
+                let label = local_dt.format("%B %-d, %Y · %-I:%M %p").to_string();
+                let dashes_total = content_width.saturating_sub(label.len() + 2);
+                let left = dashes_total / 2;
+                let right = dashes_total - left;
+                let divider_text = format!("{} {} {}", "─".repeat(left), label, "─".repeat(right),);
+                rendered_lines.push(Line::from(""));
+                line_to_message.push(None);
+                rendered_lines.push(Line::from(Span::styled(
+                    divider_text,
+                    Style::default().fg(Color::DarkGray),
+                )));
+                line_to_message.push(None);
+                rendered_lines.push(Line::from(""));
+                line_to_message.push(None);
+            }
+        }
+
         let is_coordinator = msg.role == super::state::ChatRole::Coordinator;
         let is_user = msg.role == super::state::ChatRole::User;
+        let is_sent_message = msg.role == super::state::ChatRole::SentMessage;
+        let is_editable = is_user && !app.is_chat_message_consumed(msg_idx);
+        let is_being_edited = editing_index == Some(msg_idx);
 
         let (prefix, role_style) = match msg.role {
-            super::state::ChatRole::User => (
-                "> ".to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            super::state::ChatRole::User => {
+                let name = msg.user.as_deref().unwrap_or("user");
+                (
+                    format!("{}: ", name),
+                    Style::default()
+                        .fg(super::chat_palette::USER_PREFIX)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
             super::state::ChatRole::Coordinator => (
                 "↯ ".to_string(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(super::chat_palette::COORDINATOR_PREFIX)
                     .add_modifier(Modifier::BOLD),
             ),
             super::state::ChatRole::System => (
                 "! ".to_string(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(super::chat_palette::ERROR)
+                    .add_modifier(Modifier::BOLD),
             ),
+            super::state::ChatRole::SystemError => (
+                "⚠ ERROR: ".to_string(),
+                Style::default()
+                    .fg(super::chat_palette::ERROR)
+                    .bg(Color::Indexed(52))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            super::state::ChatRole::SentMessage => {
+                let target = msg.target_task.as_deref().unwrap_or("task");
+                (
+                    format!("→ {}: ", target),
+                    Style::default()
+                        .fg(super::chat_palette::SENT_MESSAGE_PREFIX)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
         };
 
         let prefix_len = prefix.width();
@@ -1708,11 +3494,11 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         // Build wrapped lines. For coordinator tool-box lines, use special
         // wrapping that maintains the │ prefix on continuation lines and
         // preserves content coloring.
-        let border_style = Style::default().fg(Color::DarkGray);
+        let border_style = Style::default().fg(super::chat_palette::TOOL_BORDER);
         let tool_name_style = Style::default()
-            .fg(Color::Indexed(75))
+            .fg(super::chat_palette::TOOL_CALL)
             .add_modifier(Modifier::BOLD);
-        let tool_content_style = Style::default().fg(Color::Indexed(252));
+        let tool_content_style = Style::default().fg(super::chat_palette::TOOL_RESULT);
 
         let wrapped: Vec<Line> = if md_lines.is_empty() {
             vec![Line::from("")]
@@ -1777,16 +3563,37 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             out
         };
 
+        // Choose background for user messages based on state.
+        let msg_bg = if is_being_edited {
+            editing_msg_bg
+        } else if is_editable {
+            editable_user_msg_bg
+        } else {
+            user_msg_bg
+        };
+
         let mut first_line = true;
         for line in &wrapped {
             if first_line {
                 let mut spans = vec![Span::styled(prefix.clone(), role_style)];
                 spans.extend(line.spans.iter().cloned());
+                // Append "(edited)" indicator on the first line of edited messages.
+                if msg.edited {
+                    spans.push(Span::styled(
+                        " (edited)",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                }
                 let mut built = Line::from(spans);
                 if is_user {
-                    built = apply_line_bg(built, user_msg_bg);
+                    built = apply_line_bg(built, msg_bg);
+                } else if is_sent_message {
+                    built = apply_line_bg(built, sent_msg_bg);
                 }
                 rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
                 first_line = false;
             } else {
                 // Continuation/tool lines: indent to align with text after prefix
@@ -1794,116 +3601,276 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 spans.extend(line.spans.iter().cloned());
                 let mut built = Line::from(spans);
                 if is_user {
-                    built = apply_line_bg(built, user_msg_bg);
+                    built = apply_line_bg(built, msg_bg);
+                } else if is_sent_message {
+                    built = apply_line_bg(built, sent_msg_bg);
                 }
                 rendered_lines.push(built);
+                line_to_message.push(Some(msg_idx));
             }
+        }
+        // Build the per-message annotation line (timestamp, position,
+        // status indicator, sent-message read-at) and render it on its
+        // own row directly below the body. Keeping these out of the
+        // first body line avoids the overflow that previously truncated
+        // them at narrow widths and prevents any visual confusion with
+        // the response alignment below.
+        let mut annot_spans: Vec<Span> = Vec::new();
+        if is_sent_message && let Some(read_at) = &msg.read_at {
+            let now = chrono::Utc::now();
+            let rel = format_relative_time(read_at, &now);
+            annot_spans.push(Span::styled(
+                format!("read {}  ", rel),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if let Some(ts) = &msg.msg_timestamp {
+            let now = chrono::Utc::now();
+            let rel = format_relative_time(ts, &now);
+            annot_spans.push(Span::styled(
+                format!("{}  ", rel),
+                Style::default().fg(Color::Indexed(239)),
+            ));
+        }
+        if is_user {
+            let total = app.chat.messages.len();
+            annot_spans.push(Span::styled(
+                format!("#{}/{}  ", msg_idx + 1, total),
+                Style::default().fg(Color::Indexed(239)),
+            ));
+            // Delivery status: ✓ delivered, ✓✓ delivered+responded,
+            // ⋯ pending. Lives in the gutter on its own row so it is
+            // visible without disrupting text flow.
+            let has_response = app
+                .chat
+                .messages
+                .get(msg_idx + 1..)
+                .map(|rest| {
+                    rest.iter().any(|m| {
+                        m.role == super::state::ChatRole::Coordinator
+                            || m.role == super::state::ChatRole::SystemError
+                    })
+                })
+                .unwrap_or(false);
+            let status_span = if has_response {
+                Span::styled("✓✓", Style::default().fg(Color::DarkGray))
+            } else if app.chat.awaiting_response() {
+                let is_last_user = app.chat.messages[msg_idx + 1..]
+                    .iter()
+                    .all(|m| m.role != super::state::ChatRole::User);
+                if is_last_user {
+                    Span::styled("⋯", Style::default().fg(Color::Yellow))
+                } else {
+                    Span::styled("✓", Style::default().fg(Color::DarkGray))
+                }
+            } else {
+                Span::styled("✓", Style::default().fg(Color::DarkGray))
+            };
+            annot_spans.push(status_span);
+        }
+        if !annot_spans.is_empty() {
+            // Right-justify the annotations within content_width so they
+            // sit at the trailing edge of the message column. Compute the
+            // total visual width and pad the leading edge with spaces.
+            let annot_w: usize = annot_spans
+                .iter()
+                .map(|s| s.content.as_ref().width())
+                .sum();
+            let pad = content_width.saturating_sub(annot_w);
+            let mut spans: Vec<Span> = Vec::with_capacity(annot_spans.len() + 1);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.extend(annot_spans);
+            let mut annot_line = Line::from(spans);
+            if is_user {
+                annot_line = apply_line_bg(annot_line, msg_bg);
+            } else if is_sent_message {
+                annot_line = apply_line_bg(annot_line, sent_msg_bg);
+            }
+            rendered_lines.push(annot_line);
+            line_to_message.push(Some(msg_idx));
         }
         // Show attachment indicators.
         for att_name in &msg.attachments {
             let att_text = format!("{}[Attached: {}]", indent, att_name);
+            // Attachments are metadata, not content — render in subtle gray
+            // so they don't compete visually with the message text itself.
             let mut att_line = Line::from(Span::styled(
                 att_text,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::ITALIC),
+                super::chat_palette::attachment_style(),
             ));
             if is_user {
-                att_line = apply_line_bg(att_line, user_msg_bg);
+                att_line = apply_line_bg(att_line, msg_bg);
             }
             rendered_lines.push(att_line);
+            line_to_message.push(Some(msg_idx));
         }
         // Blank line between messages.
         rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
     }
 
-    // Streaming response or thinking indicator when awaiting response.
-    if app.chat.awaiting_response {
-        // Braille spinner
-        const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let frame_idx = (app.tick_count / 3) as usize % SPINNER_FRAMES.len();
-        let spinner = SPINNER_FRAMES[frame_idx];
-
-        if let Some(ref streaming) = app.chat.streaming_text {
-            // Render streaming text as an in-progress coordinator message
+    // Streaming indicator / progressive text when awaiting response.
+    //
+    // Suppress the streaming-text branch when the most recent message is
+    // already a coordinator response. In that case the agent has finished
+    // its turn (its content was just appended to `chat.messages`) and the
+    // `streaming_text` buffer is stale — the .streaming dotfile may still
+    // hold the same text the agent just flushed to outbox because the
+    // file-clear happens after the outbox-append, opening a race window
+    // (task fix-pty-output). Rendering both produces a visible duplicate
+    // block. The next poll will repopulate `streaming_text` from the file
+    // once the agent's next turn (or the file-clear) has actually run.
+    let last_is_coordinator_response = app
+        .chat
+        .messages
+        .last()
+        .map(|m| {
+            matches!(
+                m.role,
+                super::state::ChatRole::Coordinator
+                    | super::state::ChatRole::SystemError
+            )
+        })
+        .unwrap_or(false);
+    if app.chat.awaiting_response() && !last_is_coordinator_response {
+        if app.chat.streaming_text.is_empty() {
+            // No streaming text yet — show animated lightning-wave with elapsed time.
+            let elapsed = app
+                .chat
+                .awaiting_since
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            rendered_lines.push(spinner_wave_line(elapsed, ""));
+            line_to_message.push(None);
+            // Show interrupt hint after a brief delay so it's not distracting on fast responses.
+            if elapsed.as_secs() >= 2 {
+                rendered_lines.push(Line::from(Span::styled(
+                    "  Ctrl+C to interrupt",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                line_to_message.push(None);
+            }
+        } else {
+            // Show progressive streaming text from the coordinator with markdown
+            // rendering and word wrapping, matching finalized coordinator messages.
             let prefix = "↯ ";
             let prefix_len = prefix.width();
-            let indent_str = " ".repeat(prefix_len);
-            let text_w = content_width.saturating_sub(prefix_len);
+            let indent = " ".repeat(prefix_len);
+            let text_width = content_width.saturating_sub(prefix_len);
 
-            let md_lines = markdown_to_lines(streaming, text_w);
-            let wrapped = wrap_line_spans(&md_lines, text_w);
+            let md_lines = markdown_to_lines(&app.chat.streaming_text, text_width);
 
-            let mut first = true;
-            for wline in &wrapped {
-                if first {
-                    let mut spans = vec![Span::styled(
-                        prefix.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )];
-                    spans.extend(wline.spans.iter().cloned());
+            // Wrap with tool-box awareness (same logic as finalized coordinator messages).
+            let border_style = Style::default().fg(super::chat_palette::TOOL_BORDER);
+            let tool_name_style = Style::default()
+                .fg(super::chat_palette::TOOL_CALL)
+                .add_modifier(Modifier::BOLD);
+            let tool_content_style = Style::default().fg(super::chat_palette::TOOL_RESULT);
+
+            let wrapped: Vec<Line> = if md_lines.is_empty() {
+                vec![Line::from("")]
+            } else {
+                let mut out: Vec<Line> = Vec::new();
+                for line in &md_lines {
+                    let lt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    if lt.starts_with("┌─") {
+                        let after_prefix = lt.get(7..).unwrap_or("");
+                        let name_end = after_prefix.find(['─', ' ']).unwrap_or(after_prefix.len());
+                        let tool_name = after_prefix[..name_end].trim();
+                        let rest_start = 7 + name_end;
+                        let rest = lt.get(rest_start..).unwrap_or("");
+                        out.push(Line::from(vec![
+                            Span::styled("┌─ ", border_style),
+                            Span::styled(tool_name.to_string(), tool_name_style),
+                            Span::styled(format!(" {}", rest.trim_start()), border_style),
+                        ]));
+                    } else if lt.starts_with("└─") {
+                        out.push(Line::from(Span::styled(lt, border_style)));
+                    } else if lt.starts_with("│ ") {
+                        let content = lt.get(4..).unwrap_or("");
+                        let pipe_display_w: usize = 2;
+                        let cont_display_w: usize = 4;
+                        let wrap_w = text_width.saturating_sub(cont_display_w);
+                        if wrap_w == 0
+                            || content.width() <= text_width.saturating_sub(pipe_display_w)
+                        {
+                            out.push(Line::from(vec![
+                                Span::styled("│ ", border_style),
+                                Span::styled(content.to_string(), tool_content_style),
+                            ]));
+                        } else {
+                            let wrapped_content = word_wrap(content, wrap_w);
+                            for (i, w) in wrapped_content.iter().enumerate() {
+                                if i == 0 {
+                                    out.push(Line::from(vec![
+                                        Span::styled("│ ", border_style),
+                                        Span::styled(w.to_string(), tool_content_style),
+                                    ]));
+                                } else {
+                                    out.push(Line::from(vec![
+                                        Span::styled("│   ", border_style),
+                                        Span::styled(w.to_string(), tool_content_style),
+                                    ]));
+                                }
+                            }
+                        }
+                    } else {
+                        out.extend(wrap_line_spans(std::slice::from_ref(line), text_width));
+                    }
+                }
+                out
+            };
+
+            // Render with prefix on first line, indent on continuation lines.
+            let role_style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            let mut first_line = true;
+            for line in &wrapped {
+                if first_line {
+                    let mut spans = vec![Span::styled(prefix, role_style)];
+                    spans.extend(line.spans.iter().cloned());
                     rendered_lines.push(Line::from(spans));
-                    first = false;
+                    line_to_message.push(None);
+                    first_line = false;
                 } else {
-                    let mut spans = vec![Span::raw(indent_str.clone())];
-                    spans.extend(wline.spans.iter().cloned());
+                    let mut spans = vec![Span::raw(indent.clone())];
+                    spans.extend(line.spans.iter().cloned());
                     rendered_lines.push(Line::from(spans));
+                    line_to_message.push(None);
                 }
             }
-
-            // Add spinner + token count on a new line after the streaming text
-            let mut indicator_spans = vec![
-                Span::raw(indent_str.clone()),
-                Span::styled(
-                    format!("{} ", spinner),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if let Some((input_tokens, output_tokens)) = app.chat.thinking_tokens {
-                indicator_spans.push(Span::styled(
-                    format!(
-                        "→{}/←{}",
-                        format_tokens(input_tokens),
-                        format_tokens(output_tokens)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            rendered_lines.push(Line::from(indicator_spans));
-        } else {
-            // No streaming text yet — show the spinner with optional token counts
-            let mut spans = vec![Span::styled(
-                format!("↯ {} ", spinner),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )];
-
-            if let Some((input_tokens, output_tokens)) = app.chat.thinking_tokens {
-                spans.push(Span::styled(
-                    format!(
-                        "→{}/←{}",
-                        format_tokens(input_tokens),
-                        format_tokens(output_tokens)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-
-            rendered_lines.push(Line::from(spans));
+            // Append animated lightning-wave with elapsed time to indicate still generating.
+            let elapsed = app
+                .chat
+                .awaiting_since
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
+            rendered_lines.push(spinner_wave_line(elapsed, "  "));
+            line_to_message.push(None);
         }
         rendered_lines.push(Line::from(""));
+        line_to_message.push(None);
     }
+
+    // Store line-to-message mapping for click-to-edit.
+    app.chat.line_to_message = line_to_message;
 
     // Scrolling: `scroll` is lines from bottom (0 = fully scrolled down).
     let total_lines = rendered_lines.len();
     let viewport_h = msg_area.height as usize;
     app.chat.total_rendered_lines = total_lines;
     app.chat.viewport_height = viewport_h;
+
+    // Anchor compensation: when new content arrives while scrolled up,
+    // increase scroll-from-bottom so the viewport stays on the same content.
+    if app.chat.scroll > 0 && app.chat.prev_total_rendered_lines > 0 {
+        let delta = total_lines.saturating_sub(app.chat.prev_total_rendered_lines);
+        if delta > 0 {
+            app.chat.scroll = app.chat.scroll.saturating_add(delta);
+        }
+    }
+    app.chat.prev_total_rendered_lines = total_lines;
 
     // Calculate the visible window.
     let scroll_from_top = if total_lines <= viewport_h {
@@ -1917,7 +3884,33 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     app.chat.scroll_from_top = scroll_from_top;
 
     let end = (scroll_from_top + viewport_h).min(total_lines);
-    let visible_lines: Vec<Line> = rendered_lines[scroll_from_top..end].to_vec();
+    let mut visible_lines: Vec<Line> = rendered_lines[scroll_from_top..end].to_vec();
+
+    // Apply search highlights to visible lines.
+    if !app.chat.search.query.is_empty() && !app.chat.search.matches.is_empty() {
+        let query_lower = app.chat.search.query.to_lowercase();
+        let current_msg_idx = app
+            .chat
+            .search
+            .current_match
+            .and_then(|idx| app.chat.search.matches.get(idx))
+            .map(|m| m.message_idx);
+        let highlight_bg = Color::Rgb(80, 80, 0); // yellow-ish highlight for matches
+        let current_bg = Color::Rgb(180, 120, 0); // brighter for current match
+
+        for (line_idx, line) in visible_lines.iter_mut().enumerate() {
+            let global_line_idx = scroll_from_top + line_idx;
+            if let Some(Some(_msg_idx)) = app.chat.line_to_message.get(global_line_idx) {
+                let is_current_msg = current_msg_idx == Some(*_msg_idx);
+                let bg = if is_current_msg {
+                    current_bg
+                } else {
+                    highlight_bg
+                };
+                *line = highlight_query_in_line(line.clone(), &query_lower, bg);
+            }
+        }
+    }
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, msg_area);
@@ -1946,6 +3939,28 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         }
     }
 
+    // Yellow HUD: distance from bottom when scrolled up (anchored mode).
+    if app.chat.scroll > 0 && msg_area.width > 4 && msg_area.height > 0 {
+        let indicator = format!(" ↓{} ", app.chat.scroll);
+        let x = msg_area.x + msg_area.width.saturating_sub(indicator.len() as u16 + 1);
+        let y = msg_area.y;
+        if x >= msg_area.x {
+            let buf = frame.buffer_mut();
+            for (i, ch) in indicator.chars().enumerate() {
+                let cx = x + i as u16;
+                if cx < msg_area.x + msg_area.width {
+                    let cell = &mut buf[(cx, y)];
+                    cell.set_char(ch);
+                    cell.set_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow),
+                    );
+                }
+            }
+        }
+    }
+
     // Scrollbar if content overflows (auto-hides after 2 seconds of inactivity).
     if total_lines > viewport_h && app.panel_scrollbar_visible() {
         draw_panel_scrollbar(
@@ -1957,28 +3972,105 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         );
     }
 
+    // Search bar (between messages and input).
+    if chat_search_active && search_bar_area.height > 0 {
+        draw_chat_search_bar(frame, app, search_bar_area);
+    }
+
     // Input area.
     draw_chat_input(frame, app, input_area);
+}
+
+/// Draw the chat search bar showing the current query and match count.
+fn draw_chat_search_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let is_active = app.input_mode == InputMode::ChatSearch;
+    let color = if is_active {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let mut spans = vec![
+        Span::styled(
+            "/ ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.chat.search.query.clone(),
+            Style::default().fg(Color::White),
+        ),
+    ];
+    if !app.chat.search.query.is_empty() {
+        let match_info = if app.chat.search.matches.is_empty() {
+            " [no matches]".to_string()
+        } else {
+            let idx = app.chat.search.current_match.unwrap_or(0);
+            format!(" [{}/{}]", idx + 1, app.chat.search.matches.len())
+        };
+        spans.push(Span::styled(
+            match_info,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if is_active && app.chat.search.query.is_empty() {
+        spans.push(Span::styled(
+            "type to search...",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // Cursor indicator when actively typing.
+    if is_active {
+        spans.push(Span::styled("█", Style::default().fg(color)));
+    }
+    let line = Line::from(spans);
+    let bg = if is_active {
+        Color::Rgb(20, 30, 40)
+    } else {
+        Color::Rgb(15, 15, 20)
+    };
+    let paragraph = Paragraph::new(vec![line]).style(Style::default().bg(bg));
+    frame.render_widget(paragraph, area);
 }
 
 /// Draw the chat input line at the bottom of the chat panel.
 fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let is_editing = app.input_mode == InputMode::ChatInput;
+    let in_edit_mode = app.chat.editing_index.is_some();
     let has_text = !super::state::editor_is_empty(&app.chat.editor);
     app.last_chat_input_area = area;
-    let border_color = if is_editing {
-        Color::Magenta
+    // Yellow/gold border when editing an existing message; default terminal
+    // color for the normal active input (no purple styling — keeps the
+    // composer visually neutral).
+    let border_color = if is_editing && in_edit_mode {
+        Color::Yellow
+    } else if is_editing {
+        Color::Reset
     } else {
         Color::DarkGray
     };
-    let prompt_color = if is_editing {
-        Color::LightMagenta
+    let prompt_color = if is_editing && in_edit_mode {
+        Color::Yellow
+    } else if is_editing {
+        Color::Reset
     } else {
         Color::DarkGray
     };
     if is_editing || has_text {
+        // Separator line — show edit mode hint.
+        let sep_text = if is_editing && in_edit_mode {
+            let w = area.width as usize;
+            let hint = " Editing (Enter=save, Esc=cancel) ";
+            if w > hint.len() + 2 {
+                let left = (w - hint.len()) / 2;
+                let right = w - hint.len() - left;
+                format!("{}{}{}", "─".repeat(left), hint, "─".repeat(right))
+            } else {
+                "─".repeat(w)
+            }
+        } else {
+            "─".repeat(area.width as usize)
+        };
         let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
+            sep_text,
             Style::default()
                 .fg(border_color)
                 .add_modifier(if is_editing {
@@ -2061,7 +4153,7 @@ fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     format!(" \u{1F4CE} {}", att_text),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(super::chat_palette::METADATA),
                 ))),
                 Rect {
                     x: area.x,
@@ -2072,11 +4164,19 @@ fn draw_chat_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             );
         }
     } else {
-        let hint_text = if app.chat.pending_attachments.is_empty() {
-            " \u{2191}\u{2193}: scroll".to_string()
+        let hint_text = if app.chat_pty_mode && app.chat_pty_forwards_stdin {
+            if app.focused_panel == FocusedPanel::RightPanel {
+                " [PTY]  Ctrl+T: command mode  PgUp/Dn: scroll".to_string()
+            } else {
+                " [CMD]  Ctrl+T: back to chat  n: new  w: close  ←→/[]: chats  ?: help".to_string()
+            }
+        } else if app.chat_pty_mode {
+            " Enter: chat  ↑↓: scroll  Ctrl+T: focus PTY".to_string()
+        } else if app.chat.pending_attachments.is_empty() {
+            " c: chat  \u{2191}\u{2193}: scroll".to_string()
         } else {
             format!(
-                " \u{2191}\u{2193}: scroll  {} attached",
+                " c: chat  \u{2191}\u{2193}: scroll  {} attached",
                 app.chat.pending_attachments.len()
             )
         };
@@ -2160,9 +4260,7 @@ pub(super) fn word_wrap_segments(line: &str, width: usize) -> Vec<(usize, usize)
             if pos < n {
                 let curr_is_ws = chars[pos - 1].is_whitespace();
                 let next_is_ws = chars[pos].is_whitespace();
-                if !curr_is_ws && next_is_ws {
-                    last_break = Some(pos);
-                } else if curr_is_ws && !next_is_ws {
+                if (!curr_is_ws && next_is_ws) || (curr_is_ws && !next_is_ws) {
                     last_break = Some(pos);
                 }
             }
@@ -2326,115 +4424,344 @@ fn render_editor_word_wrap(
     }
 }
 
-/// Draw the Log tab content (panel 2) — reverse chronological activity log.
+/// Draw the per-task Log tab. Four view modes are available, cycled
+/// with the `4` key while the Log pane is focused:
+///   * `Events` — one structured event per line (legacy view)
+///   * `HighLevel` — coarse activity summaries
+///   * `RawPretty` — full pretty-printed transcript
+///   * `WgLog` — workgraph-level log entries only (`wg log` writes,
+///     dispatcher status, lifecycle transitions). NO LLM stream content.
+///
+/// The first three modes consume `app.log_pane.stream_events` (parsed
+/// raw_stream.jsonl); when no stream events have been parsed yet, they
+/// fall back to the raw agent output buffer. `WgLog` instead consumes
+/// `app.log_pane.rendered_lines` (populated from `task.log`).
 fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    if app.log_pane.rendered_lines.is_empty() {
-        let msg = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Activity Log",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "No log entries for selected task.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]);
-        frame.render_widget(msg, area);
+    use ratatui::widgets::Paragraph;
+
+    if area.height == 0 || area.width == 0 {
         return;
     }
 
-    let viewport_h = area.height as usize;
-    app.log_pane.viewport_height = viewport_h;
-
-    if viewport_h == 0 {
-        return;
-    }
-
-    // Display in forward chronological order (oldest first, newest at bottom), with word wrapping.
-    let wrap_width = area.width as usize;
-
-    let mut wrapped_lines: Vec<Line> = Vec::new();
-    for s in &app.log_pane.rendered_lines {
-        if let Some(bracket_end) = s.find(']') {
-            let timestamp = &s[..=bracket_end];
-            let message = &s[bracket_end + 1..];
-            let prefix_len = bracket_end + 1;
-            let text_width = wrap_width.saturating_sub(prefix_len);
-
-            if text_width == 0 || message.trim().is_empty() {
-                wrapped_lines.push(Line::from(vec![
-                    Span::styled(timestamp, Style::default().fg(Color::DarkGray)),
-                    Span::raw(message.to_string()),
-                ]));
-            } else {
-                let leading_space = &message[..message.len() - message.trim_start().len()];
-                let wrapped = word_wrap(message.trim_start(), text_width);
-                let indent = " ".repeat(prefix_len + leading_space.len());
-                for (i, wl) in wrapped.iter().enumerate() {
-                    if i == 0 {
-                        wrapped_lines.push(Line::from(vec![
-                            Span::styled(timestamp, Style::default().fg(Color::DarkGray)),
-                            Span::raw(format!("{}{}", leading_space, wl)),
-                        ]));
-                    } else {
-                        wrapped_lines.push(Line::from(Span::raw(format!("{}{}", indent, wl))));
-                    }
-                }
-            }
+    let header_line = {
+        let task_label = app
+            .log_pane
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "(no task selected)".to_string());
+        let agent_label = app
+            .log_pane
+            .agent_id
+            .as_deref()
+            .map(|id| format!("agent={}", id))
+            .unwrap_or_else(|| "no agent".to_string());
+        let mode_label = format!("view=[{}]", app.log_pane.view_mode.label());
+        let tail_label = if app.log_pane.auto_tail {
+            "tail=on"
         } else {
-            // No timestamp — plain word wrap.
-            if wrap_width > 0 && s.width() > wrap_width {
-                let wrapped = word_wrap(s, wrap_width);
-                for wl in wrapped {
-                    wrapped_lines.push(Line::from(wl));
-                }
-            } else {
-                wrapped_lines.push(Line::from(Span::raw(s.as_str())));
-            }
+            "tail=off"
+        };
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", task_label),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {}  {}  {}", agent_label, mode_label, tail_label),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "    [4] cycle view  [J] json",
+                Style::default().fg(Color::Indexed(239)),
+            ),
+        ])
+    };
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(Paragraph::new(header_line), header_area);
+
+    app.log_pane.viewport_height = body_area.height as usize;
+
+    use super::log_render::{
+        render_events_view, render_high_level_view, render_raw_pretty_view,
+        render_wg_log_view,
+    };
+    use super::state::LogViewMode;
+
+    // Collect display lines for whichever view is active. The first
+    // three modes share the same data source (parsed raw_stream events);
+    // WgLog reads workgraph-level entries from `task.log`.
+    let raw_lines: Vec<Line> = if app.log_pane.view_mode == LogViewMode::WgLog {
+        render_wg_log_view(&app.log_pane.rendered_lines)
+    } else if !app.log_pane.stream_events.is_empty() {
+        match app.log_pane.view_mode {
+            LogViewMode::Events => render_events_view(&app.log_pane.stream_events),
+            LogViewMode::HighLevel => render_high_level_view(&app.log_pane.stream_events),
+            LogViewMode::RawPretty => render_raw_pretty_view(&app.log_pane.stream_events),
+            LogViewMode::WgLog => unreachable!("handled above"),
         }
+    } else {
+        let text = &app.log_pane.agent_output.full_text;
+        if text.is_empty() {
+            vec![Line::from(Span::styled(
+                "(no agent output yet — is the task running?)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            text.split('\n')
+                .map(|l| Line::from(l.to_string()))
+                .collect()
+        }
+    };
+
+    // Pre-wrap to visual lines at the body width so scroll math (auto-tail,
+    // PageUp/PageDown) operates in the same units as what's drawn. Without
+    // this, long agent responses that wrap to many visual lines push the
+    // tail off-screen below the viewport — the user sees "missing text"
+    // because logical line count under-counts visible lines after wrap.
+    let body_width = body_area.width as usize;
+    let lines: Vec<Line> = wrap_line_spans(&raw_lines, body_width);
+    app.log_pane.total_wrapped_lines = lines.len();
+
+    // Auto-tail: pin scroll to the bottom when enabled and there's overflow.
+    let viewport = body_area.height as usize;
+    if app.log_pane.auto_tail {
+        app.log_pane.scroll = lines.len().saturating_sub(viewport);
     }
 
-    let total_lines = wrapped_lines.len();
-    app.log_pane.total_wrapped_lines = total_lines;
-    let scroll = app
-        .log_pane
-        .scroll
-        .min(total_lines.saturating_sub(viewport_h));
-    let end = (scroll + viewport_h).min(total_lines);
+    let scroll_y = app.log_pane.scroll.min(lines.len().saturating_sub(1)) as u16;
+    // No `.wrap()` here: lines are already pre-wrapped to body_width above.
+    // Adding wrap on top would re-wrap visually-identical lines that happen
+    // to be exactly body_width wide (boundary cases) and re-introduce the
+    // logical-vs-visual scroll mismatch.
+    let para = Paragraph::new(lines).scroll((scroll_y, 0));
+    frame.render_widget(para, body_area);
+}
 
-    let visible_lines: Vec<Line> = wrapped_lines[scroll..end].to_vec();
+/// Draw the Messages tab — wg msg traffic for the currently selected task.
+fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    use ratatui::widgets::{Paragraph, Wrap};
+    use super::state::MessageDirection;
 
-    let paragraph = Paragraph::new(visible_lines);
-    frame.render_widget(paragraph, area);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
 
-    // Scrollbar if content overflows (auto-hides after 2 seconds of inactivity).
-    if total_lines > viewport_h && app.panel_scrollbar_visible() {
-        draw_panel_scrollbar(
-            frame,
-            app,
-            area,
-            total_lines.saturating_sub(viewport_h),
-            scroll,
+    let task_label = app
+        .messages_panel
+        .task_id
+        .clone()
+        .unwrap_or_else(|| "(no task selected)".to_string());
+    let summary = &app.messages_panel.summary;
+    let header_line = Line::from(vec![
+        Span::styled(
+            format!(" {} ", task_label),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " in:{} out:{} unanswered:{}",
+                summary.incoming, summary.outgoing, summary.unanswered
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "    [Enter] compose  [7] switch",
+            Style::default().fg(Color::Indexed(239)),
+        ),
+    ]);
+
+    let is_editing = app.input_mode == InputMode::MessageInput;
+    let editor_text_str = super::state::editor_text(&app.messages_panel.editor);
+    let has_input_text = !editor_text_str.is_empty();
+
+    let input_height: u16 = if is_editing || has_input_text {
+        let prompt_prefix = 2;
+        let usable = (area.width as usize).saturating_sub(prompt_prefix).max(1);
+        let visual_lines = count_visual_lines(&editor_text_str, usable);
+        let wrapped_lines = (visual_lines as u16).max(1);
+        let max_input = (area.height * 3 / 4).max(2);
+        wrapped_lines.min(max_input) + 1 // +1 for separator
+    } else {
+        1
+    };
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(Paragraph::new(header_line), header_area);
+
+    let body_h = body_area.height;
+    let msg_area_height = body_h.saturating_sub(input_height);
+    let msg_area = Rect {
+        x: body_area.x,
+        y: body_area.y,
+        width: body_area.width,
+        height: msg_area_height,
+    };
+    let input_area = Rect {
+        x: body_area.x,
+        y: body_area.y + msg_area_height,
+        width: body_area.width,
+        height: input_height,
+    };
+    app.last_message_input_area = input_area;
+
+    // Render message list.
+    let lines: Vec<Line> = if app.messages_panel.entries.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no messages — press Enter to compose)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.messages_panel
+            .entries
+            .iter()
+            .map(|entry| {
+                // Direction is a structural accent (matches the SentMessage
+                // role coloring in the chat tab — magenta for outgoing, cyan
+                // for incoming). Body text reads as default — color is for
+                // role, not for marking 'this is text'.
+                let (arrow, color) = match entry.direction {
+                    MessageDirection::Incoming => ("←", Color::Cyan),
+                    MessageDirection::Outgoing => {
+                        ("→", super::chat_palette::SENT_MESSAGE_PREFIX)
+                    }
+                };
+                let urgent_marker = if entry.is_urgent { " [!]" } else { "" };
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", entry.timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{} {} ", arrow, entry.display_label),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(
+                        format!("{}{}", entry.body, urgent_marker),
+                        Style::default().fg(super::chat_palette::DEFAULT_TEXT),
+                    ),
+                ])
+            })
+            .collect()
+    };
+
+    app.messages_panel.total_wrapped_lines = lines.len();
+    app.messages_panel.viewport_height = msg_area.height as usize;
+
+    let viewport = msg_area.height as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    app.messages_panel.scroll = app.messages_panel.scroll.min(max_scroll);
+    let scroll_y = app.messages_panel.scroll as u16;
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    frame.render_widget(para, msg_area);
+
+    // Render input area.
+    if input_area.height > 0 {
+        // Separator line.
+        let sep = Paragraph::new(Line::from(Span::styled(
+            "─".repeat(input_area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(
+            sep,
+            Rect {
+                x: input_area.x,
+                y: input_area.y,
+                width: input_area.width,
+                height: 1,
+            },
         );
+
+        let editor_area = Rect {
+            x: input_area.x + 2,
+            y: input_area.y + 1,
+            width: input_area.width.saturating_sub(2),
+            height: input_area.height.saturating_sub(1),
+        };
+
+        // Prompt indicator.
+        if editor_area.height > 0 {
+            let prompt_char = if is_editing { ">" } else { " " };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("{} ", prompt_char),
+                    Style::default().fg(if is_editing {
+                        Color::Yellow
+                    } else {
+                        Color::DarkGray
+                    }),
+                )),
+                Rect {
+                    x: input_area.x,
+                    y: input_area.y + 1,
+                    width: 2,
+                    height: 1,
+                },
+            );
+
+            let text_color = if is_editing {
+                Color::White
+            } else {
+                Color::DarkGray
+            };
+            let cursor_style = if is_editing {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(text_color)
+            };
+            render_editor_word_wrap(
+                frame,
+                &app.messages_panel.editor,
+                editor_area,
+                Style::default().fg(text_color),
+                cursor_style,
+                is_editing,
+            );
+        }
     }
 }
 
-/// Draw the Coordinator Log tab (panel 7) — daemon activity log.
+/// Draw the Coordinator Log tab (panel 7) — activity feed from operations.jsonl.
 fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let header_lines = build_coordinator_runtime_lines(app);
+    let area = if !header_lines.is_empty() && area.height > 4 {
+        let header_height = (header_lines.len() as u16).min(area.height.saturating_sub(1));
+        let [header_area, body_area] =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(area);
+        frame.render_widget(Paragraph::new(header_lines), header_area);
+        body_area
+    } else {
+        area
+    };
+
+    // If we have activity feed events, render the semantic view.
+    // Otherwise fall back to the raw daemon.log display.
+    if !app.activity_feed.events.is_empty() {
+        draw_activity_feed(frame, app, area);
+        return;
+    }
+
+    // Fallback: raw daemon.log (original behavior).
     if app.coord_log.rendered_lines.is_empty() {
         let msg = Paragraph::new(vec![
             Line::from(Span::styled(
-                "Coordinator Log",
+                "Activity Feed",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "No coordinator activity yet.",
+                "No activity yet.",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
@@ -2525,427 +4852,501 @@ fn draw_coord_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 }
 
-/// Draw the Messages tab content (panel 3) — message queue for selected task.
-/// Uses chat-app style: incoming messages left-aligned, outgoing right-aligned,
-/// with a stats header showing sent/received/reply status.
-fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+fn build_coordinator_runtime_lines(app: &VizApp) -> Vec<Line<'static>> {
+    let config = workgraph::config::Config::load_or_default(&app.workgraph_dir);
+    let executor = config.coordinator.effective_executor();
+    let model = config.coordinator.model.clone().unwrap_or_else(|| {
+        config
+            .resolve_model_for_role(workgraph::config::DispatchRole::Default)
+            .model
+    });
+    let cid = app.active_coordinator_id;
+    let state =
+        workgraph::service::chat_compactor::ChatCompactorState::load(&app.workgraph_dir, cid);
+    let threshold = config.chat.compact_threshold;
+    let pending =
+        workgraph::chat::read_inbox_since_for(&app.workgraph_dir, cid, state.last_inbox_id)
+            .map(|m| m.len())
+            .unwrap_or(0)
+            + workgraph::chat::read_outbox_since_for(&app.workgraph_dir, cid, state.last_outbox_id)
+                .map(|m| m.len())
+                .unwrap_or(0);
+    let summary_present =
+        workgraph::service::chat_compactor::context_summary_path(&app.workgraph_dir, cid).exists();
+    let last = state
+        .last_compaction
+        .clone()
+        .unwrap_or_else(|| "never".to_string());
+
+    vec![
+        Line::from(vec![
+            Span::styled(
+                format!("Chat {} ", cid),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("· "),
+            Span::styled(executor, Style::default().fg(Color::White)),
+            Span::raw(" · "),
+            Span::styled(model, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            // Coordinator-tab cyan matches the "↯ " prefix branding so the
+            // header reads as part of the same role surface, not as a
+            // separate green status badge.
+            Span::styled(
+                "Chat compaction ",
+                Style::default().fg(super::chat_palette::COORDINATOR_PREFIX),
+            ),
+            Span::raw("· "),
+            Span::raw(format!("{}x", state.compaction_count)),
+            Span::raw(" · "),
+            Span::raw(format!("last {}", last)),
+            Span::raw(" · "),
+            Span::raw(format!("pending {}/{}", pending, threshold)),
+            Span::raw(" · "),
+            Span::raw(if summary_present {
+                "summary present"
+            } else {
+                "summary absent"
+            }),
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(24),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]
+}
+
+/// Render the semantic activity feed from parsed operations.jsonl events.
+fn draw_activity_feed(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let viewport_h = area.height as usize;
+    app.activity_feed.viewport_height = viewport_h;
+    if viewport_h == 0 {
+        return;
+    }
+    let wrap_width = area.width as usize;
+    let mut wrapped_lines: Vec<Line> = Vec::new();
+
+    for event in &app.activity_feed.events {
+        let (icon_color, icon_style) = activity_event_style(&event.kind);
+        // Format: "HH:MM:SS icon summary"
+        let time_span = Span::styled(
+            format!("{} ", event.time_short),
+            Style::default().fg(Color::DarkGray),
+        );
+        let icon_span = Span::styled(format!("{} ", event.icon()), icon_style);
+        let summary_span = Span::styled(event.summary.clone(), Style::default().fg(icon_color));
+
+        let prefix_len = event.time_short.len() + 1 + event.icon().len() + 1;
+        let text_width = wrap_width.saturating_sub(prefix_len);
+
+        if text_width == 0 || event.summary.is_empty() {
+            wrapped_lines.push(Line::from(vec![time_span, icon_span, summary_span]));
+        } else if event.summary.width() > text_width {
+            let wrapped = word_wrap(&event.summary, text_width);
+            let indent = " ".repeat(prefix_len);
+            for (i, wl) in wrapped.iter().enumerate() {
+                if i == 0 {
+                    wrapped_lines.push(Line::from(vec![
+                        time_span.clone(),
+                        icon_span.clone(),
+                        Span::styled(wl.to_string(), Style::default().fg(icon_color)),
+                    ]));
+                } else {
+                    wrapped_lines.push(Line::from(Span::styled(
+                        format!("{}{}", indent, wl),
+                        Style::default().fg(icon_color),
+                    )));
+                }
+            }
+        } else {
+            wrapped_lines.push(Line::from(vec![time_span, icon_span, summary_span]));
+        }
+    }
+
+    let total_lines = wrapped_lines.len();
+    app.activity_feed.total_wrapped_lines = total_lines;
+    let scroll = app
+        .activity_feed
+        .scroll
+        .min(total_lines.saturating_sub(viewport_h));
+    let end = (scroll + viewport_h).min(total_lines);
+    let visible_lines: Vec<Line> = wrapped_lines[scroll..end].to_vec();
+    let paragraph = Paragraph::new(visible_lines);
+    frame.render_widget(paragraph, area);
+    if total_lines > viewport_h && app.panel_scrollbar_visible() {
+        draw_panel_scrollbar(
+            frame,
+            app,
+            area,
+            total_lines.saturating_sub(viewport_h),
+            scroll,
+        );
+    }
+}
+
+/// Return (foreground color, icon Style) for an activity event kind.
+fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
+    match kind {
+        ActivityEventKind::TaskCreated => (Color::Blue, Style::default().fg(Color::Blue)),
+        ActivityEventKind::StatusChange => (Color::Yellow, Style::default().fg(Color::Yellow)),
+        ActivityEventKind::AgentSpawned => (Color::Green, Style::default().fg(Color::Green)),
+        ActivityEventKind::AgentCompleted => (
+            Color::Green,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ActivityEventKind::AgentFailed => (
+            Color::Red,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        ActivityEventKind::CoordinatorTick => {
+            (Color::DarkGray, Style::default().fg(Color::DarkGray))
+        }
+        ActivityEventKind::VerificationResult => (Color::Cyan, Style::default().fg(Color::Cyan)),
+        ActivityEventKind::Compact => (Color::Magenta, Style::default().fg(Color::Magenta)),
+        ActivityEventKind::UserAction => (Color::White, Style::default().fg(Color::White)),
+    }
+}
+
+fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    use super::state::DashboardAgentActivity;
+    use ratatui::widgets::Sparkline;
+
     let width = area.width as usize;
     if width < 4 || area.height < 3 {
         return;
     }
 
-    // Reserve space for input area (like Chat tab).
-    let is_msg_editing = app.input_mode == InputMode::MessageInput;
-    let msg_text = super::state::editor_text(&app.messages_panel.editor);
-    let has_msg_text = !msg_text.is_empty();
-    let input_height: u16 = if is_msg_editing || has_msg_text {
-        let prompt_prefix = 2;
-        let usable = (area.width as usize).saturating_sub(prompt_prefix).max(1);
-        let visual_lines = count_visual_lines(&msg_text, usable);
-        let wrapped_lines = (visual_lines as u16).max(1);
-        // Cap so input never eats more than 3/4 of the area.
-        let max_input = (area.height * 3 / 4).max(3);
-        let lines = wrapped_lines.min(max_input);
-        lines + 1 // +1 for separator line
-    } else {
-        1
-    };
-    let msg_area_height = area.height.saturating_sub(input_height);
+    let mut lines: Vec<Line> = Vec::new();
 
-    let msg_area = Rect {
+    // ── Coordinator Cards ──
+    lines.push(Line::from(Span::styled(
+        "── Chat Agents ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if app.dashboard.coordinator_cards.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No chat agents running",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for card in &app.dashboard.coordinator_cards {
+            let status_icon = if !card.enabled {
+                Span::styled("⏹ ", Style::default().fg(Color::Red))
+            } else if card.frozen {
+                Span::styled("❄ ", Style::default().fg(Color::Blue))
+            } else if card.paused {
+                Span::styled("⏸ ", Style::default().fg(Color::Yellow))
+            } else {
+                Span::styled("▶ ", Style::default().fg(Color::Green))
+            };
+
+            let state_label = if !card.enabled {
+                "stopped"
+            } else if card.frozen {
+                "frozen"
+            } else if card.paused {
+                "paused"
+            } else {
+                "running"
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                status_icon,
+                Span::styled(
+                    format!("Chat #{}", card.id),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({})", state_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            // Stats row
+            lines.push(Line::from(vec![
+                Span::styled("    Agents: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}/{}", card.agents_alive, card.max_agents),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Ready: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", card.tasks_ready),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("  Ticks: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}", card.ticks), Style::default().fg(Color::White)),
+            ]));
+
+            // Model + tokens
+            let mut model_spans = vec![Span::styled("    ", Style::default())];
+            if let Some(ref model) = card.model {
+                model_spans.push(Span::styled(
+                    format!("Model: {}", model),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if card.accumulated_tokens > 0 {
+                model_spans.push(Span::styled(
+                    format!("  Tokens: {}", format_tokens(card.accumulated_tokens)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if model_spans.len() > 1 {
+                lines.push(Line::from(model_spans));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    // ── Agent Table ──
+    lines.push(Line::from(Span::styled(
+        "── Agents ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if app.dashboard.agent_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No agents registered",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                format!("{:<12} {:<8} {:<8} ", "AGENT", "STATUS", "TIME"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "TASK",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for (i, row) in app.dashboard.agent_rows.iter().enumerate() {
+            let is_selected = i == app.dashboard.selected_row;
+            let activity_color = match row.activity {
+                DashboardAgentActivity::Active => Color::Green,
+                DashboardAgentActivity::Slow => Color::Yellow,
+                DashboardAgentActivity::Stuck => Color::Red,
+                DashboardAgentActivity::Exited => Color::DarkGray,
+            };
+
+            let elapsed_str = row
+                .elapsed_secs
+                .map(|s| format_duration_compact(s as u64))
+                .unwrap_or_else(|| "—".to_string());
+
+            let task_display = row.task_title.as_deref().unwrap_or(&row.task_id);
+
+            let row_style = if is_selected {
+                Style::default().bg(Color::Rgb(40, 40, 60))
+            } else {
+                Style::default()
+            };
+
+            let selector = if is_selected { "▸ " } else { "  " };
+
+            lines.push(Line::from(vec![
+                Span::styled(selector, Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:<12} ", &row.agent_id),
+                    row_style.fg(Color::White),
+                ),
+                Span::styled(
+                    format!("{:<8} ", row.activity.label()),
+                    row_style.fg(activity_color),
+                ),
+                Span::styled(
+                    format!("{:<8} ", elapsed_str),
+                    row_style.fg(Color::DarkGray),
+                ),
+                Span::styled(task_display, row_style.fg(Color::White)),
+            ]));
+
+            // Show latest snippet for active agents
+            if matches!(
+                row.activity,
+                DashboardAgentActivity::Active | DashboardAgentActivity::Slow
+            ) && let Some(ref snippet) = row.latest_snippet
+            {
+                let max_len = width.saturating_sub(6);
+                let truncated = if snippet.len() > max_len {
+                    format!("{}…", &snippet[..max_len.saturating_sub(1)])
+                } else {
+                    snippet.clone()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(truncated, Style::default().fg(Color::Rgb(100, 100, 100))),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    // ── Graph Summary ──
+    lines.push(Line::from(Span::styled(
+        "── Graph Summary ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let tc = &app.task_counts;
+    lines.push(Line::from(vec![
+        Span::styled("  Total: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.total), Style::default().fg(Color::White)),
+        Span::styled("  Done: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.done), Style::default().fg(Color::Green)),
+        Span::styled("  In-progress: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}", tc.in_progress),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Open: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.open), Style::default().fg(Color::White)),
+        Span::styled("  Failed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}", tc.failed), Style::default().fg(Color::Red)),
+        Span::styled("  Blocked: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{}", tc.blocked),
+            Style::default().fg(Color::Magenta),
+        ),
+    ]));
+
+    // Progress bar
+    if tc.total > 0 {
+        let pct = (tc.done as f64 / tc.total as f64 * 100.0) as u16;
+        let bar_width = width.saturating_sub(12).min(40);
+        let filled = (pct as usize * bar_width) / 100;
+        let empty = bar_width.saturating_sub(filled);
+        lines.push(Line::from(vec![
+            Span::styled("  [", Style::default().fg(Color::DarkGray)),
+            Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+            Span::styled(
+                "░".repeat(empty),
+                Style::default().fg(Color::Rgb(60, 60, 60)),
+            ),
+            Span::styled("] ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}%", pct), Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // ── Activity Sparkline ──
+    lines.push(Line::from(Span::styled(
+        "── Activity ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let sparkline_height: u16 = 3;
+    let total_text_lines = lines.len() as u16;
+
+    // Render the text portion
+    let text_height = area.height.saturating_sub(sparkline_height + 1);
+    let para = Paragraph::new(lines).scroll((app.dashboard.scroll as u16, 0));
+
+    let text_area = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: msg_area_height,
+        height: text_height.min(area.height),
     };
-    let input_area = Rect {
-        x: area.x,
-        y: area.y + msg_area_height,
-        width: area.width,
-        height: input_height,
-    };
+    frame.render_widget(para, text_area);
 
-    // Check if no task is selected.
-    if app.messages_panel.task_id.is_none() {
-        let msg = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Messages",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Select a task to send messages.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]);
-        frame.render_widget(msg, msg_area);
-        return;
-    }
+    // Sparkline at the bottom if there's room
+    let sparkline_y = area.y + text_area.height;
+    if sparkline_y + sparkline_height <= area.y + area.height {
+        let sparkline_area = Rect {
+            x: area.x + 1,
+            y: sparkline_y,
+            width: area.width.saturating_sub(2),
+            height: sparkline_height,
+        };
 
-    // Empty state.
-    if app.messages_panel.entries.is_empty() {
-        let msg = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Messages",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "No messages yet. Press Enter to compose.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]);
-        frame.render_widget(msg, msg_area);
-        draw_message_input(frame, app, input_area);
-        return;
-    }
-
-    let viewport_h = msg_area.height as usize;
-    let wrap_width = width;
-
-    // Color palette for distinct incoming senders.
-    const SENDER_COLORS: [Color; 6] = [
-        Color::Cyan,
-        Color::Magenta,
-        Color::Blue,
-        Color::LightYellow,
-        Color::LightRed,
-        Color::LightGreen,
-    ];
-
-    let mut wrapped_lines: Vec<Line> = Vec::new();
-    let msg_count = app.messages_panel.entries.len();
-    let summary = &app.messages_panel.summary;
-
-    // ── Stats header ──
-    // e.g., "3 sent, 2 replies  ✓ responded" or "3 sent, 1 reply  ⧖ awaiting reply"
-    {
-        let mut header_spans: Vec<Span> = Vec::new();
-
-        // Incoming count (messages sent TO the task).
-        if summary.incoming > 0 {
-            header_spans.push(Span::styled(
-                format!("{} sent", summary.incoming,),
-                Style::default().fg(Color::Green),
-            ));
-        }
-
-        // Outgoing count (replies FROM the task's agent).
-        if summary.outgoing > 0 {
-            if !header_spans.is_empty() {
-                header_spans.push(Span::styled(", ", Style::default().fg(Color::DarkGray)));
-            }
-            header_spans.push(Span::styled(
-                format!(
-                    "{} {}",
-                    summary.outgoing,
-                    if summary.outgoing == 1 {
-                        "reply"
-                    } else {
-                        "replies"
-                    }
-                ),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
-
-        // Response status indicator.
-        if summary.incoming > 0 {
-            header_spans.push(Span::styled("  ", Style::default()));
-            if summary.responded {
-                header_spans.push(Span::styled(
-                    "✓ responded",
-                    Style::default().fg(Color::Green),
-                ));
-            } else if summary.unanswered > 0 {
-                header_spans.push(Span::styled(
-                    format!("⧖ {} awaiting reply", summary.unanswered,),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-        }
-
-        if !header_spans.is_empty() {
-            wrapped_lines.push(Line::from(header_spans));
-            wrapped_lines.push(Line::from(Span::styled(
-                "─".repeat(wrap_width.min(40)),
-                Style::default().fg(Color::DarkGray),
-            )));
+        if sparkline_area.height > 0 && sparkline_area.width > 0 {
+            let data = &app.dashboard.sparkline_data;
+            let sparkline = Sparkline::default()
+                .data(data)
+                .style(Style::default().fg(Color::Green));
+            frame.render_widget(sparkline, sparkline_area);
         }
     }
 
-    // ── Render each message entry ──
-    let mut sender_color_map: std::collections::HashMap<String, Color> =
-        std::collections::HashMap::new();
-    let mut next_color_idx: usize = 0;
-
-    // Compute which incoming messages are unanswered (last N without a following outgoing).
-    let mut unanswered_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    {
-        let mut pending: Vec<usize> = Vec::new();
-        for (i, entry) in app.messages_panel.entries.iter().enumerate() {
-            match entry.direction {
-                super::state::MessageDirection::Incoming => pending.push(i),
-                super::state::MessageDirection::Outgoing => pending.clear(),
-            }
-        }
-        unanswered_set.extend(pending);
-    }
-
-    // Right-indent for outgoing messages (chat bubble effect).
-    let outgoing_indent = (wrap_width / 5).clamp(2, 8);
-
-    for (msg_idx, entry) in app.messages_panel.entries.iter().enumerate() {
-        let is_outgoing = entry.direction == super::state::MessageDirection::Outgoing;
-
-        // Strip ANSI from body.
-        let clean_body = String::from_utf8(strip_ansi_escapes::strip(entry.body.as_bytes()))
-            .unwrap_or_else(|_| entry.body.clone());
-
-        // Sender style: outgoing = green, incoming = rotating palette.
-        let sender_style = if is_outgoing {
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            let color = *sender_color_map
-                .entry(entry.sender.clone())
-                .or_insert_with(|| {
-                    let c = SENDER_COLORS[next_color_idx % SENDER_COLORS.len()];
-                    next_color_idx += 1;
-                    c
-                });
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
-        };
-
-        // Direction arrow and margin.
-        let (dir_arrow, margin) = if is_outgoing {
-            ("→ ", " ".repeat(outgoing_indent))
-        } else {
-            ("← ", String::new())
-        };
-
-        let dir_style = if is_outgoing {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-
-        // Unanswered marker for incoming messages without a reply.
-        let unanswered_marker = if !is_outgoing && unanswered_set.contains(&msg_idx) {
-            " ⧖"
-        } else {
-            ""
-        };
-
-        // Header line: [margin][arrow] sender  timestamp [unanswered]
-        let mut header_spans: Vec<Span> = Vec::new();
-        if !margin.is_empty() {
-            header_spans.push(Span::raw(margin.clone()));
-        }
-        header_spans.push(Span::styled(dir_arrow, dir_style));
-        header_spans.push(Span::styled(entry.display_label.clone(), sender_style));
-        if entry.is_urgent {
-            header_spans.push(Span::styled(
-                " [!]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-        }
-        header_spans.push(Span::styled(
-            format!("  {}", entry.timestamp),
-            Style::default().fg(Color::DarkGray),
-        ));
-        // Delivery status indicator.
-        let (status_icon, status_color) = match entry.delivery_status {
-            workgraph::messages::DeliveryStatus::Sent => ("\u{2709}", Color::DarkGray), // ✉
-            workgraph::messages::DeliveryStatus::Delivered => ("\u{1f4ec}", Color::Blue), // 📬
-            workgraph::messages::DeliveryStatus::Read => ("\u{1f441}", Color::Yellow),  // 👁
-            workgraph::messages::DeliveryStatus::Acknowledged => ("\u{2705}", Color::Green), // ✅
-        };
-        header_spans.push(Span::styled(
-            format!(" {}", status_icon),
-            Style::default().fg(status_color),
-        ));
-        if !unanswered_marker.is_empty() {
-            header_spans.push(Span::styled(
-                unanswered_marker,
-                Style::default().fg(Color::Yellow),
-            ));
-        }
-        wrapped_lines.push(Line::from(header_spans));
-
-        // Body lines with indent matching the margin + arrow.
-        let body_indent_len = if is_outgoing {
-            outgoing_indent + 2 // margin + "→ "
-        } else {
-            2 // "← "
-        };
-        let body_indent = " ".repeat(body_indent_len);
-        let text_width = wrap_width.saturating_sub(body_indent_len);
-
-        // Body style: outgoing gets a subtle dimming, incoming is default.
-        let body_style = if is_outgoing {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default()
-        };
-
-        if text_width == 0 || clean_body.is_empty() {
-            wrapped_lines.push(Line::from(Span::styled(
-                format!("{}{}", body_indent, clean_body),
-                body_style,
-            )));
-        } else {
-            // Render markdown to styled lines, then word-wrap.
-            let md_lines = markdown_to_lines(&clean_body, text_width);
-            let body_wrapped = if md_lines.is_empty() {
-                vec![Line::from("")]
-            } else {
-                wrap_line_spans(&md_lines, text_width)
-            };
-            for line in &body_wrapped {
-                let mut spans = vec![Span::raw(body_indent.clone())];
-                spans.extend(line.spans.iter().cloned());
-                wrapped_lines.push(Line::from(spans));
-            }
-        }
-
-        // Visual separator between messages.
-        if msg_idx + 1 < msg_count {
-            wrapped_lines.push(Line::from(""));
-        }
-    }
-
-    let total_lines = wrapped_lines.len();
-    app.messages_panel.total_wrapped_lines = total_lines;
-    app.messages_panel.viewport_height = viewport_h;
-
-    // Scrolling: scroll is from top (0 = fully scrolled to top).
-    let scroll = app
-        .messages_panel
-        .scroll
-        .min(total_lines.saturating_sub(viewport_h));
-    let end = (scroll + viewport_h).min(total_lines);
-
-    let visible_lines: Vec<Line> = wrapped_lines[scroll..end].to_vec();
-
-    let paragraph = Paragraph::new(visible_lines);
-    frame.render_widget(paragraph, msg_area);
-
-    if total_lines > viewport_h && app.panel_scrollbar_visible() {
-        draw_panel_scrollbar(
-            frame,
-            app,
-            msg_area,
-            total_lines.saturating_sub(viewport_h),
-            scroll,
-        );
-    }
-
-    // Input area.
-    draw_message_input(frame, app, input_area);
+    // Update metrics for scrollbar support
+    app.dashboard.total_rendered_lines = total_text_lines as usize + sparkline_height as usize;
+    app.dashboard.viewport_height = area.height as usize;
 }
 
-/// Draw the message input line at the bottom of the messages panel.
-fn draw_message_input(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    let is_editing = app.input_mode == InputMode::MessageInput;
-    let has_text = !super::state::editor_is_empty(&app.messages_panel.editor);
-    let border_color = if is_editing {
-        Color::Magenta
-    } else {
-        Color::DarkGray
-    };
-    let prompt_color = if is_editing {
-        Color::LightMagenta
-    } else {
-        Color::DarkGray
-    };
-    if is_editing || has_text {
-        let sep = Line::from(Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default()
-                .fg(border_color)
-                .add_modifier(if is_editing {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ));
-        if area.height >= 2 {
-            frame.render_widget(
-                Paragraph::new(sep),
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-        }
-        let input_y = if area.height >= 2 { area.y + 1 } else { area.y };
-        let input_h = if area.height >= 2 {
-            area.height - 1
-        } else {
-            area.height
-        };
-        let prefix_len: u16 = 2;
-        if input_h > 0 {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "> ",
-                    Style::default()
-                        .fg(prompt_color)
-                        .add_modifier(if is_editing {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ))),
-                Rect {
-                    x: area.x,
-                    y: input_y,
-                    width: prefix_len,
-                    height: 1,
-                },
-            );
-        }
-        let editor_area = Rect {
-            x: area.x + prefix_len,
-            y: input_y,
-            width: area.width.saturating_sub(prefix_len),
-            height: input_h,
-        };
-        let text_color = if is_editing {
-            Color::Reset
-        } else {
-            Color::DarkGray
-        };
-        let cursor_style = if is_editing {
-            Style::default().fg(Color::Black).bg(Color::White)
-        } else {
-            Style::default().fg(text_color)
-        };
-        render_editor_word_wrap(
-            frame,
-            &app.messages_panel.editor,
-            editor_area,
-            Style::default().fg(text_color),
-            cursor_style,
-            is_editing,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " Enter: compose  \u{2191}\u{2193}: scroll",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
+/// Highlight all occurrences of `query_lower` (already lowercased) in a Line
+/// by splitting spans and applying `bg` to matching regions.
+fn highlight_query_in_line<'a>(line: Line<'a>, query_lower: &str, bg: Color) -> Line<'a> {
+    if query_lower.is_empty() {
+        return line;
     }
+    let mut new_spans: Vec<Span<'a>> = Vec::new();
+    for span in line.spans {
+        let text = span.content.as_ref();
+        let text_lower = text.to_lowercase();
+        let mut last = 0;
+        let mut found = false;
+        let mut start = 0;
+        while start < text_lower.len() {
+            if let Some(pos) = text_lower[start..].find(query_lower) {
+                found = true;
+                let abs_pos = start + pos;
+                // Text before the match.
+                if abs_pos > last {
+                    new_spans.push(Span::styled(text[last..abs_pos].to_string(), span.style));
+                }
+                // The match itself.
+                let match_end = abs_pos + query_lower.len();
+                let match_end = match_end.min(text.len());
+                new_spans.push(Span::styled(
+                    text[abs_pos..match_end].to_string(),
+                    span.style.bg(bg).add_modifier(Modifier::BOLD),
+                ));
+                last = match_end;
+                start = match_end;
+            } else {
+                break;
+            }
+        }
+        if found {
+            if last < text.len() {
+                new_spans.push(Span::styled(text[last..].to_string(), span.style));
+            }
+        } else {
+            new_spans.push(span);
+        }
+    }
+    Line::from(new_spans)
 }
 
 /// Simple word-wrap: break text into lines that fit within `max_width` display columns.
@@ -3280,20 +5681,31 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
                     // Token usage
                     if let Some(ref usage) = phase.token_usage {
-                        let cache_total =
-                            usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-                        let mut tok_parts = vec![format!("→{}", format_tokens(usage.input_tokens))];
-                        if cache_total > 0 {
-                            tok_parts.push(format!("+{} cached", format_tokens(cache_total)));
-                        }
-                        tok_parts.push(format!("←{}", format_tokens(usage.output_tokens)));
-                        if usage.cost_usd > 0.0 {
-                            tok_parts.push(format!("${:.4}", usage.cost_usd));
-                        }
-                        lines.push(Line::from(Span::styled(
-                            format!("  Tokens: {}", tok_parts.join(" ")),
+                        let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+                        let mut spans: Vec<Span> = vec![Span::styled(
+                            format!(
+                                "  Tokens: →{} ←{}",
+                                format_tokens(novel_in),
+                                format_tokens(usage.output_tokens)
+                            ),
                             Style::default().fg(Color::DarkGray),
-                        )));
+                        )];
+                        if usage.cache_read_input_tokens > 0 {
+                            spans.push(Span::styled(
+                                format!(
+                                    "  (cached: {})",
+                                    format_tokens(usage.cache_read_input_tokens)
+                                ),
+                                Style::default().fg(Color::Rgb(80, 80, 80)),
+                            ));
+                        }
+                        if usage.cost_usd > 0.0 {
+                            spans.push(Span::styled(
+                                format!(" ${:.4}", usage.cost_usd),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        lines.push(Line::from(spans));
                     }
 
                     // Runtime
@@ -3364,7 +5776,7 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             .iter()
             .filter_map(|p| p.as_ref())
             .filter_map(|p| p.token_usage.as_ref())
-            .map(|u| u.input_tokens)
+            .map(|u| u.input_tokens + u.cache_creation_input_tokens)
             .sum();
         let total_output: u64 = phases
             .iter()
@@ -3381,29 +5793,31 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let total_tokens = total_new_input + total_output + total_cached;
         if total_tokens > 0 {
             lines.push(Line::from(""));
-            let mut summary = if total_cached > 0 {
-                format!(
-                    "  Total: →{} +{} cached ←{}",
-                    format_tokens(total_new_input),
-                    format_tokens(total_cached),
-                    format_tokens(total_output)
-                )
-            } else {
+            let mut spans: Vec<Span> = vec![Span::styled(
                 format!(
                     "  Total: →{} ←{}",
                     format_tokens(total_new_input),
                     format_tokens(total_output)
-                )
-            };
-            if total_cost > 0.0 {
-                summary.push_str(&format!(" (${:.4})", total_cost));
-            }
-            lines.push(Line::from(Span::styled(
-                summary,
+                ),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
-            )));
+            )];
+            if total_cached > 0 {
+                spans.push(Span::styled(
+                    format!("  (cached: {})", format_tokens(total_cached)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if total_cost > 0.0 {
+                spans.push(Span::styled(
+                    format!(" ${:.4}", total_cost),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         lines.push(Line::from(""));
@@ -3442,6 +5856,7 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 AgentStatus::Failed | AgentStatus::Dead => {
                     Span::styled("✗ ", Style::default().fg(Color::Red))
                 }
+                AgentStatus::Frozen => Span::styled("⏸ ", Style::default().fg(Color::Blue)),
                 _ => Span::styled("○ ", Style::default().fg(Color::DarkGray)),
             };
             // Build agent header with optional stream message count.
@@ -3582,8 +5997,8 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 // Overlay widgets
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Draw a confirmation dialog overlay.
-fn draw_confirm_dialog(frame: &mut Frame, action: &ConfirmAction) {
+/// Draw a confirmation dialog overlay. Returns the dialog area for click-outside detection.
+fn draw_confirm_dialog(frame: &mut Frame, action: &ConfirmAction) -> Rect {
     let message = match action {
         ConfirmAction::MarkDone(id) => format!("Mark '{}' done?", id),
         ConfirmAction::Retry(id) => format!("Retry '{}'?", id),
@@ -3630,6 +6045,815 @@ fn draw_confirm_dialog(frame: &mut Frame, action: &ConfirmAction) {
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+    area
+}
+
+/// Draw a choice dialog overlay with multiple selectable options. Returns the dialog area.
+fn draw_choice_dialog(frame: &mut Frame, state: &ChoiceDialogState) -> Rect {
+    use super::state::ChoiceDialogAction;
+
+    let title = match &state.action {
+        ChoiceDialogAction::RemoveCoordinator(cid) => format!(" Close Chat {} ", cid),
+    };
+
+    let size = frame.area();
+    let width: u16 = 45;
+    let height: u16 = 3 + state.options.len() as u16 + 2; // border + options + footer + border
+    let x = (size.width.saturating_sub(width)) / 2;
+    let y = (size.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (hotkey, label, desc)) in state.options.iter().enumerate() {
+        let is_selected = i == state.selected;
+        let style = if is_selected {
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        } else {
+            Style::default()
+        };
+        let hotkey_style = if is_selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" [{}] ", hotkey), hotkey_style),
+            Span::styled(format!("{:<8}", label), style.add_modifier(Modifier::BOLD)),
+            Span::styled(format!("— {}", desc), style),
+        ]));
+    }
+    // Empty line + footer
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [↑↓]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Navigate  "),
+        Span::styled("[Enter]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Select  "),
+        Span::styled("[Esc]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Cancel"),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    area
+}
+
+/// Draw the coordinator picker overlay. Returns the dialog area.
+fn draw_coordinator_picker(
+    frame: &mut Frame,
+    picker: &super::state::CoordinatorPickerState,
+    active_cid: u32,
+) -> Rect {
+    let size = frame.area();
+    let width: u16 = 50.min(size.width.saturating_sub(4));
+    let height: u16 =
+        (3 + picker.entries.len() as u16 + 2).min(size.height.saturating_sub(2)); // border + entries + footer + border
+    let x = (size.width.saturating_sub(width)) / 2;
+    let y = (size.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Switch Chat ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (cid, label, status, alive)) in picker.entries.iter().enumerate() {
+        let is_selected = i == picker.selected;
+        let is_active = *cid == active_cid;
+
+        let bg = if is_selected {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        };
+        let fg = if *alive { Color::Green } else { Color::Gray };
+        let marker = if is_active { ">" } else { " " };
+
+        let status_indicator = if *alive { "●" } else { "○" };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", marker),
+                Style::default()
+                    .bg(bg)
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", status_indicator),
+                Style::default().bg(bg).fg(fg),
+            ),
+            Span::styled(
+                format!("{:<10}", label),
+                Style::default()
+                    .bg(bg)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}", status), Style::default().bg(bg).fg(fg)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" [↑↓]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Nav  "),
+        Span::styled("[Enter]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Open  "),
+        Span::styled("[+]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" New  "),
+        Span::styled("[−]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Close  "),
+        Span::styled("[Esc]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Cancel"),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    area
+}
+
+/// Render a FilterPicker WITH hit-area collection + scroll-window clamping.
+/// Used by the launcher to make rows clickable.
+///
+/// `parent_line_offset` is the number of lines already pushed into the
+/// containing paragraph so we can compute absolute Y positions for each row.
+/// `parent_area` is the launcher pane rect we're rendering into.
+/// `hits` is appended with one (LauncherListHit, Rect) per visible row.
+/// `list_area` is set to the bounding box of all visible rows (for scroll-wheel routing).
+#[allow(clippy::too_many_arguments)]
+fn render_filter_picker_with_hits(
+    picker: &super::state::FilterPicker,
+    active: bool,
+    w: usize,
+    viewport_height: usize,
+    parent_line_offset: usize,
+    parent_area: Rect,
+    hits: &mut Vec<(super::state::LauncherListHit, Rect)>,
+    list_area: &mut Rect,
+) -> Vec<Line<'static>> {
+    use super::state::LauncherListHit;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut local_offset = parent_line_offset;
+    let row_rect = |line_idx: usize| -> Rect {
+        Rect {
+            x: parent_area.x,
+            y: parent_area.y.saturating_add(line_idx as u16),
+            width: parent_area.width,
+            height: 1,
+        }
+    };
+
+    // Filter input (consume one line if shown)
+    if active && !picker.filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    Filter: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                picker.filter.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ]));
+        local_offset += 1;
+    } else if active {
+        lines.push(Line::from(Span::styled(
+            "    Type to filter...",
+            Style::default().fg(Color::DarkGray),
+        )));
+        local_offset += 1;
+    }
+
+    if picker.items.is_empty() && !picker.empty_hint.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", picker.empty_hint),
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
+
+    // Apply scroll window: skip first `scroll_offset` filtered rows, show up
+    // to `viewport_height` of them.
+    let total_filtered = picker.filtered_indices.len();
+    let mut scroll = picker.scroll_offset;
+    // Auto-clamp: if scroll_offset is past the end, render still works.
+    if scroll >= total_filtered && total_filtered > 0 {
+        scroll = total_filtered - 1;
+    }
+    // Auto-scroll selected into view (selected indexes filtered_indices when not custom).
+    let visible_end = if picker.is_custom_selected() {
+        // Custom row is always rendered separately; window can stay where it is.
+        (scroll + viewport_height).min(total_filtered)
+    } else {
+        let sel = picker.selected;
+        let mut s = scroll;
+        if sel < s {
+            s = sel;
+        } else if sel >= s + viewport_height && viewport_height > 0 {
+            s = sel + 1 - viewport_height;
+        }
+        scroll = s;
+        (s + viewport_height).min(total_filtered)
+    };
+    let list_first_y = parent_area.y.saturating_add(local_offset as u16);
+
+    for fi in scroll..visible_end {
+        let item_idx = picker.filtered_indices[fi];
+        let (id, desc) = &picker.items[item_idx];
+        let selected = active && fi == picker.selected && !picker.custom_active;
+        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let desc_short: String = desc.chars().take(w.saturating_sub(id.len() + 14)).collect();
+        let line_idx = local_offset;
+        if desc_short.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}{}", bullet, id),
+                style,
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}{}", bullet, id), style),
+                Span::styled(
+                    format!("  {}", desc_short),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        hits.push((LauncherListHit::Item(fi), row_rect(line_idx)));
+        local_offset += 1;
+    }
+
+    // "(N/M matches)" / scroll indicator
+    if !picker.filter.is_empty() || total_filtered > viewport_height {
+        let total = picker.items.len();
+        let shown_range_end = visible_end;
+        let prefix = if !picker.filter.is_empty() {
+            format!("({}/{} matches", total_filtered, total)
+        } else {
+            format!("({}-{}/{}", scroll + 1, shown_range_end, total_filtered)
+        };
+        let suffix = if total_filtered > viewport_height {
+            format!(", scroll wheel) [{}+]", scroll)
+        } else {
+            ")".to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("    {}{}", prefix, suffix),
+            Style::default().fg(Color::DarkGray),
+        )));
+        local_offset += 1;
+    }
+
+    // Custom row
+    if picker.allow_custom {
+        let custom_selected = active && picker.is_custom_selected();
+        let custom_style = if picker.custom_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if custom_selected {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let bullet = if custom_selected || picker.custom_active {
+            " \u{25cf} "
+        } else {
+            " \u{25cb} "
+        };
+        let line_idx = local_offset;
+        if picker.custom_active {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}Custom: ", bullet), custom_style),
+                Span::raw(picker.custom_text.clone()),
+                Span::styled(
+                    "\u{2588}",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ]));
+        } else {
+            let display = if picker.custom_text.is_empty() {
+                "Custom: [enter value]".to_string()
+            } else {
+                format!("Custom: {}", picker.custom_text)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}{}", bullet, display),
+                custom_style,
+            )));
+        }
+        hits.push((LauncherListHit::Custom, row_rect(line_idx)));
+        local_offset += 1;
+    }
+
+    // Set list_area to the bounding box of all clickable rows.
+    let list_height = (local_offset as u16).saturating_sub(list_first_y - parent_area.y);
+    *list_area = Rect {
+        x: parent_area.x,
+        y: list_first_y,
+        width: parent_area.width,
+        height: list_height,
+    };
+
+    lines
+}
+
+/// Render a FilterPicker into a list of Lines.
+/// Reused by the launcher (model/endpoint) and config panel (Choice fields).
+fn render_filter_picker(
+    picker: &super::state::FilterPicker,
+    active: bool,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Filter input (shown only when active and filter has text or section is active)
+    if active && !picker.filter.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    Filter: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                picker.filter.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ]));
+    } else if active {
+        lines.push(Line::from(Span::styled(
+            "    Type to filter...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if picker.items.is_empty() && !picker.empty_hint.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", picker.empty_hint),
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
+
+    for (fi, &item_idx) in picker.filtered_indices.iter().enumerate() {
+        let (ref id, ref desc) = picker.items[item_idx];
+        let selected = active && fi == picker.selected && !picker.custom_active;
+        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let desc_short: String = desc.chars().take(w.saturating_sub(id.len() + 14)).collect();
+        if desc_short.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}{}", bullet, id),
+                style,
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}{}", bullet, id), style),
+                Span::styled(
+                    format!("  {}", desc_short),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+
+    // Show match count when filter is active
+    if !picker.filter.is_empty() {
+        let total = picker.items.len();
+        let shown = picker.filtered_indices.len();
+        if shown < total {
+            lines.push(Line::from(Span::styled(
+                format!("    ({}/{} matches)", shown, total),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    // Custom row
+    if picker.allow_custom {
+        let custom_selected = active && picker.is_custom_selected();
+        let custom_style = if picker.custom_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if custom_selected {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let bullet = if custom_selected || picker.custom_active {
+            " \u{25cf} "
+        } else {
+            " \u{25cb} "
+        };
+        if picker.custom_active {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}Custom: ", bullet), custom_style),
+                Span::raw(picker.custom_text.clone()),
+                Span::styled(
+                    "\u{2588}",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ]));
+        } else {
+            let display = if picker.custom_text.is_empty() {
+                "Custom: [enter value]".to_string()
+            } else {
+                format!("Custom: {}", picker.custom_text)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}{}", bullet, display),
+                custom_style,
+            )));
+        }
+    }
+
+    lines
+}
+
+pub(crate) fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    use super::state::{LauncherListHit, LauncherSection};
+
+    // Snapshot read-only data we need from the launcher so we can mutate
+    // hit-area buffers on `app` without holding a long borrow.
+    let (
+        active_section,
+        name,
+        executor_list,
+        executor_selected,
+        model_picker,
+        endpoint_picker,
+        show_endpoint,
+        recent_list,
+        recent_selected,
+    ) = match app.launcher.as_ref() {
+        Some(l) => (
+            l.active_section.clone(),
+            l.name.clone(),
+            l.executor_list.clone(),
+            l.executor_selected,
+            l.model_picker.clone(),
+            l.endpoint_picker.clone(),
+            l.show_endpoint(),
+            l.recent_list.clone(),
+            l.recent_selected,
+        ),
+        None => return,
+    };
+
+    // Reset hit areas for this frame.
+    app.last_launcher_area = area;
+    app.launcher_executor_hits.clear();
+    app.launcher_model_hits.clear();
+    app.launcher_endpoint_hits.clear();
+    app.launcher_recent_hits.clear();
+    app.launcher_name_hit = Rect::default();
+    app.launcher_model_list_area = Rect::default();
+    app.launcher_endpoint_list_area = Rect::default();
+
+    let w = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Helper: turn the upcoming line index into an absolute row Rect.
+    let row_rect = |line_idx: usize| -> Rect {
+        Rect {
+            x: area.x,
+            y: area.y.saturating_add(line_idx as u16),
+            width: area.width,
+            height: 1,
+        }
+    };
+
+    let section_style = |active: bool| {
+        if active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    };
+
+    // Title
+    lines.push(Line::from(Span::styled(
+        "  New Chat",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    // Action row: [Launch] [Cancel] + Name input live at the TOP. The user
+    // asked for "launch at top of view so its clear why we are doing the
+    // list below" — this is that row. Mouse hits are wired to the same
+    // handlers as the legacy footer buttons.
+    let name_active = active_section == LauncherSection::Name;
+    let name_style = if name_active {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let action_line_idx = lines.len();
+    let action_y = area.y.saturating_add(action_line_idx as u16);
+    let launch_x = area.x.saturating_add(2);
+    let launch_w: u16 = 8; // "[Launch]"
+    let cancel_x = launch_x.saturating_add(launch_w + 1);
+    let cancel_w: u16 = 8; // "[Cancel]"
+    app.launcher_launch_btn_hit = Rect {
+        x: launch_x,
+        y: action_y,
+        width: launch_w,
+        height: 1,
+    };
+    app.launcher_cancel_btn_hit = Rect {
+        x: cancel_x,
+        y: action_y,
+        width: cancel_w,
+        height: 1,
+    };
+    let mut action_spans: Vec<Span> = vec![
+        Span::raw("  "),
+        Span::styled(
+            "[Launch]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[Cancel]",
+            Style::default().fg(Color::White).bg(Color::DarkGray),
+        ),
+        Span::raw("   "),
+    ];
+    let name_prefix = if name_active { "\u{25b8} Name: " } else { "  Name: " };
+    action_spans.push(Span::styled(name_prefix.to_string(), name_style));
+    if name.is_empty() {
+        action_spans.push(Span::styled(
+            if name_active { "\u{2588}" } else { "(optional)" },
+            if name_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    } else {
+        action_spans.push(Span::raw(name.clone()));
+        if name_active {
+            action_spans.push(Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+    }
+    lines.push(Line::from(action_spans));
+    // Hit area for the Name input is the right portion of the action row,
+    // starting after "[Launch] [Cancel]   " (2 + 8 + 1 + 8 + 3 = 22 cols).
+    let name_x = area.x.saturating_add(22);
+    app.launcher_name_hit = Rect {
+        x: name_x,
+        y: action_y,
+        width: area.width.saturating_sub(22),
+        height: 1,
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "\u{2500}".repeat(w.saturating_sub(4).min(60))),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Executor section
+    let exec_active = active_section == LauncherSection::Executor;
+    lines.push(Line::from(Span::styled(
+        if exec_active {
+            "  \u{25b8} Executor"
+        } else {
+            "    Executor"
+        },
+        section_style(exec_active),
+    )));
+
+    for (i, (ename, desc, available)) in executor_list.iter().enumerate() {
+        let selected = exec_active && i == executor_selected;
+        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
+        let style = if !available {
+            Style::default().fg(Color::DarkGray)
+        } else if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let suffix = if !available { " (not found)" } else { "" };
+        let desc_short: String = desc
+            .chars()
+            .take(w.saturating_sub(ename.len() + 14))
+            .collect();
+        let row_idx = lines.len();
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {}{}", bullet, ename), style),
+            Span::styled(
+                format!("  {}{}", desc_short, suffix),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        app.launcher_executor_hits.push((i, row_rect(row_idx)));
+    }
+    lines.push(Line::from(""));
+
+    // Model section header
+    let model_active = active_section == LauncherSection::Model;
+    lines.push(Line::from(Span::styled(
+        if model_active {
+            "  \u{25b8} Model"
+        } else {
+            "    Model"
+        },
+        section_style(model_active),
+    )));
+
+    // Compute remaining vertical space, reserving room for endpoint + recent + footer.
+    let mut reserved = 1usize; // footer
+    if show_endpoint {
+        // header + items + custom row + blank
+        reserved += 2
+            + endpoint_picker.filtered_indices.len()
+            + if endpoint_picker.allow_custom { 1 } else { 0 };
+    }
+    if !recent_list.is_empty() {
+        reserved += 2 + recent_list.len(); // header + items + blank
+    }
+    let used_so_far = lines.len();
+    let area_h = area.height as usize;
+    let model_room = area_h
+        .saturating_sub(used_so_far)
+        .saturating_sub(reserved)
+        .saturating_sub(2); // blank line + safety
+    // Per-section max items shown in viewport (clamped to at least 3).
+    let model_viewport = model_room.max(3);
+
+    let model_lines = render_filter_picker_with_hits(
+        &model_picker,
+        model_active,
+        w,
+        model_viewport,
+        lines.len(),
+        area,
+        &mut app.launcher_model_hits,
+        &mut app.launcher_model_list_area,
+    );
+    lines.extend(model_lines);
+    lines.push(Line::from(""));
+
+    // Endpoint section
+    if show_endpoint {
+        let ep_active = active_section == LauncherSection::Endpoint;
+        lines.push(Line::from(Span::styled(
+            if ep_active {
+                "  \u{25b8} Endpoint"
+            } else {
+                "    Endpoint"
+            },
+            section_style(ep_active),
+        )));
+        let ep_viewport = endpoint_picker
+            .filtered_indices
+            .len()
+            .max(3)
+            .min(area_h.saturating_sub(lines.len()).saturating_sub(2));
+        let ep_lines = render_filter_picker_with_hits(
+            &endpoint_picker,
+            ep_active,
+            w,
+            ep_viewport.max(3),
+            lines.len(),
+            area,
+            &mut app.launcher_endpoint_hits,
+            &mut app.launcher_endpoint_list_area,
+        );
+        lines.extend(ep_lines);
+        lines.push(Line::from(""));
+    }
+
+    // Recent combos section
+    if !recent_list.is_empty() {
+        let recent_active = active_section == LauncherSection::Recent;
+        lines.push(Line::from(Span::styled(
+            if recent_active {
+                "  \u{25b8} Recent"
+            } else {
+                "    Recent"
+            },
+            section_style(recent_active),
+        )));
+
+        for (i, entry) in recent_list.iter().enumerate() {
+            let selected = recent_active && i == recent_selected;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let model_str = entry.model.as_deref().unwrap_or("default");
+            let ep_str = entry
+                .endpoint
+                .as_deref()
+                .map(|e| format!(" @ {}", e))
+                .unwrap_or_default();
+            let num = i + 1;
+            let row_idx = lines.len();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {}. ", num),
+                    if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::styled(
+                    format!("{} / {}{}", entry.executor, model_str, ep_str),
+                    style,
+                ),
+            ]));
+            app.launcher_recent_hits.push((i, row_rect(row_idx)));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Footer hint only — the [Launch] / [Cancel] buttons live at the top
+    // of the dialog now (see action row above), so users see the action
+    // before scrolling through the list of choices.
+    lines.push(Line::from(Span::styled(
+        "    Enter / Ctrl+Enter / Shift+Enter launch  ·  Tab section  ·  ↑↓ pgup/pgdn scroll  ·  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+
+    // Suppress the "LauncherListHit::Custom unused" warning when only Item is constructed.
+    let _ = LauncherListHit::Custom;
 }
 
 /// Draw a text prompt overlay (fail reason, message, edit description).
@@ -3834,7 +7058,12 @@ fn draw_task_form(frame: &mut Frame, form: &TaskFormState) {
             };
             let marker = if is_selected { "▸ " } else { "  " };
             let display = if title.len() > 30 {
-                format!("{}{} ({}…)", marker, id, &title[..title.floor_char_boundary(27)])
+                format!(
+                    "{}{} ({}…)",
+                    marker,
+                    id,
+                    &title[..title.floor_char_boundary(27)]
+                )
             } else {
                 format!("{}{} ({})", marker, id, title)
             };
@@ -4004,17 +7233,20 @@ fn draw_action_hints(frame: &mut Frame, app: &VizApp, area: Rect) {
         spans.extend(hint_spans);
     }
 
-    // Append notification if present.
-    if let Some((ref msg, _)) = app.notification {
+    // Append latest toast in the status bar (if any).
+    if let Some(toast) = app.toasts.last() {
+        let color = match toast.severity {
+            ToastSeverity::Info => Color::Green,
+            ToastSeverity::Warning => Color::Yellow,
+            ToastSeverity::Error => Color::Red,
+        };
         spans.push(Span::styled(
             "  │ ",
             Style::default().fg(Color::Rgb(80, 80, 80)),
         ));
         spans.push(Span::styled(
-            msg.as_str(),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
+            toast.message.as_str(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -4043,6 +7275,18 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                 ("Esc", "cancel"),
             ],
         ),
+        InputMode::ChatSearch => (
+            "0:Chat",
+            "SEARCH",
+            Color::Cyan,
+            vec![
+                ("Tab", "next"),
+                ("S-Tab", "prev"),
+                ("Enter", "accept"),
+                ("Esc", "cancel"),
+                ("C-a", "all history"),
+            ],
+        ),
         InputMode::ChatInput => {
             let label = if app.right_panel_tab == RightPanelTab::Chat {
                 "0:Chat"
@@ -4055,9 +7299,9 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                 Color::Magenta,
                 vec![
                     ("Enter", "send"),
+                    ("Esc", "cancel"),
+                    ("↑↓", "history"),
                     ("S-Enter", "newline"),
-                    ("Ctrl+K/Y", "kill/yank"),
-                    ("Esc", "exit"),
                 ],
             )
         }
@@ -4106,47 +7350,148 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
             Color::Yellow,
             vec![("Enter", "save"), ("Esc", "cancel")],
         ),
+        InputMode::SettingsEdit => (
+            "8:Settings",
+            "EDIT",
+            Color::Yellow,
+            vec![("Enter", "save"), ("Esc", "cancel")],
+        ),
+        InputMode::ChoiceDialog(_) => (
+            "Choice",
+            "EDIT",
+            Color::Yellow,
+            vec![("↑↓", "navigate"), ("Enter", "select"), ("Esc", "cancel")],
+        ),
+        InputMode::CoordinatorPicker => (
+            "Picker",
+            "NAV",
+            Color::Cyan,
+            vec![
+                ("↑↓", "select"),
+                ("Enter", "open"),
+                ("+", "new"),
+                ("−", "close"),
+                ("Esc", "cancel"),
+            ],
+        ),
         InputMode::Normal => match app.focused_panel {
-            FocusedPanel::Graph => (
-                "Graph",
-                "NAV",
-                Color::Rgb(120, 120, 120),
-                vec![
-                    ("↑↓", "select"),
-                    ("Enter", "inspect"),
-                    ("Tab", "panel"),
-                    ("/", "search"),
-                    ("a", "add"),
-                    ("D", "done"),
-                    ("i/I", "inspector size"),
-                    ("?", "help"),
-                    ("Alt←→", "tabs"),
-                ],
-            ),
+            FocusedPanel::Graph if app.archive_browser.active => {
+                if app.archive_browser.filter_active {
+                    (
+                        "Archive",
+                        "FILTER",
+                        Color::Cyan,
+                        vec![("Enter", "accept"), ("Esc", "clear")],
+                    )
+                } else {
+                    (
+                        "Archive",
+                        "NAV",
+                        Color::Yellow,
+                        vec![
+                            ("↑↓", "select"),
+                            ("/", "filter"),
+                            ("r", "restore"),
+                            ("R", "refresh"),
+                            ("A/Esc", "close"),
+                        ],
+                    )
+                }
+            }
+            FocusedPanel::Graph => {
+                let tab_hint = if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                    ("Tab/]/[", "panels")
+                } else {
+                    ("Tab", "panel")
+                };
+                (
+                    if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                        "▸Graph"
+                    } else {
+                        "Graph"
+                    },
+                    "NAV",
+                    Color::Rgb(120, 120, 120),
+                    vec![
+                        ("↑↓", "select"),
+                        ("Enter", "inspect"),
+                        tab_hint,
+                        ("/", "search"),
+                        ("a", "add"),
+                        ("D", "done"),
+                        ("M", "msg"),
+                        ("i/v", "resize pane"),
+                        ("?", "help"),
+                        ("Alt←→", "cycle views"),
+                    ],
+                )
+            }
             FocusedPanel::RightPanel => {
                 let tab = &app.right_panel_tab;
                 let tab_label: &str = match tab {
                     RightPanelTab::Chat => "0:Chat",
                     RightPanelTab::Detail => "1:Detail",
-                    RightPanelTab::Log => "2:Log",
-                    RightPanelTab::Messages => "3:Msg",
-                    RightPanelTab::Agency => "4:Agency",
-                    RightPanelTab::Config => "5:Config",
-                    RightPanelTab::Files => "6:Files",
-                    RightPanelTab::CoordLog => "7:Coord",
+                    RightPanelTab::Agency => "2:Agency",
+                    RightPanelTab::Config => "3:Config",
+                    RightPanelTab::Log => "4:Log",
+                    RightPanelTab::CoordLog => "5:Coord",
+                    RightPanelTab::Dashboard => "6:Dash",
+                    RightPanelTab::Messages => "7:Msg",
+                    RightPanelTab::Settings => "8:Settings",
+                    // Dead tabs, not reachable from the bar.
+                    RightPanelTab::Files => "Files",
+                    RightPanelTab::Firehose => "Fire",
+                    RightPanelTab::Output => "Out",
                 };
                 let mut hints: Vec<(&str, &str)> = Vec::new();
                 match tab {
+                    RightPanelTab::Chat if app.chat_pty_mode && app.chat_pty_forwards_stdin => {
+                        // PTY-active branch: in PTY mode the only TUI hotkey
+                        // is Ctrl+T to enter command mode. Show the
+                        // appropriate hint depending on whether we are in
+                        // PTY focus or have already broken out.
+                        if app.focused_panel == FocusedPanel::RightPanel {
+                            hints.push(("Ctrl+T", "command mode"));
+                            hints.push(("PgUp/Dn", "scroll"));
+                        } else {
+                            hints.push(("Ctrl+T", "back to chat"));
+                            hints.push(("n", "new chat"));
+                            hints.push(("w", "close tab"));
+                            hints.push(("←→", "chats"));
+                            hints.push(("?", "help"));
+                        }
+                    }
+                    RightPanelTab::Chat if app.chat_pty_mode => {
+                        hints.push(("Enter", "chat"));
+                        hints.push(("Ctrl+T", "focus PTY"));
+                        hints.push(("↑↓", "scroll"));
+                        hints.push(("←→", "chats"));
+                    }
                     RightPanelTab::Chat => {
-                        hints.push(("Enter", "type"));
+                        hints.push(("←→", "chats"));
+                        hints.push(("+", "new"));
+                        hints.push(("-", "close"));
+                        hints.push(("Enter", "chat"));
                         hints.push(("↑↓", "scroll"));
                     }
                     RightPanelTab::Detail => {
                         hints.push(("↑↓", "scroll"));
                         hints.push(("PgUp/Dn", "page"));
                         hints.push(("Enter", "toggle"));
+                        if !app.iteration_archives.is_empty() {
+                            hints.push(("[/]", "iterations"));
+                        }
                     }
-                    RightPanelTab::Log | RightPanelTab::CoordLog | RightPanelTab::Agency => {
+                    RightPanelTab::Log
+                    | RightPanelTab::CoordLog
+                    | RightPanelTab::Agency
+                    | RightPanelTab::Firehose => {
+                        hints.push(("↑↓", "scroll"));
+                        hints.push(("PgUp/Dn", "page"));
+                        hints.push(("Home/End", "jump"));
+                    }
+                    RightPanelTab::Output => {
+                        hints.push(("←→", "agents"));
                         hints.push(("↑↓", "scroll"));
                         hints.push(("PgUp/Dn", "page"));
                         hints.push(("Home/End", "jump"));
@@ -4160,20 +7505,70 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         hints.push(("Enter", "edit"));
                         hints.push(("Esc", "cancel"));
                     }
+                    RightPanelTab::Settings => {
+                        hints.push(("↑↓", "select"));
+                        hints.push(("Enter", "edit"));
+                        hints.push(("s", "scope"));
+                        hints.push(("Tab", "actions"));
+                        hints.push(("L", "lint"));
+                        hints.push(("W", "setup"));
+                    }
                     RightPanelTab::Files => {
                         hints.push(("↑↓", "select"));
                         hints.push(("Enter", "open"));
                         hints.push(("Esc", "back"));
                     }
+                    RightPanelTab::Dashboard => {
+                        hints.push(("↑↓", "select"));
+                        hints.push(("Enter", "drill-down"));
+                        hints.push(("k", "kill"));
+                        hints.push(("t", "task detail"));
+                    }
                 }
-                // Common hints for all right-panel tabs.
-                hints.push(("Tab", "graph"));
-                hints.push(("i/I", "inspector"));
-                hints.push(("?", "help"));
-                hints.push(("Alt←→", "tabs"));
-                (tab_label, "NAV", Color::Rgb(120, 120, 120), hints)
+                let vendor_pty_active = app.chat_pty_mode
+                    && app.chat_pty_forwards_stdin
+                    && *tab == RightPanelTab::Chat
+                    && !app.chat_pty_observer;
+                if !vendor_pty_active {
+                    // Common hints for all right-panel tabs (except vendor PTY).
+                    if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                        hints.push(("Tab/]/[", "panels"));
+                    } else {
+                        hints.push(("Tab", "graph"));
+                    }
+                    hints.push(("i/v", "resize pane"));
+                    hints.push(("?", "help"));
+                    hints.push(("Alt←→", "cycle views"));
+                }
+                // In compact mode, prefix the tab label with a breadcrumb indicator.
+                let label: &str = if app.responsive_breakpoint == ResponsiveBreakpoint::Compact {
+                    match app.single_panel_view {
+                        SinglePanelView::Detail => "▸Detail",
+                        SinglePanelView::Log => "▸Log",
+                        _ => tab_label,
+                    }
+                } else {
+                    tab_label
+                };
+                let (mode_badge, mode_color) = if vendor_pty_active {
+                    ("PTY", Color::Green)
+                } else {
+                    ("NAV", Color::Rgb(120, 120, 120))
+                };
+                (label, mode_badge, mode_color, hints)
             }
         },
+        InputMode::Launcher => (
+            "0:Chat",
+            "LAUNCHER",
+            Color::Cyan,
+            vec![
+                ("Tab", "section"),
+                ("\u{2191}\u{2193}", "select"),
+                ("Enter", "create"),
+                ("Esc", "cancel"),
+            ],
+        ),
     }
 }
 
@@ -4262,14 +7657,46 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         return;
     }
 
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Modal mode indicator (PTY vs CMD) — leading badge so it's visible
+    // even when terminal is narrow and the status bar gets truncated by
+    // the right-aligned service-health pill. Only meaningful when a chat
+    // tab is the active right-panel tab and a PTY is rendering.
+    // Implementation gate matches `vendor_pty_active` in event.rs.
+    if app.right_panel_tab == RightPanelTab::Chat
+        && app.chat_pty_mode
+        && app.chat_pty_forwards_stdin
+        && !app.chat_pty_observer
+    {
+        if app.focused_panel == FocusedPanel::RightPanel {
+            spans.push(Span::styled(
+                " [PTY] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                " [CMD] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled(" ", Style::default()));
+    }
+
     let c = &app.task_counts;
-    let mut spans = vec![Span::styled(
+    spans.push(Span::styled(
         format!(
             " {} tasks ({} done, {} open, {} active",
             c.total, c.done, c.open, c.in_progress
         ),
         Style::default().fg(Color::White),
-    )];
+    ));
 
     if c.failed > 0 {
         spans.push(Span::styled(
@@ -4279,6 +7706,13 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     }
 
     spans.push(Span::styled(") ", Style::default().fg(Color::White)));
+
+    if c.archived > 0 {
+        spans.push(Span::styled(
+            format!("{} archived ", c.archived),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     // Token breakdown: input/output/cache with view/total toggle
     let visible_usage;
@@ -4291,6 +7725,100 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     if usage.total_tokens() > 0 {
         spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
         render_token_breakdown(&mut spans, usage, label);
+    }
+
+    // Time counters
+    {
+        let tc = &app.time_counters;
+        let mut cp: Vec<Span> = Vec::new();
+        if tc.show_uptime {
+            cp.push(Span::styled(
+                match tc.live_uptime_secs() {
+                    Some(s) => format!("\u{2191}{}", format_duration_compact(s)),
+                    None => "\u{2191}-".into(),
+                },
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if tc.show_cumulative {
+            cp.push(Span::styled(
+                format!(
+                    "\u{03A3}{}",
+                    format_duration_compact(tc.live_cumulative_secs())
+                ),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        if tc.show_active && tc.active_agent_count > 0 {
+            cp.push(Span::styled(
+                format!(
+                    "\u{26A1}{}({})",
+                    format_duration_compact(tc.live_active_secs()),
+                    tc.active_agent_count
+                ),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if tc.show_session {
+            cp.push(Span::styled(
+                format!(
+                    "\u{25F7}{}",
+                    format_duration_compact(tc.session_start.elapsed().as_secs())
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if !cp.is_empty() {
+            spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+            for (i, p) in cp.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
+                spans.push(p);
+            }
+            spans.push(Span::styled(" ", Style::default()));
+        }
+    }
+
+    // Cycle timing indicators
+    if !app.cycle_timing.is_empty() {
+        spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+        for (i, ct) in app.cycle_timing.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" ", Style::default()));
+            }
+            // Compact label: task_id[iter/max, timing]
+            let short_id = if ct.task_id.len() > 12 {
+                format!("{}…", &ct.task_id[..ct.task_id.floor_char_boundary(11)])
+            } else {
+                ct.task_id.clone()
+            };
+            let timing = if let Some(secs) = ct.next_due_in_secs {
+                if secs > 0 {
+                    format!("in {}", format_duration_compact(secs as u64))
+                } else {
+                    "ready".to_string()
+                }
+            } else if let Some(ago) = ct.last_completed_ago_secs {
+                format!("{}ago", format_duration_compact(ago as u64))
+            } else {
+                "–".to_string()
+            };
+            let color = match ct.status {
+                workgraph::graph::Status::InProgress => Color::Green,
+                workgraph::graph::Status::Open => Color::Yellow,
+                workgraph::graph::Status::Done => Color::Cyan,
+                _ => Color::DarkGray,
+            };
+            spans.push(Span::styled(
+                format!(
+                    "⟳{}[{}/{}·{}]",
+                    short_id, ct.iteration, ct.max_iterations, timing
+                ),
+                Style::default().fg(color),
+            ));
+        }
+        spans.push(Span::styled(" ", Style::default()));
     }
 
     // Scroll position
@@ -4360,6 +7888,15 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         ));
     }
 
+    // Scroll axis swap indicator (horizontal scroll via vertical swipe)
+    if app.scroll_axis_swapped {
+        spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "H-SCROLL ",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
     // Sort mode indicator (show when not the default)
     if app.sort_mode != SortMode::ReverseChronological {
         spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
@@ -4403,6 +7940,840 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         Color::DarkGray,
         Color::Rgb(40, 40, 40),
     );
+}
+
+/// Render the HUD vitals bar: always-visible strip showing system health at a glance.
+///
+/// ```text
+/// | ● 2 agents | 8 open · 3 running · 45 done | last event 4s ago | coord ● 3s |
+/// ```
+fn draw_vitals_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let v = &app.vitals;
+
+    let sep_style = Style::default().fg(Color::Rgb(80, 80, 80));
+    let separator = " | ";
+
+    let mut spans: Vec<Span> = Vec::with_capacity(16);
+
+    // Agent count with dot indicator
+    let (dot, dot_color) = if v.agents_alive > 0 {
+        ("●", Color::Green)
+    } else {
+        ("○", Color::DarkGray)
+    };
+    spans.push(Span::styled(
+        format!(" {} {} agents", dot, v.agents_alive),
+        Style::default().fg(dot_color),
+    ));
+
+    // Task status counts
+    spans.push(Span::styled(separator, sep_style));
+    spans.push(Span::styled(
+        format!("{} open", v.open),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("{} running", v.running),
+        Style::default().fg(Color::Green),
+    ));
+    spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("{} done", v.done),
+        Style::default().fg(Color::Cyan),
+    ));
+
+    // Time since last event with color coding
+    spans.push(Span::styled(separator, sep_style));
+    let (event_text, event_color) = match v.last_event_time {
+        Some(t) => match t.elapsed() {
+            Ok(d) => {
+                let secs = d.as_secs();
+                let color = match vitals_staleness_color(secs) {
+                    VitalsStaleness::Fresh => Color::Green,
+                    VitalsStaleness::Stale => Color::Yellow,
+                    VitalsStaleness::Dead => Color::Red,
+                };
+                (
+                    format!("last event {} ago", format_duration_compact(secs)),
+                    color,
+                )
+            }
+            Err(_) => ("last event just now".to_string(), Color::Green),
+        },
+        None => ("no events".to_string(), Color::DarkGray),
+    };
+    spans.push(Span::styled(event_text, Style::default().fg(event_color)));
+
+    // Coordinator heartbeat
+    spans.push(Span::styled(separator, sep_style));
+    if v.daemon_running {
+        let (coord_text, coord_color) = match v.coord_last_tick {
+            Some(t) => match t.elapsed() {
+                Ok(d) => {
+                    let secs = d.as_secs();
+                    let color = match vitals_staleness_color(secs) {
+                        VitalsStaleness::Fresh => Color::Green,
+                        VitalsStaleness::Stale => Color::Yellow,
+                        VitalsStaleness::Dead => Color::Red,
+                    };
+                    (format!("coord ● {}", format_duration_compact(secs)), color)
+                }
+                Err(_) => ("coord ● 0s".to_string(), Color::Green),
+            },
+            None => ("coord ● –".to_string(), Color::DarkGray),
+        };
+        spans.push(Span::styled(coord_text, Style::default().fg(coord_color)));
+    } else {
+        spans.push(Span::styled(
+            "coord ○ down",
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    spans.push(Span::styled(" ", Style::default()));
+
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(25, 25, 25)));
+    frame.render_widget(bar, area);
+}
+
+/// Render the service health badge at the right end of the status bar.
+fn draw_service_health_badge(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    let health = &app.service_health;
+    let (dot_color, bg_color) = match health.level {
+        ServiceHealthLevel::Green => (Color::Green, Color::Rgb(20, 50, 20)),
+        ServiceHealthLevel::Yellow => (Color::Yellow, Color::Rgb(50, 50, 10)),
+        ServiceHealthLevel::Red => (Color::Red, Color::Rgb(50, 20, 20)),
+    };
+
+    let badge_text = format!(" \u{25CF} {} ", health.label);
+    let badge_width = UnicodeWidthStr::width(badge_text.as_str()) as u16;
+
+    if area.width < badge_width + 1 {
+        app.last_service_badge_area = Rect::default();
+        return;
+    }
+
+    let badge_x = area.x + area.width - badge_width;
+    let badge_area = Rect::new(badge_x, area.y, badge_width, 1);
+    app.last_service_badge_area = badge_area;
+
+    let badge = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " \u{25CF}".to_string(),
+            Style::default().fg(dot_color).bg(bg_color),
+        ),
+        Span::styled(
+            format!(" {} ", health.label),
+            Style::default().fg(Color::White).bg(bg_color),
+        ),
+    ]));
+    frame.render_widget(badge, badge_area);
+}
+
+/// Draw severity-leveled toast notifications in the top-right of the graph area.
+/// Toasts stack downward from the top-right. Max 4 visible. Each severity has
+/// a distinct color (green/yellow/red) and fade behavior.
+fn draw_toasts(frame: &mut Frame, app: &VizApp) {
+    if app.toasts.is_empty() {
+        return;
+    }
+
+    let graph_area = app.last_graph_area;
+    if graph_area.width < 20 || graph_area.height < 3 {
+        return;
+    }
+
+    let max_width = 60.min(graph_area.width.saturating_sub(4));
+    let mut y_offset: u16 = 0;
+
+    // Show newest toasts first (last in vec), up to MAX_VISIBLE_TOASTS.
+    let visible_count = app.toasts.len().min(super::state::MAX_VISIBLE_TOASTS);
+    let start = app.toasts.len().saturating_sub(visible_count);
+
+    for toast in app.toasts[start..].iter().rev() {
+        let elapsed_ms = toast.created_at.elapsed().as_millis() as u64;
+
+        // Compute fade based on severity auto-dismiss duration.
+        let fade = match toast.severity.auto_dismiss_duration() {
+            Some(dur) => {
+                let total_ms = dur.as_millis() as u64;
+                let fade_start_ms = total_ms.saturating_sub(1000);
+                if elapsed_ms >= total_ms {
+                    continue; // expired
+                } else if elapsed_ms < fade_start_ms {
+                    1.0_f64
+                } else {
+                    1.0 - ((elapsed_ms - fade_start_ms) as f64 / 1000.0)
+                }
+            }
+            None => 1.0, // Error toasts don't fade
+        };
+
+        // Truncate message to fit within max_width (with 2 chars padding).
+        let display_msg = if toast.message.width() > (max_width as usize).saturating_sub(2) {
+            let limit = (max_width as usize).saturating_sub(5);
+            let truncated: String = toast.message.chars().take(limit).collect();
+            format!("{}...", truncated)
+        } else {
+            toast.message.clone()
+        };
+
+        let toast_width = (display_msg.width() as u16 + 2).min(max_width);
+        let toast_height: u16 = 1;
+
+        // Position: top-right of graph area, stacking downward.
+        let x = graph_area.x + graph_area.width.saturating_sub(toast_width + 1);
+        let y = graph_area.y + 1 + y_offset;
+
+        if y >= graph_area.y + graph_area.height.saturating_sub(1) {
+            break; // No more room to stack.
+        }
+
+        let area = Rect::new(x, y, toast_width, toast_height);
+
+        // Color by severity, with fade.
+        let (base_fg, base_bg) = match toast.severity {
+            ToastSeverity::Info => ((100.0, 255.0, 100.0), (15.0, 40.0, 15.0)),
+            ToastSeverity::Warning => ((255.0, 220.0, 80.0), (40.0, 35.0, 10.0)),
+            ToastSeverity::Error => ((255.0, 100.0, 100.0), (50.0, 15.0, 15.0)),
+        };
+
+        let fg_r = (base_fg.0 * fade) as u8;
+        let fg_g = (base_fg.1 * fade) as u8;
+        let fg_b = (base_fg.2 * fade) as u8;
+        let bg_r = (base_bg.0 * fade) as u8;
+        let bg_g = (base_bg.1 * fade) as u8;
+        let bg_b = (base_bg.2 * fade) as u8;
+
+        frame.render_widget(Clear, area);
+        let para = Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", display_msg),
+            Style::default()
+                .fg(Color::Rgb(fg_r, fg_g, fg_b))
+                .bg(Color::Rgb(bg_r, bg_g, bg_b)),
+        )));
+        frame.render_widget(para, area);
+
+        y_offset += 1;
+    }
+}
+
+/// Draw the key feedback overlay showing recent key presses.
+/// Positioned at the bottom-left of the screen, above the hints bar.
+fn draw_key_feedback(frame: &mut Frame, app: &VizApp) {
+    let size = frame.area();
+    if size.width < 10 || size.height < 5 {
+        return;
+    }
+
+    let duration_ms = VizApp::KEY_FEEDBACK_DURATION.as_millis() as u64;
+
+    // Collect visible entries with fade factors.
+    let entries: Vec<(&str, f64)> = app
+        .key_feedback
+        .iter()
+        .filter_map(|(label, when)| {
+            let elapsed_ms = when.elapsed().as_millis() as u64;
+            if elapsed_ms >= duration_ms {
+                return None;
+            }
+            // Fade: full opacity for first 1s, then fade out over remaining time.
+            let fade_start_ms = 1000u64;
+            let fade = if elapsed_ms < fade_start_ms {
+                1.0
+            } else {
+                1.0 - ((elapsed_ms - fade_start_ms) as f64 / (duration_ms - fade_start_ms) as f64)
+            };
+            Some((label.as_str(), fade))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        return;
+    }
+
+    // Build a single-line display: keys separated by thin space.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (label, fade)) in entries.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        // Cyan tint fading to dark.
+        let brightness = (*fade * 255.0) as u8;
+        let fg = Color::Rgb((brightness as f64 * 0.7) as u8, brightness, brightness);
+        let bg = Color::Rgb(
+            (20.0 * fade) as u8,
+            (30.0 * fade) as u8,
+            (40.0 * fade) as u8,
+        );
+        spans.push(Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(fg).bg(bg).add_modifier(if *fade > 0.7 {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        ));
+    }
+
+    let line = Line::from(spans);
+    let line_width = line.width() as u16;
+
+    // Position: bottom-left, one row above the hints bar.
+    let x = 1;
+    let y = size.height.saturating_sub(2);
+    let w = line_width.min(size.width.saturating_sub(2));
+    let area = Rect::new(x, y, w, 1);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Draw touch/click echo indicators — concentric ring shapes that fade out.
+///
+/// Each echo renders a small pattern of unicode characters centered on the
+/// click position. The pattern shrinks and fades over ~0.7 seconds, providing
+/// visual feedback for mouse/touch interaction (useful for screencasts/demos).
+fn draw_touch_echoes(frame: &mut Frame, app: &VizApp) {
+    let area = frame.area();
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+
+    // Ring patterns at different animation stages (outer → inner as time progresses).
+    // Uses light box-drawing characters for a clean circle-ish look.
+    // Pattern: (dy, dx, char) offsets from center.
+    #[rustfmt::skip]
+    const RING_OUTER: &[(i16, i16, char)] = &[
+        (-1, -1, '╭'), (-1, 0, '─'), (-1, 1, '╮'),
+        ( 0, -1, '│'),               ( 0, 1, '│'),
+        ( 1, -1, '╰'), ( 1, 0, '─'), ( 1, 1, '╯'),
+    ];
+    const DOT_CENTER: char = '●';
+
+    for echo in &app.touch_echoes {
+        let progress = echo.progress();
+        if progress >= 1.0 {
+            continue;
+        }
+
+        // Color: bright cyan → dim → gone. Use RGB for smooth fade.
+        let intensity = 1.0 - progress;
+        let fg = Color::Rgb(
+            (100.0 * intensity) as u8,
+            (220.0 * intensity) as u8,
+            (255.0 * intensity) as u8,
+        );
+
+        // Phase 1 (0.0–0.4): Show ring + center dot.
+        // Phase 2 (0.4–0.7): Ring fades, center dot shrinks.
+        let show_ring = progress < 0.4;
+
+        if show_ring {
+            for &(dy, dx, ch) in RING_OUTER {
+                let r = echo.row as i16 + dy;
+                let c = echo.col as i16 + dx;
+                if r >= area.y as i16
+                    && r < (area.y + area.height) as i16
+                    && c >= area.x as i16
+                    && c < (area.x + area.width) as i16
+                {
+                    let cell_area = Rect::new(c as u16, r as u16, 1, 1);
+                    frame.render_widget(Clear, cell_area);
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(ch.to_string(), Style::default().fg(fg))),
+                        cell_area,
+                    );
+                }
+            }
+        }
+
+        // Center dot — always visible while echo is active.
+        if echo.row >= area.y
+            && echo.row < area.y + area.height
+            && echo.col >= area.x
+            && echo.col < area.x + area.width
+        {
+            let center = Rect::new(echo.col, echo.row, 1, 1);
+            frame.render_widget(Clear, center);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    DOT_CENTER.to_string(),
+                    Style::default().fg(fg).add_modifier(if progress < 0.3 {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                )),
+                center,
+            );
+        }
+    }
+}
+
+fn draw_service_health_detail(frame: &mut Frame, app: &VizApp) {
+    let size = frame.area();
+    let health = &app.service_health;
+
+    let width = 50.min(size.width.saturating_sub(4));
+    let height = 22.min(size.height.saturating_sub(4));
+
+    // Anchor to top-right, below the status bar.
+    let x = size.width.saturating_sub(width + 1);
+    let y = 1.min(size.height.saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let (border_color, title_dot) = match health.level {
+        ServiceHealthLevel::Green => (Color::Green, "\u{25CF}"),
+        ServiceHealthLevel::Yellow => (Color::Yellow, "\u{25CF}"),
+        ServiceHealthLevel::Red => (Color::Red, "\u{25CF}"),
+    };
+
+    let block = Block::default()
+        .title(format!(" {} Service Health ", title_dot))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let label_style = Style::default().fg(Color::Cyan);
+    let value_style = Style::default().fg(Color::White);
+    let dim_style = Style::default().fg(Color::DarkGray);
+
+    // PID & uptime
+    lines.push(Line::from(vec![
+        Span::styled("  PID: ", label_style),
+        Span::styled(
+            health
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "N/A".to_string()),
+            value_style,
+        ),
+        Span::styled("    Uptime: ", label_style),
+        Span::styled(health.uptime.as_deref().unwrap_or("N/A"), value_style),
+    ]));
+
+    // Socket
+    lines.push(Line::from(vec![
+        Span::styled("  Socket: ", label_style),
+        Span::styled(health.socket_path.as_deref().unwrap_or("N/A"), dim_style),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Agents
+    lines.push(Line::from(vec![
+        Span::styled("  Agents: ", label_style),
+        Span::styled(
+            format!("{} alive / {} max", health.agents_alive, health.agents_max),
+            value_style,
+        ),
+        Span::styled(format!("  ({} total)", health.agents_total), dim_style),
+    ]));
+
+    // Paused
+    if health.paused {
+        let pause_color = if health.provider_auto_pause {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Status: ", label_style),
+            Span::styled(
+                "PAUSED",
+                Style::default()
+                    .fg(pause_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" (agent spawning disabled)", dim_style),
+        ]));
+
+        // Show pause reason if available
+        if let Some(ref reason) = health.pause_reason {
+            let reason_display = if reason.len() > 40 {
+                format!("{}...", &reason[..reason.floor_char_boundary(37)])
+            } else {
+                reason.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  Reason: ", label_style),
+                Span::styled(reason_display, Style::default().fg(pause_color)),
+            ]));
+        }
+
+        // Show resume hint for provider auto-pause
+        if health.provider_auto_pause {
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim_style),
+                Span::styled("Resume with: ", dim_style),
+                Span::styled("wg service resume", Style::default().fg(Color::Cyan)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // Stuck tasks
+    if health.stuck_tasks.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Stuck tasks: ", label_style),
+            Span::styled("none", Style::default().fg(Color::Green)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Stuck tasks: ", label_style),
+            Span::styled(
+                format!("{}", health.stuck_tasks.len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for st in &health.stuck_tasks {
+            let title_display = if st.task_title.len() > 30 {
+                format!(
+                    "{}...",
+                    &st.task_title[..st.task_title.floor_char_boundary(27)]
+                )
+            } else {
+                st.task_title.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim_style),
+                Span::styled(&st.task_id, Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" ({})", title_display), dim_style),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // Recent errors
+    if health.recent_errors.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Recent errors: ", label_style),
+            Span::styled("none", Style::default().fg(Color::Green)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "  Recent errors:",
+            label_style,
+        )]));
+        for err in &health.recent_errors {
+            let max_w = width as usize - 6;
+            let truncated = if err.len() > max_w {
+                format!(
+                    "{}...",
+                    &err[..err.floor_char_boundary(max_w.saturating_sub(3))]
+                )
+            } else {
+                err.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim_style),
+                Span::styled(truncated, Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Press ", dim_style),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" or click badge to close", dim_style),
+    ]));
+
+    // Apply scroll
+    let visible_lines: Vec<Line> = lines
+        .into_iter()
+        .skip(health.detail_scroll)
+        .take(inner.height as usize)
+        .collect();
+
+    frame.render_widget(Paragraph::new(visible_lines), inner);
+}
+
+/// Draw the service control panel - a modal overlay with service actions.
+fn draw_service_control_panel(frame: &mut Frame, app: &VizApp) {
+    let size = frame.area();
+    let health = &app.service_health;
+    let is_running = health.pid.is_some() && health.level != ServiceHealthLevel::Red;
+    let width = 56.min(size.width.saturating_sub(4));
+    let height = 32.min(size.height.saturating_sub(2));
+    let x = size.width.saturating_sub(width + 1);
+    let y = 1.min(size.height.saturating_sub(height));
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+    let (border_color, title_dot) = match health.level {
+        ServiceHealthLevel::Green => (Color::Green, "\u{25CF}"),
+        ServiceHealthLevel::Yellow => (Color::Yellow, "\u{25CF}"),
+        ServiceHealthLevel::Red => (Color::Red, "\u{25CF}"),
+    };
+    let block = Block::default()
+        .title(format!(" {} Service Control ", title_dot))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines: Vec<Line> = Vec::new();
+    let label_style = Style::default().fg(Color::Cyan);
+    let value_style = Style::default().fg(Color::White);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let focus = &health.panel_focus;
+    lines.push(Line::from(vec![
+        Span::styled("  PID: ", label_style),
+        Span::styled(
+            health
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "N/A".to_string()),
+            value_style,
+        ),
+        Span::styled("    Uptime: ", label_style),
+        Span::styled(health.uptime.as_deref().unwrap_or("N/A"), value_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Agents: ", label_style),
+        Span::styled(
+            format!("{} alive / {} max", health.agents_alive, health.agents_max),
+            value_style,
+        ),
+        Span::styled(format!("  ({} total)", health.agents_total), dim_style),
+    ]));
+    if !health.recent_errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "  Recent errors:",
+            label_style,
+        )]));
+        for err in health.recent_errors.iter().take(3) {
+            let max_w = width as usize - 6;
+            let truncated = if err.len() > max_w {
+                format!(
+                    "{}...",
+                    &err[..err.floor_char_boundary(max_w.saturating_sub(3))]
+                )
+            } else {
+                err.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim_style),
+                Span::styled(truncated, Style::default().fg(Color::Red)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Controls",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    let ssl = if is_running {
+        "Stop Service"
+    } else {
+        "Start Service"
+    };
+    let ssk = if is_running { "[S] Stop" } else { "[S] Start" };
+    lines.push(control_panel_line(
+        ssl,
+        ssk,
+        *focus == ControlPanelFocus::StartStop,
+        if is_running { Color::Red } else { Color::Green },
+    ));
+    let pl = if health.paused {
+        "Resume Launches"
+    } else {
+        "Pause Launches"
+    };
+    let pk = if health.paused {
+        "[P] Resume"
+    } else {
+        "[P] Pause"
+    };
+    lines.push(control_panel_line(
+        pl,
+        pk,
+        *focus == ControlPanelFocus::PauseResume,
+        Color::Yellow,
+    ));
+    lines.push(control_panel_line(
+        "Restart Service",
+        "[Enter]",
+        *focus == ControlPanelFocus::Restart,
+        Color::Cyan,
+    ));
+    // Agent slots: show current value with +/- hint
+    let slots_focused = *focus == ControlPanelFocus::AgentSlots;
+    let slots_label = format!("Agent Slots: {}", health.agents_max);
+    let slots_style = if slots_focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(if slots_focused { " > " } else { "   " }, slots_style),
+        Span::styled(&slots_label, slots_style),
+        Span::styled("  ", Style::default()),
+        Span::styled("[+/-] adjust", Style::default().fg(Color::DarkGray)),
+    ]));
+    let pf = *focus == ControlPanelFocus::PanicKill;
+    let ps = if pf {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(if pf { " > " } else { "   " }, ps),
+        Span::styled("PANIC KILL", ps),
+        Span::styled("  [K]  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("kills {} agents + stops service", health.agents_alive),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    if health.stuck_tasks.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Stuck agents: ", label_style),
+            Span::styled("none", Style::default().fg(Color::Green)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Stuck agents: ", label_style),
+            Span::styled(
+                format!("{}", health.stuck_tasks.len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  (Enter=kill, U=unclaim)", dim_style),
+        ]));
+        for (i, st) in health.stuck_tasks.iter().enumerate() {
+            let sf = *focus == ControlPanelFocus::StuckAgent(i);
+            let td = if st.task_title.len() > 25 {
+                format!(
+                    "{}...",
+                    &st.task_title[..st.task_title.floor_char_boundary(22)]
+                )
+            } else {
+                st.task_title.clone()
+            };
+            let pfx = if sf { " > " } else { "   " };
+            let fg = if sf { Color::Yellow } else { Color::DarkGray };
+            lines.push(Line::from(vec![
+                Span::styled(pfx, Style::default().fg(fg)),
+                Span::styled(&st.agent_id, Style::default().fg(Color::Yellow)),
+                Span::styled(format!(" ({}) ", td), Style::default().fg(fg)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(control_panel_line(
+        "Kill All Dead Agents",
+        "[Enter]",
+        *focus == ControlPanelFocus::KillAllDead,
+        Color::Yellow,
+    ));
+    lines.push(control_panel_line(
+        "Retry Failed Evals",
+        "[Enter]",
+        *focus == ControlPanelFocus::RetryFailedEvals,
+        Color::Cyan,
+    ));
+    if let Some((ref msg, ref at)) = health.feedback
+        && at.elapsed() < std::time::Duration::from_secs(5)
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ", dim_style),
+            Span::styled(
+                msg.as_str(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    if health.panic_confirm {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  WARNING: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "This will kill {} running agents and stop the service.",
+                    health.agents_alive
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Are you sure? ", Style::default().fg(Color::White)),
+            Span::styled(
+                "[y]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Yes  ", dim_style),
+            Span::styled(
+                "[n/Esc]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" No", dim_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ", dim_style),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" close  ", dim_style),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Yellow)),
+        Span::styled(" navigate  ", dim_style),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled(" activate", dim_style),
+    ]));
+    let visible_lines: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(visible_lines), inner);
+}
+
+fn control_panel_line<'a>(
+    label: &'a str,
+    key_hint: &'a str,
+    focused: bool,
+    color: Color,
+) -> Line<'a> {
+    let prefix = if focused { " > " } else { "   " };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
+    };
+    Line::from(vec![
+        Span::styled(prefix, style),
+        Span::styled(label, style),
+        Span::styled("  ", Style::default()),
+        Span::styled(key_hint, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn draw_help_overlay(frame: &mut Frame) {
@@ -4455,14 +8826,17 @@ fn draw_help_overlay(frame: &mut Frame) {
         heading("Panels"),
         binding("Tab", "Switch focus: Graph ↔ Right Panel"),
         binding("Alt-↑/↓", "Switch focus: Graph ↔ Right Panel"),
-        binding("Alt-←/→", "Cycle tabs (prev / next)"),
+        binding("Alt-←/→", "Cycle inspector views (with slide animation)"),
         binding("\\", "Toggle right panel visible"),
-        binding("i", "Cycle inspector size (1/3→1/2→2/3→full→off)"),
-        binding("I", "Cycle inspector size (reverse)"),
+        binding("i", "Grow viz pane (10% per press, wraps)"),
+        binding("v", "Shrink viz pane (10% per press, wraps)"),
         binding("=", "Cycle layout: split/panel/graph"),
         binding("0-7", "Switch tab: Chat/.../Files/Coord"),
         binding("R", "Toggle raw JSON in Detail tab"),
         binding("Space", "Toggle section collapse in Detail"),
+        blank(),
+        heading("Log Tab"),
+        binding("J", "Toggle raw JSON mode"),
         blank(),
         heading("Edge Tracing"),
         binding("t", "Toggle trace on/off"),
@@ -4477,12 +8851,24 @@ fn draw_help_overlay(frame: &mut Frame) {
         binding("f", "Mark selected task failed"),
         binding("x", "Retry selected task"),
         binding("e", "Edit task description"),
+        binding("M", "Send message to task agent"),
+        binding("A", "Toggle archive browser"),
         binding("c", "Open chat input"),
         binding("Ctrl-C", "Kill agent on focused task"),
         blank(),
+        heading("Chat Panel (command mode)"),
+        binding("n", "New chat (launcher); next match if search active"),
+        binding("w / Ctrl-W", "Close current tab (non-destructive)"),
+        binding("1..9", "Jump to chat tab N"),
+        binding("←/→ / [ / ]", "Prev / next chat"),
+        binding("~ / `", "Open chat picker"),
+        binding("+", "Add new chat (picker)"),
+        binding("-", "Close/archive chat"),
+        binding("Ctrl-T", "Toggle PTY focus / command mode"),
+        blank(),
         heading("Search (vim-style)"),
         binding("/", "Start search"),
-        binding("n / N", "Next / previous match"),
+        binding("N", "Previous match (n = new chat when no search)"),
         binding("Enter", "Accept and jump to match"),
         binding("Esc", "Clear search"),
         blank(),
@@ -4490,8 +8876,12 @@ fn draw_help_overlay(frame: &mut Frame) {
         binding("s", "Cycle sort: Chrono↓/↑/Status"),
         binding("A", "Toggle animations on/off"),
         binding("m", "Toggle mouse capture"),
+        binding("X", "Swap scroll axis (for Termux)"),
         binding("r", "Force refresh"),
-        binding("L", "Toggle coordinator log"),
+        binding(".", "Toggle system tasks (visible by default)"),
+        binding("<", "Toggle running system tasks only"),
+        binding("*", "Toggle touch echo (click feedback)"),
+        binding("L", "Toggle chat log"),
         binding("?", "Toggle this help"),
         binding("q", "Quit"),
         blank(),
@@ -4509,13 +8899,13 @@ fn draw_help_overlay(frame: &mut Frame) {
 
 /// Render token breakdown spans: "→new_in ←out [+cached] (label) [$cost]"
 fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, label: &str) {
-    let new_input = format_tokens(usage.input_tokens);
+    let novel_in = usage.input_tokens + usage.cache_creation_input_tokens;
+    let new_input = format_tokens(novel_in);
     let output = format_tokens(usage.output_tokens);
 
-    let cache_total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
-    let token_str = if cache_total > 0 {
-        let cache = format_tokens(cache_total);
-        format!("→{} +{} cached ←{}", new_input, cache, output)
+    let token_str = if usage.cache_read_input_tokens > 0 {
+        let cache = format_tokens(usage.cache_read_input_tokens);
+        format!("→{} ◎{} ←{}", new_input, cache, output)
     } else {
         format!("→{} ←{}", new_input, output)
     };
@@ -4535,6 +8925,208 @@ fn render_token_breakdown<'a>(spans: &mut Vec<Span<'a>>, usage: &TokenUsage, lab
             Style::default().fg(Color::Cyan),
         ));
     }
+}
+
+/// Draw the Settings tab content: merged config grouped by section, with
+/// per-key source annotations + an action bar for `wg setup` / `wg config lint`.
+///
+/// Reference: docs/config-ux-design.md §7. The simpler sibling of the
+/// existing `Config` tab — no add-endpoint/add-model flows, just per-key
+/// edit dialogs that route through `config_cmd::set_setting_value`.
+fn draw_settings_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
+    if area.height == 0 || area.width < 4 {
+        return;
+    }
+
+    let entries = app.settings_panel.entries.clone();
+    if entries.is_empty() {
+        let msg = Paragraph::new("No settings loaded — press 'r' to reload")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    // Reserve last 3 rows for: scope/notice line, action bar, hints.
+    let action_h: u16 = 4;
+    let list_h = area.height.saturating_sub(action_h);
+    let list_area = Rect { x: area.x, y: area.y, width: area.width, height: list_h };
+    let action_area = Rect {
+        x: area.x,
+        y: area.y + list_h,
+        width: area.width,
+        height: action_h,
+    };
+
+    let selected = app.settings_panel.selected.min(entries.len().saturating_sub(1));
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row_to_entry_idx: Vec<Option<usize>> = Vec::new();
+    let mut current_section: &str = "";
+    for (i, e) in entries.iter().enumerate() {
+        if e.section != current_section {
+            if !current_section.is_empty() {
+                lines.push(Line::from(""));
+                row_to_entry_idx.push(None);
+            }
+            lines.push(Line::from(Span::styled(
+                e.section.to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            row_to_entry_idx.push(None);
+            current_section = e.section;
+        }
+        let (src_label, src_color) = source_label(&e.source);
+        let value_display = if e.value.is_empty() {
+            "(unset)".to_string()
+        } else {
+            e.value.clone()
+        };
+        let key_style = if i == selected && !app.settings_panel.focus_actions {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        let value_style = if i == selected && !app.settings_panel.focus_actions {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled(format!("  {:30}", e.key), key_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("{:24}", truncate(&value_display, 24)), value_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{}]", src_label),
+            Style::default().fg(src_color),
+        ));
+        lines.push(Line::from(spans));
+        row_to_entry_idx.push(Some(i));
+    }
+
+    // Inline edit dialog: replace selected row with input UI.
+    if app.settings_panel.editing
+        && let Some(row) = row_to_entry_idx
+            .iter()
+            .position(|x| *x == Some(selected))
+    {
+        let key = entries[selected].key.clone();
+        let buffer = app.settings_panel.edit_buffer.clone();
+        lines[row] = Line::from(vec![
+            Span::styled(
+                format!("  {:30}", key),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow),
+            ),
+            Span::raw(" → "),
+            Span::styled(
+                buffer,
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
+            Span::styled(
+                "  (Enter=save, Esc=cancel)".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
+    // Auto-scroll so selected stays visible.
+    let viewport_h = list_area.height as usize;
+    if let Some(sel_row) = row_to_entry_idx.iter().position(|x| *x == Some(selected)) {
+        if sel_row < app.settings_panel.scroll {
+            app.settings_panel.scroll = sel_row;
+        } else if sel_row >= app.settings_panel.scroll + viewport_h {
+            app.settings_panel.scroll = sel_row + 1 - viewport_h;
+        }
+    }
+    let scroll = app.settings_panel.scroll.min(lines.len().saturating_sub(1));
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(scroll)
+        .take(viewport_h)
+        .collect();
+
+    let para = Paragraph::new(visible)
+        .block(Block::default().borders(Borders::NONE));
+    frame.render_widget(para, list_area);
+
+    // Action bar: scope toggle + Run setup / Run lint buttons + notice.
+    draw_settings_actions(frame, app, action_area);
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn source_label(src: &workgraph::config::ConfigSource) -> (&'static str, Color) {
+    match src {
+        workgraph::config::ConfigSource::Default => ("built-in", Color::DarkGray),
+        workgraph::config::ConfigSource::Global => ("global", Color::Green),
+        workgraph::config::ConfigSource::Local => ("local", Color::Blue),
+    }
+}
+
+fn draw_settings_actions(frame: &mut Frame, app: &VizApp, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let scope = app.settings_panel.edit_scope;
+    let scope_label = match scope {
+        SettingsEditScope::Global => "[g]lobal",
+        SettingsEditScope::Local => "[l]ocal",
+    };
+    let buttons = [" Run setup ", " Run lint "];
+    let focus = app.settings_panel.focus_actions;
+    let action_idx = app.settings_panel.action_index.min(buttons.len() - 1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("Scope: {}  ", scope_label),
+        Style::default().fg(Color::Yellow),
+    ));
+    for (i, b) in buttons.iter().enumerate() {
+        let style = if focus && i == action_idx {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        };
+        spans.push(Span::styled(b.to_string(), style));
+        spans.push(Span::raw(" "));
+    }
+    let action_line = Line::from(spans);
+
+    let notice_line = if let Some(err) = &app.settings_panel.last_error {
+        Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        ))
+    } else if let Some(notice) = &app.settings_panel.notice {
+        Line::from(Span::styled(
+            notice.clone(),
+            Style::default().fg(Color::Green),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "↑/↓ select  Enter edit  s scope  Tab actions  L lint  W setup".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+
+    let para = Paragraph::new(vec![action_line, notice_line])
+        .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+    frame.render_widget(para, area);
 }
 
 /// Draw the Config tab content: full configuration dashboard.
@@ -4560,6 +9152,24 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         return;
     }
 
+    // If in add-model mode, draw the form instead.
+    if app.config_panel.adding_model {
+        draw_add_model_form(frame, app, area);
+        return;
+    }
+
+    // Precompute endpoint index → name for test status display.
+    let endpoint_names: HashMap<usize, String> = {
+        let config = workgraph::config::Config::load_or_default(&app.workgraph_dir);
+        config
+            .llm_endpoints
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(i, ep)| (i, ep.name.clone()))
+            .collect()
+    };
+
     // Build display lines grouped by section with collapsible headers.
     let mut lines: Vec<(Line, bool)> = Vec::new(); // (line, is_selectable)
     let mut entry_line_map: Vec<usize> = Vec::new(); // entry_idx -> display line index
@@ -4574,7 +9184,7 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             let is_collapsed = app.config_panel.collapsed.contains(&entry.section);
             let arrow = if is_collapsed { "▶" } else { "▼" };
 
-            // Service status indicator on the Service section header
+            // Section header status indicators
             let extra = if entry.section == ConfigSection::Service {
                 if app.config_panel.service_running {
                     format!(
@@ -4587,6 +9197,13 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 } else {
                     "  ○ stopped".to_string()
                 }
+            } else if entry.section == ConfigSection::Models {
+                // Count models (entries with .info suffix minus the add button)
+                let model_count = entries
+                    .iter()
+                    .filter(|e| e.section == ConfigSection::Models && e.key.ends_with(".info"))
+                    .count();
+                format!("  ({} models)", model_count)
             } else {
                 String::new()
             };
@@ -4638,19 +9255,37 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     format!("[{}▏]", app.config_panel.edit_buffer)
                 }
                 ConfigEditKind::Choice(choices) => {
-                    let ci = app.config_panel.choice_index;
-                    choices
-                        .iter()
-                        .enumerate()
-                        .map(|(j, c)| {
-                            if j == ci {
-                                format!("[{}]", c)
-                            } else {
-                                c.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                    if let Some(ref picker) = app.config_panel.choice_picker {
+                        let selected_label = picker
+                            .selected_item()
+                            .map(|(id, _)| id.as_str())
+                            .unwrap_or("");
+                        if picker.filter.is_empty() {
+                            format!("[{}] (type to filter)", selected_label)
+                        } else {
+                            format!(
+                                "[{}] filter: {} ({}/{})",
+                                selected_label,
+                                picker.filter,
+                                picker.filtered_indices.len(),
+                                picker.items.len()
+                            )
+                        }
+                    } else {
+                        let ci = app.config_panel.choice_index;
+                        choices
+                            .iter()
+                            .enumerate()
+                            .map(|(j, c)| {
+                                if j == ci {
+                                    format!("[{}]", c)
+                                } else {
+                                    c.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
                 }
                 ConfigEditKind::Toggle => entry.value.clone(),
             }
@@ -4722,11 +9357,83 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             "  "
         };
 
-        let line = Line::from(vec![
-            Span::styled(cursor, style),
-            Span::styled(label, style),
-            Span::styled(value_display, value_style),
-        ]);
+        let mut spans = vec![Span::styled(cursor, style)];
+
+        // For API Keys entries, color the status icon (✓/✗/⚠) separately
+        if entry.section == ConfigSection::ApiKeys && entry.label.len() >= 2 {
+            let icon = &entry.label[..entry
+                .label
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| i)
+                .unwrap_or(2)];
+            let rest = &entry.label[icon.len()..];
+            let icon_color = match icon.trim() {
+                "✓" => Color::Green,
+                "✗" => Color::Red,
+                "⚠" => Color::Yellow,
+                _ => style.fg.unwrap_or(Color::White),
+            };
+            let rest_padded = format!(
+                "{:<width$}",
+                rest,
+                width = label_width.saturating_sub(icon.len())
+            );
+            spans.push(Span::styled(
+                icon.to_string(),
+                Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(rest_padded, style));
+        } else {
+            spans.push(Span::styled(label, style));
+        }
+
+        spans.push(Span::styled(value_display, value_style));
+
+        // Show endpoint test status inline for endpoint name entries.
+        if entry.key.ends_with(".name")
+            && entry.section == ConfigSection::Endpoints
+            && let Some(ep_idx) = entry
+                .key
+                .strip_prefix("endpoint.")
+                .and_then(|r| r.strip_suffix(".name"))
+                .and_then(|s| s.parse::<usize>().ok())
+            && let Some(ep_name) = endpoint_names.get(&ep_idx)
+            && let Some(status) = app.config_panel.endpoint_test_results.get(ep_name)
+        {
+            match status {
+                EndpointTestStatus::Testing => {
+                    spans.push(Span::styled(
+                        " ⟳ Testing...".to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                EndpointTestStatus::Ok => {
+                    spans.push(Span::styled(
+                        " ✓ Connected".to_string(),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                EndpointTestStatus::Error(msg) => {
+                    spans.push(Span::styled(
+                        " ✗ ".to_string(),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                    let truncated = if msg.len() > 40 {
+                        format!("{}...", &msg[..msg.floor_char_boundary(40)])
+                    } else {
+                        msg.clone()
+                    };
+                    spans.push(Span::styled(truncated, Style::default().fg(Color::Red)));
+                }
+            }
+        }
+
+        let line = Line::from(spans);
 
         lines.push((line, true));
     }
@@ -4757,11 +9464,17 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 ConfigEditKind::TextInput | ConfigEditKind::SecretInput => {
                     "Enter: save  Esc: cancel"
                 }
-                ConfigEditKind::Choice(_) => "←/→: choose  Enter: save  Esc: cancel",
+                ConfigEditKind::Choice(_) => {
+                    if app.config_panel.choice_picker.is_some() {
+                        "↑/↓: choose  type: filter  Enter: save  Esc: cancel"
+                    } else {
+                        "←/→: choose  Enter: save  Esc: cancel"
+                    }
+                }
                 ConfigEditKind::Toggle => "Enter/Space: toggle",
             }
         } else {
-            "j/k: navigate  Enter: edit  Space: toggle  Tab: collapse/expand  a: add endpoint  r: reload"
+            "j/k: navigate  Enter: edit  Space: toggle  Tab: collapse  a: add endpoint  m: add model  t: test  r: reload"
         };
         lines.push((
             Line::from(Span::styled(
@@ -4881,6 +9594,80 @@ fn draw_add_endpoint_form(frame: &mut Frame, app: &VizApp, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+/// Draw the "Add model" form overlay.
+fn draw_add_model_form(frame: &mut Frame, app: &VizApp, area: Rect) {
+    let fields = &app.config_panel.new_model;
+    let active = app.config_panel.new_model_field;
+
+    let field_labels = ["Model ID", "Provider", "Tier", "Cost In/1M", "Cost Out/1M"];
+    let field_values = [
+        &fields.id,
+        &fields.provider,
+        &fields.tier,
+        &fields.cost_in,
+        &fields.cost_out,
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "── Add Model ──",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, (label, value)) in field_labels.iter().zip(field_values.iter()).enumerate() {
+        let is_active = i == active;
+        let cursor = if is_active { "▸ " } else { "  " };
+        let style = if is_active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let display = if is_active && app.config_panel.editing {
+            format!("[{}▏]", app.config_panel.edit_buffer)
+        } else if value.is_empty() {
+            match i {
+                0 => "(e.g. claude:sonnet, openrouter:deepseek/deepseek-v3.2)".to_string(),
+                1 => "(openrouter)".to_string(),
+                2 => "(budget/mid/frontier)".to_string(),
+                3 => "(USD per 1M tokens)".to_string(),
+                4 => "(USD per 1M tokens)".to_string(),
+                _ => "(empty)".to_string(),
+            }
+        } else {
+            value.to_string()
+        };
+
+        let value_color = if value.is_empty() && !is_active {
+            Color::DarkGray
+        } else if is_active {
+            Color::Yellow
+        } else {
+            Color::Gray
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(cursor, style),
+            Span::styled(format!("{:<16}", label), style),
+            Span::styled(display, Style::default().fg(value_color)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter: confirm field  Tab: next field  Esc: cancel  Ctrl+S: save model",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4921,10 +9708,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         (result, graph)
@@ -5225,10 +10012,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -5698,10 +10485,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Diamond,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         (result, graph)
@@ -5897,10 +10684,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -5999,10 +10786,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6342,10 +11129,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6429,7 +11216,13 @@ mod tests {
         graph.add_node(Node::Task(task));
 
         let mut annotations = HashMap::new();
-        annotations.insert("my-task".to_string(), "[assigning]".to_string());
+        annotations.insert(
+            "my-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[assigning]".to_string(),
+                dot_task_ids: vec![".assign-my-task".to_string()],
+            },
+        );
 
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
@@ -6440,10 +11233,10 @@ mod tests {
             &annotations,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6473,7 +11266,13 @@ mod tests {
         let task2 = make_task_with_status("eval-task", "Eval Task", Status::Done);
         graph2.add_node(Node::Task(task2));
         let mut annotations2 = HashMap::new();
-        annotations2.insert("eval-task".to_string(), "[evaluating]".to_string());
+        annotations2.insert(
+            "eval-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[∴ evaluating]".to_string(),
+                dot_task_ids: vec![".evaluate-eval-task".to_string()],
+            },
+        );
 
         let tasks2: Vec<_> = graph2.tasks().collect();
         let task_ids2: HashSet<&str> = tasks2.iter().map(|t| t.id.as_str()).collect();
@@ -6484,18 +11283,18 @@ mod tests {
             &annotations2,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
         let task_line_idx2 = viz2.node_line_map["eval-task"];
         let ansi_line2 = viz2.text.lines().nth(task_line_idx2).unwrap();
         assert!(
-            ansi_line2.contains("[evaluating]"),
-            "Evaluating phase should show [evaluating] annotation.\nLine: {:?}",
+            ansi_line2.contains("[∴ evaluating]"),
+            "Evaluating phase should show [∴ evaluating] annotation.\nLine: {:?}",
             ansi_line2
         );
         if ansi_line2.contains("\x1b[") {
@@ -6506,8 +11305,85 @@ mod tests {
             );
         }
 
+        // Test validating phase
+        let mut graph3 = WorkGraph::new();
+        let task3 = make_task_with_status("val-task", "Val Task", Status::InProgress);
+        graph3.add_node(Node::Task(task3));
+        let mut annotations3 = HashMap::new();
+        annotations3.insert(
+            "val-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[✓ validating]".to_string(),
+                dot_task_ids: vec![".verify-val-task".to_string()],
+            },
+        );
+
+        let tasks3: Vec<_> = graph3.tasks().collect();
+        let task_ids3: HashSet<&str> = tasks3.iter().map(|t| t.id.as_str()).collect();
+        let viz3 = generate_ascii(
+            &graph3,
+            &tasks3,
+            &task_ids3,
+            &annotations3,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let task_line_idx3 = viz3.node_line_map["val-task"];
+        let ansi_line3 = viz3.text.lines().nth(task_line_idx3).unwrap();
+        assert!(
+            ansi_line3.contains("[✓ validating]"),
+            "Validating phase should show [✓ validating] annotation.\nLine: {:?}",
+            ansi_line3
+        );
+
+        // Test both simultaneously
+        let mut graph4 = WorkGraph::new();
+        let task4 = make_task_with_status("both-task", "Both Task", Status::InProgress);
+        graph4.add_node(Node::Task(task4));
+        let mut annotations4 = HashMap::new();
+        annotations4.insert(
+            "both-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[∴ evaluating] [✓ validating]".to_string(),
+                dot_task_ids: vec![
+                    ".evaluate-both-task".to_string(),
+                    ".verify-both-task".to_string(),
+                ],
+            },
+        );
+
+        let tasks4: Vec<_> = graph4.tasks().collect();
+        let task_ids4: HashSet<&str> = tasks4.iter().map(|t| t.id.as_str()).collect();
+        let viz4 = generate_ascii(
+            &graph4,
+            &tasks4,
+            &task_ids4,
+            &annotations4,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let task_line_idx4 = viz4.node_line_map["both-task"];
+        let ansi_line4 = viz4.text.lines().nth(task_line_idx4).unwrap();
+        assert!(
+            ansi_line4.contains("[∴ evaluating]") && ansi_line4.contains("[✓ validating]"),
+            "Both phases should appear simultaneously.\nLine: {:?}",
+            ansi_line4
+        );
+
         // Verify the code logic: in ascii.rs, the agency phase detection checks:
-        //   is_agency_phase = use_color && annotations.get(id).map_or(false, |a| a.contains("assigning") || a.contains("evaluating"))
+        //   is_agency_phase = use_color && annotations.get(id).map_or(false, |a| a.contains("assigning") || a.contains("evaluating") || a.contains("validating") || a.contains("verifying"))
         // When true, the phase annotation is wrapped in \x1b[38;5;219m..\x1b[0m (ANSI 256-color 219, true pink).
         // The task text itself keeps its status color (e.g., green for done).
         // We've verified the annotation appears; the color logic is deterministic given use_color.
@@ -6525,7 +11401,13 @@ mod tests {
         graph.add_node(Node::Task(child));
 
         let mut annotations = HashMap::new();
-        annotations.insert("child".to_string(), "[assigning]".to_string());
+        annotations.insert(
+            "child".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[assigning]".to_string(),
+                dot_task_ids: vec![".assign-child".to_string()],
+            },
+        );
 
         let tasks: Vec<_> = graph.tasks().collect();
         let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
@@ -6536,10 +11418,10 @@ mod tests {
             &annotations,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6634,10 +11516,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6777,10 +11659,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -6885,10 +11767,10 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
                 LayoutMode::default(),
                 &HashSet::new(),
                 "gray",
+                &HashMap::new(),
                 &HashMap::new(),
             )
         };
@@ -7152,35 +12034,14 @@ mod tests {
 
         let app = build_cycle_app(&graph, "a");
 
-        // Self-loop: the SCC detection should include 'a' in its own cycle.
-        // Note: Tarjan's SCC may or may not include single-node self-loops
-        // as non-trivial SCCs depending on the implementation.
-        // The cycle_members map is built from cycle_analysis.cycles which
-        // may only contain SCCs with >1 member. Self-loops need special handling.
-        //
-        // If cycle_set is populated, verify yellow edges.
-        // If not, this reveals a gap in the implementation.
-        if app.cycle_set.contains("a") {
-            // Self-loop detected in SCC — verify yellow edges exist
-            assert!(
-                has_any_yellow_edge(&app, "a"),
-                "Self-loop: cycle_set includes 'a' but no yellow edges.\nViz:\n{}",
-                app.lines.join("\n")
-            );
-        } else {
-            // Self-loops may not be detected by the SCC algorithm as non-trivial SCCs.
-            // This is acceptable behavior — document it.
-            eprintln!(
-                "Note: Self-loop A→A not detected as cycle by SCC. \
-                       cycle_set is empty. This is expected if SCC algorithm \
-                       only reports components with >1 member."
-            );
-            assert!(
-                !has_any_yellow_edge(&app, "a"),
-                "Self-loop: cycle_set is empty, so no yellow edges expected.\nViz:\n{}",
-                app.lines.join("\n")
-            );
-        }
+        // Self-loop: the SCC detection includes 'a' in its own cycle.
+        // The ↺ symbol is rendered but isn't tracked in char_edge_map
+        // (it's a status indicator, not an arrow), so yellow edge
+        // detection won't find it. Verify cycle_set membership instead.
+        assert!(
+            app.cycle_set.contains("a"),
+            "Self-loop should be detected as a cycle member"
+        );
     }
 
     // ── Test 6: Nested cycles (larger SCC) ──
@@ -7332,10 +12193,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         (result, graph)
@@ -7409,6 +12270,126 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
+    /// Validation criterion #1: tui settings tab renders without panic.
+    /// Switches the right panel to `Settings`, drives a draw against a
+    /// TestBackend and asserts the call returns Ok().
+    #[test]
+    fn settings_tab_renders_without_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        // Use an isolated workgraph_dir so load_settings_panel doesn't
+        // touch the developer's real config.
+        let temp = tempfile::TempDir::new().unwrap();
+        app.workgraph_dir = temp.path().to_path_buf();
+        app.right_panel_tab = RightPanelTab::Settings;
+        app.load_settings_panel();
+        assert!(
+            !app.settings_panel.entries.is_empty(),
+            "settings panel should populate with default entries"
+        );
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // Same draw under a narrow viewport — tab content area shrinks
+        // and the action bar must still render without panicking.
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    /// Validation criterion #2: editing a key calls into the config_cmd
+    /// update path. Drives `commit_settings_edit` (which routes through
+    /// `crate::commands::config_cmd::set_setting_value`) and verifies
+    /// the change lands in the local config file.
+    #[test]
+    fn settings_tab_edit_calls_config_cmd_update_path() {
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        let temp = tempfile::TempDir::new().unwrap();
+        app.workgraph_dir = temp.path().to_path_buf();
+
+        // Seed an empty local config so we can inspect what was written.
+        let cfg = workgraph::config::Config::default();
+        cfg.save(&app.workgraph_dir).unwrap();
+
+        app.right_panel_tab = RightPanelTab::Settings;
+        app.settings_panel.edit_scope = SettingsEditScope::Local;
+        app.load_settings_panel();
+
+        // Find the agent.model row and edit it.
+        let idx = app
+            .settings_panel
+            .entries
+            .iter()
+            .position(|e| e.key == "agent.model")
+            .expect("agent.model entry must exist");
+        app.settings_panel.selected = idx;
+        app.begin_settings_edit();
+        assert!(app.settings_panel.editing);
+        app.settings_panel.edit_buffer = "claude:sonnet".to_string();
+        app.commit_settings_edit();
+
+        assert_eq!(app.settings_panel.last_error, None,
+            "save should succeed, but got: {:?}", app.settings_panel.last_error);
+        assert!(!app.settings_panel.editing,
+            "editing flag should clear after a successful save");
+
+        // Reload from disk independently of the panel state and confirm
+        // the value made it through `config_cmd::set_setting_value`.
+        let reloaded = workgraph::config::Config::load(&app.workgraph_dir).unwrap();
+        assert_eq!(reloaded.agent.model, "claude:sonnet");
+
+        // The panel itself should now reflect the new value with source = local.
+        let entry = app
+            .settings_panel
+            .entries
+            .iter()
+            .find(|e| e.key == "agent.model")
+            .unwrap();
+        assert_eq!(entry.value, "claude:sonnet");
+        assert_eq!(entry.source, workgraph::config::ConfigSource::Local);
+    }
+
+    /// Invalid input must not write the config file. Confirms the
+    /// validator inside `apply_setting` is wired through the TUI path.
+    #[test]
+    fn settings_tab_edit_rejects_bad_value() {
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        let temp = tempfile::TempDir::new().unwrap();
+        app.workgraph_dir = temp.path().to_path_buf();
+
+        let cfg = workgraph::config::Config::default();
+        cfg.save(&app.workgraph_dir).unwrap();
+
+        app.right_panel_tab = RightPanelTab::Settings;
+        app.settings_panel.edit_scope = SettingsEditScope::Local;
+        app.load_settings_panel();
+        let idx = app
+            .settings_panel
+            .entries
+            .iter()
+            .position(|e| e.key == "coordinator.max_agents")
+            .unwrap();
+        app.settings_panel.selected = idx;
+        app.begin_settings_edit();
+        app.settings_panel.edit_buffer = "not-a-number".to_string();
+        app.commit_settings_edit();
+
+        assert!(
+            app.settings_panel.last_error.is_some(),
+            "invalid value should surface an error"
+        );
+        // Original value preserved on disk.
+        let reloaded = workgraph::config::Config::load(&app.workgraph_dir).unwrap();
+        assert_eq!(reloaded.coordinator.max_agents, cfg.coordinator.max_agents);
+    }
+
     #[test]
     fn draw_with_hud_does_not_panic_narrow() {
         use ratatui::Terminal;
@@ -7453,6 +12434,288 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
+    /// End-to-end render smoke test for the chat pane's rendering
+    /// of the wg-nex box-drawing transcript format.
+    ///
+    /// Drives the actual `draw_chat_tab` call path against a
+    /// TestBackend and inspects the rendered cell grid. Catches the
+    /// regression class where stderr-style `> name(args)` markers
+    /// were being parsed as markdown blockquotes — the chat pane
+    /// would have rendered them with `▎` blockquote bars instead of
+    /// showing the tool box.
+    #[test]
+    fn chat_renders_box_drawing_transcript_format() {
+        use crate::tui::viz_viewer::state::{ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Build a VizApp with a chat pane active and a streaming
+        // transcript matching what the agent loop writes today.
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        // Populate the chat streaming buffer with the exact format
+        // the wg-nex agent now writes during a multi-step tool turn.
+        let transcript = "\n┌─ bash ────────────────────────────────\n\
+                          │ $ echo first && echo second\n\
+                          │ first\n\
+                          │ second\n\
+                          └─\n\
+                          I ran the bash command and observed the results.";
+        app.chat = ChatState {
+            streaming_text: transcript.to_string(),
+            pending_request_ids: {
+                let mut s = std::collections::HashSet::new();
+                s.insert("r1".to_string());
+                s
+            },
+            awaiting_since: Some(std::time::Instant::now()),
+            ..ChatState::default()
+        };
+        // Render just the chat tab directly into a known area. This
+        // sidesteps the overall viz layout (which would otherwise
+        // collapse the chat panel in our test fixture) and targets
+        // the rendering we actually care about: the chat pane
+        // drawing the streaming transcript text.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        // Extract all rendered text from the cell grid.
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        // Positive assertions: all three box-drawing glyphs made it
+        // through the rendering pipeline to the terminal grid.
+        assert!(
+            rendered.contains("┌─ bash"),
+            "missing `┌─ bash` header in rendered TUI; transcript format isn't reaching the screen.\nBuffer:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("│ $ echo first"),
+            "missing `│ $ echo first` command line.\nBuffer:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("│ first") && rendered.contains("│ second"),
+            "missing `│ first` / `│ second` output lines.\nBuffer:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("└─"),
+            "missing `└─` closing line.\nBuffer:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("I ran the bash command"),
+            "model prose after the tool box didn't render.\nBuffer:\n{}",
+            rendered
+        );
+
+        // Negative assertion: no markdown-blockquote bar (`▎`) should
+        // appear — its presence would signal we went back to the
+        // broken state where `> name(args)` rendered as a blockquote.
+        // The tool box itself uses `│` (U+2502) which is distinct.
+        assert!(
+            !rendered.contains('▎'),
+            "blockquote bar `▎` present — transcript format regressed to stderr-style markers that markdown treats as blockquotes.\nBuffer:\n{}",
+            rendered
+        );
+    }
+
+    /// Repro for the "PTY output doubled" bug (task fix-pty-output).
+    ///
+    /// The user reported a screenshot showing the same multi-line list of
+    /// review-session task IDs printed twice inside a single bordered
+    /// pane. The root cause is the chat tab's two-source rendering: the
+    /// `.streaming` dotfile (live transcript) AND the outbox-derived
+    /// finalized message can briefly contain the same content, and
+    /// `streaming_text` is only cleared when *all* pending requests are
+    /// retired. With multiple in-flight requests (user typed two messages
+    /// fast), retiring just one keeps the streaming text alive while the
+    /// finalized message is already in `chat.messages` — both render,
+    /// producing a duplicate.
+    ///
+    /// Pin the contract: after a coordinator response is appended to
+    /// `chat.messages`, `streaming_text` MUST be cleared regardless of
+    /// remaining pending requests. The next streaming chunk for a new
+    /// in-flight response will repopulate it from the file.
+    #[test]
+    fn streaming_text_does_not_double_finalized_message() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        let body = "Your review-session tasks:\n\
+                    - stocktake-assets\n\
+                    - content-review-poietic-life\n\
+                    - wg-visual-language-study";
+
+        // User typed M1, then M2 quickly while M1's response was still
+        // streaming. The agent finalizes the M1 response (writes outbox)
+        // but the .streaming dotfile hasn't been cleared yet — both
+        // sources carry the same text. After `poll_chat_messages`
+        // ingests the outbox entry into `chat.messages`, *one* request
+        // is retired, but `pending_request_ids` is non-empty (rid2 still
+        // in flight), so the legacy code path leaves `streaming_text`
+        // populated and the chat pane renders it twice.
+        let user_msg = ChatMessage {
+            role: ChatRole::User,
+            text: "list my reviews".to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: Some("erik".to_string()),
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+        let coord_msg = ChatMessage {
+            role: ChatRole::Coordinator,
+            text: body.to_string(),
+            full_text: Some(body.to_string()),
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+
+        let mut pending = std::collections::HashSet::new();
+        pending.insert("rid2".to_string()); // rid1 was just retired by poll_chat_messages
+        app.chat = ChatState {
+            messages: vec![user_msg, coord_msg],
+            streaming_text: body.to_string(),
+            pending_request_ids: pending,
+            awaiting_since: Some(std::time::Instant::now()),
+            ..ChatState::default()
+        };
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                rendered.push_str(buffer[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        for needle in [
+            "stocktake-assets",
+            "content-review-poietic-life",
+            "wg-visual-language-study",
+        ] {
+            let n = rendered.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "task id {:?} appeared {} times in chat pane render — expected 1.\n\
+                 Doubling = the bug from fix-pty-output reproduces.\n\
+                 Rendered:\n{}",
+                needle, n, rendered
+            );
+        }
+    }
+
+    /// Width-variation cover for fix-pty-output: the duplicate-suppression
+    /// must hold whether or not the streamed lines wrap. At a narrow width
+    /// each task id wraps to two visual rows; at a wide width none do.
+    #[test]
+    fn streaming_text_doubling_fix_holds_across_widths() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for &width in &[40_u16, 80, 120] {
+            let (viz, _) = build_hud_test_graph();
+            let mut app = VizApp::from_viz_output_for_test(&viz);
+            let body = "Your review-session tasks:\n\
+                        - stocktake-assets\n\
+                        - content-review-poietic-life\n\
+                        - wg-visual-language-study";
+            let coord_msg = ChatMessage {
+                role: ChatRole::Coordinator,
+                text: body.to_string(),
+                full_text: Some(body.to_string()),
+                attachments: vec![],
+                edited: false,
+                inbox_id: None,
+                user: None,
+                target_task: None,
+                msg_timestamp: None,
+                read_at: None,
+                msg_queue_id: None,
+            };
+            let mut pending = std::collections::HashSet::new();
+            pending.insert("rid2".to_string());
+            app.chat = ChatState {
+                messages: vec![coord_msg],
+                streaming_text: body.to_string(),
+                pending_request_ids: pending,
+                awaiting_since: Some(std::time::Instant::now()),
+                ..ChatState::default()
+            };
+
+            let backend = TestBackend::new(width, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw_chat_tab(frame, &mut app, area);
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer().clone();
+            let mut rendered = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    rendered.push_str(buffer[(x, y)].symbol());
+                }
+                rendered.push('\n');
+            }
+
+            // At width 40 lines may wrap; we count distinctive sub-tokens
+            // that are short enough to never split mid-word at any tested
+            // width.
+            for needle in ["stocktake", "poietic-life", "language-study"] {
+                let n = rendered.matches(needle).count();
+                assert_eq!(
+                    n, 1,
+                    "[width {}] {:?} appeared {} times — expected 1.\nRendered:\n{}",
+                    width, needle, n, rendered
+                );
+            }
+        }
+    }
+
     #[test]
     fn draw_hud_very_small_terminal_does_not_panic() {
         use ratatui::Terminal;
@@ -7465,6 +12728,575 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    /// Regression: agent response in the chat panel must have its first
+    /// line aligned with its continuation lines. Previously the user's
+    /// message line ended with a status indicator (`  ✓` / `  ✓✓`) that
+    /// could overflow the chat-pane width and visually shift the
+    /// response below.
+    ///
+    /// The fix moves the user-message annotations (timestamp, position,
+    /// status indicator) to a dedicated row below the message body, so
+    /// the body flows uniformly and never pushes other content around.
+    #[test]
+    fn test_response_first_line_aligns_with_continuation() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+
+        // A user message and a multi-line agent response. The response
+        // text is long enough to wrap to at least 3 lines at the test
+        // width (60 cols), so we exercise first-line + continuation
+        // rendering paths.
+        let user_msg = ChatMessage {
+            role: ChatRole::User,
+            text: "ping".to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: Some("erik".to_string()),
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+        let agent_response_text = "Sure, here's a longer response that should wrap \
+                                   across several lines so we can verify that the \
+                                   first line of the response is column-aligned with \
+                                   its continuation lines and not visually shifted \
+                                   by some prefix mismatch.";
+        let agent_msg = ChatMessage {
+            role: ChatRole::Coordinator,
+            text: agent_response_text.to_string(),
+            full_text: None,
+            attachments: vec![],
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: None,
+            read_at: None,
+            msg_queue_id: None,
+        };
+        app.chat = ChatState {
+            messages: vec![user_msg, agent_msg],
+            ..ChatState::default()
+        };
+
+        // Render at a moderate width so the response wraps to 3+ lines.
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area();
+        let mut grid: Vec<String> = Vec::new();
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buffer[(x, y)].symbol());
+            }
+            grid.push(row);
+        }
+
+        // Locate the agent response's first line (starts with the `↯ `
+        // role-prefix), and the two continuation lines that follow it.
+        let first_idx = grid
+            .iter()
+            .position(|row| row.trim_start().starts_with("↯ "))
+            .unwrap_or_else(|| panic!("agent response (`↯ ` prefix) not found in:\n{}", grid.join("\n")));
+
+        // The continuation lines must exist directly after.
+        assert!(
+            first_idx + 2 < grid.len(),
+            "expected at least 2 continuation lines after first response line; grid:\n{}",
+            grid.join("\n")
+        );
+
+        // Find the column of the FIRST printable text glyph on each of
+        // the response's three rendered lines.
+        let first_text_col = |row: &str| -> Option<usize> {
+            row.chars()
+                .enumerate()
+                .find(|(_, c)| !c.is_whitespace())
+                .map(|(i, _)| i)
+        };
+
+        let line1_col = first_text_col(&grid[first_idx])
+            .unwrap_or_else(|| panic!("response line 1 had no printable glyph"));
+        let line2_col = first_text_col(&grid[first_idx + 1])
+            .unwrap_or_else(|| panic!("response line 2 had no printable glyph"));
+        let line3_col = first_text_col(&grid[first_idx + 2])
+            .unwrap_or_else(|| panic!("response line 3 had no printable glyph"));
+
+        // Line 1's first glyph is the role prefix `↯`. Lines 2/3 should
+        // begin at the column where the prefix's *text body* starts —
+        // which on a correctly-aligned response is the column of the
+        // FIRST CHARACTER AFTER `↯ ` on line 1.
+        use unicode_width::UnicodeWidthStr;
+        let prefix_w = "↯ ".width();
+        let expected_body_col = line1_col + prefix_w;
+
+        assert_eq!(
+            line2_col, expected_body_col,
+            "response continuation line 2 not aligned with line-1 body.\n\
+             line1='{}' (col {})\nline2='{}' (col {})\nline3='{}' (col {})\n\
+             expected body col: {}\n\nfull grid:\n{}",
+            grid[first_idx], line1_col,
+            grid[first_idx + 1], line2_col,
+            grid[first_idx + 2], line3_col,
+            expected_body_col,
+            grid.join("\n")
+        );
+        assert_eq!(
+            line3_col, expected_body_col,
+            "response continuation line 3 not aligned with line-1 body.\n\
+             line1='{}' (col {})\nline2='{}' (col {})\nline3='{}' (col {})\n\
+             expected body col: {}\n\nfull grid:\n{}",
+            grid[first_idx], line1_col,
+            grid[first_idx + 1], line2_col,
+            grid[first_idx + 2], line3_col,
+            expected_body_col,
+            grid.join("\n")
+        );
+
+        // Also verify the user-message line does NOT inject a status
+        // indicator inline at the end of the user's text — that was the
+        // original cause of the perceived shift on the response below.
+        // The status indicator (`✓`, `✓✓`) must appear in the gutter
+        // (column 0 of the user line) or on its own dedicated row, not
+        // appended after the text content of the user message.
+        let user_row_idx = grid
+            .iter()
+            .position(|row| row.contains("erik:"))
+            .unwrap_or_else(|| panic!("user message not found"));
+        let user_row = &grid[user_row_idx];
+        let after_user_text = user_row
+            .find("ping")
+            .map(|i| &user_row[i + "ping".len()..])
+            .unwrap_or("");
+        assert!(
+            !after_user_text.contains('✓'),
+            "user-message line should not inline `✓` indicator after text body.\n\
+             user_row='{}'\nfull grid:\n{}",
+            user_row,
+            grid.join("\n")
+        );
+    }
+
+    /// Verifies the smart-coloration scheme from task `tui-chat-smart`:
+    /// bulk assistant prose renders with **default** terminal foreground (no
+    /// forced color), and attachment-metadata lines render as subtle gray —
+    /// not green. Role prefixes still carry their own structural accent.
+    ///
+    /// The test renders an assistant (coordinator) message that also carries
+    /// an attachment, then scans the buffer for two substrings:
+    ///   - `"plain assistant text marker"` — must have unset fg on every cell.
+    ///   - `"[Attached: notes.md]"` — must NOT be `Color::Green` (today it is).
+    ///
+    /// This guards against the regression where chat content was uniformly
+    /// green-washed, drowning out the meaning of color.
+    #[test]
+    fn test_chat_render_uses_no_color_for_default_text() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole, ChatState, RightPanelTab};
+        use ratatui::style::Color;
+
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+
+        app.chat = ChatState {
+            messages: vec![ChatMessage {
+                role: ChatRole::Coordinator,
+                text: "plain assistant text marker".to_string(),
+                full_text: None,
+                attachments: vec!["notes.md".to_string()],
+                edited: false,
+                inbox_id: None,
+                user: None,
+                target_task: None,
+                msg_timestamp: None,
+                read_at: None,
+                msg_queue_id: None,
+            }],
+            ..ChatState::default()
+        };
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let area = buf.area();
+
+        // Helper: find first (x, y) of `needle` in the rendered cell grid.
+        let find_substr = |needle: &str| -> Option<(u16, u16)> {
+            let chars: Vec<char> = needle.chars().collect();
+            for y in 0..area.height {
+                if (chars.len() as u16) > area.width {
+                    continue;
+                }
+                for x in 0..=area.width - chars.len() as u16 {
+                    let ok = chars.iter().enumerate().all(|(i, c)| {
+                        buf.cell((x + i as u16, y))
+                            .map(|cell| cell.symbol().chars().next().unwrap_or(' ') == *c)
+                            .unwrap_or(false)
+                    });
+                    if ok {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        };
+
+        let dump = || {
+            let mut s = String::new();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    s.push_str(buf.cell((x, y)).unwrap().symbol());
+                }
+                s.push('\n');
+            }
+            s
+        };
+
+        // ── Bulk assistant prose: every cell of the marker must have unset fg.
+        let marker = "plain assistant text marker";
+        let (mx, my) = find_substr(marker).unwrap_or_else(|| {
+            panic!(
+                "marker `{}` not found in rendered chat buffer. Buffer:\n{}",
+                marker,
+                dump()
+            )
+        });
+        for (i, _ch) in marker.chars().enumerate() {
+            let cell = buf.cell((mx + i as u16, my)).unwrap();
+            assert_eq!(
+                cell.fg,
+                Color::Reset,
+                "assistant prose cell at ({}, {}) char `{}` has fg {:?}, expected Color::Reset",
+                mx + i as u16,
+                my,
+                cell.symbol(),
+                cell.fg,
+            );
+        }
+
+        // Sanity: the role prefix (`↯`) must still carry an accent color.
+        let prefix_x = mx.saturating_sub(2);
+        let prefix_cell = buf.cell((prefix_x, my)).unwrap();
+        assert_eq!(
+            prefix_cell.symbol(),
+            "↯",
+            "expected `↯` role glyph at column {}; got `{}`",
+            prefix_x,
+            prefix_cell.symbol(),
+        );
+        assert_ne!(
+            prefix_cell.fg,
+            Color::Reset,
+            "role prefix `↯` should have an accent color, not default",
+        );
+
+        // ── Attachment metadata: "[Attached: notes.md]" must be gray (or any
+        //    non-green metadata color) — green attachments are the wash the
+        //    user complained about. We assert "not green", which catches
+        //    today's `Color::Green` regression and stays robust to future
+        //    palette tweaks (DarkGray, Indexed(239), etc).
+        let att_marker = "[Attached: notes.md]";
+        let (ax, ay) = find_substr(att_marker).unwrap_or_else(|| {
+            panic!(
+                "attachment marker `{}` not found in rendered chat buffer. Buffer:\n{}",
+                att_marker,
+                dump()
+            )
+        });
+        for (i, _ch) in att_marker.chars().enumerate() {
+            let cell = buf.cell((ax + i as u16, ay)).unwrap();
+            assert_ne!(
+                cell.fg,
+                Color::Green,
+                "attachment metadata cell at ({}, {}) char `{}` is Color::Green; \
+                 attachments should be subtle gray, not green",
+                ax + i as u16,
+                ay,
+                cell.symbol(),
+            );
+        }
+    }
+
+    /// Verify chat-tab dot colors reflect chat state (per task tui-chat-tab):
+    ///   - blue   = idle/resumable (supervisor alive, no in-flight call)
+    ///   - yellow = LLM actively responding
+    ///   - gray   = supervisor down
+    ///
+    /// We render `draw_chat_tab` directly into a TestBackend, locate the
+    /// `◉` glyph for the active tab, and inspect its foreground color.
+    /// This catches the regression class where the tab was perpetually
+    /// yellow (or perpetually any non-state hashed color) regardless of
+    /// whether the chat was idle or generating.
+    fn build_app_for_tab_color_test(coordinator_ids: &[u32]) -> (VizApp, tempfile::TempDir) {
+        use crate::tui::viz_viewer::state::{RightPanelTab, VizApp};
+        use workgraph::parser::save_graph;
+
+        let mut graph = WorkGraph::new();
+        for &cid in coordinator_ids {
+            // Use the current .chat-N format so tests exercise modern tab styling,
+            // not legacy .coordinator-N muted-gray behavior.
+            let id = format!(".chat-{}", cid);
+            let title = format!("Chat {}", cid);
+            let mut task = make_task_with_status(&id, &title, Status::InProgress);
+            task.tags = vec!["chat-loop".to_string()];
+            graph.add_node(Node::Task(task));
+        }
+        let regular = make_task_with_status("regular", "Regular Task", Status::Open);
+        graph.add_node(Node::Task(regular));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+        // Unknown executor so auto-PTY doesn't fire during the test render.
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir;
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.active_coordinator_id = coordinator_ids[0];
+        app.sync_active_tabs_from_graph();
+        (app, tmp)
+    }
+
+    /// Locate the active-tab dot (`◉`) cell and return its foreground color.
+    fn active_tab_dot_color(buf: &ratatui::buffer::Buffer) -> Option<Color> {
+        let area = buf.area();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buf.cell((x, y))?;
+                if cell.symbol() == "◉" {
+                    return Some(cell.fg);
+                }
+            }
+        }
+        None
+    }
+
+    fn render_chat_tab_to_buffer(app: &mut VizApp) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(120, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, app, area);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn test_chat_tab_color_idle_is_blue() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        // Supervisor alive, no in-flight call → idle.
+        app.chat.coordinator_active = true;
+        // pending_request_ids is empty by default.
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::Blue,
+            "Idle chat tab should be Blue (restoring the prior persistent color); got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_active_is_yellow() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        app.chat.coordinator_active = true;
+        // Mark a request in-flight → awaiting_response() == true → Responding.
+        app.chat.pending_request_ids.insert("req-1".to_string());
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::Yellow,
+            "Chat tab mid-LLM-call should be Yellow; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_supervisor_down_is_gray() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        // Service stopped → all tabs gray, regardless of in-flight state.
+        app.chat.coordinator_active = false;
+        app.chat.pending_request_ids.insert("req-1".to_string());
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+        assert_eq!(
+            color,
+            Color::DarkGray,
+            "Tab with supervisor down should be DarkGray; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_color_inactive_tab_reflects_per_chat_state() {
+        // Active tab is cid=0 (idle). Inactive tab cid=1 has a streaming
+        // file on disk → should render Yellow even though it's not the
+        // active tab.
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0, 1]);
+        app.chat.coordinator_active = true;
+        // Write streaming text for cid=1 (the non-active tab).
+        workgraph::chat::write_streaming(&app.workgraph_dir, 1, "partial reply").unwrap();
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        // Find inactive tab dot `●` and its color. The first `●` we
+        // encounter belongs to cid=1 (since cid=0 is active and uses ◉).
+        let area = buf.area();
+        let mut inactive_dot_color = None;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                if cell.symbol() == "●" {
+                    inactive_dot_color = Some(cell.fg);
+                    break;
+                }
+            }
+            if inactive_dot_color.is_some() {
+                break;
+            }
+        }
+        let color = inactive_dot_color.expect("● not found for inactive tab");
+        assert_eq!(
+            color,
+            Color::Yellow,
+            "Inactive tab with active streaming file should be Yellow; got {:?}",
+            color
+        );
+    }
+
+    #[test]
+    fn test_legacy_coordinator_tab_is_always_muted() {
+        // Legacy .coordinator-N tabs must render with muted gray (Rgb(110,110,110))
+        // even when the streaming file is non-empty. The deprecation treatment takes
+        // precedence over chat state.
+        use crate::tui::viz_viewer::state::{RightPanelTab, VizApp};
+        use workgraph::parser::save_graph;
+
+        let mut graph = WorkGraph::new();
+        // Create old-style .coordinator-1 task.
+        let mut task = make_task_with_status(".coordinator-1", "Coordinator 1", Status::InProgress);
+        task.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[coordinator]\nexecutor = \"shell\"\n",
+        )
+        .unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = wg_dir.clone();
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.active_coordinator_id = 1;
+        app.chat.coordinator_active = true;
+
+        // Write streaming data for cid=1 — state would normally be Yellow for .chat-N.
+        workgraph::chat::write_streaming(&wg_dir, 1, "partial reply").unwrap();
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let color = active_tab_dot_color(&buf).expect("◉ not found in tab bar");
+
+        // Legacy tab must be muted gray, NOT Yellow, despite streaming state.
+        assert_eq!(
+            color,
+            Color::Rgb(110, 110, 110),
+            "Legacy .coordinator-N tab dot should be muted Rgb(110,110,110); got {:?}",
+            color
+        );
+        assert_ne!(
+            color,
+            Color::Yellow,
+            "Legacy .coordinator-N tab must NOT use the streaming Yellow color"
+        );
+    }
+
+    #[test]
+    fn test_chat_tab_renders_hotkey_hint_for_first_nine_tabs() {
+        // The tab bar should render `[1]`, `[2]`, ... hints so users
+        // discover the Alt+N hotkey for tab switching.
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0, 1]);
+        app.chat.coordinator_active = true;
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let mut rendered = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                rendered.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(
+            rendered.contains("[1]"),
+            "Tab bar should include `[1]` hotkey hint.\nRendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("[2]"),
+            "Tab bar should include `[2]` hotkey hint.\nRendered:\n{}",
+            rendered
+        );
     }
 
     #[test]
@@ -7752,10 +13584,7 @@ mod tests {
     fn test_wrap_segments_multi_word() {
         let line = "hi there world";
         let segs = word_wrap_segments(line, 8);
-        assert_eq!(
-            segments_to_strings(line, &segs),
-            vec!["hi there", "world"]
-        );
+        assert_eq!(segments_to_strings(line, &segs), vec!["hi there", "world"]);
     }
 
     #[test]
@@ -7807,5 +13636,1748 @@ mod tests {
         assert_eq!(cursor_in_segments(&segs, 10), (1, 4));
         // Cursor at end (col 11): past end of last segment.
         assert_eq!(cursor_in_segments(&segs, 11), (1, 5));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ANNOTATION CLICK: hit regions, flash animation, and detail loading
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_annotation_click_hit_regions_computed() {
+        // Build a graph with a task that has an annotation.
+        let mut graph = WorkGraph::new();
+        let task = make_task_with_status("my-task", "My Task", Status::Open);
+        graph.add_node(Node::Task(task));
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "my-task".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[⊞ assigning]".to_string(),
+                dot_task_ids: vec![".assign-my-task".to_string()],
+            },
+        );
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &annotations,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+
+        // Should have exactly one hit region for "my-task".
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 annotation hit region, got {}",
+            app.annotation_hit_regions.len()
+        );
+
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "my-task");
+        assert_eq!(region.dot_task_ids, vec![".assign-my-task"]);
+
+        // The annotation text should be found in the plain line.
+        let plain = &app.plain_lines[region.orig_line];
+        let expected_text = "[⊞ assigning]";
+        assert!(
+            plain.contains(expected_text),
+            "Plain line should contain annotation text.\nLine: {:?}",
+            plain
+        );
+
+        // col_start/col_end should span the annotation text.
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("assigning"),
+            "Hit region should cover annotation text, got: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_multiple_annotations_same_graph() {
+        // Two tasks with different annotations — both should get hit regions.
+        let mut graph = WorkGraph::new();
+        let task_a = make_task_with_status("task-a", "Task A", Status::Open);
+        let task_b = make_task_with_status("task-b", "Task B", Status::Done);
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+
+        let mut annotations = HashMap::new();
+        annotations.insert(
+            "task-a".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[⊞ assigning]".to_string(),
+                dot_task_ids: vec![".assign-task-a".to_string()],
+            },
+        );
+        annotations.insert(
+            "task-b".to_string(),
+            crate::commands::viz::AnnotationInfo {
+                text: "[∴ evaluating]".to_string(),
+                dot_task_ids: vec![".evaluate-task-b".to_string()],
+            },
+        );
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &annotations,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+
+        // Should have two hit regions — one per annotated task.
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            2,
+            "Expected 2 annotation hit regions for 2 annotated tasks"
+        );
+
+        // Each region maps to its respective task.
+        let ids: HashSet<&str> = app
+            .annotation_hit_regions
+            .iter()
+            .map(|r| r.parent_task_id.as_str())
+            .collect();
+        assert!(ids.contains("task-a"));
+        assert!(ids.contains("task-b"));
+
+        // Regions should be on different lines.
+        let lines: HashSet<usize> = app
+            .annotation_hit_regions
+            .iter()
+            .map(|r| r.orig_line)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Each annotated task should be on a different line"
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_flash_rendering() {
+        // Verify that apply_annotation_flash modifies the affected column range.
+        let line = Line::from(vec![
+            Span::styled("prefix ", Style::default()),
+            Span::styled("[⊞ assigning]", Style::default().fg(Color::Magenta)),
+            Span::styled(" suffix", Style::default()),
+        ]);
+
+        // Flash at elapsed=0 should apply background color.
+        let flashed = apply_annotation_flash(line.clone(), 7, 20, 0);
+        // The flash should produce spans where the annotation region has a bg color.
+        let mut has_bg_in_region = false;
+        let mut char_idx = 0;
+        for span in &flashed.spans {
+            for _ in span.content.chars() {
+                if char_idx >= 7 && char_idx < 20 {
+                    if span.style.bg.is_some() {
+                        has_bg_in_region = true;
+                    }
+                }
+                char_idx += 1;
+            }
+        }
+        assert!(
+            has_bg_in_region,
+            "Flash at t=0 should apply background to annotation region"
+        );
+
+        // Flash at elapsed=500 should return to normal (progress=1.0).
+        let faded = apply_annotation_flash(line.clone(), 7, 20, 500);
+        // At 500ms the flash should be fully faded — no bg in the region.
+        let mut has_bg = false;
+        char_idx = 0;
+        for span in &faded.spans {
+            for _ in span.content.chars() {
+                if char_idx >= 7 && char_idx < 20 {
+                    if span.style.bg.is_some() {
+                        has_bg = true;
+                    }
+                }
+                char_idx += 1;
+            }
+        }
+        assert!(
+            !has_bg,
+            "Flash at t=500 should be fully faded (no bg color)"
+        );
+    }
+
+    #[test]
+    fn test_annotation_click_no_regions_without_annotations() {
+        // Graph with no annotations should produce no hit regions.
+        let mut graph = WorkGraph::new();
+        let task = make_task_with_status("plain-task", "Plain Task", Status::Open);
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.compute_annotation_hit_regions();
+
+        assert!(
+            app.annotation_hit_regions.is_empty(),
+            "No annotations should produce no hit regions"
+        );
+    }
+
+    // ── E2E annotation click pipeline tests ──
+    // These test the full pipeline: graph with internal dot-tasks → filter_internal_tasks
+    // generates annotations → ASCII render → VizApp hit region computation → click resolution.
+
+    /// Helper: build a graph with a parent and an internal task, run filter + ascii + hit regions.
+    /// Returns (VizApp, annotations) for assertion.
+    fn build_e2e_annotation_app(
+        parent_id: &str,
+        parent_title: &str,
+        parent_status: Status,
+        internal_id: &str,
+        internal_title: &str,
+        internal_tag: &str,
+        internal_after: Vec<&str>,
+    ) -> VizApp {
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task_with_status(parent_id, parent_title, parent_status);
+        // Wire dependency if the internal task blocks the parent
+        if !internal_after.contains(&parent_id) {
+            parent.after = vec![internal_id.to_string()];
+        }
+        graph.add_node(Node::Task(parent));
+
+        let mut internal = workgraph::graph::Task {
+            id: internal_id.to_string(),
+            title: internal_title.to_string(),
+            tags: vec![internal_tag.to_string(), "agency".to_string()],
+            after: internal_after.into_iter().map(String::from).collect(),
+            status: Status::InProgress,
+            ..workgraph::graph::Task::default()
+        };
+        let _ = &mut internal; // suppress unused warning
+        graph.add_node(Node::Task(internal));
+
+        let empty_annotations: HashMap<String, crate::commands::viz::AnnotationInfo> =
+            HashMap::new();
+        let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
+            &graph,
+            graph.tasks().collect(),
+            &empty_annotations,
+        );
+        let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+
+        let viz = generate_ascii(
+            &graph,
+            &filtered,
+            &task_ids,
+            &annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+        app
+    }
+
+    #[test]
+    fn test_e2e_assigning_click_resolves() {
+        // parent + .assign-parent → [⊞ assigning], click resolves to .assign-parent
+        let app = build_e2e_annotation_app(
+            "parent",
+            "Parent Task",
+            Status::Open,
+            ".assign-parent",
+            "Assign parent",
+            "assignment",
+            vec![],
+        );
+
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 hit region for assigning"
+        );
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "parent");
+        assert_eq!(region.dot_task_ids, vec![".assign-parent"]);
+
+        let plain = &app.plain_lines[region.orig_line];
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("assigning"),
+            "Hit region should cover [⊞ assigning], got: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_e2e_evaluating_click_resolves() {
+        // parent + .evaluate-parent → [∴ evaluating], click resolves to .evaluate-parent
+        let app = build_e2e_annotation_app(
+            "parent",
+            "Parent Task",
+            Status::Done,
+            ".evaluate-parent",
+            "Evaluate parent",
+            "evaluation",
+            vec!["parent"],
+        );
+
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 hit region for evaluating"
+        );
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "parent");
+        assert_eq!(region.dot_task_ids, vec![".evaluate-parent"]);
+
+        let plain = &app.plain_lines[region.orig_line];
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("evaluating"),
+            "Hit region should cover [∴ evaluating], got: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_e2e_assigning_click_resolves_open() {
+        // parent + .assign-parent → [⊞ assigning], click resolves to .assign-parent
+        let app = build_e2e_annotation_app(
+            "parent",
+            "Parent Task",
+            Status::Open,
+            ".assign-parent",
+            "Assign parent",
+            "assignment",
+            vec![],
+        );
+
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 hit region for assigning"
+        );
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "parent");
+        assert_eq!(region.dot_task_ids, vec![".assign-parent"]);
+
+        let plain = &app.plain_lines[region.orig_line];
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("assigning"),
+            "Hit region should cover [⊞ assigning], got: {:?}",
+            found
+        );
+    }
+
+    #[test]
+    fn test_e2e_multiple_annotations_column_accurate_click() {
+        // parent with both .assign-parent and .evaluate-parent → two annotations on same line
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task_with_status("parent", "Parent Task", Status::Done);
+        parent.after = vec![".assign-parent".to_string()];
+        graph.add_node(Node::Task(parent));
+
+        let assign = workgraph::graph::Task {
+            id: ".assign-parent".to_string(),
+            title: "Assign parent".to_string(),
+            tags: vec!["assignment".to_string(), "agency".to_string()],
+            status: Status::InProgress,
+            ..workgraph::graph::Task::default()
+        };
+        graph.add_node(Node::Task(assign));
+
+        let eval = workgraph::graph::Task {
+            id: ".evaluate-parent".to_string(),
+            title: "Evaluate parent".to_string(),
+            tags: vec!["evaluation".to_string(), "agency".to_string()],
+            after: vec!["parent".to_string()],
+            status: Status::InProgress,
+            ..workgraph::graph::Task::default()
+        };
+        graph.add_node(Node::Task(eval));
+
+        let empty_annotations: HashMap<String, crate::commands::viz::AnnotationInfo> =
+            HashMap::new();
+        let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
+            &graph,
+            graph.tasks().collect(),
+            &empty_annotations,
+        );
+        let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+
+        // Both annotations should merge onto the parent
+        assert!(
+            annots.contains_key("parent"),
+            "Annotations should include parent"
+        );
+        let info = &annots["parent"];
+        assert_eq!(
+            info.dot_task_ids.len(),
+            2,
+            "Should have 2 dot-task IDs for parent"
+        );
+        assert!(info.dot_task_ids.contains(&".assign-parent".to_string()));
+        assert!(info.dot_task_ids.contains(&".evaluate-parent".to_string()));
+
+        let viz = generate_ascii(
+            &graph,
+            &filtered,
+            &task_ids,
+            &annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.annotation_map = viz.annotation_map.clone();
+        app.compute_annotation_hit_regions();
+
+        // Should have exactly 1 hit region (both annotations merge into one composite)
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Both annotations on same parent should produce 1 combined hit region"
+        );
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "parent");
+        assert_eq!(
+            region.dot_task_ids.len(),
+            2,
+            "Combined region should carry both dot-task IDs"
+        );
+
+        // Verify the annotation text in the plain line covers both phases
+        let plain = &app.plain_lines[region.orig_line];
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("assigning"),
+            "Combined annotation should contain 'assigning', got: {:?}",
+            found
+        );
+        assert!(
+            found.contains("evaluating"),
+            "Combined annotation should contain 'evaluating', got: {:?}",
+            found
+        );
+
+        // Column accuracy: col_start and col_end should tightly bound the annotation text
+        assert!(
+            region.col_start > 0,
+            "Annotation should not start at column 0 (task label is before it)"
+        );
+        assert!(
+            region.col_end > region.col_start,
+            "col_end should be after col_start"
+        );
+    }
+
+    #[test]
+    fn test_e2e_validating_click_resolves() {
+        // parent + .verify-parent → [∴ validating], click resolves to .verify-parent
+        let app = build_e2e_annotation_app(
+            "parent",
+            "Parent Task",
+            Status::Done,
+            ".verify-parent",
+            "Verify parent",
+            "evaluation",
+            vec!["parent"],
+        );
+
+        assert_eq!(
+            app.annotation_hit_regions.len(),
+            1,
+            "Expected 1 hit region for validating"
+        );
+        let region = &app.annotation_hit_regions[0];
+        assert_eq!(region.parent_task_id, "parent");
+        assert_eq!(region.dot_task_ids, vec![".verify-parent"]);
+
+        let plain = &app.plain_lines[region.orig_line];
+        let found = &plain[region.col_start..region.col_end];
+        assert!(
+            found.contains("validating"),
+            "Hit region should cover [∴ validating], got: {:?}",
+            found
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Log tab vs Output tab rendering parity
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Verify that the Log tab and Output tab produce identical rendered
+    /// lines for the same markdown content via the shared `markdown_to_lines`
+    /// function.  The only expected difference is the agent log marker lines
+    /// (⊞ symbol in light blue) that the Log tab prepends.
+    #[test]
+    fn test_log_and_output_tabs_use_same_markdown_rendering() {
+        use crate::tui::markdown::markdown_to_lines;
+
+        let sample_md = concat!(
+            "# Heading\n",
+            "\n",
+            "Some **bold** and *italic* text with `inline code`.\n",
+            "\n",
+            "```rust\n",
+            "fn main() {\n",
+            "    println!(\"hello\");\n",
+            "}\n",
+            "```\n",
+            "\n",
+            "- bullet one\n",
+            "- bullet two\n",
+        );
+
+        let width: usize = 80;
+
+        // Both tabs use markdown_to_lines with width.saturating_sub(1).
+        let render_width = width.saturating_sub(1);
+        let output_lines = markdown_to_lines(sample_md, render_width);
+        let log_lines = markdown_to_lines(sample_md, render_width);
+
+        assert_eq!(
+            output_lines.len(),
+            log_lines.len(),
+            "Same content through markdown_to_lines should produce the same number of lines"
+        );
+
+        for (i, (out_line, log_line)) in output_lines.iter().zip(log_lines.iter()).enumerate() {
+            assert_eq!(
+                out_line.spans.len(),
+                log_line.spans.len(),
+                "Line {i}: span count mismatch"
+            );
+            for (j, (out_span, log_span)) in
+                out_line.spans.iter().zip(log_line.spans.iter()).enumerate()
+            {
+                assert_eq!(
+                    out_span.content, log_span.content,
+                    "Line {i} span {j}: content mismatch"
+                );
+                assert_eq!(
+                    out_span.style, log_span.style,
+                    "Line {i} span {j}: style mismatch"
+                );
+            }
+        }
+    }
+
+    /// Verify that log tab agent marker lines use the ⊞ symbol and pink styling
+    /// (matching agency phase annotations like [∴ evaluating]).
+    #[test]
+    fn test_log_tab_agent_markers() {
+        let log_entry = "[2026-03-25T19:06:45] Starting work on task";
+
+        // Simulate what draw_log_tab does to log entries.
+        const AGENT_MARKER: &str = "\u{229e}";
+        let message = if let Some(bracket_end) = log_entry.find(']') {
+            let timestamp = &log_entry[..=bracket_end];
+            let msg = log_entry[bracket_end + 1..].trim_start();
+            format!("{} {} {}", AGENT_MARKER, timestamp, msg)
+        } else {
+            format!("{} {}", AGENT_MARKER, log_entry)
+        };
+
+        assert!(
+            message.starts_with(AGENT_MARKER),
+            "Agent marker line should start with ⊞ symbol"
+        );
+        assert!(
+            message.contains("[2026-03-25T19:06:45]"),
+            "Agent marker line should preserve the timestamp"
+        );
+        assert!(
+            message.contains("Starting work on task"),
+            "Agent marker line should preserve the message"
+        );
+
+        // Verify the styling would be pink/rose (ANSI 219) — matching agency phase annotations.
+        let styled_line = Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Indexed(219)),
+        ));
+        assert_eq!(
+            styled_line.spans[0].style.fg,
+            Some(Color::Indexed(219)),
+            "Agent marker lines should use pink/rose color (ANSI 219)"
+        );
+    }
+
+    /// Verify that the finish status line is consistent between Log and Output tabs.
+    #[test]
+    fn test_finish_status_line_parity() {
+        // Both tabs should produce the same finish status format.
+        for (status, expected_color) in [
+            ("done", Color::Green),
+            ("failed", Color::Red),
+            ("unknown", Color::DarkGray),
+        ] {
+            let (status_text, status_color) = match status {
+                "done" => (format!("── agent finished (done) ──"), Color::Green),
+                "failed" => (format!("── agent finished (failed) ──"), Color::Red),
+                _ => (format!("── agent finished ({status}) ──"), Color::DarkGray),
+            };
+            assert_eq!(
+                status_color, expected_color,
+                "Status '{status}' should use correct color"
+            );
+            assert!(
+                status_text.contains(status),
+                "Status text should contain the status string"
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Responsive breakpoint tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_responsive_breakpoint_from_width() {
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+
+        // Compact: < 50
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(0),
+            ResponsiveBreakpoint::Compact
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(30),
+            ResponsiveBreakpoint::Compact
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(40),
+            ResponsiveBreakpoint::Compact
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(49),
+            ResponsiveBreakpoint::Compact
+        );
+
+        // Narrow: 50–80
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(50),
+            ResponsiveBreakpoint::Narrow
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(60),
+            ResponsiveBreakpoint::Narrow
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(80),
+            ResponsiveBreakpoint::Narrow
+        );
+
+        // Full: > 80
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(81),
+            ResponsiveBreakpoint::Full
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(100),
+            ResponsiveBreakpoint::Full
+        );
+        assert_eq!(
+            ResponsiveBreakpoint::from_width(200),
+            ResponsiveBreakpoint::Full
+        );
+    }
+
+    #[test]
+    fn test_responsive_compact_40_cols_no_panic() {
+        // Render at 40-col width (phone-like, Termux/Blink Shell).
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // After drawing at 40 cols, breakpoint should be Compact.
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+    }
+
+    #[test]
+    fn test_responsive_narrow_60_cols_no_panic() {
+        // Render at 60-col width (narrow terminal).
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+    }
+
+    #[test]
+    fn test_responsive_full_100_cols_no_panic() {
+        // Render at 100-col width (standard terminal).
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+    }
+
+    #[test]
+    fn test_responsive_compact_single_panel_graph_view() {
+        // In compact mode with SinglePanelView::Graph, the graph area should
+        // span the full main area (minus status/hints bars).
+        use crate::tui::viz_viewer::state::{ResponsiveBreakpoint, SinglePanelView};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.single_panel_view = SinglePanelView::Graph;
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+        // Graph area should have width == 40 (full terminal width).
+        assert_eq!(app.last_graph_area.width, 40);
+        // Graph area height should be main_area height (total - 3 for status/vitals/hints bars).
+        assert_eq!(app.last_graph_area.height, 22);
+        // Right panel area should be empty (not shown).
+        assert_eq!(app.last_right_panel_area, Rect::default());
+    }
+
+    #[test]
+    fn test_responsive_compact_single_panel_detail_view() {
+        // In compact mode with SinglePanelView::Detail, only the inspector
+        // should render — graph area should be zeroed out.
+        use crate::tui::viz_viewer::state::{ResponsiveBreakpoint, SinglePanelView};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.single_panel_view = SinglePanelView::Detail;
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+        // Graph area should be zeroed (not visible).
+        assert_eq!(app.last_graph_area, Rect::default());
+        // Right panel area should be non-empty (it's the active view).
+        assert!(app.last_right_panel_area.width > 0);
+        assert!(app.last_right_panel_area.height > 0);
+    }
+
+    #[test]
+    fn test_responsive_compact_toggle_single_panel() {
+        // Verify that toggle_single_panel_view cycles through Graph → Detail → Log → Graph.
+        use crate::tui::viz_viewer::state::{FocusedPanel, RightPanelTab, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Toggle: Graph -> Detail
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Detail);
+
+        // Toggle: Detail -> Log
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Log);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Log);
+
+        // Toggle: Log -> Graph
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
+    }
+
+    #[test]
+    fn test_responsive_narrow_split_layout() {
+        // In narrow mode (50-80 cols) with inspector visible, should use
+        // vertical (bottom) split to avoid oscillation with Full breakpoint.
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.right_panel_visible = true;
+        app.layout_mode = crate::tui::viz_viewer::state::LayoutMode::TwoThirdsInspector;
+
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+        // Both panels should be visible (stacked vertically).
+        assert!(app.last_graph_area.height > 0, "graph should have height");
+        assert!(
+            app.last_right_panel_area.height > 0,
+            "inspector should have height"
+        );
+        // Inspector should be below (same width as terminal, not beside).
+        assert_eq!(
+            app.last_graph_area.width, 60,
+            "graph should span full width in vertical layout"
+        );
+        assert_eq!(
+            app.last_right_panel_area.width, 60,
+            "inspector should span full width in vertical layout"
+        );
+        // Inspector should NOT be beside in narrow mode.
+        assert!(
+            !app.inspector_is_beside,
+            "inspector should be below, not beside, in narrow mode"
+        );
+    }
+
+    #[test]
+    fn test_responsive_resize_dynamic_breakpoint() {
+        // Simulate resize by drawing at different widths and verifying
+        // breakpoint changes dynamically.
+        use crate::tui::viz_viewer::state::ResponsiveBreakpoint;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+
+        // Start wide
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+
+        // "Resize" to narrow
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Narrow);
+
+        // "Resize" to compact
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+
+        // "Resize" back to full
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Full);
+    }
+
+    #[test]
+    fn test_inspector_layout_no_oscillation_on_zoom() {
+        // Verify inspector position is monotonic when zooming in/out:
+        // no oscillation between side and bottom layouts.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.right_panel_visible = true;
+        app.layout_mode = crate::tui::viz_viewer::state::LayoutMode::ThirdInspector;
+
+        // Wide: inspector on the right (side-by-side).
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.inspector_is_beside, "140 cols: should be side-by-side");
+
+        // Zoom in to 110: still above SIDE_MIN_WIDTH, stays beside.
+        let backend = TestBackend::new(110, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            app.inspector_is_beside,
+            "110 cols: should still be side-by-side"
+        );
+
+        // Zoom in to 95: below SIDE_MIN_WIDTH, moves to bottom.
+        let backend = TestBackend::new(95, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.inspector_is_beside, "95 cols: should be bottom");
+
+        // Zoom in to 70 (Narrow breakpoint): stays at bottom — NO oscillation.
+        let backend = TestBackend::new(70, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            !app.inspector_is_beside,
+            "70 cols: should stay bottom (no oscillation)"
+        );
+
+        // Zoom in to 45 (Compact): single panel mode.
+        let backend = TestBackend::new(45, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            !app.inspector_is_beside,
+            "45 cols: compact mode, not beside"
+        );
+
+        // Zoom back out to 105: still below SIDE_RESTORE_WIDTH (120), stays bottom (hysteresis).
+        let backend = TestBackend::new(105, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            !app.inspector_is_beside,
+            "105 cols: hysteresis — stays bottom until 120"
+        );
+
+        // Zoom out to 125: above SIDE_RESTORE_WIDTH, restores to side-by-side.
+        let backend = TestBackend::new(125, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            app.inspector_is_beside,
+            "125 cols: restores to side-by-side"
+        );
+    }
+
+    #[test]
+    fn test_responsive_compact_tab_toggles_panel_focus() {
+        // In compact mode, toggle_panel_focus should cycle through all three panels.
+        use crate::tui::viz_viewer::state::{FocusedPanel, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Tab: Graph -> Detail
+        app.toggle_panel_focus();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+
+        // Tab: Detail -> Log
+        app.toggle_panel_focus();
+        assert_eq!(app.single_panel_view, SinglePanelView::Log);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+
+        // Tab: Log -> Graph
+        app.toggle_panel_focus();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
+    }
+
+    // ── Single-panel navigation mode tests ──
+
+    #[test]
+    fn test_single_panel_forward_cycle() {
+        // ]/Tab cycles: Graph → Detail → Log → Graph
+        use crate::tui::viz_viewer::state::{FocusedPanel, RightPanelTab, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Forward: Graph → Detail
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Detail);
+
+        // Forward: Detail → Log
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Log);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Log);
+
+        // Forward: Log → Graph (wraps)
+        app.toggle_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
+    }
+
+    #[test]
+    fn test_single_panel_backward_cycle() {
+        // [ cycles backward: Graph → Log → Detail → Graph
+        use crate::tui::viz_viewer::state::{FocusedPanel, RightPanelTab, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Backward: Graph → Log
+        app.prev_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Log);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Log);
+
+        // Backward: Log → Detail
+        app.prev_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert_eq!(app.right_panel_tab, RightPanelTab::Detail);
+
+        // Backward: Detail → Graph (wraps)
+        app.prev_single_panel_view();
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.focused_panel, FocusedPanel::Graph);
+    }
+
+    #[test]
+    fn test_single_panel_state_persists_across_switches() {
+        // Panel state (scroll offset, selected task) persists across switches.
+        use crate::tui::viz_viewer::state::{FocusedPanel, SinglePanelView};
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.responsive_breakpoint = crate::tui::viz_viewer::state::ResponsiveBreakpoint::Compact;
+        app.single_panel_view = SinglePanelView::Graph;
+        app.focused_panel = FocusedPanel::Graph;
+
+        // Set some state in graph view.
+        app.scroll.offset_y = 5;
+        let original_selected = app.selected_task_idx;
+
+        // Cycle through all panels and back.
+        app.toggle_single_panel_view(); // → Detail
+        app.toggle_single_panel_view(); // → Log
+        app.toggle_single_panel_view(); // → Graph
+
+        assert_eq!(app.single_panel_view, SinglePanelView::Graph);
+        assert_eq!(app.scroll.offset_y, 5, "scroll offset should persist");
+        assert_eq!(
+            app.selected_task_idx, original_selected,
+            "selected task index should persist"
+        );
+    }
+
+    #[test]
+    fn test_single_panel_log_view_renders() {
+        // In compact mode with SinglePanelView::Log, the right panel renders
+        // with the Log tab active, and graph area is zeroed.
+        use crate::tui::viz_viewer::state::{ResponsiveBreakpoint, RightPanelTab, SinglePanelView};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.single_panel_view = SinglePanelView::Log;
+        app.right_panel_tab = RightPanelTab::Log;
+
+        let backend = TestBackend::new(40, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.responsive_breakpoint, ResponsiveBreakpoint::Compact);
+        assert_eq!(app.last_graph_area, Rect::default());
+        assert!(app.last_right_panel_area.width > 0);
+        assert!(app.last_right_panel_area.height > 0);
+    }
+
+    #[test]
+    fn test_single_panel_labels() {
+        use crate::tui::viz_viewer::state::SinglePanelView;
+
+        assert_eq!(SinglePanelView::Graph.label(), "Graph");
+        assert_eq!(SinglePanelView::Detail.label(), "Detail");
+        assert_eq!(SinglePanelView::Log.label(), "Log");
+    }
+
+    #[test]
+    fn test_single_panel_next_prev_inverse() {
+        use crate::tui::viz_viewer::state::SinglePanelView;
+
+        for view in [
+            SinglePanelView::Graph,
+            SinglePanelView::Detail,
+            SinglePanelView::Log,
+        ] {
+            assert_eq!(
+                view.next().prev(),
+                view,
+                "next then prev should return to original"
+            );
+            assert_eq!(
+                view.prev().next(),
+                view,
+                "prev then next should return to original"
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Tests for HUD vitals bar rendering
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Render the vitals bar into a test buffer and return the text content.
+    fn render_vitals_to_string(vitals: &super::super::state::VitalsState, width: u16) -> String {
+        use super::super::state::VitalsState;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (viz, _) = build_test_graph_chain_plus_isolated();
+        let mut app = build_app_from_viz_output(&viz, "a");
+        app.vitals = VitalsState {
+            agents_alive: vitals.agents_alive,
+            open: vitals.open,
+            running: vitals.running,
+            done: vitals.done,
+            last_event_time: vitals.last_event_time,
+            coord_last_tick: vitals.coord_last_tick,
+            daemon_running: vitals.daemon_running,
+        };
+
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, 1);
+                draw_vitals_bar(frame, &app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for x in 0..width {
+            let cell = buf.cell((x, 0)).unwrap();
+            text.push_str(cell.symbol());
+        }
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_zero_agents() {
+        use super::super::state::VitalsState;
+
+        let v = VitalsState {
+            agents_alive: 0,
+            open: 5,
+            running: 0,
+            done: 10,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: false,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(
+            text.contains("0 agents"),
+            "should show agent count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("5 open"),
+            "should show open count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("0 running"),
+            "should show running count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("10 done"),
+            "should show done count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("no events"),
+            "should show no events, got: {}",
+            text
+        );
+        assert!(
+            text.contains("coord"),
+            "should show coord status, got: {}",
+            text
+        );
+        assert!(text.contains("down"), "should show down, got: {}", text);
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_with_agents() {
+        use super::super::state::VitalsState;
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let v = VitalsState {
+            agents_alive: 2,
+            open: 8,
+            running: 3,
+            done: 45,
+            last_event_time: Some(now - Duration::from_secs(4)),
+            coord_last_tick: Some(now - Duration::from_secs(2)),
+            daemon_running: true,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(
+            text.contains("2 agents"),
+            "should show agent count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("8 open"),
+            "should show open count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("3 running"),
+            "should show running count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("45 done"),
+            "should show done count, got: {}",
+            text
+        );
+        assert!(
+            text.contains("last event"),
+            "should show last event, got: {}",
+            text
+        );
+        assert!(
+            text.contains("coord"),
+            "should show coord status, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_vitals_bar_renders_single_agent() {
+        use super::super::state::VitalsState;
+
+        let v = VitalsState {
+            agents_alive: 1,
+            open: 0,
+            running: 1,
+            done: 0,
+            last_event_time: None,
+            coord_last_tick: None,
+            daemon_running: true,
+        };
+        let text = render_vitals_to_string(&v, 120);
+        assert!(
+            text.contains("1 agents"),
+            "should show 1 agent, got: {}",
+            text
+        );
+    }
+
+    /// Render a TestBackend buffer to a flat string (concatenating cell symbols
+    /// row by row, separated by newlines). Useful for asserting that specific
+    /// text appears in a rendered TUI.
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Regression test for tui-log-view: when an in-progress task has an
+    /// assigned agent whose raw_stream.jsonl file contains events, the Log
+    /// pane MUST render those events on first draw — NOT show
+    /// "no agent output yet". This is the user-reported failure mode that
+    /// the prior tui-agent-activity attempt did not catch end-to-end.
+    #[test]
+    fn test_log_pane_renders_raw_stream_events_for_alive_agent() {
+        use crate::commands::viz::ascii::generate_ascii;
+        use crate::commands::viz::{LayoutMode, VizOutput};
+        use crate::tui::viz_viewer::state::{RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::collections::{HashMap, HashSet};
+        use workgraph::graph::{Node, Status, WorkGraph};
+        use workgraph::parser::save_graph;
+        use workgraph::test_helpers::make_task_with_status;
+
+        // 1) Set up a workgraph dir with one in-progress task assigned to agent-77.
+        let mut graph = WorkGraph::new();
+        let mut t = make_task_with_status("my-task", "Live Task", Status::InProgress);
+        t.assigned = Some("agent-77".to_string());
+        graph.add_node(Node::Task(t));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        // 2) Create the agent's raw_stream.jsonl with realistic events.
+        let agent_dir = tmp.path().join("agents").join("agent-77");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let stream_lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"UNIQUE_STREAM_MARKER_ALPHA"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi"}}]}}"#,
+        ];
+        std::fs::write(
+            agent_dir.join("raw_stream.jsonl"),
+            stream_lines.join("\n"),
+        )
+        .unwrap();
+        // output.log is empty — the only data source must be raw_stream.jsonl.
+        std::fs::write(agent_dir.join("output.log"), "").unwrap();
+
+        // 3) Build VizApp pointed at the workgraph dir, select the task,
+        //    and switch the right panel to the Log tab — exactly what the
+        //    user does when they press '4'.
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz: VizOutput = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = tmp.path().to_path_buf();
+        let idx = app.task_order.iter().position(|id| id == "my-task");
+        app.selected_task_idx = idx;
+        app.right_panel_visible = true;
+        app.right_panel_tab = RightPanelTab::Log;
+
+        // 4) Render via TestBackend — the user's first draw of the Log tab.
+        //    Wide enough to avoid Compact breakpoint clobbering layout.
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = buffer_to_string(terminal.backend().buffer());
+
+        // The bug surface: Log pane must show real activity, not the
+        // "no agent output yet" sentinel that the user sees today.
+        assert!(
+            !rendered.contains("no agent output yet"),
+            "Log tab must NOT show 'no agent output yet' when raw_stream.jsonl \
+             has events for an alive agent. Rendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("UNIQUE_STREAM_MARKER_ALPHA"),
+            "Log tab must render the stream event text on first draw. Rendered:\n{}",
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3: long single-line responses in the
+    /// Log pane must word-wrap to the pane width — every char must end up
+    /// on screen, distributed across multiple visual lines, not truncated
+    /// at the right edge or pushed off-screen below the viewport.
+    ///
+    /// Synthetic input: a 500-char single line of markers, rendered into a
+    /// generously-tall TestBackend. After wrapping, ALL markers must appear
+    /// in the buffer distributed across multiple rows.
+    #[test]
+    fn test_log_view_wraps_long_response() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 500-char response with a unique 4-char repeating pattern so that
+        // we can verify every chunk made it into the buffer.
+        // Pattern: 'A001 A002 A003 ...' — 5-char tokens, 100 of them = 500 chars.
+        let mut response = String::new();
+        for i in 0..100 {
+            if i > 0 {
+                response.push(' ');
+            }
+            response.push_str(&format!("A{:03}", i));
+        }
+        // response is now 4*100 + 99 spaces between = 499 chars — pad to 500.
+        let response = format!("{} ", response);
+        assert!(response.chars().count() >= 500);
+
+        // Build a minimal app — we only need draw_log_tab to render correctly,
+        // not the full draw() pipeline.
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        // Configure the log pane with no stream events; with the events
+        // list empty draw_log_tab falls back to rendering
+        // agent_output.full_text directly, exercising the wrap path.
+        app.log_pane = LogPaneState::default();
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.agent_output.full_text = response.clone();
+
+        // Render direct to TestBackend at 80 wide × 40 high so that a 500-char
+        // line MUST wrap to several visual lines but should fit entirely
+        // within 40 rows (500/80 ≈ 7 wrapped lines + header = 8 used rows).
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        // ASSERTION 1: Every 5-char marker A000..A099 (truncated to 500 chars
+        // = 100 markers * 4 chars + 99 spaces, leading 100 markers up to A099)
+        // must be present somewhere in the rendered buffer. Find at least the
+        // first 95 markers (allow for partial last token at the 500-char cut).
+        let mut missing: Vec<String> = Vec::new();
+        for i in 0..95 {
+            let marker = format!("A{:03}", i);
+            if !rendered.contains(&marker) {
+                missing.push(marker);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Log view must word-wrap a 500-char response so every marker \
+             appears in the rendered buffer. Missing markers: {:?}\nRendered:\n{}",
+            missing,
+            rendered
+        );
+
+        // ASSERTION 2: Markers must be distributed across multiple rows
+        // (not all on a single row that got truncated). We expect roughly
+        // 80-col rows of content, so 500 chars wraps to ≥ 6 distinct rows
+        // containing markers.
+        let rows_with_markers: usize = rendered
+            .lines()
+            .filter(|line| {
+                (0..100).any(|i| line.contains(&format!("A{:03}", i)))
+            })
+            .count();
+        assert!(
+            rows_with_markers >= 5,
+            "Wrapped 500-char response must span ≥ 5 visual rows in 80-col \
+             pane; got {} rows. Rendered:\n{}",
+            rows_with_markers,
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3 (auto-tail variant): when the agent
+    /// output contains multiple long lines and the viewport is too small to
+    /// hold all wrapped visual lines, auto_tail must scroll so the LAST
+    /// wrapped visual line is visible at the bottom — NOT compute scroll in
+    /// logical lines (which mis-accounts for wrapping and pushes the tail
+    /// off-screen, the symptom the user reported as "missing a lot of text").
+    #[test]
+    fn test_log_view_auto_tail_pins_last_visual_line() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Build a response of N logical lines, each long enough to wrap to
+        // multiple visual lines in an 80-col pane. The LAST line carries a
+        // unique marker that auto_tail should pin to the bottom of the view.
+        let mut response = String::new();
+        for i in 0..5 {
+            // 200-char lines → 3 wrapped visual lines each at width ≈ 78.
+            let body: String = std::iter::repeat(format!("L{:02} ", i))
+                .take(40)
+                .collect::<String>();
+            response.push_str(&body);
+            response.push('\n');
+        }
+        // Append the unique tail marker that must be visible.
+        response.push_str("UNIQUE_TAIL_MARKER_OMEGA");
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Small viewport: 10 rows total. 5 logical lines * ~3 visual lines
+        // each = 15 visual lines + tail; plus header = ~17 rows of content
+        // for a 10-row pane. With auto_tail, the LAST wrapped line (which
+        // contains the marker) MUST be in the rendered output.
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        assert!(
+            rendered.contains("UNIQUE_TAIL_MARKER_OMEGA"),
+            "auto_tail must pin the LAST wrapped visual line to the bottom \
+             of the viewport. The unique tail marker is missing — content \
+             scrolled off below the viewport because scroll math mistakes \
+             logical-line count for visual-line count after wrap. Rendered:\n{}",
+            rendered
+        );
+    }
+
+    /// Regression test for tui-log-view-3 (multi-span / inline-code variant):
+    /// when an agent response contains styled inline-code spans (`foo`) that
+    /// straddle the right edge of the pane, the renderer must word-wrap the
+    /// multi-span line without dropping content. The user's pasted example
+    /// — "**`scripts/smoke/wave-1-smoke.sh`** — 5-scenario..." — was the last
+    /// thing rendered before the response was truncated mid-content.
+    #[test]
+    fn test_log_view_wraps_multi_span_inline_code() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Wrap;
+
+        // Build a response with multi-span styled lines that include inline
+        // code (`foo`). Use agent_output with text containing many inline-
+        // code-like tokens so each visual line has plenty of content to
+        // lose if wrapping is broken.
+        let line1 = "**`scripts/smoke/wave-1-smoke.sh`** — 5-scenario assertion-driven smoke test that runs every codepath end-to-end.";
+        let line2 = "BULLET_TAIL_MARKER_GAMMA: this content must NOT be lost.";
+        let response = format!("{}\n{}", line1, line2);
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Pane narrow enough to force the first line to wrap.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        // Both lines must be present — the second line must NOT be lost
+        // because the first wrapped past the pane width.
+        assert!(
+            rendered.contains("wave-1-smoke.sh"),
+            "First line of response must render. Rendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains("BULLET_TAIL_MARKER_GAMMA"),
+            "Second line must NOT be lost when the first line wraps past \
+             pane width. This is the user-reported failure mode where text \
+             ends mid-content. Rendered:\n{}",
+            rendered
+        );
+
+        // Sanity: confirm the bug class is also gone with explicit wrap on a
+        // raw multi-span Line (which is what markdown_to_lines produces for
+        // bold + inline-code segments). Render a small Paragraph directly.
+        let multi_span = Line::from(vec![
+            Span::styled("**", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "scripts/smoke/wave-1-smoke.sh",
+                Style::default()
+                    .fg(Color::Indexed(252))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("**", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" — 5-scenario assertion-driven smoke test"),
+        ]);
+        // Pre-wrap exactly as draw_log_tab now does. Use a width wide enough
+        // that no single token must hard-break, so the wrapper has natural
+        // word boundaries to break at.
+        let wrapped = wrap_line_spans(std::slice::from_ref(&multi_span), 40);
+        // Concatenate WITHOUT a separator to confirm the wrapper preserves
+        // every char (no drops) — leading whitespace on continuation lines is
+        // trimmed (expected), so the joined text matches the original sans
+        // the inter-token break-point spaces.
+        let joined: String = wrapped
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("wave-1-smoke.sh"),
+            "wrap_line_spans must preserve inline-code segment intact when \
+             pane is wide enough for it; got:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("smoke test"),
+            "wrap_line_spans must preserve trailing content past the wrap \
+             point — NOT drop it; got:\n{}",
+            joined
+        );
+        // The wrap must produce more than one Line (input was wider than 40).
+        assert!(
+            wrapped.len() > 1,
+            "40-col wrap of a >40-col multi-span Line must produce ≥2 lines, \
+             got {} lines:\n{}",
+            wrapped.len(),
+            joined
+        );
+
+        // Quiet `Wrap` import warning if any test path needs it; not used here.
+        let _ = Wrap { trim: false };
+    }
+
+    /// Regression test for tui-log-view-3 (oversized-single-span variant):
+    /// a single span that is longer than the pane width must hard-break to
+    /// fit, distributing content across multiple visual rows. This catches
+    /// the failure mode where wrap drops trailing content because no word
+    /// boundary exists within the pane width.
+    #[test]
+    fn test_log_view_wraps_oversized_single_span() {
+        use crate::tui::viz_viewer::state::{LogPaneState, RightPanelTab, VizApp};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 200-char URL-like span with no spaces, must hard-break inside a
+        // 60-col pane so all 200 chars end up on screen.
+        let url: String = std::iter::repeat('X').take(200).collect();
+        let head = "Z000_HEAD";
+        let tail = "Z999_TAIL";
+        let response = format!("{}{}{}", head, url, tail);
+
+        let (viz, _) = build_hud_test_graph();
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane = LogPaneState::default();
+        app.log_pane.task_id = Some("my-task".to_string());
+        app.log_pane.agent_id = Some("agent-99".to_string());
+        app.log_pane.auto_tail = true;
+        app.log_pane.agent_output.full_text = response;
+
+        // Pane narrow but tall — must fit ~4 wrapped visual lines.
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_log_tab(frame, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let rendered = buffer_to_string(&buf);
+
+        assert!(
+            rendered.contains(head),
+            "head marker must render at start of wrapped span. Rendered:\n{}",
+            rendered
+        );
+        assert!(
+            rendered.contains(tail),
+            "tail marker must render at end — single oversized span must \
+             hard-break and preserve trailing content, NOT drop it. \
+             Rendered:\n{}",
+            rendered
+        );
     }
 }

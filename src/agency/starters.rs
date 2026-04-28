@@ -47,6 +47,8 @@ pub fn build_component(
         performance: PerformanceRecord::default(),
         lineage: Lineage::default(),
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: std::collections::HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     }
@@ -69,6 +71,8 @@ pub fn build_outcome(
         lineage: Lineage::default(),
         access_control: AccessControl::default(),
         requires_human_oversight: true,
+        domain_tags: vec![],
+        metadata: std::collections::HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     }
@@ -92,6 +96,8 @@ pub fn build_tradeoff(
         performance: PerformanceRecord::default(),
         lineage: Lineage::default(),
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: std::collections::HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     }
@@ -937,6 +943,8 @@ pub(crate) fn crossover_tradeoffs(
         performance: PerformanceRecord::default(),
         lineage: Lineage::crossover(&[&parent_a.id, &parent_b.id], max_gen, run_id),
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: std::collections::HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     }

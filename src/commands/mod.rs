@@ -1,6 +1,7 @@
 pub mod abandon;
 pub mod add;
 pub mod agency_create;
+pub mod agency_import;
 pub mod agency_init;
 pub mod agency_merge;
 pub mod agency_migrate;
@@ -14,18 +15,25 @@ pub mod agent_crud;
 pub mod agents;
 pub mod aging;
 pub mod analyze;
+pub mod approve;
 pub mod archive;
 pub mod artifact;
 pub mod assign;
 pub mod blocked;
 pub mod bottlenecks;
 pub mod chat;
+pub mod chat_cmd;
+pub mod chat_session;
 pub mod check;
 pub mod checkpoint;
 pub mod claim;
 pub mod claude_handler;
+pub mod cleanup;
+pub mod codex_handler;
+pub mod codex_oai_compat;
 pub mod config_cmd;
 pub mod context;
+pub mod coordinator_cmd;
 pub mod coordinate;
 pub mod cost;
 pub mod critical_path;
@@ -34,6 +42,8 @@ pub mod dead_agents;
 pub mod discover;
 pub mod done;
 pub mod edit;
+pub mod endpoints;
+pub mod eval_scaffold;
 pub mod evaluate;
 pub mod evolve;
 pub mod exec;
@@ -48,8 +58,10 @@ pub mod gc;
 pub mod graph;
 pub mod heartbeat;
 pub mod impact;
+pub mod incomplete;
 pub mod init;
 pub mod insert;
+pub mod key;
 pub mod kill;
 pub mod link;
 pub mod list;
@@ -57,18 +69,31 @@ pub mod log;
 pub mod match_cmd;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod matrix;
+pub mod metrics;
+pub mod migrate;
+pub mod model_cmd;
+pub mod models;
 pub mod msg;
 pub mod native_exec;
+pub mod nex;
 pub mod next;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod notify;
+pub mod openrouter;
 pub mod pause;
 pub mod peer;
+pub mod placement;
 pub mod plan;
+pub mod profile_cmd;
 pub mod quickstart;
 pub mod ready;
+pub mod reap;
 pub mod reclaim;
+pub mod recover;
+pub mod reject;
 pub mod replay;
+pub mod reprioritize;
+pub mod requeue;
 pub mod reschedule;
 pub mod rescue;
 pub mod reset;
@@ -78,27 +103,39 @@ pub mod resume;
 pub mod retry;
 pub mod role;
 pub mod runs_cmd;
+pub mod screencast_autopilot;
+pub mod screencast_render;
+pub mod server;
 pub mod service;
 pub mod setup;
 pub mod show;
 pub mod skills;
 pub mod spawn;
 pub mod spawn_task;
+pub mod spend;
+pub mod stats;
 pub mod status;
 pub mod structure;
+pub mod sweep;
 pub mod telegram;
+pub mod tokens;
 pub mod trace;
 pub mod trace_animate;
 pub mod trace_export;
 pub mod trace_import;
 pub mod tradeoff;
 pub mod trajectory;
+pub mod tui_nex;
+pub mod tui_pty;
+pub mod user;
 pub mod velocity;
 pub mod viz;
 pub mod wait;
 pub mod watch;
 pub mod why_blocked;
 pub mod workload;
+pub mod worktree_cmd;
+pub mod worktree_gc;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -165,6 +202,18 @@ pub fn collect_transitive_dependents(
 /// Silently ignores all errors (daemon not running, socket unavailable, etc.)
 pub fn notify_graph_changed(dir: &Path) {
     let _ = service::send_request(dir, &service::IpcRequest::GraphChanged);
+}
+
+/// Best-effort kick to the service daemon: wake up and run one tick *now*,
+/// bypassing the settling delay. Sent by user-initiated state mutations
+/// (`wg publish`, `wg unclaim`, immediate `wg add`) where the user expects
+/// sub-second visible activity.
+///
+/// Silently ignores all errors (daemon offline, socket unavailable). The
+/// periodic poll_interval safety net catches anything that would have been
+/// missed if the kick failed to deliver.
+pub fn notify_kick(dir: &Path) {
+    let _ = service::send_request(dir, &service::IpcRequest::KickDispatcher);
 }
 
 /// Write a marker file so the TUI can auto-focus on a newly created task.
@@ -241,7 +290,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -251,9 +304,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -282,7 +347,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -292,9 +361,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -322,6 +403,10 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
+            None,  // verify
+            None,  // cron
+            false, // allow_phantom
+            false, // allow_cycle
         )
         .unwrap();
 
@@ -353,7 +438,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -363,9 +452,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -401,7 +502,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -411,13 +516,25 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
-        super::done::run(dir, "prov-done", false, false).unwrap();
+        super::done::run(dir, "prov-done", false, false, false, false, false).unwrap();
         let entries = ops_with_type(dir, "done");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].task_id.as_deref(), Some("prov-done"));
@@ -443,7 +560,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -453,9 +574,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -485,7 +618,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -495,13 +632,25 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
-        super::abandon::run(dir, "prov-abandon", Some("no longer needed")).unwrap();
+        super::abandon::run(dir, "prov-abandon", Some("no longer needed"), &[]).unwrap();
         let entries = ops_with_type(dir, "abandon");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].detail["reason"], "no longer needed");
@@ -527,7 +676,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -537,14 +690,26 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
         super::fail::run(dir, "prov-retry", Some("compile error")).unwrap();
-        super::retry::run(dir, "prov-retry").unwrap();
+        super::retry::run(dir, "prov-retry", false, false, None).unwrap();
 
         let entries = ops_with_type(dir, "retry");
         assert_eq!(entries.len(), 1);
@@ -572,7 +737,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -582,9 +751,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -619,7 +800,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -629,9 +814,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -666,7 +863,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -676,14 +877,26 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
-        super::done::run(dir, "prov-archive", false, false).unwrap();
+        super::done::run(dir, "prov-archive", false, false, false, false, false).unwrap();
 
-        super::archive::run(dir, false, None, false, false).unwrap();
+        super::archive::run(dir, false, None, false, true, &[], false).unwrap();
         let entries = ops_with_type(dir, "archive");
         assert_eq!(entries.len(), 1);
         let task_ids = entries[0].detail["task_ids"].as_array().unwrap();
@@ -710,7 +923,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -720,13 +937,25 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
         super::fail::run(dir, "prov-gc", Some("oops")).unwrap();
-        super::abandon::run(dir, "prov-gc", Some("giving up")).unwrap();
+        super::abandon::run(dir, "prov-gc", Some("giving up"), &[]).unwrap();
 
         super::gc::run(dir, false, false, None).unwrap();
         let entries = ops_with_type(dir, "gc");
@@ -757,7 +986,11 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -767,9 +1000,21 @@ mod provenance_coverage_tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
         // edit
@@ -797,6 +1042,10 @@ mod provenance_coverage_tests {
             None,
             None,
             None,
+            None,  // verify
+            None,  // cron
+            false, // allow_phantom
+            false, // allow_cycle
         )
         .unwrap();
         // pause
@@ -812,9 +1061,9 @@ mod provenance_coverage_tests {
         // fail
         super::fail::run(dir, "lifecycle", Some("timeout")).unwrap();
         // retry
-        super::retry::run(dir, "lifecycle").unwrap();
+        super::retry::run(dir, "lifecycle", false, false, None).unwrap();
         // done
-        super::done::run(dir, "lifecycle", false, false).unwrap();
+        super::done::run(dir, "lifecycle", false, false, false, false, false).unwrap();
 
         let all = read_all_operations(dir).unwrap();
         let ops: Vec<&str> = all.iter().map(|e| e.op.as_str()).collect();
@@ -917,5 +1166,21 @@ mod tests {
             graph_path(dir),
             std::path::PathBuf::from("/tmp/test-wg/graph.jsonl")
         );
+    }
+
+    #[test]
+    fn notify_kick_offline_daemon_is_silent_noop() {
+        // No service/state.json present, no socket — kick must not panic
+        // or surface any error to the caller. Used by `wg publish` etc.
+        let dir = tempfile::tempdir().unwrap();
+        notify_kick(dir.path());
+        // (no assertion needed: any panic/error would fail the test)
+    }
+
+    #[test]
+    fn notify_graph_changed_offline_daemon_is_silent_noop() {
+        // Same contract for the existing GraphChanged path.
+        let dir = tempfile::tempdir().unwrap();
+        notify_graph_changed(dir.path());
     }
 }

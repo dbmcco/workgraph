@@ -17,7 +17,7 @@ A task is the atom of work. It has an identity, a lifecycle, and a body of metad
     [`id`], [A slug derived from the title at creation time. The permanent key—used in every edge, every command, every reference. Once set, it never changes.],
     [`title`], [Human-readable name. Can be updated without breaking references.],
     [`description`], [The body: acceptance criteria, context, constraints. What an agent (human or AI) needs to understand the work.],
-    [`status`], [Lifecycle state. One of six values—see below.],
+    [`status`], [Lifecycle state. One of eight values—see below.],
     [`estimate`], [Optional cost and hours. Used by budget fitting and forecasting.],
     [`tags`], [Flat labels for filtering and grouping.],
     [`skills`], [Required capabilities—matched against agent capabilities at dispatch time.],
@@ -26,10 +26,14 @@ A task is the atom of work. It has an identity, a lifecycle, and a body of metad
     [`artifacts`], [Actual outputs recorded after completion.],
     [`exec`], [A shell command for automated execution via the shell executor.],
     [`model`], [Preferred AI model (haiku, sonnet, opus). Overrides coordinator and agent defaults.],
+    [`provider`], [LLM provider for this task (`anthropic`, `openai`, `openrouter`, `local`). Overrides coordinator and agent defaults.],
+    [`exec_mode`], [Execution weight controlling the agent's tool access. One of `full` (default—complete tool access), `light` (read-only tools), `bare` (only `wg` CLI), or `shell` (no LLM—runs the `exec` field directly).],
     [`verify`], [Verification criteria—if set, the task requires review before it can be marked done.],
     [`agent`], [Content-hash ID binding an agency agent identity to this task.],
     [`visibility`], [Controls what information crosses organizational boundaries during trace exports. One of `internal` (default—organization only), `public` (sanitized sharing without agent output or logs), or `peer` (richer detail for trusted peers, including evaluations and patterns).],
     [`context_scope`], [Controls how much context the agent receives in its prompt. One of `clean` (bare executor), `task` (default—workflow commands and graph patterns), `graph` (adds project description and 1-hop neighborhood), or `full` (adds complete graph summary and CLAUDE.md). Each tier is a strict superset of the one below. Overrides role and coordinator defaults when set.],
+    [`delay`], [Duration to wait before the task becomes ready (e.g., `30s`, `5m`, `1h`, `1d`). Set via `--delay` on `wg add`/`wg edit`.],
+    [`not_before`], [Absolute ISO 8601 timestamp before which the task will not be dispatched. Set via `--not-before` on `wg add`/`wg edit`.],
     [`log`], [Append-only progress entries with timestamps and optional actor attribution.],
   ),
   caption: [Task fields. Every field except `id`, `title`, and `status` is optional.],
@@ -39,7 +43,7 @@ Tasks are not just descriptions of work—they are self-contained dispatch packe
 
 == Status and Lifecycle
 
-A task moves through six statuses. Most follow the happy path; some take detours.
+A task moves through eight statuses. Most follow the happy path; some take detours.
 
 #figure(
   raw(block: true, lang: none,
@@ -50,24 +54,44 @@ A task moves through six statuses. Most follow the happy path; some take detours
          └──────┬──────────────────▲─────────────┘
                 │                  │
            claim│             retry│ / cycle re-activation
-                │                  │
+                │                  │        ▲ reject
          ┌──────▼──────────────────┴─────────────┐
          │           InProgress                   │
          │        (agent working)                 │
-         └──────┬─────────┬──────────┬───────────┘
-                │         │          │
-           done │    fail │     abandon│
-                │         │          │
-         ┌──────▼───┐ ┌──▼──────┐ ┌─▼──────────┐
-         │   Done   │ │ Failed  │ │ Abandoned   │
-         │ terminal │ │terminal │ │  terminal   │
-         └──────────┘ └─────────┘ └─────────────┘
+         └──┬──────┬─────────┬──────────┬────────┘
+            │      │         │          │
+            │ done │    fail │     abandon│
+            │      │         │          │
+            │      │  ┌──────▼──────┐ ┌─▼──────────┐
+            │      │  │   Failed    │ │ Abandoned   │
+            │      │  │  terminal   │ │  terminal   │
+            │      │  └─────────────┘ └─────────────┘
+            │      │
+       wait │      │  (no --verify)          (has --verify)
+            │      ├──────────────────┐─────────────────┐
+            │      │                  │                  │
+            │ ┌────▼─────┐    ┌──────▼─────────────┐    │
+            │ │   Done   │    │ PendingValidation   │    │
+            │ │ terminal │    │ (awaiting review)   │    │
+            │ └──────────┘    └───────┬─────────────┘    │
+            │                   approve│                  │
+            │                  ┌───────▼────┐             │
+            │                  │    Done    │             │
+            │                  │  terminal  │             │
+            │                  └────────────┘             │
+            │                                             │
+         ┌──▼──────────────────────────────────────┐
+         │  Waiting (parked by wg wait — resumed   │
+         │  when condition is met or wg resume)    │
+         └──────────────────────▲──────────────────┘
+                                │ resume
+                            (→ InProgress)
 
          ┌──────────────────────────────────────┐
          │  Blocked (explicit, rarely used)      │
          └──────────────────────────────────────┘
 "),
-  caption: [Task state machine. The three terminal statuses share a critical property: they all unblock dependents.],
+  caption: [Task state machine. The eight statuses include three terminals (Done, Failed, Abandoned) that unblock dependents, plus PendingValidation and Waiting as non-terminal intermediate states.],
 ) <state-machine>
 
 *Open* is the starting state. A task is open when it has been created and is potentially available for work—though it may not yet be _ready_ (a distinction explored below).
@@ -76,7 +100,11 @@ A task moves through six statuses. Most follow the happy path; some take detours
 
 *Done*, *Failed*, and *Abandoned* are the three _terminal_ statuses. A terminal task will not progress further without explicit intervention—retry, manual re-open, or cycle re-activation. The crucial design choice: all three terminal statuses unblock dependents. A failed upstream does not freeze the graph. The downstream task gets dispatched and can decide for itself what to do about a failed dependency—inspect the failure reason, skip the work, or adapt.
 
-*Blocked* exists as an explicit status but is rarely used. In practice, a task is _waiting_ when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
+*PendingValidation* is entered when an agent calls `wg done` on a task that has `verify` criteria. The task is not yet terminal—it awaits external review. `wg approve` transitions it to Done; `wg reject` transitions it back to Open for re-dispatch (with the assignment cleared). After `max_rejections` (default: 3), rejection transitions the task to Failed instead.
+
+*Waiting* means an agent has voluntarily parked the task via `wg wait`. The task is not terminal and will not be re-dispatched. It resumes (returning to InProgress) when its wait condition is met—a timer elapses, a dependent task reaches a target status, a message arrives, or a file changes—or when a human runs `wg resume`.
+
+*Blocked* exists as an explicit status but is rarely used. In practice, a task is _blocked_ when its `after` list contains non-terminal entries—this is a derived condition, not a declared status. The explicit `Blocked` status is a manual override for cases where a human wants to freeze a task for reasons outside the graph.
 
 == Terminal Statuses Unblock: A Design Choice
 
@@ -150,6 +178,8 @@ Each cycle has a _header_: the entry point, identified as the task with predeces
     [`max_iterations`], [Hard cap on how many times the cycle can iterate. Mandatory—no unbounded cycles.],
     [`guard`], [A condition that must be true for the cycle to iterate. Optional—if absent, the cycle iterates unconditionally (up to `max_iterations`).],
     [`delay`], [Optional duration (e.g., `"30s"`, `"5m"`, `"1h"`) to wait before the next iteration. Sets the header's `ready_after` timestamp.],
+    [`no_converge`], [When set, agents cannot signal early convergence via `--converged`. All iterations (up to `max_iterations`) are forced to run. Set via `--no-converge` on `wg add`/`wg edit`.],
+    [`restart_on_failure`], [Whether to automatically restart the cycle when a member fails (default: true). Disabled via `--no-restart-on-failure`. The `max_failure_restarts` field caps the number of failure-triggered restarts (default: 3).],
   ),
   caption: [CycleConfig fields on the cycle header task. Every configured cycle requires a `max_iterations` cap.],
 ) <cycle-config-fields>
@@ -260,6 +290,16 @@ Sometimes you need to stop a cycle—or any task—without destroying its state.
 `wg resume <task>` clears the flag. The task re-enters the readiness calculation. If it meets all four readiness conditions, it becomes available for dispatch on the next coordinator tick.
 
 Pausing is orthogonal to status. You can pause an open task to hold it. You can pause a task mid-cycle to halt iteration without losing state. When you resume, the cycle picks up where it left off.
+
+== Placement Hints
+
+When a new task is added, the coordinator can automatically position it in the dependency graph through _placement_—an optional feature controlled by `wg config --auto-place`. Placement hints on `wg add` guide this positioning:
+
+- `--no-place` skips automatic placement entirely, leaving the task with only the dependencies explicitly specified via `--after`.
+- `--place-near <IDS>` suggests placing the task near the specified tasks in the graph—useful for grouping related work.
+- `--place-before <IDS>` suggests inserting the task before the specified tasks, adding dependency edges so those tasks come after the new one.
+
+Placement is a convenience, not a constraint. All dependency edges it creates are ordinary `after` edges, visible in the graph and editable with `wg edit`. If placement produces an undesirable result, adjust the edges manually.
 
 == Emergent Patterns
 

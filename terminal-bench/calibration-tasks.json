@@ -1,0 +1,54 @@
+{
+  "description": "Condition A/B calibration task set — 8 diverse tasks spanning easy/medium/hard",
+  "model": "qwen/qwen3-32b",
+  "tasks": [
+    {
+      "id": "cal-01-file-ops",
+      "category": "file-ops",
+      "difficulty": "easy",
+      "file": "tasks/condition-a-calibration/01-file-ops-easy.txt"
+    },
+    {
+      "id": "cal-02-text-processing",
+      "category": "text-processing",
+      "difficulty": "easy",
+      "file": "tasks/condition-a-calibration/02-text-processing-easy.txt"
+    },
+    {
+      "id": "cal-03-debugging",
+      "category": "debugging",
+      "difficulty": "medium",
+      "file": "tasks/condition-a-calibration/03-debugging-medium.txt"
+    },
+    {
+      "id": "cal-04-shell-scripting",
+      "category": "shell-scripting",
+      "difficulty": "medium",
+      "file": "tasks/condition-a-calibration/04-shell-scripting-medium.txt"
+    },
+    {
+      "id": "cal-05-data-processing",
+      "category": "data-processing",
+      "difficulty": "medium",
+      "file": "tasks/condition-a-calibration/05-data-processing-medium.txt"
+    },
+    {
+      "id": "cal-06-algorithm",
+      "category": "algorithm",
+      "difficulty": "hard",
+      "file": "tasks/condition-a-calibration/06-algorithm-hard.txt"
+    },
+    {
+      "id": "cal-07-ml",
+      "category": "ml",
+      "difficulty": "hard",
+      "file": "tasks/condition-a-calibration/07-ml-hard.txt"
+    },
+    {
+      "id": "cal-08-sysadmin",
+      "category": "sysadmin",
+      "difficulty": "hard",
+      "file": "tasks/condition-a-calibration/08-sysadmin-hard.txt"
+    }
+  ]
+}

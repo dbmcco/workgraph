@@ -1,6 +1,18 @@
 #![warn(clippy::redundant_closure)]
+// Pre-existing clippy lints surfaced by rust 1.95 that weren't in
+// 1.93. Allowed crate-wide while we decide whether to refactor each
+// site individually. Not caused by the sessions-as-identity rollout
+// work; CI was red before Phase 1 started.
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::path::{Path, PathBuf};
 use workgraph::config::Config;
@@ -10,6 +22,225 @@ mod commands;
 mod tui;
 
 use cli::*;
+
+/// Resolve the workgraph directory for this invocation.
+///
+/// Precedence (highest first):
+///
+/// 1. **Explicit `--dir <path>` CLI flag.** Always wins. Pass-through.
+/// 2. **`WG_DIR` environment variable.** Second-highest — lets users
+///    script `wg` commands against a specific graph without a flag.
+/// 3. **Project discovery.** Walk up from `cwd` looking for a
+///    `.workgraph` directory. If found, use it. This matches how
+///    `git` finds `.git`, `cargo` finds `Cargo.toml`, etc.
+/// 4. **Global fallback `~/.workgraph`.** If the user has a global
+///    workgraph directory in their home, use it. This makes `wg nex`
+///    usable from any directory without littering `.workgraph` dirs
+///    across the filesystem. Primarily for REPL-style interactive
+///    commands; project-scoped commands (`wg add`, `wg done`, etc.)
+///    will still fail-on-missing when they try to load the graph.
+/// 5. **Default `./.workgraph` in current directory.** Backward-
+///    compatible final fallback. Same as the old pre-resolver
+///    behavior — will error cleanly downstream if the directory
+///    doesn't exist and a graph-reading command is run.
+///
+/// The resolver does NOT create any directories — it only locates
+/// one. Auto-creation is the responsibility of individual commands
+/// (`wg init`, `wg nex` when the global fallback is used, etc.).
+/// Dir-name candidates we accept, in priority order.
+/// `.wg` is the modern name (written by `wg init`); `.workgraph` is the
+/// legacy name that pre-existing projects still use.
+const WORKGRAPH_DIR_NAMES: &[&str] = &[".wg", ".workgraph"];
+
+fn resolve_workgraph_dir(
+    cli_dir: Option<PathBuf>,
+    env_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> PathBuf {
+    // 1. Explicit CLI flag
+    if let Some(p) = cli_dir {
+        return p;
+    }
+
+    // 2. WG_DIR env var
+    if let Some(p) = env_dir.filter(|p| !p.as_os_str().is_empty()) {
+        return p;
+    }
+
+    // 3. Walk up from cwd looking for an existing workgraph dir.
+    //    Prefer `.wg`, fall back to legacy `.workgraph`.
+    if let Some(start) = cwd.as_ref() {
+        let mut cur: &Path = start;
+        loop {
+            for name in WORKGRAPH_DIR_NAMES {
+                let candidate = cur.join(name);
+                if candidate.is_dir() {
+                    return candidate;
+                }
+            }
+            match cur.parent() {
+                Some(parent) => cur = parent,
+                None => break,
+            }
+        }
+    }
+
+    // 4. Global fallback: ~/.wg, then legacy ~/.workgraph
+    if let Some(home) = home_dir.as_ref() {
+        for name in WORKGRAPH_DIR_NAMES {
+            let global = home.join(name);
+            if global.is_dir() {
+                return global;
+            }
+        }
+    }
+
+    // 5. Default: ./.wg in current directory (new projects get the short name)
+    cwd.map(|c| c.join(".wg"))
+        .unwrap_or_else(|| PathBuf::from(".wg"))
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::resolve_workgraph_dir;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[test]
+    fn explicit_cli_flag_wins_over_everything() {
+        let tmp = TempDir::new().unwrap();
+        let explicit = tmp.path().join("explicit/.workgraph");
+        let result = resolve_workgraph_dir(
+            Some(explicit.clone()),
+            Some(PathBuf::from("/should/not/be/used")),
+            Some(tmp.path().to_path_buf()),
+            Some(PathBuf::from("/fake/home")),
+        );
+        assert_eq!(result, explicit);
+    }
+
+    #[test]
+    fn wg_dir_env_var_wins_over_discovery_and_global() {
+        let tmp = TempDir::new().unwrap();
+        let env = tmp.path().join("from-env/.workgraph");
+        let result = resolve_workgraph_dir(
+            None,
+            Some(env.clone()),
+            Some(tmp.path().to_path_buf()),
+            Some(PathBuf::from("/fake/home")),
+        );
+        assert_eq!(result, env);
+    }
+
+    #[test]
+    fn empty_wg_dir_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let result = resolve_workgraph_dir(
+            None,
+            Some(PathBuf::from("")),
+            Some(tmp.path().to_path_buf()),
+            Some(PathBuf::from("/fake/home")),
+        );
+        // Should fall through to the default (new-project default is `.wg`)
+        assert_eq!(result, tmp.path().join(".wg"));
+    }
+
+    #[test]
+    fn project_discovery_finds_wg_in_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let wg = project.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let result =
+            resolve_workgraph_dir(None, None, Some(project), Some(tmp.path().to_path_buf()));
+        assert_eq!(result, wg);
+    }
+
+    #[test]
+    fn project_discovery_finds_legacy_workgraph_in_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let wg = project.join(".workgraph");
+        std::fs::create_dir_all(&wg).unwrap();
+        let result =
+            resolve_workgraph_dir(None, None, Some(project), Some(tmp.path().to_path_buf()));
+        assert_eq!(result, wg);
+    }
+
+    #[test]
+    fn wg_wins_over_legacy_workgraph_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let wg = project.join(".wg");
+        let legacy = project.join(".workgraph");
+        std::fs::create_dir_all(&wg).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        let result =
+            resolve_workgraph_dir(None, None, Some(project), Some(tmp.path().to_path_buf()));
+        assert_eq!(result, wg, ".wg must win over .workgraph");
+    }
+
+    #[test]
+    fn project_discovery_walks_up_from_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let deep = project.join("src/deep/nested");
+        let wg = project.join(".wg");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(&wg).unwrap();
+        let result = resolve_workgraph_dir(None, None, Some(deep), Some(tmp.path().to_path_buf()));
+        assert_eq!(result, wg);
+    }
+
+    #[test]
+    fn global_fallback_used_when_no_project_and_home_has_wg() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let global = home.join(".wg");
+        std::fs::create_dir_all(&global).unwrap();
+        let outside = tmp.path().join("somewhere/else");
+        std::fs::create_dir_all(&outside).unwrap();
+        let result = resolve_workgraph_dir(None, None, Some(outside), Some(home));
+        assert_eq!(result, global);
+    }
+
+    #[test]
+    fn global_fallback_accepts_legacy_workgraph() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let global = home.join(".workgraph");
+        std::fs::create_dir_all(&global).unwrap();
+        let outside = tmp.path().join("somewhere/else");
+        std::fs::create_dir_all(&outside).unwrap();
+        let result = resolve_workgraph_dir(None, None, Some(outside), Some(home));
+        assert_eq!(result, global);
+    }
+
+    #[test]
+    fn project_beats_global_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let global = home.join(".wg");
+        std::fs::create_dir_all(&global).unwrap();
+        let project = tmp.path().join("project");
+        let project_wg = project.join(".wg");
+        std::fs::create_dir_all(&project_wg).unwrap();
+        let result = resolve_workgraph_dir(None, None, Some(project), Some(home));
+        assert_eq!(result, project_wg);
+    }
+
+    #[test]
+    fn default_fallback_when_nothing_exists() {
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let home = tmp.path().join("home"); // no workgraph inside
+        let result = resolve_workgraph_dir(None, None, Some(outside.clone()), Some(home));
+        // New default is `.wg`
+        assert_eq!(result, outside.join(".wg"));
+    }
+}
 
 /// Print custom help output with usage-based ordering
 fn print_help(dir: &Path, show_all: bool, alphabetical: bool) {
@@ -264,13 +495,104 @@ fn maybe_print_subcommand_help() -> bool {
     false
 }
 
+/// Rewrite `wg config reset ...` to `wg config --reset ...` so the
+/// positional `reset` token works alongside the existing flag-driven
+/// `Config` command shape (which is too large to convert to a nested
+/// Subcommand without a major refactor). Idempotent: leaves all other
+/// argv shapes untouched.
+fn rewrite_config_reset_argv(args: Vec<String>) -> Vec<String> {
+    // Find the first non-`--dir`/`--json` etc. positional that is "config".
+    // For simplicity we scan for the literal pair ["config", "reset"] in
+    // order, since "config" is never used as a value for any flag.
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    let mut rewrote = false;
+    while i < args.len() {
+        if !rewrote
+            && i + 1 < args.len()
+            && args[i] == "config"
+            && args[i + 1] == "reset"
+        {
+            out.push("config".to_string());
+            out.push("--reset".to_string());
+            rewrote = true;
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
 fn main() -> Result<()> {
     // Handle subcommand-level help before clap parses (since we disable_help_flag globally)
     maybe_print_subcommand_help();
 
-    let cli = Cli::parse();
+    // Initialize logging.
+    //
+    // Default filter: "info" for normal commands, "warn" for nex/tui-nex
+    // so the interactive REPL stays quiet. Users can still override by
+    // setting RUST_LOG explicitly. We check argv directly here instead
+    // of parsing clap first, because clap's own error output depends
+    // on the logger already being initialized.
+    let is_repl_invocation = std::env::args()
+        .skip(1)
+        .any(|a| a == "nex" || a == "tui-nex");
+    let default_filter = if is_repl_invocation {
+        // warn for our code, but suppress html5ever's noisy "node with
+        // weird namespace" warnings that fire on every malformed HTML
+        // page the web_fetch readability extractor touches.
+        "warn,html5ever=error,selectors=error"
+    } else {
+        "info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .format_timestamp(None)
+        .init();
 
-    let workgraph_dir = cli.dir.unwrap_or_else(|| PathBuf::from(".workgraph"));
+    let cli = {
+        let argv: Vec<String> = std::env::args().collect();
+        let rewritten = rewrite_config_reset_argv(argv);
+        Cli::parse_from(rewritten)
+    };
+
+    let workgraph_dir = resolve_workgraph_dir(
+        cli.dir.clone(),
+        std::env::var_os("WG_DIR").map(PathBuf::from),
+        std::env::current_dir().ok(),
+        dirs::home_dir(),
+    );
+
+    // Auto-create the global fallback `~/.workgraph` for REPL-style
+    // commands that should Just Work from any directory. Project-
+    // scoped commands (wg add, wg list, etc.) still require an
+    // existing workgraph dir and will error cleanly downstream if
+    // one isn't found. This mirrors how `gh auth` can create
+    // `~/.config/gh` on first use without requiring `gh init`.
+    let is_repl_style = matches!(
+        cli.command,
+        Some(Commands::Nex { .. }) | Some(Commands::TuiNex { .. }) | Some(Commands::TuiPty { .. })
+    );
+    if is_repl_style
+        && !workgraph_dir.exists()
+        && let Some(home) = dirs::home_dir()
+        && workgraph_dir == home.join(".workgraph")
+    {
+        if let Err(e) = std::fs::create_dir_all(&workgraph_dir) {
+            eprintln!(
+                "warning: failed to create global workgraph dir {}: {}",
+                workgraph_dir.display(),
+                e
+            );
+        } else {
+            eprintln!(
+                "\x1b[2m[wg] created global workgraph directory: {}\x1b[0m",
+                workgraph_dir.display()
+            );
+        }
+    }
+
     let workgraph_dir = workgraph_dir.canonicalize().unwrap_or(workgraph_dir);
 
     // Handle help flags (top-level custom help with usage-based ordering)
@@ -298,23 +620,121 @@ fn main() -> Result<()> {
     }
 
     match command {
+        Commands::Executors { all } => {
+            let entries = if all {
+                workgraph::executor_discovery::discover()
+            } else {
+                workgraph::executor_discovery::available()
+            };
+            for e in &entries {
+                let status = if e.available {
+                    "\x1b[32m✓\x1b[0m"
+                } else {
+                    "\x1b[31m✗\x1b[0m"
+                };
+                let path = e
+                    .binary_path
+                    .as_ref()
+                    .map(|p| format!(" [{}]", p.display()))
+                    .unwrap_or_default();
+                println!("{} {:<12} {}{}", status, e.name, e.description, path);
+            }
+            Ok(())
+        }
+        Commands::Which {} => {
+            // Print resolved dir + which resolver step won, so users
+            // can debug "which graph am I talking to?" without having
+            // to read src/main.rs.
+            let cwd = std::env::current_dir().ok();
+            let home = dirs::home_dir();
+            let env_dir = std::env::var_os("WG_DIR").map(PathBuf::from);
+            let reason = if cli.dir.is_some() {
+                "--dir flag".to_string()
+            } else if let Some(ref p) = env_dir
+                && !p.as_os_str().is_empty()
+            {
+                format!("WG_DIR env var ({})", p.display())
+            } else if let Some(ref start) = cwd {
+                let mut cur: &Path = start;
+                let mut found_walk_up: Option<PathBuf> = None;
+                'outer: loop {
+                    for name in WORKGRAPH_DIR_NAMES {
+                        let candidate = cur.join(name);
+                        if candidate.is_dir() {
+                            found_walk_up = Some(candidate);
+                            break 'outer;
+                        }
+                    }
+                    match cur.parent() {
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                if let Some(p) = found_walk_up {
+                    format!("walked up from cwd and found {}", p.display())
+                } else if let Some((h, p)) = home.as_ref().and_then(|h| {
+                    WORKGRAPH_DIR_NAMES
+                        .iter()
+                        .map(|n| h.join(n))
+                        .find(|p| p.is_dir())
+                        .map(|p| (h, p))
+                }) {
+                    format!("global fallback {} (home={})", p.display(), h.display())
+                } else {
+                    "default ./.wg (does not exist yet — run `wg init` to create)".to_string()
+                }
+            } else {
+                "default ./.wg (no cwd)".to_string()
+            };
+            println!("{}", workgraph_dir.display());
+            println!("  reason: {}", reason);
+            if !workgraph_dir.exists() {
+                println!("  note: this directory does not exist yet");
+            }
+            Ok(())
+        }
         Commands::Init {
             no_agency,
+            global,
+            executor,
             model,
             endpoint,
-        } => commands::init::run(
-            &workgraph_dir,
-            no_agency,
-            model.as_deref(),
-            endpoint.as_deref(),
-        ),
-        Commands::SpawnTask {
-            task_id,
-            role,
+            route,
             dry_run,
-        } => commands::spawn_task::run(&workgraph_dir, &task_id, role.as_deref(), dry_run),
-        Commands::ClaudeHandler { chat, model } => {
-            commands::claude_handler::run(&workgraph_dir, &chat, model.as_deref())
+        } => {
+            // Init is special: it declares a NEW project at a specific
+            // place. Unlike every other command (which walks up from
+            // cwd to find an ancestor graph), `wg init` should always
+            // target `cwd/.wg` — or `~/.wg` when --global, or the
+            // explicit `--dir` if given. Walking up would make `wg init`
+            // inside `~/anything/` refuse because `~/.wg` already exists,
+            // even though the user wants a fresh graph here.
+            let target_dir = if global {
+                match dirs::home_dir() {
+                    Some(home) => home.join(".wg"),
+                    None => {
+                        anyhow::bail!(
+                            "--global requires a resolvable home directory but HOME is not set"
+                        );
+                    }
+                }
+            } else if let Some(ref explicit) = cli.dir {
+                explicit.clone()
+            } else {
+                // cwd/.wg — do NOT walk up.
+                std::env::current_dir()
+                    .context("cannot resolve current directory for wg init")?
+                    .join(".wg")
+            };
+            commands::init::run_with_route(
+                &target_dir,
+                no_agency,
+                executor.as_deref(),
+                model.as_deref(),
+                endpoint.as_deref(),
+                route.as_deref(),
+                dry_run,
+            )
         }
         Commands::Reset {
             seed,
@@ -324,20 +744,17 @@ fn main() -> Result<()> {
             dry_run,
             yes,
         } => {
-            let direction: commands::reset::Direction =
+            let dir_parsed: commands::reset::Direction =
                 direction.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let mut all_seeds = vec![seed];
             all_seeds.extend(seeds);
-            commands::reset::run(
-                &workgraph_dir,
-                &all_seeds,
-                commands::reset::ResetOptions {
-                    direction,
-                    also_strip_meta,
-                    dry_run,
-                    yes,
-                },
-            )?;
+            let opts = commands::reset::ResetOptions {
+                direction: dir_parsed,
+                also_strip_meta,
+                dry_run,
+                yes,
+            };
+            commands::reset::run(&workgraph_dir, &all_seeds, opts)?;
             Ok(())
         }
         Commands::Rescue {
@@ -374,21 +791,22 @@ fn main() -> Result<()> {
             splice,
             replace_edges,
         } => {
-            let position: commands::insert::Position =
+            let pos: commands::insert::Position =
                 position.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let opts = commands::insert::InsertOptions {
+                splice,
+                replace_edges,
+            };
             let new_id = commands::insert::run(
                 &workgraph_dir,
-                position,
+                pos,
                 &target,
                 &title,
                 description.as_deref(),
                 id.as_deref(),
-                commands::insert::InsertOptions {
-                    splice,
-                    replace_edges,
-                },
+                opts,
             )?;
-            println!("Inserted task '{}' ({:?} {}).", new_id, position, target);
+            println!("Inserted task '{}' ({:?} {}).", new_id, pos, target);
             Ok(())
         }
         Commands::Add {
@@ -408,31 +826,53 @@ fn main() -> Result<()> {
             model,
             provider,
             verify,
+            verify_timeout,
+            validation,
+            validator_agent,
+            validator_model,
             max_iterations,
             cycle_guard,
             cycle_delay,
             no_converge,
             no_restart_on_failure,
             max_failure_restarts,
+            exec,
+            timeout,
             visibility,
             context_scope,
             exec_mode,
             paused,
-            immediate,
+            no_place,
+            place_near,
+            place_before,
             delay,
             not_before,
+            allow_phantom,
+            independent,
+            propagation,
+            retry_strategy,
+            no_tier_escalation,
+            priority,
+            cron,
+            subtask,
         } => {
-            // Determine effective paused state:
-            // - --paused always pauses
-            // - --immediate always skips draft mode
-            // - Default: paused (draft) in interactive mode, immediate in agent context
+            // Determine effective paused/unplaced state:
+            // - --paused always pauses (user-managed draft, skips placement)
+            // - --no-place: unplaced=true, paused=false (immediate dispatch)
+            // - System tasks (dot-prefix): never draft, never placed
+            // - Agent context (WG_TASK_ID set): default to --no-place behavior
+            // - Default (interactive): paused=true (draft-by-default, needs placement)
+            let is_system_task = title.starts_with('.');
+            let is_agent_context =
+                std::env::var("WG_TASK_ID").is_ok() || std::env::var("WG_AGENT_ID").is_ok();
+            let effective_no_place = no_place || is_system_task || is_agent_context;
             let effective_paused = if paused {
                 true
-            } else if immediate {
+            } else if effective_no_place {
                 false
             } else {
-                // Draft by default for interactive use; agents get immediate mode
-                std::env::var("WG_AGENT_ID").is_err()
+                // Draft by default for interactive use
+                true
             };
             if let Some(ref peer_ref) = repo {
                 commands::add::run_remote(
@@ -448,6 +888,8 @@ fn main() -> Result<()> {
                     model.as_deref(),
                     provider.as_deref(),
                     verify.as_deref(),
+                    verify_timeout.as_deref(),
+                    cron.as_deref(),
                 )
             } else {
                 commands::add::run(
@@ -467,6 +909,10 @@ fn main() -> Result<()> {
                     model.as_deref(),
                     provider.as_deref(),
                     verify.as_deref(),
+                    verify_timeout.as_deref(),
+                    validation.as_deref(),
+                    validator_agent.as_deref(),
+                    validator_model.as_deref(),
                     max_iterations,
                     cycle_guard.as_deref(),
                     cycle_delay.as_deref(),
@@ -475,10 +921,22 @@ fn main() -> Result<()> {
                     max_failure_restarts,
                     &visibility,
                     context_scope.as_deref(),
+                    exec.as_deref(),
+                    timeout.as_deref(),
                     exec_mode.as_deref(),
                     effective_paused,
+                    effective_no_place,
+                    &place_near,
+                    &place_before,
                     delay.as_deref(),
                     not_before.as_deref(),
+                    allow_phantom,
+                    independent,
+                    no_tier_escalation,
+                    parse_iteration_config(propagation.as_deref(), retry_strategy.as_deref()),
+                    priority.as_deref(),
+                    cron.as_deref(),
+                    subtask,
                 )
             }
         }
@@ -505,6 +963,10 @@ fn main() -> Result<()> {
             exec_mode,
             delay,
             not_before,
+            verify,
+            cron,
+            allow_phantom,
+            allow_cycle,
         } => commands::edit::run(
             &workgraph_dir,
             &id,
@@ -529,12 +991,30 @@ fn main() -> Result<()> {
             exec_mode.as_deref(),
             delay.as_deref(),
             not_before.as_deref(),
+            verify.as_deref(),
+            cron.as_deref(),
+            allow_phantom,
+            allow_cycle,
         ),
+        Commands::Reprioritize { id, priority } => {
+            commands::reprioritize::run(&workgraph_dir, &id, &priority)
+        }
         Commands::Done {
             id,
             converged,
             skip_verify,
-        } => commands::done::run(&workgraph_dir, &id, converged, skip_verify),
+            ignore_unmerged_worktree,
+            full_smoke,
+            skip_smoke,
+        } => commands::done::run(
+            &workgraph_dir,
+            &id,
+            converged,
+            skip_verify,
+            ignore_unmerged_worktree,
+            full_smoke,
+            skip_smoke,
+        ),
         Commands::Fail {
             id,
             reason,
@@ -546,10 +1026,49 @@ fn main() -> Result<()> {
                 commands::fail::run(&workgraph_dir, &id, reason.as_deref())
             }
         }
-        Commands::Abandon { id, reason } => {
-            commands::abandon::run(&workgraph_dir, &id, reason.as_deref())
+        Commands::Incomplete { id, reason } => {
+            commands::incomplete::run(&workgraph_dir, &id, reason.as_deref())
         }
-        Commands::Retry { id } => commands::retry::run(&workgraph_dir, &id),
+        Commands::Abandon {
+            id,
+            reason,
+            superseded_by,
+        } => commands::abandon::run(&workgraph_dir, &id, reason.as_deref(), &superseded_by),
+        Commands::Retry {
+            id,
+            preserve_session,
+            fresh,
+            reason,
+        } => commands::retry::run(
+            &workgraph_dir,
+            &id,
+            preserve_session,
+            fresh,
+            reason.as_deref(),
+        ),
+        Commands::Recover {
+            yes,
+            filter,
+            set_model,
+            set_endpoint,
+            keep_agency,
+            max_attempts,
+            reason,
+        } => commands::recover::run(
+            &workgraph_dir,
+            commands::recover::RecoverOptions {
+                yes,
+                filter,
+                set_model,
+                set_endpoint,
+                keep_agency,
+                max_attempts,
+                reason,
+            },
+        ),
+        Commands::Requeue { id, reason } => commands::requeue::run(&workgraph_dir, &id, &reason),
+        Commands::Approve { id } => commands::approve::run(&workgraph_dir, &id),
+        Commands::Reject { id, reason } => commands::reject::run(&workgraph_dir, &id, &reason),
         Commands::Claim { id, actor } => {
             commands::claim::claim(&workgraph_dir, &id, actor.as_deref())
         }
@@ -579,12 +1098,27 @@ fn main() -> Result<()> {
         Commands::Blocked { id } => commands::blocked::run(&workgraph_dir, &id, cli.json),
         Commands::WhyBlocked { id } => commands::why_blocked::run(&workgraph_dir, &id, cli.json),
         Commands::Check => commands::check::run(&workgraph_dir, cli.json),
+        Commands::Cleanup { subcmd } => {
+            let args = commands::cleanup::CleanupArgs { subcmd };
+            commands::cleanup::run(args)
+        }
         Commands::Cycles => commands::cycles::run(&workgraph_dir, cli.json),
         Commands::List {
             status,
             paused,
             tags,
-        } => commands::list::run(&workgraph_dir, status.as_deref(), paused, &tags, cli.json),
+            cron,
+            all,
+        } => commands::list::run(
+            &workgraph_dir,
+            status.as_deref(),
+            paused,
+            &tags,
+            None,
+            cron,
+            cli.json,
+            all,
+        ),
         Commands::Viz {
             focus,
             all,
@@ -601,6 +1135,7 @@ fn main() -> Result<()> {
             layout,
             tags,
             edge_color,
+            columns,
         } => {
             let layout_mode: commands::viz::LayoutMode = layout.parse().unwrap_or_default();
             let _explicit_static_format = dot || mermaid || graph || output.is_some();
@@ -610,6 +1145,10 @@ fn main() -> Result<()> {
             let resolved_edge_color = edge_color
                 .unwrap_or_else(|| Config::load_or_default(&workgraph_dir).viz.edge_color);
 
+            // Resolve max columns: --columns flag > terminal width > None
+            let max_columns =
+                columns.or_else(|| crossterm::terminal::size().ok().map(|(cols, _)| cols));
+
             if use_tui {
                 let options = commands::viz::VizOptions {
                     all,
@@ -618,14 +1157,25 @@ fn main() -> Result<()> {
                     format: commands::viz::OutputFormat::Ascii,
                     output: None,
                     show_internal,
+                    show_internal_running_only: false,
                     focus,
                     tui_mode: true,
                     layout: layout_mode,
                     tags: tags.clone(),
                     edge_color: resolved_edge_color,
+                    max_columns: None, // TUI handles its own sizing
                 };
                 let mouse_override = if no_mouse { Some(false) } else { None };
-                tui::viz_viewer::run(workgraph_dir, options, mouse_override)
+                tui::viz_viewer::run(
+                    workgraph_dir,
+                    options,
+                    mouse_override,
+                    false,
+                    None,
+                    false,
+                    None,
+                    false,
+                )
             } else {
                 let fmt = if dot {
                     commands::viz::OutputFormat::Dot
@@ -643,11 +1193,13 @@ fn main() -> Result<()> {
                     format: fmt,
                     output,
                     show_internal,
+                    show_internal_running_only: false,
                     focus,
                     tui_mode: false,
                     layout: layout_mode,
                     tags,
                     edge_color: resolved_edge_color,
+                    max_columns,
                 };
                 commands::viz::run(&workgraph_dir, &options)
             }
@@ -674,6 +1226,17 @@ fn main() -> Result<()> {
         Commands::Aging => commands::aging::run(&workgraph_dir, cli.json),
         Commands::Forecast => commands::forecast::run(&workgraph_dir, cli.json),
         Commands::Workload => commands::workload::run(&workgraph_dir, cli.json),
+        Commands::Worktree(sub) => match sub {
+            cli::WorktreeCommand::List => commands::worktree_cmd::list(&workgraph_dir),
+            cli::WorktreeCommand::Archive { agent_id, remove } => {
+                commands::worktree_cmd::archive(&workgraph_dir, &agent_id, remove)
+            }
+            cli::WorktreeCommand::Gc {
+                execute,
+                older,
+                dead_only,
+            } => commands::worktree_cmd::gc(&workgraph_dir, execute, older.as_deref(), dead_only),
+        },
         Commands::Resources => commands::resources::run(&workgraph_dir, cli.json),
         Commands::CriticalPath => commands::critical_path::run(&workgraph_dir, cli.json),
         Commands::Analyze => commands::analyze::run(&workgraph_dir, cli.json),
@@ -681,6 +1244,9 @@ fn main() -> Result<()> {
             dry_run,
             older,
             list,
+            yes,
+            undo,
+            ids,
             command,
         } => match command {
             Some(cli::ArchiveCommands::Search { query, limit }) => {
@@ -690,14 +1256,46 @@ fn main() -> Result<()> {
                 commands::archive::restore(&workgraph_dir, &task_id, reopen)
             }
             None => {
-                commands::archive::run(&workgraph_dir, dry_run, older.as_deref(), list, cli.json)
+                if undo {
+                    commands::archive::undo(&workgraph_dir)
+                } else {
+                    commands::archive::run(
+                        &workgraph_dir,
+                        dry_run,
+                        older.as_deref(),
+                        list,
+                        yes,
+                        &ids,
+                        cli.json,
+                    )
+                }
+            }
+        },
+        Commands::Coordinator(sub) => match sub {
+            cli::CoordinatorCommands::List { archived, all } => {
+                commands::coordinator_cmd::run_list(&workgraph_dir, archived, all, cli.json)
+            }
+            cli::CoordinatorCommands::Archive { name } => {
+                commands::coordinator_cmd::run_archive(&workgraph_dir, &name, cli.json)
+            }
+            cli::CoordinatorCommands::Restore { name } => {
+                commands::coordinator_cmd::run_restore(&workgraph_dir, &name, cli.json)
             }
         },
         Commands::Gc {
             dry_run,
             include_done,
             older,
-        } => commands::gc::run(&workgraph_dir, dry_run, include_done, older.as_deref()),
+            worktrees,
+            apply,
+            force,
+        } => {
+            if worktrees {
+                commands::worktree_gc::run(&workgraph_dir, apply, force)
+            } else {
+                commands::gc::run(&workgraph_dir, dry_run, include_done, older.as_deref())
+            }
+        }
         Commands::Show { id } => commands::show::run(&workgraph_dir, &id, cli.json),
         Commands::Trace { command } => match command {
             TraceCommands::Show {
@@ -993,6 +1591,8 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Tokens { id, json } => commands::tokens::run(&workgraph_dir, &id, &json),
+        Commands::Spend { today, json } => commands::spend::run(&workgraph_dir, today, json),
         Commands::Msg { command } => {
             let agent_id_from_env = std::env::var("WG_AGENT_ID").ok();
             match command {
@@ -1042,25 +1642,96 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::User { command } => match command {
+            UserCommands::Init { name } => {
+                commands::user::run_init(&workgraph_dir, name.as_deref())
+            }
+            UserCommands::List => commands::user::run_list(&workgraph_dir, cli.json),
+            UserCommands::Archive { name } => {
+                commands::user::run_archive(&workgraph_dir, name.as_deref())
+            }
+        },
         Commands::Chat {
+            command,
             message,
             interactive,
             history,
             clear,
             timeout,
             attachment,
+            coordinator,
+            history_depth,
+            no_history,
+            rotate,
+            cleanup,
+            compact,
+            share_from,
         } => {
-            if clear {
-                commands::chat::run_clear(&workgraph_dir)
+            if let Some(sub) = command {
+                use cli::ChatCommands;
+                match sub {
+                    ChatCommands::Create {
+                        name,
+                        executor,
+                        model,
+                    } => commands::chat_cmd::run_create(
+                        &workgraph_dir,
+                        name.as_deref(),
+                        model.as_deref(),
+                        executor.as_deref(),
+                        cli.json,
+                    ),
+                    ChatCommands::List => {
+                        commands::chat_cmd::run_list(&workgraph_dir, cli.json)
+                    }
+                    ChatCommands::Show { chat } => {
+                        commands::chat_cmd::run_show(&workgraph_dir, &chat, cli.json)
+                    }
+                    ChatCommands::Attach { chat, cli: force_cli } => {
+                        commands::chat_cmd::run_attach(&workgraph_dir, &chat, force_cli)
+                    }
+                    ChatCommands::Send { chat, message } => {
+                        commands::chat_cmd::run_send(
+                            &workgraph_dir,
+                            &chat,
+                            &message,
+                            cli.json,
+                        )
+                    }
+                    ChatCommands::Stop { chat } => {
+                        commands::chat_cmd::run_stop(&workgraph_dir, &chat, cli.json)
+                    }
+                    ChatCommands::Resume { chat } => {
+                        commands::chat_cmd::run_resume(&workgraph_dir, &chat, cli.json)
+                    }
+                    ChatCommands::Archive { chat } => {
+                        commands::chat_cmd::run_archive(&workgraph_dir, &chat, cli.json)
+                    }
+                    ChatCommands::Delete { chat, yes } => {
+                        commands::chat_cmd::run_delete(&workgraph_dir, &chat, yes, cli.json)
+                    }
+                }
+            } else if let Some(from_id) = share_from {
+                commands::chat::run_share(&workgraph_dir, from_id, coordinator)
+            } else if compact {
+                commands::chat::run_compact(&workgraph_dir, coordinator, cli.json)
+            } else if rotate {
+                commands::chat::run_rotate(&workgraph_dir, coordinator)
+            } else if cleanup {
+                commands::chat::run_cleanup(&workgraph_dir, coordinator)
+            } else if clear {
+                commands::chat::run_clear(&workgraph_dir, coordinator)
             } else if history {
-                commands::chat::run_history(&workgraph_dir, cli.json)
+                commands::chat::run_history(&workgraph_dir, cli.json, coordinator, history_depth)
             } else if interactive {
-                commands::chat::run_interactive(&workgraph_dir, timeout)
+                commands::chat::run_interactive(&workgraph_dir, timeout, coordinator)
             } else if let Some(msg) = message {
-                commands::chat::run_send(&workgraph_dir, &msg, timeout, &attachment)
+                let _ = no_history; // no_history only affects display, not send
+                commands::chat::run_send(&workgraph_dir, &msg, timeout, &attachment, coordinator)
             } else {
                 // No message and no flags → default to interactive
-                commands::chat::run_interactive(&workgraph_dir, timeout)
+                let _ = no_history;
+                commands::chat::run_interactive(&workgraph_dir, timeout, coordinator)
             }
         }
         Commands::Resource { command } => match command {
@@ -1096,7 +1767,14 @@ fn main() -> Result<()> {
             AgencyCommands::Stats {
                 min_evals,
                 by_model,
-            } => commands::agency_stats::run(&workgraph_dir, cli.json, min_evals, by_model),
+                by_task_type,
+            } => commands::agency_stats::run(
+                &workgraph_dir,
+                cli.json,
+                min_evals,
+                by_model,
+                by_task_type,
+            ),
             AgencyCommands::Scan { root, max_depth } => {
                 let root_path = std::path::PathBuf::from(&root);
                 commands::agency_scan::run(&root_path, cli.json, max_depth)
@@ -1167,6 +1845,26 @@ fn main() -> Result<()> {
             }
             AgencyCommands::Reject { id, note } => {
                 commands::evolve::run_deferred_reject(&workgraph_dir, &id, note.as_deref())
+            }
+            AgencyCommands::Import {
+                csv_path,
+                url,
+                upstream,
+                dry_run,
+                tag,
+                force,
+                check,
+            } => {
+                let opts = commands::agency_import::ImportOptions {
+                    csv_path,
+                    url,
+                    upstream,
+                    dry_run,
+                    tag,
+                    force,
+                    check,
+                };
+                commands::agency_import::run_import(&workgraph_dir, opts).map(|_| ())
             }
             AgencyCommands::Push {
                 target,
@@ -1253,7 +1951,8 @@ fn main() -> Result<()> {
             task,
             agent_hash,
             clear,
-        } => commands::assign::run(&workgraph_dir, &task, agent_hash.as_deref(), clear),
+            auto,
+        } => commands::assign::run(&workgraph_dir, &task, agent_hash.as_deref(), clear, auto),
         Commands::Match { task } => commands::match_cmd::run(&workgraph_dir, &task, cli.json),
         Commands::Heartbeat {
             agent,
@@ -1304,6 +2003,7 @@ fn main() -> Result<()> {
                 )
             }
         }
+        Commands::Session { command } => commands::chat_session::run(&workgraph_dir, command),
         Commands::Artifact { task, path, remove } => {
             if let Some(artifact_path) = path {
                 if remove {
@@ -1336,13 +2036,26 @@ fn main() -> Result<()> {
             dry_run,
             set,
             clear,
+            shell,
+            worktree,
+            no_worktree: _,
+            model,
         } => {
             if let Some(cmd) = set {
                 commands::exec::set_exec(&workgraph_dir, &task, &cmd)
             } else if clear {
                 commands::exec::clear_exec(&workgraph_dir, &task)
-            } else {
+            } else if shell {
                 commands::exec::run(&workgraph_dir, &task, actor.as_deref(), dry_run)
+            } else {
+                commands::exec::run_interactive(
+                    &workgraph_dir,
+                    &task,
+                    actor.as_deref(),
+                    dry_run,
+                    worktree,
+                    model.as_deref(),
+                )
             }
         }
         Commands::Agent { command } => match command {
@@ -1356,6 +2069,8 @@ fn main() -> Result<()> {
                 trust_level,
                 contact,
                 executor,
+                model,
+                provider,
             } => commands::agent_crud::run_create(
                 &workgraph_dir,
                 &name,
@@ -1367,6 +2082,8 @@ fn main() -> Result<()> {
                 trust_level.as_deref(),
                 contact.as_deref(),
                 &executor,
+                model.as_deref(),
+                provider.as_deref(),
             ),
             AgentCommands::List => commands::agent_crud::run_list(&workgraph_dir, cli.json),
             AgentCommands::Show { id } => {
@@ -1475,6 +2192,11 @@ fn main() -> Result<()> {
                 strategy,
                 budget,
                 model,
+                autopoietic,
+                max_iterations,
+                cycle_delay,
+                force_fanout,
+                single_shot,
             } => commands::evolve::run(
                 &workgraph_dir,
                 dry_run,
@@ -1482,7 +2204,25 @@ fn main() -> Result<()> {
                 budget,
                 model.as_deref(),
                 cli.json,
+                autopoietic,
+                max_iterations,
+                cycle_delay,
+                force_fanout,
+                single_shot,
             ),
+            EvolveCommands::Apply {
+                synthesis_file,
+                output,
+            } => {
+                let output_path = output.unwrap_or_else(|| {
+                    // Default: place apply-results.json next to synthesis-result.json
+                    synthesis_file
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join("apply-results.json")
+                });
+                commands::evolve::run_apply_synthesis(&workgraph_dir, &synthesis_file, &output_path)
+            }
             EvolveCommands::Review {
                 command: review_cmd,
             } => match review_cmd {
@@ -1497,8 +2237,29 @@ fn main() -> Result<()> {
                 }
             },
         },
+        Commands::Profile { command } => match command {
+            ProfileCommands::Set {
+                name,
+                fast,
+                standard,
+                premium,
+            } => commands::profile_cmd::set(
+                &workgraph_dir,
+                &name,
+                fast.as_deref(),
+                standard.as_deref(),
+                premium.as_deref(),
+            ),
+            ProfileCommands::Show { verbose } => {
+                commands::profile_cmd::show(&workgraph_dir, cli.json, verbose)
+            }
+            ProfileCommands::List => commands::profile_cmd::list(&workgraph_dir, cli.json),
+            ProfileCommands::Refresh => commands::profile_cmd::refresh(&workgraph_dir),
+        },
         Commands::Config {
+            cmd: config_subcmd,
             show,
+            merged,
             init,
             global,
             local,
@@ -1510,7 +2271,9 @@ fn main() -> Result<()> {
             max_agents,
             coordinator_interval,
             poll_interval,
-            coordinator_executor,
+            dispatcher_executor,
+            coordinator_model,
+            coordinator_provider,
             matrix,
             homeserver,
             username,
@@ -1519,17 +2282,14 @@ fn main() -> Result<()> {
             room,
             auto_evaluate,
             auto_assign,
-            assigner_model,
-            evaluator_model,
-            evolver_model,
             assigner_agent,
             evaluator_agent,
             evolver_agent,
             creator_agent,
-            creator_model,
             retention_heuristics,
             auto_triage,
-            triage_model,
+            auto_place,
+            auto_create,
             triage_timeout,
             triage_max_log_bytes,
             max_child_tasks,
@@ -1540,17 +2300,94 @@ fn main() -> Result<()> {
             flip_enabled,
             flip_inference_model,
             flip_comparison_model,
+            flip_model,
             flip_verification_threshold,
-            flip_verification_model,
             chat_history,
             chat_history_max,
+            tui_counters,
+            show_registry,
+            registry_add,
+            registry_remove,
+            show_tiers,
+            set_tier,
+            reg_id,
+            reg_provider,
+            reg_model,
+            reg_tier,
+            reg_endpoint,
+            reg_context_window,
+            cost_input,
+            cost_output,
             show_models,
             set_model,
             set_provider,
             set_endpoint,
             role_model,
             role_provider,
+            retry_context_tokens,
+            set_key,
+            key_file,
+            check_key,
+            install_global,
+            force,
+            max_coordinators,
+            endpoint,
+            no_reload,
+            reset,
+            reset_route,
+            reset_keep_keys,
+            reset_dry_run,
+            reset_yes,
         } => {
+            // Subcommand form takes priority. `wg config init …` runs the
+            // new minimal-write path; flag-style args on `Config` are
+            // ignored when a subcommand is present.
+            if let Some(subcmd) = config_subcmd {
+                match subcmd {
+                    ConfigSubcommand::Init {
+                        global: init_global,
+                        local: init_local,
+                        route,
+                        bare,
+                        force,
+                    } => {
+                        let scope = if init_global {
+                            commands::config_cmd::ConfigScope::Global
+                        } else if init_local {
+                            commands::config_cmd::ConfigScope::Local
+                        } else {
+                            commands::config_cmd::ConfigScope::Local
+                        };
+                        return commands::config_cmd::init_minimal(
+                            &workgraph_dir,
+                            scope,
+                            &route,
+                            bare,
+                            force,
+                        );
+                    }
+                    ConfigSubcommand::Lint {
+                        global: lint_global,
+                        local: lint_local,
+                        merged: _lint_merged,
+                    } => {
+                        let target = if lint_global {
+                            commands::config_cmd::LintTarget::Global
+                        } else if lint_local {
+                            commands::config_cmd::LintTarget::Local
+                        } else {
+                            // Default: merged (lints both global and local).
+                            commands::config_cmd::LintTarget::Merged
+                        };
+                        return commands::config_cmd::lint_config(
+                            &workgraph_dir,
+                            target,
+                            cli.json,
+                        );
+                    }
+                }
+            }
+
             // Derive scope from --global/--local flags
             let scope = if global {
                 Some(commands::config_cmd::ConfigScope::Global)
@@ -1559,6 +2396,96 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+
+            // Handle --reset (also reachable as positional `wg config reset`)
+            if reset {
+                let reset_scope =
+                    scope.unwrap_or(commands::config_cmd::ConfigScope::Global);
+                return commands::config_cmd::reset_to_route(
+                    &workgraph_dir,
+                    reset_scope,
+                    reset_route.as_deref(),
+                    reset_keep_keys,
+                    reset_dry_run,
+                    reset_yes,
+                );
+            }
+
+            // Handle --set-key <provider> --file <path>
+            if let Some(ref provider) = set_key {
+                let file = key_file
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--set-key requires --file <path>"))?;
+                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
+                return commands::config_cmd::set_key(&workgraph_dir, write_scope, provider, file);
+            }
+
+            // Handle --check-key
+            if check_key {
+                return commands::config_cmd::check_key(&workgraph_dir, cli.json);
+            }
+
+            // Handle --install-global
+            if install_global {
+                return commands::config_cmd::install_global(&workgraph_dir, force);
+            }
+
+            // Handle --registry (list)
+            if show_registry {
+                return commands::config_cmd::show_registry(&workgraph_dir, cli.json);
+            }
+
+            // Handle --registry-add
+            if registry_add {
+                let id = reg_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--registry-add requires --id <ID>"))?;
+                let provider = reg_provider.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--registry-add requires --provider <PROVIDER>")
+                })?;
+                let model_name = reg_model.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--registry-add requires --reg-model <MODEL>")
+                })?;
+                let tier = reg_tier
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--registry-add requires --reg-tier <TIER>"))?;
+                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
+                return commands::config_cmd::add_registry_entry(
+                    &workgraph_dir,
+                    write_scope,
+                    id,
+                    provider,
+                    model_name,
+                    tier,
+                    reg_endpoint.as_deref(),
+                    reg_context_window,
+                    cost_input,
+                    cost_output,
+                );
+            }
+
+            // Handle --registry-remove
+            if let Some(ref id) = registry_remove {
+                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
+                return commands::config_cmd::remove_registry_entry(
+                    &workgraph_dir,
+                    write_scope,
+                    id,
+                    force,
+                    cli.json,
+                );
+            }
+
+            // Handle --tiers (show)
+            if show_tiers {
+                return commands::config_cmd::show_tiers(&workgraph_dir, cli.json);
+            }
+
+            // Handle --tier <tier>=<model-id>
+            if let Some(ref tier_spec) = set_tier {
+                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
+                return commands::config_cmd::set_tier(&workgraph_dir, write_scope, tier_spec);
+            }
 
             // Handle Matrix configuration
             if matrix
@@ -1592,6 +2519,9 @@ fn main() -> Result<()> {
                 || set_endpoint.is_some()
                 || role_model.is_some()
                 || role_provider.is_some()
+                || flip_inference_model.is_some()
+                || flip_comparison_model.is_some()
+                || flip_model.is_some()
             {
                 // Merge --role-model/--role-provider (key=value) into set_model/set_provider format
                 let effective_model = if let Some(ref kv) = role_model {
@@ -1620,39 +2550,66 @@ fn main() -> Result<()> {
                 };
                 // Default scope for writes = Local
                 let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
-                commands::config_cmd::update_model_routing(
-                    &workgraph_dir,
-                    write_scope,
-                    effective_model.as_deref(),
-                    effective_provider.as_deref(),
-                    set_endpoint.as_deref(),
-                )
+
+                // Handle --flip-model / --flip-inference-model / --flip-comparison-model
+                // These are shorthand for --set-model flip_inference/flip_comparison <model>
+                let flip_inf = flip_inference_model.or_else(|| flip_model.clone());
+                let flip_cmp = flip_comparison_model.or(flip_model);
+                if flip_inf.is_some() || flip_cmp.is_some() {
+                    commands::config_cmd::update_flip_models(
+                        &workgraph_dir,
+                        write_scope,
+                        flip_inf.as_deref(),
+                        flip_cmp.as_deref(),
+                    )?;
+                }
+
+                // Handle standard model routing if present
+                if effective_model.is_some()
+                    || effective_provider.is_some()
+                    || set_endpoint.is_some()
+                {
+                    commands::config_cmd::update_model_routing(
+                        &workgraph_dir,
+                        write_scope,
+                        effective_model.as_deref(),
+                        effective_provider.as_deref(),
+                        set_endpoint.as_deref(),
+                    )?;
+                }
+
+                Ok(())
             } else if list {
                 commands::config_cmd::list(&workgraph_dir, cli.json)
             } else if init {
                 commands::config_cmd::init(&workgraph_dir, scope)
+            } else if merged {
+                // `--merged` is an explicit alias for "show effective config":
+                // ignore any --global/--local scope so the user sees what the
+                // running system actually sees.
+                commands::config_cmd::show(&workgraph_dir, None, cli.json)
             } else if show
                 || (executor.is_none()
                     && model.is_none()
                     && endpoint.is_none()
                     && set_interval.is_none()
                     && max_agents.is_none()
+                    && max_coordinators.is_none()
                     && coordinator_interval.is_none()
                     && poll_interval.is_none()
-                    && coordinator_executor.is_none()
+                    && dispatcher_executor.is_none()
+                    && coordinator_model.is_none()
+                    && coordinator_provider.is_none()
                     && auto_evaluate.is_none()
                     && auto_assign.is_none()
-                    && assigner_model.is_none()
-                    && evaluator_model.is_none()
-                    && evolver_model.is_none()
                     && assigner_agent.is_none()
                     && evaluator_agent.is_none()
                     && evolver_agent.is_none()
                     && creator_agent.is_none()
-                    && creator_model.is_none()
                     && retention_heuristics.is_none()
                     && auto_triage.is_none()
-                    && triage_model.is_none()
+                    && auto_place.is_none()
+                    && auto_create.is_none()
                     && triage_timeout.is_none()
                     && triage_max_log_bytes.is_none()
                     && max_child_tasks.is_none()
@@ -1661,12 +2618,12 @@ fn main() -> Result<()> {
                     && eval_gate_threshold.is_none()
                     && eval_gate_all.is_none()
                     && flip_enabled.is_none()
-                    && flip_inference_model.is_none()
-                    && flip_comparison_model.is_none()
                     && flip_verification_threshold.is_none()
-                    && flip_verification_model.is_none()
                     && chat_history.is_none()
-                    && chat_history_max.is_none())
+                    && chat_history_max.is_none()
+                    && tui_counters.is_none()
+                    && retry_context_tokens.is_none()
+                    && endpoint.is_none())
             {
                 commands::config_cmd::show(&workgraph_dir, scope, cli.json)
             } else {
@@ -1679,22 +2636,22 @@ fn main() -> Result<()> {
                     model.as_deref(),
                     set_interval,
                     max_agents,
+                    max_coordinators,
                     coordinator_interval,
                     poll_interval,
-                    coordinator_executor.as_deref(),
+                    dispatcher_executor.as_deref(),
+                    coordinator_model.as_deref(),
+                    coordinator_provider.as_deref(),
                     auto_evaluate,
                     auto_assign,
-                    assigner_model.as_deref(),
-                    evaluator_model.as_deref(),
-                    evolver_model.as_deref(),
                     assigner_agent.as_deref(),
                     evaluator_agent.as_deref(),
                     evolver_agent.as_deref(),
                     creator_agent.as_deref(),
-                    creator_model.as_deref(),
                     retention_heuristics.as_deref(),
                     auto_triage,
-                    triage_model.as_deref(),
+                    auto_place,
+                    auto_create,
                     triage_timeout,
                     triage_max_log_bytes,
                     max_child_tasks,
@@ -1703,13 +2660,13 @@ fn main() -> Result<()> {
                     eval_gate_threshold,
                     eval_gate_all,
                     flip_enabled,
-                    flip_inference_model.as_deref(),
-                    flip_comparison_model.as_deref(),
                     flip_verification_threshold,
-                    flip_verification_model.as_deref(),
                     chat_history,
                     chat_history_max,
+                    tui_counters.as_deref(),
+                    retry_context_tokens,
                     endpoint.as_deref(),
+                    no_reload,
                 )
             }
         }
@@ -1734,32 +2691,84 @@ fn main() -> Result<()> {
                 commands::dead_agents::run_check(&workgraph_dir, threshold, cli.json)
             }
         }
+        Commands::Sweep {
+            dry_run,
+            reap_targets,
+        } => commands::sweep::run(&workgraph_dir, dry_run, reap_targets, cli.json).map(|_| ()),
+        Commands::Migrate { cmd } => match cmd {
+            MigrateCommands::ChatRename { dry_run } => {
+                commands::migrate::run_chat_rename(&workgraph_dir, dry_run, cli.json)
+            }
+            MigrateCommands::RetireCompactArchive { dry_run } => {
+                commands::migrate::run_retire_compact_archive(&workgraph_dir, dry_run, cli.json)
+            }
+            MigrateCommands::Config {
+                global,
+                local,
+                all,
+                dry_run,
+            } => {
+                let target = if all {
+                    commands::migrate::ConfigMigrateTarget::All
+                } else if global {
+                    commands::migrate::ConfigMigrateTarget::Global
+                } else if local {
+                    commands::migrate::ConfigMigrateTarget::Local
+                } else {
+                    // Default: migrate the local config in this workgraph dir.
+                    commands::migrate::ConfigMigrateTarget::Local
+                };
+                commands::migrate::run_config_migrate(&workgraph_dir, target, dry_run, cli.json)
+            }
+        },
         Commands::Agents {
+            command,
             alive,
             dead,
             working,
             idle,
-        } => {
-            let filter = if alive {
-                Some(commands::agents::AgentFilter::Alive)
-            } else if dead {
-                Some(commands::agents::AgentFilter::Dead)
-            } else if working {
-                Some(commands::agents::AgentFilter::Working)
-            } else if idle {
-                Some(commands::agents::AgentFilter::Idle)
-            } else {
-                None
-            };
-            commands::agents::run(&workgraph_dir, filter, cli.json)
-        }
+        } => match command {
+            Some(cli::AgentsCommand::Kill { agent_id, force }) => {
+                commands::agents::run_kill(&workgraph_dir, &agent_id, force, cli.json)
+            }
+            None => {
+                let filter = if alive {
+                    Some(commands::agents::AgentFilter::Alive)
+                } else if dead {
+                    Some(commands::agents::AgentFilter::Dead)
+                } else if working {
+                    Some(commands::agents::AgentFilter::Working)
+                } else if idle {
+                    Some(commands::agents::AgentFilter::Idle)
+                } else {
+                    None
+                };
+                commands::agents::run(&workgraph_dir, filter, cli.json)
+            }
+        },
         Commands::Kill {
             agent,
             force,
             all,
+            tree,
+            dry_run,
+            no_abandon,
             redispatch,
         } => {
-            if all {
+            if tree {
+                if let Some(task_id) = agent {
+                    commands::kill::run_tree(
+                        &workgraph_dir,
+                        &task_id,
+                        force,
+                        dry_run,
+                        no_abandon,
+                        cli.json,
+                    )
+                } else {
+                    anyhow::bail!("Must specify a task ID with --tree")
+                }
+            } else if all {
                 commands::kill::run_all(&workgraph_dir, force, redispatch, cli.json)
             } else if let Some(agent_id) = agent {
                 commands::kill::run(&workgraph_dir, &agent_id, force, redispatch, cli.json)
@@ -1767,6 +2776,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("Must specify an agent ID or use --all")
             }
         }
+        Commands::Reap {
+            dry_run,
+            older_than,
+        } => commands::reap::run(&workgraph_dir, dry_run, older_than.as_deref(), cli.json),
         Commands::Service { command } => match command {
             ServiceCommands::Start {
                 port,
@@ -1776,7 +2789,7 @@ fn main() -> Result<()> {
                 interval,
                 model,
                 force,
-                no_coordinator_agent,
+                no_chat_agent,
             } => commands::service::run_start(
                 &workgraph_dir,
                 socket.as_deref(),
@@ -1787,11 +2800,12 @@ fn main() -> Result<()> {
                 model.as_deref(),
                 cli.json,
                 force,
-                no_coordinator_agent,
+                no_chat_agent,
             ),
             ServiceCommands::Stop { force, kill_agents } => {
                 commands::service::run_stop(&workgraph_dir, force, kill_agents, cli.json)
             }
+            ServiceCommands::Restart => commands::service::run_restart(&workgraph_dir, cli.json),
             ServiceCommands::Status => commands::service::run_status(&workgraph_dir, cli.json),
             ServiceCommands::Reload {
                 max_agents,
@@ -1819,6 +2833,8 @@ fn main() -> Result<()> {
             ),
             ServiceCommands::Pause => commands::service::run_pause(&workgraph_dir, cli.json),
             ServiceCommands::Resume => commands::service::run_resume(&workgraph_dir, cli.json),
+            ServiceCommands::Freeze => commands::service::run_freeze(&workgraph_dir, cli.json),
+            ServiceCommands::Thaw => commands::service::run_thaw(&workgraph_dir, cli.json),
             ServiceCommands::Install => commands::service::generate_systemd_service(&workgraph_dir),
             ServiceCommands::Tick {
                 max_agents,
@@ -1830,13 +2846,64 @@ fn main() -> Result<()> {
                 executor.as_deref(),
                 model.as_deref(),
             ),
+            ServiceCommands::CreateChat {
+                name,
+                model,
+                executor,
+            } => {
+                eprintln!(
+                    "warning: 'wg service create-chat' is deprecated; use 'wg chat create' instead."
+                );
+                commands::chat_cmd::run_create(
+                    &workgraph_dir,
+                    name.as_deref(),
+                    model.as_deref(),
+                    executor.as_deref(),
+                    cli.json,
+                )
+            }
+            ServiceCommands::SetChatExecutor {
+                id,
+                executor,
+                model,
+            } => commands::service::run_set_coordinator_executor(
+                &workgraph_dir,
+                id,
+                executor.as_deref(),
+                model.as_deref(),
+                cli.json,
+            ),
+            ServiceCommands::DeleteChat { id } => {
+                eprintln!(
+                    "warning: 'wg service delete-chat' is deprecated; use 'wg chat delete' instead."
+                );
+                commands::chat_cmd::run_delete(&workgraph_dir, &id.to_string(), true, cli.json)
+            }
+            ServiceCommands::ArchiveChat { id } => {
+                eprintln!(
+                    "warning: 'wg service archive-chat' is deprecated; use 'wg chat archive' instead."
+                );
+                commands::chat_cmd::run_archive(&workgraph_dir, &id.to_string(), cli.json)
+            }
+            ServiceCommands::StopChat { id } => {
+                eprintln!(
+                    "warning: 'wg service stop-chat' is deprecated; use 'wg chat stop' instead."
+                );
+                commands::chat_cmd::run_stop(&workgraph_dir, &id.to_string(), cli.json)
+            }
+            ServiceCommands::InterruptChat { id } => {
+                commands::service::run_interrupt_coordinator(&workgraph_dir, id, cli.json)
+            }
+            ServiceCommands::PurgeChats => {
+                commands::service::run_purge_chats(&workgraph_dir, cli.json)
+            }
             ServiceCommands::Daemon {
                 socket,
                 max_agents,
                 executor,
                 interval,
                 model,
-                no_coordinator_agent,
+                no_chat_agent,
             } => commands::service::run_daemon(
                 &workgraph_dir,
                 &socket,
@@ -1844,11 +2911,19 @@ fn main() -> Result<()> {
                 executor.as_deref(),
                 interval,
                 model.as_deref(),
-                no_coordinator_agent,
+                no_chat_agent,
             ),
         },
-        Commands::Tui { no_mouse } => {
-            let resolved_edge_color = Config::load_or_default(&workgraph_dir).viz.edge_color;
+        Commands::Tui {
+            no_mouse,
+            recording,
+            trace,
+            show_keys,
+            history_depth,
+            no_history,
+        } => {
+            let config = Config::load_or_default(&workgraph_dir);
+            let resolved_edge_color = config.viz.edge_color;
             let options = commands::viz::VizOptions {
                 all: true,
                 status: None,
@@ -1856,18 +2931,121 @@ fn main() -> Result<()> {
                 format: commands::viz::OutputFormat::Ascii,
                 output: None,
                 show_internal: false,
+                show_internal_running_only: false,
                 focus: vec![],
                 tui_mode: true,
                 layout: commands::viz::LayoutMode::default(),
                 tags: vec![],
                 edge_color: resolved_edge_color,
+                max_columns: None, // TUI handles its own sizing
             };
             let mouse_override = if no_mouse { Some(false) } else { None };
-            tui::viz_viewer::run(workgraph_dir, options, mouse_override)
+            let show_keys = show_keys || config.tui.show_keys;
+            tui::viz_viewer::run(
+                workgraph_dir,
+                options,
+                mouse_override,
+                recording,
+                trace,
+                show_keys,
+                history_depth,
+                no_history,
+            )
         }
-        Commands::Setup => commands::setup::run(),
+        Commands::TuiDump {} => {
+            let snap = tui::viz_viewer::screen_dump::client_dump(&workgraph_dir)?;
+            if cli.json {
+                let j = serde_json::json!({
+                    "width": snap.width,
+                    "height": snap.height,
+                    "active_tab": snap.active_tab,
+                    "focused_panel": snap.focused_panel,
+                    "selected_task": snap.selected_task,
+                    "input_mode": snap.input_mode,
+                    "coordinator_id": snap.coordinator_id,
+                    "text": snap.text,
+                });
+                println!("{}", serde_json::to_string_pretty(&j)?);
+            } else {
+                println!("{}", snap.text);
+            }
+            Ok(())
+        }
+        Commands::Screencast { command } => match command {
+            ScreencastCommands::Render {
+                trace,
+                output,
+                compress_idle,
+                target_duration,
+                width,
+                height,
+            } => commands::screencast_render::run(
+                &workgraph_dir,
+                &trace,
+                &output,
+                &compress_idle,
+                target_duration,
+                width,
+                height,
+            ),
+            ScreencastCommands::Autopilot {
+                output,
+                cols,
+                rows,
+                duration,
+            } => commands::screencast_autopilot::run(&workgraph_dir, &output, cols, rows, duration),
+        },
+        Commands::Server { command } => match command {
+            ServerCommands::Init {
+                apply,
+                group,
+                users,
+                ttyd,
+                caddy,
+                ttyd_port,
+            } => {
+                let opts = commands::server::ServerInitOpts {
+                    apply,
+                    group: group.as_deref(),
+                    users: &users,
+                    ttyd,
+                    caddy,
+                    ttyd_port,
+                };
+                commands::server::run(&workgraph_dir, &opts)
+            }
+            ServerCommands::Connect { user } => commands::server::connect(user.as_deref()),
+        },
+        Commands::Setup {
+            route,
+            provider,
+            scope,
+            api_key_file,
+            api_key_env,
+            url,
+            model,
+            skip_validation,
+            yes,
+            dry_run,
+        } => {
+            let args = commands::setup::SetupArgs {
+                route,
+                provider,
+                scope,
+                api_key_file,
+                api_key_env,
+                url,
+                model,
+                skip_validation,
+                yes,
+                dry_run,
+            };
+            commands::setup::run_with_args(&args)
+        }
         Commands::Quickstart => commands::quickstart::run(cli.json),
-        Commands::Status => commands::status::run(&workgraph_dir, cli.json),
+        Commands::Status { all } => commands::status::run(&workgraph_dir, cli.json, all),
+        Commands::Stats => commands::stats::run(&workgraph_dir, cli.json),
+        Commands::Metrics { json } => commands::metrics::run(&workgraph_dir, json),
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Notify {
             task,
@@ -1903,20 +3081,367 @@ fn main() -> Result<()> {
                 commands::telegram::run_send(chat_id.as_deref(), &message)
             }
             TelegramCommands::Status => commands::telegram::run_status(cli.json),
+            TelegramCommands::Poll { timeout, chat_id } => {
+                commands::telegram::run_poll(chat_id.as_deref(), timeout)
+            }
+            TelegramCommands::Ask {
+                message,
+                timeout,
+                interval,
+                chat_id,
+                task_id,
+            } => commands::telegram::run_ask(
+                &message,
+                chat_id.as_deref(),
+                timeout,
+                interval,
+                task_id.as_deref(),
+            ),
         },
+        Commands::Endpoints { command } | Commands::Endpoint { command } => match command {
+            EndpointsCommands::List => commands::endpoints::run_list(&workgraph_dir, cli.json),
+            EndpointsCommands::Add {
+                name,
+                provider,
+                url,
+                model,
+                api_key,
+                api_key_file,
+                key_env,
+                default: set_default,
+                global,
+            } => commands::endpoints::run_add(
+                &workgraph_dir,
+                &name,
+                provider.as_deref(),
+                url.as_deref(),
+                model.as_deref(),
+                api_key.as_deref(),
+                api_key_file.as_deref(),
+                key_env.as_deref(),
+                set_default,
+                global,
+            ),
+            EndpointsCommands::Update {
+                name,
+                provider,
+                url,
+                model,
+                api_key,
+                api_key_file,
+                key_env,
+                default: set_default,
+                global,
+            } => commands::endpoints::run_update(
+                &workgraph_dir,
+                &name,
+                provider.as_deref(),
+                url.as_deref(),
+                model.as_deref(),
+                api_key.as_deref(),
+                api_key_file.as_deref(),
+                key_env.as_deref(),
+                set_default,
+                global,
+            ),
+            EndpointsCommands::Remove { name, global } => {
+                commands::endpoints::run_remove(&workgraph_dir, &name, global)
+            }
+            EndpointsCommands::SetDefault { name, global } => {
+                commands::endpoints::run_set_default(&workgraph_dir, &name, global)
+            }
+            EndpointsCommands::Test { name } => {
+                commands::endpoints::run_test(&workgraph_dir, &name)
+            }
+        },
+        Commands::Models { command } => match command {
+            ModelsCommands::List { tier } => {
+                commands::models::run_list(&workgraph_dir, tier.as_deref(), cli.json)
+            }
+            ModelsCommands::Search {
+                query,
+                tools,
+                no_cache,
+                limit,
+            } => commands::models::run_search(
+                &workgraph_dir,
+                &query,
+                tools,
+                no_cache,
+                limit,
+                cli.json,
+            ),
+            ModelsCommands::Remote {
+                tools,
+                no_cache,
+                limit,
+            } => {
+                commands::models::run_list_remote(&workgraph_dir, tools, no_cache, limit, cli.json)
+            }
+            ModelsCommands::Add {
+                id,
+                provider,
+                cost_in,
+                cost_out,
+                context_window,
+                capability,
+                tier,
+            } => commands::models::run_add(
+                &workgraph_dir,
+                &id,
+                provider.as_deref(),
+                cost_in,
+                cost_out,
+                context_window,
+                &capability,
+                &tier,
+            ),
+            ModelsCommands::SetDefault { id } => {
+                commands::models::run_set_default(&workgraph_dir, &id)
+            }
+            ModelsCommands::Init => commands::models::run_init(&workgraph_dir),
+            ModelsCommands::Fetch { no_cache } => {
+                commands::models::run_fetch(&workgraph_dir, no_cache)
+            }
+            ModelsCommands::Benchmarks { tier, limit } => {
+                commands::models::run_benchmarks(&workgraph_dir, tier.as_deref(), limit, cli.json)
+            }
+        },
+        Commands::Model { command } => match command {
+            ModelCommands::List { tier } => {
+                commands::model_cmd::run_list(&workgraph_dir, tier.as_deref(), cli.json)
+            }
+            ModelCommands::Add {
+                alias,
+                provider,
+                model_id,
+                tier,
+                endpoint,
+                context_window,
+                cost_in,
+                cost_out,
+                global,
+            } => commands::model_cmd::run_add(
+                &workgraph_dir,
+                &alias,
+                &provider,
+                model_id.as_deref(),
+                &tier,
+                endpoint.as_deref(),
+                context_window,
+                cost_in,
+                cost_out,
+                global,
+            ),
+            ModelCommands::Remove {
+                alias,
+                force,
+                global,
+            } => commands::model_cmd::run_remove(&workgraph_dir, &alias, force, global, cli.json),
+            ModelCommands::SetDefault { alias, global } => {
+                commands::model_cmd::run_set_default(&workgraph_dir, &alias, global)
+            }
+            ModelCommands::Routing => commands::model_cmd::run_routing(&workgraph_dir, cli.json),
+            ModelCommands::Set {
+                role,
+                model,
+                provider,
+                endpoint,
+                tier: _tier,
+                global,
+            } => commands::model_cmd::run_set(
+                &workgraph_dir,
+                &role,
+                &model,
+                provider.as_deref(),
+                endpoint.as_deref(),
+                global,
+            ),
+        },
+        Commands::Nex {
+            model,
+            endpoint,
+            system_prompt,
+            message,
+            max_turns,
+            chatty,
+            verbose,
+            read_only,
+            resume,
+            role,
+            chat_id,
+            chat_ref,
+            autonomous,
+            no_mcp,
+            eval_mode,
+            idle_timeout_secs,
+            minimal_tools,
+        } => commands::nex::run(
+            &workgraph_dir,
+            model.as_deref(),
+            endpoint.as_deref(),
+            system_prompt.as_deref(),
+            message.as_deref(),
+            max_turns,
+            chatty,
+            verbose,
+            read_only,
+            resume.as_deref(),
+            role.as_deref(),
+            chat_id,
+            chat_ref.as_deref(),
+            autonomous,
+            no_mcp,
+            eval_mode,
+            idle_timeout_secs,
+            minimal_tools,
+        ),
+        Commands::TuiNex { model, endpoint } => {
+            commands::tui_nex::run(&workgraph_dir, model.as_deref(), endpoint.as_deref())
+        }
+        Commands::TuiPty {
+            model,
+            endpoint,
+            chat_ref,
+            resume,
+        } => commands::tui_pty::run(
+            &workgraph_dir,
+            model.as_deref(),
+            endpoint.as_deref(),
+            chat_ref.as_deref(),
+            resume.as_deref(),
+        ),
+        Commands::SpawnTask {
+            task_id,
+            role,
+            dry_run,
+        } => commands::spawn_task::run(&workgraph_dir, &task_id, role.as_deref(), dry_run),
+        Commands::ClaudeHandler {
+            chat,
+            resume,
+            role,
+            model,
+        } => commands::claude_handler::run(
+            &workgraph_dir,
+            &chat,
+            resume,
+            role.as_deref(),
+            model.as_deref(),
+        ),
+        Commands::CodexHandler {
+            chat,
+            resume,
+            role,
+            model,
+        } => commands::codex_handler::run(
+            &workgraph_dir,
+            &chat,
+            resume,
+            role.as_deref(),
+            model.as_deref(),
+        ),
         Commands::NativeExec {
             prompt_file,
             exec_mode,
             task_id,
             model,
+            provider,
+            endpoint_name,
+            endpoint_url,
+            api_key,
             max_turns,
+            no_resume,
         } => commands::native_exec::run(
             &workgraph_dir,
             &prompt_file,
             &exec_mode,
             &task_id,
             model.as_deref(),
+            provider.as_deref(),
+            endpoint_name.as_deref(),
+            endpoint_url.as_deref(),
+            api_key.as_deref(),
             max_turns,
+            no_resume,
         ),
+        Commands::ApplyPlacement {
+            output_dir,
+            source_task_id,
+        } => {
+            let output_path = std::path::Path::new(&output_dir);
+            let raw_stream = output_path.join("raw_stream.jsonl");
+            match commands::placement::parse_and_apply(&raw_stream, &source_task_id, &workgraph_dir)
+            {
+                Ok(msg) => {
+                    eprintln!("[apply-placement] {}", msg);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("[apply-placement] FAILED: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Key { command } => match command {
+            KeyCommands::Set {
+                provider,
+                env,
+                file,
+                value,
+                global,
+            } => commands::key::run_set(
+                &workgraph_dir,
+                &provider,
+                env.as_deref(),
+                file.as_deref(),
+                value.as_deref(),
+                global,
+            ),
+            KeyCommands::Check { provider } => {
+                commands::key::run_check(&workgraph_dir, provider.as_deref(), cli.json)
+            }
+            KeyCommands::List => commands::key::run_list(&workgraph_dir, cli.json),
+        },
+        cli::Commands::Openrouter { command } => {
+            commands::openrouter::run(&workgraph_dir, &command, cli.json)
+        }
     }
+}
+
+/// Parse --propagation and --retry-strategy into an IterationConfig.
+fn parse_iteration_config(
+    propagation: Option<&str>,
+    retry_strategy: Option<&str>,
+) -> Option<workgraph::agency::IterationConfig> {
+    use workgraph::agency::{IterationConfig, PropagationPolicy, RetryStrategy};
+
+    let prop = propagation.map(|p| {
+        let p = p.trim().to_lowercase();
+        if p == "conservative" {
+            PropagationPolicy::Conservative
+        } else if p == "aggressive" {
+            PropagationPolicy::Aggressive
+        } else if let Some(threshold) = p.strip_prefix("conditional:") {
+            let val: f32 = threshold.parse().unwrap_or(0.0);
+            PropagationPolicy::Conditional(val)
+        } else {
+            PropagationPolicy::Conservative
+        }
+    });
+
+    let strat = retry_strategy.map(|s| match s.trim().to_lowercase().as_str() {
+        "same-model" => RetryStrategy::SameModel,
+        "upgrade-model" => RetryStrategy::UpgradeModel,
+        "escalate-to-human" => RetryStrategy::EscalateToHuman,
+        _ => RetryStrategy::SameModel,
+    });
+
+    if prop.is_none() && strat.is_none() {
+        return None;
+    }
+    Some(IterationConfig {
+        max_retries: None,
+        propagation: prop,
+        retry_strategy: strat,
+    })
 }

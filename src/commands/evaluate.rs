@@ -18,7 +18,7 @@ use workgraph::provenance;
 /// Extract the model from a task's spawn log entry.
 ///
 /// Spawn log entries have the format:
-///   "Spawned by coordinator --executor claude --model anthropic/claude-opus-4-6"
+///   "Spawned by coordinator --executor claude --model opus"
 /// Returns the model string if found.
 fn extract_spawn_model(log: &[LogEntry]) -> Option<String> {
     for entry in log {
@@ -85,9 +85,10 @@ fn compute_artifact_diff(artifacts: &[String], started_at: Option<&str>) -> Opti
 
     // Truncate overly large diffs
     if diff.len() > MAX_DIFF_BYTES {
-        let truncated = &diff[..MAX_DIFF_BYTES];
+        let safe_end = diff.floor_char_boundary(MAX_DIFF_BYTES);
+        let truncated = &diff[..safe_end];
         // Find the last newline to avoid cutting mid-line
-        let cut_point = truncated.rfind('\n').unwrap_or(MAX_DIFF_BYTES);
+        let cut_point = truncated.rfind('\n').unwrap_or(safe_end);
         Some(format!(
             "{}\n\n... (diff truncated at {} bytes, total {} bytes)",
             &diff[..cut_point],
@@ -97,6 +98,82 @@ fn compute_artifact_diff(artifacts: &[String], started_at: Option<&str>) -> Opti
     } else {
         Some(diff)
     }
+}
+
+/// Try to find the user message that originated a task's creation.
+///
+/// Heuristic: look at the coordinator chat inbox for messages sent shortly
+/// before the task's `created_at` timestamp. Falls back to scanning the
+/// task's own log entries for context clues.
+fn find_originating_user_message(
+    dir: &Path,
+    task: &workgraph::graph::Task,
+) -> Option<String> {
+    let created_at = task.created_at.as_deref()?;
+    let created_ts: chrono::DateTime<chrono::Utc> = created_at.parse().ok()?;
+
+    // Strategy 1: scan coordinator chat inboxes for a user message before task creation.
+    // Walk all chat directories looking for inbox messages.
+    let chat_dir = dir.join("chat");
+    if chat_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&chat_dir) {
+            let mut best_message: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+
+            for entry in entries.flatten() {
+                let inbox_path = entry.path().join("inbox.jsonl");
+                if !inbox_path.exists() {
+                    continue;
+                }
+                if let Ok(contents) = std::fs::read_to_string(&inbox_path) {
+                    for line in contents.lines() {
+                        if let Ok(msg) =
+                            serde_json::from_str::<workgraph::chat::ChatMessage>(line)
+                        {
+                            if msg.role != "user" {
+                                continue;
+                            }
+                            if let Ok(msg_ts) =
+                                msg.timestamp.parse::<chrono::DateTime<chrono::Utc>>()
+                            {
+                                // Message must be before (or within 60s of) task creation
+                                let delta = created_ts
+                                    .signed_duration_since(msg_ts)
+                                    .num_seconds();
+                                if delta >= -60 && delta <= 600 {
+                                    // Within 10 min window before creation
+                                    if best_message
+                                        .as_ref()
+                                        .map(|(ts, _)| msg_ts > *ts)
+                                        .unwrap_or(true)
+                                    {
+                                        best_message =
+                                            Some((msg_ts, msg.content.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((_, content)) = best_message {
+                return Some(content);
+            }
+        }
+    }
+
+    // Strategy 2: look at log entries for coordinator context.
+    // The coordinator sometimes logs the user request that triggered task creation.
+    for entry in &task.log {
+        if entry.actor.as_deref() == Some("coordinator")
+            && (entry.message.contains("user request")
+                || entry.message.contains("User:"))
+        {
+            return Some(entry.message.clone());
+        }
+    }
+
+    None
 }
 
 /// Run `wg evaluate <task-id>` — trigger evaluation of a completed task.
@@ -115,14 +192,16 @@ pub fn run(
     let graph = load_graph(&path)?;
     let task = graph.get_task_or_err(task_id)?;
 
-    // Step 1: Verify task is done or failed
+    // Step 1: Verify task is done, failed, or pending-eval.
     // Failed tasks are also evaluated — there is useful signal in what kinds
     // of tasks cause which agents to fail (see §4.3 of agency design).
+    // PendingEval is the eval-gated state — it means "done but eval pending",
+    // so evaluation must accept it (otherwise every .evaluate-X auto-fails).
     match task.status {
-        Status::Done | Status::Failed => {}
+        Status::Done | Status::Failed | Status::PendingEval => {}
         ref other => {
             bail!(
-                "Task '{}' has status {:?} — must be done or failed to evaluate",
+                "Task '{}' has status {:?} — must be done, failed, or pending-eval to evaluate",
                 task_id,
                 other
             );
@@ -237,7 +316,75 @@ pub fn run(
         })
         .collect();
 
+    // Step 3.75: Collect child task context for decomposition detection.
+    // Find tasks that have this task as a dependency (tasks where `task.after` contains current task_id).
+    let child_tasks: Vec<(String, String, Option<String>)> = graph
+        .tasks()
+        .filter(|t| t.after.contains(&task_id.to_string()))
+        .map(|child| {
+            let status_str = format!("{:?}", child.status);
+            let desc = child.description.clone();
+            (child.title.clone(), status_str, desc)
+        })
+        .collect();
+
+    // Step 3.8: Load FLIP score and verify findings (if available)
+    let flip_score = {
+        let evals_dir = agency_dir.join("evaluations");
+        let all_evals = load_all_evaluations_or_warn(&evals_dir);
+        all_evals
+            .iter()
+            .find(|e| e.task_id == task_id && e.source == eval_source::FLIP)
+            .map(|e| e.score)
+    };
+
+    let verify_task_id = format!(".verify-{}", task_id);
+    let verify_task_data = graph.get_task(&verify_task_id);
+    let verify_status_owned: Option<String> = verify_task_data.and_then(|vt| match vt.status {
+        Status::Done => Some("passed".to_string()),
+        Status::Failed => Some("failed".to_string()),
+        _ => None,
+    });
+    let verify_findings_owned: Option<String> = verify_task_data.and_then(|vt| {
+        if vt.log.is_empty() {
+            None
+        } else {
+            let entries: Vec<String> = vt
+                .log
+                .iter()
+                .map(|entry| {
+                    let actor = entry.actor.as_deref().unwrap_or("system");
+                    format!("[{}] ({}): {}", entry.timestamp, actor, entry.message)
+                })
+                .collect();
+            Some(entries.join("\n"))
+        }
+    });
+
+    // Step 3.9: Run constraint-fidelity lint on the task description (deterministic, no LLM).
+    let cf_result = if let Some(desc) = task.description.as_deref() {
+        let user_message = find_originating_user_message(dir, task);
+        Some(workgraph::agency::constraint_fidelity::lint_task_description(
+            desc,
+            user_message.as_deref(),
+        ))
+    } else {
+        None
+    };
+    let cf_score = cf_result
+        .as_ref()
+        .filter(|cf| cf.total_constraints > 0)
+        .map(|cf| cf.score);
+    let cf_unanchored = cf_result
+        .as_ref()
+        .filter(|cf| cf.total_constraints > 0)
+        .map(|cf| cf.unanchored_constraints);
+
     // Step 4: Build evaluator prompt
+    let evaluated_outcome = role
+        .as_ref()
+        .and_then(|r| resolve_outcome(&r.outcome_id, &agency_dir));
+    let evaluated_outcome_name = evaluated_outcome.as_ref().map(|o| o.name.as_str());
     let evaluator_input = EvaluatorInput {
         task_title: &task.title,
         task_description: task.description.as_deref(),
@@ -253,6 +400,13 @@ pub fn run(
         artifact_diff: artifact_diff.as_deref(),
         evaluator_identity: evaluator_identity.as_deref(),
         downstream_tasks: &downstream_tasks,
+        flip_score,
+        verify_status: verify_status_owned.as_deref(),
+        verify_findings: verify_findings_owned.as_deref(),
+        resolved_outcome_name: evaluated_outcome_name,
+        child_tasks: &child_tasks,
+        constraint_fidelity_score: cf_score,
+        constraint_fidelity_unanchored: cf_unanchored,
     };
 
     let prompt = render_evaluator_prompt(&evaluator_input);
@@ -296,18 +450,44 @@ pub fn run(
     // Step 6: Run lightweight LLM call for evaluation (replaces claude --print)
     println!("Evaluating task '{}' with model '{}'...", task_id, model);
 
-    let timeout_secs = config.agency.triage_timeout.unwrap_or(60);
-    let eval_result = workgraph::service::llm::run_lightweight_llm_call(
-        &config,
-        workgraph::config::DispatchRole::Evaluator,
-        &prompt,
-        timeout_secs,
-    )
-    .context("Evaluation LLM call failed")?;
+    // Eval calls can be slow with large task outputs — use a generous timeout.
+    // The triage_timeout is designed for short triage calls; evals need more.
+    let timeout_secs = config.agency.triage_timeout.unwrap_or(60).max(300);
 
-    // Step 7: Parse the JSON output from the evaluator
-    let eval_json =
-        extract_json(&eval_result.text).context("Failed to extract valid JSON from evaluator output")?;
+    // Retry LLM call up to 3 times if JSON extraction fails (transient format failures)
+    let (eval_json, eval_token_usage) = {
+        let mut last_text = String::new();
+        let mut extracted = None;
+        let mut token_usage = None;
+        for attempt in 1..=3 {
+            let eval_result = workgraph::service::llm::run_lightweight_llm_call(
+                &config,
+                workgraph::config::DispatchRole::Evaluator,
+                &prompt,
+                timeout_secs,
+            )
+            .context("Evaluation LLM call failed")?;
+            last_text = eval_result.text;
+            token_usage = eval_result.token_usage;
+            if let Some(json) = extract_json(&last_text) {
+                extracted = Some(json);
+                break;
+            }
+            if attempt < 3 {
+                eprintln!(
+                    "[evaluate] JSON extraction failed, retrying ({}/3)...",
+                    attempt
+                );
+            }
+        }
+        let json = extracted.with_context(|| {
+            format!(
+                "Failed to extract valid JSON from evaluator output after 3 attempts. Last response:\n{}",
+                last_text
+            )
+        })?;
+        (json, token_usage)
+    };
 
     let parsed: EvalOutput = serde_json::from_str(&eval_json)
         .with_context(|| format!("Failed to parse evaluator JSON:\n{}", eval_json))?;
@@ -328,6 +508,16 @@ pub fn run(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let eval_id = format!("eval-{}-{}", task_id, timestamp.replace(':', "-"));
 
+    let mut dimensions = parsed.dimensions;
+    if let Some(fs) = flip_score {
+        dimensions.insert("intent_fidelity".to_string(), fs);
+    }
+
+    // Step 7.5: Inject constraint-fidelity score (computed in Step 3.9).
+    if let Some(score) = cf_score {
+        dimensions.insert("constraint_fidelity".to_string(), score);
+    }
+
     let evaluation = Evaluation {
         id: eval_id,
         task_id: task_id.to_string(),
@@ -335,7 +525,7 @@ pub fn run(
         role_id: role_id.clone(),
         tradeoff_id: tradeoff_id.clone(),
         score: parsed.score,
-        dimensions: parsed.dimensions,
+        dimensions,
         notes: parsed.notes,
         evaluator: format!("claude:{}", model),
         timestamp,
@@ -367,6 +557,13 @@ pub fn run(
                 println!("Model:      {}", m);
             }
             println!("Score:      {:.2}", evaluation.score);
+            if let Some(f) = evaluation.dimensions.get("intent_fidelity") {
+                println!("  intent_fidelity:        {:.2}", f);
+            }
+            if let Some(cf) = evaluation.dimensions.get("constraint_fidelity") {
+                let flag = if *cf < 0.5 { " \x1b[33m⚠ unanchored constraints\x1b[0m" } else { "" };
+                println!("  constraint_fidelity:    {:.2}{}", cf, flag);
+            }
             // Individual quality dimensions
             if let Some(c) = evaluation.dimensions.get("correctness") {
                 println!("  correctness:            {:.2}", c);
@@ -430,16 +627,22 @@ pub fn run(
     }
 
     // Step 8.5: Persist token usage to the .evaluate-* task
-    if let Some(usage) = eval_result.token_usage {
+    if let Some(ref usage) = eval_token_usage {
         let eval_task_id = format!(".evaluate-{}", task_id);
         let graph_path = super::graph_path(dir);
-        if let Ok(lock) = lock_graph_file(&graph_path) {
-            if let Ok(mut graph) = load_graph_locked(&graph_path, &lock) {
-                if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
-                    eval_task.token_usage = Some(usage);
-                    let _ = save_graph_locked(&graph, &graph_path, &lock);
-                }
+        let usage_clone = usage.clone();
+        let _ = workgraph::parser::modify_graph(&graph_path, |graph| {
+            if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
+                eval_task.token_usage = Some(usage_clone.clone());
+                true
+            } else {
+                false
             }
+        });
+        // Emit machine-readable token summary for inline eval capture.
+        // The spawn_eval_inline script greps for this line and calls `wg tokens`.
+        if let Ok(json) = serde_json::to_string(usage) {
+            eprintln!("__WG_TOKENS__:{}", json);
         }
     }
 
@@ -447,6 +650,55 @@ pub fn run(
     let rejected = check_eval_gate(dir, task_id, &task.tags, &evaluation, &config, json)?;
     if rejected && !json {
         println!("  REJECTED: task '{}' failed by evaluation gate", task_id);
+    }
+
+    // Step 8.7: LLM verification gate (docs/design/llm-verification-gate.md).
+    // When the source task opted in via validation="llm" and is currently
+    // PendingValidation, translate the evaluation score/notes into a gate
+    // decision and apply approve/reject/escalate accordingly.
+    // `rejected` above means the score gate already failed the task; no need
+    // to double-reject.
+    let is_llm_gated = task.validation.as_deref() == Some("llm");
+    if !rejected && is_llm_gated {
+        // Re-load to see current state (check_eval_gate may have mutated).
+        let path = super::graph_path(dir);
+        let graph2 = workgraph::parser::load_graph(&path).ok();
+        let still_pending = graph2
+            .as_ref()
+            .and_then(|g| g.get_task(task_id))
+            .map(|t| t.status == Status::PendingValidation)
+            .unwrap_or(false);
+        if still_pending {
+            let gate = GateDecision::from_evaluation(&evaluation, &config);
+            match apply_gate_decision(dir, task_id, &gate, &config) {
+                Ok(action) => {
+                    if !json {
+                        match action {
+                            GateAction::Approved => {
+                                println!(
+                                    "  LLM gate: approved '{}' (score {:.2})",
+                                    task_id, evaluation.score
+                                )
+                            }
+                            GateAction::Rejected => {
+                                println!(
+                                    "  LLM gate: rejected '{}' (score {:.2})",
+                                    task_id, evaluation.score
+                                )
+                            }
+                            GateAction::Held => {
+                                println!(
+                                    "  LLM gate: '{}' held for human review (score {:.2})",
+                                    task_id, evaluation.score
+                                )
+                            }
+                            GateAction::Skipped => {}
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Warning: LLM gate application failed: {}", e),
+            }
+        }
     }
 
     // Step 9: Record evaluator agent performance (if evaluator_agent is configured)
@@ -519,12 +771,14 @@ pub fn run_flip(
     let graph = load_graph(&path)?;
     let task = graph.get_task_or_err(task_id)?;
 
-    // Verify task is done or failed
+    // Verify task is done, failed, or pending-eval.
+    // PendingEval is the eval-gated state — accept it so .flip-X tasks can
+    // run while the parent waits for eval scoring.
     match task.status {
-        Status::Done | Status::Failed => {}
+        Status::Done | Status::Failed | Status::PendingEval => {}
         ref other => {
             bail!(
-                "Task '{}' has status {:?} — must be done or failed to evaluate",
+                "Task '{}' has status {:?} — must be done, failed, or pending-eval to evaluate",
                 task_id,
                 other
             );
@@ -593,18 +847,41 @@ pub fn run_flip(
     let log_entries = &task.log;
     let artifact_diff = compute_artifact_diff(artifacts, task.started_at.as_deref());
 
-    // Determine models for each phase via model routing
-    let inference_model = evaluator_model
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| {
+    // Determine models for each phase.
+    // Priority: CLI --evaluator-model > per-task model > config (DispatchRole) > tier default
+    let task_model = extract_spawn_model(&task.log).or_else(|| task.model.clone());
+
+    let (inference_model, inference_source) = if let Some(m) = evaluator_model {
+        (m.to_string(), "cli-override")
+    } else if let Some(ref m) = task_model {
+        // Per-task model: FLIP should probe the same 'mind' that did the work
+        (m.clone(), "task-model")
+    } else {
+        (
             config
                 .resolve_model_for_role(workgraph::config::DispatchRole::FlipInference)
-                .model
-        });
+                .model,
+            "config",
+        )
+    };
 
-    let comparison_model = config
-        .resolve_model_for_role(workgraph::config::DispatchRole::FlipComparison)
-        .model;
+    let (comparison_model, comparison_source) = if let Some(m) = evaluator_model {
+        (m.to_string(), "cli-override")
+    } else if let Some(ref m) = task_model {
+        (m.clone(), "task-model")
+    } else {
+        (
+            config
+                .resolve_model_for_role(workgraph::config::DispatchRole::FlipComparison)
+                .model,
+            "config",
+        )
+    };
+
+    eprintln!(
+        "FLIP models: inference='{}' ({}), comparison='{}' ({})",
+        inference_model, inference_source, comparison_model, comparison_source
+    );
 
     // --- Phase 1: Inference ---
     let inference_input = FlipInferenceInput {
@@ -640,16 +917,42 @@ pub fn run_flip(
         inference_model
     );
 
-    let flip_timeout = config.agency.triage_timeout.unwrap_or(60);
-    let inference_result = workgraph::service::llm::run_lightweight_llm_call(
-        &config,
-        workgraph::config::DispatchRole::FlipInference,
-        &inference_prompt,
-        flip_timeout,
-    )
-    .context("FLIP inference LLM call failed")?;
-    let inference_json = extract_json(&inference_result.text)
-        .context("Failed to extract JSON from FLIP inference output")?;
+    let flip_timeout = config.agency.triage_timeout.unwrap_or(60).max(300);
+
+    // Retry LLM call up to 3 times if JSON extraction fails (transient format failures)
+    let (inference_json, inference_token_usage) = {
+        let mut last_text = String::new();
+        let mut extracted = None;
+        let mut token_usage = None;
+        for attempt in 1..=3 {
+            let inference_result = workgraph::service::llm::run_lightweight_llm_call(
+                &config,
+                workgraph::config::DispatchRole::FlipInference,
+                &inference_prompt,
+                flip_timeout,
+            )
+            .context("FLIP inference LLM call failed")?;
+            last_text = inference_result.text;
+            token_usage = inference_result.token_usage;
+            if let Some(json) = extract_json(&last_text) {
+                extracted = Some(json);
+                break;
+            }
+            if attempt < 3 {
+                eprintln!(
+                    "[evaluate] JSON extraction failed, retrying ({}/3)...",
+                    attempt
+                );
+            }
+        }
+        let json = extracted.with_context(|| {
+            format!(
+                "Failed to extract JSON from FLIP inference output after 3 attempts. Last response:\n{}",
+                last_text
+            )
+        })?;
+        (json, token_usage)
+    };
 
     let parsed_inference: FlipInferenceOutput = serde_json::from_str(&inference_json)
         .with_context(|| format!("Failed to parse FLIP inference JSON:\n{}", inference_json))?;
@@ -673,15 +976,40 @@ pub fn run_flip(
         comparison_model
     );
 
-    let comparison_result = workgraph::service::llm::run_lightweight_llm_call(
-        &config,
-        workgraph::config::DispatchRole::FlipComparison,
-        &comparison_prompt,
-        flip_timeout,
-    )
-    .context("FLIP comparison LLM call failed")?;
-    let comparison_json = extract_json(&comparison_result.text)
-        .context("Failed to extract JSON from FLIP comparison output")?;
+    // Retry LLM call up to 3 times if JSON extraction fails (transient format failures)
+    let (comparison_json, comparison_token_usage) = {
+        let mut last_text = String::new();
+        let mut extracted = None;
+        let mut token_usage = None;
+        for attempt in 1..=3 {
+            let comparison_result = workgraph::service::llm::run_lightweight_llm_call(
+                &config,
+                workgraph::config::DispatchRole::FlipComparison,
+                &comparison_prompt,
+                flip_timeout,
+            )
+            .context("FLIP comparison LLM call failed")?;
+            last_text = comparison_result.text;
+            token_usage = comparison_result.token_usage;
+            if let Some(json) = extract_json(&last_text) {
+                extracted = Some(json);
+                break;
+            }
+            if attempt < 3 {
+                eprintln!(
+                    "[evaluate] JSON extraction failed, retrying ({}/3)...",
+                    attempt
+                );
+            }
+        }
+        let json = extracted.with_context(|| {
+            format!(
+                "Failed to extract JSON from FLIP comparison output after 3 attempts. Last response:\n{}",
+                last_text
+            )
+        })?;
+        (json, token_usage)
+    };
 
     let parsed_comparison: FlipComparisonOutput = serde_json::from_str(&comparison_json)
         .with_context(|| format!("Failed to parse FLIP comparison JSON:\n{}", comparison_json))?;
@@ -692,8 +1020,6 @@ pub fn run_flip(
         .map(|a| a.id.clone())
         .unwrap_or_default();
 
-    let task_model = extract_spawn_model(&task.log).or_else(|| task.model.clone());
-
     let timestamp = chrono::Utc::now().to_rfc3339();
     let eval_id = format!("flip-{}-{}", task_id, timestamp.replace(':', "-"));
 
@@ -701,7 +1027,9 @@ pub fn run_flip(
     let flip_metadata = serde_json::json!({
         "inferred_prompt": parsed_inference.inferred_prompt,
         "inference_model": inference_model,
+        "inference_source": inference_source,
         "comparison_model": comparison_model,
+        "comparison_source": comparison_source,
     });
 
     let notes = format!(
@@ -768,7 +1096,8 @@ pub fn run_flip(
 
             // Show a snippet of the inferred prompt
             let snippet = if parsed_inference.inferred_prompt.len() > 200 {
-                format!("{}...", &parsed_inference.inferred_prompt[..200])
+                let end = parsed_inference.inferred_prompt.floor_char_boundary(200);
+                format!("{}...", &parsed_inference.inferred_prompt[..end])
             } else {
                 parsed_inference.inferred_prompt.clone()
             };
@@ -806,21 +1135,23 @@ pub fn run_flip(
         }
     }
 
-    // Persist combined token usage from both FLIP phases to the .evaluate-* task
-    let combined_usage = combine_token_usage(&[
-        inference_result.token_usage,
-        comparison_result.token_usage,
-    ]);
-    if let Some(usage) = combined_usage {
-        let eval_task_id = format!(".evaluate-{}", task_id);
+    // Persist combined token usage from both FLIP phases to the .flip-* task
+    let combined_usage = combine_token_usage(&[inference_token_usage, comparison_token_usage]);
+    if let Some(ref usage) = combined_usage {
+        let eval_task_id = format!(".flip-{}", task_id);
         let graph_path = super::graph_path(dir);
-        if let Ok(lock) = lock_graph_file(&graph_path) {
-            if let Ok(mut graph) = load_graph_locked(&graph_path, &lock) {
-                if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
-                    eval_task.token_usage = Some(usage);
-                    let _ = save_graph_locked(&graph, &graph_path, &lock);
-                }
+        let usage_clone = usage.clone();
+        let _ = workgraph::parser::modify_graph(&graph_path, |graph| {
+            if let Some(eval_task) = graph.get_task_mut(&eval_task_id) {
+                eval_task.token_usage = Some(usage_clone.clone());
+                true
+            } else {
+                false
             }
+        });
+        // Emit machine-readable token summary for inline eval capture.
+        if let Ok(json) = serde_json::to_string(usage) {
+            eprintln!("__WG_TOKENS__:{}", json);
         }
     }
 
@@ -1044,7 +1375,7 @@ pub fn run_show(
                         if e.agent_id.is_empty() {
                             "-"
                         } else {
-                            &e.agent_id[..e.agent_id.len().min(10)]
+                            &e.agent_id[..e.agent_id.floor_char_boundary(10)]
                         },
                         e.timestamp
                     );
@@ -1106,17 +1437,17 @@ pub fn run_show(
             let agent_display = if e.agent_id.is_empty() {
                 "-"
             } else if e.agent_id.len() > 10 {
-                &e.agent_id[..10]
+                &e.agent_id[..e.agent_id.floor_char_boundary(10)]
             } else {
                 &e.agent_id
             };
             let task_display = if e.task_id.len() > 18 {
-                &e.task_id[..18]
+                &e.task_id[..e.task_id.floor_char_boundary(18)]
             } else {
                 &e.task_id
             };
             let source_display = if e.source.len() > 14 {
-                &e.source[..14]
+                &e.source[..e.source.floor_char_boundary(14)]
             } else {
                 &e.source
             };
@@ -1213,6 +1544,11 @@ fn check_eval_gate(
         return Ok(false);
     }
 
+    // Skip system evaluations (infrastructure failures) - these should not trigger task failure
+    if evaluation.source == "system" {
+        return Ok(false);
+    }
+
     // Check if score is below threshold
     if evaluation.score >= threshold {
         return Ok(false); // Score is acceptable
@@ -1253,10 +1589,311 @@ fn check_eval_gate(
         }
     }
 
-    // Reject the original task
-    super::fail::run_eval_reject(dir, task_id, Some(&reason))?;
+    // Auto-rescue: evaluation-drives-remediation. Per the in-place-eval
+    // design (2026-04-27): when the eval gate fails, we DON'T spawn a
+    // fresh rescue task with a new agent identity. Instead we transition
+    // the SAME task back from PendingEval → Open, keeping `task.agent`
+    // (the persona hash) and the on-disk worktree intact, and let the
+    // dispatcher re-pick the same task on the next tick. The next agent
+    // sees the evaluator's notes via `previous_attempt_context` (gated
+    // by `task.rescue_count > 0` in spawn/execution.rs).
+    //
+    // Cascade-failure cap: each iteration increments `rescue_count`.
+    // When the count reaches `coordinator.max_verify_failures` (alias
+    // `max_eval_rescues`), the task transitions to Failed (terminal)
+    // instead of iterating again — the loop terminates and a human can
+    // triage.
+    if config.agency.auto_rescue_on_eval_fail {
+        let max_rescues = config.coordinator.max_verify_failures;
+        let path = super::graph_path(dir);
+        let prior_rescue_count = workgraph::parser::load_graph(&path)
+            .ok()
+            .and_then(|g| g.get_task(task_id).map(|t| t.rescue_count))
+            .unwrap_or(0);
 
+        if max_rescues > 0 && prior_rescue_count >= max_rescues {
+            // Cap reached — terminal failure so the loop ends.
+            super::fail::run_eval_reject(dir, task_id, Some(&reason))?;
+            let msg = format!(
+                "  [eval-rescue] cap reached: '{}' has been rescued {} time(s) \
+                 (max_verify_failures = {}). Leaving task Failed for triage.",
+                task_id, prior_rescue_count, max_rescues
+            );
+            if json {
+                eprintln!("{}", msg);
+            } else {
+                println!("{}", msg);
+            }
+            // Append a clear log entry on the failed task so wg show records
+            // why no further iteration spawned.
+            let cap_msg = format!(
+                "Auto-rescue cap reached ({}/{}); no further in-place iteration",
+                prior_rescue_count, max_rescues
+            );
+            let _ = workgraph::parser::modify_graph(&path, |graph| {
+                if let Some(task) = graph.get_task_mut(task_id) {
+                    task.log.push(workgraph::graph::LogEntry {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        actor: None,
+                        user: Some(workgraph::current_user()),
+                        message: cap_msg.clone(),
+                    });
+                    return true;
+                }
+                false
+            });
+            return Ok(true);
+        }
+
+        // In-place iteration: PendingEval → Open, preserving `task.agent`
+        // identity hash and (transitively) the agent's worktree on disk
+        // (`is_safe_to_reap` requires Status::Done, so a non-terminal
+        // task keeps its worktree). Clear `task.assigned` so the
+        // dispatcher will re-pick this task on the next tick.
+        let next_count = prior_rescue_count.saturating_add(1);
+        let log_msg = format!(
+            "Eval rescue {}/{}: score {:.2} below threshold {:.2}. \
+             Re-iterating in place (same agent identity, same worktree). \
+             Evaluator notes: {}",
+            next_count,
+            max_rescues,
+            evaluation.score,
+            threshold,
+            evaluation.notes
+        );
+        let mutated = workgraph::parser::modify_graph(&path, |graph| {
+            if let Some(task) = graph.get_task_mut(task_id) {
+                task.status = workgraph::graph::Status::Open;
+                task.rescue_count = next_count;
+                task.assigned = None;
+                task.failure_reason = None;
+                task.log.push(workgraph::graph::LogEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    actor: Some("evaluator".to_string()),
+                    user: Some(workgraph::current_user()),
+                    message: log_msg.clone(),
+                });
+                return true;
+            }
+            false
+        });
+
+        if mutated.is_ok() {
+            let msg = format!(
+                "  [eval-rescue] '{}' → Open (in-place iteration {}/{}); \
+                 same agent identity + worktree preserved",
+                task_id, next_count, max_rescues
+            );
+            if json {
+                eprintln!("{}", msg);
+            } else {
+                println!("{}", msg);
+            }
+        } else {
+            // Non-fatal: log and surface so the eval still records.
+            eprintln!(
+                "\x1b[33mwarning:\x1b[0m in-place eval rescue failed to update graph for '{}'",
+                task_id
+            );
+        }
+
+        return Ok(true);
+    }
+
+    // No auto-rescue configured: classic fail-reject path.
+    super::fail::run_eval_reject(dir, task_id, Some(&reason))?;
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// LLM verification gate — per docs/design/llm-verification-gate.md
+// ---------------------------------------------------------------------------
+
+/// The gate verdict produced by the evaluator for `validation = "llm"` tasks.
+///
+/// Maps to the `decision` field in the `gate` block of the evaluator's JSON
+/// output. Derived from the overall score when no explicit gate block is
+/// present (see `GateDecision::from_evaluation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    Pass,
+    Fail,
+    Uncertain,
+}
+
+/// Action taken by `apply_gate_decision`. Returned for observability and
+/// used by callers to wire further side effects (notifications, rescue, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAction {
+    /// Source task was approved (transitioned PendingValidation → Done).
+    Approved,
+    /// Source task was rejected (wg reject was called — reopen or fail).
+    Rejected,
+    /// Source task stayed in PendingValidation awaiting human adjudication.
+    Held,
+    /// Source task was not in PendingValidation — gate took no action.
+    Skipped,
+}
+
+/// The structured gate decision the evaluator produces for a gated task.
+///
+/// Parallels the `gate` block of the extended `EvalOutput` in the design.
+#[derive(Debug, Clone)]
+pub struct GateDecision {
+    pub decision: GateVerdict,
+    pub confidence: f64,
+    pub must_fix: Vec<String>,
+    pub rationale: String,
+}
+
+impl GateDecision {
+    /// Derive a gate decision from a plain evaluation score/notes when the
+    /// evaluator did not emit an explicit gate block. Uses the configured
+    /// `eval_gate_threshold` and `gate_confidence_threshold` as bands:
+    /// - score >= gate_confidence_threshold → Pass, confidence = score
+    /// - score < fail_cutoff (0.4 by default)  → Fail, confidence = 1 - score
+    /// - otherwise                             → Uncertain, confidence = low
+    pub fn from_evaluation(evaluation: &Evaluation, config: &Config) -> Self {
+        let pass_threshold = config.agency.gate_confidence_threshold;
+        let fail_cutoff = 0.4f64;
+        if evaluation.score >= pass_threshold {
+            GateDecision {
+                decision: GateVerdict::Pass,
+                confidence: evaluation.score,
+                must_fix: Vec::new(),
+                rationale: evaluation.notes.clone(),
+            }
+        } else if evaluation.score < fail_cutoff {
+            GateDecision {
+                decision: GateVerdict::Fail,
+                confidence: 1.0 - evaluation.score,
+                must_fix: if evaluation.notes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![evaluation.notes.clone()]
+                },
+                rationale: evaluation.notes.clone(),
+            }
+        } else {
+            GateDecision {
+                decision: GateVerdict::Uncertain,
+                confidence: (pass_threshold - evaluation.score).abs().max(0.1),
+                must_fix: Vec::new(),
+                rationale: evaluation.notes.clone(),
+            }
+        }
+    }
+}
+
+/// Apply a gate decision to a source task that is in PendingValidation
+/// because its `validation = "llm"`.
+///
+/// - Pass + confidence ≥ threshold → approve::run (→ Done)
+/// - Fail + confidence ≥ threshold → reject::run (→ Open or Failed)
+/// - Uncertain or low-confidence    → policy-driven (escalate / retry / fail-closed)
+///
+/// Always increments `gate_attempts` and logs the decision on the task.
+/// Returns the action taken so callers can wire notifications.
+pub fn apply_gate_decision(
+    dir: &Path,
+    task_id: &str,
+    gate: &GateDecision,
+    config: &Config,
+) -> Result<GateAction> {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        bail!("Workgraph not initialized. Run `wg init` first.");
+    }
+
+    // Snapshot prerequisites and always bump gate_attempts so the caller
+    // (and the escalate / retry policies) see the same counter.
+    let mut is_pending = false;
+    let mut attempts_now: u32 = 0;
+    let mut validation_is_llm = false;
+    let _ = workgraph::parser::modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(task_id) {
+            Some(t) => t,
+            None => return false,
+        };
+        is_pending = matches!(task.status, Status::PendingValidation);
+        validation_is_llm = task.validation.as_deref() == Some("llm");
+        task.gate_attempts = task.gate_attempts.saturating_add(1);
+        attempts_now = task.gate_attempts;
+        let verdict = match gate.decision {
+            GateVerdict::Pass => "pass",
+            GateVerdict::Fail => "fail",
+            GateVerdict::Uncertain => "uncertain",
+        };
+        task.log.push(LogEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            actor: None,
+            user: Some(workgraph::current_user()),
+            message: format!(
+                "LLM gate decision: {} (confidence {:.2}, attempts {}/{}). {}",
+                verdict,
+                gate.confidence,
+                attempts_now,
+                config.agency.gate_max_attempts,
+                gate.rationale
+            ),
+        });
+        true
+    })
+    .context("Failed to save graph for gate decision")?;
+
+    if !is_pending {
+        return Ok(GateAction::Skipped);
+    }
+    if !validation_is_llm {
+        // The source task is PendingValidation but not llm-mode — leave it
+        // alone; the existing external-validation path controls it.
+        return Ok(GateAction::Held);
+    }
+
+    let threshold = config.agency.gate_confidence_threshold;
+    let high_conf = gate.confidence >= threshold;
+    let over_budget = attempts_now >= config.agency.gate_max_attempts;
+
+    match (gate.decision, high_conf, over_budget) {
+        (GateVerdict::Pass, true, _) => {
+            super::approve::run(dir, task_id)?;
+            Ok(GateAction::Approved)
+        }
+        (GateVerdict::Fail, true, _) => {
+            let reason = if gate.must_fix.is_empty() {
+                gate.rationale.clone()
+            } else {
+                format!(
+                    "LLM gate rejected (confidence {:.2}). Must fix:\n- {}",
+                    gate.confidence,
+                    gate.must_fix.join("\n- ")
+                )
+            };
+            super::reject::run(dir, task_id, &reason)?;
+            Ok(GateAction::Rejected)
+        }
+        _ => {
+            // Uncertain, low-confidence, or over-budget: policy-driven.
+            match config.agency.gate_uncertain_policy.as_str() {
+                "fail-closed" => {
+                    let reason = format!(
+                        "LLM gate uncertain (confidence {:.2}, attempts {}): {}",
+                        gate.confidence, attempts_now, gate.rationale
+                    );
+                    super::reject::run(dir, task_id, &reason)?;
+                    Ok(GateAction::Rejected)
+                }
+                "retry" if !over_budget => {
+                    // Leave in PendingValidation so the coordinator can
+                    // re-dispatch another eval. The gate_attempts counter
+                    // we just bumped prevents runaway.
+                    Ok(GateAction::Held)
+                }
+                // "escalate" (default) or "retry" over budget
+                _ => Ok(GateAction::Held),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1314,5 +1951,548 @@ mod tests {
         assert!((parsed.score - 0.82).abs() < f64::EPSILON);
         assert_eq!(parsed.dimensions.len(), 4);
         assert_eq!(parsed.notes, "Well implemented but could be more efficient");
+    }
+
+    #[test]
+    fn flip_score_injected_as_intent_fidelity() {
+        let parsed = EvalOutput {
+            score: 0.80,
+            dimensions: {
+                let mut d = HashMap::new();
+                d.insert("correctness".to_string(), 0.9);
+                d
+            },
+            notes: "good".to_string(),
+        };
+        let flip_score: Option<f64> = Some(0.75);
+
+        let mut dimensions = parsed.dimensions;
+        if let Some(fs) = flip_score {
+            dimensions.insert("intent_fidelity".to_string(), fs);
+        }
+
+        assert_eq!(dimensions.get("intent_fidelity"), Some(&0.75));
+        assert_eq!(dimensions.get("correctness"), Some(&0.9));
+        assert_eq!(dimensions.len(), 2);
+    }
+
+    #[test]
+    fn no_intent_fidelity_when_flip_score_none() {
+        let parsed = EvalOutput {
+            score: 0.80,
+            dimensions: {
+                let mut d = HashMap::new();
+                d.insert("correctness".to_string(), 0.9);
+                d
+            },
+            notes: "good".to_string(),
+        };
+        let flip_score: Option<f64> = None;
+
+        let mut dimensions = parsed.dimensions;
+        if let Some(fs) = flip_score {
+            dimensions.insert("intent_fidelity".to_string(), fs);
+        }
+
+        assert!(dimensions.get("intent_fidelity").is_none());
+        assert_eq!(dimensions.len(), 1);
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // '─' is a 3-byte UTF-8 char (E2 94 80).
+        // Build a string where a naive byte slice at 10 would land inside a multi-byte char.
+        let text = "ab─cd─ef─gh─ij"; // bytes: a(1) b(1) ─(3) c(1) d(1) ─(3) ...
+        assert!(text.len() > 10);
+
+        // Naive &text[..10] would panic because byte 10 is inside '─'.
+        // floor_char_boundary finds the nearest valid boundary at or before 10.
+        let end = text.floor_char_boundary(10);
+        let truncated = &text[..end];
+        // Must not panic, and must be valid UTF-8 (guaranteed by &str).
+        assert!(truncated.len() <= 10);
+        assert!(text.is_char_boundary(end));
+
+        // Also test with emoji (4-byte char)
+        let emoji_text = "hello 🎉 world";
+        let end2 = emoji_text.floor_char_boundary(8);
+        let truncated2 = &emoji_text[..end2];
+        assert!(truncated2.len() <= 8);
+        assert!(emoji_text.is_char_boundary(end2));
+    }
+
+    // -------------------------------------------------------------------
+    // LLM gate decision tests (docs/design/llm-verification-gate.md)
+    // -------------------------------------------------------------------
+
+    use std::fs;
+    use tempfile::tempdir;
+    use workgraph::graph::{Node, Task, WorkGraph};
+    use workgraph::parser::{load_graph, save_graph};
+
+    fn setup_gate_fixture(dir: &Path, validation: Option<&str>) -> std::path::PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = super::super::graph_path(dir);
+        let mut graph = WorkGraph::new();
+        let task = Task {
+            id: "t1".to_string(),
+            title: "Test llm-gated task".to_string(),
+            status: Status::PendingValidation,
+            validation: validation.map(String::from),
+            ..Task::default()
+        };
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, &path).unwrap();
+        path
+    }
+
+    fn cfg_with_threshold(threshold: f64) -> Config {
+        let mut cfg = Config::default();
+        cfg.agency.gate_confidence_threshold = threshold;
+        cfg
+    }
+
+    #[test]
+    fn test_llm_verify_pass() {
+        // Pass decision with confidence above threshold → source task
+        // transitions PendingValidation → Done via approve.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_gate_fixture(dir_path, Some("llm"));
+
+        let config = cfg_with_threshold(0.7);
+        let gate = GateDecision {
+            decision: GateVerdict::Pass,
+            confidence: 0.9,
+            must_fix: vec![],
+            rationale: "all criteria met".to_string(),
+        };
+
+        let action = apply_gate_decision(dir_path, "t1", &gate, &config).unwrap();
+        assert_eq!(action, GateAction::Approved);
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Done);
+        assert_eq!(task.gate_attempts, 1);
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("LLM gate decision: pass"))
+        );
+    }
+
+    #[test]
+    fn test_llm_verify_fail() {
+        // Fail decision with confidence above threshold → source task
+        // transitions PendingValidation → Open (for re-dispatch) via reject.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_gate_fixture(dir_path, Some("llm"));
+
+        let config = cfg_with_threshold(0.7);
+        let gate = GateDecision {
+            decision: GateVerdict::Fail,
+            confidence: 0.95,
+            must_fix: vec!["tests are missing".to_string()],
+            rationale: "work does not match task description".to_string(),
+        };
+
+        let action = apply_gate_decision(dir_path, "t1", &gate, &config).unwrap();
+        assert_eq!(action, GateAction::Rejected);
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        // reject::run reopens the task by default (rejection_count < max)
+        assert_eq!(task.status, Status::Open);
+        assert_eq!(task.rejection_count, 1);
+        assert_eq!(task.gate_attempts, 1);
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("LLM gate decision: fail")),
+            "expected fail decision log entry"
+        );
+    }
+
+    #[test]
+    fn test_llm_verify_uncertain() {
+        // Uncertain decision → task stays in PendingValidation (escalate policy),
+        // gate_attempts is bumped so the retry/escalate logic can bound cost.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_gate_fixture(dir_path, Some("llm"));
+
+        let mut config = cfg_with_threshold(0.7);
+        config.agency.gate_uncertain_policy = "escalate".to_string();
+        let gate = GateDecision {
+            decision: GateVerdict::Uncertain,
+            confidence: 0.4,
+            must_fix: vec![],
+            rationale: "insufficient evidence to decide".to_string(),
+        };
+
+        let action = apply_gate_decision(dir_path, "t1", &gate, &config).unwrap();
+        assert_eq!(action, GateAction::Held);
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        // Stays in PendingValidation for human adjudication.
+        assert_eq!(task.status, Status::PendingValidation);
+        assert_eq!(task.gate_attempts, 1);
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("LLM gate decision: uncertain")),
+            "expected uncertain decision log entry"
+        );
+    }
+
+    #[test]
+    fn test_llm_verify_fail_closed_policy_rejects_uncertain() {
+        // fail-closed: uncertain verdicts are converted into rejections.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        setup_gate_fixture(dir_path, Some("llm"));
+
+        let mut config = cfg_with_threshold(0.7);
+        config.agency.gate_uncertain_policy = "fail-closed".to_string();
+        let gate = GateDecision {
+            decision: GateVerdict::Uncertain,
+            confidence: 0.4,
+            must_fix: vec![],
+            rationale: "ambiguous".to_string(),
+        };
+
+        let action = apply_gate_decision(dir_path, "t1", &gate, &config).unwrap();
+        assert_eq!(action, GateAction::Rejected);
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+        assert_eq!(task.status, Status::Open);
+    }
+
+    #[test]
+    fn test_gate_decision_from_evaluation_score_bands() {
+        let config = cfg_with_threshold(0.7);
+        let mk_eval = |score: f64| Evaluation {
+            id: "e".into(),
+            task_id: "t1".into(),
+            agent_id: String::new(),
+            role_id: String::new(),
+            tradeoff_id: String::new(),
+            score,
+            dimensions: HashMap::new(),
+            notes: String::new(),
+            evaluator: String::new(),
+            timestamp: String::new(),
+            model: None,
+            source: String::new(),
+        };
+        assert_eq!(
+            GateDecision::from_evaluation(&mk_eval(0.9), &config).decision,
+            GateVerdict::Pass
+        );
+        assert_eq!(
+            GateDecision::from_evaluation(&mk_eval(0.3), &config).decision,
+            GateVerdict::Fail
+        );
+        assert_eq!(
+            GateDecision::from_evaluation(&mk_eval(0.55), &config).decision,
+            GateVerdict::Uncertain
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // In-place eval-fail iteration tests (in-place-eval task)
+    // -------------------------------------------------------------------
+
+    fn setup_eval_gate_fixture(dir: &Path, agent_hash: &str, rescue_count: u32) {
+        fs::create_dir_all(dir).unwrap();
+        let path = super::super::graph_path(dir);
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: "t1".to_string(),
+            title: "Test eval-gated task".to_string(),
+            status: Status::PendingEval,
+            agent: Some(agent_hash.to_string()),
+            assigned: Some("agent-1".to_string()),
+            tags: vec!["eval-gate".to_string()],
+            rescue_count,
+            ..Task::default()
+        }));
+        save_graph(&graph, &path).unwrap();
+    }
+
+    fn cfg_with_eval_gate(threshold: f64, max_rescues: u32) -> Config {
+        let mut cfg = Config::default();
+        cfg.agency.eval_gate_threshold = Some(threshold);
+        cfg.agency.auto_rescue_on_eval_fail = true;
+        cfg.coordinator.max_verify_failures = max_rescues;
+        cfg
+    }
+
+    fn mk_failing_eval(score: f64, notes: &str) -> Evaluation {
+        Evaluation {
+            id: "e1".into(),
+            task_id: "t1".into(),
+            agent_id: String::new(),
+            role_id: String::new(),
+            tradeoff_id: String::new(),
+            score,
+            dimensions: HashMap::new(),
+            notes: notes.to_string(),
+            evaluator: String::new(),
+            timestamp: String::new(),
+            model: None,
+            source: "llm".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_eval_fail_retries_in_place_with_same_agent() {
+        // Eval scores below threshold, rescue_count < max:
+        // task should transition PendingEval → Open with the SAME task.agent
+        // identity hash, rescue_count incremented, and NO new task created.
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let agent_hash = "0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd";
+        setup_eval_gate_fixture(dir_path, agent_hash, 0);
+
+        let config = cfg_with_eval_gate(0.7, 3);
+        let eval = mk_failing_eval(0.3, "missing tests; see notes");
+
+        let rejected = check_eval_gate(
+            dir_path,
+            "t1",
+            &["eval-gate".to_string()],
+            &eval,
+            &config,
+            true, // json mode silences stdout for tests
+        )
+        .unwrap();
+        assert!(rejected, "eval gate should report rejection");
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+
+        assert_eq!(
+            task.status,
+            Status::Open,
+            "in-place rescue: PendingEval → Open"
+        );
+        assert_eq!(
+            task.agent.as_deref(),
+            Some(agent_hash),
+            "agent identity hash MUST be preserved across in-place rescue"
+        );
+        assert_eq!(
+            task.rescue_count, 1,
+            "rescue_count should increment by 1"
+        );
+
+        // No new task created — only the original t1 in the graph.
+        let task_count = graph.tasks().count();
+        assert_eq!(
+            task_count, 1,
+            "in-place rescue must NOT create a new rescue task; saw {}",
+            task_count
+        );
+    }
+
+    #[test]
+    fn test_eval_fail_at_cap_transitions_to_failed() {
+        // rescue_count == max_eval_rescues: task should NOT iterate further;
+        // instead transition to Failed (terminal).
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let agent_hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        setup_eval_gate_fixture(dir_path, agent_hash, 3); // already at cap
+
+        let config = cfg_with_eval_gate(0.7, 3);
+        let eval = mk_failing_eval(0.2, "still broken at cap");
+
+        let rejected = check_eval_gate(
+            dir_path,
+            "t1",
+            &["eval-gate".to_string()],
+            &eval,
+            &config,
+            true,
+        )
+        .unwrap();
+        assert!(rejected);
+
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap();
+
+        assert_eq!(
+            task.status,
+            Status::Failed,
+            "at cap, in-place rescue MUST stop and transition to Failed"
+        );
+
+        // No new rescue task spawned at cap.
+        let task_count = graph.tasks().count();
+        assert_eq!(
+            task_count, 1,
+            "at cap, no further rescue task should be spawned; saw {}",
+            task_count
+        );
+    }
+
+    #[test]
+    fn test_eval_feedback_in_next_spawn_context() {
+        // After an in-place rescue, the spawn helper should inject the
+        // evaluator's notes into the next agent's previous_attempt_context.
+        // We exercise this end-to-end by:
+        //   1. Writing an evaluation JSON to .workgraph/agency/evaluations/
+        //   2. Running check_eval_gate (which transitions task to Open and
+        //      bumps rescue_count).
+        //   3. Calling build_previous_attempt_context() and asserting the
+        //      eval notes appear in the returned string.
+        use super::super::spawn::context::build_previous_attempt_context;
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let agent_hash = "feedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeed";
+        setup_eval_gate_fixture(dir_path, agent_hash, 0);
+
+        // Drop an evaluation file so build_previous_attempt_context can find
+        // it via the agency/evaluations lookup by task_id.
+        let evals_dir = dir_path.join("agency").join("evaluations");
+        fs::create_dir_all(&evals_dir).unwrap();
+        let eval_filename = "eval-t1-2026-04-27T15-00-00Z.json";
+        let eval_json = serde_json::json!({
+            "id": "eval-t1-001",
+            "task_id": "t1",
+            "score": 0.30,
+            "notes": "EVALUATOR_NOTE_FOR_TEST: implementation skipped tests",
+            "dimensions": {},
+            "evaluator": "test",
+            "timestamp": "2026-04-27T15:00:00Z",
+            "source": "llm",
+        });
+        fs::write(
+            evals_dir.join(eval_filename),
+            serde_json::to_string_pretty(&eval_json).unwrap(),
+        )
+        .unwrap();
+
+        let config = cfg_with_eval_gate(0.7, 3);
+        let eval = mk_failing_eval(0.30, "EVALUATOR_NOTE_FOR_TEST: implementation skipped tests");
+        let rejected = check_eval_gate(
+            dir_path,
+            "t1",
+            &["eval-gate".to_string()],
+            &eval,
+            &config,
+            true,
+        )
+        .unwrap();
+        assert!(rejected);
+
+        // Reload the task (now Open with rescue_count == 1).
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        let task = graph.get_task("t1").unwrap().clone();
+        assert_eq!(task.status, Status::Open);
+        assert_eq!(task.rescue_count, 1);
+
+        let ctx = build_previous_attempt_context(&task, dir_path, 4096);
+        assert!(
+            ctx.contains("EVALUATOR_NOTE_FOR_TEST"),
+            "next-spawn previous_attempt_context must include evaluator's notes; got: {:?}",
+            ctx
+        );
+    }
+
+    #[test]
+    fn test_worktree_preserved_across_eval_iteration() {
+        // After an in-place eval-fail rescue, the prior agent's worktree must
+        // not be reaped: the task is still non-terminal (Open) so
+        // is_safe_to_reap returns false, and any sweep leaves the dir alone.
+        use super::super::service::worktree::is_safe_to_reap;
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        let agent_hash = "11112222333344445555666677778888aaaabbbbccccddddeeeeffff00001111";
+        setup_eval_gate_fixture(dir_path, agent_hash, 0);
+
+        // Simulate a worktree dir on disk for agent-1 (matching task.assigned).
+        let project_root = dir_path.parent().unwrap();
+        let worktree_path = project_root.join(".wg-worktrees").join("agent-1");
+        fs::create_dir_all(&worktree_path).unwrap();
+        assert!(worktree_path.exists(), "precondition: worktree exists");
+
+        let config = cfg_with_eval_gate(0.7, 3);
+        let eval = mk_failing_eval(0.3, "incomplete");
+        check_eval_gate(
+            dir_path,
+            "t1",
+            &["eval-gate".to_string()],
+            &eval,
+            &config,
+            true,
+        )
+        .unwrap();
+
+        // Verify the worktree dir on disk is untouched by the rescue path.
+        assert!(
+            worktree_path.exists(),
+            "worktree dir for in-place rescue MUST NOT be removed during eval-fail handling"
+        );
+
+        // And: the GC safety predicate refuses to reap it because the task
+        // is now Open (non-terminal).
+        let path = super::super::graph_path(dir_path);
+        let graph = load_graph(&path).unwrap();
+        // is_safe_to_reap(graph, task_id, project_root, branch)
+        let safe = is_safe_to_reap(Some(&graph), Some("t1"), project_root, Some("dummy-branch"));
+        assert!(
+            !safe,
+            "is_safe_to_reap MUST return false for an in-place eval-rescue task (non-terminal)"
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&worktree_path);
+    }
+
+    #[test]
+    fn test_gate_skips_non_pending_task() {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+        // Task in Done status — gate is a no-op
+        fs::create_dir_all(dir_path).unwrap();
+        let path = super::super::graph_path(dir_path);
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(Task {
+            id: "t1".to_string(),
+            title: "already done".to_string(),
+            status: Status::Done,
+            validation: Some("llm".to_string()),
+            ..Task::default()
+        }));
+        save_graph(&graph, &path).unwrap();
+
+        let config = cfg_with_threshold(0.7);
+        let gate = GateDecision {
+            decision: GateVerdict::Pass,
+            confidence: 0.95,
+            must_fix: vec![],
+            rationale: String::new(),
+        };
+        let action = apply_gate_decision(dir_path, "t1", &gate, &config).unwrap();
+        assert_eq!(action, GateAction::Skipped);
+
+        let graph = load_graph(&path).unwrap();
+        // Status unchanged
+        assert_eq!(graph.get_task("t1").unwrap().status, Status::Done);
     }
 }

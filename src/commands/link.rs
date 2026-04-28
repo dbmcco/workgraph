@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::path::Path;
 use workgraph::graph::Status;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -22,42 +23,63 @@ pub fn run_link(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> {
         graph.get_task_or_err(task_id)?;
         graph.get_task_or_err(dependency_id)?;
 
+    let mut error: Option<anyhow::Error> = None;
+    let mut already_linked = false;
+    let task_id_owned = task_id.to_string();
+    let dep_id_owned = dependency_id.to_string();
+    modify_graph(&path, |graph| {
+        // Validate both tasks exist
+        if graph.get_task(&task_id_owned).is_none() {
+            error = Some(anyhow::anyhow!("Task '{}' not found", task_id_owned));
+            return false;
+        }
+        if graph.get_task(&dep_id_owned).is_none() {
+            error = Some(anyhow::anyhow!("Task '{}' not found", dep_id_owned));
+            return false;
+        }
+
+        // Warn if the task is in-progress
         if graph
-            .get_task(task_id)
+            .get_task(&task_id_owned)
             .is_some_and(|t| t.status == Status::InProgress)
         {
             eprintln!(
                 "Warning: '{}' is currently in-progress. Adding a dependency on '{}' anyway.",
-                task_id, dependency_id
+                task_id_owned, dep_id_owned
             );
         }
 
+        // Add the forward edge: task.after includes dependency
         {
-            let task = graph.get_task_mut_or_err(task_id)?;
-            if task.after.contains(&dependency_id.to_string()) {
-                return Ok(false);
+            let task = graph.get_task_mut(&task_id_owned).unwrap();
+            if task.after.contains(&dep_id_owned) {
+                already_linked = true;
+                return false;
             }
-            task.after.push(dependency_id.to_string());
+            task.after.push(dep_id_owned.clone());
         }
 
+        // Add the reverse edge: dependency.before includes task
         {
-            let dep = graph.get_task_mut_or_err(dependency_id)?;
-            if !dep.before.contains(&task_id.to_string()) {
-                dep.before.push(task_id.to_string());
+            let dep = graph.get_task_mut(&dep_id_owned).unwrap();
+            if !dep.before.contains(&task_id_owned) {
+                dep.before.push(task_id_owned.clone());
             }
         }
 
-        Ok(true)
-    })?;
-
-    if !linked {
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
+    if already_linked {
         println!(
             "'{}' already depends on '{}' — no change",
             task_id, dependency_id
         );
         return Ok(());
     }
-
     super::notify_graph_changed(dir);
 
     let config = workgraph::config::Config::load_or_default(dir);
@@ -83,9 +105,25 @@ pub fn run_unlink(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> 
         graph.get_task_or_err(task_id)?;
         graph.get_task_or_err(dependency_id)?;
 
+    let mut error: Option<anyhow::Error> = None;
+    let mut not_linked = false;
+    let task_id_owned = task_id.to_string();
+    let dep_id_owned = dependency_id.to_string();
+    modify_graph(&path, |graph| {
+        // Validate both tasks exist
+        if graph.get_task(&task_id_owned).is_none() {
+            error = Some(anyhow::anyhow!("Task '{}' not found", task_id_owned));
+            return false;
+        }
+        if graph.get_task(&dep_id_owned).is_none() {
+            error = Some(anyhow::anyhow!("Task '{}' not found", dep_id_owned));
+            return false;
+        }
+
+        // Remove the forward edge
         let removed = {
-            let task = graph.get_task_mut_or_err(task_id)?;
-            if let Some(pos) = task.after.iter().position(|x| x == dependency_id) {
+            let task = graph.get_task_mut(&task_id_owned).unwrap();
+            if let Some(pos) = task.after.iter().position(|x| x == &dep_id_owned) {
                 task.after.remove(pos);
                 true
             } else {
@@ -93,22 +131,30 @@ pub fn run_unlink(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> 
             }
         };
 
-        if removed {
-            let dep = graph.get_task_mut_or_err(dependency_id)?;
-            dep.before.retain(|b| b != task_id);
+        if !removed {
+            not_linked = true;
+            return false;
         }
 
-        Ok(removed)
-    })?;
+        // Remove the reverse edge
+        {
+            let dep = graph.get_task_mut(&dep_id_owned).unwrap();
+            dep.before.retain(|b| b != &task_id_owned);
+        }
 
-    if !removed {
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
+    if not_linked {
         println!(
             "'{}' does not depend on '{}' — no change",
             task_id, dependency_id
         );
         return Ok(());
     }
-
     super::notify_graph_changed(dir);
 
     // Record provenance
@@ -136,6 +182,7 @@ pub fn run_unlink(dir: &Path, task_id: &str, dependency_id: &str) -> Result<()> 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use workgraph::parser::load_graph;
 
     fn setup_graph(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
@@ -158,7 +205,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -168,9 +219,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -190,7 +253,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -200,9 +267,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
 
@@ -222,7 +301,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -232,9 +315,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )
         .unwrap();
     }

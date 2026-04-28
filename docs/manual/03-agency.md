@@ -1,6 +1,6 @@
 # The Agency Model
 
-A generic AI assistant is a blank slate. It has no declared priorities, no persistent personality, no way to accumulate craft. Every session starts from zero. The agency system exists to change this. It gives agents *composable identities*—a role that defines what the agent does, paired with a motivation that defines why it acts the way it does. The same role combined with a different motivation produces a different agent. This is the key insight: identity is not a name tag, it is a *function*—the Cartesian product of competence and intent.
+A generic AI assistant is a blank slate. It has no declared priorities, no persistent personality, no way to accumulate craft. Every session starts from zero. The agency system exists to change this. It gives agents *composable identities*—a role that defines what the agent does, paired with a motivation (called a *tradeoff* in the CLI—`wg tradeoff`) that defines why it acts the way it does. The same role combined with a different motivation produces a different agent. This is the key insight: identity is not a name tag, it is a *function*—the Cartesian product of competence and intent.
 
 The result is an identity space that grows combinatorially. Four roles and four motivations yield sixteen distinct agents, each with its own behavioral signature. These identities are not administrative labels. They are content-hashed, immutable, evaluable, and evolvable. An agent’s identity is a mathematical fact, verifiable by anyone who knows the hash.
 
@@ -16,11 +16,13 @@ It carries three identity-defining fields:
 
 - **Desired outcome.** What good output looks like. This is the standard against which the agent’s work will be evaluated—not a vague aspiration, but a crisp definition of success.
 
-A role also carries a *name* (a human-readable label like “Programmer” or “Architect“), a *performance* record (aggregated evaluation scores), and *lineage* metadata (evolutionary history). These are mutable—they can change without altering the role’s identity. The name is for humans. The identity is for the system.
+A role also carries mutable operational fields that do not affect its identity: a *name* (a human-readable label like “Programmer” or “Architect”), a *performance* record (aggregated evaluation scores), *lineage* metadata (evolutionary history), an optional *context scope* default (`clean`, `task`, `graph`, or `full`), and an optional *exec-mode* default (`full`, `light`, `bare`, or `shell`). When an agent with this role is dispatched, the role’s context scope and exec-mode are used as fallbacks if the task does not specify them (see the resolution priority chains in *Section 4*). The name is for humans. The identity is for the system.
 
 Consider two roles: one describes a code reviewer who checks for correctness, testing gaps, and style violations; the other describes an architect who evaluates structural decisions and dependency management. They may share some skills, but their descriptions and desired outcomes differ, so they produce different content-hash IDs—different identities, different agents, different behaviors when paired with the same motivation.
 
 ## Motivations
+
+> **Terminology note:** The CLI uses the command `wg tradeoff` for this concept. This manual uses "motivation" when discussing the conceptual model and "tradeoff" when referencing CLI commands.
 
 A motivation answers the complementary question: *why does this agent act the way it does?*
 
@@ -161,7 +163,7 @@ Both types are evaluated using the same rubric. But human agent evaluations are 
 
 ## Composition in Practice
 
-To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates four starter roles and four starter motivations:
+To make the compositional nature of agents concrete, consider a small agency seeded with `wg agency init`. This creates starter roles and starter motivations from a bundled CSV. Alternatively, `wg agency import` supports importing primitives from a local CSV file (`wg agency import path/to/file.csv`), a remote URL (`wg agency import --url <URL>`), or a configured upstream bureau (`wg agency import --upstream`). The `--dry-run` flag previews what would be imported. Change detection via manifest hashing ensures repeated imports skip already-imported entities. The default starter set includes four roles and four motivations:
 
 |                   |                         |
 |:------------------|:------------------------|
@@ -212,6 +214,19 @@ Referential integrity is enforced during transfer. When you pull an agent, its r
 Federation preserves lineage across project boundaries. An entity pulled from a remote carries its full ancestry chain. You can trace it back through mutations and crossovers to its manually created roots, even when those roots were created in a different project by a different team. The immutable nature of content-hash IDs guarantees that each link in the chain refers to the exact content that existed at creation time, no matter where it was created.
 
 The practical effect is that organizations can maintain a shared pool of proven agent identities. A team that has evolved an effective “Reviewer” role over dozens of evaluations can push it to a shared remote. Other teams pull it, pair it with their own motivations, and immediately benefit from that evolutionary history. The performance data travels with the entity, so the receiving team can see *why* the role is considered effective before deciding to adopt it.
+
+## Automation: Auto-Create and Auto-Place
+
+Two configuration options streamline the agency pipeline for projects that want minimal manual intervention:
+
+- `auto_create` (set via `wg config --auto-create`) tells the coordinator to automatically create agent identities for new tasks based on the available roles and motivations. Without it, agents must be explicitly created and assigned.
+- `auto_place` (set via `wg config --auto-place`) enables automatic placement of newly added tasks in the dependency graph. The coordinator uses heuristics to position the task near related work, respecting any placement hints (`--place-near`, `--place-before`) provided at creation time.
+
+Both options interact with the existing `auto_assign` pipeline: when all three are enabled, a new task is automatically placed, assigned an agent identity, and dispatched—the full lifecycle from creation to execution requires no manual intervention beyond the initial `wg add`.
+
+## Configuration: Creator Identity
+
+The agency configuration supports two settings that control the identity recorded on newly created entities: `creator_agent` and `creator_model`. These are set via `wg config --creator-agent <agent-hash>` and `wg config --creator-model <model>`. When configured, new roles, motivations, and agents created by the system record these values in their metadata, providing provenance for entities created programmatically (e.g., by the evolver or by automated workflows).
 
 ## Cross-References
 

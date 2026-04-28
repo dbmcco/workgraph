@@ -1,0 +1,127 @@
+{
+  "run_id": "pilot-f-5x1",
+  "condition": "F",
+  "description": "Condition F pilot: wg-native with surveillance loops",
+  "timestamp": "2026-04-06T21:14:49.545481+00:00",
+  "model": "openrouter:minimax/minimax-m2.7",
+  "max_iterations": 3,
+  "cycle_delay": "1m",
+  "total_trials": 5,
+  "passed": 5,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "mean_time_s": 55.67,
+  "model_verified_count": 5,
+  "wg_context_available": true,
+  "surveillance_loop_stats": {
+    "loops_created": 5,
+    "cycle_edges_created": 5,
+    "total_iterations_across_trials": 0,
+    "trials_converged_first_try": 5,
+    "trials_needed_retry": 0,
+    "issues_detected": [],
+    "issues_detected_count": 0
+  },
+  "per_trial": [
+    {
+      "trial_id": "f-file-ops-r0",
+      "task": "file-ops",
+      "difficulty": "easy",
+      "status": "done",
+      "elapsed_s": 51.05,
+      "model_verified": true,
+      "surveillance_iterations": 0,
+      "surveillance_converged": true,
+      "surveillance_issues": [],
+      "metrics": {
+        "total_input_tokens": 83040,
+        "total_output_tokens": 2013,
+        "total_cost_usd": 0.0,
+        "total_turns": 13,
+        "model_used": "minimax/minimax-m2.7"
+      },
+      "verify_output": "============================= test session starts ==============================\nplatform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3\ncachedir: .pytest_cache\nrootdir: /tmp/project/src/tests\nplugins: anyio-4.13.0\ncollecting ... collected 1 item\n\n../../../tmp/project/src/tests/test_utils.py::TestUtils::test_add PASSED [100%]\n\n============================== 1 passed in 0.00s ===============================\n",
+      "error": null
+    },
+    {
+      "trial_id": "f-text-processing-r0",
+      "task": "text-processing",
+      "difficulty": "easy",
+      "status": "done",
+      "elapsed_s": 41.8,
+      "model_verified": true,
+      "surveillance_iterations": 0,
+      "surveillance_converged": true,
+      "surveillance_issues": [],
+      "metrics": {
+        "total_input_tokens": 65780,
+        "total_output_tokens": 1708,
+        "total_cost_usd": 0.0,
+        "total_turns": 11,
+        "model_used": "minimax/minimax-m2.7"
+      },
+      "verify_output": "",
+      "error": null
+    },
+    {
+      "trial_id": "f-debugging-r0",
+      "task": "debugging",
+      "difficulty": "medium",
+      "status": "done",
+      "elapsed_s": 56.82,
+      "model_verified": true,
+      "surveillance_iterations": 0,
+      "surveillance_converged": true,
+      "surveillance_issues": [],
+      "metrics": {
+        "total_input_tokens": 121322,
+        "total_output_tokens": 2881,
+        "total_cost_usd": 0.0,
+        "total_turns": 18,
+        "model_used": "minimax/minimax-m2.7"
+      },
+      "verify_output": "",
+      "error": null
+    },
+    {
+      "trial_id": "f-data-processing-r0",
+      "task": "data-processing",
+      "difficulty": "medium",
+      "status": "done",
+      "elapsed_s": 71.86,
+      "model_verified": true,
+      "surveillance_iterations": 0,
+      "surveillance_converged": true,
+      "surveillance_issues": [],
+      "metrics": {
+        "total_input_tokens": 125793,
+        "total_output_tokens": 3784,
+        "total_cost_usd": 0.0,
+        "total_turns": 17,
+        "model_used": "minimax/minimax-m2.7"
+      },
+      "verify_output": "",
+      "error": null
+    },
+    {
+      "trial_id": "f-algorithm-r0",
+      "task": "algorithm",
+      "difficulty": "hard",
+      "status": "done",
+      "elapsed_s": 56.83,
+      "model_verified": true,
+      "surveillance_iterations": 0,
+      "surveillance_converged": true,
+      "surveillance_issues": [],
+      "metrics": {
+        "total_input_tokens": 94296,
+        "total_output_tokens": 2697,
+        "total_cost_usd": 0.0,
+        "total_turns": 14,
+        "model_used": "minimax/minimax-m2.7"
+      },
+      "verify_output": "",
+      "error": null
+    }
+  ]
+}

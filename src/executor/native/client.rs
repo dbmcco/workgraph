@@ -1,7 +1,8 @@
-//! LLM client abstraction and Anthropic Messages API implementation.
+//! Anthropic Messages API client and canonical request/response types.
 //!
-//! Defines the `LlmClient` trait and canonical request/response types used by the
-//! agent loop. The `AnthropicClient` implements this trait for the Anthropic API.
+//! Defines the canonical types (`Message`, `ContentBlock`, `ToolDefinition`, etc.)
+//! used by the agent loop. The `AnthropicClient` implements the `Provider` trait
+//! (defined in `provider.rs`) for the Anthropic Messages API.
 //! See `openai_client.rs` for the OpenAI-compatible implementation.
 
 use std::path::Path;
@@ -29,6 +30,13 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        /// Opaque reasoning_details from the API, passed back verbatim in
+        /// subsequent requests to preserve reasoning context.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<Vec<serde_json::Value>>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -37,7 +45,7 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
 }
@@ -78,6 +86,9 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
+    /// Reasoning/thinking tokens consumed (subset of output_tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl Usage {
@@ -91,27 +102,11 @@ impl Usage {
         if let Some(v) = other.cache_read_input_tokens {
             *self.cache_read_input_tokens.get_or_insert(0) += v;
         }
+        if let Some(v) = other.reasoning_tokens {
+            *self.reasoning_tokens.get_or_insert(0) += v;
+        }
     }
 }
-
-// ── LlmClient trait ─────────────────────────────────────────────────────
-
-/// Provider-agnostic LLM client trait.
-///
-/// Both `AnthropicClient` and `OpenAiClient` implement this trait so the
-/// agent loop can work with any backend.
-#[async_trait::async_trait]
-pub trait LlmClient: Send + Sync {
-    /// Send a messages request (non-streaming) and return the response.
-    async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse>;
-
-    /// The model name this client is configured with.
-    fn model(&self) -> &str;
-
-    /// Max tokens per response.
-    fn max_tokens(&self) -> u32;
-}
-
 /// Request body for POST /v1/messages.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagesRequest {
@@ -204,10 +199,19 @@ const DEFAULT_MAX_TOKENS: u32 = 16384;
 /// Anthropic Messages API client.
 pub struct AnthropicClient {
     http: reqwest::Client,
+    /// Bearer token. Empty string means "send no x-api-key header" — used
+    /// for the keyless-init path where we let the endpoint decide whether
+    /// it needs auth (and surface a config-pointing 401 if it does).
     api_key: String,
     base_url: String,
     pub model: String,
     pub max_tokens: u32,
+    /// Whether to use SSE streaming for requests (default: true).
+    use_streaming: bool,
+    /// Endpoint name from `[[llm_endpoints.endpoints]]` (when known).
+    /// Surfaced in 401/403 error messages so the user is pointed at the
+    /// exact config block to add `api_key` to — never an env var.
+    endpoint_name: Option<String>,
 }
 
 impl AnthropicClient {
@@ -222,7 +226,7 @@ impl AnthropicClient {
         Self::new(api_key.to_string(), model)
     }
 
-    fn new(api_key: String, model: &str) -> Result<Self> {
+    pub fn new(api_key: String, model: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
@@ -234,6 +238,8 @@ impl AnthropicClient {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            use_streaming: true,
+            endpoint_name: None,
         })
     }
 
@@ -243,9 +249,43 @@ impl AnthropicClient {
         self
     }
 
+    /// Tag this client with the endpoint name it's configured against, so
+    /// 401/403 responses can surface a config-pointing error message naming
+    /// the exact `[[llm_endpoints.endpoints]]` block to set `api_key` in.
+    pub fn with_endpoint_name(mut self, name: &str) -> Self {
+        self.endpoint_name = Some(name.to_string());
+        self
+    }
+
+    /// Auth-config hint string injected into 401/403 error messages.
+    /// Names the `[[llm_endpoints.endpoints]]` block to set `api_key`
+    /// in — NEVER an env var, per the workgraph credential contract.
+    fn auth_config_hint(&self) -> String {
+        match &self.endpoint_name {
+            Some(name) => format!(
+                " To configure: set `api_key = \"...\"` (or `api_key_file`) under \
+                 [[llm_endpoints.endpoints]] block named '{}' in .workgraph/config.toml.",
+                name
+            ),
+            None => " To configure: add an `[[llm_endpoints.endpoints]]` entry with `api_key = \"...\"` \
+                     to .workgraph/config.toml (run `wg endpoints add` for a wizard)."
+                .to_string(),
+        }
+    }
+
     /// Override max tokens per response.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Enable or disable SSE streaming for requests.
+    ///
+    /// When enabled (the default), the client sends `stream: true` and parses
+    /// the SSE response, accumulating content block deltas and tool call JSON
+    /// across chunks. Disable for endpoints that don't support streaming.
+    pub fn with_streaming(mut self, enabled: bool) -> Self {
+        self.use_streaming = enabled;
         self
     }
 
@@ -274,6 +314,63 @@ impl AnthropicClient {
         assemble_stream_response(events).await
     }
 
+    /// Streaming request with a text callback for progressive display.
+    ///
+    /// Processes SSE events inline, calling `on_text` for each text delta
+    /// as it arrives from the wire.
+    pub async fn messages_streaming_with_callback(
+        &self,
+        request: &MessagesRequest,
+        on_text: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let mut req = request.clone();
+        req.stream = true;
+
+        let headers = self.build_headers();
+        let resp = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to send streaming request")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(api_error_with_hint(
+                status.as_u16(),
+                &body,
+                &self.auth_config_hint(),
+            ));
+        }
+
+        let mut events = Vec::new();
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Error reading SSE chunk")?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(event) = parse_next_sse_event(&mut buffer) {
+                // Forward text deltas to the callback immediately
+                if let StreamEvent::ContentBlockDelta {
+                    delta: ContentDelta::TextDelta { ref text },
+                    ..
+                } = event
+                {
+                    on_text(text.clone());
+                }
+                events.push(event);
+            }
+        }
+
+        assemble_stream_response(events).await
+    }
+
     /// Send a streaming request and collect raw SSE events.
     async fn messages_stream_raw(&self, request: &MessagesRequest) -> Result<Vec<StreamEvent>> {
         let url = format!("{}/v1/messages", self.base_url);
@@ -294,7 +391,11 @@ impl AnthropicClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(api_error(status.as_u16(), &body));
+            return Err(api_error_with_hint(
+                status.as_u16(),
+                &body,
+                &self.auth_config_hint(),
+            ));
         }
 
         let mut events = Vec::new();
@@ -366,7 +467,11 @@ impl AnthropicClient {
                         continue;
                     }
 
-                    return Err(api_error(status_code, &body));
+                    return Err(api_error_with_hint(
+                        status_code,
+                        &body,
+                        &self.auth_config_hint(),
+                    ));
                 }
                 Err(e) => {
                     if retry_count < max_retries {
@@ -387,10 +492,15 @@ impl AnthropicClient {
 
     fn build_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&self.api_key).expect("invalid api key header"),
-        );
+        // Empty key = no x-api-key header. The endpoint decides whether
+        // it requires one; if it does, the 401 path surfaces a config-
+        // pointing error message via `api_error_with_hint`.
+        if !self.api_key.is_empty() {
+            headers.insert(
+                "x-api-key",
+                HeaderValue::from_str(&self.api_key).expect("invalid api key header"),
+            );
+        }
         headers.insert(
             "anthropic-version",
             HeaderValue::from_static(ANTHROPIC_VERSION),
@@ -401,9 +511,9 @@ impl AnthropicClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for AnthropicClient {
-    async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
-        self.messages(request).await
+impl super::provider::Provider for AnthropicClient {
+    fn name(&self) -> &str {
+        "anthropic"
     }
 
     fn model(&self) -> &str {
@@ -412,6 +522,23 @@ impl LlmClient for AnthropicClient {
 
     fn max_tokens(&self) -> u32 {
         self.max_tokens
+    }
+
+    async fn send(&self, request: &MessagesRequest) -> Result<MessagesResponse> {
+        if self.use_streaming {
+            self.messages_streaming(request).await
+        } else {
+            self.messages(request).await
+        }
+    }
+
+    async fn send_streaming(
+        &self,
+        request: &MessagesRequest,
+        on_text: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<MessagesResponse> {
+        self.messages_streaming_with_callback(request, on_text)
+            .await
     }
 }
 
@@ -465,11 +592,9 @@ pub fn resolve_api_key_from_dir(workgraph_dir: &Path) -> Result<String> {
         return Ok(key);
     }
 
-    // 2. Workgraph config
-    let config_path = workgraph_dir.join("config.toml");
-    if let Ok(content) = std::fs::read_to_string(&config_path)
-        && let Ok(val) = toml::from_str::<toml::Value>(&content)
-        && let Some(key) = val
+    // 2. Workgraph config (merged: global + local)
+    if let Ok(merged_val) = crate::config::Config::load_merged_toml_value(workgraph_dir)
+        && let Some(key) = merged_val
             .get("native_executor")
             .and_then(|v| v.get("api_key"))
             .and_then(|v| v.as_str())
@@ -502,16 +627,31 @@ fn is_retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
-fn api_error(status: u16, body: &str) -> anyhow::Error {
+/// Build an Anthropic API error from an HTTP response. When the status
+/// is auth-related (401/403), `config_hint` is appended so the user is
+/// pointed at the right `[[llm_endpoints.endpoints]]` block — never an
+/// env var. Pass `""` for the hint when none applies.
+fn api_error_with_hint(status: u16, body: &str, config_hint: &str) -> anyhow::Error {
+    let auth_suffix = if matches!(status, 401 | 403) && !config_hint.is_empty() {
+        config_hint
+    } else {
+        ""
+    };
     if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(body) {
         anyhow!(
-            "Anthropic API error {}: {} ({})",
+            "Anthropic API error {}: {} ({}){}",
             status,
             err.error.message,
-            err.error.error_type
+            err.error.error_type,
+            auth_suffix,
         )
     } else {
-        anyhow!("Anthropic API error {}: {}", status, truncate(body, 500))
+        anyhow!(
+            "Anthropic API error {}: {}{}",
+            status,
+            truncate(body, 500),
+            auth_suffix,
+        )
     }
 }
 

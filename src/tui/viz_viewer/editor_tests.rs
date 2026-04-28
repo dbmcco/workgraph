@@ -15,7 +15,8 @@ mod tui_editor_tests {
     use crate::commands::viz::VizOutput;
     use crate::tui::viz_viewer::render;
     use crate::tui::viz_viewer::state::{
-        FocusedPanel, InputMode, InspectorSubFocus, RightPanelTab, VizApp, editor_text,
+        FocusedPanel, InputMode, InspectorSubFocus, RightPanelTab, SinglePanelView, VizApp,
+        editor_text,
     };
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ mod tui_editor_tests {
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
         };
         let mut app = VizApp::from_viz_output_for_test(&viz);
         app.right_panel_visible = true;
@@ -579,7 +581,7 @@ mod tui_editor_tests {
 
     #[test]
     fn tui_editor_mouse_click_positions_cursor() {
-        use crate::tui::viz_viewer::event::{route_mouse_to_editor, EditorTarget};
+        use crate::tui::viz_viewer::event::{EditorTarget, route_mouse_to_editor};
 
         let mut app = make_editor_test_app();
         enter_chat_input(&mut app);
@@ -619,7 +621,7 @@ mod tui_editor_tests {
 
     #[test]
     fn tui_editor_mouse_click_positions_cursor_multiline() {
-        use crate::tui::viz_viewer::event::{route_mouse_to_editor, EditorTarget};
+        use crate::tui::viz_viewer::event::{EditorTarget, route_mouse_to_editor};
 
         let mut app = make_editor_test_app();
         enter_chat_input(&mut app);
@@ -657,7 +659,7 @@ mod tui_editor_tests {
 
     #[test]
     fn tui_editor_mouse_click_positions_cursor_exact_col() {
-        use crate::tui::viz_viewer::event::{route_mouse_to_editor, EditorTarget};
+        use crate::tui::viz_viewer::event::{EditorTarget, route_mouse_to_editor};
 
         let mut app = make_editor_test_app();
         enter_chat_input(&mut app);
@@ -690,7 +692,7 @@ mod tui_editor_tests {
 
     #[test]
     fn tui_editor_mouse_click_wrapped_line() {
-        use crate::tui::viz_viewer::event::{route_mouse_to_editor, EditorTarget};
+        use crate::tui::viz_viewer::event::{EditorTarget, route_mouse_to_editor};
 
         let mut app = make_editor_test_app();
         enter_chat_input(&mut app);
@@ -700,12 +702,13 @@ mod tui_editor_tests {
         // so the editor area will be ~18 chars. Type a long line that wraps.
         // We need to know the exact editor width after render, so render first with
         // some text, check the area, then construct the right amount.
+        // At 40 cols we hit Compact mode — set Detail view so the chat panel renders.
+        app.single_panel_view = SinglePanelView::Detail;
         type_string(&mut app, "a]placeholder");
         render_to_string(&mut app, 40, 20);
 
         let prefix_len: u16 = 2;
-        let editor_width =
-            app.last_chat_input_area.width.saturating_sub(prefix_len) as usize;
+        let editor_width = app.last_chat_input_area.width.saturating_sub(prefix_len) as usize;
 
         // Clear and type text that will wrap to 2+ visual lines.
         // We need at least editor_width+1 chars. Use distinct chars so we can verify.
@@ -914,6 +917,91 @@ mod tui_editor_tests {
         );
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // Paste tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Helper: simulate pasting text into the chat editor.
+    fn paste_into_chat(app: &mut VizApp, text: &str) {
+        crate::tui::viz_viewer::state::paste_insert_mode(text, &mut app.chat.editor);
+    }
+
+    #[test]
+    fn test_paste_cursor_position() {
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+
+        paste_into_chat(&mut app, "hello");
+        assert_eq!(editor_text(&app.chat.editor), "hello");
+        assert_eq!(
+            app.chat.editor.cursor.col, 5,
+            "cursor should be at col 5 (after 'hello'), got {}",
+            app.chat.editor.cursor.col
+        );
+        assert_eq!(app.chat.editor.cursor.row, 0);
+
+        // Typing after paste should append
+        send_chat_key(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(editor_text(&app.chat.editor), "hello!");
+    }
+
+    #[test]
+    fn test_paste_cursor_position_multiline() {
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+
+        paste_into_chat(&mut app, "line1\nline2");
+        assert_eq!(editor_text(&app.chat.editor), "line1\nline2");
+        assert_eq!(app.chat.editor.cursor.row, 1);
+        assert_eq!(
+            app.chat.editor.cursor.col, 5,
+            "cursor should be at col 5 (after 'line2'), got {}",
+            app.chat.editor.cursor.col
+        );
+
+        // Typing after paste should append to line2
+        send_chat_key(&mut app, KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(editor_text(&app.chat.editor), "line1\nline2!");
+    }
+
+    #[test]
+    fn test_paste_into_existing_text() {
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+
+        type_string(&mut app, "ac");
+        // Move cursor back one so it's between 'a' and 'c'
+        send_chat_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        paste_into_chat(&mut app, "b");
+        assert_eq!(editor_text(&app.chat.editor), "abc");
+        // Cursor should be after the pasted 'b' (col 2), before 'c'
+        assert_eq!(app.chat.editor.cursor.col, 2);
+    }
+
+    #[test]
+    fn test_paste_ending_with_newline() {
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+
+        paste_into_chat(&mut app, "hello\n");
+        assert_eq!(editor_text(&app.chat.editor), "hello\n");
+        // Cursor should be at start of the new empty line
+        assert_eq!(app.chat.editor.cursor.row, 1);
+        assert_eq!(app.chat.editor.cursor.col, 0);
+    }
+
+    #[test]
+    fn test_paste_empty_string() {
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+
+        type_string(&mut app, "abc");
+        let cursor_before = app.chat.editor.cursor;
+        paste_into_chat(&mut app, "");
+        assert_eq!(app.chat.editor.cursor, cursor_before);
+        assert_eq!(editor_text(&app.chat.editor), "abc");
+    }
+
     #[test]
     fn tui_editor_ctrl_u_kills_to_beginning() {
         let mut app = make_editor_test_app();
@@ -928,6 +1016,239 @@ mod tui_editor_tests {
             text.is_empty() || text.len() < "hello world".len(),
             "Ctrl-U should delete to beginning of line, got: {:?}",
             text
+        );
+    }
+
+    // ── Key feedback tests ──────────────────────────────────────────
+
+    #[test]
+    fn key_feedback_records_when_enabled() {
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+        app.record_key_feedback("Tab".to_string());
+        app.record_key_feedback("↑".to_string());
+        assert_eq!(app.key_feedback.len(), 2);
+        assert_eq!(app.key_feedback[0].0, "Tab");
+        assert_eq!(app.key_feedback[1].0, "↑");
+    }
+
+    #[test]
+    fn key_feedback_ignored_when_disabled() {
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = false;
+        app.record_key_feedback("Tab".to_string());
+        assert!(app.key_feedback.is_empty());
+    }
+
+    #[test]
+    fn key_feedback_respects_max_entries() {
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+        for i in 0..10 {
+            app.record_key_feedback(format!("k{i}"));
+        }
+        // MAX is 6 entries
+        assert!(app.key_feedback.len() <= 6);
+        // Newest entry is the last one recorded
+        assert_eq!(app.key_feedback.back().unwrap().0, "k9");
+    }
+
+    #[test]
+    fn key_feedback_cleanup_removes_expired() {
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+        // Manually push an entry with an old timestamp.
+        app.key_feedback.push_back((
+            "old".to_string(),
+            std::time::Instant::now() - std::time::Duration::from_secs(5),
+        ));
+        app.key_feedback
+            .push_back(("new".to_string(), std::time::Instant::now()));
+        app.cleanup_key_feedback();
+        assert_eq!(app.key_feedback.len(), 1);
+        assert_eq!(app.key_feedback[0].0, "new");
+    }
+
+    #[test]
+    fn key_feedback_dispatch_event_records_keys() {
+        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+        // Dispatch a Tab key event
+        let ev = Event::Key(KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::tui::viz_viewer::event::dispatch_event(&mut app, ev);
+        assert!(!app.key_feedback.is_empty());
+        assert_eq!(app.key_feedback.back().unwrap().0, "Tab");
+    }
+
+    #[test]
+    fn key_feedback_label_arrow_keys() {
+        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+
+        for (code, expected) in [
+            (KeyCode::Up, "↑"),
+            (KeyCode::Down, "↓"),
+            (KeyCode::Left, "←"),
+            (KeyCode::Right, "→"),
+        ] {
+            let ev = Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            });
+            crate::tui::viz_viewer::event::dispatch_event(&mut app, ev);
+            assert_eq!(app.key_feedback.back().unwrap().0, expected);
+        }
+    }
+
+    #[test]
+    fn key_feedback_label_ctrl_modifier() {
+        use crossterm::event::{Event, KeyEvent, KeyEventKind, KeyEventState};
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+
+        let ev = Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        crate::tui::viz_viewer::event::dispatch_event(&mut app, ev);
+        assert_eq!(app.key_feedback.back().unwrap().0, "Ctrl+c");
+    }
+
+    #[test]
+    fn key_feedback_renders_without_panic() {
+        let mut app = make_editor_test_app();
+        app.key_feedback_enabled = true;
+        app.record_key_feedback("Tab".to_string());
+        app.record_key_feedback("↑".to_string());
+        app.record_key_feedback("Enter".to_string());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &mut app))
+            .unwrap();
+        // If we got here without panicking, rendering works.
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Input box style: no purple/magenta (tui-purple-styled)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// The bottom chat input box must not be rendered with purple/magenta
+    /// foreground anywhere — neither the border separator, the `> ` prompt,
+    /// nor the typed text. User reports purple "is cool but not right anymore"
+    /// and the styling should be the default terminal color.
+    #[test]
+    fn test_chat_input_box_color_is_default() {
+        use ratatui::style::Color;
+
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+        type_string(&mut app, "hello");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render::draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let area = app.last_chat_input_area;
+        assert!(area.height > 0 && area.width > 0, "input area not laid out");
+
+        let mut bad: Vec<(u16, u16, String, Color)> = Vec::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                let cell = &buf[(x, y)];
+                let fg = cell.style().fg;
+                if matches!(fg, Some(Color::Magenta) | Some(Color::LightMagenta)) {
+                    bad.push((x, y, cell.symbol().to_string(), fg.unwrap()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "Chat input box must not contain magenta/purple cells, found {} offending cells: {:?}",
+            bad.len(),
+            bad.iter().take(8).collect::<Vec<_>>()
+        );
+    }
+
+    /// After a chat message is sent and an executor response arrives (success
+    /// or fault), the input box must not be pre-populated with executor
+    /// output. Only user input belongs in the editor.
+    #[test]
+    fn test_chat_input_box_does_not_capture_previous_output() {
+        use crate::tui::viz_viewer::state::{ChatMessage, ChatRole};
+
+        let mut app = make_editor_test_app();
+        enter_chat_input(&mut app);
+        type_string(&mut app, "hi nex");
+
+        // Submit (clears editor, sends message).
+        send_chat_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            editor_text(&app.chat.editor),
+            "",
+            "editor should be empty right after submit"
+        );
+
+        // Simulate executor (wg nex) emitting output, then faulting with an
+        // error. None of this content should ever reach the editor.
+        let nex_output = "internal traceback: nex died here";
+        let nex_error = "Executor faulted: connection refused";
+        app.chat.messages.push(ChatMessage {
+            role: ChatRole::Coordinator,
+            text: nex_output.to_string(),
+            full_text: None,
+            attachments: Vec::new(),
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            read_at: None,
+            msg_queue_id: None,
+        });
+        app.chat.messages.push(ChatMessage {
+            role: ChatRole::SystemError,
+            text: nex_error.to_string(),
+            full_text: None,
+            attachments: Vec::new(),
+            edited: false,
+            inbox_id: None,
+            user: None,
+            target_task: None,
+            msg_timestamp: Some(chrono::Utc::now().to_rfc3339()),
+            read_at: None,
+            msg_queue_id: None,
+        });
+
+        // Render — re-rendering must not pre-fill the editor with anything.
+        let _ = render_to_string(&mut app, 120, 40);
+
+        let editor_after = editor_text(&app.chat.editor);
+        assert_eq!(
+            editor_after, "",
+            "editor must remain empty after executor output/fault, got {:?}",
+            editor_after
+        );
+        assert!(
+            !editor_after.contains(nex_output),
+            "editor must never contain executor stdout/output"
+        );
+        assert!(
+            !editor_after.contains(nex_error),
+            "editor must never contain executor error text"
         );
     }
 }

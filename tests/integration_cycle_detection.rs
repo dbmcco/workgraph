@@ -446,10 +446,10 @@ fn test_cycle_analysis_deterministic() {
 #[test]
 fn test_dispatch_header_ready_when_external_deps_done() {
     // 2-node cycle: worker ↔ validator.
-    // worker.after = [validator, x] (validator is back-edge blocker, x is external)
-    // validator.after = [worker] (forward dep)
-    // validator has cycle_config (the iterator).
-    // X is Done → worker should be ready (exempt from validator, X done).
+    // worker.after = [validator, x], validator.after = [worker].
+    // worker is the cycle entry (has external dep x). Back-edge: validator→worker.
+    // X is Done → worker is ready (back-edge from validator skipped).
+    // Validator blocked by worker (forward dep).
     let x = make_task_with_status("x", "External", Status::Done);
     let mut worker = make_task("worker", "Worker");
     worker.after = vec!["validator".to_string(), "x".to_string()];
@@ -472,12 +472,12 @@ fn test_dispatch_header_ready_when_external_deps_done() {
 
     assert!(
         ready_ids.contains(&"worker"),
-        "Worker should be ready (exempt from validator iterator, external X done). Ready: {:?}",
+        "Worker (header) should be ready (back-edge from validator skipped, X done). Ready: {:?}",
         ready_ids
     );
     assert!(
         !ready_ids.contains(&"validator"),
-        "Validator should NOT be ready (worker is Open). Ready: {:?}",
+        "Validator should NOT be ready (forward dep on worker). Ready: {:?}",
         ready_ids
     );
 }
@@ -543,9 +543,11 @@ fn test_dispatch_non_header_waits_for_predecessor() {
 
 #[test]
 fn test_dispatch_non_iterator_not_ready_when_pred_open() {
-    // 3-node cycle: B → C → A (execution order). A is the iterator.
-    // When B is Done, C becomes ready (exempt from A). A stays blocked by C.
-    // Verify forward deps within cycle are still enforced.
+    // 3-node cycle: B(Done) → C → A (execution order). A is the iterator.
+    // SCC = {a, c}. C is the cycle entry (has external dep B). Header = C.
+    // Back-edge: a→c (A feeds back to C). Forward: c→a.
+    // C: B Done + A back-edge skipped → READY.
+    // A: forward dep on C (Open) → blocked.
     let b = make_task_with_status("b", "B (done)", Status::Done);
     let mut c = make_task("c", "C (worker 2)");
     c.after = vec!["b".to_string(), "a".to_string()]; // a is auto-back-edge
@@ -566,27 +568,29 @@ fn test_dispatch_non_iterator_not_ready_when_pred_open() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // C should be ready: B is Done, A is iterator (exempt).
+    // C should be ready: B is Done, A is back-edge (skipped).
     assert!(
         ready_ids.contains(&"c"),
-        "C should be ready (B done, exempt from A iterator). Ready: {:?}",
+        "C (header) should be ready (B done, A back-edge skipped). Ready: {:?}",
         ready_ids
     );
-    // A should NOT be ready: C is still Open.
+    // A should NOT be ready: forward dep on C (Open).
     assert!(
         !ready_ids.contains(&"a"),
-        "A should NOT be ready (C is Open, C has no cycle_config). Ready: {:?}",
+        "A should NOT be ready (forward dep on C is Open). Ready: {:?}",
         ready_ids
     );
 }
 
 #[test]
-fn test_dispatch_header_without_config_not_exempt() {
-    // Cycle: A → B → A. A has NO cycle_config.
-    // Back-edge exemption requires cycle_config on header.
+fn test_dispatch_no_config_header_still_ready() {
+    // Cycle: A ↔ B. Neither has cycle_config.
+    // Back-edge exemption is purely structural — cycle_config is not required.
+    // The header (a, smallest ID) is ready because its back-edge blocker is skipped.
+    // B is blocked by A (forward dep).
+    // Without cycle_config the cycle won't re-iterate, but the first pass executes.
     let mut a = make_task("a", "A (no config)");
     a.after = vec!["b".to_string()];
-    // No cycle_config!
     let mut b = make_task("b", "B");
     b.after = vec!["a".to_string()];
 
@@ -596,21 +600,26 @@ fn test_dispatch_header_without_config_not_exempt() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // Without cycle_config, back-edge exemption doesn't apply → deadlock
-    assert!(
-        ready_ids.is_empty(),
-        "No tasks should be ready (unconfigured cycle → deadlock). Ready: {:?}",
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Header should be ready (back-edge exemption is structural). Ready: {:?}",
         ready_ids
+    );
+    assert_eq!(
+        ready_ids[0], analysis.cycles[0].header,
+        "The ready task should be the cycle header"
     );
 }
 
 #[test]
 fn test_dispatch_back_edge_exemption_only_for_iterator_blocker() {
-    // 3-node cycle: B → C → A (execution order). A is the iterator (cycle_config).
-    // B has no cycle deps → READY.
-    // C.after = [B, A]: B is forward dep, A is auto-back-edge → C exempt from A.
-    //   But B is Open → C NOT ready.
-    // A.after = [C]: forward dep → A NOT ready.
+    // 3-node: B(Open, no deps) → C → A (execution order). A is the iterator.
+    // SCC = {a, c}. C is entry (has external dep B). Header = C.
+    // Back-edge: a→c. Forward: c→a.
+    // B: no deps → READY.
+    // C: B Open → blocked.
+    // A: forward dep on C (Open) → blocked.
     let b = make_task("b", "B (worker 1)");
     let mut c = make_task("c", "C (worker 2)");
     c.after = vec!["b".to_string(), "a".to_string()]; // a is auto-back-edge
@@ -631,20 +640,22 @@ fn test_dispatch_back_edge_exemption_only_for_iterator_blocker() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // Only B should be ready (no deps). C blocked by B. A blocked by C.
+    // B should be ready (no deps).
     assert!(
         ready_ids.contains(&"b"),
         "B should be ready (no deps). Ready: {:?}",
         ready_ids
     );
+    // C blocked by B (B is Open, not terminal).
     assert!(
         !ready_ids.contains(&"c"),
         "C should NOT be ready (B is Open). Ready: {:?}",
         ready_ids
     );
+    // A blocked by C (forward dep, C is Open).
     assert!(
         !ready_ids.contains(&"a"),
-        "A should NOT be ready (C is Open). Ready: {:?}",
+        "A should NOT be ready (forward dep on C). Ready: {:?}",
         ready_ids
     );
 }
@@ -668,8 +679,8 @@ fn test_dispatch_non_cycle_tasks_unaffected() {
 }
 
 #[test]
-fn test_dispatch_reiteration_worker_ready_after_reopen() {
-    // After cycle re-opens, the worker should again be ready (exempt from iterator).
+fn test_dispatch_reiteration_header_ready_after_reopen() {
+    // After cycle re-opens, the header should be ready (back-edge skipped).
     // Simulate: all cycle members re-opened (Open status, loop_iteration > 0).
     let mut worker = make_task("worker", "Worker");
     worker.after = vec!["validator".to_string()];
@@ -692,29 +703,35 @@ fn test_dispatch_reiteration_worker_ready_after_reopen() {
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    assert!(
-        ready_ids.contains(&"worker"),
-        "Worker should be ready on re-iteration (exempt from validator). Ready: {:?}",
+    // Exactly one task (the cycle header) should be ready after re-open.
+    let header = &analysis.cycles[0].header;
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Exactly one task (the header) should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        !ready_ids.contains(&"validator"),
-        "Validator should NOT be ready (worker is Open). Ready: {:?}",
-        ready_ids
+    assert_eq!(
+        ready_ids[0],
+        header.as_str(),
+        "The cycle header should be ready on re-iteration"
     );
 }
 
 #[test]
 fn test_dispatch_cycle_header_not_exempt_from_forward_deps() {
     // Context-scopes scenario: design → integrate → verify (cycle via back-edges).
-    // verify has cycle_config (--max-iterations 3). Auto-back-edges add verify
-    // to design.after and integrate.after, forming an SCC.
+    // verify has cycle_config. SCC = {design, integrate, verify}.
+    // Havlak DFS (sorted task IDs) visits design first → header = design.
+    // Back-edges from DFS: verify→design, verify→integrate.
     //
-    // When design is Done and integrate is Open:
-    //   - integrate should be ready (worker exempt from verify back-edge, design Done)
-    //   - verify must NOT be ready (must wait for integrate, its forward dep)
+    // When design is Done:
+    //   - integrate: design Done + verify back-edge skipped → READY
+    //   - verify: forward dep on integrate (Open) → blocked
+    let x = make_task_with_status("x", "External", Status::Done);
+
     let mut design = make_task_with_status("design", "Design", Status::Done);
-    design.after = vec!["verify".to_string()]; // auto-back-edge
+    design.after = vec!["verify".to_string(), "x".to_string()]; // auto-back-edge + external
 
     let mut integrate = make_task("integrate", "Integrate");
     integrate.after = vec!["design".to_string(), "verify".to_string()]; // forward + auto-back-edge
@@ -730,20 +747,29 @@ fn test_dispatch_cycle_header_not_exempt_from_forward_deps() {
         max_failure_restarts: None,
     });
 
-    let graph = build_graph(vec![design, integrate, verify]);
+    let graph = build_graph(vec![x, design, integrate, verify]);
     let analysis = graph.compute_cycle_analysis();
+
+    // Havlak header is "design" (alphabetically first in SCC).
+    // Back-edges: (verify, design) and (verify, integrate).
+    assert_eq!(
+        analysis.cycles[0].header, "design",
+        "Design should be the cycle header (alphabetically first in SCC)"
+    );
 
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
+    // design is Done. integrate: design Done + verify back-edge skipped → READY.
     assert!(
         ready_ids.contains(&"integrate"),
-        "Integrate should be ready (worker exempt from verify, design Done). Ready: {:?}",
+        "Integrate should be ready (design Done, verify back-edge skipped). Ready: {:?}",
         ready_ids
     );
+    // verify depends on integrate (not a back-edge) which is Open → blocked
     assert!(
         !ready_ids.contains(&"verify"),
-        "Verify (cycle header) must NOT be ready — integrate (forward dep) is still Open. Ready: {:?}",
+        "Verify must NOT be ready (forward dep on integrate is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -779,6 +805,206 @@ fn test_dispatch_cycle_header_ready_when_all_forward_deps_done() {
         ready_ids.contains(&"verify"),
         "Verify should be ready (all forward deps Done). Ready: {:?}",
         ready_ids
+    );
+}
+
+// ===========================================================================
+// 2b. Sequential dispatch ordering tests (back-edge exemption)
+// ===========================================================================
+
+#[test]
+fn test_dispatch_two_task_cycle_sequential_order() {
+    // 2-task cycle: A ↔ B, A has cycle_config (max_iterations=2).
+    // External dep X (Done) → A, making A the deterministic entry/header.
+    // Iteration 0: A ready (back-edge from B skipped, X done) → complete A → B ready.
+    // Iteration 1: cycle resets → A ready again → complete A → B ready → cycle done.
+    let x = make_task_with_status("x", "External", Status::Done);
+
+    let mut a = make_task("a", "A");
+    a.after = vec!["b".to_string(), "x".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 2,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task("b", "B");
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![x, a, b]);
+
+    // --- Iteration 0 ---
+    let analysis = graph.compute_cycle_analysis();
+    assert_eq!(analysis.cycles[0].header, "a", "A should be the header");
+
+    // Step 1: Only A should be ready
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 0 step 1: only A ready");
+
+    // Step 2: Complete A → B should be ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Iteration 0 step 2: only B ready");
+
+    // Step 3: Complete B → cycle should re-open (both A and B done)
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+    assert_eq!(reactivated.len(), 2, "Both tasks should be re-activated");
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+    assert_eq!(graph.get_task("b").unwrap().loop_iteration, 1);
+
+    // --- Iteration 1 ---
+    let analysis = graph.compute_cycle_analysis();
+
+    // Step 4: A should be ready again
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 1 step 1: only A ready");
+
+    // Step 5: Complete A → B ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Iteration 1 step 2: only B ready");
+
+    // Step 6: Complete B → max_iterations reached, no re-open
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
+    );
+}
+
+#[test]
+fn test_dispatch_three_task_cycle_sequential_order() {
+    // 3-task cycle: A → B → C → A, A has cycle_config.
+    // External dep X (Done) → A, making A the deterministic header.
+    // Dispatch order: A first, then B, then C.
+    let x = make_task_with_status("x", "External", Status::Done);
+
+    let mut a = make_task("a", "A");
+    a.after = vec!["c".to_string(), "x".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 2,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task("b", "B");
+    b.after = vec!["a".to_string()];
+
+    let mut c = make_task("c", "C");
+    c.after = vec!["b".to_string()];
+
+    let mut graph = build_graph(vec![x, a, b, c]);
+
+    // --- Iteration 0 ---
+    let analysis = graph.compute_cycle_analysis();
+    assert_eq!(analysis.cycles[0].header, "a", "A should be the header");
+
+    // Step 1: Only A ready (back-edge C→A skipped, X done)
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Step 1: only A ready");
+
+    // Step 2: Complete A → only B ready
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["b"], "Step 2: only B ready (A done)");
+
+    // Step 3: Complete B → only C ready
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["c"], "Step 3: only C ready (A+B done)");
+
+    // Step 4: Complete C → cycle re-opens (all done, iteration < max)
+    graph.get_task_mut("c").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+    assert_eq!(reactivated.len(), 3, "All three should re-activate");
+
+    // --- Iteration 1 ---
+    let analysis = graph.compute_cycle_analysis();
+
+    // Step 5: A ready again
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ready_ids, vec!["a"], "Iteration 1: only A ready");
+
+    // Complete full cycle
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    graph.get_task_mut("c").unwrap().status = Status::Done;
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
+    );
+}
+
+#[test]
+fn test_dispatch_self_loop_ready_on_all_iterations() {
+    // Self-loop: A → A with cycle_config.
+    // A should be ready on every iteration (back-edge A→A always skipped).
+    let mut a = make_task("a", "A");
+    a.after = vec!["a".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![a]);
+
+    // Iteration 0
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 0");
+    assert_eq!(ready[0].id, "a");
+
+    // Complete and re-open
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+
+    // Iteration 1: still ready
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 1");
+    assert_eq!(ready[0].id, "a");
+
+    // Complete and re-open again
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 2);
+
+    // Iteration 2: still ready
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    assert_eq!(ready.len(), 1, "A should be ready on iteration 2");
+
+    // Complete → at max_iterations, no re-open
+    graph.get_task_mut("a").unwrap().status = Status::Done;
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not re-activate at max_iterations"
     );
 }
 
@@ -3178,13 +3404,16 @@ fn test_deep_guard_authority_blocks_self_convergence() {
     );
 }
 
-// --- 9.5 First-iteration ordering: B must NOT be ready until A is done ---
+// --- 9.5 First-iteration ordering: only header ready, B waits for A ---
 
 #[test]
 fn test_deep_first_iteration_ordering_b_waits_for_a() {
-    // B (cycle header with --after A) must NOT be ready until A is done,
-    // even though back-edge exists and both are in SCC.
-    // This is the KEY test — the whole point of the exemption fix.
+    // A ↔ B cycle. B has --max-iterations (cycle_config).
+    // Auto back-edge creates: A.after=[B], B.after=[A].
+    // Header = A (alphabetically first in isolated SCC).
+    // Back-edge: B→A (adj direction) = A's dep on B is skipped.
+    // Forward edge: A→B (adj direction) = B's dep on A blocks.
+    // Only A should be ready; B waits for A to complete.
     let tmp = TempDir::new().unwrap();
     let wg_dir = setup_workgraph(&tmp, vec![]);
 
@@ -3204,8 +3433,6 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
         ],
     );
 
-    // Both are Open. Auto back-edge: A.after=[B], B.after=[A].
-    // Verify: A should be ready (exempt from B's back-edge), B should NOT be ready.
     let graph = load_graph(wg_dir.join("graph.jsonl")).unwrap();
     let analysis = graph.compute_cycle_analysis();
 
@@ -3219,12 +3446,12 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
 
     assert!(
         ready_ids.contains(&"a"),
-        "A should be ready (exempt from B's back-edge). Ready: {:?}",
+        "A (header) should be ready (back-edge from B skipped). Ready: {:?}",
         ready_ids
     );
     assert!(
         !ready_ids.contains(&"b"),
-        "B should NOT be ready (A is still Open, B depends on A via forward edge). Ready: {:?}",
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -3233,9 +3460,9 @@ fn test_deep_first_iteration_ordering_b_waits_for_a() {
 fn test_deep_first_iteration_ordering_unit_test() {
     // Same test but purely in-memory (no CLI):
     // A.after = [B] (back-edge), B.after = [A] (forward dep).
-    // B has cycle_config → B is the cycle header/iterator.
-    // A should be ready (exempt from B, which has cycle_config).
-    // B should NOT be ready (A is Open, A has no cycle_config).
+    // Header = A (alphabetically first in isolated SCC).
+    // Back-edge: B→A in adj = A's dep on B skipped → A ready.
+    // Forward: A→B in adj = B's dep on A blocks → B not ready.
     let mut a = make_task("a", "Task A");
     a.after = vec!["b".to_string()];
     let mut b = make_task("b", "Task B");
@@ -3257,12 +3484,12 @@ fn test_deep_first_iteration_ordering_unit_test() {
 
     assert!(
         ready_ids.contains(&"a"),
-        "A should be ready: its blocker B has cycle_config → exempt. Ready: {:?}",
+        "A (header) should be ready: back-edge from B skipped. Ready: {:?}",
         ready_ids
     );
     assert!(
         !ready_ids.contains(&"b"),
-        "B should NOT be ready: its blocker A has no cycle_config → not exempt. Ready: {:?}",
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -3455,18 +3682,20 @@ fn test_deep_three_task_cycle_reopen_and_ordering() {
     assert_eq!(graph.get_task("b").unwrap().loop_iteration, 1);
     assert_eq!(graph.get_task("c").unwrap().loop_iteration, 1);
 
-    // Verify ordering is preserved: B should be ready (C is iterator, exempt)
+    // SCC is {b, c}. Havlak DFS visits b first (alphabetically) → header = b.
+    // Back-edge: (c, b). B's dep on C is skipped. B ready (A Done, C skipped).
+    // C depends on B (forward, not back-edge) → C blocked.
     let analysis = graph.compute_cycle_analysis();
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
     assert!(
         ready_ids.contains(&"b"),
-        "B should be ready after re-open (exempt from C iterator). Ready: {:?}",
+        "B should be ready after re-open (cycle header, C back-edge skipped, A Done). Ready: {:?}",
         ready_ids
     );
     assert!(
         !ready_ids.contains(&"c"),
-        "C should NOT be ready (B is Open). Ready: {:?}",
+        "C should NOT be ready (forward dep on B is Open). Ready: {:?}",
         ready_ids
     );
 }
@@ -3505,25 +3734,20 @@ fn test_deep_three_task_cycle_unit() {
         assert_eq!(task.loop_iteration, 1);
     }
 
-    // Ordering after re-open: B should be ready (after A, which has cycle_config → exempt).
-    // C should wait for B. A should wait for C.
+    // Ordering after re-open: only the cycle header should be ready
+    // (back-edge to header skipped, all forward deps block non-headers).
     let analysis = graph.compute_cycle_analysis();
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
     let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
-    assert!(
-        ready_ids.contains(&"b"),
-        "B should be ready (exempt from A iterator). Ready: {:?}",
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Only the cycle header should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        !ready_ids.contains(&"c"),
-        "C should wait for B. Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        !ready_ids.contains(&"a"),
-        "A should wait for C. Ready: {:?}",
-        ready_ids
+    assert_eq!(
+        ready_ids[0], analysis.cycles[0].header,
+        "The ready task should be the cycle header"
     );
 }
 
@@ -3732,7 +3956,7 @@ fn test_deep_no_max_iterations_no_auto_iteration() {
     wg_ok(&wg_dir, &["add", "Task B", "--id", "b", "--after", "a"]);
 
     // Create manual back-edge: A --add-after B
-    wg_ok(&wg_dir, &["edit", "a", "--add-after", "b"]);
+    wg_ok(&wg_dir, &["edit", "a", "--add-after", "b", "--allow-cycle"]);
 
     // Verify back-edge exists
     let graph = load_graph(wg_dir.join("graph.jsonl")).unwrap();
@@ -3955,10 +4179,8 @@ fn test_deep_parallel_cycles_no_interference() {
 #[test]
 fn test_deep_parallel_cycles_dispatch_independence() {
     // Verify dispatch doesn't mix tasks from different cycles.
-    // Cycle 1: A ↔ B (B has cycle_config)
-    // Cycle 2: C ↔ D (D has cycle_config)
-    // All Open. A should be ready (exempt from B), C should be ready (exempt from D).
-    // B and D should NOT be ready.
+    // Cycle 1: A ↔ B, Cycle 2: C ↔ D.
+    // With back-edge exemption, only each cycle's header is ready.
     let mut a = make_task("a", "A");
     a.after = vec!["b".to_string()];
     let mut b = make_task("b", "B");
@@ -3995,28 +4217,29 @@ fn test_deep_parallel_cycles_dispatch_independence() {
     );
 
     let ready = ready_tasks_cycle_aware(&graph, &analysis);
-    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    let mut ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    ready_ids.sort();
 
-    assert!(
-        ready_ids.contains(&"a"),
-        "A should be ready (exempt from B). Ready: {:?}",
+    // Exactly one task from each cycle should be ready (the header).
+    assert_eq!(
+        ready_ids.len(),
+        2,
+        "Exactly two tasks (one per cycle header) should be ready. Ready: {:?}",
         ready_ids
     );
-    assert!(
-        ready_ids.contains(&"c"),
-        "C should be ready (exempt from D). Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        !ready_ids.contains(&"b"),
-        "B should NOT be ready (A is Open). Ready: {:?}",
-        ready_ids
-    );
-    assert!(
-        !ready_ids.contains(&"d"),
-        "D should NOT be ready (C is Open). Ready: {:?}",
-        ready_ids
-    );
+
+    // Each ready task should be its cycle's header.
+    for task in &ready {
+        let cycle_idx = analysis
+            .task_to_cycle
+            .get(&task.id)
+            .expect("Ready task should be in a cycle");
+        assert_eq!(
+            analysis.cycles[*cycle_idx].header, task.id,
+            "Ready task {} should be its cycle's header",
+            task.id
+        );
+    }
 }
 
 // --- 9.13 Nested structure: outer cycle contains inner non-cycle tasks ---
@@ -4101,10 +4324,12 @@ fn test_deep_nested_structure_dependent_non_cycle() {
         ready_ids
     );
 
-    // Worker should be ready (exempt from validator iterator)
+    // Only the cycle header should be ready (back-edge to header skipped)
+    let header = &analysis.cycles[0].header;
     assert!(
-        ready_ids.contains(&"worker"),
-        "Worker should be ready. Ready: {:?}",
+        ready_ids.contains(&header.as_str()),
+        "Cycle header ({}) should be ready. Ready: {:?}",
+        header,
         ready_ids
     );
 }
@@ -4588,6 +4813,42 @@ fn test_evaluate_all_cycles_respects_max_iterations() {
         reactivated.is_empty(),
         "Should not reactivate at max iterations"
     );
+}
+
+#[test]
+fn test_cycle_reactivates_indefinitely_with_max_iterations_zero() {
+    // max_iterations=0 means unlimited. The cycle should reactivate no matter
+    // how high the loop_iteration gets.
+    for iteration in [0, 1, 5, 100, 1000] {
+        let mut a = make_task_with_status("a", "A", Status::Done);
+        a.after = vec!["b".to_string()];
+        a.loop_iteration = iteration;
+        a.cycle_config = Some(CycleConfig {
+            max_iterations: 0,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        let mut b = make_task_with_status("b", "B", Status::Done);
+        b.after = vec!["a".to_string()];
+        b.loop_iteration = iteration;
+
+        let mut graph = build_graph(vec![a, b]);
+        let analysis = graph.compute_cycle_analysis();
+
+        let reactivated = evaluate_all_cycle_iterations(&mut graph, &analysis);
+        assert_eq!(
+            reactivated.len(),
+            2,
+            "Cycle with max_iterations=0 should reactivate at iteration {}",
+            iteration
+        );
+        assert_eq!(graph.get_task("a").unwrap().status, Status::Open);
+        assert_eq!(graph.get_task("b").unwrap().status, Status::Open);
+        assert_eq!(graph.get_task("a").unwrap().loop_iteration, iteration + 1);
+    }
 }
 
 #[test]
@@ -5198,5 +5459,1228 @@ fn test_failure_restart_not_triggered_for_non_cycle_task() {
     assert!(
         reactivated.is_empty(),
         "Non-cycle task should not trigger restart"
+    );
+}
+
+// ===========================================================================
+// Abandoned members in cycles
+// ===========================================================================
+
+#[test]
+fn test_cycle_iterates_when_one_member_done_one_abandoned() {
+    // Cycle: A → B → A. A is Done, B is Abandoned. max_iterations = 3.
+    // The cycle should iterate because all members are terminal.
+    // Only the Done member (A) should be reset to Open.
+    // The Abandoned member (B) should stay Abandoned.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    let mut b = make_task_with_status("b", "B", Status::Abandoned);
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+
+    assert!(
+        !reactivated.is_empty(),
+        "Cycle should iterate when all members are terminal (done + abandoned)"
+    );
+    // Done member resets to Open
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Open);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+    // Abandoned member stays Abandoned
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Abandoned);
+}
+
+#[test]
+fn test_cycle_does_not_iterate_when_all_members_abandoned() {
+    // Cycle: A → B → A. Both A and B are Abandoned.
+    // The cycle should NOT iterate — there's no work to do.
+    let mut a = make_task_with_status("a", "A (header)", Status::Abandoned);
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    let mut b = make_task_with_status("b", "B", Status::Abandoned);
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Cycle should NOT iterate when all members are abandoned (no work to do)"
+    );
+    // Both stay Abandoned
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Abandoned);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Abandoned);
+}
+
+#[test]
+fn test_cycle_abandoned_member_stays_abandoned_after_reset() {
+    // Cycle: A → B → C → A. A=Done, B=Abandoned, C=Done. max_iterations=5.
+    // After iteration: A and C reset to Open, B stays Abandoned.
+    // loop_iteration increments for A and C but B stays unchanged.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["c".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    let mut b = make_task_with_status("b", "B", Status::Abandoned);
+    b.after = vec!["a".to_string()];
+    let mut c = make_task_with_status("c", "C", Status::Done);
+    c.after = vec!["b".to_string()];
+
+    let mut graph = build_graph(vec![a, b, c]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+
+    // A and C should be reactivated, B should not
+    assert!(reactivated.contains(&"a".to_string()));
+    assert!(reactivated.contains(&"c".to_string()));
+    assert!(!reactivated.contains(&"b".to_string()));
+
+    // A and C reset to Open with incremented iteration
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Open);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+    assert_eq!(graph.get_task("c").unwrap().status, Status::Open);
+    assert_eq!(graph.get_task("c").unwrap().loop_iteration, 1);
+
+    // B stays Abandoned, loop_iteration unchanged
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Abandoned);
+    assert_eq!(graph.get_task("b").unwrap().loop_iteration, 0);
+}
+
+// ===========================================================================
+// Converged scope: --converged should complete current iteration before stopping
+// ===========================================================================
+
+#[test]
+fn test_converged_non_header_member_stops_cycle() {
+    // Cycle: A → B → A. B is config owner (header). A signals --converged.
+    // Both Done. The cycle should NOT iterate because A has the converged tag,
+    // even though A is not the config owner.
+    let mut a = make_task_with_status("a", "A (worker)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.tags = vec!["converged".to_string()];
+
+    let mut b = make_task_with_status("b", "B (header)", Status::Done);
+    b.after = vec!["a".to_string()];
+    b.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Should NOT iterate when any member has 'converged' tag, got: {:?}",
+        reactivated
+    );
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_converged_current_iteration_completes_before_stopping() {
+    // Cycle: A → B → A. A is header (has cycle_config).
+    // A completes with --converged but B is still Open.
+    // B should still be ready (current iteration should complete).
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.tags = vec!["converged".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task_with_status("b", "B (worker)", Status::Open);
+    b.after = vec!["a".to_string()];
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    // evaluate_cycle_iteration should NOT reactivate (B is not done yet)
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Should not reactivate while B is still Open"
+    );
+
+    // B should be ready because A (its dependency) is Done
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert!(
+        ready_ids.contains(&"b"),
+        "B should be ready — its dependency A is Done. Ready: {:?}",
+        ready_ids
+    );
+
+    // Now mark B as Done and re-evaluate
+    graph.get_task_mut("b").unwrap().status = Status::Done;
+    let analysis = graph.compute_cycle_analysis();
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+
+    // Cycle should NOT reactivate because A has the converged tag
+    assert!(
+        reactivated.is_empty(),
+        "Should NOT iterate after current iteration completes with converged member"
+    );
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_converged_last_member_in_iteration_no_hang() {
+    // Cycle: A → B → A. A is header. B signals --converged (last to complete).
+    // Both Done. Cycle should stop cleanly.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task_with_status("b", "B (worker)", Status::Done);
+    b.after = vec!["a".to_string()];
+    b.tags = vec!["converged".to_string()];
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "b", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Should NOT iterate when last member signals converged"
+    );
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_converged_multiple_members_same_iteration() {
+    // Cycle: A → B → C → A. A is header. Both B and C signal --converged.
+    // All Done. Cycle should stop.
+    let mut a = make_task_with_status("a", "A (header)", Status::Done);
+    a.after = vec!["c".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut b = make_task_with_status("b", "B", Status::Done);
+    b.after = vec!["a".to_string()];
+    b.tags = vec!["converged".to_string()];
+
+    let mut c = make_task_with_status("c", "C", Status::Done);
+    c.after = vec!["b".to_string()];
+    c.tags = vec!["converged".to_string()];
+
+    let mut graph = build_graph(vec![a, b, c]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "c", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Should NOT iterate when multiple members signal converged"
+    );
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("c").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_converged_non_header_with_evaluate_all() {
+    // Same as test_converged_non_header_member_stops_cycle but using
+    // evaluate_all_cycle_iterations (the coordinator's safety-net path).
+    let mut a = make_task_with_status("a", "A (worker)", Status::Done);
+    a.after = vec!["b".to_string()];
+    a.tags = vec!["converged".to_string()];
+
+    let mut b = make_task_with_status("b", "B (header)", Status::Done);
+    b.after = vec!["a".to_string()];
+    b.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_all_cycle_iterations(&mut graph, &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "evaluate_all should also respect non-header converged tags"
+    );
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Done);
+}
+
+// ===========================================================================
+// Cycle deadlock breaker (Path 3): symmetric cycle_config
+// ===========================================================================
+
+#[test]
+fn test_deadlock_breaker_two_task_symmetric_cycle() {
+    // A ↔ B, both have cycle_config. After reactivation at iteration 1,
+    // all members are Open with cycle_config — deadlock without Path 3.
+    // The cycle header should be exempted to break the deadlock.
+    let mut a = make_task("a", "Task A");
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.loop_iteration = 1;
+
+    let mut b = make_task("b", "Task B");
+    b.after = vec!["a".to_string()];
+    b.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    b.loop_iteration = 1;
+
+    let graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+
+    // Exactly one task (the header) should be ready via Path 3.
+    assert_eq!(
+        ready.len(),
+        1,
+        "Exactly one task should be ready (deadlock breaker). Got: {:?}",
+        ready.iter().map(|t| &t.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ready[0].id, analysis.cycles[0].header,
+        "The cycle header should be the one that becomes ready"
+    );
+}
+
+#[test]
+fn test_deadlock_breaker_three_task_symmetric_cycle() {
+    // A → B → C → A, all have cycle_config. After reactivation at iteration 1,
+    // deadlock without Path 3. The cycle header should break it.
+    let mut a = make_task("a", "Task A");
+    a.after = vec!["c".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.loop_iteration = 1;
+
+    let mut b = make_task("b", "Task B");
+    b.after = vec!["a".to_string()];
+    b.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    b.loop_iteration = 1;
+
+    let mut c = make_task("c", "Task C");
+    c.after = vec!["b".to_string()];
+    c.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    c.loop_iteration = 1;
+
+    let graph = build_graph(vec![a, b, c]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+
+    // Exactly one task (the header) should be ready.
+    assert_eq!(
+        ready.len(),
+        1,
+        "Exactly one task should be ready (deadlock breaker). Got: {:?}",
+        ready.iter().map(|t| &t.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ready[0].id, analysis.cycles[0].header,
+        "The cycle header should be the one that becomes ready"
+    );
+}
+
+#[test]
+fn test_deadlock_breaker_does_not_fire_when_member_in_progress() {
+    // A ↔ B, both have cycle_config, B is InProgress.
+    // Back-edge exemption is structural — A's dep on B is a back-edge
+    // regardless of B's status. A is Open → A is ready.
+    // (B is InProgress, not Open, so B is not considered for readiness.)
+    let mut a = make_task("a", "Task A");
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.loop_iteration = 1;
+
+    let mut b = make_task("b", "Task B");
+    b.after = vec!["a".to_string()];
+    b.status = Status::InProgress;
+    b.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    b.loop_iteration = 1;
+
+    let graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+
+    // A is ready: its dep on B is a structural back-edge (always skipped).
+    // B is InProgress (not Open), so not a readiness candidate.
+    assert!(
+        ready_ids.contains(&"a"),
+        "A should be ready (back-edge from B skipped, no other deps). Ready: {:?}",
+        ready_ids
+    );
+    assert_eq!(
+        ready_ids.len(),
+        1,
+        "Only A should be ready (B is InProgress). Ready: {:?}",
+        ready_ids
+    );
+}
+
+#[test]
+fn test_deadlock_breaker_asymmetric_config_not_triggered() {
+    // A(cc) ↔ B(no cc). A.after=[B], B.after=[A].
+    // Back-edge analysis is purely structural — cycle_config is irrelevant.
+    // Header = A (alphabetically first). Back-edge: B→A in adj.
+    // A's dep on B is skipped (back-edge) → A ready.
+    // B's dep on A is forward → B waits for A.
+    let mut a = make_task("a", "Task A");
+    a.after = vec!["b".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.loop_iteration = 1;
+
+    let mut b = make_task("b", "Task B");
+    b.after = vec!["a".to_string()];
+    // b has NO cycle_config
+    b.loop_iteration = 1;
+
+    let graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+
+    assert!(
+        ready_ids.contains(&"a"),
+        "A (header) should be ready (back-edge from B skipped). Ready: {:?}",
+        ready_ids
+    );
+    assert!(
+        !ready_ids.contains(&"b"),
+        "B should NOT be ready (forward dep on A is Open). Ready: {:?}",
+        ready_ids
+    );
+}
+
+#[test]
+fn test_deadlock_breaker_self_loop_iteration_1() {
+    // Self-loop: A depends on A, has cycle_config, iteration 1.
+    // Path 2 doesn't fire (iteration > 0). Path 3 should handle it:
+    // single member SCC, all members Open with cycle_config, A is header.
+    let mut a = make_task("a", "Task A");
+    a.after = vec!["a".to_string()];
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.loop_iteration = 1;
+
+    let graph = build_graph(vec![a]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+
+    assert_eq!(
+        ready.len(),
+        1,
+        "Self-loop should be ready via deadlock breaker on iteration 1"
+    );
+    assert_eq!(ready[0].id, "a");
+}
+
+#[test]
+fn test_deadlock_breaker_e2e_two_task_cycle() {
+    // End-to-end: create a 2-task symmetric cycle, complete iteration 0,
+    // verify both reopen, then verify the header becomes ready on iteration 1.
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp, vec![]);
+
+    // Create A and B with mutual dependencies and cycle_config
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task A",
+            "--id",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task B",
+            "--id",
+            "b",
+            "--after",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+
+    // Complete iteration 0
+    wg_ok(&wg_dir, &["done", "a"]);
+    wg_ok(&wg_dir, &["done", "b"]);
+
+    // Both should be re-opened at iteration 1
+    let graph = load_graph(wg_dir.join("graph.jsonl")).unwrap();
+    assert_eq!(graph.get_task("a").unwrap().status, Status::Open);
+    assert_eq!(graph.get_task("b").unwrap().status, Status::Open);
+    assert_eq!(graph.get_task("a").unwrap().loop_iteration, 1);
+    assert_eq!(graph.get_task("b").unwrap().loop_iteration, 1);
+
+    // Verify both have cycle_config (auto back-edge gives b cycle_config too)
+    assert!(
+        graph.get_task("a").unwrap().cycle_config.is_some(),
+        "A should have cycle_config"
+    );
+    assert!(
+        graph.get_task("b").unwrap().cycle_config.is_some(),
+        "B should have cycle_config (auto back-edge)"
+    );
+
+    // The cycle header should be ready via Path 3
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+
+    assert!(
+        !ready.is_empty(),
+        "At least one task should be ready after deadlock breaker. \
+         Cycle header: {}, members: {:?}",
+        analysis.cycles[0].header,
+        analysis.cycles[0].members
+    );
+
+    let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+    assert!(
+        ready_ids.contains(&analysis.cycles[0].header.as_str()),
+        "The cycle header should be ready. Ready: {:?}, Header: {}",
+        ready_ids,
+        analysis.cycles[0].header
+    );
+}
+
+#[test]
+fn test_deadlock_breaker_e2e_three_task_cycle() {
+    // End-to-end: 3-task symmetric cycle via CLI, verify deadlock broken.
+    let tmp = TempDir::new().unwrap();
+    let wg_dir = setup_workgraph(&tmp, vec![]);
+
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task A",
+            "--id",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task B",
+            "--id",
+            "b",
+            "--after",
+            "a",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Task C",
+            "--id",
+            "c",
+            "--after",
+            "b",
+            "--max-iterations",
+            "3",
+            "--immediate",
+        ],
+    );
+
+    // Complete iteration 0 in order
+    wg_ok(&wg_dir, &["done", "a"]);
+    wg_ok(&wg_dir, &["done", "b"]);
+    wg_ok(&wg_dir, &["done", "c"]);
+
+    // All should be re-opened at iteration 1
+    let graph = load_graph(wg_dir.join("graph.jsonl")).unwrap();
+    for id in &["a", "b", "c"] {
+        let task = graph.get_task(id).unwrap();
+        assert_eq!(task.status, Status::Open, "{} should be Open", id);
+        assert_eq!(task.loop_iteration, 1, "{} should be at iteration 1", id);
+    }
+
+    // Verify the deadlock breaker fires
+    let analysis = graph.compute_cycle_analysis();
+    let ready = ready_tasks_cycle_aware(&graph, &analysis);
+
+    assert!(
+        !ready.is_empty(),
+        "At least one task should be ready after deadlock breaker in 3-task cycle. \
+         Cycle header: {}, members: {:?}",
+        analysis.cycles[0].header,
+        analysis.cycles[0].members
+    );
+}
+
+// ===========================================================================
+// Archived cycle header suppresses reset
+// ===========================================================================
+
+#[test]
+fn test_archived_cycle_header_suppresses_reset() {
+    // Scenario: 2-node cycle (header ↔ archive-task), header is Done + tagged 'archived',
+    // archive-task completes afterward. The cycle should NOT reset.
+    let mut header = make_task_with_status("coordinator-0", "Coordinator", Status::Done);
+    header.after = vec!["archive-0".to_string()];
+    header.cycle_config = Some(CycleConfig {
+        max_iterations: 0, // unlimited
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    header.tags = vec!["archived".to_string()];
+
+    let mut archive = make_task_with_status("archive-0", "Archive", Status::Done);
+    archive.after = vec!["coordinator-0".to_string()];
+
+    let mut graph = build_graph(vec![header, archive]);
+    let analysis = graph.compute_cycle_analysis();
+
+    // Simulate archive-0 completing last — trigger cycle evaluation
+    let reactivated = evaluate_cycle_iteration(&mut graph, "archive-0", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "Archived cycle header should suppress reset, got: {:?}",
+        reactivated
+    );
+
+    // Both tasks should remain Done
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Done
+    );
+    assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Done);
+
+    // loop_iteration should NOT have been incremented
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().loop_iteration,
+        0,
+        "Header loop_iteration should remain 0"
+    );
+    assert_eq!(
+        graph.get_task("archive-0").unwrap().loop_iteration,
+        0,
+        "Archive task loop_iteration should remain 0"
+    );
+}
+
+#[test]
+fn test_archived_cycle_header_suppresses_evaluate_all() {
+    // Same scenario but via evaluate_all_cycle_iterations (coordinator safety net path).
+    let mut header = make_task_with_status("coordinator-0", "Coordinator", Status::Done);
+    header.after = vec!["archive-0".to_string()];
+    header.cycle_config = Some(CycleConfig {
+        max_iterations: 0,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    header.tags = vec!["archived".to_string()];
+
+    let mut archive = make_task_with_status("archive-0", "Archive", Status::Done);
+    archive.after = vec!["coordinator-0".to_string()];
+
+    let mut graph = build_graph(vec![header, archive]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_all_cycle_iterations(&mut graph, &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "evaluate_all should not reactivate archived cycle, got: {:?}",
+        reactivated
+    );
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Done
+    );
+    assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_non_archived_cycle_still_resets_normally() {
+    // Sanity check: a cycle without the archived tag should still reset as expected.
+    let mut header = make_task_with_status("coordinator-0", "Coordinator", Status::Done);
+    header.after = vec!["archive-0".to_string()];
+    header.cycle_config = Some(CycleConfig {
+        max_iterations: 3,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    // No 'archived' tag
+
+    let mut archive = make_task_with_status("archive-0", "Archive", Status::Done);
+    archive.after = vec!["coordinator-0".to_string()];
+
+    let mut graph = build_graph(vec![header, archive]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "archive-0", &analysis);
+    assert_eq!(
+        reactivated.len(),
+        2,
+        "Non-archived cycle should reactivate both members"
+    );
+    assert_eq!(
+        graph.get_task("coordinator-0").unwrap().status,
+        Status::Open
+    );
+    assert_eq!(graph.get_task("archive-0").unwrap().status, Status::Open);
+}
+
+// ===========================================================================
+// Shell Task + Checker Cycle (Retry Loop) Tests
+// ===========================================================================
+
+/// Tests the shell-task → checker → retry → success cycle pattern.
+/// This validates the core "reset-from-downstream" workflow.
+#[test]
+fn test_shell_checker_cycle_iteration() {
+    // Shell task → checker → (back-edge to shell task).
+    // Checker owns the cycle_config. When both are Done and checker is not
+    // converged, both should reset to Open.
+    let mut shell_task = make_task_with_status("run-batch", "Run Batch", Status::Done);
+    shell_task.exec = Some("python3 run.py --batch 1".to_string());
+    shell_task.exec_mode = Some("shell".to_string());
+    shell_task.after = vec!["check-batch".to_string()]; // back-edge
+
+    let mut checker = make_task_with_status("check-batch", "Check Batch", Status::Done);
+    checker.after = vec!["run-batch".to_string()]; // forward edge
+    checker.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![shell_task, checker]);
+    let analysis = graph.compute_cycle_analysis();
+
+    // Complete checker without --converged → cycle should iterate
+    let reactivated = evaluate_cycle_iteration(&mut graph, "check-batch", &analysis);
+
+    assert_eq!(
+        reactivated.len(),
+        2,
+        "Both shell task and checker should be re-activated"
+    );
+
+    let shell = graph.get_task("run-batch").unwrap();
+    assert_eq!(shell.status, Status::Open, "Shell task should be Open");
+    assert_eq!(shell.loop_iteration, 1, "Shell task iteration should be 1");
+
+    let check = graph.get_task("check-batch").unwrap();
+    assert_eq!(check.status, Status::Open, "Checker should be Open");
+    assert_eq!(check.loop_iteration, 1, "Checker iteration should be 1");
+}
+
+#[test]
+fn test_shell_checker_cycle_converged_stops() {
+    // Shell → checker cycle. Checker is converged → cycle should stop.
+    let mut shell_task = make_task_with_status("run-batch", "Run Batch", Status::Done);
+    shell_task.exec = Some("python3 run.py".to_string());
+    shell_task.after = vec!["check-batch".to_string()];
+
+    let mut checker = make_task_with_status("check-batch", "Check Batch", Status::Done);
+    checker.after = vec!["run-batch".to_string()];
+    checker.tags = vec!["converged".to_string()];
+    checker.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![shell_task, checker]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "check-batch", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Converged cycle should NOT re-activate any tasks"
+    );
+
+    // Both should stay Done
+    assert_eq!(graph.get_task("run-batch").unwrap().status, Status::Done);
+    assert_eq!(graph.get_task("check-batch").unwrap().status, Status::Done);
+}
+
+#[test]
+fn test_shell_checker_cycle_max_iterations_honored() {
+    // Shell → checker. Checker at max_iterations limit.
+    let mut shell_task = make_task_with_status("run-batch", "Run Batch", Status::Done);
+    shell_task.exec = Some("python3 run.py".to_string());
+    shell_task.after = vec!["check-batch".to_string()];
+    shell_task.loop_iteration = 4; // Already at iteration 4
+
+    let mut checker = make_task_with_status("check-batch", "Check Batch", Status::Done);
+    checker.after = vec!["run-batch".to_string()];
+    checker.loop_iteration = 4;
+    checker.cycle_config = Some(CycleConfig {
+        max_iterations: 5, // max=5, iteration 4 is the last (0..4 = 5 iterations)
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+
+    let mut graph = build_graph(vec![shell_task, checker]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "check-batch", &analysis);
+
+    assert!(
+        reactivated.is_empty(),
+        "Should NOT re-activate when max iterations reached"
+    );
+}
+
+#[test]
+fn test_shell_checker_cycle_logs_preserved() {
+    // Verify that log entries survive across cycle resets.
+    let mut shell_task = make_task_with_status("run-batch", "Run Batch", Status::Done);
+    shell_task.exec = Some("python3 run.py".to_string());
+    shell_task.after = vec!["check-batch".to_string()];
+    shell_task.log = vec![workgraph::graph::LogEntry {
+        timestamp: "2026-04-07T12:00:00Z".to_string(),
+        message: "Attempt 1: completed with 3 errors".to_string(),
+        actor: None,
+        user: None,
+    }];
+
+    let mut checker = make_task_with_status("check-batch", "Check Batch", Status::Done);
+    checker.after = vec!["run-batch".to_string()];
+    checker.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    checker.log = vec![workgraph::graph::LogEntry {
+        timestamp: "2026-04-07T12:05:00Z".to_string(),
+        message: "Attempt 1: 3 errors found, requesting retry".to_string(),
+        actor: None,
+        user: None,
+    }];
+
+    let mut graph = build_graph(vec![shell_task, checker]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let reactivated = evaluate_cycle_iteration(&mut graph, "check-batch", &analysis);
+    assert_eq!(reactivated.len(), 2);
+
+    // Logs should be preserved (append-only, not cleared)
+    let shell = graph.get_task("run-batch").unwrap();
+    assert!(
+        shell.log.len() >= 1,
+        "Shell task logs should be preserved across reset"
+    );
+    assert!(
+        shell.log.iter().any(|e| e.message.contains("Attempt 1")),
+        "Original log entry should still exist"
+    );
+
+    let check = graph.get_task("check-batch").unwrap();
+    assert!(
+        check.log.len() >= 1,
+        "Checker logs should be preserved across reset"
+    );
+    assert!(
+        check.log.iter().any(|e| e.message.contains("3 errors")),
+        "Original checker log entry should still exist"
+    );
+}
+
+#[test]
+fn test_shell_checker_cycle_failure_restarts() {
+    // Shell → checker. Checker fails → cycle failure restart.
+    let mut shell_task = make_task_with_status("run-batch", "Run Batch", Status::Done);
+    shell_task.exec = Some("python3 run.py".to_string());
+    shell_task.after = vec!["check-batch".to_string()];
+
+    let mut checker = make_task_with_status("check-batch", "Check Batch", Status::Failed);
+    checker.after = vec!["run-batch".to_string()];
+    checker.failure_reason = Some("Agent crash".to_string());
+    checker.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: Some(3),
+    });
+
+    let mut graph = build_graph(vec![shell_task, checker]);
+    let analysis = graph.compute_cycle_analysis();
+
+    let restarted = evaluate_cycle_on_failure(&mut graph, "check-batch", &analysis);
+
+    assert!(
+        !restarted.is_empty(),
+        "Failure restart should re-activate tasks"
+    );
+
+    // Checker should be reset to Open
+    let check = graph.get_task("check-batch").unwrap();
+    assert_eq!(check.status, Status::Open, "Failed checker should restart");
+}
+
+/// CLI integration test: wg add --exec creates a task with exec and exec_mode=shell.
+#[test]
+fn test_cli_add_with_exec_flag() {
+    let dir = TempDir::new().unwrap();
+    let wg_dir = dir.path().join(".workgraph");
+
+    wg_ok(&wg_dir, &["init"]);
+    let output = wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Run batch script",
+            "--exec",
+            "python3 run_batch.py --quality high",
+            "--no-place",
+        ],
+    );
+    assert!(
+        output.contains("run-batch-script"),
+        "Should create task with slugified ID: {}",
+        output
+    );
+
+    let graph = load_graph(&wg_dir.join("graph.jsonl")).unwrap();
+    let task = graph
+        .get_task("run-batch-script")
+        .expect("Task should exist");
+    assert_eq!(
+        task.exec.as_deref(),
+        Some("python3 run_batch.py --quality high"),
+        "Task should have exec command set"
+    );
+    assert_eq!(
+        task.exec_mode.as_deref(),
+        Some("shell"),
+        "exec_mode should auto-set to 'shell'"
+    );
+}
+
+/// CLI integration test: wg add --exec --timeout creates a task with timeout.
+#[test]
+fn test_cli_add_with_exec_and_timeout() {
+    let dir = TempDir::new().unwrap();
+    let wg_dir = dir.path().join(".workgraph");
+
+    wg_ok(&wg_dir, &["init"]);
+    wg_ok(
+        &wg_dir,
+        &[
+            "add",
+            "Long render",
+            "--exec",
+            "render.sh",
+            "--timeout",
+            "6h",
+            "--no-place",
+        ],
+    );
+
+    let graph = load_graph(&wg_dir.join("graph.jsonl")).unwrap();
+    let task = graph.get_task("long-render").expect("Task should exist");
+    assert_eq!(task.exec.as_deref(), Some("render.sh"));
+    assert_eq!(task.timeout.as_deref(), Some("6h"));
+}
+
+// ===========================================================================
+// chat-agent-loops-2: chat-loop tagged tasks with cycle_config must NOT be
+// reactivated by cycle iteration.
+//
+// Repro of the user-visible bug: a `.chat-N` task has cycle_config (unlimited
+// iterations, no_converge). The chat agent runs, finds the inbox empty, calls
+// `wg done`. Without the guard, evaluate_cycle_iteration (Mode 2 implicit
+// cycle) re-Opens the chat task in microseconds. The chat supervisor then
+// spawns another `wg spawn-task .chat-N`, which finds the task Open, claims
+// it, the new agent calls `wg done`, repeat. .chat-2 hit dispatch count 458
+// in the user's autohaiku/workgraph project before manual archive.
+//
+// The fix lives in graph.rs::reactivate_cycle (covers wg-done sync path)
+// AND graph.rs::evaluate_all_cycle_iterations (covers dispatcher safety net).
+// ===========================================================================
+
+fn make_chat_task(id: &str) -> Task {
+    let mut t = make_task(id, id);
+    t.tags = vec![workgraph::chat_id::CHAT_LOOP_TAG.to_string()];
+    t.cycle_config = Some(CycleConfig {
+        max_iterations: 0, // unlimited — like real chat tasks
+        guard: None,
+        delay: None,
+        no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    t
+}
+
+#[test]
+fn test_chat_loop_task_not_reactivated_by_evaluate_cycle_iteration() {
+    // Mode 2 implicit cycle: chat task with cycle_config but no after-edges.
+    // This is the path that fired 458 times for .chat-2 in the bug repro.
+    let mut chat = make_chat_task(".chat-7");
+    chat.status = Status::Done;
+    let mut graph = build_graph(vec![chat]);
+
+    let analysis = graph.compute_cycle_analysis();
+    let reactivated = evaluate_cycle_iteration(&mut graph, ".chat-7", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "chat-loop tagged task with cycle_config must NOT be reactivated by \
+         evaluate_cycle_iteration — chat tasks are event-driven (woken on \
+         inbox writes), not polled. Got reactivated: {:?}",
+        reactivated
+    );
+    assert_eq!(
+        graph.get_task(".chat-7").unwrap().status,
+        Status::Done,
+        "chat task must remain Done after evaluate_cycle_iteration"
+    );
+    assert_eq!(
+        graph.get_task(".chat-7").unwrap().loop_iteration,
+        0,
+        "loop_iteration must NOT increment on chat-loop tasks"
+    );
+}
+
+#[test]
+fn test_legacy_coordinator_loop_tag_also_skipped() {
+    // Legacy `.coordinator-N` tasks with `coordinator-loop` tag must also
+    // be exempt from cycle reactivation — same event-driven semantics, just
+    // pre-rename naming. Without this, projects with un-migrated graphs
+    // would still spawn-loop on the legacy chat tasks.
+    let mut chat = make_task(".coordinator-3", ".coordinator-3");
+    chat.tags = vec![workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG.to_string()];
+    chat.cycle_config = Some(CycleConfig {
+        max_iterations: 0,
+        guard: None,
+        delay: None,
+        no_converge: true,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    chat.status = Status::Done;
+    let mut graph = build_graph(vec![chat]);
+
+    let analysis = graph.compute_cycle_analysis();
+    let reactivated = evaluate_cycle_iteration(&mut graph, ".coordinator-3", &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "coordinator-loop (legacy) tagged task must also be skipped"
+    );
+}
+
+#[test]
+fn test_chat_loop_skipped_by_evaluate_all_cycle_iterations() {
+    // Defense-in-depth path: dispatcher safety-net tick. This only fires for
+    // SCC-detected cycles, so build a 2-task SCC where the header has the
+    // chat-loop tag. If the guard is missing, evaluate_all_cycle_iterations
+    // would reactivate both members.
+    let mut a = make_chat_task("chat-header");
+    a.after = vec!["worker".to_string()];
+    a.status = Status::Done;
+
+    let mut b = make_task("worker", "Worker");
+    b.after = vec!["chat-header".to_string()];
+    b.status = Status::Done;
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+    assert!(
+        !analysis.cycles.is_empty(),
+        "test setup: SCC must be detected"
+    );
+
+    let reactivated = evaluate_all_cycle_iterations(&mut graph, &analysis);
+    assert!(
+        reactivated.is_empty(),
+        "chat-loop owner must skip safety-net reactivation. Got: {:?}",
+        reactivated
+    );
+}
+
+#[test]
+fn test_non_chat_cycle_still_reactivates() {
+    // Anti-regression: ordinary cycles WITHOUT chat-loop tag must still
+    // reactivate normally. The guard is opt-in by tag.
+    let mut a = make_task("a", "A");
+    a.cycle_config = Some(CycleConfig {
+        max_iterations: 5,
+        guard: None,
+        delay: None,
+        no_converge: false,
+        restart_on_failure: true,
+        max_failure_restarts: None,
+    });
+    a.after = vec!["b".to_string()];
+    a.status = Status::Done;
+
+    let mut b = make_task("b", "B");
+    b.after = vec!["a".to_string()];
+    b.status = Status::Done;
+
+    let mut graph = build_graph(vec![a, b]);
+    let analysis = graph.compute_cycle_analysis();
+    let reactivated = evaluate_cycle_iteration(&mut graph, "a", &analysis);
+    assert_eq!(
+        reactivated.len(),
+        2,
+        "ordinary cycles must still reactivate — guard is chat-loop specific"
     );
 }

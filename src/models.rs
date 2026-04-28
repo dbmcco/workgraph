@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+
 use std::path::Path;
 
 /// Tier classification for models
@@ -74,6 +75,22 @@ impl ModelEntry {
     pub fn short_name(&self) -> &str {
         self.id.rsplit('/').next().unwrap_or(&self.id)
     }
+
+    /// Return a provider:short_name string suitable for config values.
+    /// Maps the registry provider to the config provider prefix
+    /// (e.g., "anthropic" → "claude", others stay as-is).
+    pub fn config_spec(&self) -> String {
+        let prefix = match self.provider.as_str() {
+            "anthropic" => "claude",
+            other => other,
+        };
+        format!("{}:{}", prefix, self.short_name())
+    }
+
+    /// Whether this model supports tool use (function calling).
+    pub fn supports_tool_use(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "tool_use")
+    }
 }
 
 fn default_provider() -> String {
@@ -114,6 +131,7 @@ impl ModelRegistry {
                     "analysis".into(),
                     "creative".into(),
                     "reasoning".into(),
+                    "tool_use".into(),
                 ],
                 tier: ModelTier::Frontier,
             },
@@ -123,7 +141,12 @@ impl ModelRegistry {
                 cost_per_1m_input: 3.0,
                 cost_per_1m_output: 15.0,
                 context_window: 1_000_000,
-                capabilities: vec!["coding".into(), "analysis".into(), "creative".into()],
+                capabilities: vec![
+                    "coding".into(),
+                    "analysis".into(),
+                    "creative".into(),
+                    "tool_use".into(),
+                ],
                 tier: ModelTier::Mid,
             },
             ModelEntry {
@@ -132,7 +155,7 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.80,
                 cost_per_1m_output: 4.0,
                 context_window: 200_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
@@ -141,7 +164,12 @@ impl ModelRegistry {
                 cost_per_1m_input: 2.50,
                 cost_per_1m_output: 10.0,
                 context_window: 128_000,
-                capabilities: vec!["coding".into(), "analysis".into(), "creative".into()],
+                capabilities: vec![
+                    "coding".into(),
+                    "analysis".into(),
+                    "creative".into(),
+                    "tool_use".into(),
+                ],
                 tier: ModelTier::Mid,
             },
             ModelEntry {
@@ -150,7 +178,7 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.15,
                 cost_per_1m_output: 0.60,
                 context_window: 128_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
@@ -159,7 +187,12 @@ impl ModelRegistry {
                 cost_per_1m_input: 2.0,
                 cost_per_1m_output: 8.0,
                 context_window: 200_000,
-                capabilities: vec!["coding".into(), "analysis".into(), "reasoning".into()],
+                capabilities: vec![
+                    "coding".into(),
+                    "analysis".into(),
+                    "reasoning".into(),
+                    "tool_use".into(),
+                ],
                 tier: ModelTier::Frontier,
             },
             ModelEntry {
@@ -173,6 +206,7 @@ impl ModelRegistry {
                     "analysis".into(),
                     "creative".into(),
                     "reasoning".into(),
+                    "tool_use".into(),
                 ],
                 tier: ModelTier::Mid,
             },
@@ -182,16 +216,16 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.10,
                 cost_per_1m_output: 0.40,
                 context_window: 1_000_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
-                id: "deepseek/deepseek-chat-v3".into(),
+                id: "deepseek/deepseek-chat".into(),
                 provider: "openrouter".into(),
                 cost_per_1m_input: 0.30,
                 cost_per_1m_output: 0.88,
                 context_window: 164_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
@@ -209,7 +243,7 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.20,
                 cost_per_1m_output: 0.60,
                 context_window: 1_000_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
@@ -218,7 +252,7 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.10,
                 cost_per_1m_output: 0.30,
                 context_window: 512_000,
-                capabilities: vec!["coding".into(), "analysis".into()],
+                capabilities: vec!["coding".into(), "analysis".into(), "tool_use".into()],
                 tier: ModelTier::Budget,
             },
             ModelEntry {
@@ -227,7 +261,12 @@ impl ModelRegistry {
                 cost_per_1m_input: 0.20,
                 cost_per_1m_output: 0.60,
                 context_window: 131_072,
-                capabilities: vec!["coding".into(), "analysis".into(), "reasoning".into()],
+                capabilities: vec![
+                    "coding".into(),
+                    "analysis".into(),
+                    "reasoning".into(),
+                    "tool_use".into(),
+                ],
                 tier: ModelTier::Budget,
             },
         ];
@@ -275,6 +314,11 @@ impl ModelRegistry {
         self.models.get(id)
     }
 
+    /// Find a model by its ID (alias for get).
+    pub fn find_by_model(&self, model: &str) -> Option<&ModelEntry> {
+        self.models.get(model)
+    }
+
     /// Get the default model entry
     pub fn get_default(&self) -> Option<&ModelEntry> {
         self.default_model
@@ -286,8 +330,12 @@ impl ModelRegistry {
     pub fn set_default(&mut self, id: &str) -> Result<()> {
         if !self.models.contains_key(id) {
             anyhow::bail!(
-                "Model '{}' not found in registry. Use 'wg models list' to see available models.",
-                id
+                "Model '{}' not found in registry.\n  \
+                 Try: `wg models search {}` to find valid alternatives\n  \
+                 Or:  `wg models list` to see the local registry\n  \
+                 Tip: `openrouter/auto` is a safe default that auto-routes to the best model.",
+                id,
+                id.split('/').next_back().unwrap_or(id),
             );
         }
         self.default_model = Some(id.to_string());
@@ -297,6 +345,18 @@ impl ModelRegistry {
     /// Add or update a model entry
     pub fn add(&mut self, entry: ModelEntry) {
         self.models.insert(entry.id.clone(), entry);
+    }
+
+    /// Check if a model supports tool use by its ID.
+    ///
+    /// Returns `true` if the model has the `tool_use` capability, or if the
+    /// model is not in the registry (unknown models default to tool support
+    /// to avoid silently breaking existing behavior).
+    pub fn supports_tool_use(&self, model_id: &str) -> bool {
+        match self.models.get(model_id) {
+            Some(entry) => entry.supports_tool_use(),
+            None => true, // Unknown models default to tool support
+        }
     }
 
     /// List all models, optionally filtered by tier
@@ -318,10 +378,10 @@ impl ModelRegistry {
         };
         let mut entries: Vec<&ModelEntry> = self.models.values().collect();
         entries.sort_by_key(|e| (tier_order(&e.tier), e.id.clone()));
-        entries.iter().map(|e| e.short_name().to_string()).collect()
+        entries.iter().map(|e| e.config_spec()).collect()
     }
 
-    /// Return (short_name, description) pairs for setup wizard display.
+    /// Return (config_spec, description) pairs for setup wizard display.
     pub fn model_choices_with_descriptions(&self) -> Vec<(String, String)> {
         let tier_order = |t: &ModelTier| -> u8 {
             match t {
@@ -336,7 +396,7 @@ impl ModelRegistry {
             .iter()
             .map(|e| {
                 let desc = format!("{} tier, {}", e.tier, e.provider);
-                (e.short_name().to_string(), desc)
+                (e.config_spec(), desc)
             })
             .collect()
     }
@@ -346,7 +406,13 @@ impl ModelRegistry {
 pub fn load_model_choices(workgraph_dir: &std::path::Path) -> Vec<String> {
     ModelRegistry::load(workgraph_dir)
         .map(|r| r.model_choices())
-        .unwrap_or_else(|_| vec!["opus".into(), "sonnet".into(), "haiku".into()])
+        .unwrap_or_else(|_| {
+            vec![
+                "claude:opus".into(),
+                "claude:sonnet".into(),
+                "claude:haiku".into(),
+            ]
+        })
 }
 
 /// Load model choices with descriptions, falling back to defaults.
@@ -357,9 +423,18 @@ pub fn load_model_choices_with_descriptions(
         .map(|r| r.model_choices_with_descriptions())
         .unwrap_or_else(|_| {
             vec![
-                ("opus".into(), "Most capable, best for complex tasks".into()),
-                ("sonnet".into(), "Balanced capability and speed".into()),
-                ("haiku".into(), "Fastest, best for simple tasks".into()),
+                (
+                    "claude:opus".into(),
+                    "Most capable, best for complex tasks".into(),
+                ),
+                (
+                    "claude:sonnet".into(),
+                    "Balanced capability and speed".into(),
+                ),
+                (
+                    "claude:haiku".into(),
+                    "Fastest, best for simple tasks".into(),
+                ),
             ]
         })
 }
@@ -369,13 +444,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    const OPENROUTER_OPUS_ID: &str = "anthropic/claude-opus-4-6";
+
     #[test]
     fn test_default_registry_has_models() {
         let reg = ModelRegistry::with_defaults();
         assert!(reg.models.len() >= 10);
-        assert!(reg.models.contains_key("anthropic/claude-opus-4-6"));
+        assert!(reg.models.contains_key(OPENROUTER_OPUS_ID));
         assert!(reg.models.contains_key("openai/gpt-4o"));
-        assert!(reg.models.contains_key("deepseek/deepseek-chat-v3"));
+        assert!(reg.models.contains_key("deepseek/deepseek-chat"));
     }
 
     #[test]
@@ -404,7 +481,7 @@ mod tests {
 
         let loaded = ModelRegistry::load(dir.path()).unwrap();
         assert_eq!(loaded.models.len(), reg.models.len());
-        assert!(loaded.models.contains_key("anthropic/claude-opus-4-6"));
+        assert!(loaded.models.contains_key(OPENROUTER_OPUS_ID));
     }
 
     #[test]
@@ -469,13 +546,55 @@ mod tests {
     #[test]
     fn test_yaml_roundtrip() {
         let mut reg = ModelRegistry::with_defaults();
-        reg.set_default("anthropic/claude-opus-4-6").unwrap();
+        reg.set_default(OPENROUTER_OPUS_ID).unwrap();
 
         let yaml = serde_yaml::to_string(&reg).unwrap();
         let parsed: ModelRegistry = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.default_model, reg.default_model);
         assert_eq!(parsed.models.len(), reg.models.len());
+    }
+
+    #[test]
+    fn test_supports_tool_use() {
+        let reg = ModelRegistry::with_defaults();
+
+        // Models with tool_use capability
+        assert!(reg.supports_tool_use(OPENROUTER_OPUS_ID));
+        assert!(reg.supports_tool_use("openai/gpt-4o"));
+        assert!(reg.supports_tool_use("google/gemini-2.5-pro"));
+        assert!(reg.supports_tool_use("deepseek/deepseek-chat"));
+
+        // DeepSeek R1 reasoning model does NOT support tools
+        assert!(!reg.supports_tool_use("deepseek/deepseek-r1"));
+
+        // Unknown models default to true
+        assert!(reg.supports_tool_use("unknown/model-xyz"));
+    }
+
+    #[test]
+    fn test_model_entry_supports_tool_use() {
+        let with_tools = ModelEntry {
+            id: "test/with-tools".into(),
+            provider: "test".into(),
+            cost_per_1m_input: 1.0,
+            cost_per_1m_output: 2.0,
+            context_window: 32_000,
+            capabilities: vec!["coding".into(), "tool_use".into()],
+            tier: ModelTier::Mid,
+        };
+        assert!(with_tools.supports_tool_use());
+
+        let without_tools = ModelEntry {
+            id: "test/no-tools".into(),
+            provider: "test".into(),
+            cost_per_1m_input: 1.0,
+            cost_per_1m_output: 2.0,
+            context_window: 32_000,
+            capabilities: vec!["coding".into(), "reasoning".into()],
+            tier: ModelTier::Mid,
+        };
+        assert!(!without_tools.supports_tool_use());
     }
 
     #[test]

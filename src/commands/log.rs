@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use workgraph::graph::LogEntry;
 use workgraph::messages;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -16,15 +17,38 @@ pub fn run_add(
     actor: Option<&str>,
     agent_id: Option<&str>,
 ) -> Result<()> {
-    super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(id)?;
-        task.log.push(LogEntry {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    let mut error: Option<anyhow::Error> = None;
+
+    let _graph = modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
+
+        let entry = LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: actor.map(String::from),
+            user: Some(workgraph::current_user()),
             message: message.to_string(),
-        });
-        Ok(())
-    })?;
+        };
+
+        task.log.push(entry);
+        true
+    })
+    .context("Failed to save graph")?;
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+
     super::notify_graph_changed(dir);
 
     let actor_str = actor.map(|a| format!(" ({})", a)).unwrap_or_default();

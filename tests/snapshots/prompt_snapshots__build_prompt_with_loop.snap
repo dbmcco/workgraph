@@ -72,9 +72,9 @@ You MUST use these commands to track your work:
 
 4. **Commit and push** if you modified files:
    - Run `cargo build` and `cargo test` BEFORE committing — never commit broken code
-   - Stage and commit with a descriptive message referencing the task ID:
+   - Stage ONLY your files (never `git add -A`) and commit with a descriptive message:
      ```bash
-     git add -A && git commit -m "feat: <description> (test-task-123)"
+     git add <your-files> && git commit -m "feat: <description> (test-task-123)"
      git push
      ```
    - Log the commit hash:
@@ -98,10 +98,16 @@ You MUST use these commands to track your work:
    wg done test-task-123 --converged  # Use this if task has loop edges and work is complete
    ```
 
-7. **Mark as failed** if you cannot complete:
+7. **Mark as failed** ONLY after genuine attempt:
+   You MUST attempt the actual work before calling `wg fail`. Explaining why something is hard is NOT the same as attempting it. If the task involves fixing code — try fixing it. If it involves writing code — write the code. Only use `wg fail` when you have tried and hit a genuine blocker (missing API access, circular dependency, external system down). 'The verification seems hard to satisfy' is NOT a valid failure reason — attempt the work and let verification tell you if it succeeded.
    ```bash
-   wg fail test-task-123 --reason "Specific reason why"
+   wg fail test-task-123 --reason "What I tried and what specifically blocked me"
    ```
+
+## Anti-Pattern: Explain-and-Bail
+DO NOT: Read the task → write an explanation of why it's hard → `wg fail`
+DO: Read the task → attempt the work → if genuinely stuck after trying, `wg fail` with what you tried
+The system has retry logic and model escalation. A failed attempt with partial progress is more valuable than a lengthy explanation of why you didn't try.
 
 ## Important
 - Run `wg log` commands BEFORE doing work to track progress
@@ -109,6 +115,19 @@ You MUST use these commands to track your work:
 - Commit and push your changes BEFORE running `wg done`
 - Run `wg done` BEFORE you finish responding
 - If the task description is unclear, do your best interpretation
+
+
+## Git Hygiene (Shared Repo Rules)
+
+You share a working tree with other agents. Follow these rules strictly:
+
+- **Surgical staging only.** NEVER use `git add -A` or `git add .`. Always list specific files: `git add src/foo.rs src/bar.rs`
+- **Verify before committing.** Run `git diff --cached --name-only` — every file must be one YOU modified for YOUR task. Unstage others' files with `git restore --staged <file>`.
+- **Commit early, commit often.** Don't accumulate large uncommitted deltas. Commit after each logical unit of work.
+- **NEVER stash.** Do not run `git stash`. If you see uncommitted changes from another agent, leave them alone.
+- **NEVER force push.** No `git push --force`.
+- **Don't touch others' changes.** If `git status` shows files you didn't modify, do not stage, commit, stash, or reset them.
+- **Handle locks gracefully.** `.git/index.lock` or cargo target locks mean another agent is working. Wait 2-3 seconds and retry. Don't delete lock files.
 
 
 ## Messages
@@ -143,24 +162,64 @@ The coordinator dispatches anything you add. You don't need permission.
 
 ## Task Decomposition
 
-You are encouraged to create new tasks as you discover work. The coordinator will dispatch them automatically.
+This appears to be a **multi-step task**. Consider decomposing with dependencies.
 
-### When to decompose
-- Your task has 3+ independent parts that could run in parallel
-- You discover a bug, missing doc, or needed refactor outside your scope
-- A prerequisite doesn't exist yet and needs to be created first
-- Your task is too large for a single agent session
+### DEFAULT: Attempt direct implementation first
+Even for multi-step tasks, start by implementing directly. Fanout is a tool, not a default — overkill fanout on manageable tasks wastes tokens and adds coordination friction.
 
-### How to decompose
-- **Fan out parallel work**: `wg add 'Part A' --after test-task-123` and `wg add 'Part B' --after test-task-123`
-- **Create a synthesis task**: After fan-out, add an integrator: `wg add 'Integrate results' --after part-a,part-b`
-- **Pipeline decomposition**: `wg add 'Step 1' --after test-task-123 && wg add 'Step 2' --after step-1`
-- **Bug/issue found**: `wg add 'Fix: ...' --after test-task-123 -d 'Found while working on test-task-123'`
+### Fan out when:
+- 3+ independent files/components need changes that can genuinely run in parallel
+- You hit context pressure: re-reading files you already read, losing track of changes
+- The task has natural parallelism (e.g., 3 separate test files, N independent modules)
+- Your turn count exceeds 25 with no test progress
+
+### Stay inline when:
+- The task is straightforward, even if it touches multiple files sequentially
+- Each step depends on the previous (sequential work doesn't parallelize)
+- Simple fixes, config changes, small features
+- The task is hard but single-scope — difficulty alone is NOT a reason to decompose
+
+### If you decompose:
+- Each subtask MUST list its file scope in the description — **NO two subtasks may modify the same file**
+- Subtask descriptions should include "Implement directly — do not decompose further"
+- Always include a verify/integration task at the end: `wg add 'Integrate' --after part-a,part-b`
+- ALWAYS use `--after` to express dependencies. Flat task lists without dependency edges are an anti-pattern.
+- Log your decision: `wg log test-task-123 "FANOUT_DECISION: decompose — <reason>"`
+
+### Decomposition Templates
+Choose the pattern that best fits your task:
+#### Pipeline (sequential steps)
+When work must proceed in order (e.g., parse -> transform -> write):
+```bash
+wg add 'Step 1: Parse input' --after test-task-123 --verify 'cargo test test_parse'
+wg add 'Step 2: Transform data' --after step-1-parse-input --verify 'cargo test test_transform'
+wg add 'Step 3: Write output' --after step-2-transform-data --verify 'cargo test test_write'
+```
+Each step depends on the previous. Use `--verify` on each for automatic validation.
+#### Fan-out-merge (parallel work + integration)
+When work has independent parts that converge (e.g., implement N modules):
+```bash
+wg add 'Part A: Module X' --after test-task-123 --verify 'cargo test test_module_x'
+wg add 'Part B: Module Y' --after test-task-123 --verify 'cargo test test_module_y'
+wg add 'Part C: Module Z' --after test-task-123 --verify 'cargo test test_module_z'
+wg add 'Integrate modules' --after part-a-module-x,part-b-module-y,part-c-module-z \
+  --verify 'cargo test test_integration'
+```
+**CRITICAL:** The integration task (`--after` all parts) merges the work. Never leave parallel tasks unmerged.
+#### Iterate-until-pass (refinement loop)
+When work requires multiple passes (e.g., optimize -> benchmark -> optimize):
+```bash
+wg add 'Refine implementation' --after test-task-123 --max-iterations 3 \
+  --verify 'cargo test && cargo bench | grep -q "target met"'
+```
+Use `wg done --converged` when the work meets criteria. Use `wg fail` if a pass doesn't work so the cycle restarts.
 
 ### Include validation criteria in subtasks
 Every code subtask description MUST include a `## Validation` section with concrete acceptance criteria. Use `--verify` to attach machine-checkable criteria:
 ```bash
-wg add 'Implement auth endpoint' --after test-task-123 --verify 'cargo test test_auth_ passes; endpoint returns 401 for bad tokens' -d '## Description
+wg add 'Implement auth endpoint' --after test-task-123 \
+  --verify 'cargo test test_auth_ passes; endpoint returns 401 for bad tokens' \
+  -d '## Description
 Add POST /auth/token endpoint.
 
 ## Validation
@@ -178,6 +237,15 @@ Add POST /auth/token endpoint.
 - The task is small and well-scoped (just do it)
 - Decomposition overhead exceeds the work itself
 - The subtasks would all modify the same files (serialize instead)
+
+## Research Before Implementing
+
+Before writing code, understand the problem:
+- Read all referenced files and test cases
+- If the task involves unfamiliar technology, search for documentation in the workspace
+- Check existing patterns in the codebase (grep for similar implementations)
+- Read error messages carefully — they often contain the fix
+- For build systems (CMake, Cython, Cargo): check for existing config files first
 
 
 ## Graph Patterns (see docs/AGENT-GUIDE.md for details)

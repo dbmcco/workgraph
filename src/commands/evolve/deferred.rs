@@ -4,8 +4,8 @@ use std::fs;
 use std::path::Path;
 
 use workgraph::agency;
-use workgraph::graph::{Node, Status, Task};
-use workgraph::{lock_graph_file, load_graph_locked, save_graph_locked};
+use workgraph::graph::{Node, PRIORITY_DEFAULT, Status, Task};
+use workgraph::modify_graph;
 
 use super::operations::apply_operation;
 use super::strategy::EvolverOperation;
@@ -59,9 +59,6 @@ pub(crate) fn defer_self_mutation(
     run_id: &str,
 ) -> Result<String> {
     let graph_path = super::super::graph_path(dir);
-    let _lock = lock_graph_file(&graph_path).context("Failed to lock graph")?;
-    let mut graph =
-        load_graph_locked(&graph_path, &_lock).context("Failed to load graph for self-mutation deferral")?;
 
     let task_id = format!(
         "evolve-review-{}-{}",
@@ -69,10 +66,9 @@ pub(crate) fn defer_self_mutation(
         op.target_id.as_deref().unwrap_or("unknown"),
     );
 
-    // Don't create duplicate review tasks
-    if graph.get_task(&task_id).is_some() {
-        return Ok(task_id);
-    }
+    // Check for duplicate outside modify_graph to avoid needless locking
+    // (still re-checked inside for safety)
+    let task_id_clone = task_id.clone();
 
     let op_json = serde_json::to_string_pretty(op).unwrap_or_else(|_| format!("{:?}", op.op));
 
@@ -96,6 +92,7 @@ pub(crate) fn defer_self_mutation(
         ),
         description: Some(desc),
         status: Status::Open,
+        priority: PRIORITY_DEFAULT,
         assigned: None,
         estimate: None,
         before: vec![],
@@ -107,6 +104,7 @@ pub(crate) fn defer_self_mutation(
         deliverables: vec![],
         artifacts: vec![],
         exec: None,
+        timeout: None,
         not_before: None,
         created_at: Some(Utc::now().to_rfc3339()),
         started_at: None,
@@ -117,9 +115,12 @@ pub(crate) fn defer_self_mutation(
         failure_reason: None,
         model: None,
         provider: None,
+        endpoint: None,
         verify: Some("Human must approve evolver self-mutation before applying.".to_string()),
+        verify_timeout: None,
         agent: None,
         loop_iteration: 0,
+        last_iteration_completed_at: None,
         cycle_failure_restarts: 0,
         ready_after: None,
         paused: false,
@@ -130,15 +131,56 @@ pub(crate) fn defer_self_mutation(
         session_id: None,
         wait_condition: None,
         checkpoint: None,
+        triage_count: 0,
         resurrection_count: 0,
         last_resurrected_at: None,
+        validation: None,
+        validation_commands: vec![],
+        validator_agent: None,
+        validator_model: None,
+        gate_attempts: 0,
+        test_required: false,
+        rejection_count: 0,
+        max_rejections: None,
         exec_mode: None,
+        verify_failures: 0,
+        rescue_count: 0,
+        spawn_failures: 0,
+        dispatch_count: 0,
+        tier: None,
+        no_tier_escalation: false,
+        tried_models: vec![],
+        superseded_by: vec![],
+        supersedes: None,
+        unplaced: false,
+        place_before: vec![],
+        place_near: vec![],
+        independent: false,
+        iteration_round: 0,
+        iteration_anchor: None,
+        iteration_parent: None,
+        iteration_config: None,
+        cron_schedule: None,
+        cron_enabled: false,
+        last_cron_fire: None,
+        next_cron_fire: None,
     };
 
-    graph.add_node(Node::Task(task));
-    save_graph_locked(&graph, &graph_path, &_lock)
-        .context("Failed to save graph with self-mutation review task")?;
-    super::super::notify_graph_changed(dir);
+    let mut already_exists = false;
+    modify_graph(&graph_path, |graph| {
+        // Re-check for duplicate under lock
+        if graph.get_task(&task_id_clone).is_some() {
+            already_exists = true;
+            return false;
+        }
+        graph.add_node(Node::Task(task));
+        true
+    })
+    .context("Failed to save graph with self-mutation review task")?;
+
+    if !already_exists {
+        super::super::notify_graph_changed(dir);
+    }
 
     Ok(task_id)
 }

@@ -53,6 +53,10 @@ pub struct Message {
     /// Delivery status tracking.
     #[serde(default)]
     pub status: DeliveryStatus,
+    /// ISO 8601 timestamp of when the message was read by the agent.
+    /// Set when `update_message_statuses()` transitions status to `Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
 }
 
 fn default_priority() -> String {
@@ -145,6 +149,7 @@ pub fn send_message(
         body: body.to_string(),
         priority: priority.to_string(),
         status: DeliveryStatus::Sent,
+        read_at: None,
     };
 
     // Append the message as a single JSON line
@@ -302,8 +307,12 @@ pub fn update_message_statuses(
     let mut messages = list_messages(workgraph_dir, task_id)?;
     let mut changed = false;
 
+    let now = Utc::now().to_rfc3339();
     for msg in &mut messages {
         if id_set.contains(&msg.id) && status_rank(&new_status) > status_rank(&msg.status) {
+            if new_status == DeliveryStatus::Read && msg.read_at.is_none() {
+                msg.read_at = Some(now.clone());
+            }
             msg.status = new_status.clone();
             changed = true;
         }
@@ -560,6 +569,28 @@ impl MessageAdapter for ClaudeMessageAdapter {
     }
 }
 
+/// Codex executor message adapter.
+///
+/// Codex runs non-interactively via `codex exec`, so message delivery matches
+/// the Claude adapter in v1: queue the message, write a notification file, and
+/// let the next spawned turn consume it.
+pub struct CodexMessageAdapter;
+
+impl MessageAdapter for CodexMessageAdapter {
+    fn deliver(&self, workgraph_dir: &Path, agent: &AgentEntry, message: &Message) -> Result<bool> {
+        write_notification(workgraph_dir, &agent.id, message)?;
+        Ok(false)
+    }
+
+    fn supports_realtime(&self) -> bool {
+        false
+    }
+
+    fn executor_type(&self) -> &str {
+        "codex"
+    }
+}
+
 /// Amplifier executor message adapter.
 ///
 /// Amplifier runs in `--mode single` with text output. Like the Claude adapter,
@@ -613,12 +644,110 @@ impl MessageAdapter for ShellMessageAdapter {
     }
 }
 
+/// Status of coordinator-side (TUI) message read state for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatorMessageStatus {
+    /// Task has messages and the TUI has not viewed them yet.
+    Unseen,
+    /// TUI has viewed all messages but not replied after the last incoming message.
+    Seen,
+    /// The TUI (or user/coordinator) has sent a reply after the last incoming message.
+    Replied,
+}
+
+impl CoordinatorMessageStatus {
+    /// ANSI color for this status (ratatui Color).
+    pub fn color(&self) -> ratatui::style::Color {
+        match self {
+            CoordinatorMessageStatus::Unseen => ratatui::style::Color::DarkGray,
+            CoordinatorMessageStatus::Seen => ratatui::style::Color::Yellow,
+            CoordinatorMessageStatus::Replied => ratatui::style::Color::Green,
+        }
+    }
+
+    /// Single-character icon for this status.
+    pub fn icon(&self) -> char {
+        match self {
+            CoordinatorMessageStatus::Unseen => '✉',
+            CoordinatorMessageStatus::Seen => '↩',
+            CoordinatorMessageStatus::Replied => '✓',
+        }
+    }
+
+    /// ANSI escape code prefix for terminal coloring.
+    pub fn ansi_prefix(&self) -> &'static str {
+        match self {
+            CoordinatorMessageStatus::Unseen => "\x1b[90m", // DarkGray
+            CoordinatorMessageStatus::Seen => "\x1b[33m",   // Yellow
+            CoordinatorMessageStatus::Replied => "\x1b[32m", // Green
+        }
+    }
+}
+
+/// Compute the coordinator (TUI) message status for a given task.
+///
+/// Uses the "tui" cursor to determine what the coordinator has seen.
+/// - `Replied`: an outgoing message from "tui", "user", or "coordinator" exists
+///   after the last incoming message.
+/// - `Seen`: tui cursor >= max incoming message ID (all seen, no reply yet).
+/// - `Unseen`: tui cursor < max incoming message ID or no cursor exists.
+///
+/// Returns `None` if the task has no messages.
+pub fn coordinator_message_status(
+    workgraph_dir: &Path,
+    task_id: &str,
+) -> Option<CoordinatorMessageStatus> {
+    let messages = list_messages(workgraph_dir, task_id).ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Senders considered "coordinator-side" (outgoing from the TUI perspective).
+    let is_coordinator_sender = |sender: &str| matches!(sender, "tui" | "user" | "coordinator");
+
+    let mut last_incoming_id: u64 = 0;
+    let mut last_outgoing_after_incoming_id: u64 = 0;
+
+    // Walk messages in order to find last incoming and whether there's an outgoing reply after it.
+    for msg in &messages {
+        if is_coordinator_sender(&msg.sender) {
+            // This is an outgoing message from the coordinator side.
+            if last_incoming_id > 0 && msg.id > last_incoming_id {
+                last_outgoing_after_incoming_id = msg.id;
+            }
+        } else {
+            // Incoming message — reset the outgoing-after-incoming tracker.
+            last_incoming_id = msg.id;
+            last_outgoing_after_incoming_id = 0;
+        }
+    }
+
+    if last_incoming_id == 0 {
+        // All messages are outgoing — no incoming messages to respond to.
+        return None;
+    }
+
+    // Check if there's a reply after the last incoming message.
+    if last_outgoing_after_incoming_id > last_incoming_id {
+        return Some(CoordinatorMessageStatus::Replied);
+    }
+
+    // Check the TUI cursor: if it's >= last_incoming_id, the user has seen everything.
+    let tui_cursor = read_cursor(workgraph_dir, "tui", task_id).unwrap_or(0);
+    if tui_cursor >= last_incoming_id {
+        Some(CoordinatorMessageStatus::Seen)
+    } else {
+        Some(CoordinatorMessageStatus::Unseen)
+    }
+}
+
 /// Create the appropriate message adapter for a given executor type.
 ///
 /// Returns a boxed trait object that handles message delivery for that executor.
 pub fn adapter_for_executor(executor_type: &str) -> Box<dyn MessageAdapter> {
     match executor_type {
         "claude" => Box::new(ClaudeMessageAdapter),
+        "codex" => Box::new(CodexMessageAdapter),
         "amplifier" => Box::new(AmplifierMessageAdapter),
         "shell" => Box::new(ShellMessageAdapter),
         // Default to claude-like behavior for unknown executors
@@ -653,6 +782,7 @@ pub fn deliver_message(
         body: body.to_string(),
         priority: priority.to_string(),
         status: DeliveryStatus::Sent,
+        read_at: None,
     };
     let delivered = adapter.deliver(workgraph_dir, agent, &msg)?;
 
@@ -850,6 +980,38 @@ mod tests {
     }
 
     #[test]
+    fn test_read_at_timestamp_set_on_read() {
+        let (_tmp, wg_dir) = setup();
+
+        send_message(&wg_dir, "task-1", "Hello", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "World", "user", "normal").unwrap();
+
+        // Before reading: read_at should be None.
+        let msgs = list_messages(&wg_dir, "task-1").unwrap();
+        assert!(msgs[0].read_at.is_none());
+        assert!(msgs[1].read_at.is_none());
+
+        // Read the messages as agent-1.
+        let unread = read_unread(&wg_dir, "task-1", "agent-1").unwrap();
+        assert_eq!(unread.len(), 2);
+
+        // After reading: read_at should be set.
+        let msgs = list_messages(&wg_dir, "task-1").unwrap();
+        assert!(
+            msgs[0].read_at.is_some(),
+            "read_at should be set after read_unread"
+        );
+        assert!(
+            msgs[1].read_at.is_some(),
+            "read_at should be set after read_unread"
+        );
+
+        // The read_at should be a valid RFC 3339 timestamp.
+        let read_at = msgs[0].read_at.as_ref().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(read_at).is_ok());
+    }
+
+    #[test]
     fn test_separate_cursors_per_agent() {
         let (_tmp, wg_dir) = setup();
 
@@ -971,6 +1133,7 @@ mod tests {
             output_file: "/tmp/output.log".to_string(),
             model: None,
             completed_at: None,
+            worktree_path: None,
         }
     }
 
@@ -985,6 +1148,13 @@ mod tests {
     fn test_adapter_for_executor_amplifier() {
         let adapter = adapter_for_executor("amplifier");
         assert_eq!(adapter.executor_type(), "amplifier");
+        assert!(!adapter.supports_realtime());
+    }
+
+    #[test]
+    fn test_adapter_for_executor_codex() {
+        let adapter = adapter_for_executor("codex");
+        assert_eq!(adapter.executor_type(), "codex");
         assert!(!adapter.supports_realtime());
     }
 
@@ -1017,6 +1187,7 @@ mod tests {
             body: "Hello agent".to_string(),
             priority: "normal".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let delivered = adapter.deliver(&wg_dir, &agent, &msg).unwrap();
@@ -1049,6 +1220,7 @@ mod tests {
             body: "Context update".to_string(),
             priority: "urgent".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let delivered = adapter.deliver(&wg_dir, &agent, &msg).unwrap();
@@ -1083,6 +1255,7 @@ mod tests {
                 body: format!("Message {}", i),
                 priority: "normal".to_string(),
                 status: DeliveryStatus::Sent,
+                read_at: None,
             };
             adapter.deliver(&wg_dir, &agent, &msg).unwrap();
         }
@@ -1141,6 +1314,7 @@ mod tests {
             body: "Auto-create dir".to_string(),
             priority: "normal".to_string(),
             status: DeliveryStatus::Sent,
+            read_at: None,
         };
 
         let adapter = ClaudeMessageAdapter;
@@ -1148,5 +1322,94 @@ mod tests {
 
         let notif_path = notification_file(&wg_dir, "agent-new");
         assert!(notif_path.exists());
+    }
+
+    // --- CoordinatorMessageStatus tests ---
+
+    #[test]
+    fn test_coordinator_message_status_no_messages() {
+        let (_tmp, wg_dir) = setup();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn test_coordinator_message_status_unseen() {
+        let (_tmp, wg_dir) = setup();
+        // Send an incoming message (from agent, not tui/user/coordinator)
+        send_message(&wg_dir, "task-1", "Hello", "agent-1", "normal").unwrap();
+        // No cursor set — should be Unseen
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_unseen_cursor_behind() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Msg 1", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Msg 2", "agent-1", "normal").unwrap();
+        // Cursor at 1 but last incoming is 2
+        write_cursor(&wg_dir, "tui", "task-1", 1).unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_seen() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Hello", "agent-1", "normal").unwrap();
+        // TUI cursor advanced to cover the incoming message
+        write_cursor(&wg_dir, "tui", "task-1", 1).unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Seen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_tui() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "tui", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_user() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "user", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_from_coordinator() {
+        let (_tmp, wg_dir) = setup();
+        send_message(&wg_dir, "task-1", "Question", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Answer", "coordinator", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Replied));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_replied_resets_on_new_incoming() {
+        let (_tmp, wg_dir) = setup();
+        // Agent asks, user replies, then agent asks again
+        send_message(&wg_dir, "task-1", "Q1", "agent-1", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "A1", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Q2", "agent-1", "normal").unwrap();
+        // Now Q2 is unanswered — should be Unseen (no cursor advance)
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, Some(CoordinatorMessageStatus::Unseen));
+    }
+
+    #[test]
+    fn test_coordinator_message_status_all_outgoing_returns_none() {
+        let (_tmp, wg_dir) = setup();
+        // Only outgoing messages from the coordinator side
+        send_message(&wg_dir, "task-1", "Hello", "user", "normal").unwrap();
+        send_message(&wg_dir, "task-1", "Follow-up", "tui", "normal").unwrap();
+        let status = coordinator_message_status(&wg_dir, "task-1");
+        assert_eq!(status, None);
     }
 }

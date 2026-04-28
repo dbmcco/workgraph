@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::LogEntry;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -9,19 +10,45 @@ use super::graph_path;
 use workgraph::parser::{load_graph, save_graph};
 
 pub fn run(dir: &Path, id: &str) -> Result<()> {
-    super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(id)?;
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    // Use modify_graph for atomic load-modify-save under a single exclusive
+    // lock, preventing race conditions with the coordinator.
+    let mut error: Option<anyhow::Error> = None;
+
+    let _graph = modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
+
         if task.paused {
-            anyhow::bail!("Task '{}' is already paused", id);
+            error = Some(anyhow::anyhow!("Task '{}' is already paused", id));
+            return false;
         }
+
         task.paused = true;
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: None,
+            user: Some(workgraph::current_user()),
             message: "Task paused".to_string(),
         });
-        Ok(())
-    })?;
+
+        true
+    })
+    .context("Failed to save graph")?;
+
+    if let Some(e) = error {
+        return Err(e);
+    }
+
     super::notify_graph_changed(dir);
 
     // Record operation
@@ -45,6 +72,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use workgraph::graph::{Node, Status, Task, WorkGraph};
+    use workgraph::parser::save_graph;
 
     fn make_task(id: &str, title: &str, status: Status) -> Task {
         Task {

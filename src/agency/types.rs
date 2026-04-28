@@ -193,6 +193,10 @@ pub struct RoleComponent {
     #[serde(default)]
     pub access_control: AccessControl,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_deployments: Vec<DeploymentRef>,
@@ -215,6 +219,10 @@ pub struct DesiredOutcome {
     pub access_control: AccessControl,
     #[serde(default = "default_true")]
     pub requires_human_oversight: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -242,6 +250,10 @@ pub struct TradeoffConfig {
     pub lineage: Lineage,
     #[serde(default)]
     pub access_control: AccessControl,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -310,10 +322,11 @@ pub struct Agent {
         skip_serializing_if = "is_default_executor"
     )]
     pub executor: String,
-    /// Preferred model for this agent (for routing and assignment defaults).
+    /// Preferred model for this agent (e.g., "opus", "sonnet", "haiku",
+    /// or a full model ID like "claude-opus-4-6").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_model: Option<String>,
-    /// Preferred provider for this agent (for executor routing defaults).
+    /// Preferred provider for this agent (e.g., "anthropic", "openrouter").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -338,6 +351,9 @@ pub fn is_human_executor(executor: &str) -> bool {
     HUMAN_EXECUTORS.contains(&executor)
 }
 
+/// Providers that are not Anthropic-native and should default to the "native" executor.
+const NON_ANTHROPIC_PROVIDERS: &[&str] = &["openrouter", "oai-compat", "openai", "local"];
+
 impl Agent {
     /// Returns true if this agent uses a human executor (matrix, email, shell).
     pub fn is_human(&self) -> bool {
@@ -345,17 +361,53 @@ impl Agent {
     }
 
     /// Return the effective executor, considering provider-based auto-detection.
+    ///
+    /// If executor was explicitly set to a non-default value, returns that.
+    /// Otherwise, if `preferred_provider` is openrouter/openai/local, returns "native".
     pub fn effective_executor(&self) -> &str {
+        self.effective_executor_for_model(None)
+    }
+
+    /// Return the effective executor for this agent. The `model` parameter
+    /// is accepted but no longer used to override the agent's choice — that
+    /// override lives at the dispatch layer (see [`crate::dispatch::plan_spawn`]).
+    ///
+    /// Returns the agent's choice as a string, defaulting to `"claude"` when
+    /// the agent has no opinion. Spawn-site code should prefer
+    /// [`Self::explicit_executor`] which returns `None` for the abstain
+    /// case so the dispatcher's executor floor can take effect.
+    pub fn effective_executor_for_model(&self, _model: Option<&str>) -> &str {
+        self.explicit_executor().unwrap_or("claude")
+    }
+
+    /// Return the agent's explicit executor preference, or `None` if it has
+    /// none. An agent has an explicit preference iff:
+    /// - `executor` is set to a non-default value (e.g. `codex`, `native`), OR
+    /// - `preferred_provider` is non-Anthropic (implies `native`).
+    ///
+    /// When this returns `None`, the dispatcher's executor floor
+    /// (`[dispatcher].executor`, then default) takes over.
+    ///
+    /// History (agency-still-picks): the previous implementation overrode
+    /// claude → native here whenever a `local:` / `openrouter:` / `oai-compat:`
+    /// / `openai:` model met a default-claude agent. That fix was correct
+    /// in spirit but wrong in placement: an agency-level override sits in
+    /// `resolve_executor`'s precedence step 3 and overrides the dispatcher's
+    /// explicit `-x codex` (step 4). So `wg init -x codex -m local:qwen3`
+    /// silently routed to native instead of codex. Moving the override to
+    /// the dispatch layer (after the executor floor is applied) AND making
+    /// agency abstain for default agents fixes both directions: explicit
+    /// `-x codex` is honored, and `-x claude` + `local:` model still
+    /// switches to native via `enforce_model_compat`.
+    pub fn explicit_executor(&self) -> Option<&str> {
         if !is_default_executor(&self.executor) {
-            &self.executor
-        } else if let Some(ref provider) = self.preferred_provider {
-            if NON_ANTHROPIC_PROVIDERS.contains(&provider.as_str()) {
-                "native"
-            } else {
-                &self.executor
-            }
+            Some(self.executor.as_str())
+        } else if let Some(ref provider) = self.preferred_provider
+            && NON_ANTHROPIC_PROVIDERS.contains(&provider.as_str())
+        {
+            Some("native")
         } else {
-            &self.executor
+            None
         }
     }
 }
@@ -460,6 +512,53 @@ fn default_eval_source() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Iteration / Retry Types
+// ---------------------------------------------------------------------------
+
+/// How propagation should be applied to dependents when a task retries.
+/// Used in IterationConfig.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum PropagationPolicy {
+    /// Conservative: only dependents with changed interface re-run
+    #[default]
+    Conservative,
+    /// Aggressive: all dependents re-run
+    Aggressive,
+    /// Conditional: re-run if score delta exceeds threshold
+    Conditional(f32),
+}
+
+/// Retry strategy recommended by the evaluator.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryStrategy {
+    /// Retry with the same model/executor
+    SameModel,
+    /// Retry with a stronger model
+    UpgradeModel,
+    /// Escalate to a human for review
+    EscalateToHuman,
+}
+
+/// Configuration for task iteration/retry behavior.
+/// Attached to tasks via --max-retries, --propagation, --retry-strategy flags.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct IterationConfig {
+    /// Maximum number of retries allowed (evaluator-triggered)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    /// How to propagate retries to dependent tasks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propagation: Option<PropagationPolicy>,
+    /// What retry strategy to use
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_strategy: Option<RetryStrategy>,
+}
+
+// ---------------------------------------------------------------------------
 // Evaluation source type conventions
 // ---------------------------------------------------------------------------
 
@@ -471,6 +570,8 @@ pub mod eval_source {
     pub const MANUAL: &str = "manual";
     /// FLIP (roundtrip intent fidelity) evaluation.
     pub const FLIP: &str = "flip";
+    /// Constraint-fidelity lint (detect orchestrator-fabricated constraints).
+    pub const CONSTRAINT_FIDELITY: &str = "constraint-fidelity";
     /// Human reviewing evaluator output (meta-evaluation).
     pub const META_HUMAN_REVIEW: &str = "meta:human-review";
 
@@ -566,14 +667,27 @@ pub struct AssignmentExperiment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssignmentMode {
-    /// Deployed from composition cache.
-    CacheHit { cache_score: f64 },
-    /// Cache miss; basic composition, no structured experiment.
-    CacheMiss,
-    /// Deliberate learning experiment (run_mode > 0).
+    /// Deliberate learning experiment.
     Learning(AssignmentExperiment),
     /// Forced learning episode (exploration_interval trigger).
     ForcedExploration(AssignmentExperiment),
+}
+
+// ---------------------------------------------------------------------------
+// Assignment source tracking
+// ---------------------------------------------------------------------------
+
+/// Tracks how an assignment was sourced — natively via workgraph's built-in
+/// pipeline, or externally via the Agency server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AssignmentSource {
+    Native,
+    Agency { agency_task_id: String },
+}
+
+fn default_assignment_source() -> AssignmentSource {
+    AssignmentSource::Native
 }
 
 /// Persisted alongside each task assignment.
@@ -585,9 +699,202 @@ pub struct TaskAssignmentRecord {
     pub agent_id: String,
     pub composition_id: String,
     pub timestamp: String,
-    /// Snapshot of run_mode at time of assignment.
-    pub run_mode_value: f64,
     pub mode: AssignmentMode,
+    /// Agency-side task ID, populated when assignment came from Agency.
+    /// Used to POST evaluation results back to Agency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agency_task_id: Option<String>,
+    /// How this assignment was sourced (native pipeline vs. Agency server).
+    #[serde(default = "default_assignment_source")]
+    pub assignment_source: AssignmentSource,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent_with_executor(executor: &str, preferred_provider: Option<&str>) -> Agent {
+        Agent {
+            id: "test-agent".to_string(),
+            role_id: "test-role".to_string(),
+            tradeoff_id: "test-tradeoff".to_string(),
+            name: "TestAgent".to_string(),
+            performance: PerformanceRecord {
+                task_count: 0,
+                avg_score: None,
+                evaluations: vec![],
+            },
+            lineage: Lineage::default(),
+            capabilities: vec![],
+            rate: None,
+            capacity: None,
+            trust_level: TrustLevel::Provisional,
+            contact: None,
+            executor: executor.to_string(),
+            preferred_model: None,
+            preferred_provider: preferred_provider.map(String::from),
+            deployment_history: vec![],
+            attractor_weight: 0.5,
+            staleness_flags: vec![],
+        }
+    }
+
+    /// Regression: agency-still-picks. Agency MUST abstain (return its
+    /// default-claude candidate as-is) for an agent on the default executor,
+    /// even when the model has a non-Anthropic provider prefix. The
+    /// model-compatibility override now lives at the dispatch layer
+    /// (`crate::dispatch::plan_spawn`) so it can run AFTER the dispatcher's
+    /// explicit executor floor is honored. This way, `wg init -x codex -m
+    /// local:qwen3` gets codex (the user's choice), not native (the previous
+    /// agency override that ignored the dispatcher).
+    #[test]
+    fn test_agency_abstains_for_default_agent_with_local_model() {
+        let agent = test_agent_with_executor("claude", None);
+
+        // Sanity: with no model, default behavior is preserved.
+        assert_eq!(agent.effective_executor(), "claude");
+
+        // Default agent + non-Anthropic model → agency abstains (returns
+        // "claude"). The dispatch layer will apply the model-compat override
+        // if no explicit dispatcher executor takes precedence.
+        assert_eq!(
+            agent.effective_executor_for_model(Some("local:qwen3-coder")),
+            "claude",
+            "agency must abstain for default agents — let dispatcher decide"
+        );
+        assert_eq!(
+            agent.effective_executor_for_model(Some("openrouter:deepseek/deepseek-v3.2")),
+            "claude",
+        );
+        assert_eq!(
+            agent.effective_executor_for_model(Some("oai-compat:llama3")),
+            "claude",
+        );
+        assert_eq!(
+            agent.effective_executor_for_model(Some("openai:gpt-4o")),
+            "claude",
+        );
+    }
+
+    /// claude:opus + claude executor is a valid combination — agency returns
+    /// its default candidate unchanged.
+    #[test]
+    fn test_agency_keeps_claude_for_anthropic_model() {
+        let agent = test_agent_with_executor("claude", None);
+        assert_eq!(
+            agent.effective_executor_for_model(Some("claude:opus")),
+            "claude",
+        );
+        assert_eq!(agent.effective_executor_for_model(Some("opus")), "claude");
+        assert_eq!(agent.effective_executor_for_model(Some("sonnet")), "claude");
+    }
+
+    /// codex executor explicitly chosen + non-Anthropic model: agency keeps
+    /// the agent's explicit choice. Explicit choices are preserved at the
+    /// agency layer; the dispatch layer's model-compat override only fires
+    /// when the resolved executor is claude.
+    #[test]
+    fn test_agency_does_not_override_explicit_non_claude_executor() {
+        let agent = test_agent_with_executor("codex", None);
+        assert_eq!(
+            agent.effective_executor_for_model(Some("local:qwen3-coder")),
+            "codex",
+        );
+    }
+
+    /// preferred_provider = "openrouter" / "local" / etc. is an explicit
+    /// agent preference — agency reflects it (returns "native"). This is
+    /// distinct from the default-claude-agent case above.
+    #[test]
+    fn test_agency_returns_native_for_non_anthropic_preferred_provider() {
+        let agent = test_agent_with_executor("claude", Some("openrouter"));
+        assert_eq!(
+            agent.effective_executor_for_model(Some("openrouter:deepseek/deepseek-v3.2")),
+            "native",
+        );
+    }
+
+    /// `explicit_executor` returns `None` when the agent has no opinion —
+    /// default executor + no preferred_provider. This is the abstain case
+    /// the dispatch layer relies on so the dispatcher's `-x codex` floor
+    /// can take effect.
+    #[test]
+    fn test_explicit_executor_abstains_for_default_agent() {
+        let agent = test_agent_with_executor("claude", None);
+        assert_eq!(agent.explicit_executor(), None);
+    }
+
+    /// `explicit_executor` returns `Some` for an agent with a non-default
+    /// `executor` field — that's an explicit choice the agency must report.
+    #[test]
+    fn test_explicit_executor_returns_explicit_executor_field() {
+        let agent = test_agent_with_executor("codex", None);
+        assert_eq!(agent.explicit_executor(), Some("codex"));
+
+        let agent = test_agent_with_executor("native", None);
+        assert_eq!(agent.explicit_executor(), Some("native"));
+    }
+
+    /// `explicit_executor` reports `Some("native")` when the agent has a
+    /// non-Anthropic `preferred_provider` (even though `executor` is the
+    /// default), because that's an explicit "I run on native" preference.
+    #[test]
+    fn test_explicit_executor_returns_native_for_non_anthropic_provider() {
+        let agent = test_agent_with_executor("claude", Some("openrouter"));
+        assert_eq!(agent.explicit_executor(), Some("native"));
+
+        let agent = test_agent_with_executor("claude", Some("local"));
+        assert_eq!(agent.explicit_executor(), Some("native"));
+    }
+
+    /// An Anthropic `preferred_provider` on a default-claude agent is the
+    /// same as no preference — agency abstains.
+    #[test]
+    fn test_explicit_executor_abstains_for_anthropic_preferred_provider() {
+        let agent = test_agent_with_executor("claude", Some("anthropic"));
+        assert_eq!(agent.explicit_executor(), None);
+    }
+
+    /// Existing YAML files without `assignment_source` should deserialize
+    /// with the default value (Native).
+    #[test]
+    fn test_assignment_record_default_source() {
+        let yaml = r#"
+task_id: my-task
+agent_id: agent-1
+composition_id: comp-1
+timestamp: "2026-03-19T00:00:00Z"
+mode:
+  type: learning
+  base_composition: null
+  dimension:
+    type: novel_composition
+  bizarre_ideation: false
+  ucb_scores: {}
+"#;
+        let record: TaskAssignmentRecord = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(record.assignment_source, AssignmentSource::Native);
+    }
+
+    /// Roundtrip: serialize Agency variant then deserialize back.
+    #[test]
+    fn test_assignment_source_agency_roundtrip() {
+        let source = AssignmentSource::Agency {
+            agency_task_id: "ext-task-42".to_string(),
+        };
+        let yaml = serde_yaml::to_string(&source).unwrap();
+        let deserialized: AssignmentSource = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized, source);
+    }
+
+    /// Roundtrip: serialize Native variant then deserialize back.
+    #[test]
+    fn test_assignment_source_native_roundtrip() {
+        let source = AssignmentSource::Native;
+        let yaml = serde_yaml::to_string(&source).unwrap();
+        let deserialized: AssignmentSource = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized, source);
+    }
 }
 
 #[cfg(test)]

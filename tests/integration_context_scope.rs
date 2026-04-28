@@ -318,6 +318,8 @@ fn test_full_scope_prompt_includes_everything() {
         full_graph_summary: "## Full Graph Summary\n\n- t1 [done]\n- t2 [open]".to_string(),
         claude_md_content: "Always use workgraph.".to_string(),
         queued_messages: String::new(),
+        previous_attempt_context: String::new(),
+        ..ScopeContext::default()
     };
 
     let prompt = build_prompt(&vars, ContextScope::Full, &ctx);
@@ -442,12 +444,20 @@ fn test_scope_ordering_is_strict() {
 #[test]
 fn test_pattern_keyword_detection() {
     // Positive cases
-    assert!(description_has_pattern_keywords("Use autopoietic decomposition"));
-    assert!(description_has_pattern_keywords("This is a self-organizing task"));
-    assert!(description_has_pattern_keywords("Create a committee review"));
+    assert!(description_has_pattern_keywords(
+        "Use autopoietic decomposition"
+    ));
+    assert!(description_has_pattern_keywords(
+        "This is a self-organizing task"
+    ));
+    assert!(description_has_pattern_keywords(
+        "Create a committee review"
+    ));
     assert!(description_has_pattern_keywords("Use swarm intelligence"));
     assert!(description_has_pattern_keywords("Fork-join the workers"));
-    assert!(description_has_pattern_keywords("Fan-out to parallel tasks"));
+    assert!(description_has_pattern_keywords(
+        "Fan-out to parallel tasks"
+    ));
     assert!(description_has_pattern_keywords("Run tasks in parallel"));
     assert!(description_has_pattern_keywords("Loop until converged"));
     assert!(description_has_pattern_keywords("Add a cycle for retries"));
@@ -479,6 +489,9 @@ fn test_pattern_glossary_included_when_keywords_present() {
         task_verify: None,
         max_child_tasks: 10,
         max_task_depth: 8,
+        has_failed_deps: false,
+        failed_deps_info: String::new(),
+        in_worktree: false,
     };
     let ctx = ScopeContext::default();
     let prompt = build_prompt(&vars, ContextScope::Clean, &ctx);
@@ -528,6 +541,9 @@ fn test_pattern_glossary_excluded_when_no_keywords() {
         task_verify: None,
         max_child_tasks: 10,
         max_task_depth: 8,
+        has_failed_deps: false,
+        failed_deps_info: String::new(),
+        in_worktree: false,
     };
     let ctx = ScopeContext::default();
     let prompt = build_prompt(&vars, ContextScope::Clean, &ctx);
@@ -535,5 +551,65 @@ fn test_pattern_glossary_excluded_when_no_keywords() {
     assert!(
         !prompt.contains("## Pattern Keywords"),
         "Prompt should NOT include pattern glossary when description has no keywords"
+    );
+}
+
+#[test]
+fn test_worktree_isolation_section_included_when_in_worktree() {
+    let vars = TemplateVars {
+        task_id: "wt-task".into(),
+        task_title: "Worktree task".into(),
+        task_description: "A task running in a worktree".into(),
+        task_context: "No dependencies".into(),
+        task_identity: String::new(),
+        working_dir: String::new(),
+        skills_preamble: String::new(),
+        model: String::new(),
+        task_loop_info: String::new(),
+        task_verify: None,
+        max_child_tasks: 10,
+        max_task_depth: 8,
+        has_failed_deps: false,
+        failed_deps_info: String::new(),
+        in_worktree: true,
+    };
+    let ctx = ScopeContext::default();
+    let prompt = build_prompt(&vars, ContextScope::Task, &ctx);
+
+    assert!(
+        prompt.contains("CRITICAL: Worktree Isolation"),
+        "Prompt should include worktree isolation warning when in_worktree is true"
+    );
+    assert!(
+        prompt.contains("NEVER use the `EnterWorktree` or `ExitWorktree` tools"),
+        "Prompt should warn against EnterWorktree"
+    );
+}
+
+#[test]
+fn test_worktree_isolation_section_excluded_when_not_in_worktree() {
+    let vars = TemplateVars {
+        task_id: "no-wt-task".into(),
+        task_title: "Normal task".into(),
+        task_description: "A task not in a worktree".into(),
+        task_context: "No dependencies".into(),
+        task_identity: String::new(),
+        working_dir: String::new(),
+        skills_preamble: String::new(),
+        model: String::new(),
+        task_loop_info: String::new(),
+        task_verify: None,
+        max_child_tasks: 10,
+        max_task_depth: 8,
+        has_failed_deps: false,
+        failed_deps_info: String::new(),
+        in_worktree: false,
+    };
+    let ctx = ScopeContext::default();
+    let prompt = build_prompt(&vars, ContextScope::Task, &ctx);
+
+    assert!(
+        !prompt.contains("CRITICAL: Worktree Isolation"),
+        "Prompt should NOT include worktree isolation warning when not in worktree"
     );
 }

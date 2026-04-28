@@ -5,7 +5,7 @@
 A generic AI assistant is a blank slate. It has no declared priorities, no persistent
 personality, no way to accumulate craft. Every session starts from zero. The agency
 system exists to change this. It gives agents _composable identities_---a role that
-defines what the agent does, paired with a motivation that defines why it acts the way
+defines what the agent does, paired with a motivation (called a _tradeoff_ in the CLI---`wg tradeoff`) that defines why it acts the way
 it does. The same role combined with a different motivation produces a different agent.
 This is the key insight: identity is not a name tag, it is a _function_---the
 Cartesian product of competence and intent.
@@ -36,9 +36,10 @@ It carries three identity-defining fields:
 A role also carries mutable operational fields that do not affect its identity:
 a _name_ (a human-readable label like "Programmer" or "Architect"), a _performance_
 record (aggregated evaluation scores), _lineage_ metadata (evolutionary history),
-and an optional _context scope_ default (`clean`, `task`, `graph`, or `full`). When
-an agent with this role is dispatched, the role's context scope is used as a fallback
-if the task does not specify one (see the resolution priority chain in @sec-coordination).
+an optional _context scope_ default (`clean`, `task`, `graph`, or `full`), and an
+optional _exec-mode_ default (`full`, `light`, `bare`, or `shell`). When an agent with
+this role is dispatched, the role's context scope and exec-mode are used as fallbacks
+if the task does not specify them (see the resolution priority chains in @sec-coordination).
 The name is for humans. The identity is for the system.
 
 Consider two roles: one describes a code reviewer who checks for correctness, testing
@@ -48,6 +49,11 @@ and desired outcomes differ, so they produce different content-hash IDs---differ
 identities, different agents, different behaviors when paired with the same motivation.
 
 == Motivations <motivations>
+
+#block(
+  stroke: (left: 2pt + gray),
+  inset: (left: 12pt, y: 4pt),
+)[*Terminology note:* The CLI uses the command `wg tradeoff` for this concept. This manual uses "motivation" when discussing the conceptual model and "tradeoff" when referencing CLI commands.]
 
 A motivation answers the complementary question: _why does this agent act the way it does?_
 
@@ -264,7 +270,12 @@ role or motivation has a direct, mechanistic effect on behavior through prompt i
 == Composition in Practice
 
 To make the compositional nature of agents concrete, consider a small agency seeded with
-`wg agency init`. This creates four starter roles and four starter motivations:
+`wg agency init`. This creates starter roles and starter motivations from a bundled CSV.
+Alternatively, `wg agency import` supports importing primitives from a local CSV file
+(`wg agency import path/to/file.csv`), a remote URL (`wg agency import --url <URL>`), or
+a configured upstream bureau (`wg agency import --upstream`). The `--dry-run` flag previews
+what would be imported. Change detection via manifest hashing ensures repeated imports skip
+already-imported entities. The default starter set includes four roles and four motivations:
 
 #figure(
   table(
@@ -382,6 +393,15 @@ evaluations can push it to a shared remote. Other teams pull it, pair it with th
 motivations, and immediately benefit from that evolutionary history. The performance
 data travels with the entity, so the receiving team can see _why_ the role is considered
 effective before deciding to adopt it.
+
+== Automation: Auto-Create and Auto-Place <automation>
+
+Two configuration options streamline the agency pipeline for projects that want minimal manual intervention:
+
+- `auto_create` (set via `wg config --auto-create`) tells the coordinator to automatically create agent identities for new tasks based on the available roles and motivations. Without it, agents must be explicitly created and assigned.
+- `auto_place` (set via `wg config --auto-place`) enables automatic placement of newly added tasks in the dependency graph. The coordinator uses heuristics to position the task near related work, respecting any placement hints (`--place-near`, `--place-before`) provided at creation time.
+
+Both options interact with the existing `auto_assign` pipeline: when all three are enabled, a new task is automatically placed, assigned an agent identity, and dispatched—the full lifecycle from creation to execution requires no manual intervention beyond the initial `wg add`.
 
 == Configuration: Creator Identity <creator-config>
 

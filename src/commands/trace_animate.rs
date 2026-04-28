@@ -35,6 +35,13 @@ pub fn run(dir: &Path, root_id: &str, speed: f64) -> Result<()> {
     let last_ts = snapshots.last().unwrap().timestamp;
     let total_secs = (last_ts - first_ts).num_seconds().max(1);
 
+    // Check if stdout is a terminal before entering raw mode
+    if !crossterm::tty::IsTty::is_tty(&io::stdout()) {
+        return Err(anyhow::anyhow!(
+            "Cannot run trace animation: stdout is not a terminal (this is normal in test/CI environments)"
+        ));
+    }
+
     // Enter raw mode
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -72,7 +79,7 @@ fn run_animation_loop(
     initial_speed: f64,
 ) -> Result<()> {
     let task_ids: HashSet<&str> = subgraph_ids.iter().copied().collect();
-    let annotations = HashMap::new();
+    let annotations: HashMap<String, super::viz::AnnotationInfo> = HashMap::new();
     let mut current_idx: usize = 0;
     let mut paused = false;
     let mut speed = initial_speed;
@@ -230,7 +237,7 @@ fn render_frame(
     graph: &workgraph::graph::WorkGraph,
     descendants: &[&workgraph::graph::Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::viz::AnnotationInfo>,
     snapshot: &GraphSnapshot,
     current_idx: usize,
     total_snapshots: usize,
@@ -253,7 +260,6 @@ fn render_frame(
         task_ids,
         annotations,
         &status_overrides,
-        &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),

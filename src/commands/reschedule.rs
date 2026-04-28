@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use std::path::Path;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -13,28 +14,54 @@ pub fn run(
     after_hours: Option<f64>,
     at_timestamp: Option<&str>,
 ) -> Result<()> {
-    // Compute the new timestamp before acquiring the lock
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    // Pre-compute the new timestamp (or None to clear)
     let new_timestamp = if let Some(hours) = after_hours {
         let secs = hours * 3600.0;
         if !secs.is_finite() || secs > i64::MAX as f64 || secs < i64::MIN as f64 {
             anyhow::bail!("Hours value {} is out of range", hours);
         }
         let duration = Duration::seconds(secs as i64);
-        Some((Utc::now() + duration).to_rfc3339())
+        let future_time = Utc::now() + duration;
+        Some(future_time.to_rfc3339())
     } else if let Some(timestamp) = at_timestamp {
         timestamp.parse::<chrono::DateTime<Utc>>().context(
             "Invalid timestamp format. Use ISO 8601 format (e.g., 2024-01-20T10:00:00Z)",
         )?;
         Some(timestamp.to_string())
     } else {
-        None // clear not_before
+        None
     };
 
-    super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(id)?;
-        task.not_before = new_timestamp.clone();
-        Ok(())
-    })?;
+    let mut error: Option<anyhow::Error> = None;
+    modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
+
+        match &new_timestamp {
+            Some(ts) => {
+                task.not_before = Some(ts.clone());
+            }
+            None => {
+                task.not_before = None;
+            }
+        }
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
+
     super::notify_graph_changed(dir);
 
     match &new_timestamp {
@@ -51,6 +78,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use workgraph::graph::{Node, Task, WorkGraph};
+    use workgraph::parser::save_graph;
 
     fn make_task(id: &str, title: &str) -> Task {
         Task {

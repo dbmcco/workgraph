@@ -41,110 +41,152 @@ pub enum Commands {
         #[arg(long)]
         no_agency: bool,
 
-        /// Pre-populate the coordinator/agent model in config.toml.
+        /// Initialize the GLOBAL workgraph at `~/.wg` instead of
+        /// the current directory. Useful for `wg nex`-style interactive
+        /// usage from arbitrary directories without littering workgraph
+        /// dirs everywhere. Resolver precedence: --dir > $WG_DIR >
+        /// project discovery (`.wg` preferred, legacy `.workgraph` accepted) >
+        /// global (`~/.wg` preferred) > ./.wg
+        #[arg(long)]
+        global: bool,
+
+        /// [DEPRECATED] Agent executor (`claude`, `codex`, `nex`/`native`,
+        /// `amplifier`, `shell`). The executor is now derived from the
+        /// model spec's provider prefix — you should not need this flag.
+        /// Kept for one release with a deprecation warning so existing
+        /// scripts keep working. Migrate to `-m <provider>:<model>`.
+        #[arg(short = 'x', long)]
+        executor: Option<String>,
+
+        /// Model spec for this project. Use `provider:model` form
+        /// (e.g. `claude:opus`, `local:qwen3-coder`,
+        /// `openrouter:anthropic/claude-opus-4-6`, `oai-compat:gpt-5`).
+        /// The provider prefix tells wg which handler to spawn — claude
+        /// CLI for `claude:*`, codex CLI for `codex:*`, in-process nex
+        /// for `local:*` / `openrouter:*` / `oai-compat:*` / etc.
+        /// Bare aliases (`opus`, `sonnet`, `haiku`) default to claude.
         #[arg(short = 'm', long)]
         model: Option<String>,
 
-        /// Inline LLM endpoint URL written into config.toml on init.
+        /// Inline LLM endpoint URL. Required for `local:*` models and
+        /// any other model whose handler needs an explicit URL (nex /
+        /// native). Ignored for handlers that auth themselves
+        /// (claude / codex CLIs).
+        /// Example: `wg init -m local:qwen3-coder -e http://127.0.0.1:8088`
         #[arg(short = 'e', long)]
         endpoint: Option<String>,
-    },
 
-    /// Internal coordinator subprocess entrypoint for task execution.
-    #[command(name = "spawn-task", hide = true)]
-    SpawnTask {
-        task_id: String,
-
+        /// Pick one of the named setup routes (openrouter, claude-cli,
+        /// codex-cli, local, nex-custom) for a complete fill-in of
+        /// tiers + endpoint + model registry. Equivalent to picking a
+        /// model+endpoint pair; routes are the canonical entry point.
         #[arg(long)]
-        role: Option<String>,
+        route: Option<String>,
 
+        /// Print the config that would be written but don't actually create
+        /// the workgraph directory or files.
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// Internal coordinator subprocess entrypoint for Claude chat handling.
-    #[command(name = "claude-handler", hide = true)]
-    ClaudeHandler {
-        #[arg(long)]
-        chat: String,
-
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-    },
-
-    /// Bulk-reset a subgraph from one or more seed tasks
+    /// Bulk-reset a subgraph: given one or more seed tasks, close the
+    /// reachable set in the chosen direction and reset each task to
+    /// Open (clearing status, failure_reason, retry_count). With
+    /// --also-strip-meta, also delete all dot-prefixed system tasks
+    /// (.flip-*, .evaluate-*, .verify-*, .assign-*, .place-*, ...)
+    /// attached to the closure, so the coordinator can regenerate
+    /// fresh ones instead of reviving stale done ones.
     Reset {
-        /// First seed task
+        /// First (required) seed task.
         seed: String,
 
-        /// Additional seed tasks
+        /// Additional seed tasks (comma-separated or repeated --seeds).
         #[arg(long = "seeds", value_delimiter = ',', num_args = 0..)]
         seeds: Vec<String>,
 
-        /// Traversal direction: forward, backward, or both
+        /// Traversal direction: `forward` (downstream, default),
+        /// `backward` (upstream), or `both`.
         #[arg(long, default_value = "forward")]
         direction: String,
 
-        /// Also delete attached dot-prefixed system tasks
+        /// Also delete dot-prefixed system tasks (.flip-*, .evaluate-*,
+        /// .verify-*, .assign-*, .place-*, .verify-deferred-*)
+        /// attached to any closure member.
         #[arg(long = "also-strip-meta")]
         also_strip_meta: bool,
 
-        /// Show what would be reset without mutating
+        /// Show what would be reset/stripped without mutating.
         #[arg(long = "dry-run")]
         dry_run: bool,
 
-        /// Confirm destructive execution when affecting more than one task
+        /// Confirm destructive execution when affecting more than one task.
         #[arg(long)]
         yes: bool,
     },
 
-    /// Rescue a failed task by inserting a first-class replacement at its graph slot
+    /// Rescue a failed task by inserting a first-class replacement at
+    /// its graph slot. Successors are rewired to unblock from the
+    /// rescue instead of the failed target; the target stays in the
+    /// graph for history with `superseded_by` log entries.
+    ///
+    /// Primary caller: the `.evaluate-*` agent, when it judges a task
+    /// failed and can describe a concrete fix. The description becomes
+    /// the rescue task's brief — be specific about what to change.
     Rescue {
-        /// Target task to rescue
+        /// The failed task's ID to rescue.
         target: String,
 
-        /// What the rescue task needs to do differently
+        /// What the rescue task needs to do differently. Becomes the
+        /// rescue task's description — treat this as the next agent's
+        /// assignment brief.
         #[arg(long, short = 'd', alias = "desc")]
         description: String,
 
-        /// Optional title override
+        /// Optional title override (default: `Rescue: <target>`).
         #[arg(long)]
         title: Option<String>,
 
-        /// Explicit ID for the rescue task
+        /// Explicit ID for the rescue task (auto-derived from title otherwise).
         #[arg(long)]
         id: Option<String>,
 
-        /// Eval task that concluded the failure
+        /// The ID of the eval task that concluded the failure. Recorded
+        /// in the rescue task's description and in the operations log.
         #[arg(long = "from-eval")]
         from_eval: Option<String>,
     },
 
-    /// Insert a task before, after, or parallel to an existing task
+    /// Insert a new task at a position relative to an existing target
+    /// (before / after / parallel). Graph-surgery primitive; used as
+    /// the foundation for `wg rescue`.
     Insert {
-        /// Where to insert: before, after, or parallel
+        /// Where to insert: `before`, `after`, or `parallel`.
         position: String,
 
-        /// Existing task that anchors the insertion
+        /// The existing task's ID that anchors the insertion.
         target: String,
 
-        /// Title for the new task
+        /// Title for the new task (required).
         #[arg(long)]
         title: String,
 
-        /// Detailed description for the new task
+        /// Detailed description for the new task.
         #[arg(long, short = 'd', alias = "desc")]
         description: Option<String>,
 
-        /// Explicit ID for the new task
+        /// Explicit ID for the new task (auto-derived from title if absent).
         #[arg(long)]
         id: Option<String>,
 
-        /// Rewire direct edges through the new node exclusively in before/after mode
+        /// For `before` / `after`: rewire target's old predecessor/successor
+        /// edges through the new node exclusively (remove the direct old
+        /// edge). No effect in `parallel` mode.
         #[arg(long)]
         splice: bool,
 
-        /// In parallel mode, route successors to the new node only
+        /// For `parallel`: remove target from its successors' dependency
+        /// lists so they unblock from the new node ONLY (rescue semantics).
+        /// No effect in `before` / `after` mode.
         #[arg(long = "replace-edges")]
         replace_edges: bool,
     },
@@ -206,13 +248,35 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Provider for this task (anthropic, openai, openrouter, local)
+        /// [DEPRECATED] Provider for this task — use provider:model format in --model instead
         #[arg(long)]
         provider: Option<String>,
 
-        /// Verification criteria - task requires review before done
-        #[arg(long)]
+        /// [DEPRECATED] Put validation criteria in a `## Validation` section of the
+        /// task description; the agency evaluator scores against it.
+        #[arg(long, hide = true)]
         verify: Option<String>,
+
+        /// [DEPRECATED] Put validation criteria in a `## Validation` section of the
+        /// task description; the agency evaluator scores against it.
+        #[arg(long = "verify-timeout", hide = true)]
+        verify_timeout: Option<String>,
+
+        /// [DEPRECATED, no-op] The hard-gate `--validation` flag has been
+        /// removed. Put validation criteria in a `## Validation` section of
+        /// the task description; the agency evaluator (auto_evaluate +
+        /// FLIP) reads it. Accepted-but-ignored for one release with a
+        /// deprecation warning.
+        #[arg(long, hide = true)]
+        validation: Option<String>,
+
+        /// [DEPRECATED, no-op] Removed alongside `--validation`.
+        #[arg(long = "validator-agent", hide = true)]
+        validator_agent: Option<String>,
+
+        /// [DEPRECATED, no-op] Removed alongside `--validation`.
+        #[arg(long = "validator-model", hide = true)]
+        validator_model: Option<String>,
 
         /// Maximum iterations for structural cycle (sets cycle_config on this task as cycle header)
         #[arg(long = "max-iterations")]
@@ -246,6 +310,14 @@ pub enum Commands {
         #[arg(long = "context-scope")]
         context_scope: Option<String>,
 
+        /// Shell command to execute for this task (auto-sets exec_mode=shell)
+        #[arg(long)]
+        exec: Option<String>,
+
+        /// Per-task timeout (e.g., 30s, 5m, 1h, 4h, 1d)
+        #[arg(long)]
+        timeout: Option<String>,
+
         /// Execution weight: full (default), light (read-only tools), bare (wg CLI only), shell (no LLM)
         #[arg(long = "exec-mode")]
         exec_mode: Option<String>,
@@ -254,9 +326,17 @@ pub enum Commands {
         #[arg(long)]
         paused: bool,
 
-        /// Skip draft mode and make task immediately available for dispatch
-        #[arg(long, alias = "ready")]
-        immediate: bool,
+        /// Skip automatic placement — make task immediately available for dispatch
+        #[arg(long = "no-place", alias = "immediate", alias = "ready")]
+        no_place: bool,
+
+        /// Placement hint: place near these tasks (comma-separated IDs)
+        #[arg(long = "place-near", value_delimiter = ',')]
+        place_near: Vec<String>,
+
+        /// Placement hint: place before these tasks (comma-separated IDs)
+        #[arg(long = "place-before", value_delimiter = ',')]
+        place_before: Vec<String>,
 
         /// Delay before task becomes ready (e.g., 30s, 5m, 1h, 1d)
         #[arg(long)]
@@ -265,6 +345,38 @@ pub enum Commands {
         /// Absolute timestamp before which task won't be dispatched (ISO 8601)
         #[arg(long = "not-before")]
         not_before: Option<String>,
+
+        /// Allow phantom (forward-reference) dependencies without error
+        #[arg(long = "allow-phantom")]
+        allow_phantom: bool,
+
+        /// Suppress implicit --after dependency on the creating task (alias: --no-after)
+        #[arg(long = "independent", alias = "no-after")]
+        independent: bool,
+
+        /// Retry propagation policy: conservative, aggressive, or conditional:<float>
+        #[arg(long = "propagation")]
+        propagation: Option<String>,
+
+        /// Retry strategy: same-model, upgrade-model, or escalate-to-human
+        #[arg(long = "retry-strategy")]
+        retry_strategy: Option<String>,
+
+        /// Opt out of tier escalation on retry for this task
+        #[arg(long = "no-tier-escalation")]
+        no_tier_escalation: bool,
+
+        /// Task priority (higher = more important). Accepts a number or name: critical (100), high (50), normal (10), low (5), idle (0)
+        #[arg(long, short = 'p')]
+        priority: Option<String>,
+
+        /// Cron schedule expression (6-field format: "sec min hour day month dow")
+        #[arg(long)]
+        cron: Option<String>,
+
+        /// Create as a blocking subtask: child is created, parent waits for child to complete
+        #[arg(long)]
+        subtask: bool,
     },
 
     /// Edit an existing task
@@ -305,7 +417,7 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Update provider for this task
+        /// [DEPRECATED] Update provider — use provider:model format in --model instead
         #[arg(long)]
         provider: Option<String>,
 
@@ -360,6 +472,23 @@ pub enum Commands {
         /// Absolute timestamp before which task won't be dispatched (ISO 8601)
         #[arg(long = "not-before")]
         not_before: Option<String>,
+
+        /// [DEPRECATED] Put validation criteria in a `## Validation` section of the
+        /// task description; the agency evaluator scores against it.
+        #[arg(long, hide = true)]
+        verify: Option<String>,
+
+        /// Set or clear cron schedule (empty string "" clears; 6-field: "sec min hour day month dow")
+        #[arg(long)]
+        cron: Option<String>,
+
+        /// Allow phantom (forward-reference) dependencies without error
+        #[arg(long = "allow-phantom")]
+        allow_phantom: bool,
+
+        /// Allow cycle creation without CycleConfig (overrides cycle detection guard)
+        #[arg(long = "allow-cycle")]
+        allow_cycle: bool,
     },
 
     /// Mark a task as done
@@ -375,6 +504,21 @@ pub enum Commands {
         /// Skip the verify command gate (human escape hatch, blocked when WG_AGENT_ID is set)
         #[arg(long)]
         skip_verify: bool,
+
+        /// Defer worktree merge: mark the task done even if the worktree branch
+        /// cannot be cleanly merged, creating a .merge-<id> task for later resolution.
+        #[arg(long)]
+        ignore_unmerged_worktree: bool,
+
+        /// Run every scenario in the smoke manifest, not just those owned by
+        /// this task. Use before merging high-impact changes.
+        #[arg(long = "full-smoke")]
+        full_smoke: bool,
+
+        /// Bypass the smoke gate. Loud-warns; refused for agents (WG_AGENT_ID set)
+        /// unless WG_SMOKE_AGENT_OVERRIDE=1 is also exported.
+        #[arg(long = "skip-smoke")]
+        skip_smoke: bool,
     },
 
     /// Mark a task as failed (can be retried)
@@ -395,6 +539,17 @@ pub enum Commands {
         eval_reject: bool,
     },
 
+    /// Mark a task as incomplete (retryable — needs another pass)
+    Incomplete {
+        /// Task ID to mark as incomplete
+        #[arg(value_name = "TASK")]
+        id: String,
+
+        /// Reason the task is incomplete
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Mark a task as abandoned (will not be retried)
     Abandon {
         /// Task ID to abandon
@@ -404,13 +559,109 @@ pub enum Commands {
         /// Reason for abandonment
         #[arg(long)]
         reason: Option<String>,
+
+        /// Task IDs that supersede/replace this task (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        superseded_by: Vec<String>,
     },
 
-    /// Retry a failed task (resets to open status)
+    /// Retry a failed, incomplete, or in-progress (hung) task.
+    ///
+    /// For failed/incomplete: resets to open status (clears failure_reason,
+    /// assigned, session_id by default).
+    ///
+    /// For in-progress: kills the assigned agent (SIGTERM, escalating to
+    /// SIGKILL after 5s), increments retry_count, resets to open. The
+    /// dispatcher's next tick respawns a fresh agent.
+    ///
+    /// Idempotent: re-running while the previous retry is still mid-transition
+    /// is safe — the kill is a no-op on a dead PID, and the graph reset is
+    /// guarded by the file lock.
     Retry {
         /// Task ID to retry
         #[arg(value_name = "TASK")]
         id: String,
+
+        /// Keep the stored Claude session ID (default: clear it so the retry starts fresh)
+        #[arg(long)]
+        preserve_session: bool,
+
+        /// Discard the prior worktree (if any) and start over from main.
+        /// Default is retry-in-place: the next agent reuses the existing
+        /// worktree + branch so uncommitted WIP and prior commits are preserved.
+        #[arg(long)]
+        fresh: bool,
+
+        /// Reason for the retry — recorded as a log entry on the task
+        /// (e.g., "agent hung at 0% CPU for 20min")
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Batch-recover from credit-exhaustion / mass-failure (default: dry-run)
+    ///
+    /// Surveys failed tasks and resets them in one operation: retries
+    /// user-tasks, abandons agency followups so they regenerate from parents.
+    /// Without --yes this only prints the plan.
+    Recover {
+        /// Execute the plan (default: dry-run)
+        #[arg(long)]
+        yes: bool,
+
+        /// Filter clauses (repeatable, comma-separated). Examples:
+        /// `status=failed`, `tag=eval-scheduled`, `id-prefix=tui-`,
+        /// `attempts<=2`, `error~credit`
+        #[arg(long, value_name = "EXPR")]
+        filter: Vec<String>,
+
+        /// Override model on each user-task before retry (provider:model format)
+        #[arg(long, value_name = "MODEL")]
+        set_model: Option<String>,
+
+        /// Override endpoint on each user-task before retry
+        #[arg(long, value_name = "ENDPOINT")]
+        set_endpoint: Option<String>,
+
+        /// Don't abandon agency followups (`.evaluate-*` / `.flip-*` / `.assign-*` / `.verify-*`)
+        #[arg(long)]
+        keep_agency: bool,
+
+        /// Skip tasks whose attempt-count >= N (default: 5; protects against retry loops)
+        #[arg(long, default_value_t = 5)]
+        max_attempts: u32,
+
+        /// Reason for recovery — recorded as a log entry on each retried task
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Requeue an in-progress task for failed-dependency triage (resets to open)
+    Requeue {
+        /// Task ID to requeue
+        #[arg(value_name = "TASK")]
+        id: String,
+
+        /// Reason for requeue (what fix tasks were created)
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Approve a task pending validation (transitions to Done)
+    Approve {
+        /// Task ID to approve
+        #[arg(value_name = "TASK")]
+        id: String,
+    },
+
+    /// Reject a task pending validation (reopens with feedback, or fails after max rejections)
+    Reject {
+        /// Task ID to reject
+        #[arg(value_name = "TASK")]
+        id: String,
+
+        /// Reason for rejection
+        #[arg(long)]
+        reason: String,
     },
 
     /// Claim a task for work (sets status to InProgress)
@@ -543,6 +794,12 @@ pub enum Commands {
     /// Check the graph for issues (cycles, orphan references)
     Check,
 
+    /// Manual cleanup commands for edge case recovery
+    Cleanup {
+        #[command(subcommand)]
+        subcmd: crate::commands::cleanup::CleanupSubcommand,
+    },
+
     /// Analyze structural cycles in after edges (Tarjan's SCC)
     Cycles,
 
@@ -559,6 +816,14 @@ pub enum Commands {
         /// Filter by tag (multiple --tag flags use AND semantics)
         #[arg(long = "tag")]
         tags: Vec<String>,
+
+        /// Only show cron-scheduled tasks
+        #[arg(long)]
+        cron: bool,
+
+        /// Show all tasks including dot-prefixed system tasks (hidden by default)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Visualize the dependency graph (ASCII tree by default)
@@ -623,6 +888,10 @@ pub enum Commands {
         /// Edge color style: 'gray' (default), 'white', or 'mixed' (tree=white, arcs=gray)
         #[arg(long)]
         edge_color: Option<String>,
+
+        /// Force a specific output width in columns (default: auto-detect terminal width)
+        #[arg(long)]
+        columns: Option<u16>,
     },
 
     /// Output the full graph data (DOT format with archive support)
@@ -683,6 +952,17 @@ pub enum Commands {
         at: Option<String>,
     },
 
+    /// Change a task's priority level (critical, high, normal, low, idle)
+    Reprioritize {
+        /// Task ID
+        #[arg(value_name = "TASK")]
+        id: String,
+
+        /// New priority level: critical, high, normal, low, idle
+        #[arg(value_name = "PRIORITY")]
+        priority: String,
+    },
+
     /// Show impact analysis - what tasks depend on this one
     Impact {
         /// Task ID
@@ -719,6 +999,10 @@ pub enum Commands {
     /// or completed, to identify over/under-utilization.
     Workload,
 
+    /// Manage agent worktrees (list, archive, inspect)
+    #[command(subcommand, name = "worktree")]
+    Worktree(WorktreeCommand),
+
     /// Show resource utilization - committed vs available capacity
     Resources,
 
@@ -742,23 +1026,57 @@ pub enum Commands {
         #[arg(long)]
         list: bool,
 
+        /// Skip confirmation prompt for bulk archive operations
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Undo the last archive operation (restore all tasks from the last batch)
+        #[arg(long)]
+        undo: bool,
+
+        /// Specific task IDs to archive
+        #[arg(value_name = "IDS")]
+        ids: Vec<String>,
+
         #[command(subcommand)]
         command: Option<ArchiveCommands>,
     },
 
-    /// Garbage collect terminal tasks (failed, abandoned) from the graph
+    /// Manage coordinator sessions (list, archive, restore)
+    #[command(subcommand, name = "coordinator")]
+    Coordinator(CoordinatorCommands),
+
+    /// Garbage collect terminal tasks (failed, abandoned) from the graph,
+    /// or orphaned worktrees under `.wg-worktrees/` with `--worktrees`.
     Gc {
         /// Show what would be removed without actually removing
         #[arg(long)]
         dry_run: bool,
 
-        /// Also remove done tasks (by default only failed+abandoned)
+        /// Also remove done tasks (by default only failed+abandoned).
+        /// (Ignored when `--worktrees` is passed.)
         #[arg(long)]
         include_done: bool,
 
-        /// Only remove tasks older than this duration (e.g., 30d, 7d, 1w, 24h)
+        /// Only remove tasks older than this duration (e.g., 30d, 7d, 1w, 24h).
+        /// (Ignored when `--worktrees` is passed.)
         #[arg(long)]
         older: Option<String>,
+
+        /// GC orphaned agent worktrees under `.wg-worktrees/` instead of
+        /// graph tasks. Dry-run by default — pair with `--apply` to remove.
+        #[arg(long)]
+        worktrees: bool,
+
+        /// With `--worktrees`: actually remove matched worktrees. Without
+        /// this flag the command prints what would happen and exits.
+        #[arg(long)]
+        apply: bool,
+
+        /// With `--worktrees`: also remove worktrees that have uncommitted
+        /// changes (destroys that work). Use with caution.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show detailed information about a single task
@@ -843,10 +1161,43 @@ pub enum Commands {
         operations: bool,
     },
 
+    /// Set or accumulate token usage on a task
+    #[command(hide = true)]
+    Tokens {
+        /// Task ID
+        id: String,
+
+        /// Token usage JSON (e.g. '{"cost_usd":0.1,"input_tokens":500,"output_tokens":200}')
+        json: String,
+    },
+
+    /// Show token usage and estimated cost summaries
+    Spend {
+        /// Show only today's spend
+        #[arg(long, short = 't')]
+        today: bool,
+
+        /// Output as JSON
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
+
+    /// OpenRouter cost monitoring and management
+    Openrouter {
+        #[command(subcommand)]
+        command: OpenRouterCommands,
+    },
+
     /// Send and receive messages to/from tasks and agents
     Msg {
         #[command(subcommand)]
         command: MsgCommands,
+    },
+
+    /// Manage per-user conversation boards (.user-NAME)
+    User {
+        #[command(subcommand)]
+        command: UserCommands,
     },
 
     /// Save a checkpoint for context preservation during long-running tasks
@@ -892,8 +1243,25 @@ pub enum Commands {
         list: bool,
     },
 
-    /// Chat with the coordinator agent
+    /// Chat with the coordinator agent.
+    ///
+    /// `wg chat <subcommand>` (create, list, show, attach, send, stop,
+    /// resume, archive, delete) manages chat agents as first-class graph
+    /// entities — these work whether the service daemon is up or down.
+    ///
+    /// `wg chat <message>` (no subcommand) keeps the legacy one-shot
+    /// behaviour: send a message to coordinator 0 and wait for the
+    /// response.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_precedence_over_arg = true
+    )]
     Chat {
+        /// New: subcommand for chat-as-entity management. When set, the
+        /// per-message flags below are ignored.
+        #[command(subcommand)]
+        command: Option<ChatCommands>,
+
         /// Message to send (omit for interactive mode)
         message: Option<String>,
 
@@ -916,12 +1284,55 @@ pub enum Commands {
         /// Attach a file (copied to .workgraph/attachments/)
         #[arg(long)]
         attachment: Vec<String>,
+
+        /// Target coordinator ID (default: 0)
+        #[arg(long, default_value = "0")]
+        coordinator: u32,
+
+        /// Show only the last N messages (with --history) or load only the last N
+        /// messages in interactive mode.
+        #[arg(long, value_name = "N")]
+        history_depth: Option<usize>,
+
+        /// Start with no history loaded. History is still persisted — this only
+        /// affects the initial display.
+        #[arg(long)]
+        no_history: bool,
+
+        /// Rotate chat files to archive (force-rotate regardless of thresholds)
+        #[arg(long)]
+        rotate: bool,
+
+        /// Clean up archived files older than the retention period
+        #[arg(long)]
+        cleanup: bool,
+
+        /// Compact chat history into a context summary
+        #[arg(long)]
+        compact: bool,
+
+        /// Share context from another coordinator into this one.
+        /// Copies the source coordinator's compacted summary as imported context.
+        /// Use with --coordinator to specify the target (default: 0).
+        #[arg(long, value_name = "FROM_ID")]
+        share_from: Option<u32>,
     },
 
     /// Manage resources
     Resource {
         #[command(subcommand)]
         command: ResourceCommands,
+    },
+
+    /// Manage nex chat sessions (list, attach, alias).
+    ///
+    /// Every `wg nex` session — interactive, coordinator,
+    /// task-agent — lives under `chat/<uuid>/` and is addressable by
+    /// UUID, UUID prefix, or alias. These subcommands are the UX for
+    /// inspecting and attaching to them.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommands,
     },
 
     /// Manage skills (Claude Code skill installation, task skill queries)
@@ -966,6 +1377,10 @@ pub enum Commands {
         /// Clear the agent assignment from the task
         #[arg(long)]
         clear: bool,
+
+        /// Automatically select an agent using LLM
+        #[arg(long)]
+        auto: bool,
     },
 
     /// Find agents capable of performing a task
@@ -1029,7 +1444,7 @@ pub enum Commands {
         actor: Option<String>,
     },
 
-    /// Execute a task's shell command (claim + run + done/fail)
+    /// Drop into an interactive agent session for a task (or run its shell command)
     Exec {
         /// Task ID to execute
         task: String,
@@ -1038,7 +1453,7 @@ pub enum Commands {
         #[arg(long)]
         actor: Option<String>,
 
-        /// Show what would be executed without running
+        /// Show assembled context and env vars without launching anything
         #[arg(long)]
         dry_run: bool,
 
@@ -1049,6 +1464,22 @@ pub enum Commands {
         /// Clear the exec command for a task
         #[arg(long)]
         clear: bool,
+
+        /// Run the task's shell exec command (legacy behavior) instead of interactive session
+        #[arg(long)]
+        shell: bool,
+
+        /// Create an isolated git worktree (like real agents get)
+        #[arg(long, conflicts_with = "no_worktree")]
+        worktree: bool,
+
+        /// Work in-place without worktree isolation (default)
+        #[arg(long, conflicts_with = "worktree")]
+        no_worktree: bool,
+
+        /// Model to use for the executor (e.g., opus, sonnet, haiku)
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Manage agent definitions (identity: role + tradeoff pairings)
@@ -1090,11 +1521,30 @@ pub enum Commands {
         command: EvolveCommands,
     },
 
+    /// Manage provider profiles (model tier presets)
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+
     /// View or modify project configuration
     Config {
+        /// Subcommand form (e.g. `wg config init`). When provided, all
+        /// flag-style args on `Config` are ignored and the subcommand
+        /// runs in isolation.
+        #[command(subcommand)]
+        cmd: Option<ConfigSubcommand>,
+
         /// Show current configuration
         #[arg(long)]
         show: bool,
+
+        /// Show the effective merged config (global + local) — exactly what
+        /// the running daemon and agents will see. Use this to debug e.g.
+        /// "why is openrouter still in my routing when I removed it locally?"
+        /// Equivalent to `wg config show` with no scope, but explicit.
+        #[arg(long)]
+        merged: bool,
 
         /// Initialize default config file
         #[arg(long)]
@@ -1116,13 +1566,25 @@ pub enum Commands {
         #[arg(long)]
         executor: Option<String>,
 
-        /// Set model (opus-4-5, sonnet, haiku)
-        #[arg(long)]
+        /// Set model. Accepts `provider:model` (e.g. `claude:opus`) or
+        /// a bare name when combined with `-e URL` (implies oai-compat).
+        /// Updates `agent.model` and `coordinator.model`.
+        #[arg(short = 'm', long)]
         model: Option<String>,
 
-        /// Rewrite the default LLM endpoint to this URL.
-        #[arg(long)]
+        /// Rewrite the default LLM endpoint to this URL. Must be
+        /// `http://` or `https://`. Creates/replaces a `[[llm_endpoints.endpoints]]`
+        /// entry named `default` with `provider = "local"`, marked
+        /// `is_default = true`. Pair with `-m MODEL` to also set the
+        /// model in one shot.
+        #[arg(short = 'e', long)]
         endpoint: Option<String>,
+
+        /// Skip the auto-reload signal to the running daemon. By default
+        /// `wg config -m/-e` sends a reconfigure IPC so the change takes
+        /// effect immediately — set this flag to just write the file.
+        #[arg(long)]
+        no_reload: bool,
 
         /// Set default interval in seconds
         #[arg(long)]
@@ -1132,6 +1594,10 @@ pub enum Commands {
         #[arg(long)]
         max_agents: Option<usize>,
 
+        /// Set max concurrent coordinator agents (LLM sessions). Default: 4.
+        #[arg(long)]
+        max_coordinators: Option<usize>,
+
         /// Set coordinator poll interval in seconds
         #[arg(long)]
         coordinator_interval: Option<u64>,
@@ -1140,9 +1606,17 @@ pub enum Commands {
         #[arg(long)]
         poll_interval: Option<u64>,
 
-        /// Set coordinator executor
+        /// Set dispatcher executor (legacy alias: --coordinator-executor)
+        #[arg(long, alias = "coordinator-executor")]
+        dispatcher_executor: Option<String>,
+
+        /// Set dispatcher model (e.g., opus, sonnet, haiku); legacy alias: --coordinator-model
+        #[arg(long, alias = "coordinator-model")]
+        coordinator_model: Option<String>,
+
+        /// [DEPRECATED] Set coordinator provider — use provider:model in --coordinator-model instead
         #[arg(long)]
-        coordinator_executor: Option<String>,
+        coordinator_provider: Option<String>,
 
         /// Matrix configuration subcommand
         #[arg(long)]
@@ -1176,18 +1650,6 @@ pub enum Commands {
         #[arg(long)]
         auto_assign: Option<bool>,
 
-        /// Set model for assigner agents
-        #[arg(long)]
-        assigner_model: Option<String>,
-
-        /// Set model for evaluator agents
-        #[arg(long)]
-        evaluator_model: Option<String>,
-
-        /// Set model for evolver agents
-        #[arg(long)]
-        evolver_model: Option<String>,
-
         /// Set assigner agent (content-hash)
         #[arg(long)]
         assigner_agent: Option<String>,
@@ -1204,10 +1666,6 @@ pub enum Commands {
         #[arg(long)]
         creator_agent: Option<String>,
 
-        /// Set model for creator agents
-        #[arg(long)]
-        creator_model: Option<String>,
-
         /// Set retention heuristics (prose policy for evolver)
         #[arg(long)]
         retention_heuristics: Option<String>,
@@ -1216,9 +1674,13 @@ pub enum Commands {
         #[arg(long)]
         auto_triage: Option<bool>,
 
-        /// Set model for triage (default: haiku)
+        /// Enable/disable automatic placement analysis on new tasks
         #[arg(long)]
-        triage_model: Option<String>,
+        auto_place: Option<bool>,
+
+        /// Enable/disable automatic creator agent invocation
+        #[arg(long)]
+        auto_create: Option<bool>,
 
         /// Set timeout in seconds for triage calls (default: 30)
         #[arg(long)]
@@ -1254,21 +1716,21 @@ pub enum Commands {
         #[arg(long, name = "flip-enabled")]
         flip_enabled: Option<bool>,
 
-        /// Model for FLIP inference phase (reconstructing prompt from output)
+        /// Set FLIP inference model (Phase 1: prompt reconstruction). Shorthand for --set-model flip_inference <model>
         #[arg(long, name = "flip-inference-model")]
         flip_inference_model: Option<String>,
 
-        /// Model for FLIP comparison phase (scoring similarity)
+        /// Set FLIP comparison model (Phase 2: similarity scoring). Shorthand for --set-model flip_comparison <model>
         #[arg(long, name = "flip-comparison-model")]
         flip_comparison_model: Option<String>,
+
+        /// Set both FLIP inference and comparison models to the same value
+        #[arg(long, name = "flip-model")]
+        flip_model: Option<String>,
 
         /// FLIP score threshold for triggering Opus verification (default: 0.7)
         #[arg(long, name = "flip-verification-threshold")]
         flip_verification_threshold: Option<f64>,
-
-        /// Model for FLIP-triggered verification agents (default: opus)
-        #[arg(long, name = "flip-verification-model")]
-        flip_verification_model: Option<String>,
 
         /// Enable/disable chat history persistence across TUI restarts
         #[arg(long, name = "chat-history")]
@@ -1277,6 +1739,62 @@ pub enum Commands {
         /// Maximum number of chat messages to persist (default: 1000)
         #[arg(long, name = "chat-history-max")]
         chat_history_max: Option<usize>,
+
+        /// TUI time counters (comma-separated: uptime,cumulative,active,session)
+        #[arg(long, name = "tui-counters")]
+        tui_counters: Option<String>,
+
+        /// Show all model registry entries (built-in + user-defined)
+        #[arg(long = "registry")]
+        show_registry: bool,
+
+        /// Add a new model to the registry (use with --id, --provider, --reg-model, --reg-tier)
+        #[arg(long = "registry-add")]
+        registry_add: bool,
+
+        /// Remove a model from the registry by ID
+        #[arg(long = "registry-remove", value_name = "ID")]
+        registry_remove: Option<String>,
+
+        /// Show current tier→model assignments
+        #[arg(long = "tiers")]
+        show_tiers: bool,
+
+        /// Set which model a tier uses (e.g., --tier standard=gpt-4o)
+        #[arg(long = "tier", value_name = "TIER=MODEL_ID")]
+        set_tier: Option<String>,
+
+        /// Registry entry short ID (for --registry-add)
+        #[arg(long = "id", requires = "registry_add")]
+        reg_id: Option<String>,
+
+        /// Provider name (for --registry-add, e.g., openai, anthropic)
+        #[arg(long = "provider", requires = "registry_add")]
+        reg_provider: Option<String>,
+
+        /// Full API model identifier (for --registry-add, e.g., gpt-4o)
+        #[arg(long = "reg-model", requires = "registry_add")]
+        reg_model: Option<String>,
+
+        /// Quality tier for registry entry (for --registry-add: fast, standard, premium)
+        #[arg(long = "reg-tier", requires = "registry_add")]
+        reg_tier: Option<String>,
+
+        /// API endpoint URL (for --registry-add)
+        #[arg(long = "reg-endpoint", requires = "registry_add")]
+        reg_endpoint: Option<String>,
+
+        /// Context window in tokens (for --registry-add)
+        #[arg(long = "context-window", requires = "registry_add")]
+        reg_context_window: Option<u64>,
+
+        /// Cost per million input tokens in USD (for --registry-add)
+        #[arg(long = "cost-input", requires = "registry_add")]
+        cost_input: Option<f64>,
+
+        /// Cost per million output tokens in USD (for --registry-add)
+        #[arg(long = "cost-output", requires = "registry_add")]
+        cost_output: Option<f64>,
 
         /// Show all model routing assignments (per-role model+provider)
         #[arg(long = "models")]
@@ -1288,11 +1806,12 @@ pub enum Commands {
         #[arg(long = "set-model", num_args = 2, value_names = ["ROLE", "MODEL"])]
         set_model: Option<Vec<String>>,
 
-        /// Set provider for a dispatch role: --set-provider <role> <provider>
+        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
         #[arg(long = "set-provider", num_args = 2, value_names = ["ROLE", "PROVIDER"])]
         set_provider: Option<Vec<String>>,
 
         /// Set endpoint for a dispatch role: --set-endpoint <role> <endpoint-name>
+        /// Binds a named endpoint (from `wg endpoints list`) to a dispatch role.
         #[arg(long = "set-endpoint", num_args = 2, value_names = ["ROLE", "ENDPOINT"])]
         set_endpoint: Option<Vec<String>>,
 
@@ -1301,10 +1820,58 @@ pub enum Commands {
         #[arg(long = "role-model", value_name = "ROLE=MODEL")]
         role_model: Option<String>,
 
-        /// Set provider for a dispatch role: --role-provider <role>=<provider>
+        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
         /// Equivalent to --set-provider but uses key=value syntax.
         #[arg(long = "role-provider", value_name = "ROLE=PROVIDER")]
         role_provider: Option<String>,
+
+        /// Max tokens of previous-attempt context to inject on retry (default: 2000, 0 = disabled)
+        #[arg(long, name = "retry-context-tokens")]
+        retry_context_tokens: Option<u32>,
+
+        /// Set API key file for a provider: --set-key <provider> --file <path>
+        #[arg(long = "set-key", value_name = "PROVIDER")]
+        set_key: Option<String>,
+
+        /// File path for --set-key (the key file to reference)
+        #[arg(long = "file", requires = "set_key", value_name = "PATH")]
+        key_file: Option<String>,
+
+        /// Check OpenRouter API key validity and credit status
+        #[arg(long, name = "check-key")]
+        check_key: bool,
+
+        /// Install project config as global default (~/.workgraph/config.toml)
+        #[arg(long, name = "install-global")]
+        install_global: bool,
+
+        /// Skip confirmation when overwriting existing global config
+        #[arg(long)]
+        force: bool,
+
+        /// Reset config to defaults. With `--route <name>` resets to that route's
+        /// defaults; without a route, picks the closest route based on the current
+        /// executor. Always backs up to config.toml.bak-<timestamp> first.
+        /// Also reachable as `wg config reset` (positional alias).
+        #[arg(long)]
+        reset: bool,
+
+        /// One of the 5 named routes for `--reset`: openrouter, claude-cli, codex-cli,
+        /// local, nex-custom.
+        #[arg(long = "route", value_name = "NAME")]
+        reset_route: Option<String>,
+
+        /// Preserve existing `[[llm_endpoints.endpoints]]` entries when resetting.
+        #[arg(long = "keep-keys")]
+        reset_keep_keys: bool,
+
+        /// Print the diff that `--reset` would apply, but don't actually write.
+        #[arg(long = "dry-run")]
+        reset_dry_run: bool,
+
+        /// Skip confirmation when `--reset` would replace a non-empty config.
+        #[arg(long = "yes")]
+        reset_yes: bool,
     },
 
     /// Detect and clean up dead agents
@@ -1334,11 +1901,34 @@ pub enum Commands {
         threshold: Option<u64>,
     },
 
-    /// List running agent processes (service workers)
+    /// Detect and recover orphaned in-progress tasks with dead agents
     #[command(
-        after_help = "This command shows agent processes spawned by the service coordinator.\nThese are runtime workers, not agent identity definitions.\n\nSee also: 'wg agent' to manage agent definitions (role + tradeoff pairings)."
+        after_help = "Sweep detects in-progress tasks whose assigned agent has died,\nbeen marked Dead, or is missing from the registry. It resets them\nto Open so the dispatcher can re-dispatch.\n\nWith --reap-targets, also removes cargo build artifacts from\nworktrees of agents that are no longer live (preserving source\nfiles and the worktree itself).\n\nThis is safe to run anytime — it is idempotent."
+    )]
+    Sweep {
+        /// Only report orphaned tasks, don't fix them
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Also remove `target/` build artifacts from dead-agent worktrees
+        #[arg(long)]
+        reap_targets: bool,
+    },
+
+    /// Run a one-shot graph migration (chat-rename, etc.)
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCommands,
+    },
+
+    /// List or manage running agent processes (service workers)
+    #[command(
+        after_help = "Without a subcommand, lists all agent processes spawned by the service\ncoordinator. These are runtime workers, not agent identity definitions.\n\nSubcommands:\n  wg agents kill <agent-id>   # SIGTERM the agent process (no-op if dead)\n\nSee also: 'wg agent' to manage agent definitions (role + tradeoff pairings)."
     )]
     Agents {
+        #[command(subcommand)]
+        command: Option<AgentsCommand>,
+
         /// Only show alive agents (starting, working, idle)
         #[arg(long)]
         alive: bool,
@@ -1358,7 +1948,7 @@ pub enum Commands {
 
     /// Kill running agent(s)
     Kill {
-        /// Agent ID to kill (e.g., agent-1)
+        /// Agent ID to kill, or task ID when using --tree
         agent: Option<String>,
 
         /// Force kill (SIGKILL immediately instead of graceful SIGTERM)
@@ -1369,9 +1959,32 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Leave the killed task open for immediate re-dispatch instead of auto-pausing it
+        /// Kill agent for task + all downstream tasks (cascade kill)
+        #[arg(long)]
+        tree: bool,
+
+        /// Show what would be killed/abandoned without doing it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Kill agents but don't abandon tasks (allows respawn)
+        #[arg(long)]
+        no_abandon: bool,
+
+        /// Leave the task open for re-dispatch instead of pausing it
         #[arg(long)]
         redispatch: bool,
+    },
+
+    /// Reap dead/done/failed agents from the registry
+    Reap {
+        /// Show what would be reaped without removing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Only reap agents dead/done/failed for longer than this duration (e.g., 1h, 30m, 7d)
+        #[arg(long)]
+        older_than: Option<String>,
     },
 
     /// Manage the agent service daemon
@@ -1385,16 +1998,109 @@ pub enum Commands {
         /// Disable mouse capture (useful in tmux)
         #[arg(long)]
         no_mouse: bool,
+
+        /// Recording mode: disable mouse capture and keyboard enhancement
+        /// queries for clean asciinema/terminal recording. Auto-enabled when
+        /// ASCIINEMA_REC is set.
+        #[arg(long)]
+        recording: bool,
+
+        /// Record all input events to a JSONL file for replay-based screencasts.
+        #[arg(long, value_name = "FILE")]
+        trace: Option<std::path::PathBuf>,
+
+        /// Show key press feedback overlay (useful for screencasts/demos).
+        /// Also enabled by tui.show_keys config.
+        #[arg(long)]
+        show_keys: bool,
+
+        /// Load only the last N chat messages on startup (overrides default pagination window).
+        /// User can still scroll up to load more.
+        #[arg(long, value_name = "N")]
+        history_depth: Option<usize>,
+
+        /// Start with a clean chat view (no history loaded). History is still
+        /// persisted — this only affects the initial display. Prevents scrollback
+        /// for this session.
+        #[arg(long)]
+        no_history: bool,
+    },
+
+    /// Dump the current TUI screen contents (requires a running `wg tui`)
+    #[command(name = "tui-dump")]
+    TuiDump {},
+
+    /// Render TUI event traces into asciinema screencasts
+    Screencast {
+        #[command(subcommand)]
+        command: ScreencastCommands,
+    },
+
+    /// Multi-user server setup automation
+    Server {
+        #[command(subcommand)]
+        command: ServerCommands,
     },
 
     /// Interactive configuration wizard for first-time setup
-    Setup,
+    Setup {
+        /// One of the 5 named routes: openrouter, claude-cli, codex-cli, local, nex-custom.
+        /// Picks a complete, working config end-to-end (executor + tiers + endpoint
+        /// when applicable). Use with `--yes` for non-interactive setup.
+        #[arg(long)]
+        route: Option<String>,
+        /// [DEPRECATED] Use `--route` instead. Still accepted: anthropic, openrouter,
+        /// openai, local, custom. Maps internally onto the closest route.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Where to write the config: `global` (~/.wg/config.toml),
+        /// `local` (./.wg/config.toml), or `both`. When omitted, the
+        /// interactive wizard prompts; non-interactive routes default to
+        /// `global`.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Path to API key file (route-dependent: openrouter / nex-custom).
+        #[arg(long)]
+        api_key_file: Option<String>,
+        /// Environment variable name for API key (route-dependent).
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// API endpoint URL (route-dependent: local / nex-custom).
+        #[arg(long)]
+        url: Option<String>,
+        /// Default model ID (route-dependent).
+        #[arg(long)]
+        model: Option<String>,
+        /// Skip API key validation
+        #[arg(long)]
+        skip_validation: bool,
+        /// Non-interactive: write the route's config without prompting.
+        #[arg(long)]
+        yes: bool,
+        /// Print the config that would be written but don't write it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Print a concise cheat sheet for agent onboarding
     Quickstart,
 
     /// Quick one-screen status overview
-    Status,
+    Status {
+        /// Include dot-prefixed system tasks in counts (hidden by default)
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show time counters and agent statistics
+    Stats,
+
+    /// Display cleanup and monitoring metrics
+    Metrics {
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Send task notification to Matrix room
     #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
@@ -1437,6 +2143,320 @@ pub enum Commands {
         command: TelegramCommands,
     },
 
+    /// Manage LLM endpoints (add, remove, list, test)
+    Endpoints {
+        #[command(subcommand)]
+        command: EndpointsCommands,
+    },
+
+    /// Manage LLM endpoints (singular alias for 'endpoints')
+    #[command(hide = true)]
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointsCommands,
+    },
+
+    /// Browse and search available models from OpenRouter
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommands,
+    },
+
+    /// Model registry and routing management
+    Model {
+        #[command(subcommand)]
+        command: ModelCommands,
+    },
+
+    /// Manage API keys for LLM providers
+    Key {
+        #[command(subcommand)]
+        command: KeyCommands,
+    },
+
+    /// Interactive agentic REPL — coding assistant powered by any model
+    Nex {
+        /// Model to use (e.g., openrouter:qwen/qwen3-coder, ollama:llama3.2, sonnet)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+
+        /// Named endpoint from config (e.g., `openrouter`, `local`)
+        /// OR a bare URL like `http://localhost:11434` for zero-config
+        /// local servers (Ollama, vLLM, llama.cpp). URLs use
+        /// oai-compat + no auth by default; pass `-k` to override.
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+
+        /// Custom system prompt
+        #[arg(long)]
+        system_prompt: Option<String>,
+
+        /// Initial message (skip the first prompt)
+        message: Option<String>,
+
+        /// Maximum conversation turns
+        #[arg(long, default_value = "200")]
+        max_turns: usize,
+
+        /// Chatty mode: echo the full tool output content under each
+        /// tool-call line, exactly as the model sees it (capped at
+        /// 20 lines / 1600 bytes per call). Default shows only a
+        /// one-line summary per call. Useful when actively following
+        /// an agent's actions.
+        #[arg(long, short = 'c')]
+        chatty: bool,
+
+        /// Verbose console output: implies `--chatty` and also emits
+        /// compaction diagnostics, token accounting, and the
+        /// session-log path banner. Useful for debugging the REPL
+        /// itself. The on-disk NDJSON session log is always complete
+        /// regardless of this flag.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Read-only safety mode: only expose tools that cannot modify
+        /// state (read_file, grep, web_search, web_fetch, etc.). Tools
+        /// like write_file, edit_file, and bash (which can run arbitrary
+        /// commands) are removed from the registry. Use this when you
+        /// want to browse, research, or explore without risk of the
+        /// agent modifying any files.
+        #[arg(long, short = 'r')]
+        read_only: bool,
+
+        /// Resume a previous nex session. Three shapes:
+        ///
+        ///   `wg nex --resume`              — interactive picker
+        ///                                   over all sessions,
+        ///                                   most-recent first.
+        ///   `wg nex --resume <pattern>`    — pattern-match the
+        ///                                   most-recent session
+        ///                                   whose alias / uuid
+        ///                                   prefix / kind
+        ///                                   contains `<pattern>`.
+        ///   `wg nex --chat <uuid|alias>`   — address a specific
+        ///                                   session directly
+        ///                                   (works without
+        ///                                   `--resume`).
+        ///
+        /// Bare `wg nex` (no flags) starts a FRESH session every
+        /// time — no auto-resume.
+        #[arg(long, value_name = "PATTERN", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+
+        /// Load an agency role/skill by name to augment the session.
+        /// Searches `.workgraph/agency/primitives/components/` for a
+        /// matching component and appends its content to the system
+        /// prompt. Use "coordinator" to enable workgraph management
+        /// tools (wg_add, wg_done) which are otherwise stripped in
+        /// interactive mode.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Run as a chat-tethered agent: read user turns from
+        /// `<workgraph>/chat/<id>/inbox.jsonl`, write streaming tokens
+        /// to `<workgraph>/chat/<id>/streaming`, append finalized
+        /// assistant turns to `<workgraph>/chat/<id>/outbox.jsonl`.
+        /// Bypasses stdin/stderr. When set, the journal is stored at
+        /// `<workgraph>/chat/<id>/conversation.jsonl` so `--resume`
+        /// picks up the right session automatically.
+        ///
+        /// Primary use case: this is how `wg nex` serves as the
+        /// coordinator (spawned by the service / a graph task with a
+        /// chat tether to the TUI). Pair with `--role coordinator`
+        /// for the wg_* mutation tools.
+        #[arg(long = "chat-id")]
+        chat_id: Option<u32>,
+
+        /// Bind this nex session to a chat dir by reference. Accepts
+        /// a UUID, a UUID prefix (≥4 chars), or an alias like
+        /// `coordinator-0` / `task-<id>` / a user-chosen handle.
+        /// If the reference doesn't yet resolve to a session, a new
+        /// session is created under that alias. Same effect as
+        /// `--chat-id` except not limited to numeric ids.
+        #[arg(long = "chat")]
+        chat_ref: Option<String>,
+
+        /// Run in autonomous mode — EndTurn exits the loop instead
+        /// of prompting for next input. Used when a task-agent
+        /// spawns `wg nex` as a one-shot executor.
+        #[arg(long = "autonomous")]
+        autonomous: bool,
+
+        /// Skip the MCP server spawn/discover step at startup. Use
+        /// this when MCP tooling is misconfigured or when you want a
+        /// deterministic, minimal tool surface for debugging.
+        #[arg(long = "no-mcp")]
+        no_mcp: bool,
+
+        /// Benchmark/evaluation mode — run nex as a non-interactive
+        /// eval-harness target (SWE-bench, Terminal-Bench, etc.).
+        ///
+        /// Implies `--autonomous` and `--no-mcp`. Skips mounting the
+        /// chat-file surface (no inbox.jsonl/outbox.jsonl/.streaming
+        /// files dropped into the repo under eval). Suppresses the
+        /// decorative banner on stderr. On clean exit, emits a
+        /// single-line JSON summary to stdout so the harness can log
+        /// turns/tokens/final-status without parsing ANSI output:
+        ///   {"status":"ok","turns":N,"input_tokens":I,"output_tokens":O,"exit_reason":"..."}
+        ///
+        /// Process exit: 0 on EndTurn/clean completion, non-zero on
+        /// max-turns/context-limit/error — same abnormal-exit rules
+        /// the autonomous task-agent path already uses.
+        #[arg(long = "eval-mode")]
+        eval_mode: bool,
+
+        /// Streaming idle timeout in seconds (default: 600). How long to
+        /// wait for new chunks before aborting a streaming request.
+        /// Useful for slow local models where prefill can take minutes.
+        /// Also configurable via WG_STREAM_IDLE_TIMEOUT_SECS env var
+        /// (flag takes precedence).
+        #[arg(long = "idle-timeout-secs")]
+        idle_timeout_secs: Option<u64>,
+
+        /// Minimal tool surface: expose only the canonical local-dev
+        /// tool set (Read, Edit, Write, Bash, Grep, Glob, TodoWrite)
+        /// and omit everything else (WebFetch, WebSearch, NotebookEdit,
+        /// Monitor, Task*, Remote*, Cron*, MCP tools). Dramatically
+        /// reduces prefill cost for small local models. Implies --no-mcp.
+        #[arg(long = "minimal-tools")]
+        minimal_tools: bool,
+    },
+
+    /// Interactive agentic TUI — ratatui-based nex (two-pane with streaming + Ctrl-C cancel)
+    #[command(name = "tui-nex")]
+    TuiNex {
+        /// Model to use (e.g., openrouter:qwen/qwen3-coder, ollama:llama3.2, sonnet)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+
+        /// Named endpoint from config
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+    },
+
+    /// PTY-embedded nex TUI — spawns `wg nex` as a PTY child and
+    /// renders its terminal output in a ratatui pane. Inherits every
+    /// wg nex feature (streaming, tool boxes, rustyline editing,
+    /// Ctrl-C semantics, slash commands) verbatim because we're
+    /// literally running it in a terminal. Exit the embedded nex
+    /// normally (`/quit` or Ctrl-D) or press Ctrl-Q to kill it.
+    #[command(name = "tui-pty")]
+    TuiPty {
+        /// Pass-through `--model` for the embedded `wg nex`.
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+
+        /// Pass-through `--endpoint` for the embedded `wg nex`.
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+
+        /// Pass-through `--chat <ref>` — bind the embedded nex to a
+        /// chat session. Normal stdin/stderr mode otherwise.
+        #[arg(long = "chat")]
+        chat_ref: Option<String>,
+
+        /// Pass-through `--resume [<pattern>]`.
+        #[arg(long, value_name = "PATTERN", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+    },
+
+    /// Spawn the handler for a task — the single entry point that
+    /// resolves executor type, chat session, and role, then launches
+    /// the right command (replaces the current process via exec).
+    ///
+    /// This is what the TUI PTY pane runs when you focus a task,
+    /// what humans run at a terminal to interact with a task, and
+    /// what the daemon supervisor runs to (re)start a handler.
+    ///
+    /// Per design (docs/design/sessions-as-identity.md), the
+    /// abstraction point is here: per-executor adapters live in
+    /// `commands/spawn_task.rs`. When a CLI vendor changes flags or
+    /// adds a new executor, we change one adapter; the TUI and the
+    /// daemon don't need to know.
+    #[command(name = "spawn-task")]
+    SpawnTask {
+        /// Task id in the graph. Resolves to a chat session
+        /// (alias == task id, by convention until Phase 5 migration).
+        task_id: String,
+
+        /// Override the auto-detected role. Interpreted per-executor
+        /// (native passes as `--role`; adapters may translate).
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Dry-run: print the command we'd exec without running it.
+        /// Useful for the TUI to preview, or for debugging.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// Bridge Claude CLI stream-json stdio ↔ chat/<ref>/*.jsonl.
+    ///
+    /// Peer of `wg nex --chat <ref>` for the Claude executor. Dispatched
+    /// by `wg spawn-task` when the session's executor is `claude`.
+    /// Not typically invoked directly — use `wg spawn-task <task-id>`
+    /// or `wg service create-coordinator --executor claude`.
+    #[command(name = "claude-handler")]
+    ClaudeHandler {
+        /// Chat session reference (alias, task id, or UUID).
+        #[arg(long = "chat")]
+        chat: String,
+
+        /// Resume mode (accepted for argv symmetry with `wg nex`).
+        #[arg(long)]
+        resume: bool,
+
+        /// Role hint (e.g., "coordinator"). Loads the coordinator
+        /// system prompt when set to "coordinator" or when the chat
+        /// ref starts with `coordinator-`.
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Model override. Stripped of provider prefix before passing
+        /// to the Claude CLI.
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
+    /// Bridge Codex CLI JSONL output ↔ chat/<ref>/*.jsonl.
+    ///
+    /// Peer of `wg nex --chat <ref>` and `wg claude-handler` for the
+    /// Codex executor. Codex is single-shot (`codex exec` runs a
+    /// turn and exits), so this handler re-runs codex per inbox
+    /// message with the full conversation history prepended.
+    #[command(name = "codex-handler")]
+    CodexHandler {
+        #[arg(long = "chat")]
+        chat: String,
+
+        #[arg(long)]
+        resume: bool,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
+    /// Print the workgraph directory that `wg` would use from here,
+    /// and show which resolver step won (CLI flag / env / walk-up /
+    /// home / default). Useful when you're confused about which graph
+    /// `wg add` is talking to.
+    #[command(name = "which")]
+    Which {},
+
+    /// List executors wg knows about, which are usable on this
+    /// system, and where their backing binaries live. Useful for
+    /// seeing what `--executor` values `wg service create-coordinator`
+    /// and `wg edit --model` can target.
+    #[command(name = "executors")]
+    Executors {
+        /// Show all executors, including unusable ones.
+        #[arg(long)]
+        all: bool,
+    },
+
     /// Run the native executor agent loop (internal, called by spawn)
     #[command(name = "native-exec", hide = true)]
     NativeExec {
@@ -1452,13 +2472,442 @@ pub enum Commands {
         #[arg(long)]
         task_id: String,
 
-        /// Model to use (e.g., claude-sonnet-4-5-20250514)
+        /// Model to use (e.g., anthropic/claude-sonnet-4-6)
         #[arg(long)]
         model: Option<String>,
+
+        /// LLM provider (e.g., anthropic, openai)
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Named endpoint from config (e.g., openrouter, anthropic-prod)
+        #[arg(long)]
+        endpoint_name: Option<String>,
+
+        /// Endpoint URL override
+        #[arg(long)]
+        endpoint_url: Option<String>,
+
+        /// Pre-resolved API key (avoids re-resolution from config/files)
+        #[arg(long)]
+        api_key: Option<String>,
 
         /// Maximum agent turns before stopping
         #[arg(long, default_value = "100")]
         max_turns: usize,
+
+        /// Disable resume from existing conversation journal (start fresh)
+        #[arg(long, default_value = "false")]
+        no_resume: bool,
+    },
+
+    /// Apply placement agent output (internal, called by wrapper script)
+    #[command(name = "apply-placement", hide = true)]
+    ApplyPlacement {
+        /// Path to the agent output directory (contains raw_stream.jsonl)
+        output_dir: String,
+
+        /// Source task ID (the task being placed)
+        source_task_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCommand {
+    /// List all agent worktrees with size, age, and uncommitted-changes status
+    List,
+
+    /// Archive an agent's worktree: auto-commit uncommitted work, optionally remove
+    Archive {
+        /// Agent ID (e.g., agent-16803)
+        agent_id: String,
+
+        /// Remove the worktree directory after committing.
+        /// Without this flag, the directory is preserved on disk.
+        #[arg(long)]
+        remove: bool,
+    },
+
+    /// Garbage-collect stale worktrees. Dry-run by default — use --execute
+    /// to actually remove. Filters (at least one recommended) narrow which
+    /// worktrees qualify; with no filters, nothing is removed.
+    Gc {
+        /// Actually perform the removal. Without this flag, prints what
+        /// would be removed and exits.
+        #[arg(long)]
+        execute: bool,
+
+        /// Only consider worktrees older than this duration (e.g. "7d", "24h").
+        /// Age is the last-modification time of the worktree directory.
+        #[arg(long)]
+        older: Option<String>,
+
+        /// Only consider worktrees whose owning agent is no longer alive
+        /// (process gone, registry status dead, or no registry entry).
+        #[arg(long)]
+        dead_only: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EndpointsCommands {
+    /// List all configured endpoints
+    List,
+
+    /// Add a new endpoint
+    Add {
+        /// Endpoint name (e.g., "openrouter", "anthropic-prod")
+        name: String,
+
+        /// Provider type: anthropic, openai, openrouter, local
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// API endpoint URL (defaults based on provider)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Default model for this endpoint
+        #[arg(long)]
+        model: Option<String>,
+
+        /// API key (prefer --api-key-file for security)
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Path to a file containing the API key
+        #[arg(long)]
+        api_key_file: Option<String>,
+
+        /// Environment variable name to read the API key from
+        #[arg(long)]
+        key_env: Option<String>,
+
+        /// Set as the default endpoint
+        #[arg(long)]
+        default: bool,
+
+        /// Target global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Update an existing endpoint (only specified fields are changed)
+    Update {
+        /// Endpoint name to update
+        name: String,
+
+        /// Provider type: anthropic, openai, openrouter, local
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// API endpoint URL (defaults based on provider)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Default model for this endpoint
+        #[arg(long)]
+        model: Option<String>,
+
+        /// API key (prefer --api-key-file for security)
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Path to a file containing the API key
+        #[arg(long)]
+        api_key_file: Option<String>,
+
+        /// Environment variable name to read the API key from
+        #[arg(long)]
+        key_env: Option<String>,
+
+        /// Set as the default endpoint
+        #[arg(long)]
+        default: bool,
+
+        /// Target global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Remove an endpoint by name
+    Remove {
+        /// Endpoint name to remove
+        name: String,
+
+        /// Target global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Set an endpoint as the default
+    SetDefault {
+        /// Endpoint name to set as default
+        name: String,
+
+        /// Target global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Test endpoint connectivity (hits /models API)
+    Test {
+        /// Endpoint name to test
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ModelsCommands {
+    /// List models from the local registry
+    List {
+        /// Filter by tier (frontier, mid, budget)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+
+    /// Search models from OpenRouter by name, ID, or description
+    Search {
+        /// Search query (matches against model ID, name, and description)
+        query: String,
+
+        /// Only show models that support tool use (function calling)
+        #[arg(long)]
+        tools: bool,
+
+        /// Skip the local cache and fetch fresh data from the API
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Maximum number of results to show (default: 50)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// List all models available on OpenRouter (remote API)
+    Remote {
+        /// Only show models that support tool use (function calling)
+        #[arg(long)]
+        tools: bool,
+
+        /// Skip the local cache and fetch fresh data from the API
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Maximum number of results to show (default: 100)
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+
+    /// Add a custom model to the local registry
+    Add {
+        /// Model ID (e.g. "anthropic/claude-opus-4-6")
+        id: String,
+
+        /// Provider name
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Cost per 1M input tokens (USD)
+        #[arg(long, name = "cost-in")]
+        cost_in: f64,
+
+        /// Cost per 1M output tokens (USD)
+        #[arg(long, name = "cost-out")]
+        cost_out: f64,
+
+        /// Context window size in tokens
+        #[arg(long)]
+        context_window: Option<u64>,
+
+        /// Capability tags (e.g. coding, analysis, tool_use)
+        #[arg(long, short)]
+        capability: Vec<String>,
+
+        /// Tier classification (frontier, mid, budget)
+        #[arg(long, default_value = "mid")]
+        tier: String,
+    },
+
+    /// Set the default model
+    SetDefault {
+        /// Model ID to set as default
+        id: String,
+    },
+
+    /// Initialize the models.yaml with defaults
+    Init,
+
+    /// Fetch model data from OpenRouter and build the benchmark registry
+    Fetch {
+        /// Skip the local cache and fetch fresh data from the API
+        #[arg(long)]
+        no_cache: bool,
+    },
+
+    /// Show the benchmark registry with fitness scores and tier classification
+    Benchmarks {
+        /// Filter by tier (frontier, mid, budget)
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Maximum number of models to display
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ModelCommands {
+    /// Show all models in the registry (built-in + user-defined)
+    List {
+        /// Filter by tier (fast, standard, premium)
+        #[arg(long)]
+        tier: Option<String>,
+    },
+
+    /// Add or update a model in the config registry
+    Add {
+        /// Short alias for the model (e.g., "gpt-4o", "claude-via-openrouter")
+        alias: String,
+
+        /// Provider: anthropic, openai, openrouter, local
+        #[arg(long)]
+        provider: String,
+
+        /// Full API model identifier (defaults to alias if omitted)
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// Quality tier: fast, standard, premium
+        #[arg(long, default_value = "standard")]
+        tier: String,
+
+        /// Named endpoint to use for this model
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Context window in tokens
+        #[arg(long)]
+        context_window: Option<u64>,
+
+        /// Cost per million input tokens (USD)
+        #[arg(long)]
+        cost_in: Option<f64>,
+
+        /// Cost per million output tokens (USD)
+        #[arg(long)]
+        cost_out: Option<f64>,
+
+        /// Write to global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Remove a model from the config registry
+    Remove {
+        /// Model alias to remove
+        alias: String,
+
+        /// Skip confirmation for entries referenced by roles
+        #[arg(long)]
+        force: bool,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Set the default model for agent dispatch
+    SetDefault {
+        /// Model alias (must exist in registry)
+        alias: String,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Show per-role model routing configuration
+    Routing,
+
+    /// Set the model for a specific dispatch role
+    Set {
+        /// Role name (e.g., default, evaluator, triage, compactor)
+        role: String,
+
+        /// Model alias or ID
+        model: String,
+
+        /// Also set provider for this role
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Also set endpoint for this role
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Set tier override instead of direct model
+        #[arg(long)]
+        tier: Option<String>,
+
+        /// Write to global config
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeyCommands {
+    /// Configure an API key for a provider
+    Set {
+        /// Provider name (e.g., openrouter, anthropic, openai)
+        provider: String,
+
+        /// Reference an environment variable by name
+        #[arg(long)]
+        env: Option<String>,
+
+        /// Path to a file containing the key
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Store key value directly (written to ~/.workgraph/keys/<provider>.key, NOT to config)
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Apply to global config (~/.workgraph/config.toml)
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Validate API key availability and status
+    Check {
+        /// Provider name (omit to check all)
+        provider: Option<String>,
+    },
+
+    /// Show key configuration status for all providers
+    List,
+}
+
+#[derive(Subcommand)]
+pub enum OpenRouterCommands {
+    /// Show OpenRouter API key status and usage
+    Status,
+    /// Show session cost summary
+    Session,
+    /// Set cost cap limits
+    SetLimit {
+        /// Global cost cap in USD
+        #[arg(long)]
+        global: Option<f64>,
+        /// Session cost cap in USD
+        #[arg(long)]
+        session: Option<f64>,
+        /// Task cost cap in USD
+        #[arg(long)]
+        task: Option<f64>,
     },
 }
 
@@ -1509,6 +2958,24 @@ pub enum MsgCommands {
         /// Agent ID (default: from WG_AGENT_ID env var, or "user")
         #[arg(long)]
         agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UserCommands {
+    /// Create a user board (defaults to current user)
+    Init {
+        /// User handle (default: $WG_USER or $USER)
+        name: Option<String>,
+    },
+
+    /// List all user boards (active + archived)
+    List,
+
+    /// Archive the active board and create a successor
+    Archive {
+        /// User handle (default: $WG_USER or $USER)
+        name: Option<String>,
     },
 }
 
@@ -1569,6 +3036,37 @@ pub enum EvaluateCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ProfileCommands {
+    /// Set the active provider profile
+    Set {
+        /// Profile name (e.g., anthropic, openrouter, openai)
+        name: String,
+
+        /// Pin the fast tier to a specific model (e.g., openrouter:qwen/qwen3-coder)
+        #[arg(long)]
+        fast: Option<String>,
+
+        /// Pin the standard tier to a specific model (e.g., openrouter:deepseek/deepseek-r1)
+        #[arg(long)]
+        standard: Option<String>,
+
+        /// Pin the premium tier to a specific model (e.g., openrouter:qwen/qwen3-max)
+        #[arg(long)]
+        premium: Option<String>,
+    },
+    /// Show current profile and resolved model mappings
+    Show {
+        /// Show raw metrics (pricing, context length, benchmark scores) per model
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// List available profiles
+    List,
+    /// Refresh model data from OpenRouter and recompute rankings
+    Refresh,
+}
+
+#[derive(Subcommand)]
 pub enum EvolveCommands {
     /// Trigger an evolution cycle on agency roles and tradeoffs
     Run {
@@ -1587,6 +3085,36 @@ pub enum EvolveCommands {
         /// Model to use for the evolver agent
         #[arg(long)]
         model: Option<String>,
+
+        /// Enable autopoietic cycle mode (back-edge from evaluate to partition)
+        #[arg(long, alias = "cycle")]
+        autopoietic: bool,
+
+        /// Max cycle iterations (default: 3, requires --autopoietic)
+        #[arg(long)]
+        max_iterations: Option<u32>,
+
+        /// Seconds between cycle iterations (default: 3600, requires --autopoietic)
+        #[arg(long)]
+        cycle_delay: Option<u64>,
+
+        /// Force fan-out mode even with <50 evaluations
+        #[arg(long)]
+        force_fanout: bool,
+
+        /// Force legacy single-shot mode even with ≥50 evaluations
+        #[arg(long, conflicts_with = "force_fanout")]
+        single_shot: bool,
+    },
+
+    /// Apply a synthesis-result.json from a fan-out evolution run
+    Apply {
+        /// Path to synthesis-result.json
+        synthesis_file: std::path::PathBuf,
+
+        /// Output path for apply-results.json (default: auto-derived from synthesis file path)
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
     },
 
     /// Review deferred evolver operations (list, approve, reject)
@@ -1643,6 +3171,32 @@ pub enum ArchiveCommands {
         /// Reopen the task (set status to 'open' instead of 'done')
         #[arg(long)]
         reopen: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CoordinatorCommands {
+    /// List coordinator sessions (active by default, --archived for archived)
+    List {
+        /// Show archived coordinators instead of active ones
+        #[arg(long)]
+        archived: bool,
+
+        /// Show all coordinators (active + archived)
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Archive a coordinator session (moves chat dir, hides from listings)
+    Archive {
+        /// Coordinator name (e.g., "coordinator-3" or just "3")
+        name: String,
+    },
+
+    /// Restore an archived coordinator session
+    Restore {
+        /// Coordinator name (e.g., "coordinator-3" or just "3")
+        name: String,
     },
 }
 
@@ -1947,6 +3501,26 @@ pub enum ResourceCommands {
 }
 
 #[derive(Subcommand)]
+pub enum AgentsCommand {
+    /// SIGTERM (or SIGKILL with --force) the named agent process.
+    ///
+    /// Lower-level building block for hung-agent recovery. Used internally
+    /// by `wg retry` for in-progress tasks. No-op if the agent is already
+    /// dead or absent from the registry. Does NOT pause the task — the
+    /// dispatcher is free to respawn (use `wg kill <agent>` instead if
+    /// you want the task paused).
+    Kill {
+        /// Agent ID (e.g., "agent-42")
+        #[arg(value_name = "AGENT")]
+        agent_id: String,
+
+        /// Use SIGKILL immediately instead of graceful SIGTERM
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum SkillCommands {
     /// List all skills used across tasks
     List,
@@ -1989,6 +3563,10 @@ pub enum AgencyCommands {
         /// Group stats by model (shows per-model score breakdown)
         #[arg(long)]
         by_model: bool,
+
+        /// Group stats by task type (research, implementation, fix, design, test, docs, refactor)
+        #[arg(long)]
+        by_task_type: bool,
     },
 
     /// Scan filesystem for agency stores
@@ -2089,6 +3667,36 @@ pub enum AgencyCommands {
         dry_run: bool,
     },
 
+    /// Import Agency's starter.csv primitives into WorkGraph
+    Import {
+        /// Path to the CSV file to import (omit when using --url or --upstream)
+        csv_path: Option<String>,
+
+        /// Fetch CSV from a remote URL instead of local file
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Fetch from the configured upstream URL (agency.upstream_url in config)
+        #[arg(long)]
+        upstream: bool,
+
+        /// Show what would be imported without writing files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Provenance tag (default: agency-import)
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Re-import even if manifest hash matches (skip change detection)
+        #[arg(long)]
+        force: bool,
+
+        /// Only check if upstream has changed (exit 0 = changed, exit 1 = same)
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Push local entities to another agency store
     Push {
         /// Target store (path, named remote, or directory)
@@ -2152,6 +3760,206 @@ pub enum RemoteCommands {
     Show {
         /// Remote name
         name: String,
+    },
+}
+
+/// Subcommands for `wg chat <sub>` — chat as a first-class graph entity.
+///
+/// These commands separate "create the persistent chat in the graph" from
+/// "spawn the runtime supervisor right now". Most subcommands work with
+/// the service daemon up OR down; the few that genuinely require the
+/// supervisor (resume, stop) error clearly when it's not running.
+#[derive(Subcommand, Debug)]
+pub enum ChatCommands {
+    /// Create a new chat agent task in the graph.
+    /// Works with the service running or stopped — the supervisor picks
+    /// up the new chat on next start.
+    Create {
+        /// Optional human-readable name (becomes part of the task title
+        /// and addressable as a chat reference).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Per-chat executor override (e.g. "claude", "amplifier", "native").
+        #[arg(long)]
+        executor: Option<String>,
+
+        /// Per-chat model override (e.g. "claude:opus", "openai:qwen3-coder-30b").
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
+    /// List all chat agents with their runtime status.
+    #[command(alias = "ls")]
+    List,
+
+    /// Detailed view of one chat: task, runtime, executor, model.
+    Show {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+    },
+
+    /// Open an interactive view of the chat session.
+    /// Defaults to the TUI when on a TTY; use `--cli` to force a
+    /// read-only stream view.
+    Attach {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+        /// Force CLI (read-only stream) mode even on a TTY.
+        #[arg(long)]
+        cli: bool,
+    },
+
+    /// Append a one-shot message to a chat's inbox.
+    /// Does NOT wait for a response. Works with the daemon up or down
+    /// (queues until the handler is alive).
+    Send {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+        /// Message body. Pass quoted; reads stdin if `-`.
+        message: String,
+    },
+
+    /// SIGTERM the live handler (chat entity stays in graph). Reversible
+    /// via `wg chat resume`. Requires the service daemon.
+    Stop {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+    },
+
+    /// Ask the supervisor to (re)spawn the handler. Errors clearly if
+    /// the service daemon is not running.
+    Resume {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+    },
+
+    /// Mark the chat as Done and tag it `archived`. Out of the active
+    /// set; chat directory is preserved.
+    Archive {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+    },
+
+    /// Hard delete: abandon the graph task. Chat directory is preserved
+    /// (archived under `.archive/` by the daemon, or left in-place when
+    /// the daemon is down).
+    Delete {
+        /// Chat reference: numeric ID, `.chat-N` task ID, or name.
+        chat: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionCommands {
+    /// List every nex session in this workgraph.
+    List {
+        /// Print UUIDs + aliases as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
+        /// Show 8-char UUID prefixes (git-log-oneline style) instead
+        /// of the full 36-char UUIDs. Default is full.
+        #[arg(long)]
+        short: bool,
+    },
+
+    /// Open a live view of an existing session. Tails `.streaming`
+    /// and `outbox.jsonl` — new tokens appear as they're emitted by
+    /// whichever process owns the session.
+    Attach {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+    },
+
+    /// Register a new, empty session with a chosen alias. Useful
+    /// for pre-allocating a handle so something else (e.g. a
+    /// spawned `wg nex --chat <alias>`) can pick it up.
+    New {
+        /// Alias (human handle) for the new session.
+        alias: String,
+
+        /// Optional longer descriptive label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Fork an existing session. Copies its conversation journal
+    /// into a fresh session so you can explore a different
+    /// direction without losing the original. The new session has
+    /// its own inbox/outbox; writes to it don't affect the parent.
+    Fork {
+        /// Source session reference: UUID, prefix, or alias.
+        source: String,
+
+        /// Alias for the fork. Defaults to `fork-<short-uuid>`.
+        #[arg(long)]
+        alias: Option<String>,
+    },
+
+    /// Manage aliases on an existing session.
+    Alias {
+        #[command(subcommand)]
+        command: SessionAliasCommands,
+    },
+
+    /// Delete a session (registry entry + chat dir + all aliases).
+    Rm {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+    },
+
+    /// Ask the live handler of a session (if any) to exit cleanly at
+    /// its next turn boundary. Writes a release marker that the
+    /// handler observes. Does not forcefully kill anything — a
+    /// runaway tool call will delay the release until it completes.
+    /// If no handler is running, this is a no-op.
+    Release {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+
+        /// Wait up to this many seconds for the handler to actually
+        /// release before returning. 0 = don't wait.
+        #[arg(long, default_value_t = 10)]
+        wait: u64,
+    },
+
+    /// Show who currently holds the handler lock for a session (if
+    /// anyone). Prints PID, kind, start time, and live/stale status.
+    Status {
+        /// Session reference: UUID, prefix, or alias.
+        session: String,
+    },
+
+    /// Doctor: scan the session registry and `chat/` directory for
+    /// inconsistencies. Reports orphans, split-brain, stale locks,
+    /// and anything else that would produce "TUI chat hangs" or
+    /// "messages loop" symptoms. Optionally fix what it can.
+    Check {
+        /// Attempt to repair issues found (currently: remove orphan
+        /// chat dirs, clean stale locks held by dead PIDs, merge
+        /// legacy regular dirs sitting at alias paths).
+        #[arg(long)]
+        fix: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionAliasCommands {
+    /// Add an alias to an existing session.
+    Add {
+        /// Session reference: UUID, prefix, or existing alias.
+        session: String,
+        /// New alias to install.
+        alias: String,
+    },
+    /// Remove an alias from a session. The session itself stays.
+    Rm {
+        /// Alias to remove.
+        alias: String,
     },
 }
 
@@ -2323,6 +4131,14 @@ pub enum AgentCommands {
         /// Executor backend (claude, matrix, email, shell)
         #[arg(long, default_value = "claude")]
         executor: String,
+
+        /// Preferred model (e.g., opus, sonnet, haiku, or full model ID)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Preferred provider (e.g., anthropic, openrouter)
+        #[arg(long)]
+        provider: Option<String>,
     },
 
     /// List all agent definitions
@@ -2377,6 +4193,213 @@ pub enum AgentCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ScreencastCommands {
+    /// Render a TUI event trace into an asciinema .cast file
+    Render {
+        /// Path to the trace JSONL file produced by `wg tui --trace`
+        #[arg(long)]
+        trace: std::path::PathBuf,
+
+        /// Output .cast file path
+        #[arg(long)]
+        output: std::path::PathBuf,
+
+        /// Idle compression ratio as threshold:target (e.g. 5:2 compresses gaps >5s to 2s)
+        #[arg(long, default_value = "5:2")]
+        compress_idle: String,
+
+        /// Target total recording duration in seconds (optional)
+        #[arg(long)]
+        target_duration: Option<f64>,
+
+        /// Terminal width for the recording
+        #[arg(long, default_value = "120")]
+        width: u16,
+
+        /// Terminal height for the recording
+        #[arg(long, default_value = "36")]
+        height: u16,
+    },
+
+    /// Launch an autopilot that drives the TUI for screencast recording
+    Autopilot {
+        /// Output .cast file path
+        #[arg(long, default_value = "screencast.cast")]
+        output: std::path::PathBuf,
+
+        /// Terminal width
+        #[arg(long, default_value = "80")]
+        cols: u16,
+
+        /// Terminal height
+        #[arg(long, default_value = "24")]
+        rows: u16,
+
+        /// Maximum recording duration in seconds
+        #[arg(long, default_value = "60")]
+        duration: f64,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServerCommands {
+    /// Initialize multi-user server setup (dry-run by default)
+    Init {
+        /// Actually apply changes (default is dry-run)
+        #[arg(long)]
+        apply: bool,
+
+        /// Unix group name (default: wg-<project>)
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Users to add to the project group (repeatable)
+        #[arg(long = "user")]
+        users: Vec<String>,
+
+        /// Generate ttyd configuration for web terminal access
+        #[arg(long)]
+        ttyd: bool,
+
+        /// Generate Caddy reverse-proxy configuration
+        #[arg(long)]
+        caddy: bool,
+
+        /// Port for ttyd web terminal (default: 7681)
+        #[arg(long, default_value = "7681")]
+        ttyd_port: u16,
+    },
+
+    /// Create or attach to a user's tmux session
+    Connect {
+        /// User name (defaults to $WG_USER)
+        #[arg(long)]
+        user: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MigrateCommands {
+    /// Rewrite legacy `.coordinator-N` task ids to `.chat-N`,
+    /// rename `coordinator-loop` tags to `chat-loop`, fix up
+    /// after-edges that referenced the old ids, and rewrite
+    /// `Coordinator: <name>` / `Coordinator N` titles.
+    ///
+    /// Safe to run multiple times — idempotent.
+    ChatRename {
+        /// Only report what would change, don't write.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Mark all legacy `.compact-N` and `.archive-N` tasks as Abandoned.
+    /// The graph-cycle compactor and archive-loop scaffolding were retired
+    /// — archival now runs natively in the dispatcher; chat memory is
+    /// handled by the chat agent's own memory subsystem.
+    ///
+    /// Safe to run multiple times — idempotent.
+    RetireCompactArchive {
+        /// Only report what would change, don't write.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Rewrite a stale `config.toml` to canonical form.
+    ///
+    /// Strips deprecated keys (`agent.executor`, retired compactor knobs,
+    /// `verify_autospawn_enabled`), renames legacy section/field names
+    /// (`[coordinator]` → `[dispatcher]`, `chat_agent` → `coordinator_agent`,
+    /// `max_chats` → `max_coordinators`), and fixes known stale model
+    /// strings (`openrouter:anthropic/claude-sonnet-4` → `…-sonnet-4-6`,
+    /// etc). Always writes a backup to `<path>.pre-migrate.<timestamp>`.
+    ///
+    /// Safe to run multiple times — idempotent.
+    Config {
+        /// Migrate the global config (~/.wg/config.toml).
+        #[arg(long, conflicts_with_all = ["local", "all"])]
+        global: bool,
+
+        /// Migrate the local project config (.wg/config.toml).
+        #[arg(long, conflicts_with_all = ["global", "all"])]
+        local: bool,
+
+        /// Migrate both global and local configs in one pass.
+        #[arg(long, conflicts_with_all = ["global", "local"])]
+        all: bool,
+
+        /// Print a unified diff of what would change but don't rewrite.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Subcommand variants for `wg config`.
+///
+/// At top level, `Commands::Config` keeps its legacy flag interface for
+/// backwards compatibility (`wg config --init`, `wg config --show`, ...).
+/// The subcommand form (`wg config init …`) takes priority when present.
+#[derive(Subcommand)]
+pub enum ConfigSubcommand {
+    /// Write a minimal canonical config file for a chosen route.
+    ///
+    /// The file contains only keys the design picked as 'always-set' for
+    /// the route — every other key falls through to the built-in default.
+    /// This is the modern replacement for `wg config --init`, which
+    /// continues to work for one release as a deprecated alias.
+    Init {
+        /// Target the global config (~/.wg/config.toml).
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+
+        /// Target the local project config (.wg/config.toml).
+        ///
+        /// Default when neither --global nor --local is given.
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+
+        /// Setup route. One of: `claude-cli` (default), `codex-cli`,
+        /// `openrouter`, `local`, `nex-custom`.
+        #[arg(long, default_value = "claude-cli")]
+        route: String,
+
+        /// Write only the absolute minimum (`[project]` for local,
+        /// just `agent.model` for global). Use this when you want
+        /// the file to exist but be as close to empty as possible.
+        #[arg(long)]
+        bare: bool,
+
+        /// Overwrite an existing file. Without --force, init refuses
+        /// to clobber a non-empty config and tells you to run `wg
+        /// migrate config` instead.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Read-only companion to `wg migrate config`. Walks the chosen
+    /// config file(s) and reports everything `wg migrate config`
+    /// would change — deprecated keys, legacy field names, stale
+    /// model strings — without rewriting anything.
+    ///
+    /// Use this as the "what's stale?" exploration step before
+    /// committing to a migration. With `--merged` (default) both
+    /// the global and local configs are linted in sequence; pass
+    /// `--global` or `--local` to scope to one file.
+    Lint {
+        /// Lint only the global config (~/.wg/config.toml).
+        #[arg(long, conflicts_with_all = ["local", "merged"])]
+        global: bool,
+
+        /// Lint only the local project config (.wg/config.toml).
+        #[arg(long, conflicts_with_all = ["global", "merged"])]
+        local: bool,
+
+        /// Lint both global and local configs (default when no flag is given).
+        #[arg(long, conflicts_with_all = ["global", "local"])]
+        merged: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ServiceCommands {
     /// Start the agent service daemon
     Start {
@@ -2408,9 +4431,9 @@ pub enum ServiceCommands {
         #[arg(long)]
         force: bool,
 
-        /// Disable the persistent coordinator agent (LLM chat session)
-        #[arg(long)]
-        no_coordinator_agent: bool,
+        /// Disable the persistent chat agent (LLM session); legacy alias: --no-coordinator-agent
+        #[arg(long, alias = "no-coordinator-agent")]
+        no_chat_agent: bool,
     },
 
     /// Stop the agent service daemon
@@ -2449,28 +4472,33 @@ pub enum ServiceCommands {
         model: Option<String>,
     },
 
-    /// Set the coordinator executor/model without touching other runtime settings.
+    /// Restart the service daemon (graceful stop then start)
     ///
-    /// This is a compatibility-oriented alias over the existing reload/override path.
-    #[command(name = "set-executor", alias = "switch")]
-    SetExecutor {
-        /// Coordinator ID. This fork currently supports only the primary coordinator.
-        id: u32,
-
-        /// Executor to use for spawned agents
-        #[arg(long)]
-        executor: Option<String>,
-
-        /// Model to use for spawned agents
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-    },
+    /// Stops the running daemon without killing agents, then starts a new one
+    /// with the same configuration. Running agents continue independently.
+    Restart,
 
     /// Pause the coordinator (running agents continue, no new spawns)
     Pause,
 
     /// Resume the coordinator
     Resume,
+
+    /// Freeze all agents (SIGSTOP) and pause the service
+    ///
+    /// Sends SIGSTOP to all running agent processes, stopping them immediately
+    /// while keeping all state in memory. Also pauses the coordinator so no new
+    /// agents are spawned. Use `wg service thaw` to resume.
+    ///
+    /// Note: TCP connections may time out if frozen too long (~30-60s).
+    /// Agents/executors should handle reconnection on resume.
+    Freeze,
+
+    /// Thaw frozen agents (SIGCONT) and resume the service
+    ///
+    /// Sends SIGCONT to all previously frozen agent processes, resuming them
+    /// exactly where they left off. Also resumes the coordinator.
+    Thaw,
 
     /// Generate a systemd user service file for the wg service daemon
     Install,
@@ -2489,6 +4517,72 @@ pub enum ServiceCommands {
         #[arg(long)]
         model: Option<String>,
     },
+
+    /// Create a new chat agent session (legacy alias: create-coordinator)
+    #[command(alias = "create-coordinator")]
+    CreateChat {
+        /// Optional name for the chat agent
+        #[arg(long)]
+        name: Option<String>,
+        /// Model for this chat agent (e.g., "openai:qwen3-coder-30b")
+        #[arg(long)]
+        model: Option<String>,
+        /// Executor for this chat agent (e.g., "native", "claude")
+        #[arg(long)]
+        executor: Option<String>,
+    },
+
+    /// Hot-swap a chat agent's executor and/or model.
+    /// SIGTERMs the live handler; the supervisor respawns it with
+    /// the new settings. Conversation history is preserved via
+    /// chat/<ref>/{inbox,outbox}.jsonl — the new handler sees
+    /// prior turns on startup.
+    #[command(name = "set-executor", alias = "switch")]
+    SetChatExecutor {
+        /// Chat agent ID (0, 1, ...)
+        id: u32,
+        /// New executor: `native`, `claude`, `codex`, ...
+        /// Omit to keep current executor (model-only change).
+        #[arg(long)]
+        executor: Option<String>,
+        /// New model spec (e.g., `codex:gpt-5-codex`). Omit to
+        /// keep current model (executor-only change).
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
+    /// Delete a chat agent session (legacy alias: delete-coordinator)
+    #[command(alias = "delete-coordinator")]
+    DeleteChat {
+        /// Chat agent ID to delete
+        id: u32,
+    },
+
+    /// Archive a chat agent session — mark as Done (legacy alias: archive-coordinator)
+    #[command(alias = "archive-coordinator")]
+    ArchiveChat {
+        /// Chat agent ID to archive
+        id: u32,
+    },
+
+    /// Stop a chat agent session — kill agent, reset to Open (legacy alias: stop-coordinator)
+    #[command(alias = "stop-coordinator")]
+    StopChat {
+        /// Chat agent ID to stop
+        id: u32,
+    },
+
+    /// Interrupt a chat agent's current generation — sends SIGINT, preserves context (legacy alias: interrupt-coordinator)
+    #[command(alias = "interrupt-coordinator")]
+    InterruptChat {
+        /// Chat agent ID to interrupt
+        id: u32,
+    },
+
+    /// Bulk-purge all chat agents: archive every chat-loop task, kill all live
+    /// chat handler processes, prevent respawn on daemon restart. Preserves
+    /// chat task nodes + history. Idempotent. Reversible via `wg chat new`.
+    PurgeChats,
 
     /// Run the daemon (internal, called by start)
     #[command(hide = true)]
@@ -2513,9 +4607,9 @@ pub enum ServiceCommands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Disable the persistent coordinator agent (LLM chat session)
-        #[arg(long)]
-        no_coordinator_agent: bool,
+        /// Disable the persistent chat agent (LLM session); legacy alias: --no-coordinator-agent
+        #[arg(long, alias = "no-coordinator-agent")]
+        no_chat_agent: bool,
     },
 }
 
@@ -2579,23 +4673,65 @@ pub enum TelegramCommands {
 
     /// Show Telegram configuration status
     Status,
+
+    /// Poll for replies from the configured Telegram chat
+    ///
+    /// Calls the Telegram Bot API getUpdates endpoint and filters for messages
+    /// from the configured chat_id. Returns the reply text or empty/timeout.
+    Poll {
+        /// Maximum time to wait for a reply in seconds (default: 120)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+
+        /// Target chat ID (uses configured chat_id if not specified)
+        #[arg(long)]
+        chat_id: Option<String>,
+    },
+
+    /// Send a message and wait for reply
+    ///
+    /// Sends the message and polls for reply at intervals. Times out after
+    /// configurable max wait. Includes task ID context in sent messages.
+    Ask {
+        /// Message to send and wait for reply to
+        message: String,
+
+        /// Maximum time to wait for a reply in seconds (default: 600)
+        #[arg(long, default_value = "600")]
+        timeout: u64,
+
+        /// Polling interval in seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        interval: u64,
+
+        /// Target chat ID (uses configured chat_id if not specified)
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Task ID to include in message context (optional)
+        #[arg(long)]
+        task_id: Option<String>,
+    },
 }
 
 /// Get the command name from a Commands enum variant for usage tracking
 pub fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Init { .. } => "init",
-        Commands::SpawnTask { .. } => "spawn-task",
-        Commands::ClaudeHandler { .. } => "claude-handler",
-        Commands::Reset { .. } => "reset",
-        Commands::Rescue { .. } => "rescue",
         Commands::Insert { .. } => "insert",
+        Commands::Rescue { .. } => "rescue",
+        Commands::Reset { .. } => "reset",
         Commands::Add { .. } => "add",
         Commands::Edit { .. } => "edit",
         Commands::Done { .. } => "done",
         Commands::Fail { .. } => "fail",
+        Commands::Incomplete { .. } => "incomplete",
         Commands::Abandon { .. } => "abandon",
         Commands::Retry { .. } => "retry",
+        Commands::Recover { .. } => "recover",
+        Commands::Requeue { .. } => "requeue",
+        Commands::Approve { .. } => "approve",
+        Commands::Reject { .. } => "reject",
         Commands::Claim { .. } => "claim",
         Commands::Unclaim { .. } => "unclaim",
         Commands::Pause { .. } => "pause",
@@ -2610,6 +4746,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Blocked { .. } => "blocked",
         Commands::WhyBlocked { .. } => "why-blocked",
         Commands::Check => "check",
+        Commands::Cleanup { .. } => "cleanup",
         Commands::Cycles => "cycles",
         Commands::List { .. } => "list",
         Commands::Viz { .. } => "viz",
@@ -2618,6 +4755,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Coordinate { .. } => "coordinate",
         Commands::Plan { .. } => "plan",
         Commands::Reschedule { .. } => "reschedule",
+        Commands::Reprioritize { .. } => "reprioritize",
         Commands::Impact { .. } => "impact",
         Commands::Structure => "structure",
         Commands::Bottlenecks => "bottlenecks",
@@ -2625,10 +4763,12 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Aging => "aging",
         Commands::Forecast => "forecast",
         Commands::Workload => "workload",
+        Commands::Worktree(_) => "worktree",
         Commands::Resources => "resources",
         Commands::CriticalPath => "critical-path",
         Commands::Analyze => "analyze",
         Commands::Archive { .. } => "archive",
+        Commands::Coordinator { .. } => "coordinator",
         Commands::Gc { .. } => "gc",
         Commands::Show { .. } => "show",
         Commands::Trace { .. } => "trace",
@@ -2636,7 +4776,9 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Replay { .. } => "replay",
         Commands::Runs { .. } => "runs",
         Commands::Log { .. } => "log",
+        Commands::Tokens { .. } => "tokens",
         Commands::Msg { .. } => "msg",
+        Commands::User { .. } => "user",
         Commands::Resource { .. } => "resource",
         Commands::Skill { .. } => "skill",
         Commands::Agency { .. } => "agency",
@@ -2657,22 +4799,47 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Evaluate { .. } => "evaluate",
         Commands::Watch { .. } => "watch",
         Commands::Evolve { .. } => "evolve",
+        Commands::Profile { .. } => "profile",
         Commands::Config { .. } => "config",
         Commands::DeadAgents { .. } => "dead-agents",
+        Commands::Sweep { .. } => "sweep",
+        Commands::Migrate { .. } => "migrate",
         Commands::Agents { .. } => "agents",
         Commands::Kill { .. } => "kill",
+        Commands::Reap { .. } => "reap",
+        Commands::Server { .. } => "server",
         Commands::Service { .. } => "service",
+        Commands::Screencast { .. } => "screencast",
         Commands::Tui { .. } => "tui",
-        Commands::Setup => "setup",
+        Commands::TuiDump { .. } => "tui-dump",
+        Commands::Setup { .. } => "setup",
         Commands::Quickstart => "quickstart",
-        Commands::Status => "status",
+        Commands::Status { .. } => "status",
+        Commands::Stats => "stats",
+        Commands::Metrics { .. } => "metrics",
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Notify { .. } => "notify",
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         Commands::Matrix { .. } => "matrix",
         Commands::Telegram { .. } => "telegram",
         Commands::Chat { .. } => "chat",
+        Commands::Endpoints { .. } | Commands::Endpoint { .. } => "endpoints",
+        Commands::Models { .. } => "models",
+        Commands::Model { .. } => "model",
+        Commands::Key { .. } => "key",
+        Commands::Nex { .. } => "nex",
+        Commands::TuiNex { .. } => "tui-nex",
+        Commands::TuiPty { .. } => "tui-pty",
+        Commands::SpawnTask { .. } => "spawn-task",
+        Commands::ClaudeHandler { .. } => "claude-handler",
+        Commands::CodexHandler { .. } => "codex-handler",
         Commands::NativeExec { .. } => "native-exec",
+        Commands::Which { .. } => "which",
+        Commands::Executors { .. } => "executors",
+        Commands::Spend { .. } => "spend",
+        Commands::Openrouter { .. } => "openrouter",
+        Commands::ApplyPlacement { .. } => "apply-placement",
+        Commands::Session { .. } => "session",
     }
 }
 
@@ -2699,10 +4866,12 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Aging
             | Commands::Forecast
             | Commands::Workload
+            | Commands::Worktree(_)
             | Commands::Resources
             | Commands::CriticalPath
             | Commands::Analyze
             | Commands::Archive { .. }
+            | Commands::Coordinator { .. }
             | Commands::Gc { .. }
             | Commands::Show { .. }
             | Commands::Trace { .. }
@@ -2710,7 +4879,9 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Replay { .. }
             | Commands::Runs { .. }
             | Commands::Log { .. }
+            | Commands::Tokens { .. }
             | Commands::Msg { .. }
+            | Commands::User { .. }
             | Commands::Resource { .. }
             | Commands::Skill { .. }
             | Commands::Agency { .. }
@@ -2728,18 +4899,31 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Evaluate { .. }
             | Commands::Watch { .. }
             | Commands::Evolve { .. }
+            | Commands::Profile { .. }
             | Commands::Config { .. }
             | Commands::DeadAgents { .. }
+            | Commands::Sweep { .. }
             | Commands::Agents { .. }
             | Commands::Kill { .. }
+            | Commands::Reap { .. }
             | Commands::Service { .. }
+            | Commands::Screencast { .. }
             | Commands::Cost { .. }
             | Commands::Check
+            | Commands::Cleanup { .. }
             | Commands::Cycles
             | Commands::Quickstart
-            | Commands::Status
+            | Commands::Status { .. }
+            | Commands::Stats
+            | Commands::Metrics { .. }
             | Commands::Chat { .. }
             | Commands::Telegram { .. }
+            | Commands::Endpoints { .. }
+            | Commands::Endpoint { .. }
+            | Commands::Models { .. }
+            | Commands::Model { .. }
+            | Commands::Key { .. }
+            | Commands::TuiDump { .. }
     ) || {
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
         {

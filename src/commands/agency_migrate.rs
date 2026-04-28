@@ -218,6 +218,8 @@ fn migrate_roles(
                     performance: old_role.performance.clone(),
                     lineage: old_role.lineage.clone(),
                     access_control: AccessControl::default(),
+                    domain_tags: vec![],
+                    metadata: HashMap::new(),
                     former_agents: vec![],
                     former_deployments: vec![],
                 };
@@ -250,6 +252,8 @@ fn migrate_roles(
                         lineage: old_role.lineage.clone(),
                         access_control: AccessControl::default(),
                         requires_human_oversight: true,
+                        domain_tags: vec![],
+                        metadata: HashMap::new(),
                         former_agents: vec![],
                         former_deployments: vec![],
                     };
@@ -280,6 +284,8 @@ fn migrate_roles(
                     lineage: old_role.lineage.clone(),
                     access_control: AccessControl::default(),
                     requires_human_oversight: true,
+                    domain_tags: vec![],
+                    metadata: HashMap::new(),
                     former_agents: vec![],
                     former_deployments: vec![],
                 };
@@ -311,6 +317,8 @@ fn migrate_roles(
                     performance: old_role.performance.clone(),
                     lineage: old_role.lineage.clone(),
                     access_control: AccessControl::default(),
+                    domain_tags: vec![],
+                    metadata: HashMap::new(),
                     former_agents: vec![],
                     former_deployments: vec![],
                 };
@@ -377,6 +385,8 @@ fn migrate_motivations(
                 performance: old_mot.performance.clone(),
                 lineage: old_mot.lineage.clone(),
                 access_control: AccessControl::default(),
+                domain_tags: vec![],
+                metadata: HashMap::new(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };

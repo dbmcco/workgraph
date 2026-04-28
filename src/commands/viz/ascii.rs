@@ -1,8 +1,9 @@
 use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
-use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, format_token_display};
-use workgraph::messages::MessageStats;
+use unicode_width::UnicodeWidthChar;
+use workgraph::graph::{PRIORITY_DEFAULT, Status, Task, TokenUsage, WorkGraph, format_token_display};
+use workgraph::messages::{CoordinatorMessageStatus, MessageStats};
 
 use super::{LayoutMode, VizOutput};
 
@@ -28,14 +29,14 @@ pub(crate) fn generate_ascii(
     graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     live_token_usage: &HashMap<String, TokenUsage>,
-    assign_token_usage: &HashMap<String, TokenUsage>,
-    eval_token_usage: &HashMap<String, TokenUsage>,
+    agency_token_usage: &HashMap<String, TokenUsage>,
     layout: LayoutMode,
     context_ids: &HashSet<String>,
     edge_color: &str,
     message_stats: &HashMap<String, MessageStats>,
+    coordinator_status: &HashMap<String, CoordinatorMessageStatus>,
 ) -> VizOutput {
     if tasks.is_empty() {
         return VizOutput {
@@ -46,6 +47,7 @@ pub(crate) fn generate_ascii(
             reverse_edges: HashMap::new(),
             char_edge_map: HashMap::new(),
             cycle_members: HashMap::new(),
+            annotation_map: annotations.clone(),
         };
     }
 
@@ -233,13 +235,15 @@ pub(crate) fn generate_ascii(
             return "";
         }
         match status {
-            Status::Done => "\x1b[32m",       // green
-            Status::InProgress => "\x1b[33m", // yellow
-            Status::Open => "\x1b[37m",       // white
-            Status::Blocked => "\x1b[90m",    // gray
-            Status::Failed => "\x1b[31m",     // red
-            Status::Abandoned => "\x1b[90m",  // gray
-            Status::Waiting => "\x1b[33m",    // yellow
+            Status::Done => "\x1b[32m",                                // green
+            Status::InProgress => "\x1b[33m",                          // yellow
+            Status::Open => "\x1b[37m",                                // white
+            Status::Blocked => "\x1b[90m",                             // gray
+            Status::Failed => "\x1b[31m",                              // red
+            Status::Abandoned => "\x1b[90m",                           // gray
+            Status::Waiting | Status::PendingValidation => "\x1b[33m", // yellow
+            Status::PendingEval => "\x1b[38;5;154m",                   // chartreuse
+            Status::Incomplete => "\x1b[38;5;208m",                    // orange
         }
     };
     let reset = if use_color { "\x1b[0m" } else { "" };
@@ -252,7 +256,9 @@ pub(crate) fn generate_ascii(
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
-            Status::Waiting => "waiting",
+            Status::Waiting | Status::PendingValidation => "waiting",
+            Status::PendingEval => "pending-eval",
+            Status::Incomplete => "incomplete",
         }
     };
 
@@ -275,6 +281,8 @@ pub(crate) fn generate_ascii(
     let format_node = |id: &str| -> String {
         let task = task_map.get(id);
         let is_context = context_ids.contains(id);
+        let is_chat_agent = task.is_some_and(|t| super::is_chat_agent_task(t));
+        let is_legacy_coord = task.is_some_and(|t| super::is_legacy_coordinator_task(t));
         let status = task.map(|t| status_label(&t.status)).unwrap_or("unknown");
 
         // Context nodes: dimmed, reduced detail (just ID and status, no tokens/phase/loop)
@@ -282,39 +290,56 @@ pub(crate) fn generate_ascii(
             return format!("{}{}  ({}){}", dim, id, status, reset);
         }
 
-        let color = task.map(|t| status_color(&t.status)).unwrap_or("");
-        let loop_info = task
-            .filter(|t| t.cycle_config.is_some() || t.loop_iteration > 0)
-            .map(|t| {
-                let (iter, max, forced) = if let Some(ref cfg) = t.cycle_config {
-                    (t.loop_iteration, cfg.max_iterations, cfg.no_converge)
-                } else {
-                    (t.loop_iteration, 0, false)
-                };
-                if max > 0 {
-                    let label = if forced { "forced" } else { "iter" };
-                    format!(" ↺ ({} {}/{})", label, iter, max)
-                } else {
-                    format!(" ↺ (iter {})", iter)
-                }
-            })
-            .unwrap_or_default();
+        // Chat agent tasks: cyan for current (.chat-N), dark gray for legacy (.coordinator-N)
+        let color = if is_chat_agent && use_color {
+            if is_legacy_coord {
+                "\x1b[90m" // dark gray — muted for legacy
+            } else {
+                "\x1b[36m" // cyan — accent for current
+            }
+        } else {
+            task.map(|t| status_color(&t.status)).unwrap_or("")
+        };
+        let loop_info = if is_chat_agent {
+            task.map(|t| format!(" [turn {}]", t.loop_iteration))
+                .unwrap_or_default()
+        } else {
+            task.filter(|t| t.cycle_config.is_some() || t.loop_iteration > 0)
+                .map(|t| {
+                    let (iter, max, forced) = if let Some(ref cfg) = t.cycle_config {
+                        (t.loop_iteration, cfg.max_iterations, cfg.no_converge)
+                    } else {
+                        (t.loop_iteration, 0, false)
+                    };
+                    if max > 0 {
+                        let label = if forced { "forced" } else { "iter" };
+                        format!(" ↺ ({} {}/{})", label, iter, max)
+                    } else {
+                        format!(" ↺ (iter {})", iter)
+                    }
+                })
+                .unwrap_or_default()
+        };
         let phase_info = annotations
             .get(id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         // Override phase annotation to true pink for agency phases (assigning/evaluating).
         // Uses ANSI 256-color 219 (light pink) to be visually distinct from magenta/purple
         // which is used for upstream edge tracing.
         let is_agency_phase = use_color
-            && annotations
-                .get(id)
-                .is_some_and(|a| a.contains("assigning") || a.contains("evaluating"));
+            && annotations.get(id).is_some_and(|a| {
+                a.text.contains("placing")
+                    || a.text.contains("assigning")
+                    || a.text.contains("evaluating")
+                    || a.text.contains("validating")
+                    || a.text.contains("verifying")
+            });
         let phase_info = if is_agency_phase {
             annotations
                 .get(id)
-                .map(|a| format!(" \x1b[38;5;219m{}\x1b[0m", a))
+                .map(|a| format!(" \x1b[38;5;219m{}\x1b[0m", a.text))
                 .unwrap_or_default()
         } else {
             phase_info
@@ -325,14 +350,18 @@ pub(crate) fn generate_ascii(
                 .as_ref()
                 .or_else(|| live_token_usage.get(&t.id))
         });
-        let atok_usage = assign_token_usage.get(id);
-        let etok_usage = eval_token_usage.get(id);
-        let status_with_tokens =
-            if let Some(tok_str) = format_token_display(usage, atok_usage, etok_usage) {
-                format!("{} · {}", status, tok_str)
-            } else {
-                status.to_string()
-            };
+        let agency_usage = agency_token_usage.get(id);
+        let priority_suffix = task
+            .filter(|t| t.priority != PRIORITY_DEFAULT)
+            .map(|t| format!(" · ⌁{}", t.priority))
+            .unwrap_or_default();
+        let status_with_tokens = if let Some(tok_str) = format_token_display(usage, agency_usage) {
+            format!("{} · {}{}", status, tok_str, priority_suffix)
+        } else if !priority_suffix.is_empty() {
+            format!("{}{}", status, priority_suffix)
+        } else {
+            status.to_string()
+        };
         let msg_indicator = message_stats
             .get(id)
             .map(|stats| {
@@ -342,25 +371,33 @@ pub(crate) fn generate_ascii(
                     format!("{}", stats.incoming)
                 };
                 if use_color {
-                    // Green: all messages responded to
-                    // Blue: all messages read (but not responded)
-                    // Yellow: has unread messages
-                    let color = if stats.responded {
-                        "\x1b[32m" // green
-                    } else if !stats.has_unread {
-                        "\x1b[34m" // blue
+                    if let Some(status) = coordinator_status.get(id) {
+                        format!(
+                            " {}{}{}\x1b[0m",
+                            status.ansi_prefix(),
+                            status.icon(),
+                            count_str
+                        )
                     } else {
-                        "\x1b[33m" // yellow
-                    };
-                    format!(" {}✉{}\x1b[0m", color, count_str)
+                        // No TUI cursor data: fall back to MessageStats-based coloring.
+                        let color = if stats.responded {
+                            "\x1b[32m" // green
+                        } else if !stats.has_unread {
+                            "\x1b[34m" // blue
+                        } else {
+                            "\x1b[33m" // yellow
+                        };
+                        format!(" {}✉{}\x1b[0m", color, count_str)
+                    }
                 } else {
-                    format!(" ✉{}", count_str)
+                    let icon = coordinator_status.get(id).map(|s| s.icon()).unwrap_or('✉');
+                    format!(" {}{}", icon, count_str)
                 }
             })
             .unwrap_or_default();
         // Delay indicator for tasks with not_before in the future
         let delay_hint = task
-            .filter(|t| t.status == Status::Open)
+            .filter(|t| matches!(t.status, Status::Open | Status::Incomplete))
             .and_then(|t| {
                 t.not_before.as_deref().and_then(|nb| {
                     nb.parse::<chrono::DateTime<Utc>>().ok().and_then(|ts| {
@@ -470,6 +507,17 @@ pub(crate) fn generate_ascii(
                 let Some(t) = task_map.get(id) else {
                     return false;
                 };
+                // Coordinator tasks are hot when they have a recent log entry
+                // (within 60s), indicating the coordinator is actively processing.
+                if t.tags.iter().any(|tag| tag == "coordinator-loop")
+                    && let Some(last_log) = t.log.last()
+                    && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last_log.timestamp)
+                {
+                    let age = now_utc.signed_duration_since(dt);
+                    if age.num_seconds() < 60 {
+                        return true;
+                    }
+                }
                 if t.status == Status::InProgress {
                     return true;
                 }
@@ -728,22 +776,13 @@ pub(crate) fn generate_ascii(
         build_tree_char_edge_map(&lines, &node_line_map);
 
     // Phase 2: Draw right-side arcs for all non-tree edges
-    let has_crossings = draw_back_edge_arcs(
+    let _has_crossings = draw_back_edge_arcs(
         &mut lines,
         &back_edge_arcs,
         use_color,
         arc_color,
         &mut char_edge_map,
     );
-
-    // Append legend when crossings are present
-    if has_crossings {
-        lines.push(String::new());
-        lines.push(format!(
-            "{}Legend: ┼ = crossing (vertical arc passes through horizontal){}",
-            dim, reset
-        ));
-    }
 
     // Build owned node_line_map and task_order (sorted by line number)
     let owned_node_line_map: HashMap<String, usize> = node_line_map
@@ -792,6 +831,7 @@ pub(crate) fn generate_ascii(
         reverse_edges,
         char_edge_map,
         cycle_members: cycle_members_map,
+        annotation_map: annotations.clone(),
     }
 }
 
@@ -1039,7 +1079,16 @@ fn draw_back_edge_arcs(
 
     for line_idx in self_loops {
         if line_idx < lines.len() {
-            lines[line_idx].push_str(" ↺");
+            // If the node label already contains ↺ (from cycle_config/loop_iteration
+            // in format_node), skip appending — avoids duplicate indicators.
+            // Otherwise, append ⟳ as a distinct self-loop indicator.
+            if !lines[line_idx].contains('↺') {
+                if use_color {
+                    lines[line_idx].push_str(&format!(" {}⟳{}", arc_color_code, "\x1b[0m"));
+                } else {
+                    lines[line_idx].push_str(" ⟳");
+                }
+            }
         }
     }
 
@@ -1173,13 +1222,6 @@ fn draw_back_edge_arcs(
     }
 
     for band in &bands {
-        let band_max_width = lines[band.top..=band.bottom.min(lines.len() - 1)]
-            .iter()
-            .map(|l| visible_len(l))
-            .max()
-            .unwrap_or(0);
-        let band_margin_start = band_max_width + 2;
-
         // Build node_set for this band's columns (using band-local indices)
         let node_set: HashSet<(usize, usize)> = band
             .col_indices
@@ -1193,9 +1235,26 @@ fn draw_back_edge_arcs(
             })
             .collect();
 
+        let mut col_x_positions: Vec<usize> = Vec::new();
         for (local_idx, &col_idx) in band.col_indices.iter().enumerate() {
             let column = &columns[col_idx];
-            let col_x = band_margin_start + local_idx * col_stride;
+
+            // Compute column position from the widest line in this column's
+            // span (not the entire band). This keeps arcs compact when they
+            // don't need to route around wider content on other lines.
+            let span_max_width = (column.top..=column.bottom.min(lines.len() - 1))
+                .map(|l| visible_len(&lines[l]))
+                .max()
+                .unwrap_or(0);
+            let mut col_x = span_max_width + 2;
+            // Ensure col_stride spacing from any earlier column that overlaps vertically
+            for (prev_local, &prev_ci) in band.col_indices[..local_idx].iter().enumerate() {
+                let prev_col = &columns[prev_ci];
+                if column.top <= prev_col.bottom && column.bottom >= prev_col.top {
+                    col_x = col_x.max(col_x_positions[prev_local] + col_stride);
+                }
+            }
+            col_x_positions.push(col_x);
 
             for line_idx in column.top..=column.bottom {
                 if line_idx >= lines.len() {
@@ -1437,10 +1496,62 @@ pub(crate) fn visible_len(s: &str) -> usize {
         } else if ch == '\x1b' {
             in_escape = true;
         } else {
-            len += 1;
+            len += ch.width().unwrap_or(0);
         }
     }
     len
+}
+
+/// Truncate a string to at most `max_visible` visible columns,
+/// preserving ANSI escape sequences and appending a reset code if needed.
+/// Returns the original string unchanged if it fits.
+pub(crate) fn truncate_to_width(s: &str, max_visible: usize) -> String {
+    if visible_len(s) <= max_visible {
+        return s.to_string();
+    }
+
+    let mut result = String::with_capacity(s.len());
+    let mut vis = 0;
+    let mut in_escape = false;
+    let mut has_active_style = false;
+
+    for ch in s.chars() {
+        if in_escape {
+            result.push(ch);
+            if ch == 'm' {
+                in_escape = false;
+                // Track whether we have active styling (non-reset)
+                // A reset is \x1b[0m; anything else is active
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            has_active_style = true;
+            result.push(ch);
+        } else {
+            let w = ch.width().unwrap_or(0);
+            if vis + w > max_visible {
+                break;
+            }
+            result.push(ch);
+            vis += w;
+        }
+    }
+
+    // Ensure we reset any active ANSI styling
+    if has_active_style {
+        result.push_str("\x1b[0m");
+    }
+
+    result
+}
+
+/// Truncate all lines in a multiline string to `max_columns` visible width.
+pub(crate) fn truncate_lines(text: &str, max_columns: u16) -> String {
+    let max = max_columns as usize;
+    text.lines()
+        .map(|line| truncate_to_width(line, max))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -1479,10 +1590,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(result.text, "(no tasks to display)");
@@ -1507,10 +1618,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1543,10 +1654,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1579,10 +1690,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1612,10 +1723,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1644,10 +1755,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1677,10 +1788,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1713,7 +1824,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -1728,10 +1839,10 @@ mod tests {
             &annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1739,7 +1850,7 @@ mod tests {
         assert!(!result.text.contains("assign-my-task"));
         // Parent task should appear with phase annotation
         assert!(result.text.contains("my-task"));
-        assert!(result.text.contains("[assigning]"));
+        assert!(result.text.contains("[⊞ assigning]"));
     }
 
     #[test]
@@ -1757,7 +1868,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(eval));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -1772,16 +1883,16 @@ mod tests {
             &annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
         assert!(!result.text.contains("evaluate-my-task"));
         assert!(result.text.contains("my-task"));
-        assert!(result.text.contains("[evaluating]"));
+        assert!(result.text.contains("[∴ evaluating]"));
     }
 
     #[test]
@@ -1811,10 +1922,10 @@ mod tests {
             &annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1822,7 +1933,7 @@ mod tests {
         assert!(result.text.contains("assign-my-task"));
         assert!(result.text.contains("my-task"));
         // No phase annotation when shown as literal nodes
-        assert!(!result.text.contains("[assigning]"));
+        assert!(!result.text.contains("[⊞ assigning]"));
     }
 
     #[test]
@@ -1856,10 +1967,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1904,10 +2015,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1953,10 +2064,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1984,10 +2095,10 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2000,6 +2111,160 @@ mod tests {
         assert!(
             !result.text.contains("↻"),
             "Should NOT contain ↻ on normal task:\n{}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("⟳"),
+            "Should NOT contain ⟳ on normal task:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_self_loop_without_cycle_config_shows_gapped_arrow() {
+        // A task with itself in its `after` list but no cycle_config should show ⟳
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("self-loop", "Self Loop Task");
+        task.after = vec!["self-loop".to_string()];
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(
+            result.text.contains("⟳"),
+            "Self-loop without cycle_config should show ⟳:\n{}",
+            result.text
+        );
+        // Should NOT have double loop symbols
+        assert!(
+            !result.text.contains("↺"),
+            "Self-loop without cycle_config should not show ↺:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_self_loop_with_cycle_config_no_duplicate() {
+        // A task with cycle_config AND a self-loop edge should NOT get double ↺
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("cycler", "Cycling task");
+        task.after = vec!["cycler".to_string()];
+        task.cycle_config = Some(CycleConfig {
+            max_iterations: 10,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        task.loop_iteration = 3;
+        graph.add_node(Node::Task(task));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Should show the cycle_config ↺ with iteration info
+        assert!(
+            result.text.contains("↺ (iter 3/10)"),
+            "Should show iteration info:\n{}",
+            result.text
+        );
+        // Count occurrences of ↺ — should be exactly one
+        let loop_count = result.text.matches('↺').count();
+        assert_eq!(
+            loop_count, 1,
+            "Self-loop with cycle_config should have exactly one ↺, got {}:\n{}",
+            loop_count, result.text
+        );
+        // Should NOT also show ⟳ since ↺ is already present
+        assert!(
+            !result.text.contains("⟳"),
+            "Should not show ⟳ when ↺ already present:\n{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_non_self_loop_cycle_unchanged() {
+        // A two-task cycle (A→B→A) should NOT show ⟳ — only standard back-edge arcs
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("task-a", "Task A");
+        a.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("task-b", "Task B");
+        b.after = vec!["task-a".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        a.after = vec!["task-b".to_string()]; // back-edge
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let no_annots = HashMap::new();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &no_annots,
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Multi-member cycle should NOT show ⟳
+        assert!(
+            !result.text.contains("⟳"),
+            "Multi-member cycle should not show ⟳:\n{}",
+            result.text
+        );
+        // Should have back-edge arcs (← and ┘)
+        assert!(
+            result.text.contains("←"),
+            "Multi-member cycle should have back-edge arcs:\n{}",
             result.text
         );
     }
@@ -2036,10 +2301,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2097,10 +2362,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2155,10 +2420,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Diamond,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("DIAMOND:\n{}", result.text);
@@ -2204,10 +2469,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("TREE:\n{}", result_tree.text);
@@ -2258,10 +2523,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Diamond,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("WIDE DIAMOND:\n{}", result.text);
@@ -2314,10 +2579,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2383,10 +2648,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2440,10 +2705,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2486,10 +2751,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2525,10 +2790,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         let tree_lines: Vec<&str> = result_tree.text.lines().collect();
@@ -2578,10 +2843,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2637,10 +2902,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2728,10 +2993,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
         eprintln!("CROSSING OUTPUT:\n{}", result.text);
@@ -2739,12 +3004,6 @@ mod tests {
         assert!(
             result.text.contains("┼"),
             "Should have crossing character ┼ where arcs cross\nOutput:\n{}",
-            result.text
-        );
-        // Should contain legend explaining the crossing symbol
-        assert!(
-            result.text.contains("Legend:"),
-            "Should have legend when crossings exist\nOutput:\n{}",
             result.text
         );
     }
@@ -2771,10 +3030,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2836,10 +3095,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -2889,10 +3148,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -3005,10 +3264,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         )
     }
@@ -3395,8 +3654,8 @@ mod tests {
         graph.add_node(Node::Task(assign));
 
         let tasks: Vec<_> = graph.tasks().collect();
-        let (filtered, annotations) =
-            super::super::filter_internal_tasks(&graph, tasks, &HashMap::new());
+        let empty: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
+        let (filtered, annotations) = super::super::filter_internal_tasks(&graph, tasks, &empty);
         let filtered_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
         let result = generate_ascii(
             &graph,
@@ -3405,17 +3664,17 @@ mod tests {
             &annotations,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::default(),
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
         let plain = strip_ansi_for_map(&result.text);
         assert!(
-            plain.contains("[assigning]"),
-            "Should contain [assigning]. Plain: {}",
+            plain.contains("[⊞ assigning]"),
+            "Should contain [⊞ assigning]. Plain: {}",
             plain
         );
         // Internal assign task should be filtered out.
@@ -3468,21 +3727,6 @@ mod tests {
             viz.task_order[viz.task_order.len() - 1],
             *viz.task_order.last().unwrap()
         ); // End → last
-    }
-
-    // --- Spec Rule 18: No legend in simple graphs ---
-
-    #[test]
-    fn spec_rule_18_no_legend_simple_graph() {
-        let graph = build_linear_chain();
-        let viz = render_graph(&graph);
-        let plain = strip_ansi_for_map(&viz.text);
-        for line in plain.lines() {
-            assert!(
-                !line.trim_start().starts_with("Legend:"),
-                "Simple chain should not have a Legend line"
-            );
-        }
     }
 
     // --- char_edge_map: linear chain completeness & no spurious edges ---
@@ -4302,10 +4546,10 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             LayoutMode::Tree,
             &HashSet::new(),
             "gray",
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -4367,5 +4611,672 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Smoke tests for TUI graph rendering (smoke-tui-graph-2)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Smoke test: 100+ node graph renders without panic and produces output.
+    #[test]
+    fn test_smoke_100_node_graph_no_panic() {
+        let mut graph = WorkGraph::new();
+        // Create a chain of 110 tasks: t0 → t1 → t2 → ... → t109
+        for i in 0..110 {
+            let mut t = make_task(&format!("t{}", i), &format!("Task {}", i));
+            t.created_at = Some(format!("2024-01-01T00:{:02}:00Z", i % 60));
+            if i > 0 {
+                t.after = vec![format!("t{}", i - 1)];
+            }
+            graph.add_node(Node::Task(t));
+        }
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // All 110 tasks should appear in the output
+        for i in 0..110 {
+            assert!(
+                result.text.contains(&format!("t{}", i)),
+                "Task t{} should appear in output",
+                i
+            );
+        }
+        // node_line_map should have entries for all tasks
+        assert_eq!(result.node_line_map.len(), 110);
+        assert_eq!(result.task_order.len(), 110);
+    }
+
+    /// Smoke test: 100+ node graph with fan-out and fan-in (diamond patterns)
+    /// renders without panic.
+    #[test]
+    fn test_smoke_100_node_complex_graph_no_panic() {
+        let mut graph = WorkGraph::new();
+
+        // Root node
+        let mut root = make_task("root", "Root");
+        root.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        graph.add_node(Node::Task(root));
+
+        // Fan-out: root → {fan-0..fan-49}
+        for i in 0..50 {
+            let mut t = make_task(&format!("fan-{}", i), &format!("Fan {}", i));
+            t.after = vec!["root".to_string()];
+            t.created_at = Some(format!("2024-01-01T00:{:02}:01Z", i % 60));
+            graph.add_node(Node::Task(t));
+        }
+
+        // Fan-in: {fan-0..fan-49} → join
+        let mut join = make_task("join", "Join");
+        join.after = (0..50).map(|i| format!("fan-{}", i)).collect();
+        join.created_at = Some("2024-01-01T00:50:00Z".to_string());
+        graph.add_node(Node::Task(join));
+
+        // Additional chains off the join
+        for i in 0..60 {
+            let mut t = make_task(&format!("chain-{}", i), &format!("Chain {}", i));
+            if i == 0 {
+                t.after = vec!["join".to_string()];
+            } else {
+                t.after = vec![format!("chain-{}", i - 1)];
+            }
+            t.created_at = Some(format!("2024-01-01T01:{:02}:00Z", i % 60));
+            graph.add_node(Node::Task(t));
+        }
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        assert!(
+            tasks.len() > 100,
+            "Should have > 100 tasks, got {}",
+            tasks.len()
+        );
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Should not be empty
+        assert!(!result.text.is_empty());
+        // Root, join, and chain tasks should all appear
+        assert!(result.text.contains("root"));
+        assert!(result.text.contains("join"));
+        assert!(result.text.contains("chain-59"));
+        // node_line_map should be populated
+        assert!(result.node_line_map.len() > 100);
+    }
+
+    /// Smoke test: arrowheads — tree connectors use → and arc dependents use ←.
+    #[test]
+    fn test_smoke_arrowheads_correct() {
+        // A → B → C, A → C (forward skip produces an arc)
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("aaa", "A");
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("bbb", "B");
+        b.after = vec!["aaa".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        let mut c = make_task("ccc", "C");
+        c.after = vec!["bbb".to_string(), "aaa".to_string()];
+        c.created_at = Some("2024-01-01T00:02:00Z".to_string());
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(c));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let lines: Vec<&str> = result.text.lines().collect();
+
+        // Tree connectors should have → (right arrow)
+        let has_tree_arrow = lines.iter().any(|l| l.contains("→"));
+        assert!(
+            has_tree_arrow,
+            "Tree connectors should have → arrowheads\nOutput:\n{}",
+            result.text
+        );
+
+        // Arc dependent (C with forward skip from A) should have ← (left arrow)
+        let c_line = lines
+            .iter()
+            .find(|l| l.contains("ccc"))
+            .expect("C should appear");
+        assert!(
+            c_line.contains("←"),
+            "Arc dependent C should have ← arrowhead\nOutput:\n{}",
+            result.text
+        );
+    }
+
+    /// Smoke test: cycle edges produce cycle_members map entries.
+    #[test]
+    fn test_smoke_cycle_members_populated() {
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+        let mut a = make_task("a", "A");
+        a.cycle_config = Some(CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut b = make_task("b", "B");
+        b.after = vec!["a".to_string()];
+        b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        // Create cycle: A → B → A
+        a.after = vec!["b".to_string()];
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // cycle_members should contain both a and b
+        assert!(
+            result.cycle_members.contains_key("a"),
+            "Cycle member 'a' should be in cycle_members map"
+        );
+        assert!(
+            result.cycle_members.contains_key("b"),
+            "Cycle member 'b' should be in cycle_members map"
+        );
+        // Each should reference the other
+        let a_members = &result.cycle_members["a"];
+        assert!(a_members.contains("a") && a_members.contains("b"));
+    }
+
+    /// Smoke test: dot-task toggle — show_internal changes viz_options,
+    /// which is instant (just a boolean flip, no animation delay).
+    /// We verify by generating with show_internal=false and show_internal=true
+    /// and confirming the internal tasks only appear in the latter.
+    #[test]
+    fn test_smoke_dot_task_toggle_instant() {
+        let mut graph = WorkGraph::new();
+        let mut t = make_task("my-task", "My Task");
+        t.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        graph.add_node(Node::Task(t));
+
+        let mut assign = make_internal_task(
+            ".assign-my-task",
+            "Assign my-task",
+            "assignment",
+            vec!["my-task"],
+        );
+        assign.status = Status::InProgress;
+        assign.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        graph.add_node(Node::Task(assign));
+
+        let all_tasks: Vec<_> = graph.tasks().collect();
+        let all_task_ids: HashSet<&str> = all_tasks.iter().map(|t| t.id.as_str()).collect();
+
+        // Without internal tasks (default)
+        let visible_tasks: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| !super::super::is_internal_task(t))
+            .copied()
+            .collect();
+        let visible_ids: HashSet<&str> = visible_tasks.iter().map(|t| t.id.as_str()).collect();
+
+        let result_hidden = generate_ascii(
+            &graph,
+            &visible_tasks,
+            &visible_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            !result_hidden.text.contains(".assign-my-task"),
+            "Internal tasks should be hidden when show_internal=false"
+        );
+        assert!(result_hidden.text.contains("my-task"));
+
+        // With internal tasks (show_internal=true)
+        let result_shown = generate_ascii(
+            &graph,
+            &all_tasks,
+            &all_task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            result_shown.text.contains(".assign-my-task"),
+            "Internal tasks should be visible when show_internal=true"
+        );
+    }
+
+    /// Smoke test: deeply nested graph (depth 50) with multiple branches renders correctly.
+    #[test]
+    fn test_smoke_deep_nested_graph_no_panic() {
+        let mut graph = WorkGraph::new();
+
+        // Create a tree with depth 50, branching factor 2 at first 5 levels
+        let mut task_count = 0;
+        let mut current_level = vec!["root".to_string()];
+        let mut root = make_task("root", "Root");
+        root.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        graph.add_node(Node::Task(root));
+        task_count += 1;
+
+        for depth in 0..50 {
+            let mut next_level = Vec::new();
+            let branch_factor = if depth < 5 { 2 } else { 1 };
+            for parent_id in &current_level {
+                for b in 0..branch_factor {
+                    let id = format!("d{}-{}-{}", depth, parent_id, b);
+                    let mut t = make_task(&id, &format!("D{} B{}", depth, b));
+                    t.after = vec![parent_id.clone()];
+                    t.created_at = Some(format!(
+                        "2024-01-01T{:02}:{:02}:00Z",
+                        (task_count / 60) % 24,
+                        task_count % 60
+                    ));
+                    graph.add_node(Node::Task(t));
+                    task_count += 1;
+                    next_level.push(id);
+                }
+            }
+            current_level = next_level;
+        }
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(!result.text.is_empty());
+        assert!(result.text.contains("root"));
+        // Should have rendered many tasks
+        assert!(
+            result.node_line_map.len() > 50,
+            "Should have > 50 tasks rendered, got {}",
+            result.node_line_map.len()
+        );
+    }
+
+    /// Smoke test: graph with multiple cycles renders without panic.
+    #[test]
+    fn test_smoke_multiple_cycles_no_panic() {
+        use workgraph::graph::CycleConfig;
+
+        let mut graph = WorkGraph::new();
+
+        // Cycle 1: c1a → c1b → c1a
+        let mut c1a = make_task("c1a", "Cycle1 A");
+        c1a.cycle_config = Some(CycleConfig {
+            max_iterations: 2,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        c1a.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut c1b = make_task("c1b", "Cycle1 B");
+        c1b.after = vec!["c1a".to_string()];
+        c1b.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        c1a.after = vec!["c1b".to_string()];
+
+        // Cycle 2: c2a → c2b → c2c → c2a
+        let mut c2a = make_task("c2a", "Cycle2 A");
+        c2a.cycle_config = Some(CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+        c2a.created_at = Some("2024-01-01T00:10:00Z".to_string());
+        let mut c2b = make_task("c2b", "Cycle2 B");
+        c2b.after = vec!["c2a".to_string()];
+        c2b.created_at = Some("2024-01-01T00:11:00Z".to_string());
+        let mut c2c = make_task("c2c", "Cycle2 C");
+        c2c.after = vec!["c2b".to_string()];
+        c2c.created_at = Some("2024-01-01T00:12:00Z".to_string());
+        c2a.after = vec!["c2c".to_string()];
+
+        // Isolated task (not in any cycle)
+        let mut solo = make_task("solo", "Solo");
+        solo.created_at = Some("2024-01-01T00:20:00Z".to_string());
+
+        graph.add_node(Node::Task(c1a));
+        graph.add_node(Node::Task(c1b));
+        graph.add_node(Node::Task(c2a));
+        graph.add_node(Node::Task(c2b));
+        graph.add_node(Node::Task(c2c));
+        graph.add_node(Node::Task(solo));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(!result.text.is_empty());
+        // Both cycles and the solo task should appear
+        assert!(result.text.contains("c1a"));
+        assert!(result.text.contains("c2c"));
+        assert!(result.text.contains("solo"));
+
+        // cycle_members should have entries for cycle 1 and cycle 2
+        assert!(result.cycle_members.contains_key("c1a"));
+        assert!(result.cycle_members.contains_key("c2a"));
+        // Solo should NOT be in any cycle
+        assert!(!result.cycle_members.contains_key("solo"));
+    }
+
+    /// Smoke test: char_edge_map is populated for graphs with arcs.
+    #[test]
+    fn test_smoke_char_edge_map_populated() {
+        // Diamond: root → {left, right} → join
+        let mut graph = WorkGraph::new();
+        let mut root = make_task("root", "Root");
+        root.created_at = Some("2024-01-01T00:00:00Z".to_string());
+        let mut left = make_task("left", "Left");
+        left.after = vec!["root".to_string()];
+        left.created_at = Some("2024-01-01T00:01:00Z".to_string());
+        let mut right = make_task("right", "Right");
+        right.after = vec!["root".to_string()];
+        right.created_at = Some("2024-01-01T00:02:00Z".to_string());
+        let mut join = make_task("join", "Join");
+        join.after = vec!["left".to_string(), "right".to_string()];
+        join.created_at = Some("2024-01-01T00:03:00Z".to_string());
+        graph.add_node(Node::Task(root));
+        graph.add_node(Node::Task(left));
+        graph.add_node(Node::Task(right));
+        graph.add_node(Node::Task(join));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // char_edge_map should have entries for the arc edges
+        assert!(
+            !result.char_edge_map.is_empty(),
+            "Diamond graph should produce char_edge_map entries for arcs\nOutput:\n{}",
+            result.text
+        );
+
+        // forward_edges and reverse_edges should be populated
+        assert!(
+            !result.forward_edges.is_empty(),
+            "forward_edges should be populated"
+        );
+        assert!(
+            !result.reverse_edges.is_empty(),
+            "reverse_edges should be populated"
+        );
+    }
+
+    use workgraph::graph::LogEntry;
+
+    #[test]
+    fn test_coordinator_with_recent_log_sorts_above_in_progress() {
+        let mut graph = WorkGraph::new();
+
+        // WCC 1: a regular in-progress task (hot by status)
+        let mut worker = make_task("worker-task", "Worker");
+        worker.status = Status::InProgress;
+        graph.add_node(Node::Task(worker));
+
+        // WCC 2: coordinator-loop task in Open status with a recent log entry
+        let mut coordinator = make_task("coordinator-0", "Coordinator");
+        coordinator.status = Status::Open;
+        coordinator.tags = vec!["coordinator-loop".to_string()];
+        coordinator.log.push(LogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            actor: None,
+            user: Some(workgraph::current_user()),
+            message: "Processing turn".to_string(),
+        });
+        graph.add_node(Node::Task(coordinator));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let coord_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "coordinator-0")
+            .expect("coordinator-0 should appear in task_order");
+        let worker_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "worker-task")
+            .expect("worker-task should appear in task_order");
+        assert!(
+            coord_pos < worker_pos,
+            "Coordinator with recent log (pos {}) should sort before in-progress WCC (pos {})\nOutput:\n{}",
+            coord_pos,
+            worker_pos,
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_coordinator_without_recent_log_does_not_override_in_progress() {
+        let mut graph = WorkGraph::new();
+
+        // WCC 1: a regular in-progress task (hot by status)
+        let mut worker = make_task("worker-task", "Worker");
+        worker.status = Status::InProgress;
+        graph.add_node(Node::Task(worker));
+
+        // WCC 2: coordinator-loop task with no log entries (stale)
+        let mut coordinator = make_task("coordinator-0", "Coordinator");
+        coordinator.status = Status::Open;
+        coordinator.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(coordinator));
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let coord_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "coordinator-0")
+            .expect("coordinator-0 should appear in task_order");
+        let worker_pos = result
+            .task_order
+            .iter()
+            .position(|id| id == "worker-task")
+            .expect("worker-task should appear in task_order");
+        assert!(
+            coord_pos > worker_pos,
+            "Stale coordinator (pos {}) should NOT sort before in-progress WCC (pos {})\nOutput:\n{}",
+            coord_pos,
+            worker_pos,
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_visible_len_plain() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len(""), 0);
+        assert_eq!(visible_len("├→ task"), 7);
+    }
+
+    #[test]
+    fn test_visible_len_with_ansi() {
+        assert_eq!(visible_len("\x1b[32mhello\x1b[0m"), 5);
+        assert_eq!(visible_len("\x1b[90m├→\x1b[0m test"), 7);
+        assert_eq!(visible_len("\x1b[38;5;219m[assigning]\x1b[0m"), 11);
+    }
+
+    #[test]
+    fn test_visible_len_unicode_width() {
+        // Box-drawing characters are single-width
+        assert_eq!(visible_len("─────"), 5);
+        assert_eq!(visible_len("│├└┐┘┤┼"), 7);
+        // Hourglass emoji is double-width
+        assert_eq!(visible_len("⏳"), 2);
+        assert_eq!(visible_len("ab⏳cd"), 6);
+    }
+
+    #[test]
+    fn test_truncate_to_width_no_truncation() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_to_width_plain() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_to_width_with_ansi() {
+        let s = "\x1b[32mhello\x1b[0m world";
+        let t = truncate_to_width(s, 5);
+        assert_eq!(visible_len(&t), 5);
+        assert!(t.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_truncate_to_width_unicode() {
+        // ⏳ is 2 columns wide — if only 1 column left, skip it
+        let s = "abc⏳";
+        assert_eq!(truncate_to_width(s, 4), "abc");
+        assert_eq!(truncate_to_width(s, 5), "abc⏳");
+        // With ANSI, the reset is appended
+        let s2 = "\x1b[33mabc⏳\x1b[0m";
+        let t = truncate_to_width(s2, 4);
+        assert_eq!(visible_len(&t), 3); // "abc" = 3, ⏳ doesn't fit
+        assert!(t.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_truncate_lines() {
+        let text = "short\nthis is a longer line\nok";
+        let result = truncate_lines(text, 10);
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines[0], "short");
+        assert_eq!(visible_len(lines[1]), 10);
+        assert_eq!(lines[2], "ok");
     }
 }

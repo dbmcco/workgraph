@@ -183,6 +183,9 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
                     Status::Failed => "failed",
                     Status::Abandoned => "abandoned",
                     Status::Waiting => "waiting",
+                    Status::PendingValidation => "pending-validation",
+                    Status::PendingEval => "pending-eval",
+                    Status::Incomplete => "incomplete",
                 };
 
                 let hours_str = task
@@ -376,7 +379,7 @@ fn find_cycles_dfs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workgraph::graph::{Estimate, Node, Task};
+    use workgraph::graph::{Estimate, Node, PRIORITY_DEFAULT, Task};
 
     fn make_task(id: &str, title: &str) -> Task {
         Task {
@@ -392,6 +395,7 @@ mod tests {
             title: title.to_string(),
             description: None,
             status: Status::Open,
+            priority: PRIORITY_DEFAULT,
             assigned: None,
             estimate: Some(Estimate {
                 hours: Some(hours),
@@ -406,6 +410,7 @@ mod tests {
             deliverables: vec![],
             artifacts: vec![],
             exec: None,
+            timeout: None,
             not_before: None,
             created_at: None,
             started_at: None,
@@ -416,9 +421,12 @@ mod tests {
             failure_reason: None,
             model: None,
             provider: None,
+            endpoint: None,
             verify: None,
+            verify_timeout: None,
             agent: None,
             loop_iteration: 0,
+            last_iteration_completed_at: None,
             cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
@@ -430,8 +438,38 @@ mod tests {
             session_id: None,
             wait_condition: None,
             checkpoint: None,
+            triage_count: 0,
             resurrection_count: 0,
             last_resurrected_at: None,
+            validation: None,
+            validation_commands: vec![],
+            validator_agent: None,
+            validator_model: None,
+            gate_attempts: 0,
+            test_required: false,
+            rejection_count: 0,
+            max_rejections: None,
+            verify_failures: 0,
+            rescue_count: 0,
+            spawn_failures: 0,
+            dispatch_count: 0,
+            tier: None,
+            no_tier_escalation: false,
+            tried_models: vec![],
+            superseded_by: vec![],
+            supersedes: None,
+            unplaced: false,
+            place_near: vec![],
+            place_before: vec![],
+            independent: false,
+            iteration_anchor: None,
+            iteration_config: None,
+            iteration_round: 0,
+            iteration_parent: None,
+            cron_schedule: None,
+            cron_enabled: false,
+            last_cron_fire: None,
+            next_cron_fire: None,
         }
     }
 

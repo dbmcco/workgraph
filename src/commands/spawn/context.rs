@@ -9,6 +9,16 @@ use std::path::Path;
 use workgraph::config::Config;
 use workgraph::context_scope::ContextScope;
 use workgraph::graph::{LogEntry, Status};
+use workgraph::notify::config::NotifyConfig;
+use workgraph::notify::telegram::TelegramConfig;
+
+/// Knowledge tiers for model-specific context injection
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum KnowledgeTier {
+    Essential, // 8KB for Minimax M2.7, 32K context models
+    Core,      // 16KB for DeepSeek V3, 64K context models
+    Full,      // 40KB for Llama 3.1+, 128K context models
+}
 
 /// Build context string from dependency artifacts and logs.
 ///
@@ -40,10 +50,25 @@ pub(crate) fn build_task_context(
                     ));
                 }
             }
+
+            // Include context for Failed dependencies (triage support)
+            if dep_task.status == Status::Failed {
+                let reason = dep_task.failure_reason.as_deref().unwrap_or("unknown");
+                context_parts.push(format!("From {} (FAILED): reason: {}", dep_id, reason));
+                if !dep_task.log.is_empty() {
+                    let logs: Vec<&LogEntry> = dep_task.log.iter().rev().take(3).collect();
+                    for entry in logs.iter().rev() {
+                        context_parts.push(format!(
+                            "From {} logs: {} {}",
+                            dep_id, entry.timestamp, entry.message
+                        ));
+                    }
+                }
+            }
         }
     }
 
-    // Inject cycle metadata if this task has cycle_config
+    // Inject cycle metadata and --converged hint
     if let Some(ref cc) = task.cycle_config {
         context_parts.push(format!(
             "Cycle status: iteration {} of this task (max {})",
@@ -51,6 +76,27 @@ pub(crate) fn build_task_context(
         ));
         if let Some(ref delay) = cc.delay {
             context_parts.push(format!("  cycle delay: {}", delay));
+        }
+        context_parts.push(format!(
+            "This task is part of a cycle (iter {}/{}). When your work is complete and the convergence condition is met, call `wg done {} --converged` to halt the cycle. Use plain `wg done {}` only if you want the cycle to continue.",
+            task.loop_iteration, cc.max_iterations, task.id, task.id
+        ));
+    } else {
+        // Non-header cycle member: check if this task belongs to a cycle via SCC analysis
+        let ca = graph.compute_cycle_analysis();
+        if let Some(&cycle_idx) = ca.task_to_cycle.get(&task.id) {
+            let cycle = &ca.cycles[cycle_idx];
+            let header_info = cycle.members.iter().find_map(|mid| {
+                graph.get_task(mid).and_then(|t| {
+                    t.cycle_config.as_ref().map(|cc| (t.loop_iteration, cc.max_iterations))
+                })
+            });
+            if let Some((iter, max)) = header_info {
+                context_parts.push(format!(
+                    "This task is part of a cycle (iter {}/{}). When your work is complete and the convergence condition is met, call `wg done {} --converged` to halt the cycle. Use plain `wg done {}` only if you want the cycle to continue.",
+                    iter, max, task.id, task.id
+                ));
+            }
         }
     }
 
@@ -141,7 +187,175 @@ pub(crate) fn build_scope_context(
     // Note: cursor advancement happens after spawn in execution.rs,
     // where the agent_id is known.
 
+    // Adaptive decomposition guidance toggle (from config)
+    ctx.decomp_guidance = config.guardrails.decomp_guidance;
+
+    // Task+ scope: Telegram escalation availability
+    if scope >= ContextScope::Task {
+        ctx.telegram_available = is_telegram_configured(workgraph_dir);
+    }
+
     ctx
+}
+
+/// Test file glob patterns recognized by the pre-spawn scanner.
+///
+/// Each entry is `(glob_pattern, verify_command_template)`.
+/// The template uses `{file}` as a placeholder for the matched path.
+const TEST_FILE_PATTERNS: &[(&str, &str)] = &[
+    // Python
+    ("test_*.py", "python -m pytest {file}"),
+    ("*_test.py", "python -m pytest {file}"),
+    // Rust (Rust tests are typically inline; but test binaries live in tests/)
+    ("test_*.rs", "cargo test"),
+    ("*_test.rs", "cargo test"),
+    // Go
+    ("*_test.go", "go test ./..."),
+    // JavaScript / TypeScript
+    ("*.test.js", "npx jest {file}"),
+    ("*.test.ts", "npx jest {file}"),
+    ("*.test.tsx", "npx jest {file}"),
+    ("*.test.mjs", "npx jest {file}"),
+    ("*.spec.js", "npx jest {file}"),
+    ("*.spec.ts", "npx jest {file}"),
+    ("*.spec.tsx", "npx jest {file}"),
+];
+
+/// Directories to scan for test files (relative to project root).
+const TEST_DIRS: &[&str] = &["tests", "test", "spec", "src/tests", "src/test"];
+
+/// Discover test files in the project directory before spawning an agent.
+///
+/// Returns a list of test file paths (relative to `project_root`).
+/// Scans both well-known test directories and the project root for
+/// files matching common test naming conventions.
+pub(crate) fn discover_test_files(project_root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+
+    // Collect directories to scan: known test dirs + project root
+    let mut scan_dirs: Vec<std::path::PathBuf> = TEST_DIRS
+        .iter()
+        .map(|d| project_root.join(d))
+        .filter(|d| d.is_dir())
+        .collect();
+    // Also scan project root itself (for top-level test files)
+    scan_dirs.push(project_root.to_path_buf());
+
+    for dir in &scan_dirs {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            for (pattern, _) in TEST_FILE_PATTERNS {
+                if glob_match(pattern, &file_name) {
+                    // Make path relative to project root
+                    if let Ok(rel) = path.strip_prefix(project_root) {
+                        let rel_str = rel.to_string_lossy().to_string();
+                        if !found.contains(&rel_str) {
+                            found.push(rel_str);
+                        }
+                    }
+                    break; // matched — no need to check other patterns
+                }
+            }
+        }
+    }
+
+    found.sort();
+    found
+}
+
+/// Build a verify command from discovered test files.
+///
+/// Selects the most appropriate test runner based on the file types found.
+/// Returns `None` if no test files were discovered.
+#[cfg(test)]
+pub(crate) fn build_auto_verify_command(test_files: &[String]) -> Option<String> {
+    if test_files.is_empty() {
+        return None;
+    }
+
+    // Detect project type from test file extensions
+    let has_rust = test_files.iter().any(|f| f.ends_with(".rs"));
+    let has_python = test_files.iter().any(|f| f.ends_with(".py"));
+    let has_go = test_files.iter().any(|f| f.ends_with(".go"));
+    let has_js = test_files.iter().any(|f| {
+        f.ends_with(".js") || f.ends_with(".ts") || f.ends_with(".tsx") || f.ends_with(".mjs")
+    });
+
+    // For mixed projects or Rust projects, use cargo test
+    if has_rust {
+        return Some("cargo test".to_string());
+    }
+    if has_go {
+        return Some("go test ./...".to_string());
+    }
+    if has_python {
+        // Use the specific test files for targeted verification
+        let py_files: Vec<&str> = test_files
+            .iter()
+            .filter(|f| f.ends_with(".py"))
+            .map(|s| s.as_str())
+            .collect();
+        return Some(format!("python -m pytest {}", py_files.join(" ")));
+    }
+    if has_js {
+        return Some("npx jest".to_string());
+    }
+
+    None
+}
+
+/// Format discovered test files for injection into the agent prompt.
+pub(crate) fn format_test_discovery_context(test_files: &[String]) -> String {
+    if test_files.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "## Discovered Test Files\n".to_string(),
+        "The following test files exist in this project and will be used to verify your work:"
+            .to_string(),
+    ];
+    for f in test_files {
+        lines.push(format!("- `{}`", f));
+    }
+    lines.push(String::new());
+    lines.push(
+        "**You MUST run these tests before calling `wg done`.** \
+         If any test fails, fix the issue before marking the task complete."
+            .to_string(),
+    );
+
+    lines.join("\n")
+}
+
+/// Simple glob matching for test file patterns.
+/// Supports only `*` (matches any sequence of non-dot chars within a segment)
+/// and leading/trailing wildcards.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        // *_test.py → name ends with "_test.py"
+        name.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        // test_* → name starts with "test_"
+        name.starts_with(prefix)
+    } else if pattern.contains('*') {
+        // e.g. *.test.js — split on first *
+        let (before, after) = pattern.split_once('*').unwrap();
+        name.starts_with(before) && name.ends_with(after)
+    } else {
+        name == pattern
+    }
 }
 
 /// Inline artifact content for graph+ scopes.
@@ -233,7 +447,9 @@ pub(crate) fn build_graph_summary(
             Status::Done => done += 1,
             Status::Failed => failed += 1,
             Status::Blocked => blocked += 1,
-            Status::Abandoned | Status::Waiting => {}
+            Status::Incomplete => open += 1,
+            Status::Abandoned | Status::Waiting | Status::PendingValidation => {}
+            Status::PendingEval => in_progress += 1,
         }
     }
     parts.push(format!(
@@ -376,6 +592,457 @@ fn read_claude_md(workgraph_dir: &Path) -> String {
     std::fs::read_to_string(&claude_md_path).unwrap_or_default()
 }
 
+/// Read the workgraph usage guide for non-Claude models.
+///
+/// Checks for a user-customizable guide at `.workgraph/wg-guide.md`. If that file
+/// exists, its content is used. Otherwise falls back to the built-in default guide
+/// embedded in the binary.
+#[allow(dead_code)]
+pub(crate) fn read_wg_guide(workgraph_dir: &Path) -> String {
+    let custom_path = workgraph_dir.join("wg-guide.md");
+    if custom_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&custom_path)
+        && !content.trim().is_empty()
+    {
+        return content;
+    }
+    workgraph::service::executor::DEFAULT_WG_GUIDE.to_string()
+}
+
+/// Classify model into knowledge tier based on context window and capabilities
+pub(crate) fn classify_model_tier(model: &str) -> KnowledgeTier {
+    let model_lower = model.to_lowercase();
+
+    // Tier 1: Essential (8KB) - 32K context window models
+    if model_lower.contains("minimax")
+        || model_lower.contains("qwen-2.5")
+        || model_lower.contains("qwen2.5")
+    {
+        KnowledgeTier::Essential
+    }
+    // Tier 2: Core (16KB) - 64K context window models
+    else if model_lower.contains("deepseek") || model_lower.contains("claude-haiku") {
+        KnowledgeTier::Core
+    }
+    // Tier 3: Full (40KB) - 128K+ context window models
+    else if model_lower.contains("llama-3.1")
+        || model_lower.contains("llama3.1")
+        || model_lower.contains("claude-sonnet")
+        || model_lower.contains("claude-opus")
+    {
+        KnowledgeTier::Full
+    }
+    // Conservative default for unknown models
+    else {
+        KnowledgeTier::Essential
+    }
+}
+
+/// Check if Telegram escalation is configured and available.
+///
+/// Looks for a valid Telegram configuration in either the project-local
+/// `.workgraph/notify.toml` or global `~/.config/workgraph/notify.toml`.
+/// Returns true if Telegram bot token and chat ID are configured.
+fn is_telegram_configured(workgraph_dir: &Path) -> bool {
+    // Try project-local config first
+    let project_config_path = workgraph_dir.join("notify.toml");
+    if let Ok(config) = NotifyConfig::load_from(&project_config_path)
+        && TelegramConfig::from_notify_config(&config).is_ok()
+    {
+        return true;
+    }
+
+    // Try global config
+    if let Some(global_config_path) = dirs::config_dir() {
+        let global_config_path = global_config_path.join("workgraph").join("notify.toml");
+        if let Ok(config) = NotifyConfig::load_from(&global_config_path)
+            && TelegramConfig::from_notify_config(&config).is_ok()
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Build tiered workgraph knowledge guide based on model capabilities
+pub(crate) fn build_tiered_guide(
+    workgraph_dir: &Path,
+    tier: KnowledgeTier,
+    _model: &str,
+) -> String {
+    // Check for custom override first
+    let custom_path = workgraph_dir.join("wg-guide.md");
+    if custom_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&custom_path)
+        && !content.trim().is_empty()
+    {
+        return content;
+    }
+
+    match tier {
+        KnowledgeTier::Essential => build_essential_guide(workgraph_dir),
+        KnowledgeTier::Core => build_core_guide(workgraph_dir),
+        KnowledgeTier::Full => build_full_guide(workgraph_dir),
+    }
+}
+
+/// Build essential guide (8KB) for Tier 1 models like Minimax M2.7
+fn build_essential_guide(workgraph_dir: &Path) -> String {
+    let claude_md = read_claude_md_content(workgraph_dir);
+    let memory_md = read_memory_md(workgraph_dir);
+
+    format!(
+        r#"# Workgraph Agent Guide (Essential)
+
+**You are an AI agent working on one task in a workgraph project.** Other agents work on other tasks concurrently.
+
+## CRITICAL: Attempt Work Before Failing or Decomposing
+
+**Core Principle:** Always attempt the work before concluding it cannot be done. Difficulty is not impossibility.
+
+**The Graph is Alive.** You are one node in a living system. Your job is not just to complete your task, but to grow the graph where it needs growing:
+
+- **Task too large?** → Fan out independent parts as parallel subtasks
+- **Prerequisite missing?** → `wg add "Prereq: ..." && wg add "$WG_TASK_ID" --after prereq-id`
+- **Follow-up needed?** → `wg add "Verify: ..." --after $WG_TASK_ID`
+- **Found a bug/missing doc?** → `wg add "Fix: ..." --after $WG_TASK_ID`
+
+**Anti-pattern — Explain-and-Bail:** DO NOT read a task, write a long explanation of why it's hard, and then fail. Attempt the work first. A failed attempt with partial progress is more valuable than an explanation of why you didn't try.
+
+## Decision Framework: When to Decompose vs Implement
+
+Fanout is a tool, not a default. Assess complexity first, then decide.
+
+### Stay inline (default) when:
+- Task is straightforward, even if it touches multiple files sequentially
+- Each step depends on the previous (sequential work doesn't parallelize)
+- Simple fixes, config changes, small features
+- Task seems hard but is single-scope — difficulty alone is NOT a reason to decompose
+
+### Fan out when:
+- 3+ independent files/components need changes that can genuinely run in parallel
+- You hit context pressure (re-reading files, losing track of changes)
+- Natural parallelism exists (e.g., 3 separate test files, N independent modules)
+- Discovered bugs or missing prereqs outside your scope
+
+### If you decompose:
+- Each subtask must list its file scope — NO two subtasks may modify the same file
+- Include "Implement directly — do not decompose further" in subtask descriptions
+- Always include an integrator task at join points
+
+## Decomposition Pattern Templates
+
+### Pipeline (Sequential Steps)
+When work must proceed in order:
+```bash
+wg add 'Step 1: Parse input' --after $WG_TASK_ID -d '## Validation\n- [ ] cargo test test_parse passes'
+wg add 'Step 2: Transform data' --after step-1-parse-input
+wg add 'Step 3: Write output' --after step-2-transform-data
+```
+
+### Fan-Out-Merge (Parallel + Integration)
+When work has independent parts that converge:
+```bash
+wg add 'Part A: Module X' --after $WG_TASK_ID
+wg add 'Part B: Module Y' --after $WG_TASK_ID
+wg add 'Part C: Module Z' --after $WG_TASK_ID
+wg add 'Integrate modules' --after part-a-module-x,part-b-module-y,part-c-module-z
+```
+
+**CRITICAL:** Always include an integrator task at join points. Never leave parallel work unmerged.
+
+### Iterate-Until-Pass (Refinement Loop)
+When work requires multiple passes:
+```bash
+wg add 'Refine implementation' --after $WG_TASK_ID --max-iterations 3 \
+  -d '## Validation\n- [ ] cargo test passes\n- [ ] performance benchmark target met'
+```
+Use `wg done --converged` when work has stabilized.
+
+## Task Description Requirements
+
+Every **code task** description MUST include:
+
+```markdown
+## Validation
+- [ ] Failing test written first: test_feature_x_<scenario>
+- [ ] Implementation makes test pass
+- [ ] cargo build + cargo test pass with no regressions
+- [ ] <any additional acceptance criteria>
+```
+
+The agency evaluator (auto_evaluate + FLIP) reads the `## Validation` section and scores the agent's output against it.
+
+## Core Commands
+
+| Command | Purpose |
+|---------|---------|
+| `wg add "title" -d "desc"` | Create a new task |
+| `wg add "title" --after task-id` | Create task with dependency |
+| `wg show <id>` | View task details, status, deps, logs |
+| `wg log <id> "msg"` | Log progress (recoverable breadcrumbs) |
+| `wg done <id>` | Mark your task complete |
+| `wg fail <id> --reason "..."` | Mark failed (only after genuine attempt) |
+| `wg list` | List all tasks |
+| `wg ready` | List tasks ready to be worked on |
+
+## Dependencies with `--after`
+
+Use `--after` to express that one task depends on another. This is CRITICAL for correct execution order.
+
+```bash
+# Task B depends on Task A completing first
+wg add "Task B" --after task-a
+
+# Task C depends on multiple predecessors
+wg add "Task C" --after task-a,task-b
+
+# Subtask that depends on current task
+wg add "Subtask" --after $WG_TASK_ID
+```
+
+**Always use `--after` when creating subtasks.** Without it, tasks form a flat unordered list.
+
+## Environment Variables
+- `$WG_TASK_ID` — the task you are working on
+- `$WG_AGENT_ID` — your unique agent identifier
+- `$WG_EXECUTOR_TYPE` — executor type (native, claude, etc.)
+- `$WG_MODEL` — the model you are running as
+- `$WG_TIER` — your quality tier (fast, standard, or premium)
+
+You are a **$WG_TIER-tier** agent. Tiers control capability and cost:
+- **fast**: lightweight tasks (triage, routing, compaction)
+- **standard**: typical implementation work
+- **premium**: complex reasoning, verification, evolution
+
+{}
+
+{}"#,
+        extract_project_instructions(&claude_md),
+        extract_project_context(&memory_md)
+    )
+}
+
+/// Build core guide (16KB) for Tier 2 models like DeepSeek V3
+fn build_core_guide(workgraph_dir: &Path) -> String {
+    // For now, build on essential guide with additional content
+    let essential = build_essential_guide(workgraph_dir);
+
+    format!(
+        "{}\n\n{}\n\n{}",
+        essential,
+        build_agent_communication_section(),
+        build_graph_patterns_section()
+    )
+}
+
+/// Build full guide (40KB) for Tier 3 models like Llama 3.1+
+fn build_full_guide(workgraph_dir: &Path) -> String {
+    // For now, build on core guide with additional content
+    let core = build_core_guide(workgraph_dir);
+
+    format!(
+        "{}\n\n{}\n\n{}",
+        core,
+        build_agency_system_section(),
+        build_advanced_patterns_section()
+    )
+}
+
+/// Read CLAUDE.md content from the project root
+fn read_claude_md_content(workgraph_dir: &Path) -> String {
+    let project_root = workgraph_dir.parent().unwrap_or(workgraph_dir);
+    let claude_md_path = project_root.join("CLAUDE.md");
+    std::fs::read_to_string(&claude_md_path).unwrap_or_default()
+}
+
+/// Read memory context from user's memory directory
+fn read_memory_md(workgraph_dir: &Path) -> String {
+    // Try to find the memory directory - it could be in ~/.claude/ or similar
+    let project_root = workgraph_dir.parent().unwrap_or(workgraph_dir);
+    if let Some(home_dir) = dirs::home_dir() {
+        let memory_path = home_dir
+            .join(".claude")
+            .join("projects")
+            .join("-home-erik-workgraph")
+            .join("memory")
+            .join("MEMORY.md");
+
+        if let Ok(content) = std::fs::read_to_string(&memory_path) {
+            return content;
+        }
+    }
+
+    // Fallback - try relative to workgraph dir
+    let memory_path = project_root
+        .join(".claude")
+        .join("memory")
+        .join("MEMORY.md");
+    std::fs::read_to_string(&memory_path).unwrap_or_default()
+}
+
+/// Extract critical project instructions from CLAUDE.md
+fn extract_project_instructions(claude_md: &str) -> String {
+    if claude_md.trim().is_empty() {
+        return String::new();
+    }
+
+    // Look for orchestrator role and critical patterns
+    let mut instructions = String::new();
+
+    if claude_md.contains("orchestrating agent") || claude_md.contains("Orchestrating agent") {
+        instructions.push_str("\n## Project Role (from CLAUDE.md)\n");
+        instructions.push_str("**You are a distributed agent** in a workgraph system. Other agents handle other tasks.\n");
+        instructions.push_str("**CRITICAL:** Use `wg add` for task creation. Do NOT attempt monolithic implementations.\n");
+    }
+
+    if claude_md.contains("CRITICAL") {
+        instructions.push_str("\n**Project-specific critical constraints apply** - see task description for details.\n");
+    }
+
+    instructions
+}
+
+/// Extract project context from memory
+fn extract_project_context(memory_md: &str) -> String {
+    if memory_md.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut context = String::new();
+    context.push_str("\n## Project Context\n");
+
+    // Extract key project facts - limit to essential info for Tier 1
+    if memory_md.contains("Workgraph") {
+        context.push_str(
+            "**Project:** Workgraph - task coordination graph for humans and AI agents\n",
+        );
+    }
+
+    if memory_md.contains("Rust") {
+        context
+            .push_str("**Language:** Rust (use `cargo build` and `cargo test` for validation)\n");
+    }
+
+    if memory_md.contains("graph.jsonl") {
+        context.push_str(
+            "**Core files:** `.workgraph/graph.jsonl` (task storage), `src/` (implementation)\n",
+        );
+    }
+
+    context
+}
+
+/// Build agent communication section for Tier 2+
+fn build_agent_communication_section() -> String {
+    r#"## Agent Communication
+
+### Messages
+Check for messages from other agents:
+```bash
+wg msg read $WG_TASK_ID --agent $WG_AGENT_ID
+wg msg send $WG_TASK_ID "Acknowledged - implementing your suggestion"
+```
+
+### Coordination Patterns
+- **Sequential handoff:** Use `--after` to pass work from one agent to another
+- **Parallel collaboration:** Multiple agents work on parts, integrator combines results
+- **Iterative refinement:** Use cycles with `--max-iterations` for review/improve loops"#
+        .to_string()
+}
+
+/// Build graph patterns section for Tier 2+
+fn build_graph_patterns_section() -> String {
+    r#"## Advanced Graph Patterns
+
+### Cycles and Loops
+Workgraph supports cycles for recurring work:
+```bash
+wg add 'Review code' --after implement-feature --max-iterations 3
+wg add 'Fix issues' --after review-code
+wg add 'Final check' --after fix-issues
+# Creates a review→fix→check cycle that can repeat
+```
+
+### Conditional Dependencies
+Use status-based dependencies:
+```bash
+wg add 'Deploy to staging' --after tests-pass
+wg add 'Deploy to prod' --after deploy-to-staging
+```
+
+### Complex Fan-Out
+For multi-dimensional work:
+```bash
+# By component
+wg add 'Frontend tests' --after $WG_TASK_ID
+wg add 'Backend tests' --after $WG_TASK_ID
+wg add 'Integration tests' --after $WG_TASK_ID
+
+# By environment
+wg add 'Test on Linux' --after $WG_TASK_ID
+wg add 'Test on MacOS' --after $WG_TASK_ID
+wg add 'Test on Windows' --after $WG_TASK_ID
+
+# Integration
+wg add 'Merge results' --after frontend-tests,backend-tests,integration-tests,test-on-linux,test-on-macos,test-on-windows
+```"#.to_string()
+}
+
+/// Build agency system section for Tier 3+
+fn build_agency_system_section() -> String {
+    r#"## Agency System (Advanced)
+
+### Roles and Specialization
+Tasks can be assigned to specialized agents:
+```bash
+wg agent create security-expert --role programmer --tradeoff careful
+wg assign security-audit security-expert
+```
+
+### Evaluation and Feedback
+Use FLIP scoring for quality assessment:
+```bash
+wg evaluate run $WG_TASK_ID --criteria "correctness,completeness,efficiency"
+```
+
+### Agent Evolution
+The system learns from performance:
+```bash
+wg evolve run  # Analyzes task outcomes and improves agent assignments
+```"#
+        .to_string()
+}
+
+/// Build advanced patterns section for Tier 3+
+fn build_advanced_patterns_section() -> String {
+    r#"## Advanced Coordination Patterns
+
+### Federation and Sharing
+Share successful patterns across projects:
+```bash
+wg func save "testing-pipeline" --pattern "test→review→merge"
+wg func apply "testing-pipeline" --input target=new-feature
+```
+
+### Complex Lifecycle Management
+Handle long-running processes:
+```bash
+wg add 'Monitor deployment' --after deploy --max-iterations 24 \
+  --cycle-delay 3600  # Check hourly
+```
+
+### Error Recovery Patterns
+Build resilient workflows:
+```bash
+wg add 'Backup strategy' --after main-task
+wg add 'Fallback implementation' --after main-task
+wg add 'Choose best result' --after backup-strategy,fallback-implementation
+```"#
+        .to_string()
+}
+
 /// Resolve the effective exec_mode for a task using the priority hierarchy:
 /// task.exec_mode > role.default_exec_mode > "full".
 pub(crate) fn resolve_task_exec_mode(
@@ -426,6 +1093,252 @@ pub(crate) fn resolve_task_scope(
     )
 }
 
+/// Build previous attempt context for retry injection.
+///
+/// Triggered when `task.retry_count > 0` (classic fail-and-retry) OR
+/// `task.rescue_count > 0` (in-place eval-fail iteration — see
+/// `commands::evaluate::check_eval_gate`). Looks for the most recent archived
+/// agent attempt and extracts context in priority order:
+/// 1. Checkpoint summary (auto or explicit)
+/// 2. Truncated output.log tail
+/// 3. Task log entries
+/// 4. Eval rationale alone (in-place rescue path: no archive yet, but the
+///    evaluator wrote notes that the next iteration must see)
+///
+/// Returns empty string if both counts are 0 or there is no recoverable context.
+pub(crate) fn build_previous_attempt_context(
+    task: &workgraph::graph::Task,
+    workgraph_dir: &Path,
+    max_tokens: u32,
+) -> String {
+    if (task.retry_count == 0 && task.rescue_count == 0) || max_tokens == 0 {
+        return String::new();
+    }
+
+    // Estimate max bytes (~4 chars per token as rough heuristic)
+    let max_bytes = (max_tokens as usize) * 4;
+
+    // In-place eval rescue may run before any archive directory exists for
+    // this task — the prior agent reported `wg done`, the eval ran and
+    // failed, and we transitioned PendingEval → Open without spawning a
+    // fresh archive. Surface eval rationale on its own when that's all we
+    // have (otherwise the early-return below would skip it).
+    let archive_base = workgraph_dir.join("log").join("agents").join(&task.id);
+    if !archive_base.exists() {
+        let eval_context = build_eval_rationale_context(&task.id, workgraph_dir);
+        if !eval_context.is_empty() {
+            return format_previous_context(
+                &chrono::Utc::now().to_rfc3339(),
+                &eval_context,
+                max_bytes,
+            );
+        }
+        return String::new();
+    }
+
+    // Get the most recent archive directory (sorted by timestamp)
+    let mut archives: Vec<_> = match fs::read_dir(&archive_base) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .collect(),
+        Err(_) => return String::new(),
+    };
+
+    if archives.is_empty() {
+        return String::new();
+    }
+
+    // Sort by directory name (ISO timestamps sort lexicographically)
+    archives.sort_by_key(|e| e.file_name());
+    let latest_archive = archives.last().unwrap().path();
+    let archive_timestamp = archives
+        .last()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .to_string();
+
+    // Collect evaluation rationale if available (max_bytes computed above
+    // before the archive-existence early-return).
+    let eval_context = build_eval_rationale_context(&task.id, workgraph_dir);
+
+    // Priority 1: Look for checkpoint summary from the previous agent
+    let checkpoint_context = find_checkpoint_for_task(task, workgraph_dir);
+    if let Some(summary) = checkpoint_context
+        && !summary.is_empty()
+    {
+        let combined = combine_with_eval_context(&summary, &eval_context);
+        return format_previous_context(&archive_timestamp, &combined, max_bytes);
+    }
+
+    // Priority 2: Truncated output.log from the archive
+    let output_path = latest_archive.join("output.txt");
+    if output_path.exists()
+        && let Ok(content) = fs::read_to_string(&output_path)
+        && !content.trim().is_empty()
+    {
+        let tail = truncate_to_tail(&content, max_bytes / 2);
+        let combined = combine_with_eval_context(&tail, &eval_context);
+        return format_previous_context(&archive_timestamp, &combined, max_bytes);
+    }
+
+    // Priority 3: Task log entries
+    if !task.log.is_empty() {
+        let log_context = task
+            .log
+            .iter()
+            .map(|entry| {
+                format!(
+                    "[{}] {}: {}",
+                    entry.timestamp,
+                    entry.actor.as_deref().unwrap_or("system"),
+                    entry.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !log_context.is_empty() {
+            let truncated = truncate_to_tail(&log_context, max_bytes / 2);
+            let combined = combine_with_eval_context(&truncated, &eval_context);
+            return format_previous_context(&archive_timestamp, &combined, max_bytes);
+        }
+    }
+
+    // Priority 4: Eval context alone (no archive output/checkpoint/logs, but eval exists)
+    if !eval_context.is_empty() {
+        return format_previous_context(&archive_timestamp, &eval_context, max_bytes);
+    }
+
+    String::new()
+}
+
+fn build_eval_rationale_context(task_id: &str, workgraph_dir: &Path) -> String {
+    let evals_dir = workgraph_dir.join("agency").join("evaluations");
+    if !evals_dir.exists() {
+        return String::new();
+    }
+
+    let prefix = format!("eval-{}-", task_id);
+    let mut eval_files: Vec<_> = match fs::read_dir(&evals_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+
+    if eval_files.is_empty() {
+        return String::new();
+    }
+
+    eval_files.sort_by_key(|e| e.file_name());
+    let latest_eval = eval_files.last().unwrap().path();
+
+    let content = match fs::read_to_string(&latest_eval) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let eval: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    let mut parts = Vec::new();
+    parts.push("### Evaluation Feedback from Previous Attempt".to_string());
+
+    if let Some(score) = eval.get("score").and_then(|v| v.as_f64()) {
+        parts.push(format!("Score: {:.2}", score));
+    }
+
+    if let Some(notes) = eval.get("notes").and_then(|v| v.as_str()) {
+        if !notes.is_empty() {
+            parts.push(format!("Evaluator notes: {}", notes));
+        }
+    }
+
+    if let Some(dims) = eval.get("dimensions").and_then(|v| v.as_object()) {
+        if !dims.is_empty() {
+            let dim_strs: Vec<String> = dims
+                .iter()
+                .map(|(k, v)| format!("  {}: {:.2}", k, v.as_f64().unwrap_or(0.0)))
+                .collect();
+            parts.push(format!("Dimension scores:\n{}", dim_strs.join("\n")));
+        }
+    }
+
+    if parts.len() <= 1 {
+        return String::new();
+    }
+
+    parts.join("\n")
+}
+
+fn combine_with_eval_context(base: &str, eval_context: &str) -> String {
+    if eval_context.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}\n\n{}", eval_context, base)
+    }
+}
+
+/// Find the most recent checkpoint for a task from any previously assigned agent.
+fn find_checkpoint_for_task(task: &workgraph::graph::Task, workgraph_dir: &Path) -> Option<String> {
+    let mut prev_agents: Vec<String> = Vec::new();
+    for entry in &task.log {
+        if let Some(ref actor) = entry.actor
+            && actor.starts_with("agent-")
+            && !prev_agents.contains(actor)
+        {
+            prev_agents.push(actor.clone());
+        }
+    }
+
+    for agent_id in prev_agents.iter().rev() {
+        if let Ok(Some(checkpoint)) =
+            crate::commands::checkpoint::load_latest(workgraph_dir, agent_id)
+        {
+            return Some(format!(
+                "Checkpoint ({:?}, agent {}): {}",
+                checkpoint.checkpoint_type, checkpoint.agent_id, checkpoint.summary
+            ));
+        }
+    }
+
+    None
+}
+
+/// Truncate a string to its last `max_bytes` bytes, preserving valid UTF-8 boundaries.
+fn truncate_to_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let start = s.len() - max_bytes;
+    let start = s.ceil_char_boundary(start);
+    format!("... (truncated)\n{}", &s[start..])
+}
+
+/// Format the previous attempt context section for injection into the prompt.
+fn format_previous_context(timestamp: &str, content: &str, max_bytes: usize) -> String {
+    let truncated_content = if content.len() > max_bytes {
+        truncate_to_tail(content, max_bytes)
+    } else {
+        content.to_string()
+    };
+
+    format!(
+        "## Previous Attempt Context\n\
+         This task was previously attempted (archived at {}).\n\
+         Here is context from that attempt:\n\n\
+         {}\n\n\
+         Continue from where they left off. Do not repeat work already done.",
+        timestamp, truncated_content
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,16 +1364,19 @@ mod tests {
             LogEntry {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 actor: Some("agent-1".to_string()),
+                user: Some(workgraph::current_user()),
                 message: "Started work".to_string(),
             },
             LogEntry {
                 timestamp: "2026-01-01T00:01:00Z".to_string(),
                 actor: Some("agent-1".to_string()),
+                user: Some(workgraph::current_user()),
                 message: "Found important result".to_string(),
             },
             LogEntry {
                 timestamp: "2026-01-01T00:02:00Z".to_string(),
                 actor: Some("agent-1".to_string()),
+                user: Some(workgraph::current_user()),
                 message: "Completed successfully".to_string(),
             },
         ];
@@ -913,5 +1829,529 @@ mod tests {
             ContextScope::Graph,
             "Config scope should be used as fallback"
         );
+    }
+
+    // =========================================================================
+    // Previous attempt context tests
+    // =========================================================================
+
+    #[test]
+    fn test_build_previous_attempt_context_zero_retry_count() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        let task = make_task("t1", "Test task");
+        // retry_count is 0 by default
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(result.is_empty(), "Should return empty for retry_count 0");
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_disabled_by_zero_tokens() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        let result = build_previous_attempt_context(&task, wg_dir, 0);
+        assert!(
+            result.is_empty(),
+            "Should return empty when max_tokens is 0"
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_no_archive() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.is_empty(),
+            "Should return empty when no archive exists"
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_with_archive_output() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        // Create an archive with output
+        let archive_dir = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-07T10:00:00Z");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("output.txt"),
+            "Agent started working on task t1\nCompleted analysis of requirements\nFound 3 issues",
+        )
+        .unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.contains("Previous Attempt Context"),
+            "Should contain header"
+        );
+        assert!(
+            result.contains("2026-03-07T10:00:00Z"),
+            "Should contain archive timestamp"
+        );
+        assert!(
+            result.contains("Found 3 issues"),
+            "Should contain output content"
+        );
+        assert!(
+            result.contains("Continue from where they left off"),
+            "Should contain continuation instruction"
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_empty_output_skipped() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        // Create an archive with empty output
+        let archive_dir = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-07T10:00:00Z");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("output.txt"), "   \n\n  ").unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        // No checkpoint, empty output, no logs => empty result
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.is_empty(),
+            "Should return empty for whitespace-only output"
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_uses_most_recent_archive() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        // Create two archives (older and newer)
+        let old_archive = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-06T10:00:00Z");
+        std::fs::create_dir_all(&old_archive).unwrap();
+        std::fs::write(old_archive.join("output.txt"), "Old agent output").unwrap();
+
+        let new_archive = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-07T10:00:00Z");
+        std::fs::create_dir_all(&new_archive).unwrap();
+        std::fs::write(new_archive.join("output.txt"), "New agent output").unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 2;
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.contains("New agent output"),
+            "Should use most recent archive"
+        );
+        assert!(
+            !result.contains("Old agent output"),
+            "Should not use old archive"
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_with_checkpoint() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        // Create an archive
+        let archive_dir = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-07T10:00:00Z");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("output.txt"), "Some output").unwrap();
+
+        // Create a checkpoint for the agent
+        let cp_dir = wg_dir.join("agents").join("agent-99").join("checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        let checkpoint = serde_json::json!({
+            "task_id": "t1",
+            "agent_id": "agent-99",
+            "timestamp": "2026-03-07T10:30:00Z",
+            "type": "auto",
+            "summary": "Completed web search, found 5 relevant docs",
+            "files_modified": [],
+            "artifacts_registered": []
+        });
+        std::fs::write(
+            cp_dir.join("2026-03-07T10-30-00.000Z.json"),
+            serde_json::to_string(&checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        task.log = vec![LogEntry {
+            timestamp: "2026-03-07T09:00:00Z".to_string(),
+            actor: Some("agent-99".to_string()),
+            user: Some(workgraph::current_user()),
+            message: "Spawned by coordinator".to_string(),
+        }];
+
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.contains("Completed web search"),
+            "Should use checkpoint summary. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_build_previous_attempt_context_falls_back_to_logs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wg_dir = temp_dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+
+        // Create an archive directory but NO output.txt
+        let archive_dir = wg_dir
+            .join("log")
+            .join("agents")
+            .join("t1")
+            .join("2026-03-07T10:00:00Z");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let mut task = make_task("t1", "Test task");
+        task.retry_count = 1;
+        task.log = vec![
+            LogEntry {
+                timestamp: "2026-03-07T09:00:00Z".to_string(),
+                actor: Some("agent-50".to_string()),
+                user: Some(workgraph::current_user()),
+                message: "Started research".to_string(),
+            },
+            LogEntry {
+                timestamp: "2026-03-07T09:30:00Z".to_string(),
+                actor: Some("agent-50".to_string()),
+                user: Some(workgraph::current_user()),
+                message: "Found key insight about X".to_string(),
+            },
+        ];
+
+        let result = build_previous_attempt_context(&task, wg_dir, 2000);
+        assert!(
+            result.contains("Found key insight"),
+            "Should fall back to task log entries. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_truncate_to_tail() {
+        let short = "Hello";
+        assert_eq!(truncate_to_tail(short, 100), "Hello");
+
+        let long = "A".repeat(1000);
+        let truncated = truncate_to_tail(&long, 500);
+        assert!(truncated.len() <= 520, "Should be roughly max_bytes");
+        assert!(truncated.starts_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_format_previous_context_structure() {
+        let result = format_previous_context("2026-03-07T10:00:00Z", "Some work done", 8000);
+        assert!(result.starts_with("## Previous Attempt Context"));
+        assert!(result.contains("2026-03-07T10:00:00Z"));
+        assert!(result.contains("Some work done"));
+        assert!(result.contains("Continue from where they left off"));
+    }
+
+    #[test]
+    fn test_build_task_context_includes_failed_dep_info() {
+        let mut graph = WorkGraph::new();
+
+        let mut dep_task = make_task("dep-a", "Build parser");
+        dep_task.status = Status::Failed;
+        dep_task.failure_reason = Some("cargo test test_parse_config failed".to_string());
+        dep_task.log = vec![LogEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            actor: Some("agent-1".to_string()),
+            user: None,
+            message: "Parser fails on nested keys".to_string(),
+        }];
+        graph.add_node(Node::Task(dep_task));
+
+        let mut task = make_task("task-b", "Use parser");
+        task.after = vec!["dep-a".to_string()];
+        graph.add_node(Node::Task(task.clone()));
+
+        let context = build_task_context(&graph, &task);
+        assert!(
+            context.contains("(FAILED)"),
+            "Context should mention FAILED status, got: {}",
+            context
+        );
+        assert!(
+            context.contains("cargo test test_parse_config failed"),
+            "Context should include failure reason, got: {}",
+            context
+        );
+        assert!(
+            context.contains("Parser fails on nested keys"),
+            "Context should include recent log, got: {}",
+            context
+        );
+    }
+
+    #[test]
+    fn test_build_task_context_failed_dep_unknown_reason() {
+        let mut graph = WorkGraph::new();
+
+        let mut dep_task = make_task("dep-x", "Failing task");
+        dep_task.status = Status::Failed;
+        // No failure_reason set
+        graph.add_node(Node::Task(dep_task));
+
+        let mut task = make_task("task-y", "Downstream");
+        task.after = vec!["dep-x".to_string()];
+        graph.add_node(Node::Task(task.clone()));
+
+        let context = build_task_context(&graph, &task);
+        assert!(context.contains("(FAILED)"));
+        assert!(context.contains("unknown"));
+    }
+
+    #[test]
+    fn test_build_task_context_mixed_done_and_failed_deps() {
+        let mut graph = WorkGraph::new();
+
+        let mut done_dep = make_task("dep-ok", "Done task");
+        done_dep.status = Status::Done;
+        done_dep.artifacts = vec!["result.txt".to_string()];
+        done_dep.log = vec![LogEntry {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            actor: None,
+            user: None,
+            message: "Completed".to_string(),
+        }];
+        graph.add_node(Node::Task(done_dep));
+
+        let mut failed_dep = make_task("dep-fail", "Failed task");
+        failed_dep.status = Status::Failed;
+        failed_dep.failure_reason = Some("OOM".to_string());
+        graph.add_node(Node::Task(failed_dep));
+
+        let mut task = make_task("task-z", "Multi-dep task");
+        task.after = vec!["dep-ok".to_string(), "dep-fail".to_string()];
+        graph.add_node(Node::Task(task.clone()));
+
+        let context = build_task_context(&graph, &task);
+        // Should have Done dep's artifacts
+        assert!(context.contains("result.txt"));
+        // Should have Done dep's log
+        assert!(context.contains("Completed"));
+        // Should have Failed dep's info
+        assert!(context.contains("(FAILED)"));
+        assert!(context.contains("OOM"));
+    }
+
+    #[test]
+    fn test_glob_match_prefix() {
+        assert!(glob_match("test_*.py", "test_foo.py"));
+        assert!(glob_match("test_*.py", "test_outputs.py"));
+        assert!(!glob_match("test_*.py", "foo_test.py"));
+        assert!(!glob_match("test_*.py", "test_foo.rs"));
+    }
+
+    #[test]
+    fn test_glob_match_suffix() {
+        assert!(glob_match("*_test.py", "foo_test.py"));
+        assert!(glob_match("*_test.go", "widget_test.go"));
+        assert!(!glob_match("*_test.py", "test_foo.py"));
+    }
+
+    #[test]
+    fn test_glob_match_middle() {
+        assert!(glob_match("*.test.js", "app.test.js"));
+        assert!(glob_match("*.test.ts", "widget.test.ts"));
+        assert!(glob_match("*.spec.js", "app.spec.js"));
+        assert!(!glob_match("*.test.js", "test_app.js"));
+    }
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("Makefile", "Makefile"));
+        assert!(!glob_match("Makefile", "makefile"));
+    }
+
+    #[test]
+    fn test_discover_test_files_finds_python_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create test directory with test files
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(tests_dir.join("test_outputs.py"), "# test").unwrap();
+        fs::write(tests_dir.join("widget_test.py"), "# test").unwrap();
+        fs::write(tests_dir.join("helper.py"), "# not a test").unwrap();
+
+        let found = discover_test_files(root);
+        assert!(found.contains(&"tests/test_outputs.py".to_string()));
+        assert!(found.contains(&"tests/widget_test.py".to_string()));
+        assert!(!found.iter().any(|f| f.contains("helper.py")));
+    }
+
+    #[test]
+    fn test_discover_test_files_finds_rust_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let tests_dir = root.join("tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(tests_dir.join("test_integration.rs"), "// test").unwrap();
+
+        let found = discover_test_files(root);
+        assert!(found.contains(&"tests/test_integration.rs".to_string()));
+    }
+
+    #[test]
+    fn test_discover_test_files_finds_js_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::write(root.join("app.test.js"), "// test").unwrap();
+        fs::write(root.join("widget.spec.ts"), "// test").unwrap();
+
+        let found = discover_test_files(root);
+        assert!(found.contains(&"app.test.js".to_string()));
+        assert!(found.contains(&"widget.spec.ts".to_string()));
+    }
+
+    #[test]
+    fn test_discover_test_files_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let found = discover_test_files(tmp.path());
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn test_build_auto_verify_command_rust() {
+        let files = vec!["tests/test_integration.rs".to_string()];
+        assert_eq!(
+            build_auto_verify_command(&files),
+            Some("cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_auto_verify_command_python() {
+        let files = vec![
+            "tests/test_outputs.py".to_string(),
+            "tests/test_parser.py".to_string(),
+        ];
+        assert_eq!(
+            build_auto_verify_command(&files),
+            Some("python -m pytest tests/test_outputs.py tests/test_parser.py".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_auto_verify_command_go() {
+        let files = vec!["widget_test.go".to_string()];
+        assert_eq!(
+            build_auto_verify_command(&files),
+            Some("go test ./...".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_auto_verify_command_js() {
+        let files = vec!["app.test.js".to_string()];
+        assert_eq!(
+            build_auto_verify_command(&files),
+            Some("npx jest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_auto_verify_command_empty() {
+        let files: Vec<String> = vec![];
+        assert_eq!(build_auto_verify_command(&files), None);
+    }
+
+    #[test]
+    fn test_format_test_discovery_context() {
+        let files = vec![
+            "tests/test_outputs.py".to_string(),
+            "tests/test_parser.py".to_string(),
+        ];
+        let ctx = format_test_discovery_context(&files);
+        assert!(ctx.contains("## Discovered Test Files"));
+        assert!(ctx.contains("tests/test_outputs.py"));
+        assert!(ctx.contains("tests/test_parser.py"));
+        assert!(ctx.contains("MUST run these tests"));
+    }
+
+    #[test]
+    fn test_format_test_discovery_context_empty() {
+        let ctx = format_test_discovery_context(&[]);
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_read_wg_guide_returns_default_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let guide = read_wg_guide(&wg_dir);
+        assert_eq!(guide, workgraph::service::executor::DEFAULT_WG_GUIDE);
+    }
+
+    #[test]
+    fn test_read_wg_guide_reads_custom_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        let custom_guide = "Custom wg guide for this project.";
+        std::fs::write(wg_dir.join("wg-guide.md"), custom_guide).unwrap();
+
+        let guide = read_wg_guide(&wg_dir);
+        assert_eq!(guide, custom_guide);
+    }
+
+    #[test]
+    fn test_read_wg_guide_falls_back_on_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".workgraph");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        std::fs::write(wg_dir.join("wg-guide.md"), "  \n  ").unwrap();
+
+        let guide = read_wg_guide(&wg_dir);
+        assert_eq!(guide, workgraph::service::executor::DEFAULT_WG_GUIDE);
     }
 }

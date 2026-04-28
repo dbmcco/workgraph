@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use workgraph::check::{OrphanRef, check_orphans};
-use workgraph::graph::Status;
+use workgraph::graph::{CycleAnalysis, Status};
 use workgraph::parser::load_graph;
 use workgraph::query::ready_tasks;
 use workgraph::service::{AgentRegistry, AgentStatus};
@@ -86,6 +86,29 @@ struct DanglingDep {
     relation: String,
 }
 
+/// A task with repeated verify failures
+#[derive(Debug, Clone, serde::Serialize)]
+struct VerifyFailingTask {
+    task_id: String,
+    failures: u32,
+    verify_command: String,
+}
+
+/// Active cycle timing info
+#[derive(Debug, Clone, serde::Serialize)]
+struct CycleTimingInfo {
+    task_id: String,
+    iteration: u32,
+    max_iterations: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_iteration_completed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_due: Option<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay: Option<String>,
+}
+
 /// Full status output
 #[derive(Debug, Clone, serde::Serialize)]
 struct StatusOutput {
@@ -93,13 +116,17 @@ struct StatusOutput {
     coordinator: CoordinatorInfo,
     agents: AgentSummaryInfo,
     tasks: TaskSummaryInfo,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cycles: Vec<CycleTimingInfo>,
     recent: Vec<RecentActivityEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     dangling_deps: Vec<DanglingDep>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verify_failing: Vec<VerifyFailingTask>,
 }
 
-pub fn run(dir: &Path, json: bool) -> Result<()> {
-    let status = gather_status(dir)?;
+pub fn run(dir: &Path, json: bool, show_all: bool) -> Result<()> {
+    let status = gather_status(dir, show_all)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -110,7 +137,7 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn gather_status(dir: &Path) -> Result<StatusOutput> {
+fn gather_status(dir: &Path, show_all: bool) -> Result<StatusOutput> {
     // 1. Service status
     let service = gather_service_status(dir)?;
 
@@ -121,21 +148,29 @@ fn gather_status(dir: &Path) -> Result<StatusOutput> {
     let agents = gather_agent_summary(dir);
 
     // 4. Task summary
-    let tasks = gather_task_summary(dir)?;
+    let tasks = gather_task_summary(dir, show_all)?;
 
-    // 5. Recent activity
-    let recent = gather_recent_activity(dir)?;
+    // 5. Cycle timing (legacy compaction widget removed alongside .compact-N retirement)
+    let cycles = gather_cycle_timing(dir);
 
-    // 6. Dangling dependencies
+    // 6. Recent activity
+    let recent = gather_recent_activity(dir, show_all)?;
+
+    // 7. Dangling dependencies
     let dangling_deps = gather_dangling_deps(dir);
+
+    // 8. Verify-failing tasks
+    let verify_failing = gather_verify_failing(dir, show_all);
 
     Ok(StatusOutput {
         service,
         coordinator,
         agents,
         tasks,
+        cycles,
         recent,
         dangling_deps,
+        verify_failing,
     })
 }
 
@@ -170,7 +205,7 @@ fn gather_service_status(dir: &Path) -> Result<ServiceStatusInfo> {
 
 fn gather_coordinator_info(dir: &Path) -> CoordinatorInfo {
     // Try to get runtime state from coordinator (if daemon is running)
-    if let Some(coord) = CoordinatorState::load(dir) {
+    if let Some(coord) = CoordinatorState::load_for(dir, 0) {
         return CoordinatorInfo {
             max_agents: coord.max_agents,
             executor: coord.executor,
@@ -224,7 +259,7 @@ fn gather_agent_summary(dir: &Path) -> AgentSummaryInfo {
     }
 }
 
-fn gather_task_summary(dir: &Path) -> Result<TaskSummaryInfo> {
+fn gather_task_summary(dir: &Path, show_all: bool) -> Result<TaskSummaryInfo> {
     let path = graph_path(dir);
     if !path.exists() {
         return Ok(TaskSummaryInfo {
@@ -244,6 +279,7 @@ fn gather_task_summary(dir: &Path) -> Result<TaskSummaryInfo> {
 
     let now = Utc::now();
     let mut in_progress = 0;
+    let mut ready_count = 0;
     let mut blocked = 0;
     let mut delayed = 0;
     let mut done_today = 0;
@@ -256,9 +292,14 @@ fn gather_task_summary(dir: &Path) -> Result<TaskSummaryInfo> {
         .and_utc();
 
     for task in graph.tasks() {
+        if !show_all && task.id.starts_with('.') {
+            continue;
+        }
         match task.status {
             Status::Open => {
-                if !ready_ids.contains(task.id.as_str()) {
+                if ready_ids.contains(task.id.as_str()) {
+                    ready_count += 1;
+                } else {
                     // Distinguish delayed (waiting on ready_after) from blocked (waiting on deps)
                     let has_future_ready_after = task.ready_after.as_ref().is_some_and(|ra| {
                         ra.parse::<DateTime<Utc>>()
@@ -302,15 +343,21 @@ fn gather_task_summary(dir: &Path) -> Result<TaskSummaryInfo> {
             Status::Blocked => {
                 blocked += 1;
             }
-            Status::Failed | Status::Abandoned | Status::Waiting => {
+            Status::Incomplete => {
+                // Retryable: counted like open work
+            }
+            Status::Failed | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
                 // Terminal/parked states, not counted in summary
+            }
+            Status::PendingEval => {
+                in_progress += 1;
             }
         }
     }
 
     Ok(TaskSummaryInfo {
         in_progress,
-        ready: ready_tasks_list.len(),
+        ready: ready_count,
         blocked,
         delayed,
         done_today,
@@ -318,7 +365,7 @@ fn gather_task_summary(dir: &Path) -> Result<TaskSummaryInfo> {
     })
 }
 
-fn gather_recent_activity(dir: &Path) -> Result<Vec<RecentActivityEntry>> {
+fn gather_recent_activity(dir: &Path, show_all: bool) -> Result<Vec<RecentActivityEntry>> {
     let path = graph_path(dir);
     if !path.exists() {
         return Ok(Vec::new());
@@ -329,6 +376,7 @@ fn gather_recent_activity(dir: &Path) -> Result<Vec<RecentActivityEntry>> {
     // Collect done tasks with completion timestamps
     let mut completed: Vec<_> = graph
         .tasks()
+        .filter(|t| show_all || !t.id.starts_with('.'))
         .filter(|t| t.status == Status::Done && t.completed_at.is_some())
         .filter_map(|t| {
             let completed_at = t.completed_at.as_ref()?;
@@ -365,6 +413,70 @@ fn gather_recent_activity(dir: &Path) -> Result<Vec<RecentActivityEntry>> {
     Ok(recent)
 }
 
+fn gather_cycle_timing(dir: &Path) -> Vec<CycleTimingInfo> {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    let graph = match load_graph(&path) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    let cycle_analysis = CycleAnalysis::from_graph(&graph);
+    let now = Utc::now();
+    let mut results = Vec::new();
+
+    for cycle in &cycle_analysis.cycles {
+        // Find the config owner (cycle header with CycleConfig)
+        let config_owner = cycle.members.iter().find_map(|mid| {
+            let task = graph.get_task(mid)?;
+            task.cycle_config.as_ref()?;
+            Some(task)
+        });
+
+        let Some(owner) = config_owner else {
+            continue;
+        };
+        let cc = owner.cycle_config.as_ref().unwrap();
+
+        // Use last_iteration_completed_at from the config owner, falling back to completed_at
+        let last_completed = owner
+            .last_iteration_completed_at
+            .as_ref()
+            .or(owner.completed_at.as_ref())
+            .cloned();
+
+        // Next due: use ready_after if present, otherwise compute from last_completed + delay
+        let next_due = owner.ready_after.clone().or_else(|| {
+            let delay_secs = cc
+                .delay
+                .as_ref()
+                .and_then(|d| workgraph::graph::parse_delay(d))?;
+            let last_ts = last_completed.as_ref()?.parse::<DateTime<Utc>>().ok()?;
+            let next = last_ts + chrono::Duration::seconds(delay_secs as i64);
+            if next > now {
+                Some(next.to_rfc3339())
+            } else {
+                None
+            }
+        });
+
+        results.push(CycleTimingInfo {
+            task_id: owner.id.clone(),
+            iteration: owner.loop_iteration + 1, // 1-based display
+            max_iterations: cc.max_iterations,
+            last_iteration_completed: last_completed,
+            next_due,
+            status: owner.status.to_string(),
+            delay: cc.delay.clone(),
+        });
+    }
+
+    results
+}
+
 fn gather_dangling_deps(dir: &Path) -> Vec<DanglingDep> {
     let path = super::graph_path(dir);
     if !path.exists() {
@@ -390,6 +502,31 @@ fn gather_dangling_deps(dir: &Path) -> Vec<DanglingDep> {
         .collect()
 }
 
+fn gather_verify_failing(dir: &Path, show_all: bool) -> Vec<VerifyFailingTask> {
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    let graph = match load_graph(&path) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    graph
+        .tasks()
+        .filter(|t| show_all || !t.id.starts_with('.'))
+        .filter(|t| {
+            t.verify_failures > 0 && t.status != Status::Failed && t.status != Status::Abandoned
+        })
+        .map(|t| VerifyFailingTask {
+            task_id: t.id.clone(),
+            failures: t.verify_failures,
+            verify_command: t.verify.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
 fn print_status(status: &StatusOutput) {
     // Line 1: Service status
     if status.service.running {
@@ -400,17 +537,17 @@ fn print_status(status: &StatusOutput) {
         println!("Service: stopped");
     }
 
-    // Line 2: Coordinator config
+    // Line 2: Dispatcher config
     let model_str = status.coordinator.model.as_deref().unwrap_or("default");
     println!(
-        "Coordinator: max={}, executor={}, model={}, poll={}s",
+        "Dispatcher: max={}, executor={}, model={}, poll={}s",
         status.coordinator.max_agents,
         status.coordinator.executor,
         model_str,
         status.coordinator.poll_interval
     );
 
-    // Line 3+: Agent summary
+    // Line 4+: Agent summary
     println!();
     if status.agents.alive == 0 && status.agents.dead == 0 {
         println!("Agents: none");
@@ -452,6 +589,75 @@ fn print_status(status: &StatusOutput) {
         status.tasks.done_total,
         status.tasks.done_today
     );
+
+    // Active cycles
+    if !status.cycles.is_empty() {
+        println!();
+        println!("Cycles:");
+        for cycle in &status.cycles {
+            let iter_str = if cycle.max_iterations == 0 {
+                format!("{}/unlimited", cycle.iteration)
+            } else {
+                format!("{}/{}", cycle.iteration, cycle.max_iterations)
+            };
+
+            let last_str = match cycle.last_iteration_completed {
+                Some(ref ts) => {
+                    if let Ok(parsed) = ts.parse::<DateTime<Utc>>() {
+                        let ago = Utc::now().signed_duration_since(parsed).num_seconds();
+                        format!("last: {} ago", workgraph::format_duration(ago, true))
+                    } else {
+                        "last: unknown".to_string()
+                    }
+                }
+                None => "last: never".to_string(),
+            };
+
+            let next_str = match cycle.next_due {
+                Some(ref ts) => {
+                    if let Ok(parsed) = ts.parse::<DateTime<Utc>>() {
+                        let now = Utc::now();
+                        if parsed > now {
+                            let secs = (parsed - now).num_seconds();
+                            format!("next: in {}", workgraph::format_duration(secs, true))
+                        } else {
+                            "next: ready".to_string()
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            };
+
+            let timing = if next_str.is_empty() {
+                last_str
+            } else {
+                format!("{}, {}", last_str, next_str)
+            };
+
+            println!(
+                "  {} [{}] iter {} — {}",
+                cycle.task_id, cycle.status, iter_str, timing
+            );
+        }
+    }
+
+    // Attention: verify-failing tasks
+    if !status.verify_failing.is_empty() {
+        println!();
+        println!(
+            "\x1b[33m⚠ Attention:\x1b[0m {} task(s) have verify failures:",
+            status.verify_failing.len()
+        );
+        for vf in &status.verify_failing {
+            let cmd_snippet: String = vf.verify_command.chars().take(60).collect();
+            println!(
+                "  VERIFY FAILING: \x1b[33m{}\x1b[0m — verify command has failed {} times: {}",
+                vf.task_id, vf.failures, cmd_snippet
+            );
+        }
+    }
 
     // Attention: dangling dependencies
     if !status.dangling_deps.is_empty() {
@@ -503,7 +709,7 @@ mod tests {
     #[test]
     fn test_gather_status_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let result = gather_status(temp_dir.path());
+        let result = gather_status(temp_dir.path(), true);
         assert!(result.is_ok());
         let status = result.unwrap();
         assert!(!status.service.running);
@@ -539,7 +745,7 @@ mod tests {
 
         save_graph(&graph, &path).unwrap();
 
-        let summary = gather_task_summary(temp_dir.path()).unwrap();
+        let summary = gather_task_summary(temp_dir.path(), true).unwrap();
         assert_eq!(summary.ready, 1);
         assert_eq!(summary.in_progress, 1);
         assert_eq!(summary.done_total, 1);
@@ -565,7 +771,7 @@ mod tests {
 
         save_graph(&graph, &path).unwrap();
 
-        let recent = gather_recent_activity(temp_dir.path()).unwrap();
+        let recent = gather_recent_activity(temp_dir.path(), true).unwrap();
         // Should return 5 most recent
         assert_eq!(recent.len(), 5);
         // Most recent should be first (t1 is most recent)
@@ -579,7 +785,7 @@ mod tests {
         let graph = WorkGraph::new();
         save_graph(&graph, &path).unwrap();
 
-        let summary = gather_task_summary(temp_dir.path()).unwrap();
+        let summary = gather_task_summary(temp_dir.path(), true).unwrap();
         assert_eq!(summary.ready, 0);
         assert_eq!(summary.in_progress, 0);
         assert_eq!(summary.done_total, 0);
@@ -609,7 +815,7 @@ mod tests {
 
         save_graph(&graph, &path).unwrap();
 
-        let summary = gather_task_summary(temp_dir.path()).unwrap();
+        let summary = gather_task_summary(temp_dir.path(), true).unwrap();
         assert_eq!(summary.delayed, 1);
         assert_eq!(summary.blocked, 1);
         assert_eq!(summary.ready, 1); // blocker is ready
@@ -622,7 +828,7 @@ mod tests {
         let graph = WorkGraph::new();
         save_graph(&graph, &path).unwrap();
 
-        let recent = gather_recent_activity(temp_dir.path()).unwrap();
+        let recent = gather_recent_activity(temp_dir.path(), true).unwrap();
         assert_eq!(recent.len(), 0);
     }
 
@@ -734,5 +940,124 @@ mod tests {
         // No graph file at all
         let dangling = gather_dangling_deps(temp_dir.path());
         assert!(dangling.is_empty());
+    }
+
+    #[test]
+    fn test_gather_verify_failing_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Normal task")));
+        save_graph(&graph, &path).unwrap();
+
+        let failing = gather_verify_failing(temp_dir.path(), true);
+        assert!(failing.is_empty());
+    }
+
+    #[test]
+    fn test_gather_verify_failing_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("t1", "Failing verify");
+        task.status = Status::InProgress;
+        task.verify = Some("cargo test".to_string());
+        task.verify_failures = 2;
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, &path).unwrap();
+
+        let failing = gather_verify_failing(temp_dir.path(), true);
+        assert_eq!(failing.len(), 1);
+        assert_eq!(failing[0].task_id, "t1");
+        assert_eq!(failing[0].failures, 2);
+        assert_eq!(failing[0].verify_command, "cargo test");
+    }
+
+    #[test]
+    fn test_gather_verify_failing_excludes_failed_tasks() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        // Task already failed (circuit breaker tripped) — should not appear
+        let mut task = make_task("t1", "Already failed");
+        task.status = Status::Failed;
+        task.verify_failures = 3;
+        task.verify = Some("cargo test".to_string());
+        graph.add_node(Node::Task(task));
+        save_graph(&graph, &path).unwrap();
+
+        let failing = gather_verify_failing(temp_dir.path(), true);
+        assert!(
+            failing.is_empty(),
+            "Failed tasks should not be listed as verify-failing"
+        );
+    }
+
+    #[test]
+    fn test_gather_verify_failing_no_graph() {
+        let temp_dir = TempDir::new().unwrap();
+        let failing = gather_verify_failing(temp_dir.path(), true);
+        assert!(failing.is_empty());
+    }
+
+    #[test]
+    fn test_gather_task_summary_hides_dot_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("real-task", "Real task")));
+
+        let mut dot_task = make_task(".assign-real-task", "Assign real task");
+        dot_task.status = Status::InProgress;
+        graph.add_node(Node::Task(dot_task));
+
+        let mut dot_done = make_task(".flip-real-task", "FLIP real task");
+        dot_done.status = Status::Done;
+        dot_done.completed_at = Some(Utc::now().to_rfc3339());
+        graph.add_node(Node::Task(dot_done));
+
+        save_graph(&graph, &path).unwrap();
+
+        // show_all=false: only count non-dot-prefixed tasks
+        let summary = gather_task_summary(temp_dir.path(), false).unwrap();
+        assert_eq!(summary.ready, 1);
+        assert_eq!(summary.in_progress, 0);
+        assert_eq!(summary.done_total, 0);
+
+        // show_all=true: count everything
+        let summary = gather_task_summary(temp_dir.path(), true).unwrap();
+        assert_eq!(summary.ready, 1);
+        assert_eq!(summary.in_progress, 1);
+        assert_eq!(summary.done_total, 1);
+    }
+
+    #[test]
+    fn test_gather_recent_activity_hides_dot_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut real_done = make_task("real-done", "Real done");
+        real_done.status = Status::Done;
+        real_done.completed_at = Some(Utc::now().to_rfc3339());
+        graph.add_node(Node::Task(real_done));
+
+        let mut dot_done = make_task(".flip-real-done", "FLIP done");
+        dot_done.status = Status::Done;
+        dot_done.completed_at = Some(Utc::now().to_rfc3339());
+        graph.add_node(Node::Task(dot_done));
+
+        save_graph(&graph, &path).unwrap();
+
+        let recent = gather_recent_activity(temp_dir.path(), false).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].task_id, "real-done");
+
+        let recent = gather_recent_activity(temp_dir.path(), true).unwrap();
+        assert_eq!(recent.len(), 2);
     }
 }

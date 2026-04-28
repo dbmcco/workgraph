@@ -4,9 +4,20 @@
 
 use anyhow::{Context, Result};
 
-use workgraph::agency::{self, short_hash, Agent};
+use workgraph::agency::{self, Agent, short_hash};
 use workgraph::config::{Config, DispatchRole};
-use workgraph::graph::{Task, TokenUsage};
+use workgraph::graph::{Task, TokenUsage, WorkGraph, is_system_task};
+
+/// Placement decision: dependency edges to add to the source task.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct PlacementDecision {
+    /// Task IDs to add as `after` dependencies (task runs after these).
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// Task IDs to add as `before` dependencies (task runs before these).
+    #[serde(default)]
+    pub before: Vec<String>,
+}
 
 /// Parsed assignment decision from the LLM.
 #[derive(Debug, serde::Deserialize)]
@@ -22,6 +33,14 @@ pub(crate) struct AssignmentVerdict {
     /// Brief explanation of the decision.
     #[serde(default)]
     pub reason: String,
+    /// When true, the assigner signals that no good match was found and the
+    /// primitive store should be expanded via the creator agent.
+    #[serde(default)]
+    pub create_needed: bool,
+    /// Optional placement decision: dependency edges to add to the source task.
+    /// When null or absent, no placement changes are made.
+    #[serde(default)]
+    pub placement: Option<PlacementDecision>,
 }
 
 /// Pre-gathered agent catalog entry for prompt rendering.
@@ -51,12 +70,7 @@ fn build_agent_catalog(
             let tradeoff = agency::find_tradeoff_by_prefix(tradeoffs_dir, &a.tradeoff_id).ok();
             let role_skills = role
                 .as_ref()
-                .map(|r| {
-                    r.component_ids
-                        .iter()
-                        .map(|c| c.clone())
-                        .collect::<Vec<_>>()
-                })
+                .map(|r| r.component_ids.to_vec())
                 .unwrap_or_default();
             AgentEntry {
                 hash: short_hash(&a.id).to_string(),
@@ -67,7 +81,11 @@ fn build_agent_catalog(
                 avg_score: a.performance.avg_score,
                 task_count: a.performance.task_count,
                 capabilities: a.capabilities.clone(),
-                _staleness_flags: a.staleness_flags.iter().map(|f| format!("{:?}", f)).collect(),
+                _staleness_flags: a
+                    .staleness_flags
+                    .iter()
+                    .map(|f| format!("{:?}", f))
+                    .collect(),
             }
         })
         .collect()
@@ -106,11 +124,17 @@ fn render_agent_catalog(entries: &[AgentEntry]) -> String {
 }
 
 /// Build the full assignment prompt for the lightweight LLM call.
+///
+/// When `active_tasks_context` is non-empty, the prompt includes an "Active Tasks"
+/// section and placement instructions, asking the LLM to also decide dependency
+/// edges for the source task.
 pub(crate) fn build_assignment_prompt(
     task: &Task,
     mode_context: &str,
     agent_catalog: &str,
     underspec_warning: Option<&str>,
+    active_tasks_context: &str,
+    executor_type: &str,
 ) -> String {
     let task_id = &task.id;
     let task_title = &task.title;
@@ -138,6 +162,57 @@ pub(crate) fn build_assignment_prompt(
 
     let underspec = underspec_warning.unwrap_or("");
 
+    let placement_section = if active_tasks_context.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"
+## Active Tasks (for placement)
+
+{active_tasks_context}
+## Placement Instructions
+
+In addition to agent assignment, decide whether this task needs additional dependency edges.
+Look at the task's existing dependencies and the active tasks above. If the task should
+run after or before any active tasks (beyond its current deps), include a `placement` field.
+Only add edges that are clearly needed — do NOT add edges to system tasks (.assign-*, .flip-*, .evaluate-*).
+If no placement changes are needed, set `placement` to null.
+"#
+        )
+    };
+
+    let placement_json = if active_tasks_context.is_empty() {
+        String::new()
+    } else {
+        r#",
+  "placement": null | {"after": ["task-id-1"], "before": ["task-id-2"]}"#
+            .to_string()
+    };
+
+    let valid_modes = workgraph::config::ExecMode::valid_for_executor(executor_type);
+    let valid_modes_str: Vec<String> = valid_modes.iter().map(|m| m.to_string()).collect();
+    let valid_modes_list = valid_modes_str.join(", ");
+    let valid_modes_pipe = valid_modes_str.join("|");
+
+    let exec_mode_descriptions: String = valid_modes
+        .iter()
+        .map(|m| match m {
+            workgraph::config::ExecMode::Shell => {
+                "- **shell**: Task has exec command, no LLM needed."
+            }
+            workgraph::config::ExecMode::Bare => {
+                "- **bare**: Pure reasoning, synthesis, no file access needed."
+            }
+            workgraph::config::ExecMode::Light => {
+                "- **light**: Read-only file access (research, review, exploration)."
+            }
+            workgraph::config::ExecMode::Full => {
+                "- **full**: Modifies files (implementation, debugging, refactoring, test writing). Default if unsure."
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     format!(
         r#"You are an agent assignment system. Given a task and available agents, select the best agent and configure execution parameters.
 
@@ -161,35 +236,46 @@ pub(crate) fn build_assignment_prompt(
 4. **Capabilities**: Match agent capabilities to task tags/skills.
 5. **Cold start**: When agents have no scores, match on role and spread work across untested agents.
 
+## System Configuration
+- **Available executor:** {executor_type}
+- **Valid exec_modes:** {valid_modes_list}
+- Do NOT use exec_modes outside this list. They will cause spawn failures.
+
 ## exec_mode Selection
-- **shell**: Task has exec command, no LLM needed.
-- **bare**: Pure reasoning, synthesis, no file access needed.
-- **light**: Read-only file access (research, review, exploration).
-- **full**: Modifies files (implementation, debugging, refactoring, test writing). Default if unsure.
+{exec_mode_descriptions}
 
 ## context_scope Selection
 - **clean**: Self-contained computation/writing, no workgraph interaction needed.
 - **task**: Standard implementation (default if unsure).
 - **graph**: Integration tasks spanning multiple components (3+ dependencies).
 - **full**: Meta-tasks about workgraph itself.
-
+{placement_section}
 ## Response
 
 Respond with ONLY a JSON object (no markdown fences, no commentary):
 
 {{
   "agent_hash": "<hash prefix of selected agent>",
-  "exec_mode": "<shell|bare|light|full>",
+  "exec_mode": "<{valid_modes_pipe}>",
   "context_scope": "<clean|task|graph|full>",
-  "reason": "<one-sentence explanation>"
+  "reason": "<one-sentence explanation>",
+  "create_needed": false{placement_json}
 }}
 
-If no suitable agent exists, still pick the closest match — never fail to assign."#
+Always pick the closest match — never fail to assign. If no agent is a good fit
+(the task requires capabilities not represented by any existing agent), still assign
+the best available but set `"create_needed": true` to signal that new agent types
+should be created for future tasks like this."#
     )
 }
 
 /// Run the lightweight assignment LLM call and parse the verdict.
 /// Returns the assignment verdict and any token usage from the LLM call.
+///
+/// When `active_tasks_context` is non-empty, the prompt includes placement
+/// instructions and the verdict may contain a `placement` field with dependency
+/// edges to apply to the source task.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_lightweight_assignment(
     config: &Config,
     task: &Task,
@@ -198,13 +284,22 @@ pub(crate) fn run_lightweight_assignment(
     tradeoffs_dir: &std::path::Path,
     mode_context: &str,
     underspec_warning: Option<&str>,
+    active_tasks_context: &str,
 ) -> Result<(AssignmentVerdict, Option<TokenUsage>)> {
     let timeout_secs = config.agency.triage_timeout.unwrap_or(30);
 
     let catalog_entries = build_agent_catalog(agents, roles_dir, tradeoffs_dir);
     let catalog_text = render_agent_catalog(&catalog_entries);
 
-    let prompt = build_assignment_prompt(task, mode_context, &catalog_text, underspec_warning);
+    let executor_type = config.coordinator.effective_executor();
+    let prompt = build_assignment_prompt(
+        task,
+        mode_context,
+        &catalog_text,
+        underspec_warning,
+        active_tasks_context,
+        &executor_type,
+    );
 
     let result = workgraph::service::llm::run_lightweight_llm_call(
         config,
@@ -217,24 +312,21 @@ pub(crate) fn run_lightweight_assignment(
     let token_usage = result.token_usage;
 
     // Parse JSON verdict from output (reuse triage JSON extraction logic)
-    let json_str = extract_assignment_json(&result.text)
-        .ok_or_else(|| anyhow::anyhow!("No valid JSON found in assignment output: {}", &result.text[..result.text.len().min(200)]))?;
+    let json_str = extract_assignment_json(&result.text).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No valid JSON found in assignment output: {}",
+            &result.text[..result.text.len().min(200)]
+        )
+    })?;
 
-    let verdict: AssignmentVerdict = serde_json::from_str(&json_str)
+    let mut verdict: AssignmentVerdict = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse assignment JSON: {}", json_str))?;
 
-    // Validate exec_mode
-    if let Some(ref mode) = verdict.exec_mode {
-        match mode.as_str() {
-            "shell" | "bare" | "light" | "full" => {}
-            other => {
-                eprintln!(
-                    "[assignment] Warning: invalid exec_mode '{}', defaulting to 'full'",
-                    other
-                );
-            }
-        }
-    }
+    // Validate exec_mode against the configured executor
+    verdict.exec_mode = Some(validate_exec_mode(
+        verdict.exec_mode.as_deref(),
+        &executor_type,
+    ));
 
     // Validate context_scope
     if let Some(ref scope) = verdict.context_scope {
@@ -250,6 +342,67 @@ pub(crate) fn run_lightweight_assignment(
     }
 
     Ok((verdict, token_usage))
+}
+
+/// Build a compact list of active (non-terminal, non-paused, non-system) tasks
+/// for placement context. Only includes task IDs and titles to keep the prompt slim.
+pub(crate) fn build_active_tasks_context(graph: &WorkGraph, exclude_task_id: &str) -> String {
+    let active_tasks: Vec<_> = graph
+        .tasks()
+        .filter(|t| {
+            !t.status.is_terminal()
+                && !t.paused
+                && !is_system_task(&t.id)
+                && t.id != exclude_task_id
+        })
+        .collect();
+
+    if active_tasks.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    for t in &active_tasks {
+        out.push_str(&format!("- {} ({})\n", t.id, t.title));
+    }
+    out
+}
+
+/// Validate that exec_mode is compatible with the configured executor.
+/// Returns the validated mode string. If the mode is incompatible or invalid,
+/// overrides to the safe default for that executor and logs a warning.
+pub(crate) fn validate_exec_mode(mode: Option<&str>, executor_type: &str) -> String {
+    use workgraph::config::ExecMode;
+
+    let default = ExecMode::default_for_executor(executor_type);
+
+    let mode_str = match mode {
+        Some(m) => m,
+        None => return default.to_string(),
+    };
+
+    // Parse the mode string
+    let parsed: ExecMode = match mode_str.parse() {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!(
+                "[assignment] Warning: invalid exec_mode '{}'. Overriding to '{}' for executor '{}'.",
+                mode_str, default, executor_type
+            );
+            return default.to_string();
+        }
+    };
+
+    // Check compatibility with the executor
+    if !parsed.is_valid_for_executor(executor_type) {
+        eprintln!(
+            "[assignment] Warning: exec_mode '{}' is incompatible with executor '{}'. Overriding to '{}'.",
+            mode_str, executor_type, default
+        );
+        return default.to_string();
+    }
+
+    mode_str.to_string()
 }
 
 /// Extract a JSON object from potentially noisy LLM output.
@@ -323,7 +476,14 @@ mod tests {
             tags: vec!["implementation".to_string()],
             ..Default::default()
         };
-        let prompt = build_assignment_prompt(&task, "## Mode\nPerformance", "- Agent1 (hash: abc)\n", None);
+        let prompt = build_assignment_prompt(
+            &task,
+            "## Mode\nPerformance",
+            "- Agent1 (hash: abc)\n",
+            None,
+            "",
+            "claude",
+        );
         assert!(prompt.contains("test-task"));
         assert!(prompt.contains("Fix the bug"));
         assert!(prompt.contains("rust"));
@@ -355,5 +515,153 @@ mod tests {
         assert!(result.contains("abc12345"));
         assert!(result.contains("0.85"));
         assert!(result.contains("rust"));
+    }
+
+    #[test]
+    fn test_build_assignment_prompt_includes_placement_when_active_tasks() {
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Fix the bug".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        };
+        let active_ctx = "- other-task (Other Task)\n- third-task (Third Task)\n";
+        let prompt = build_assignment_prompt(
+            &task,
+            "",
+            "- Agent1 (hash: abc)\n",
+            None,
+            active_ctx,
+            "claude",
+        );
+        assert!(prompt.contains("Active Tasks"));
+        assert!(prompt.contains("other-task"));
+        assert!(prompt.contains("Placement Instructions"));
+        assert!(prompt.contains("\"placement\""));
+    }
+
+    #[test]
+    fn test_build_assignment_prompt_no_placement_when_no_active_tasks() {
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Fix the bug".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        };
+        let prompt =
+            build_assignment_prompt(&task, "", "- Agent1 (hash: abc)\n", None, "", "claude");
+        assert!(!prompt.contains("Active Tasks"));
+        assert!(!prompt.contains("Placement Instructions"));
+    }
+
+    #[test]
+    fn test_verdict_with_placement_deserialization() {
+        let json = r#"{
+            "agent_hash": "abc123",
+            "exec_mode": "full",
+            "context_scope": "task",
+            "reason": "best match",
+            "create_needed": false,
+            "placement": {"after": ["dep-a", "dep-b"], "before": ["dep-c"]}
+        }"#;
+        let verdict: AssignmentVerdict = serde_json::from_str(json).unwrap();
+        assert_eq!(verdict.agent_hash, "abc123");
+        let placement = verdict.placement.unwrap();
+        assert_eq!(placement.after, vec!["dep-a", "dep-b"]);
+        assert_eq!(placement.before, vec!["dep-c"]);
+    }
+
+    #[test]
+    fn test_verdict_without_placement_deserialization() {
+        let json = r#"{
+            "agent_hash": "abc123",
+            "reason": "ok"
+        }"#;
+        let verdict: AssignmentVerdict = serde_json::from_str(json).unwrap();
+        assert!(verdict.placement.is_none());
+    }
+
+    #[test]
+    fn test_verdict_null_placement_deserialization() {
+        let json = r#"{
+            "agent_hash": "abc123",
+            "reason": "ok",
+            "placement": null
+        }"#;
+        let verdict: AssignmentVerdict = serde_json::from_str(json).unwrap();
+        assert!(verdict.placement.is_none());
+    }
+
+    #[test]
+    fn test_build_assignment_prompt_contains_executor_info_claude() {
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Some task".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        };
+        let prompt = build_assignment_prompt(&task, "", "- Agent1\n", None, "", "claude");
+        // Should mention the configured executor
+        assert!(prompt.contains("Available executor:** claude"));
+        // Should list valid modes for claude (bare, light, full — NOT shell)
+        assert!(prompt.contains("bare, light, full"));
+        assert!(!prompt.contains("Valid exec_modes:** shell"));
+        // The exec_mode enum in the JSON response should only show valid options
+        assert!(prompt.contains("bare|light|full"));
+        assert!(!prompt.contains("shell|bare|light|full"));
+        // Should warn against using invalid modes
+        assert!(prompt.contains("Do NOT use exec_modes outside this list"));
+    }
+
+    #[test]
+    fn test_build_assignment_prompt_contains_executor_info_shell() {
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Shell task".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        };
+        let prompt = build_assignment_prompt(&task, "", "- Agent1\n", None, "", "shell");
+        // Should mention shell executor
+        assert!(prompt.contains("Available executor:** shell"));
+        // Should only list shell as valid mode
+        assert!(prompt.contains("Valid exec_modes:** shell"));
+        // Should NOT include bare/light/full in the valid modes list
+        assert!(!prompt.contains("bare, light, full"));
+    }
+
+    #[test]
+    fn test_exec_mode_validation() {
+        // Valid mode for claude executor — no override
+        assert_eq!(validate_exec_mode(Some("full"), "claude"), "full");
+        assert_eq!(validate_exec_mode(Some("bare"), "claude"), "bare");
+        assert_eq!(validate_exec_mode(Some("light"), "claude"), "light");
+
+        // shell is incompatible with claude executor — override to full
+        assert_eq!(validate_exec_mode(Some("shell"), "claude"), "full");
+
+        // Valid mode for shell executor
+        assert_eq!(validate_exec_mode(Some("shell"), "shell"), "shell");
+
+        // bare/light/full are incompatible with shell executor — override to shell
+        assert_eq!(validate_exec_mode(Some("full"), "shell"), "shell");
+        assert_eq!(validate_exec_mode(Some("bare"), "shell"), "shell");
+        assert_eq!(validate_exec_mode(Some("light"), "shell"), "shell");
+
+        // Invalid mode string — override to default for executor
+        assert_eq!(validate_exec_mode(Some("invalid"), "claude"), "full");
+        assert_eq!(validate_exec_mode(Some("invalid"), "shell"), "shell");
+
+        // None — return default for executor
+        assert_eq!(validate_exec_mode(None, "claude"), "full");
+        assert_eq!(validate_exec_mode(None, "shell"), "shell");
+
+        // native executor — same valid modes as claude
+        assert_eq!(validate_exec_mode(Some("full"), "native"), "full");
+        assert_eq!(validate_exec_mode(Some("shell"), "native"), "full");
+
+        // amplifier executor — same valid modes as claude
+        assert_eq!(validate_exec_mode(Some("light"), "amplifier"), "light");
+        assert_eq!(validate_exec_mode(Some("shell"), "amplifier"), "full");
     }
 }

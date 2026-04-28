@@ -9,6 +9,7 @@ use workgraph::graph::{Status, Task};
 struct BlockingNode {
     id: String,
     status: Status,
+    is_phantom: bool,
     children: Vec<BlockingNode>,
 }
 
@@ -45,13 +46,34 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         })
         .collect();
 
+    // Collect phantom root blocker IDs (not in graph, so not in root_blockers)
+    let phantom_root_ids: Vec<String> = root_blocker_ids
+        .iter()
+        .filter(|rid| {
+            graph.get_task(rid).is_none() && workgraph::federation::parse_remote_ref(rid).is_none()
+        })
+        .cloned()
+        .collect();
+
     // Count total blocking tasks
     let total_blockers = count_blockers(&blocking_tree);
 
     if json {
-        print_json(task, &blocking_tree, &root_blockers, total_blockers)?;
+        print_json(
+            task,
+            &blocking_tree,
+            &root_blockers,
+            &phantom_root_ids,
+            total_blockers,
+        )?;
     } else {
-        print_human(task, &blocking_tree, &root_blockers, total_blockers);
+        print_human(
+            task,
+            &blocking_tree,
+            &root_blockers,
+            &phantom_root_ids,
+            total_blockers,
+        );
     }
 
     Ok(())
@@ -64,11 +86,13 @@ fn build_blocking_tree(
     dir: &Path,
 ) -> BlockingNode {
     let task = graph.get_task(task_id);
+    let is_phantom = task.is_none() && workgraph::federation::parse_remote_ref(task_id).is_none();
     let status = task.map(|t| t.status).unwrap_or(Status::Open);
 
     let mut node = BlockingNode {
         id: task_id.to_string(),
         status,
+        is_phantom,
         children: vec![],
     };
 
@@ -97,6 +121,7 @@ fn build_blocking_tree(
                     let child = BlockingNode {
                         id: blocker_id.clone(),
                         status: remote.status,
+                        is_phantom: false,
                         children: vec![], // Don't recurse into remote graphs
                     };
                     node.children.push(child);
@@ -107,6 +132,15 @@ fn build_blocking_tree(
                     let child = build_blocking_tree(graph, blocker_id, visited, dir);
                     node.children.push(child);
                 }
+            } else {
+                // Phantom dependency — task doesn't exist in the graph
+                let child = BlockingNode {
+                    id: blocker_id.clone(),
+                    status: Status::Open,
+                    is_phantom: true,
+                    children: vec![],
+                };
+                node.children.push(child);
             }
         }
     }
@@ -116,8 +150,10 @@ fn build_blocking_tree(
 
 fn collect_root_blockers(graph: &WorkGraph, node: &BlockingNode, roots: &mut HashSet<String>) {
     if node.children.is_empty() {
-        // This node has no blockers - check if it's actually a blocker (not the root task)
-        if let Some(task) = graph.get_task(&node.id) {
+        if node.is_phantom {
+            // Phantom dependency is always a root blocker
+            roots.insert(node.id.clone());
+        } else if let Some(task) = graph.get_task(&node.id) {
             // It's a root blocker if it's not terminal (still open, in-progress, or blocked)
             if !task.status.is_terminal() {
                 roots.insert(node.id.clone());
@@ -156,7 +192,13 @@ fn count_blockers_recursive(node: &BlockingNode, count: &mut usize, visited: &mu
     }
 }
 
-fn print_human(task: &Task, tree: &BlockingNode, root_blockers: &[RootBlocker], total: usize) {
+fn print_human(
+    task: &Task,
+    tree: &BlockingNode,
+    root_blockers: &[RootBlocker],
+    phantom_roots: &[String],
+    total: usize,
+) {
     println!("Task: {}", task.id);
 
     if tree.children.is_empty() {
@@ -172,7 +214,7 @@ fn print_human(task: &Task, tree: &BlockingNode, root_blockers: &[RootBlocker], 
     println!();
     print_tree(tree, "", 0);
 
-    if !root_blockers.is_empty() {
+    if !root_blockers.is_empty() || !phantom_roots.is_empty() {
         println!();
         println!("Root blockers (actionable now):");
         for rb in root_blockers {
@@ -186,6 +228,12 @@ fn print_human(task: &Task, tree: &BlockingNode, root_blockers: &[RootBlocker], 
             println!(
                 "  - {}: {:?}{}{}",
                 rb.task.id, rb.task.status, assigned, ready_str
+            );
+        }
+        for phantom_id in phantom_roots {
+            println!(
+                "  - {}: DOES NOT EXIST (phantom dependency — fix with: wg edit {} --remove-after {})",
+                phantom_id, task.id, phantom_id
             );
         }
     }
@@ -222,6 +270,12 @@ fn print_tree(node: &BlockingNode, prefix: &str, depth: usize) {
     if depth == 0 {
         // Root node - just print the ID
         println!("{}", node.id);
+    } else if node.is_phantom {
+        // Phantom dependency — clearly label as non-existent
+        println!(
+            "{} \\-- blocked by: {} (DOES NOT EXIST — phantom dependency) <-- ROOT CAUSE",
+            prefix, node.id
+        );
     } else {
         // Child node - print with tree connector and status
         let status_str = format!("(status: {:?})", node.status);
@@ -252,8 +306,28 @@ fn print_json(
     task: &Task,
     tree: &BlockingNode,
     root_blockers: &[RootBlocker],
+    phantom_roots: &[String],
     total: usize,
 ) -> Result<()> {
+    let mut all_root_blockers: Vec<serde_json::Value> = root_blockers
+        .iter()
+        .map(|rb| {
+            serde_json::json!({
+                "id": rb.task.id,
+                "title": rb.task.title,
+                "status": rb.task.status,
+                "assigned": rb.task.assigned,
+                "is_ready": rb.is_ready,
+            })
+        })
+        .collect();
+    for phantom_id in phantom_roots {
+        all_root_blockers.push(serde_json::json!({
+            "id": phantom_id,
+            "phantom": true,
+            "status": "DOES NOT EXIST",
+        }));
+    }
     let output = serde_json::json!({
         "task": {
             "id": task.id,
@@ -262,15 +336,7 @@ fn print_json(
         },
         "is_blocked": !tree.children.is_empty(),
         "blocking_chain": tree_to_json(tree),
-        "root_blockers": root_blockers.iter().map(|rb| {
-            serde_json::json!({
-                "id": rb.task.id,
-                "title": rb.task.title,
-                "status": rb.task.status,
-                "assigned": rb.task.assigned,
-                "is_ready": rb.is_ready,
-            })
-        }).collect::<Vec<_>>(),
+        "root_blockers": all_root_blockers,
         "total_blockers": total,
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
@@ -278,11 +344,15 @@ fn print_json(
 }
 
 fn tree_to_json(node: &BlockingNode) -> serde_json::Value {
-    serde_json::json!({
+    let mut obj = serde_json::json!({
         "id": node.id,
         "status": format!("{:?}", node.status),
         "after": node.children.iter().map(tree_to_json).collect::<Vec<_>>(),
-    })
+    });
+    if node.is_phantom {
+        obj["phantom"] = serde_json::Value::Bool(true);
+    }
+    obj
 }
 
 #[cfg(test)]

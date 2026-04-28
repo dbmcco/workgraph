@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::graph::{LogEntry, Status, WaitCondition, WaitSpec, parse_delay};
+use workgraph::parser::modify_graph;
 use workgraph::service::registry::{AgentRegistry, AgentStatus};
 
 /// Parse a condition string into a WaitCondition.
@@ -126,30 +127,69 @@ fn parse_wait_spec(s: &str, graph: &workgraph::graph::WorkGraph) -> Result<WaitS
 }
 
 pub fn run(dir: &Path, id: &str, until: &str, checkpoint: Option<&str>) -> Result<()> {
-    let assigned_agent = super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_or_err(id)?;
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    let mut error: Option<anyhow::Error> = None;
+    let mut assigned_agent: Option<String> = None;
+
+    modify_graph(&path, |graph| {
+        let task = match graph.get_task(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
+
+        // Validate task is InProgress
         if task.status != Status::InProgress {
-            anyhow::bail!(
+            error = Some(anyhow::anyhow!(
                 "Cannot wait on task '{}': status is '{}', expected 'in-progress'",
-                id, task.status
-            );
+                id,
+                task.status
+            ));
+            return false;
         }
-        let wait_spec = parse_wait_spec(until, graph)?;
-        let task = graph.get_task_mut(id).ok_or_else(|| anyhow::anyhow!("Task '{}' not found", id))?;
+
+        // Parse and validate the condition
+        let wait_spec = match parse_wait_spec(until, graph) {
+            Ok(ws) => ws,
+            Err(e) => {
+                error = Some(e);
+                return false;
+            }
+        };
+
+        // Now mutate
+        let task = graph.get_task_mut(id).expect("task verified above");
+
         task.status = Status::Waiting;
         task.wait_condition = Some(wait_spec);
+
         if let Some(cp) = checkpoint {
             task.checkpoint = Some(cp.to_string());
         }
+
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: task.assigned.clone(),
+            user: Some(workgraph::current_user()),
             message: format!("Agent parked. Waiting for: {}", until),
         });
-        Ok(task.assigned.clone())
-    })?;
 
-    // Update agent registry outside the graph lock
+        assigned_agent = task.assigned.clone();
+
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    // Update agent status to Parked if there's an assigned agent
     if let Some(ref assigned) = assigned_agent
         && let Ok(mut registry) = AgentRegistry::load_locked(dir)
     {

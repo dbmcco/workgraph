@@ -4,9 +4,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-
 #[derive(Error, Debug)]
 pub enum ParseError {
     #[error("IO error: {0}")]
@@ -27,17 +24,30 @@ struct FileLock {
 }
 
 impl FileLock {
-    /// Acquire an exclusive lock on a lock file
+    /// Acquire an exclusive lock on a lock file (blocks until available)
     #[cfg(unix)]
     fn acquire<P: AsRef<Path>>(lock_path: P) -> Result<Self, ParseError> {
+        Self::flock_impl(&lock_path, libc::LOCK_EX)
+    }
+
+    #[cfg(not(unix))]
+    fn acquire<P: AsRef<Path>>(_lock_path: P) -> Result<Self, ParseError> {
+        // On non-Unix systems, we can't use flock - return a no-op lock
+        // This is a limitation but workgraph is primarily for Unix systems
+        Ok(FileLock {})
+    }
+
+    /// Try to acquire a shared (read) lock, non-blocking.
+    /// Returns `Ok(Some(lock))` on success, `Ok(None)` if the lock is held
+    /// exclusively by another process (EWOULDBLOCK).
+    #[cfg(unix)]
+    fn try_acquire_shared<P: AsRef<Path>>(lock_path: P) -> Result<Option<Self>, ParseError> {
         use std::os::unix::io::AsRawFd;
 
-        // Ensure the .workgraph directory exists
         if let Some(parent) = lock_path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Open/create the lock file
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -45,9 +55,49 @@ impl FileLock {
             .truncate(false)
             .open(&lock_path)?;
 
-        // Acquire exclusive lock (LOCK_EX) - blocks until available
         let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        let ret = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(ParseError::Lock(format!(
+                "Failed to acquire shared lock on {:?}: {}",
+                lock_path.as_ref(),
+                err
+            )));
+        }
+
+        Ok(Some(FileLock { file }))
+    }
+
+    #[cfg(not(unix))]
+    fn try_acquire_shared<P: AsRef<Path>>(_lock_path: P) -> Result<Option<Self>, ParseError> {
+        Ok(Some(FileLock {}))
+    }
+
+    #[cfg(unix)]
+    fn flock_impl<P: AsRef<Path>>(
+        lock_path: P,
+        operation: libc::c_int,
+    ) -> Result<Self, ParseError> {
+        use std::os::unix::io::AsRawFd;
+
+        if let Some(parent) = lock_path.as_ref().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, operation) };
 
         if ret != 0 {
             return Err(ParseError::Lock(format!(
@@ -59,19 +109,13 @@ impl FileLock {
 
         Ok(FileLock { file })
     }
-
-    #[cfg(not(unix))]
-    fn acquire<P: AsRef<Path>>(_lock_path: P) -> Result<Self, ParseError> {
-        // On non-Unix systems, we can't use flock - return a no-op lock
-        // This is a limitation but workgraph is primarily for Unix systems
-        Ok(FileLock {})
-    }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
+            use std::os::unix::io::AsRawFd;
             // Release the lock (LOCK_UN) - best effort, ignore errors on drop
             let fd = self.file.as_raw_fd();
             unsafe {
@@ -91,7 +135,10 @@ fn get_lock_path<P: AsRef<Path>>(graph_path: P) -> PathBuf {
     }
 }
 
-/// Load a graph from disk without acquiring any lock.
+/// Load a work graph from a JSONL file (internal, no locking).
+///
+/// Callers must hold the flock themselves or use [`load_graph`] which
+/// acquires it automatically.
 fn load_graph_inner<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -128,12 +175,30 @@ fn load_graph_inner<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
 }
 
 /// Load a work graph from a JSONL file.
-/// Uses advisory file locking to prevent concurrent access corruption.
+///
+/// Uses a non-blocking shared lock (`LOCK_SH | LOCK_NB`). If another process
+/// holds an exclusive lock (e.g. `modify_graph` in the coordinator), the read
+/// proceeds without the lock. This is safe because `save_graph_inner` uses
+/// atomic writes (temp file + rename), so readers always see a consistent
+/// snapshot — either the pre- or post-write state, never a partial write.
+///
+/// This prevents the TUI (and other read-only callers) from blocking
+/// indefinitely while the coordinator holds an exclusive lock during
+/// long-running modify_graph closures.
 pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
     let lock_path = get_lock_path(&path);
-    let _lock = FileLock::acquire(&lock_path)?;
+    // Try a non-blocking shared lock; proceed regardless.
+    let _lock = FileLock::try_acquire_shared(&lock_path)?;
     load_graph_inner(path)
+    // Lock (if acquired) is automatically released when _lock goes out of scope
 }
+
+/// Save a work graph to a JSONL file (internal, no locking).
+///
+/// Callers must hold the flock themselves or use [`save_graph`] which
+/// acquires it automatically.
+fn save_graph_inner<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
+    let path = path.as_ref();
 
 /// Save a graph to disk without acquiring any lock.
 fn save_graph_inner(graph: &WorkGraph, path: &Path) -> Result<(), ParseError> {
@@ -175,51 +240,44 @@ fn save_graph_inner(graph: &WorkGraph, path: &Path) -> Result<(), ParseError> {
     result
 }
 
-/// Save a work graph to a JSONL file.
-/// Uses advisory file locking and atomic write (temp file + rename).
+/// Save a work graph to a JSONL file
+/// Uses advisory file locking and atomic write (temp file + rename) to
+/// prevent data loss on crash.
 pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
     let path = path.as_ref();
     let lock_path = get_lock_path(path);
     let _lock = FileLock::acquire(&lock_path)?;
     save_graph_inner(graph, path)
+    // Lock is automatically released when _lock goes out of scope
 }
 
-/// Opaque guard that holds the graph file lock.
-/// The lock is released when this guard is dropped.
-#[allow(dead_code)]
-pub struct GraphLock(FileLock);
-
-/// Acquire an exclusive lock on the graph file.
-/// While held, other processes will block on load_graph/save_graph/mutate_graph.
-pub fn lock_graph_file(path: impl AsRef<Path>) -> Result<GraphLock, ParseError> {
-    let lock_path = get_lock_path(&path);
-    Ok(GraphLock(FileLock::acquire(&lock_path)?))
-}
-
-/// Load a work graph while already holding the lock.
-pub fn load_graph_locked(path: impl AsRef<Path>, _lock: &GraphLock) -> Result<WorkGraph, ParseError> {
-    load_graph_inner(path)
-}
-
-/// Save a work graph while already holding the lock.
-pub fn save_graph_locked(graph: &WorkGraph, path: impl AsRef<Path>, _lock: &GraphLock) -> Result<(), ParseError> {
-    save_graph_inner(graph, path.as_ref())
-}
-
-/// Atomically load, modify, and save a graph while holding flock across
-/// the entire read-modify-write cycle. Prevents TOCTOU races where
-/// concurrent writers silently overwrite each other's changes.
-pub fn mutate_graph<F, T, E>(path: impl AsRef<Path>, f: F) -> Result<T, E>
+/// Atomically load, modify, and save a graph file.
+///
+/// The file lock is held for the entire load-modify-save cycle, preventing
+/// concurrent read-modify-write operations from clobbering each other's
+/// changes (the "lost update" problem).
+///
+/// The closure receives a mutable reference to the freshly-loaded graph.
+/// It should return `true` if it modified the graph (triggering a save),
+/// or `false` to skip saving.
+///
+/// Returns the final graph state (after any modifications and save).
+pub fn modify_graph<P, F>(path: P, f: F) -> Result<WorkGraph, ParseError>
 where
-    F: FnOnce(&mut WorkGraph) -> Result<T, E>,
-    E: From<ParseError>,
+    P: AsRef<Path>,
+    F: FnOnce(&mut WorkGraph) -> bool,
 {
     let path = path.as_ref();
-    let lock = lock_graph_file(path)?;
-    let mut graph = load_graph_locked(path, &lock)?;
-    let result = f(&mut graph)?;
-    save_graph_locked(&graph, path, &lock)?;
-    Ok(result)
+    let lock_path = get_lock_path(path);
+    let _lock = FileLock::acquire(&lock_path)?;
+
+    let mut graph = load_graph_inner(path)?;
+    let modified = f(&mut graph);
+    if modified {
+        save_graph_inner(&graph, path)?;
+    }
+    Ok(graph)
+    // Lock is automatically released when _lock goes out of scope
 }
 
 #[cfg(test)]
@@ -947,5 +1005,96 @@ mod tests {
         // Last-wins semantics: the second definition should be kept
         let task = graph.get_task("dup").unwrap();
         assert_eq!(task.title, "Second version");
+    }
+
+    // ---- modify_graph tests ----
+
+    #[test]
+    fn test_modify_graph_saves_when_modified() {
+        let file = NamedTempFile::new().unwrap();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Task 1")));
+        save_graph(&graph, file.path()).unwrap();
+
+        let result = modify_graph(file.path(), |g| {
+            g.add_node(Node::Task(make_task("t2", "Task 2")));
+            true
+        })
+        .unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // Verify it was persisted to disk
+        let loaded = load_graph(file.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.get_task("t2").is_some());
+    }
+
+    #[test]
+    fn test_modify_graph_skips_save_when_not_modified() {
+        let file = NamedTempFile::new().unwrap();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Task 1")));
+        save_graph(&graph, file.path()).unwrap();
+
+        let result = modify_graph(file.path(), |_g| false).unwrap();
+        assert_eq!(result.len(), 1);
+
+        // Still the original graph on disk
+        let loaded = load_graph(file.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn test_modify_graph_concurrent_no_lost_updates() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let file = NamedTempFile::new().unwrap();
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t0", "Initial")));
+        save_graph(&graph, file.path()).unwrap();
+
+        let path = Arc::new(file.path().to_path_buf());
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn 10 threads, each atomically adding a task via modify_graph
+        for i in 0..10 {
+            let path = Arc::clone(&path);
+            let success_count = Arc::clone(&success_count);
+
+            let handle = thread::spawn(move || {
+                let result = modify_graph(path.as_ref(), |g| {
+                    g.add_node(Node::Task(make_task(
+                        &format!("t{}", i + 1),
+                        &format!("Task {}", i + 1),
+                    )));
+                    true
+                });
+                if result.is_ok() {
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let final_graph = load_graph(path.as_ref()).unwrap();
+
+        // All 10 threads should have succeeded
+        assert_eq!(success_count.load(Ordering::SeqCst), 10);
+
+        // All 11 tasks should be present (no lost updates)
+        assert_eq!(
+            final_graph.len(),
+            11,
+            "modify_graph should prevent lost updates: expected 11 tasks (1 initial + 10 added), got {}",
+            final_graph.len()
+        );
     }
 }

@@ -384,7 +384,10 @@ fn print_ops(_id: &str, ops: &[OperationEntry]) {
             if detail_str.len() <= 120 {
                 println!("    {}", detail_str);
             } else {
-                println!("    {}...", &detail_str[..117]);
+                println!(
+                    "    {}...",
+                    &detail_str[..detail_str.floor_char_boundary(117)]
+                );
             }
         }
     }
@@ -873,7 +876,12 @@ fn print_recursive_tree(
                 Status::InProgress => "\x1b[33m",
                 Status::Failed => "\x1b[31m",
                 Status::Open => "\x1b[37m",
-                Status::Blocked | Status::Abandoned | Status::Waiting => "\x1b[90m",
+                Status::Blocked
+                | Status::Abandoned
+                | Status::Waiting
+                | Status::PendingValidation => "\x1b[90m",
+                Status::PendingEval => "\x1b[38;5;154m", // chartreuse (xterm-256: 154 ~ light green)
+                Status::Incomplete => "\x1b[38;5;208m",
             }
         };
 
@@ -885,7 +893,9 @@ fn print_recursive_tree(
                 Status::Open => "open",
                 Status::Blocked => "blocked",
                 Status::Abandoned => "abandoned",
-                Status::Waiting => "waiting",
+                Status::Waiting | Status::PendingValidation => "waiting",
+                Status::PendingEval => "pending-eval",
+                Status::Incomplete => "incomplete",
             }
         };
 
@@ -1042,6 +1052,10 @@ fn print_recursive_tree(
         .iter()
         .filter(|t| t.status == Status::Open)
         .count();
+    let incomplete_count = descendants
+        .iter()
+        .filter(|t| t.status == Status::Incomplete)
+        .count();
 
     print!("{}Summary: ", dim);
     let mut parts = Vec::new();
@@ -1053,6 +1067,12 @@ fn print_recursive_tree(
     }
     if open_count > 0 {
         parts.push(format!("{} open", open_count));
+    }
+    if incomplete_count > 0 {
+        parts.push(format!(
+            "\x1b[38;5;208m{} incomplete{}",
+            incomplete_count, reset
+        ));
     }
     if failed_count > 0 {
         parts.push(format!("{}{} failed{}", red, failed_count, reset));
@@ -1091,7 +1111,11 @@ fn print_timeline(
             Status::InProgress => "\x1b[33m",
             Status::Failed => "\x1b[31m",
             Status::Open => "\x1b[37m",
-            Status::Blocked | Status::Abandoned | Status::Waiting => "\x1b[90m",
+            Status::Blocked | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
+                "\x1b[90m"
+            }
+            Status::PendingEval => "\x1b[38;5;154m",
+            Status::Incomplete => "\x1b[38;5;208m",
         }
     };
 
@@ -1306,7 +1330,6 @@ pub fn run_graph(dir: &Path, root_id: &str) -> Result<()> {
         &descendants,
         &task_ids,
         &annotations,
-        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashSet::new(),

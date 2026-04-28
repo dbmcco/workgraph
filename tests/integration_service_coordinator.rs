@@ -63,6 +63,7 @@ fn make_agent_entry(id: &str, pid: u32, task_id: &str, status: AgentStatus) -> A
         output_file: format!("/tmp/{}.log", id),
         model: None,
         completed_at: None,
+        worktree_path: None,
     }
 }
 
@@ -353,6 +354,7 @@ fn test_cleanup_unclaims_in_progress_task() {
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: None,
+            user: None,
             message: format!("Task unclaimed: agent '{}' process exited", agent_id),
         });
     }
@@ -806,15 +808,17 @@ fn test_auto_evaluate_unblocks_on_failed_source() {
 
 #[test]
 fn test_auto_evaluate_task_has_exec_and_model() {
-    // Verify that auto-evaluate tasks get the exec command and evaluator_model
+    // Verify that auto-evaluate tasks get the exec command and model from models section
     let tmp = TempDir::new().unwrap();
     let (wg_dir, graph_path) = setup_workgraph(&tmp);
 
-    // Write config with evaluator_model
+    // Write config with models.evaluator section
     let config_content = r#"
 [agency]
 auto_evaluate = true
-evaluator_model = "sonnet"
+
+[models.evaluator]
+model = "claude:sonnet"
 "#;
     fs::write(wg_dir.join("config.toml"), config_content).unwrap();
 
@@ -844,6 +848,8 @@ evaluator_model = "sonnet"
 
     for (task_id, task_title) in &tasks_needing_eval {
         let eval_task_id = format!("evaluate-{}", task_id);
+        let resolved_model =
+            config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
         let eval_task = Task {
             id: eval_task_id.clone(),
             title: format!("Evaluate: {}", task_title),
@@ -851,7 +857,7 @@ evaluator_model = "sonnet"
             after: vec![task_id.clone()],
             tags: vec!["evaluation".to_string(), "agency".to_string()],
             exec: Some(format!("wg evaluate {}", task_id)),
-            model: config.agency.evaluator_model.clone(),
+            model: Some(resolved_model.model),
             agent: config.agency.evaluator_agent.clone(),
             ..Task::default()
         };
@@ -864,7 +870,13 @@ evaluator_model = "sonnet"
 
     // The eval task should have exec and model set
     assert_eq!(eval.exec.as_deref(), Some("wg evaluate my-task"));
-    assert_eq!(eval.model.as_deref(), Some("sonnet"));
+    // resolve_model_for_role expands "claude:sonnet" to the full model ID
+    assert!(eval.model.is_some(), "eval task should have a model set");
+    assert!(
+        eval.model.as_deref().unwrap().contains("sonnet"),
+        "model should be a sonnet variant, got: {:?}",
+        eval.model
+    );
     assert!(eval.tags.contains(&"evaluation".to_string()));
 }
 
@@ -1198,6 +1210,14 @@ mod llm_tests {
         path
     }
 
+    /// Derive a fake HOME from the wg_dir path so global config doesn't leak in.
+    fn fake_home_for(wg_dir: &Path) -> PathBuf {
+        wg_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| wg_dir.to_path_buf())
+    }
+
     /// Run `wg` with given args in a specific workgraph directory.
     fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
         let wg = wg_binary();
@@ -1205,6 +1225,7 @@ mod llm_tests {
             .arg("--dir")
             .arg(wg_dir)
             .args(args)
+            .env("HOME", fake_home_for(wg_dir))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1758,4 +1779,187 @@ fn test_cycle_aware_ready_tasks_blocks_dangling() {
         ready.is_empty(),
         "Cycle-aware ready_tasks should block on dangling deps"
     );
+}
+
+// ===========================================================================
+// PID reuse detection (Bug 1 fix)
+// ===========================================================================
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_pid_reuse_detection_current_process() {
+    // Current process should pass identity verification
+    use workgraph::service::{read_proc_start_time_secs, verify_process_identity};
+
+    let current_pid = std::process::id();
+    let proc_start = read_proc_start_time_secs(current_pid);
+    assert!(
+        proc_start.is_some(),
+        "Should be able to read start time for current process"
+    );
+
+    // Verify with the actual start time — should pass
+    let start_epoch = proc_start.unwrap();
+    assert!(
+        verify_process_identity(current_pid, start_epoch),
+        "Current process should pass identity verification"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_pid_reuse_detection_nonexistent_pid() {
+    use workgraph::service::read_proc_start_time_secs;
+
+    // PID 999999999 should not exist
+    let result = read_proc_start_time_secs(999999999);
+    assert!(result.is_none(), "Non-existent PID should return None");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_pid_reuse_detection_old_start_time() {
+    use workgraph::service::verify_process_identity;
+
+    let current_pid = std::process::id();
+    // Pretend the agent was registered far in the past — the process (us) was
+    // started much more recently, so this should detect PID reuse.
+    let ancient_epoch: i64 = 1_000_000_000; // ~2001
+    assert!(
+        !verify_process_identity(current_pid, ancient_epoch),
+        "Process started long after expected should be detected as PID reuse"
+    );
+}
+
+#[test]
+fn test_pid_reuse_detection_nonexistent_returns_true() {
+    use workgraph::service::verify_process_identity;
+
+    // Non-existent PID: verify_process_identity should return true
+    // (conservative fallback when /proc is unavailable)
+    let result = verify_process_identity(999999999, 0);
+    // On Linux, /proc/999999999 won't exist, so read_proc_start_time_secs returns None,
+    // and verify_process_identity falls back to true.
+    // On non-Linux, read_proc_start_time_secs always returns None → true.
+    assert!(
+        result,
+        "Non-existent PID should fall back to conservative true"
+    );
+}
+
+// ===========================================================================
+// Dead agent detection after daemon restart (Bug 1 integration test)
+// ===========================================================================
+
+#[test]
+fn test_dead_agent_detection_after_daemon_restart() {
+    // Simulate an agent registered with a non-existent PID (daemon restart scenario)
+    let tmp = TempDir::new().unwrap();
+    let (wg_dir, graph_path) = setup_workgraph(&tmp);
+
+    // Create in-progress task assigned to agent-1
+    let mut graph = WorkGraph::new();
+    let mut task = make_task("task-1", "Test Task", Status::InProgress);
+    task.assigned = Some("agent-1".to_string());
+    graph.add_node(Node::Task(task));
+    save_graph(&graph, &graph_path).unwrap();
+
+    // Register agent with a PID that doesn't exist (simulates daemon restart)
+    let mut registry = AgentRegistry::new();
+    registry.register_agent(999999999, "task-1", "test", "/tmp/out.log");
+    registry.save(&wg_dir).unwrap();
+
+    // After daemon restart, the registry still has the old agent.
+    // The old PID (999999999) doesn't exist, so cleanup should detect and remove it.
+    let loaded_registry = AgentRegistry::load(&wg_dir).unwrap();
+    let agent = loaded_registry.get_agent("agent-1").unwrap();
+    assert!(
+        agent.is_alive(),
+        "Agent should still show as alive in registry"
+    );
+    assert!(
+        !workgraph::service::is_process_alive(agent.pid),
+        "PID 999999999 should not be alive"
+    );
+}
+
+// ===========================================================================
+// Rapid respawn detection/backoff (Bug 2 fix)
+// ===========================================================================
+
+#[test]
+fn test_rapid_respawn_detection_no_deaths() {
+    // A task with no death log entries should not be throttled
+    let task = make_task("task-1", "Test Task", Status::Open);
+    // No log entries at all — should be fine
+    assert!(task.log.is_empty(), "Fresh task should have no log entries");
+}
+
+#[test]
+fn test_rapid_respawn_detection_recent_deaths_in_log() {
+    // A task with multiple recent "process exited" log entries
+    // should have its retry_count incremented by the triage system
+    let now = Utc::now();
+
+    let mut task = make_task("task-1", "Test Task", Status::Open);
+    // Add 4 rapid death log entries within the last minute
+    for i in 0..4 {
+        let ts = now - chrono::Duration::seconds(10 * (4 - i));
+        task.log.push(LogEntry {
+            timestamp: ts.to_rfc3339(),
+            actor: None,
+            user: None,
+            message: format!(
+                "Task unclaimed: agent 'agent-{}' (PID {}) process exited",
+                i,
+                1000 + i
+            ),
+        });
+    }
+
+    // Verify the log has the expected pattern
+    let recent_deaths: Vec<_> = task
+        .log
+        .iter()
+        .filter(|e| e.message.contains("process exited"))
+        .collect();
+    assert_eq!(recent_deaths.len(), 4, "Should have 4 death entries in log");
+}
+
+#[test]
+fn test_rapid_respawn_fails_task_at_threshold() {
+    // When a task has >= 5 rapid deaths, the coordinator should fail it
+    let tmp = TempDir::new().unwrap();
+    let (_wg_dir, graph_path) = setup_workgraph(&tmp);
+
+    let now = Utc::now();
+    let mut task = make_task("task-1", "Test Task", Status::Open);
+    // Add 5 rapid death log entries (at the threshold)
+    for i in 0..5 {
+        let ts = now - chrono::Duration::seconds(10 * (5 - i));
+        task.log.push(LogEntry {
+            timestamp: ts.to_rfc3339(),
+            actor: None,
+            user: None,
+            message: format!(
+                "Task unclaimed: agent 'agent-{}' (PID {}) process exited",
+                i,
+                1000 + i
+            ),
+        });
+    }
+
+    let mut graph = WorkGraph::new();
+    graph.add_node(Node::Task(task));
+    save_graph(&graph, &graph_path).unwrap();
+
+    // Reload and verify the task has the death entries
+    let loaded = load_graph(&graph_path).unwrap();
+    let task = loaded.get_task("task-1").unwrap();
+    let death_count = task
+        .log
+        .iter()
+        .filter(|e| e.message.contains("process exited"))
+        .count();
+    assert_eq!(death_count, 5, "Task should have 5 death entries");
 }

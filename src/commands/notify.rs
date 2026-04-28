@@ -202,6 +202,9 @@ fn format_notification(task: &Task, custom_message: Option<&str>) -> (String, St
         Status::Failed => "❌",
         Status::Abandoned => "🗑️",
         Status::Waiting => "⏸️",
+        Status::PendingValidation => "🔍",
+        Status::PendingEval => "🔍",
+        Status::Incomplete => "🔁",
     };
 
     let status_str = task.status.to_string();
@@ -313,7 +316,7 @@ fn escape_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use workgraph::graph::Task;
+    use workgraph::graph::{PRIORITY_DEFAULT, Task};
 
     fn make_test_task() -> Task {
         Task {
@@ -321,6 +324,7 @@ mod tests {
             title: "Test Task Title".to_string(),
             description: Some("This is a test description".to_string()),
             status: Status::InProgress,
+            priority: PRIORITY_DEFAULT,
             assigned: Some("agent-1".to_string()),
             estimate: None,
             before: vec![],
@@ -332,6 +336,7 @@ mod tests {
             deliverables: vec![],
             artifacts: vec![],
             exec: None,
+            timeout: None,
             not_before: None,
             created_at: None,
             started_at: None,
@@ -342,9 +347,12 @@ mod tests {
             failure_reason: None,
             model: None,
             provider: None,
+            endpoint: None,
             verify: None,
+            verify_timeout: None,
             agent: None,
             loop_iteration: 0,
+            last_iteration_completed_at: None,
             cycle_failure_restarts: 0,
             ready_after: None,
             paused: false,
@@ -356,8 +364,38 @@ mod tests {
             session_id: None,
             wait_condition: None,
             checkpoint: None,
+            triage_count: 0,
             resurrection_count: 0,
             last_resurrected_at: None,
+            validation: None,
+            validation_commands: vec![],
+            validator_agent: None,
+            validator_model: None,
+            gate_attempts: 0,
+            test_required: false,
+            rejection_count: 0,
+            max_rejections: None,
+            verify_failures: 0,
+            rescue_count: 0,
+            spawn_failures: 0,
+            dispatch_count: 0,
+            tier: None,
+            no_tier_escalation: false,
+            tried_models: vec![],
+            superseded_by: vec![],
+            supersedes: None,
+            unplaced: false,
+            place_near: vec![],
+            place_before: vec![],
+            independent: false,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
+            cron_schedule: None,
+            cron_enabled: false,
+            last_cron_fire: None,
+            next_cron_fire: None,
         }
     }
 

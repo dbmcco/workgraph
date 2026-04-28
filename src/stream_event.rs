@@ -41,8 +41,18 @@ pub enum StreamEvent {
         duration_ms: u64,
         timestamp_ms: i64,
     },
+    /// A chunk of streaming output from a tool (e.g., bash stdout/stderr line).
+    ToolOutputChunk {
+        tool: String,
+        text: String,
+        timestamp_ms: i64,
+    },
     /// Periodic heartbeat.
     Heartbeat { timestamp_ms: i64 },
+    /// A text chunk from real-time streaming output.
+    TextChunk { text: String, timestamp_ms: i64 },
+    /// A thinking/reasoning chunk from real-time streaming output.
+    ThinkingChunk { text: String, timestamp_ms: i64 },
     /// Final event — aggregated usage and outcome.
     Result {
         success: bool,
@@ -60,6 +70,9 @@ pub struct TurnUsage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Reasoning/thinking tokens consumed (subset of output_tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Aggregated token usage for an entire run.
@@ -85,7 +98,10 @@ impl StreamEvent {
             | StreamEvent::Turn { timestamp_ms, .. }
             | StreamEvent::ToolStart { timestamp_ms, .. }
             | StreamEvent::ToolEnd { timestamp_ms, .. }
+            | StreamEvent::ToolOutputChunk { timestamp_ms, .. }
             | StreamEvent::Heartbeat { timestamp_ms }
+            | StreamEvent::TextChunk { timestamp_ms, .. }
+            | StreamEvent::ThinkingChunk { timestamp_ms, .. }
             | StreamEvent::Result { timestamp_ms, .. } => *timestamp_ms,
         }
     }
@@ -136,6 +152,7 @@ pub fn read_stream_events(path: &Path, offset: u64) -> Result<(Vec<StreamEvent>,
 // ── NDJSON file writing ─────────────────────────────────────────────────
 
 /// Writer that appends StreamEvent records as NDJSON to a file.
+#[derive(Clone)]
 pub struct StreamWriter {
     path: std::path::PathBuf,
 }
@@ -196,9 +213,34 @@ impl StreamWriter {
         });
     }
 
+    /// Write a ToolOutputChunk event for streaming tool output (e.g., bash lines).
+    pub fn write_tool_output_chunk(&self, tool: &str, text: &str) {
+        self.write_event(&StreamEvent::ToolOutputChunk {
+            tool: tool.to_string(),
+            text: text.to_string(),
+            timestamp_ms: now_ms(),
+        });
+    }
+
     /// Write a Heartbeat event.
     pub fn write_heartbeat(&self) {
         self.write_event(&StreamEvent::Heartbeat {
+            timestamp_ms: now_ms(),
+        });
+    }
+
+    /// Write a TextChunk event for a streaming text delta.
+    pub fn write_text_chunk(&self, text: &str) {
+        self.write_event(&StreamEvent::TextChunk {
+            text: text.to_string(),
+            timestamp_ms: now_ms(),
+        });
+    }
+
+    /// Write a ThinkingChunk event for a streaming reasoning/thinking delta.
+    pub fn write_thinking_chunk(&self, text: &str) {
+        self.write_event(&StreamEvent::ThinkingChunk {
+            text: text.to_string(),
             timestamp_ms: now_ms(),
         });
     }
@@ -258,6 +300,7 @@ pub fn translate_claude_event(line: &str) -> Option<StreamEvent> {
                     .get("cache_creation_input_tokens")
                     .or_else(|| u.get("cacheCreationInputTokens"))
                     .and_then(|v| v.as_u64()),
+                reasoning_tokens: None,
             });
 
             // Extract tool names from content blocks
@@ -411,7 +454,10 @@ impl AgentStreamState {
                 StreamEvent::ToolEnd { .. } => {
                     self.current_tool = None;
                 }
-                StreamEvent::Heartbeat { .. } => {}
+                StreamEvent::ToolOutputChunk { .. } => {}
+                StreamEvent::Heartbeat { .. }
+                | StreamEvent::TextChunk { .. }
+                | StreamEvent::ThinkingChunk { .. } => {}
                 StreamEvent::Result { usage, .. } => {
                     // Final usage overwrites accumulated
                     self.accumulated_usage = usage.clone();
@@ -453,6 +499,7 @@ pub const RAW_STREAM_FILE_NAME: &str = "raw_stream.jsonl";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CLAUDE_SONNET_MODEL_ID;
     use tempfile::TempDir;
 
     #[test]
@@ -460,7 +507,7 @@ mod tests {
         let events = vec![
             StreamEvent::Init {
                 executor_type: "claude".to_string(),
-                model: Some("claude-sonnet-4-20250514".to_string()),
+                model: Some(CLAUDE_SONNET_MODEL_ID.to_string()),
                 session_id: Some("sess-123".to_string()),
                 timestamp_ms: 1000,
             },
@@ -472,6 +519,7 @@ mod tests {
                     output_tokens: 200,
                     cache_read_input_tokens: Some(100),
                     cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 timestamp_ms: 2000,
             },
@@ -494,7 +542,7 @@ mod tests {
                     cache_read_input_tokens: Some(200),
                     cache_creation_input_tokens: Some(50),
                     cost_usd: Some(0.05),
-                    model: Some("claude-sonnet-4-20250514".to_string()),
+                    model: Some(CLAUDE_SONNET_MODEL_ID.to_string()),
                 },
                 timestamp_ms: 5000,
             },
@@ -583,8 +631,10 @@ mod tests {
 
     #[test]
     fn test_translate_claude_system_event() {
-        let line = r#"{"type":"system","session_id":"abc123","model":"claude-sonnet-4-20250514"}"#;
-        let event = translate_claude_event(line).unwrap();
+        let line = format!(
+            r#"{{"type":"system","session_id":"abc123","model":"{CLAUDE_SONNET_MODEL_ID}"}}"#
+        );
+        let event = translate_claude_event(&line).unwrap();
         match event {
             StreamEvent::Init {
                 executor_type,
@@ -593,7 +643,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(executor_type, "claude");
-                assert_eq!(model.as_deref(), Some("claude-sonnet-4-20250514"));
+                assert_eq!(model.as_deref(), Some(CLAUDE_SONNET_MODEL_ID));
                 assert_eq!(session_id.as_deref(), Some("abc123"));
             }
             _ => panic!("Expected Init event"),
@@ -623,6 +673,7 @@ mod tests {
                     output_tokens: 200,
                     cache_read_input_tokens: Some(100),
                     cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
                 }),
                 timestamp_ms: 2000,
             },
@@ -704,10 +755,12 @@ not json
         let dir = TempDir::new().unwrap();
         let raw_path = dir.path().join("raw_stream.jsonl");
 
-        let content = r#"{"type":"system","session_id":"s1","model":"claude-sonnet-4-20250514"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":100,"output_tokens":50}}}
-{"type":"result","total_cost_usd":0.01,"usage":{"input_tokens":100,"output_tokens":50}}
-"#;
+        let content = format!(
+            r#"{{"type":"system","session_id":"s1","model":"{CLAUDE_SONNET_MODEL_ID}"}}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":100,"output_tokens":50}}}}}}
+{{"type":"result","total_cost_usd":0.01,"usage":{{"input_tokens":100,"output_tokens":50}}}}
+"#
+        );
         std::fs::write(&raw_path, content).unwrap();
 
         let (events, offset) = translate_claude_stream(&raw_path, 0).unwrap();

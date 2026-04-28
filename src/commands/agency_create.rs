@@ -202,7 +202,7 @@ fn gather_project_context(workgraph_dir: &Path) -> String {
         && let Ok(content) = std::fs::read_to_string(&claude_md)
     {
         let truncated = if content.len() > 3000 {
-            &content[..3000]
+            &content[..content.floor_char_boundary(3000)]
         } else {
             &content
         };
@@ -215,7 +215,7 @@ fn gather_project_context(workgraph_dir: &Path) -> String {
         if readme.exists() {
             if let Ok(content) = std::fs::read_to_string(&readme) {
                 let truncated = if content.len() > 3000 {
-                    &content[..3000]
+                    &content[..content.floor_char_boundary(3000)]
                 } else {
                     &content
                 };

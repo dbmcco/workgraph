@@ -19,6 +19,7 @@ A role defines **what** an agent does.
 | `performance` | Aggregated evaluation scores | No (mutable) |
 | `lineage` | Evolutionary history | No (mutable) |
 | `default_context_scope` | Default context scope for tasks dispatched with this role (`clean`, `task`, `graph`, `full`) | No (mutable) |
+| `default_exec_mode` | Default execution mode for tasks with this role (`full`, `light`, `bare`, `shell`) | No (mutable) |
 
 ### Tradeoff
 
@@ -73,19 +74,19 @@ For display, IDs are shown as 8-character prefixes (e.g. `a3f7c21d`). All comman
 
 ## The Full Agency Loop
 
-The agency system runs as a loop: assign identity → execute task → evaluate → evolve. Each step can be manual or automated.
+The agency system runs as a loop: assign identity → execute task → evaluate → FLIP fidelity check → evolve. Each step can be manual or automated.
 
 ```
-┌─────────────┐     ┌───────────┐     ┌───────────┐     ┌──────────┐
-│  1. Assign  │────>│ 2. Execute│────>│3. Evaluate│────>│ 4. Evolve│
-│  identity   │     │   task    │     │  results  │     │  agency  │
-│  to task    │     │  (agent   │     │  (score   │     │  (create │
-│             │     │   runs)   │     │   agent)  │     │   new    │
-│  wg assign  │     │  wg spawn │     │ wg evaluate│    │  roles)  │
-└─────────────┘     └───────────┘     └───────────┘     └──────────┘
-       ▲                                                      │
-       └──────────────────────────────────────────────────────┘
-                    performance data feeds back
+┌─────────────┐     ┌───────────┐     ┌───────────┐     ┌──────────┐     ┌──────────┐
+│  1. Assign  │────>│ 2. Execute│────>│3. Evaluate│────>│ 4. FLIP  │────>│ 5. Evolve│
+│  identity   │     │   task    │     │  results  │     │  fidelity│     │  agency  │
+│  to task    │     │  (agent   │     │  (score   │     │  check   │     │  (create │
+│             │     │   runs)   │     │   agent)  │     │  (+verify│     │   new    │
+│  wg assign  │     │  wg spawn │     │ wg evaluate│    │  if low) │     │  roles)  │
+└─────────────┘     └───────────┘     └───────────┘     └──────────┘     └──────────┘
+       ▲                                                                      │
+       └──────────────────────────────────────────────────────────────────────┘
+                              performance data feeds back
 ```
 
 ### Manual loop
@@ -101,7 +102,7 @@ wg service start
 wg evaluate run my-task
 
 # 4. Evolve
-wg evolve
+wg evolve run
 ```
 
 ### Automated loop
@@ -116,8 +117,20 @@ wg service start
 wg add "Implement feature X" --skill rust
 
 # Evolution is still manual (run when you have enough evaluations):
-wg evolve
+wg evolve run
 ```
+
+Additional automation options:
+
+```bash
+# Auto-place new tasks in the graph (coordinator creates .place-* meta-tasks)
+wg config --auto-place true
+
+# Auto-create new primitives when the store needs expansion
+wg config --auto-create true
+```
+
+When `auto_place` is enabled, the coordinator creates `.place-*` tasks for newly added tasks to determine optimal graph wiring. When `auto_create` is enabled, the coordinator invokes the creator agent to discover and add new primitives after a configurable number of completed tasks (`auto_create_threshold`, default: 20).
 
 ## Lifecycle
 
@@ -264,15 +277,109 @@ Scores propagate to three levels:
 2. The **role's** performance record (with `tradeoff_id` as context)
 3. The **tradeoff's** performance record (with `role_id` as context)
 
+### 4b. FLIP — Fidelity via Latent Intent Probing
+
+FLIP is a **roundtrip intent fidelity** metric that complements standard evaluation. While evaluation judges *quality* (was the approach good?), FLIP judges *fidelity* (did the output match what was asked?).
+
+#### How it works
+
+FLIP runs in two phases:
+
+1. **Inference phase** (sonnet): An LLM reads *only* the agent's output (logs, artifacts, diffs) and reconstructs what the original task prompt must have been — without seeing the actual task description.
+2. **Comparison phase** (haiku): A second LLM compares the inferred prompt to the actual task description, scoring similarity across four dimensions.
+
+The resulting `flip_score` (0.0–1.0) measures whether the agent's output faithfully reflects the task spec. High FLIP = output clearly reflects the task. Low FLIP = agent went off-track.
+
+#### FLIP dimensions
+
+| Dimension | Description |
+|-----------|-------------|
+| `semantic_match` | How closely the inferred intent matches the actual task |
+| `requirement_coverage` | What fraction of requirements are reflected in the output |
+| `specificity_match` | Whether the output addresses task-specific details vs. generic work |
+| `hallucination_rate` | How much of the output addresses things *not* in the task spec |
+
+#### FLIP vs evaluation
+
+FLIP and evaluation are independent — they measure different things and should not be merged into a single score:
+
+- **High quality + low fidelity** = well-crafted code that doesn't match the spec
+- **Low quality + high fidelity** = sloppy code that does what was asked
+- **Both high** = ideal
+- **Both low** = needs rework
+
+#### Low-FLIP verification
+
+When a FLIP score falls below the configured threshold (default: 0.70), the coordinator automatically creates a `.verify-flip-{task-id}` task. This task uses a high-capability model (default: opus) to independently verify whether the work was actually completed correctly.
+
+The verification task receives the original task description, the agent's output, and the low FLIP score, then makes a pass/fail determination.
+
+#### Running FLIP
+
+FLIP runs automatically as part of the `.evaluate-*` task when enabled:
+
+```bash
+# Enable globally
+wg config --flip-enabled true
+
+# Or tag individual tasks for FLIP evaluation
+wg add "My task" --tag flip-eval
+
+# Run manually
+wg evaluate run <task-id> --flip
+wg evaluate run <task-id> --flip --dry-run    # preview the prompts
+```
+
+FLIP evaluations are stored with `source: "flip"` in the evaluations directory, separate from standard evaluations.
+
+#### Per-role model routing
+
+FLIP uses different models for each phase, configured via the model routing system:
+
+| Role | Default model | Rationale |
+|------|---------------|-----------|
+| `flip_inference` | sonnet | Creative reconstruction requires mid-tier capability |
+| `flip_comparison` | haiku | Comparison/scoring is simpler, cost-effective |
+| `verification` | opus | Independent verification needs highest capability |
+
+Configure via `[models]` in config.toml:
+
+```toml
+[models.flip_inference]
+model = "sonnet"
+
+[models.flip_comparison]
+model = "haiku"
+
+[models.verification]
+model = "opus"
+```
+
+#### Pipeline integration
+
+FLIP fits into the coordinator tick as follows:
+
+```
+Phase 4:   Task completes -> .evaluate-* created
+           Eval script runs standard eval, then FLIP (non-fatal)
+Phase 4.5: If FLIP score < threshold -> .verify-flip-* created
+Phase 4.6: Auto-evolve (if enabled)
+```
+
 ### 5. Evolve
 
 Use performance data to improve the agency:
 
 ```bash
-wg evolve                                     # full cycle, all strategies
-wg evolve --strategy mutation --budget 3      # targeted changes
-wg evolve --model opus                        # use specific model
-wg evolve --dry-run                           # preview without applying
+wg evolve run                                     # full cycle, all strategies
+wg evolve run --strategy mutation --budget 3      # targeted changes
+wg evolve run --model opus                        # use specific model
+wg evolve run --dry-run                           # preview without applying
+wg evolve run --autopoietic                       # enable autopoietic cycle mode
+wg evolve run --autopoietic --max-iterations 5    # cycle with custom iteration limit (default: 3)
+wg evolve run --autopoietic --cycle-delay 1800    # custom delay between iterations (default: 3600s)
+wg evolve run --force-fanout                      # force fan-out mode even with <50 evaluations
+wg evolve run --single-shot                       # force legacy single-shot mode even with ≥50 evaluations
 ```
 
 ## CLI Reference
@@ -322,11 +429,32 @@ wg evolve --dry-run                           # preview without applying
 | `--trust-level <LEVEL>` | `verified`, `provisional`, or `unknown` |
 | `--contact <STRING>` | Contact info (email, Matrix ID, etc.) |
 | `--executor <NAME>` | Executor backend: `claude` (default), `matrix`, `email`, `shell` |
+| `--model <MODEL>` | Preferred model (e.g., `opus`, `sonnet`, `haiku`, or full model ID) |
+| `--provider <PROVIDER>` | Preferred provider (e.g., `anthropic`, `openrouter`) |
+
+### `wg agency`
+
+| Command | Description |
+|---------|-------------|
+| `wg agency init` | Seed agency with starter roles and tradeoffs |
+| `wg agency stats [--min-evals <N>] [--by-model] [--by-task-type]` | Show agency performance analytics |
+| `wg agency create [--model <MODEL>] [--dry-run]` | Invoke the creator agent to discover and add new primitives |
+| `wg agency import [CSV_PATH] [--url <URL>] [--upstream] [--dry-run] [--tag <TAG>] [--force] [--check]` | Import Agency starter.csv primitives into WorkGraph |
+| `wg agency migrate [--dry-run]` | Migrate old-format agency store to primitive+cache format |
+| `wg agency deferred` | List pending deferred evolver operations (alias for `wg evolve review list`) |
+| `wg agency approve <id>` | Approve a deferred operation (alias for `wg evolve review approve`) |
+| `wg agency reject <id>` | Reject a deferred operation (alias for `wg evolve review reject`) |
+| `wg agency scan <root-dir> [--max-depth <N>]` | Scan filesystem for agency stores |
+| `wg agency remote add\|list\|show\|remove` | Manage named references to other agency stores |
+| `wg agency pull <source> [OPTIONS]` | Pull entities from another store |
+| `wg agency push <target> [OPTIONS]` | Push local entities to another store |
+| `wg agency merge <source1> <source2> ... [OPTIONS]` | Merge entities from multiple stores |
 
 ### `wg assign`
 
 ```bash
 wg assign <task-id> <agent-hash>    # assign agent to task
+wg assign <task-id> --auto          # automatically select an agent using LLM
 wg assign <task-id> --clear         # remove assignment
 ```
 
@@ -347,21 +475,11 @@ wg evaluate show [--task <id>] [--agent <id>] [--source <glob>] [--limit <N>]
 ### `wg evolve`
 
 ```bash
-wg evolve [--strategy <name>] [--budget <N>] [--model <model>] [--dry-run]
+wg evolve run [--strategy <name>] [--budget <N>] [--model <model>] [--dry-run]
+              [--autopoietic] [--max-iterations <N>] [--cycle-delay <secs>]
+              [--force-fanout] [--single-shot]
+wg evolve apply <synthesis-file> [-o <output>]   # apply a synthesis-result.json from a fan-out run
 ```
-
-### `wg agency stats`
-
-```bash
-wg agency stats [--min-evals <N>] [--by-model]
-```
-
-Shows: role leaderboard, tradeoff leaderboard, synergy matrix, tag breakdown, under-explored combinations.
-
-| Flag | Description |
-|------|-------------|
-| `--min-evals <N>` | Minimum evaluations to consider a pair "explored" (default: 3) |
-| `--by-model` | Group stats by model, showing per-model score breakdown |
 
 ## Skill System
 
@@ -399,6 +517,22 @@ Skill content embedded directly.
 wg role add "Writer" --skill "tone:inline:Write in a clear, technical style" --outcome "Documentation"
 ```
 
+### Installing skills
+
+The workgraph skill can be installed as a Claude Code skill:
+
+```bash
+wg skill install     # installs to ~/.claude/skills/wg/
+```
+
+Other skill management commands:
+
+```bash
+wg skill list                # list all skills used across tasks
+wg skill task <task-id>      # show skills for a specific task
+wg skill find <skill-name>   # find tasks requiring a specific skill
+```
+
 ### Resolution
 
 When a task is dispatched with an agent identity, all skill references on the role are resolved:
@@ -422,20 +556,49 @@ The evolution system improves agency performance by analyzing evaluation data an
 | `gap-analysis` | Create entirely new roles/tradeoffs for unmet needs |
 | `retirement` | Remove consistently poor-performing roles/tradeoffs |
 | `tradeoff-tuning` | Adjust trade-offs and constraints on existing tradeoffs |
+| `component-mutation` | Mutate individual components (skills, outcomes, tradeoffs) at the primitive level |
+| `randomisation` | Randomly compose new roles or agents from existing primitives |
+| `bizarre-ideation` | Generate novel primitives via creative/divergent prompting |
+| `coordinator` | Evolve coordinator prompt files (`evolved-amendments.md`, `common-patterns.md`) |
 | `all` | Use all strategies as appropriate (default) |
 
 ### Operations
 
-The evolver outputs structured JSON operations:
+The evolver outputs structured JSON operations. These span three levels of the agency hierarchy:
+
+**Legacy (role/motivation level):**
 
 | Operation | Effect |
 |-----------|--------|
 | `create_role` | Creates a new role (typically from gap-analysis) |
 | `modify_role` | Mutates or crosses over an existing role into a new one |
-| `create_tradeoff` | Creates a new tradeoff |
-| `modify_tradeoff` | Tunes an existing tradeoff into a new variant |
+| `create_motivation` | Creates a new tradeoff/motivation |
+| `modify_motivation` | Tunes an existing tradeoff into a new variant |
 | `retire_role` | Retires a poor-performing role (renamed to `.yaml.retired`) |
-| `retire_tradeoff` | Retires a poor-performing tradeoff |
+| `retire_motivation` | Retires a poor-performing tradeoff |
+
+**Primitive-level mutations:**
+
+| Operation | Effect |
+|-----------|--------|
+| `wording_mutation` | Rewrites description/content of a component, tradeoff, or outcome |
+| `component_substitution` | Swaps one component for another in a role |
+| `config_add_component` | Adds a component to an existing role |
+| `config_remove_component` | Removes a component from an existing role |
+| `config_swap_outcome` | Changes which outcome a role targets (deferred for approval) |
+| `config_swap_tradeoff` | Changes which tradeoff an agent uses |
+| `random_compose_role` | Randomly assembles a role from existing components |
+| `random_compose_agent` | Randomly assembles an agent from existing role + tradeoff |
+| `bizarre_ideation` | Generates a novel primitive via creative divergent prompting |
+
+**Meta-agent operations (coordinator-level):**
+
+| Operation | Effect |
+|-----------|--------|
+| `meta_swap_role` | Change which role a meta-agent (assigner/evaluator/evolver) uses |
+| `meta_swap_tradeoff` | Change which tradeoff a meta-agent uses |
+| `meta_compose_agent` | Compose a new agent for a meta-agent slot from scratch |
+| `modify_coordinator_prompt` | Modify mutable coordinator prompt files (`evolved-amendments.md`, `common-patterns.md`) |
 
 ### Safety guardrails
 
@@ -443,6 +606,61 @@ The evolver outputs structured JSON operations:
 - Retired entities are preserved as `.yaml.retired` files, not deleted
 - `--dry-run` shows the full evolver prompt without making changes
 - `--budget` limits the number of operations applied
+
+### Deferred operations
+
+Some operations are too impactful to apply immediately. The evolver automatically defers operations that require human approval:
+
+- **Objective changes** (`config_swap_outcome`, or `wording_mutation` on outcomes with `requires_human_oversight`) — changing a role's target outcome changes what "success" means
+- **Bizarre objectives** (`bizarre_ideation` targeting outcomes) — novel outcomes generated via divergent prompting need human review
+- **Protected objectives** — outcomes marked with the `requires_human_oversight` flag in their YAML, or referenced by `random_compose_role`
+- **Self-mutation** — operations targeting the evolver's own role or tradeoff (creates a review task in the graph rather than a deferred-ops file)
+
+Deferred operations are saved to `.workgraph/agency/deferred/` and can be managed with:
+
+```bash
+wg evolve review list              # view pending deferred operations
+wg evolve review approve <id>      # approve and apply a deferred operation
+wg evolve review reject <id>       # reject and discard
+```
+
+### Coordinator prompt evolution
+
+The evolver can modify the coordinator agent's behavior by writing to mutable prompt files in `.workgraph/agency/coordinator-prompt/`:
+
+| File | Mutability | Purpose |
+|------|-----------|---------|
+| `base-system-prompt.md` | Immutable | Core coordinator instructions |
+| `behavioral-rules.md` | Immutable | Safety and behavioral constraints |
+| `evolved-amendments.md` | **Mutable** | Evolver-written rules and heuristics |
+| `common-patterns.md` | **Mutable** | Evolver-written examples and patterns |
+
+The `evolved-amendments.md` file is the primary output of coordinator prompt evolution — the evolver appends learned rules and heuristics based on evaluation data.
+
+### Auto-evolve infrastructure
+
+The coordinator can automatically trigger evolution cycles when sufficient evaluation data accumulates. This is opt-in:
+
+```bash
+wg config --auto-evolve true
+```
+
+When enabled, the coordinator's Phase 4.6 checks two triggers:
+
+1. **Threshold trigger**: New evaluations since last evolution exceed `evolution_threshold` (default: 10)
+2. **Reactive trigger**: Performance has dropped below `evolution_reactive_threshold`
+
+The coordinator creates a `.evolve-*` meta-task that runs `wg evolve run` with the configured budget. A minimum interval (`evolution_interval`, default: 7200 seconds / 2 hours) prevents evolution from running too frequently.
+
+Configuration:
+
+```toml
+[agency]
+auto_evolve = false              # enable auto-evolution (default: false)
+evolution_interval = 7200        # minimum seconds between cycles (default: 2h)
+evolution_threshold = 10         # new evals needed to trigger (default: 10)
+evolution_budget = 5             # max operations per cycle (default: 5)
+```
 
 ### Evolver identity and meta-agent configuration
 
@@ -483,7 +701,10 @@ Strategy-specific guidance documents live in `.workgraph/agency/evolver-skills/`
 - `role-crossover.md` — procedures for combining two roles
 - `gap-analysis.md` — procedures for identifying missing capabilities
 - `retirement.md` — procedures for removing underperformers
-- `tradeoff-tuning.md` — procedures for adjusting trade-offs
+- `motivation-tuning.md` — procedures for adjusting trade-offs
+- `component-mutation.md` — procedures for mutating individual primitives
+- `randomisation.md` — procedures for random composition
+- `bizarre-ideation.md` — procedures for divergent creative generation
 
 ## Performance Tracking
 
@@ -552,22 +773,46 @@ wg agent lineage <id>        # shows agent + role + tradeoff ancestry
 
 ```
 .workgraph/agency/
-├── roles/
-│   ├── <sha256>.yaml            # Role definitions
-│   └── <sha256>.yaml.retired    # Retired roles
-├── tradeoffs/
-│   ├── <sha256>.yaml            # Tradeoff definitions
-│   └── <sha256>.yaml.retired    # Retired tradeoffs
-├── agents/
-│   └── <sha256>.yaml            # Agent definitions (role+tradeoff pairs)
+├── primitives/
+│   ├── components/              # Skill components (atomic capabilities)
+│   │   └── <sha256>.yaml
+│   ├── outcomes/                # Desired outcomes
+│   │   └── <sha256>.yaml
+│   └── tradeoffs/               # Tradeoff definitions
+│       ├── <sha256>.yaml
+│       └── <sha256>.yaml.retired
+├── cache/
+│   ├── roles/                   # Composed roles (component_ids + outcome_id)
+│   │   ├── <sha256>.yaml
+│   │   └── <sha256>.yaml.retired
+│   └── agents/                  # Agent definitions (role + tradeoff pairs)
+│       └── <sha256>.yaml
+├── assignments/                 # Task-to-agent assignment records
+│   └── <task-id>.yaml
 ├── evaluations/
-│   └── eval-<task-id>-<timestamp>.json  # Evaluation records
-└── evolver-skills/
-    ├── role-mutation.md
-    ├── role-crossover.md
-    ├── gap-analysis.md
-    ├── retirement.md
-    └── tradeoff-tuning.md
+│   ├── eval-<task-id>-<timestamp>.json   # Standard evaluations (source: "llm")
+│   └── flip-<task-id>-<timestamp>.json   # FLIP evaluations (source: "flip")
+├── org-evaluations/             # Organization-level evaluations
+│   └── org-eval-<task-id>-<timestamp>.json
+├── evolution_runs/              # Evolution run history
+│   └── evo-<date>.json
+├── evolver-skills/              # Strategy-specific guidance documents
+│   ├── role-mutation.md
+│   ├── role-crossover.md
+│   ├── gap-analysis.md
+│   ├── retirement.md
+│   ├── motivation-tuning.md
+│   ├── component-mutation.md
+│   ├── randomisation.md
+│   └── bizarre-ideation.md
+├── coordinator-prompt/          # Coordinator prompt files
+│   ├── base-system-prompt.md    # (immutable)
+│   ├── behavioral-rules.md      # (immutable)
+│   ├── evolved-amendments.md    # (mutable — evolver-written rules)
+│   └── common-patterns.md       # (mutable — evolver-written examples)
+├── deferred/                    # Deferred evolution operations awaiting approval
+│   └── <op-id>.json
+└── creator_state.json           # Auto-create tracking (last count, timestamp)
 ```
 
 Roles, tradeoffs, and agents are stored as YAML. Evaluations are stored as JSON. All filenames are based on the entity's content-hash ID.
@@ -623,12 +868,28 @@ wg agency merge <source1> <source2> --dry-run        # preview
 
 For the full federation design (conflict resolution, global store, trust propagation), see `docs/design/agency-federation.md`.
 
+## Provider Profiles
+
+Provider profiles (`wg profile`) define model tier presets that affect how agency meta-agents resolve their models. When a profile is active, tier names like `opus`, `sonnet`, and `haiku` in the agency configuration map to provider-specific model IDs.
+
+```bash
+wg profile list                   # list available profiles
+wg profile show                   # show current profile and resolved model mappings
+wg profile set <name>             # activate a profile
+wg profile refresh                # refresh model data and recompute rankings
+```
+
+For example, with an OpenRouter profile active, `evaluator_model = "haiku"` resolves to the best-available haiku-tier model on OpenRouter rather than the default Anthropic endpoint.
+
 ## Configuration Reference
 
 ```toml
 [agency]
 auto_evaluate = false              # auto-create evaluation tasks on completion
 auto_assign = false                # auto-create assignment tasks for ready work
+auto_place = false                 # auto-place new tasks in the graph via .place-* tasks
+auto_create = false                # auto-invoke creator agent for new primitives
+auto_create_threshold = 20         # completed tasks before triggering creator again
 auto_triage = false                # auto-triage dead agents before respawning
 assigner_model = "haiku"           # model for assigner agents
 evaluator_model = "haiku"          # model for evaluator agents
@@ -639,15 +900,61 @@ assigner_agent = ""                # content-hash of assigner agent
 evaluator_agent = ""               # content-hash of evaluator agent
 evolver_agent = ""                 # content-hash of evolver agent
 creator_agent = ""                 # content-hash of agent-creator agent
+placer_agent = ""                  # content-hash of placer agent
 retention_heuristics = ""          # prose policy for retirement decisions
 triage_timeout = 30                # timeout in seconds for triage calls
 triage_max_log_bytes = 50000       # max bytes of agent log to read for triage
+auto_assign_grace_seconds = 10    # seconds after task creation before auto-assign eligible
+
+# Evaluation gate settings
+eval_gate_threshold = 0.7         # evaluations below this score reject the task (None = disabled)
+eval_gate_all = false             # apply eval gate to ALL tasks, not just those tagged 'eval-gate'
+
+# FLIP settings
+flip_enabled = true                # enable FLIP fidelity evaluation (default: true)
+flip_inference_model = "sonnet"   # model for FLIP inference phase (reconstructing prompt)
+flip_comparison_model = "haiku"   # model for FLIP comparison phase (scoring similarity)
+flip_verification_threshold = 0.7  # FLIP score below this triggers verification
+flip_verification_model = "opus"  # model for FLIP-triggered verification agents
+
+# Auto-evolve settings
+auto_evolve = false                # enable automatic evolution cycles
+evolution_interval = 7200          # minimum seconds between cycles (default: 2h)
+evolution_threshold = 10           # new evals needed to trigger (default: 10)
+evolution_budget = 5               # max operations per auto-evolve cycle
+evolution_reactive_threshold = 0.4 # avg score below this triggers reactive evolution
+
+# Learning/exploration settings
+exploration_interval = 20         # force learning assignment every N tasks (0 = disabled)
+cache_population_threshold = 0.8  # score threshold for populating composition cache
+ucb_exploration_constant = 1.414  # UCB exploration constant C for primitive selection
+novelty_bonus_multiplier = 1.5    # multiplier for low-attractor-weight primitives
+bizarre_ideation_interval = 10    # force bizarre ideation every N learning assignments (0 = disabled)
+
+# Agency server integration
+agency_server_url = ""            # URL of Agency server for evaluation feedback (empty = disabled)
+agency_token_path = ""            # path to file containing Agency API token
+agency_project_id = ""            # project ID on the Agency server
+assignment_source = ""            # default assignment source label (e.g. "native", "agency")
+upstream_url = ""                 # URL for upstream agency bureau CSV (used by `wg agency import --upstream`)
+
+# Per-role model routing (alternative to legacy model fields above)
+[models.flip_inference]
+model = "sonnet"                   # model for FLIP inference phase
+
+[models.flip_comparison]
+model = "haiku"                    # model for FLIP comparison phase
+
+[models.verification]
+model = "opus"                     # model for FLIP-triggered verification
 ```
 
 ```bash
 # CLI equivalents
 wg config --auto-evaluate true
 wg config --auto-assign true
+wg config --auto-place true
+wg config --auto-create true
 wg config --auto-triage true
 wg config --assigner-model haiku
 wg config --evaluator-model opus
@@ -661,4 +968,12 @@ wg config --creator-agent abc123
 wg config --retention-heuristics "Retire roles scoring below 0.3 after 10 evaluations"
 wg config --triage-timeout 30
 wg config --triage-max-log-bytes 50000
+wg config --eval-gate-threshold 0.7
+wg config --eval-gate-all true
+wg config --flip-enabled true
+wg config --flip-inference-model sonnet
+wg config --flip-comparison-model haiku
+wg config --flip-verification-threshold 0.7
+wg config --flip-verification-model opus
+wg config --auto-evolve true
 ```

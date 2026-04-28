@@ -1,33 +1,72 @@
+// Pre-existing clippy lints surfaced by rust 1.95 that weren't in
+// 1.93. Allowed crate-wide while we decide whether to refactor each
+// site individually. Not caused by the sessions-as-identity rollout
+// work; CI was red before Phase 1 started.
+#![allow(clippy::while_let_loop)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_else_if)]
+
+// Self-alias so `use workgraph::` paths in #[path]-included command modules
+// resolve correctly when compiled as part of the library crate.
+#[cfg(feature = "test-support")]
+extern crate self as workgraph;
+
 pub mod agency;
 pub mod chat;
+pub mod chat_id;
+pub mod chat_sessions;
 pub mod check;
 pub mod config;
+pub mod config_defaults;
 pub mod context_scope;
+pub mod cron;
 pub mod cycle;
+pub mod dispatch;
 pub mod executor;
+pub mod executor_discovery;
 pub mod federation;
 pub mod function;
 pub mod function_memory;
 pub mod graph;
 pub mod json_extract;
+pub mod launcher_history;
+pub mod lifecycle;
+pub mod markdown;
 #[cfg(feature = "matrix")]
 pub mod matrix;
 pub mod matrix_commands;
 #[cfg(feature = "matrix-lite")]
 pub mod matrix_lite;
 pub mod messages;
+pub mod metrics;
+pub mod model_benchmarks;
 pub mod models;
 pub mod notify;
 pub mod parser;
 pub mod plan_validator;
+pub mod profile;
 pub mod provenance;
 pub mod query;
+pub mod registry {
+    pub use crate::service::registry::AgentEntry as Agent;
+    pub use crate::service::registry::AgentRegistry as Registry;
+    pub use crate::service::registry::AgentStatus;
+}
 pub mod runs;
 pub mod service;
 pub mod session_lock;
+pub mod smoke;
 pub mod stream_event;
+pub mod syntect_convert;
 pub mod telegram_commands;
 pub mod usage;
+pub mod vendor_history;
+pub mod verify_lint;
 
 pub use config::MatrixConfig;
 pub use graph::WorkGraph;
@@ -51,14 +90,28 @@ pub use matrix_lite::{
     IncomingMessage as IncomingMessageLite, MatrixClient as MatrixClientLite, send_notification,
     send_notification_to_room,
 };
-pub use parser::{
-    load_graph, load_graph_locked, lock_graph_file, mutate_graph, save_graph, save_graph_locked,
-    GraphLock,
-};
+pub use parser::{load_graph, modify_graph, save_graph};
 pub use service::{AgentEntry, AgentRegistry, AgentStatus};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_helpers;
+
+#[cfg(feature = "test-support")]
+pub mod commands {
+    pub mod service {
+        pub mod worktree;
+    }
+    pub mod codex_oai_compat;
+}
+
+/// Return the current user identity.
+///
+/// Fallback chain: `WG_USER` env var → `USER` env var → `"unknown"`.
+pub fn current_user() -> String {
+    std::env::var("WG_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
 
 /// Format a duration in seconds to a human-readable string.
 ///
@@ -162,5 +215,76 @@ mod tests {
         assert_eq!(format_duration(119, false), "1m 59s");
         assert_eq!(format_duration(120, false), "2m");
         assert_eq!(format_duration(0, true), "0s");
+    }
+
+    // Mutex to serialize tests that mutate env vars (process-global state).
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_current_user_returns_wg_user_when_set() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_wg = std::env::var("WG_USER").ok();
+            let orig_user = std::env::var("USER").ok();
+
+            std::env::set_var("WG_USER", "alice");
+            assert_eq!(current_user(), "alice");
+
+            // Restore
+            match orig_wg {
+                Some(v) => std::env::set_var("WG_USER", v),
+                None => std::env::remove_var("WG_USER"),
+            }
+            match orig_user {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_current_user_falls_back_to_user_env() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_wg = std::env::var("WG_USER").ok();
+            let orig_user = std::env::var("USER").ok();
+
+            std::env::remove_var("WG_USER");
+            std::env::set_var("USER", "bob");
+            assert_eq!(current_user(), "bob");
+
+            // Restore
+            match orig_wg {
+                Some(v) => std::env::set_var("WG_USER", v),
+                None => std::env::remove_var("WG_USER"),
+            }
+            match orig_user {
+                Some(v) => std::env::set_var("USER", v),
+                None => std::env::remove_var("USER"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_current_user_returns_unknown_when_neither_set() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        unsafe {
+            let orig_wg = std::env::var("WG_USER").ok();
+            let orig_user = std::env::var("USER").ok();
+
+            std::env::remove_var("WG_USER");
+            std::env::remove_var("USER");
+            assert_eq!(current_user(), "unknown");
+
+            // Restore
+            match orig_wg {
+                Some(v) => std::env::set_var("WG_USER", v),
+                None => {}
+            }
+            match orig_user {
+                Some(v) => std::env::set_var("USER", v),
+                None => {}
+            }
+        }
     }
 }

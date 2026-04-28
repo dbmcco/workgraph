@@ -81,16 +81,20 @@ impl Bundle {
         }
     }
 
-    /// Built-in "research" bundle: read-only file access + wg tools.
+    /// Built-in "research" bundle: read-only file access + wg tools + bg + web (no delegate).
     pub fn research() -> Self {
         Bundle {
             name: "research".to_string(),
-            description: "Read-only research agent.".to_string(),
+            description: "Read-only research agent with background tasks and web access."
+                .to_string(),
             tools: vec![
                 "read_file".to_string(),
                 "glob".to_string(),
                 "grep".to_string(),
                 "bash".to_string(),
+                "bg".to_string(),
+                "web_search".to_string(),
+                "web_fetch".to_string(),
                 "wg_show".to_string(),
                 "wg_list".to_string(),
                 "wg_add".to_string(),
@@ -101,6 +105,28 @@ impl Bundle {
             ],
             context_scope: "graph".to_string(),
             system_prompt_suffix: "You are a research agent. Report findings, do not modify files."
+                .to_string(),
+        }
+    }
+
+    /// Built-in "shell" bundle: bash + bg + wg tools only.
+    pub fn shell() -> Self {
+        Bundle {
+            name: "shell".to_string(),
+            description: "Shell executor agent with bash and background tasks.".to_string(),
+            tools: vec![
+                "bash".to_string(),
+                "bg".to_string(),
+                "wg_show".to_string(),
+                "wg_list".to_string(),
+                "wg_add".to_string(),
+                "wg_done".to_string(),
+                "wg_fail".to_string(),
+                "wg_log".to_string(),
+                "wg_artifact".to_string(),
+            ],
+            context_scope: "task".to_string(),
+            system_prompt_suffix: "You are a shell agent. Use bash and bg for task execution."
                 .to_string(),
         }
     }
@@ -124,13 +150,13 @@ impl Bundle {
 /// 2. Fall back to built-in defaults.
 ///
 /// Exec mode → bundle mapping:
-/// - "shell" → None (shell executor doesn't use bundles)
+/// - "shell" → shell bundle (bash + bg + wg)
 /// - "bare"  → bare bundle (wg tools only)
-/// - "light" → research bundle (read-only + wg)
+/// - "light" → research bundle (read-only + bg + web + wg)
 /// - "full"  → implementer bundle (all tools)
 pub fn resolve_bundle(exec_mode: &str, workgraph_dir: &Path) -> Option<Bundle> {
     let bundle_name = match exec_mode {
-        "shell" => return None,
+        "shell" => "shell",
         "bare" => "bare",
         "light" => "research",
         "full" => "implementer",
@@ -157,6 +183,7 @@ pub fn resolve_bundle(exec_mode: &str, workgraph_dir: &Path) -> Option<Bundle> {
     // Fall back to built-in defaults
     match bundle_name {
         "bare" => Some(Bundle::bare()),
+        "shell" => Some(Bundle::shell()),
         "research" => Some(Bundle::research()),
         "implementer" => Some(Bundle::implementer()),
         _ => {
@@ -206,6 +233,7 @@ pub fn ensure_default_bundles(workgraph_dir: &Path) -> Result<()> {
 
     let defaults = [
         ("bare.toml", Bundle::bare()),
+        ("shell.toml", Bundle::shell()),
         ("research.toml", Bundle::research()),
         ("implementer.toml", Bundle::implementer()),
     ];
@@ -259,7 +287,13 @@ mod tests {
     #[test]
     fn test_resolve_bundle_shell() {
         let tmp = TempDir::new().unwrap();
-        assert!(resolve_bundle("shell", tmp.path()).is_none());
+        let bundle = resolve_bundle("shell", tmp.path()).unwrap();
+        assert_eq!(bundle.name, "shell");
+        assert!(bundle.tools.contains(&"bash".to_string()));
+        assert!(bundle.tools.contains(&"bg".to_string()));
+        assert!(!bundle.tools.contains(&"read_file".to_string()));
+        assert!(!bundle.tools.contains(&"web_search".to_string()));
+        assert!(!bundle.tools.contains(&"delegate".to_string()));
     }
 
     #[test]
@@ -334,6 +368,7 @@ context_scope = "graph"
 
         let bundles_dir = tmp.path().join("bundles");
         assert!(bundles_dir.join("bare.toml").exists());
+        assert!(bundles_dir.join("shell.toml").exists());
         assert!(bundles_dir.join("research.toml").exists());
         assert!(bundles_dir.join("implementer.toml").exists());
 
@@ -396,7 +431,7 @@ context_scope = "graph"
         ensure_default_bundles(tmp.path()).unwrap();
 
         let bundles = load_all_bundles(tmp.path());
-        assert_eq!(bundles.len(), 3);
+        assert_eq!(bundles.len(), 4);
     }
 
     #[test]
@@ -404,5 +439,162 @@ context_scope = "graph"
         let tmp = TempDir::new().unwrap();
         let bundles = load_all_bundles(tmp.path());
         assert!(bundles.is_empty());
+    }
+
+    #[test]
+    fn test_bundle_research_has_bg_and_web() {
+        let bundle = Bundle::research();
+        assert!(
+            bundle.tools.contains(&"bg".to_string()),
+            "research should include bg"
+        );
+        assert!(
+            bundle.tools.contains(&"web_search".to_string()),
+            "research should include web_search"
+        );
+        assert!(
+            bundle.tools.contains(&"web_fetch".to_string()),
+            "research should include web_fetch"
+        );
+        assert!(
+            !bundle.tools.contains(&"delegate".to_string()),
+            "research should NOT include delegate"
+        );
+    }
+
+    #[test]
+    fn test_bundle_shell_has_bg_only() {
+        let bundle = Bundle::shell();
+        assert!(
+            bundle.tools.contains(&"bash".to_string()),
+            "shell should include bash"
+        );
+        assert!(
+            bundle.tools.contains(&"bg".to_string()),
+            "shell should include bg"
+        );
+        assert!(
+            !bundle.tools.contains(&"web_search".to_string()),
+            "shell should NOT include web_search"
+        );
+        assert!(
+            !bundle.tools.contains(&"web_fetch".to_string()),
+            "shell should NOT include web_fetch"
+        );
+        assert!(
+            !bundle.tools.contains(&"delegate".to_string()),
+            "shell should NOT include delegate"
+        );
+    }
+
+    #[test]
+    fn test_bundle_bare_no_new_tools() {
+        let bundle = Bundle::bare();
+        assert!(
+            !bundle.tools.contains(&"bg".to_string()),
+            "bare should NOT include bg"
+        );
+        assert!(
+            !bundle.tools.contains(&"web_search".to_string()),
+            "bare should NOT include web_search"
+        );
+        assert!(
+            !bundle.tools.contains(&"web_fetch".to_string()),
+            "bare should NOT include web_fetch"
+        );
+        assert!(
+            !bundle.tools.contains(&"delegate".to_string()),
+            "bare should NOT include delegate"
+        );
+    }
+
+    #[test]
+    fn test_bundle_implementer_allows_all() {
+        let bundle = Bundle::implementer();
+        // Implementer uses wildcard so all tools (bg, web, delegate) are included
+        assert!(bundle.allows_all());
+    }
+
+    #[test]
+    fn test_filter_registry_research_includes_bg_web() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ToolRegistry::default_all(tmp.path(), &std::env::current_dir().unwrap());
+        let bundle = Bundle::research();
+        let filtered = bundle.filter_registry(registry);
+        let names: Vec<String> = filtered
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"bg".to_string()),
+            "filtered research should have bg"
+        );
+        assert!(
+            names.contains(&"web_search".to_string()),
+            "filtered research should have web_search"
+        );
+        assert!(
+            names.contains(&"web_fetch".to_string()),
+            "filtered research should have web_fetch"
+        );
+        assert!(
+            !names.contains(&"delegate".to_string()),
+            "filtered research should NOT have delegate"
+        );
+    }
+
+    #[test]
+    fn test_filter_registry_shell_includes_bg() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ToolRegistry::default_all(tmp.path(), &std::env::current_dir().unwrap());
+        let bundle = Bundle::shell();
+        let filtered = bundle.filter_registry(registry);
+        let names: Vec<String> = filtered
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"bash".to_string()),
+            "filtered shell should have bash"
+        );
+        assert!(
+            names.contains(&"bg".to_string()),
+            "filtered shell should have bg"
+        );
+        assert!(
+            !names.contains(&"web_search".to_string()),
+            "filtered shell should NOT have web_search"
+        );
+        assert!(
+            !names.contains(&"delegate".to_string()),
+            "filtered shell should NOT have delegate"
+        );
+    }
+
+    #[test]
+    fn test_filter_registry_bare_no_new_tools() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ToolRegistry::default_all(tmp.path(), &std::env::current_dir().unwrap());
+        let bundle = Bundle::bare();
+        let filtered = bundle.filter_registry(registry);
+        let names: Vec<String> = filtered
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"bg".to_string()),
+            "filtered bare should NOT have bg"
+        );
+        assert!(
+            !names.contains(&"web_search".to_string()),
+            "filtered bare should NOT have web_search"
+        );
+        assert!(
+            !names.contains(&"delegate".to_string()),
+            "filtered bare should NOT have delegate"
+        );
     }
 }

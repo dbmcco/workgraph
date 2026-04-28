@@ -10,6 +10,16 @@ use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, parse_token_usage_li
 // Re-export public API
 pub use graph::{generate_graph, generate_graph_with_overrides};
 
+/// Rich annotation info for a parent task, carrying both the display text
+/// and the dot-task IDs that produced it (for click resolution in the TUI).
+#[derive(Debug, Clone)]
+pub struct AnnotationInfo {
+    /// The rendered annotation text (e.g. "[⊞ assigning]").
+    pub text: String,
+    /// The system task IDs that contributed to this annotation (e.g. [".assign-my-task"]).
+    pub dot_task_ids: Vec<String>,
+}
+
 /// Structured output from viz generation, containing both the rendered string
 /// and metadata needed for interactive features (e.g., TUI task selection).
 pub struct VizOutput {
@@ -33,6 +43,9 @@ pub struct VizOutput {
     /// Cycle membership: task_id → set of all task IDs in the same SCC.
     /// Only populated for tasks that are in non-trivial SCCs (>1 member).
     pub cycle_members: HashMap<String, HashSet<String>>,
+    /// Phase annotation info per parent task ID, carrying display text and
+    /// the dot-task IDs that produced the annotation (for TUI click resolution).
+    pub annotation_map: HashMap<String, AnnotationInfo>,
 }
 
 /// Output format for visualization
@@ -103,6 +116,8 @@ pub struct VizOptions {
     pub output: Option<String>,
     /// Show internal tasks (assign-*, evaluate-*) that are normally hidden
     pub show_internal: bool,
+    /// Show only internal tasks that are currently running (in-progress/open)
+    pub show_internal_running_only: bool,
     /// Focus on specific task IDs — show only their containing subgraphs
     pub focus: Vec<String>,
     /// TUI mode: sort subgraphs by most-recently-updated first (LRU ordering)
@@ -114,6 +129,8 @@ pub struct VizOptions {
     pub tags: Vec<String>,
     /// Edge color style: "gray", "white", or "mixed"
     pub edge_color: String,
+    /// Maximum output width in columns (None = no limit)
+    pub max_columns: Option<u16>,
 }
 
 impl Default for VizOptions {
@@ -125,40 +142,94 @@ impl Default for VizOptions {
             format: OutputFormat::Ascii,
             output: None,
             show_internal: false,
+            show_internal_running_only: false,
             focus: Vec::new(),
             tui_mode: false,
             layout: LayoutMode::default(),
             tags: Vec::new(),
             edge_color: "gray".to_string(),
+            max_columns: None,
         }
     }
 }
 
 /// Returns true if the task is an auto-generated internal task (assignment or evaluation).
+/// Chat (coordinator) tasks are exempt — always visible.
 fn is_internal_task(task: &Task) -> bool {
+    if task
+        .tags
+        .iter()
+        .any(|t| t == "coordinator-loop" || t == "chat-loop" || t == "user-board" || t == "evolution")
+    {
+        return false;
+    }
     workgraph::graph::is_system_task(&task.id)
-        || task.tags.iter().any(|t| t == "assignment" || t == "evaluation")
+        || task
+            .tags
+            .iter()
+            .any(|t| t == "assignment" || t == "evaluation")
+}
+
+/// Returns true if the task is a legacy coordinator task (`.coordinator-N` with `coordinator-loop` tag).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_coordinator_task(task: &Task) -> bool {
+    task.tags.iter().any(|t| t == "coordinator-loop")
+}
+
+/// Returns true if the task is any chat agent (`.chat-N` or legacy `.coordinator-N`).
+pub(crate) fn is_chat_agent_task(task: &Task) -> bool {
+    task.tags
+        .iter()
+        .any(|t| t == "chat-loop" || t == "coordinator-loop")
+}
+
+/// Returns true if the task is a legacy coordinator (`.coordinator-N` prefix).
+pub(crate) fn is_legacy_coordinator_task(task: &Task) -> bool {
+    workgraph::chat_id::is_legacy_coordinator_id(&task.id)
+}
+
+/// Returns true if a pipeline task is actively running (not just existing/pending).
+///
+/// Only `InProgress` and `PendingValidation` count as active — `Open`, `Blocked`,
+/// and `Waiting` mean the pipeline stage hasn't started yet and shouldn't be shown
+/// as an active indicator.
+fn is_pipeline_active(task: &Task) -> bool {
+    matches!(
+        task.status,
+        Status::InProgress | Status::PendingValidation | Status::PendingEval
+    )
 }
 
 /// Determine the phase annotation for a parent task based on its related internal tasks.
 ///
-/// - If an assignment task exists and is not done → "[assigning]"
-/// - If an evaluation task exists and is not done → "[evaluating]"
+/// - If an assignment task is actively running → "[assigning]"
+/// - If an evaluation task is actively running → "[evaluating]"
 fn compute_phase_annotation(internal_task: &Task) -> &'static str {
     let id = &internal_task.id;
     if id.starts_with(".assign-") || id.starts_with("assign-") {
-        "[assigning]"
+        "[⊞ assigning]"
     } else if id.starts_with(".verify-") || id.starts_with("verify-") {
-        "[verifying]"
+        "[∴ validating]"
     } else {
-        "[evaluating]"
+        "[∴ evaluating]"
     }
 }
 
 /// Extract the parent task ID from a system task ID.
 fn system_task_parent_id(id: &str) -> Option<String> {
-    for prefix in &[".assign-", ".evaluate-", ".verify-flip-", ".respond-to-",
-                     "assign-", "evaluate-", "verify-flip-", "respond-to-"] {
+    for prefix in &[
+        ".assign-",
+        ".evaluate-",
+        ".verify-",
+        ".flip-",
+        ".respond-to-",
+        ".place-", // Legacy: kept so old .place-* tasks still resolve
+        "assign-",
+        "evaluate-",
+        "verify-",
+        "flip-",
+        "respond-to-",
+    ] {
         if let Some(rest) = id.strip_prefix(prefix) {
             return Some(rest.to_string());
         }
@@ -170,13 +241,13 @@ fn system_task_parent_id(id: &str) -> Option<String> {
 ///
 /// Returns:
 /// - The filtered list of tasks (internal tasks removed)
-/// - A map of parent_task_id → phase annotation string
+/// - A map of parent_task_id → AnnotationInfo (display text + source dot-task IDs)
 pub(crate) fn filter_internal_tasks<'a>(
     _graph: &'a WorkGraph,
     tasks: Vec<&'a Task>,
-    _existing_annotations: &HashMap<String, String>,
-) -> (Vec<&'a Task>, HashMap<String, String>) {
-    let mut annotations: HashMap<String, String> = HashMap::new();
+    _existing_annotations: &HashMap<String, AnnotationInfo>,
+) -> (Vec<&'a Task>, HashMap<String, AnnotationInfo>) {
+    let mut annotations: HashMap<String, AnnotationInfo> = HashMap::new();
     let mut internal_ids: HashSet<&str> = HashSet::new();
 
     for task in &tasks {
@@ -185,13 +256,31 @@ pub(crate) fn filter_internal_tasks<'a>(
         }
         internal_ids.insert(task.id.as_str());
 
-        if let Some(pid) = system_task_parent_id(&task.id) {
-            if task.status == Status::InProgress {
-                let annotation = compute_phase_annotation(task);
-                annotations.insert(pid, annotation.to_string());
-            }
+        if let Some(pid) = system_task_parent_id(&task.id)
+            && is_pipeline_active(task)
+        {
+            let annotation = compute_phase_annotation(task);
+            annotations
+                .entry(pid)
+                .and_modify(|existing| {
+                    existing.text.push(' ');
+                    existing.text.push_str(annotation);
+                    existing.dot_task_ids.push(task.id.clone());
+                })
+                .or_insert_with(|| AnnotationInfo {
+                    text: annotation.to_string(),
+                    dot_task_ids: vec![task.id.clone()],
+                });
         }
     }
+
+    // Parent-state-driven annotations: a task in PendingEval is being evaluated
+    // for its entire pending window, regardless of whether the .evaluate-X task
+    // is currently in_progress, terminal, or hasn't been scheduled yet. Without
+    // this, the [∴ evaluating] badge flashes briefly during the evaluator's
+    // (often sub-second) active window and then disappears, even though the
+    // parent stays in PendingEval until promotion.
+    add_parent_state_annotations(&tasks, &mut annotations);
 
     // Second pass: filter out internal tasks and fix edges
     // For tasks that were blocked by internal tasks, rewire to the internal task's blockers
@@ -201,6 +290,92 @@ pub(crate) fn filter_internal_tasks<'a>(
         .collect();
 
     (filtered, annotations)
+}
+
+/// Like `filter_internal_tasks`, but keeps internal tasks that are currently running
+/// (in-progress or open). Non-running internal tasks are still filtered out.
+pub(crate) fn filter_internal_tasks_running_only<'a>(
+    _graph: &'a WorkGraph,
+    tasks: Vec<&'a Task>,
+    _existing_annotations: &HashMap<String, AnnotationInfo>,
+) -> (Vec<&'a Task>, HashMap<String, AnnotationInfo>) {
+    let mut annotations: HashMap<String, AnnotationInfo> = HashMap::new();
+
+    // Compute phase annotations only for actively-running internal tasks
+    for task in &tasks {
+        if !is_internal_task(task) {
+            continue;
+        }
+        if let Some(pid) = system_task_parent_id(&task.id)
+            && is_pipeline_active(task)
+        {
+            let annotation = compute_phase_annotation(task);
+            annotations
+                .entry(pid)
+                .and_modify(|existing| {
+                    existing.text.push(' ');
+                    existing.text.push_str(annotation);
+                    existing.dot_task_ids.push(task.id.clone());
+                })
+                .or_insert_with(|| AnnotationInfo {
+                    text: annotation.to_string(),
+                    dot_task_ids: vec![task.id.clone()],
+                });
+        }
+    }
+
+    // Parent-state-driven annotations (see filter_internal_tasks for rationale).
+    add_parent_state_annotations(&tasks, &mut annotations);
+
+    let filtered: Vec<&'a Task> = tasks
+        .into_iter()
+        .filter(|t| {
+            if !is_internal_task(t) {
+                return true;
+            }
+            // Keep only running internal tasks
+            matches!(t.status, Status::InProgress | Status::Open)
+        })
+        .collect();
+
+    (filtered, annotations)
+}
+
+/// Annotate a task based on its own status: PendingEval → "[∴ evaluating]",
+/// PendingValidation → "[∴ validating]". This is the parent-state view of the
+/// pipeline phase, complementary to the internal-task-state view; together they
+/// keep the badge visible across the whole phase even when the .evaluate-X /
+/// .verify-X helper task is briefly absent or terminal.
+///
+/// Idempotent: if an annotation with the same text already exists for the task
+/// (typically from the internal-task-driven pass above), this is a no-op so the
+/// badge isn't duplicated.
+fn add_parent_state_annotations(
+    tasks: &[&Task],
+    annotations: &mut HashMap<String, AnnotationInfo>,
+) {
+    for task in tasks {
+        if is_internal_task(task) {
+            continue;
+        }
+        let annotation = match task.status {
+            Status::PendingEval => "[∴ evaluating]",
+            Status::PendingValidation => "[∴ validating]",
+            _ => continue,
+        };
+        let entry = annotations.entry(task.id.clone()).or_insert_with(|| {
+            AnnotationInfo {
+                text: String::new(),
+                dot_task_ids: Vec::new(),
+            }
+        });
+        if !entry.text.contains(annotation) {
+            if !entry.text.is_empty() {
+                entry.text.push(' ');
+            }
+            entry.text.push_str(annotation);
+        }
+    }
 }
 
 /// Generate the ASCII viz output string for the given directory and options.
@@ -322,7 +497,9 @@ pub fn generate_viz_output_from_graph(
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
-            Status::Waiting => "waiting",
+            Status::Waiting | Status::PendingValidation => "waiting",
+            Status::PendingEval => "pending-eval",
+            Status::Incomplete => "incomplete",
         }
     };
 
@@ -405,9 +582,11 @@ pub fn generate_viz_output_from_graph(
     };
 
     // Filter out internal tasks (assign-*, evaluate-*) unless --show-internal
-    let empty_annotations = HashMap::new();
+    let empty_annotations: HashMap<String, AnnotationInfo> = HashMap::new();
     let (tasks_to_show, annotations) = if options.show_internal {
         (tasks_to_show, empty_annotations)
+    } else if options.show_internal_running_only {
+        filter_internal_tasks_running_only(graph, tasks_to_show, &empty_annotations)
     } else {
         filter_internal_tasks(graph, tasks_to_show, &empty_annotations)
     };
@@ -494,14 +673,13 @@ pub fn generate_viz_output_from_graph(
         })
         .collect();
 
-    // Build separate assign and eval token usage maps for each visible task
-    let mut assign_token_usage: HashMap<String, TokenUsage> = HashMap::new();
-    let mut eval_token_usage: HashMap<String, TokenUsage> = HashMap::new();
+    // Build unified agency token usage map: aggregate all lifecycle tasks
+    // (.assign-*, .evaluate-*, .flip-*, .verify-*) into a single total per parent task.
+    let mut agency_token_usage: HashMap<String, TokenUsage> = HashMap::new();
     for task in graph.tasks() {
         if !is_internal_task(task) {
             continue;
         }
-        let is_assign = task.id.starts_with(".assign-") || task.id.starts_with("assign-");
         let parent_id = system_task_parent_id(&task.id);
         let Some(pid) = parent_id else { continue };
         let usage = task
@@ -537,23 +715,14 @@ pub fn generate_viz_output_from_graph(
                 None
             });
         if let Some(u) = usage {
-            let map = if is_assign {
-                &mut assign_token_usage
-            } else {
-                &mut eval_token_usage
-            };
-            let entry = map.entry(pid).or_insert_with(|| TokenUsage {
+            let entry = agency_token_usage.entry(pid).or_insert_with(|| TokenUsage {
                 cost_usd: 0.0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             });
-            entry.cost_usd += u.cost_usd;
-            entry.output_tokens += u.output_tokens;
-            entry.input_tokens += u.input_tokens;
-            entry.cache_read_input_tokens += u.cache_read_input_tokens;
-            entry.cache_creation_input_tokens += u.cache_creation_input_tokens;
+            entry.accumulate(&u);
         }
     }
 
@@ -570,6 +739,16 @@ pub fn generate_viz_output_from_graph(
         })
         .collect();
 
+    // Compute per-task coordinator message status (TUI-perspective read state).
+    let coordinator_status: HashMap<String, workgraph::messages::CoordinatorMessageStatus> =
+        tasks_to_show
+            .iter()
+            .filter_map(|t| {
+                workgraph::messages::coordinator_message_status(dir, &t.id)
+                    .map(|s| (t.id.clone(), s))
+            })
+            .collect();
+
     // Generate output
     let output = match options.format {
         OutputFormat::Ascii => ascii::generate_ascii(
@@ -578,12 +757,12 @@ pub fn generate_viz_output_from_graph(
             &task_ids,
             &annotations,
             &live_token_usage,
-            &assign_token_usage,
-            &eval_token_usage,
+            &agency_token_usage,
             options.layout,
             &context_ids,
             &options.edge_color,
             &message_stats,
+            &coordinator_status,
         ),
         _ => {
             let text = match options.format {
@@ -607,8 +786,7 @@ pub fn generate_viz_output_from_graph(
                     &task_ids,
                     &annotations,
                     &live_token_usage,
-                    &assign_token_usage,
-                    &eval_token_usage,
+                    &agency_token_usage,
                     &context_ids,
                 ),
                 OutputFormat::Ascii => unreachable!(),
@@ -621,6 +799,7 @@ pub fn generate_viz_output_from_graph(
                 reverse_edges: HashMap::new(),
                 char_edge_map: HashMap::new(),
                 cycle_members: HashMap::new(),
+                annotation_map: annotations,
             }
         }
     };
@@ -639,7 +818,13 @@ pub fn run(dir: &Path, options: &VizOptions) -> Result<()> {
         dot::render_dot(&output.text, output_path)?;
         println!("Rendered graph to {}", output_path);
     } else {
-        println!("{}", output.text);
+        // Truncate lines to terminal width if known
+        let text = if let Some(cols) = options.max_columns {
+            ascii::truncate_lines(&output.text, cols)
+        } else {
+            output.text
+        };
+        println!("{}", text);
     }
 
     Ok(())
@@ -908,7 +1093,7 @@ mod tests {
         graph.add_node(Node::Task(assign_b));
         graph.add_node(Node::Task(task_b));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
         let (filtered, annots) =
             filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
         let task_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
@@ -918,8 +1103,11 @@ mod tests {
         assert!(task_ids.contains("b"));
         assert!(!task_ids.contains("assign-b"));
 
-        // b should show [assigning] annotation
+        // b should show [assigning] annotation with the source dot-task ID
         assert!(annots.contains_key("b"));
+        let b_annot = &annots["b"];
+        assert!(b_annot.text.contains("assigning"));
+        assert!(b_annot.dot_task_ids.contains(&"assign-b".to_string()));
     }
 
     /// Verify the default viz filter includes in-progress tasks alongside open tasks,
@@ -960,12 +1148,14 @@ mod tests {
             format: OutputFormat::Ascii,
             output: None,
             show_internal: true,
+            show_internal_running_only: false,
             critical_path: false,
             focus: Vec::new(),
             tui_mode: false,
             layout: LayoutMode::default(),
             tags: Vec::new(),
             edge_color: "gray".to_string(),
+            max_columns: None,
         };
         // We test via run() output by checking generate_ascii directly
         // with the same filter logic
@@ -1037,5 +1227,390 @@ mod tests {
         assert!(!ids.contains(&"done-a"), "Fully done tree: hidden");
         assert!(!ids.contains(&"done-b"), "Fully done tree: hidden");
         assert!(!ids.contains(&"task-abandoned"), "Abandoned: hidden");
+    }
+
+    #[test]
+    fn test_coordinator_task_not_internal() {
+        // Coordinator tasks (tagged coordinator-loop) should NOT be filtered as internal,
+        // even though they have system task IDs (starting with '.').
+        use workgraph::graph::CycleConfig;
+        let coordinator = Task {
+            id: ".coordinator".to_string(),
+            title: "Coordinator".to_string(),
+            status: Status::InProgress,
+            tags: vec!["coordinator-loop".to_string()],
+            cycle_config: Some(CycleConfig {
+                max_iterations: 0,
+                guard: None,
+                delay: None,
+                no_converge: true,
+                restart_on_failure: true,
+                max_failure_restarts: None,
+            }),
+            ..Task::default()
+        };
+
+        // Should not be treated as internal
+        assert!(
+            !is_internal_task(&coordinator),
+            "Coordinator tasks should not be filtered as internal"
+        );
+        // Should be detected as coordinator
+        assert!(
+            is_coordinator_task(&coordinator),
+            "Coordinator tasks should be detected by is_coordinator_task"
+        );
+
+        // Regular system tasks should still be internal
+        let assign = make_internal_task("assign-foo", "Assign", "assignment", vec![]);
+        assert!(is_internal_task(&assign));
+    }
+
+    #[test]
+    fn test_evolve_task_not_internal() {
+        // Evolve tasks (tagged "evolution") should NOT be filtered as internal,
+        // even though they have system task IDs (starting with '.').
+        let evolve = Task {
+            id: ".evolve-auto-20260402-150000".to_string(),
+            title: "Auto-evolve: threshold".to_string(),
+            status: Status::Open,
+            tags: vec!["evolution".to_string(), "agency".to_string()],
+            ..Task::default()
+        };
+        assert!(
+            !is_internal_task(&evolve),
+            "Evolve tasks should not be filtered as internal"
+        );
+
+        // Evolve pipeline subtasks should also be visible
+        let partition = Task {
+            id: ".evolve-partition-1".to_string(),
+            title: "Partition".to_string(),
+            tags: vec!["evolution".to_string(), "partition".to_string()],
+            ..Task::default()
+        };
+        assert!(!is_internal_task(&partition));
+
+        let analyze = Task {
+            id: ".evolve-analyze-mutation-1".to_string(),
+            title: "Analyze".to_string(),
+            tags: vec!["evolution".to_string(), "analyzer".to_string()],
+            ..Task::default()
+        };
+        assert!(!is_internal_task(&analyze));
+
+        // Other system tasks should still be internal
+        let assign = make_internal_task("assign-foo", "Assign", "assignment", vec![]);
+        assert!(is_internal_task(&assign));
+
+        let flip = Task {
+            id: ".flip-foo".to_string(),
+            title: "FLIP: foo".to_string(),
+            tags: vec!["evaluation".to_string()],
+            ..Task::default()
+        };
+        assert!(is_internal_task(&flip));
+    }
+
+    #[test]
+    fn test_coordinator_visible_in_filter() {
+        // Coordinator tasks should pass through filter_internal_tasks
+        use workgraph::graph::CycleConfig;
+        let mut graph = WorkGraph::new();
+
+        let coordinator = Task {
+            id: ".coordinator".to_string(),
+            title: "Coordinator".to_string(),
+            status: Status::InProgress,
+            tags: vec!["coordinator-loop".to_string()],
+            cycle_config: Some(CycleConfig {
+                max_iterations: 0,
+                guard: None,
+                delay: None,
+                no_converge: true,
+                restart_on_failure: true,
+                max_failure_restarts: None,
+            }),
+            ..Task::default()
+        };
+        let normal = make_task("foo", "Normal task");
+        let assign = make_internal_task(".assign-foo", "Assign foo", "assignment", vec![]);
+
+        graph.add_node(Node::Task(coordinator));
+        graph.add_node(Node::Task(normal));
+        graph.add_node(Node::Task(assign));
+
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (filtered, _) = filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
+        let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+
+        assert!(
+            ids.contains(".coordinator"),
+            "Coordinator should be visible"
+        );
+        assert!(ids.contains("foo"), "Normal tasks should be visible");
+        assert!(
+            !ids.contains(".assign-foo"),
+            "Internal tasks should be hidden"
+        );
+    }
+
+    #[test]
+    fn test_filter_internal_tasks_running_only_computes_annotations() {
+        // filter_internal_tasks_running_only should compute phase annotations
+        // only for actively in-progress internal tasks, not Open/Blocked ones.
+        let mut graph = WorkGraph::new();
+        let task_b = make_task("b", "Task B");
+        let mut assign_b =
+            make_internal_task(".assign-b", "Assign agent to b", "assignment", vec!["b"]);
+        assign_b.status = Status::InProgress;
+        let mut eval_b = make_internal_task(".evaluate-b", "Evaluate b", "evaluation", vec!["b"]);
+        eval_b.status = Status::Open; // Open = not yet active, should NOT annotate
+
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(assign_b));
+        graph.add_node(Node::Task(eval_b));
+
+        let empty: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (filtered, annots) =
+            filter_internal_tasks_running_only(&graph, graph.tasks().collect(), &empty);
+
+        // Both b and in-progress .assign-b and open .evaluate-b should be kept (visibility)
+        let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains("b"));
+        assert!(ids.contains(".assign-b"));
+        assert!(ids.contains(".evaluate-b"));
+
+        // Only the in-progress .assign-b should produce an annotation, not the open .evaluate-b
+        assert!(annots.contains_key("b"), "Expected annotation for task b");
+        let b_annot = &annots["b"];
+        assert!(
+            b_annot.text.contains("assigning"),
+            "Expected 'assigning' in annotation, got: {}",
+            b_annot.text
+        );
+        assert!(
+            !b_annot.text.contains("evaluating"),
+            "Open .evaluate-b should NOT produce annotation, got: {}",
+            b_annot.text
+        );
+        assert!(b_annot.dot_task_ids.contains(&".assign-b".to_string()));
+        assert!(!b_annot.dot_task_ids.contains(&".evaluate-b".to_string()));
+    }
+
+    #[test]
+    fn test_task_visible_during_assignment_with_open_internal_tasks() {
+        // When a task is blocked on Open agency pipeline tasks (.assign-*),
+        // it should still be visible in the filtered output BUT without annotations,
+        // because Open pipeline tasks haven't started yet.
+        let mut graph = WorkGraph::new();
+
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::Open;
+        parent.after = vec![".assign-my-task".to_string()];
+
+        let assign = Task {
+            id: ".assign-my-task".to_string(),
+            title: "Assign agent for: my-task".to_string(),
+            status: Status::Open,
+            before: vec!["my-task".to_string()],
+            tags: vec!["assignment".to_string(), "agency".to_string()],
+            ..Task::default()
+        };
+
+        graph.add_node(Node::Task(parent));
+        graph.add_node(Node::Task(assign));
+
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
+        let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+
+        // Parent task should be visible
+        assert!(
+            ids.contains("my-task"),
+            "Parent task should be visible during assignment"
+        );
+        // Internal tasks should be hidden
+        assert!(
+            !ids.contains(".assign-my-task"),
+            "Internal assign task should be hidden"
+        );
+
+        // No annotations: Open pipeline tasks are pending, not active
+        assert!(
+            !annots.contains_key("my-task"),
+            "Open pipeline tasks should not produce annotations"
+        );
+    }
+
+    #[test]
+    fn test_task_shows_annotation_when_pipeline_in_progress() {
+        // When a pipeline task is actively InProgress, its parent should show the annotation.
+        let mut graph = WorkGraph::new();
+
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::Open;
+        parent.after = vec![".assign-my-task".to_string()];
+
+        let assign = Task {
+            id: ".assign-my-task".to_string(),
+            title: "Assign agent for: my-task".to_string(),
+            status: Status::InProgress,
+            before: vec!["my-task".to_string()],
+            tags: vec!["assignment".to_string(), "agency".to_string()],
+            ..Task::default()
+        };
+
+        graph.add_node(Node::Task(parent));
+        graph.add_node(Node::Task(assign));
+
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (_filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
+
+        // Parent should have annotation from the InProgress .assign task
+        assert!(
+            annots.contains_key("my-task"),
+            "Expected annotation for my-task"
+        );
+        let annot = &annots["my-task"];
+        assert!(
+            annot.text.contains("assigning"),
+            "Expected 'assigning' annotation, got: {}",
+            annot.text
+        );
+    }
+
+    #[test]
+    fn test_done_internal_tasks_do_not_annotate() {
+        // When internal tasks are Done (assignment complete), no annotation should appear.
+        let mut graph = WorkGraph::new();
+
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::Open;
+        parent.after = vec![".assign-my-task".to_string()];
+
+        let mut assign = Task {
+            id: ".assign-my-task".to_string(),
+            title: "Assign agent for: my-task".to_string(),
+            status: Status::Done,
+            before: vec!["my-task".to_string()],
+            tags: vec!["assignment".to_string(), "agency".to_string()],
+            ..Task::default()
+        };
+        assign.completed_at = Some("2024-01-01T00:00:00Z".to_string());
+
+        graph.add_node(Node::Task(parent));
+        graph.add_node(Node::Task(assign));
+
+        let annotations: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &annotations);
+
+        // Parent should be visible
+        let ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains("my-task"));
+
+        // No annotations (internal task is Done)
+        assert!(
+            !annots.contains_key("my-task"),
+            "Done internal tasks should not produce annotations"
+        );
+    }
+
+    /// Issue 1 (fix-tui-detail): the [∴ evaluating] badge must persist for the
+    /// entire window the parent task is in PendingEval, not just while the
+    /// .evaluate-X helper task is running. This was previously broken because:
+    /// (a) the helper often completes in sub-second windows, and
+    /// (b) when wg evaluate run rejects PendingEval parents, the helper goes
+    /// terminal Failed in milliseconds, leaving the parent stuck in PendingEval
+    /// with no badge at all (only the 3-second sticky cache covered the gap).
+    #[test]
+    fn pendingeval_parent_shows_evaluating_annotation_without_helper() {
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::PendingEval;
+        graph.add_node(Node::Task(parent));
+
+        let empty: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (_filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let annot = annots
+            .get("my-task")
+            .expect("PendingEval parent must produce an evaluating annotation");
+        assert!(
+            annot.text.contains("evaluating"),
+            "expected 'evaluating' badge for PendingEval parent, got: {}",
+            annot.text
+        );
+    }
+
+    /// Even when the .evaluate-X helper has terminated (Failed because parent
+    /// was in PendingEval — the bug surfaced in research-tui-detail), the badge
+    /// must remain visible because the parent is still in PendingEval.
+    #[test]
+    fn pendingeval_parent_shows_evaluating_when_helper_failed() {
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::PendingEval;
+        let mut eval = make_internal_task(
+            ".evaluate-my-task",
+            "Evaluate my-task",
+            "evaluation",
+            vec!["my-task"],
+        );
+        eval.status = Status::Failed;
+        graph.add_node(Node::Task(parent));
+        graph.add_node(Node::Task(eval));
+
+        let empty: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (_filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let annot = annots
+            .get("my-task")
+            .expect("PendingEval parent must produce an evaluating annotation");
+        assert!(annot.text.contains("evaluating"));
+        assert!(
+            !annot.text.contains("evaluating [∴ evaluating]")
+                && annot.text.matches("evaluating").count() == 1,
+            "badge must not be duplicated when helper is also active: {}",
+            annot.text
+        );
+    }
+
+    /// PendingValidation parents should likewise persistently show validating.
+    #[test]
+    fn pendingvalidation_parent_shows_validating_annotation() {
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::PendingValidation;
+        graph.add_node(Node::Task(parent));
+
+        let empty: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (_filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        let annot = annots
+            .get("my-task")
+            .expect("PendingValidation parent must produce a validating annotation");
+        assert!(
+            annot.text.contains("validating"),
+            "expected 'validating' badge, got: {}",
+            annot.text
+        );
+    }
+
+    /// Done parents must NOT pick up a phase badge.
+    #[test]
+    fn done_parent_has_no_phase_annotation() {
+        let mut graph = WorkGraph::new();
+        let mut parent = make_task("my-task", "My Task");
+        parent.status = Status::Done;
+        graph.add_node(Node::Task(parent));
+
+        let empty: HashMap<String, AnnotationInfo> = HashMap::new();
+        let (_filtered, annots) =
+            filter_internal_tasks(&graph, graph.tasks().collect(), &empty);
+        assert!(!annots.contains_key("my-task"));
     }
 }

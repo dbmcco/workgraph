@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use std::path::Path;
+use workgraph::cycle::{EdgeAddResult, check_edge_addition};
 use workgraph::graph::{CycleConfig, parse_delay};
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use workgraph::parser::{load_graph, save_graph};
@@ -35,29 +37,175 @@ pub fn run(
     exec_mode: Option<&str>,
     delay: Option<&str>,
     not_before: Option<&str>,
+    verify: Option<&str>,
+    cron: Option<&str>,
+    allow_phantom: bool,
+    allow_cycle: bool,
 ) -> Result<()> {
-    // Validate self-blocking (no graph needed)
+    let path = graph_path(dir);
+
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    // Validate self-blocking (can be done before loading graph)
     for dep in add_after {
         if dep == task_id {
             anyhow::bail!("Task '{}' cannot block itself", task_id);
         }
     }
 
-    // Atomic graph mutation (flock held across read-modify-write)
-    let (changed, field_changes) = super::mutate_workgraph(dir, |graph| {
-        graph.get_task_or_err(task_id)?;
+    // Deprecation warning for --provider flag
+    if let Some(p) = provider {
+        let suggested_provider = if p == "anthropic" { "claude" } else { p };
+        eprintln!(
+            "Warning: --provider is deprecated. Use provider:model format in --model instead.\n\
+             Example: wg update {} --model {}:MODEL",
+            task_id, suggested_provider,
+        );
+    }
 
-        let mut changed = false;
-        let mut field_changes: Vec<serde_json::Value> = Vec::new();
+    // Validate model uses provider:model format
+    if let Some(m) = model
+        && let Err(e) = workgraph::config::parse_model_spec_strict(m)
+    {
+        anyhow::bail!("Invalid --model format: {}", e);
+    }
+
+    let mut changed = false;
+    let mut field_changes: Vec<serde_json::Value> = Vec::new();
+    let mut error: Option<anyhow::Error> = None;
+
+    modify_graph(&path, |graph| {
+
+    // Validate task exists
+    if graph.get_task(task_id).is_none() {
+        error = Some(anyhow::anyhow!("Task '{}' not found", task_id));
+        return false;
+    }
+
+    // Validate add-after dependencies before taking mutable borrow (phantom edge prevention)
+    if !allow_phantom {
+        for dep in add_after {
+            if workgraph::federation::parse_remote_ref(dep).is_some() {
+                continue;
+            }
+            if graph.get_node(dep).is_none() {
+                let mut msg = format!("Dependency '{}' does not exist.", dep);
+                let all_ids: Vec<&str> = graph.tasks().map(|t| t.id.as_str()).collect();
+                if let Some((suggestion, _)) =
+                    workgraph::check::fuzzy_match_task_id(dep, all_ids.iter().copied(), 3)
+                {
+                    msg.push_str(&format!("\n  → Did you mean '{}'?", suggestion));
+                }
+                msg.push_str(
+                    "\n  Hint: Use --allow-phantom to allow forward references.",
+                );
+                error = Some(anyhow::anyhow!("{}", msg));
+                return false;
+            }
+        }
+    }
+
+    // Check for cycles before adding dependencies (unless allow_cycle is set)
+    if !allow_cycle && !add_after.is_empty() {
+        // Build adjacency list for cycle detection
+        let task_ids: Vec<String> = graph.tasks().map(|t| t.id.clone()).collect();
+        let mut task_id_to_index = std::collections::HashMap::new();
+        for (i, id) in task_ids.iter().enumerate() {
+            task_id_to_index.insert(id, i);
+        }
+
+        let mut adjacency_list = vec![Vec::new(); task_ids.len()];
+        for task in graph.tasks() {
+            if let Some(&task_idx) = task_id_to_index.get(&task.id) {
+                for dep_id in &task.after {
+                    if let Some(&dep_idx) = task_id_to_index.get(dep_id) {
+                        adjacency_list[dep_idx].push(task_idx);
+                    }
+                }
+            }
+        }
+
+        // Get the current task's dependencies to check what would actually be added
+        let current_after = graph.get_task(task_id)
+            .map(|t| &t.after)
+            .unwrap_or(&vec![])
+            .clone();
+
+        // Check each new dependency for cycle creation
+        let task_id_string = task_id.to_string();
+        if let Some(&task_idx) = task_id_to_index.get(&task_id_string) {
+            for dep in add_after {
+                if !current_after.contains(dep)
+                    && let Some(&dep_idx) = task_id_to_index.get(dep)
+                {
+                        match check_edge_addition(task_ids.len(), &adjacency_list, dep_idx, task_idx) {
+                            EdgeAddResult::CreatesCycle { cycle_members } => {
+                                // Check if the cycle would have CycleConfig
+                                let has_cycle_config = cycle_members.iter()
+                                    .filter_map(|&idx| task_ids.get(idx))
+                                    .any(|cycle_task_id| {
+                                        // Check if max_iterations will be set on this task
+                                        if cycle_task_id == task_id && max_iterations.is_some() {
+                                            return true;
+                                        }
+                                        graph.get_task(cycle_task_id)
+                                            .map(|t| t.cycle_config.is_some())
+                                            .unwrap_or(false)
+                                    });
+
+                                if !has_cycle_config && !allow_cycle {
+                                    let cycle_task_names: Vec<String> = cycle_members.iter()
+                                        .filter_map(|&idx| task_ids.get(idx))
+                                        .cloned()
+                                        .collect();
+                                    error = Some(anyhow::anyhow!(
+                                        "Adding dependency '{}' → '{}' would create a cycle without CycleConfig: [{}]. \
+                                         Use --allow-cycle to override, or add --max-iterations to one of the cycle members.",
+                                        dep, task_id, cycle_task_names.join(" → ")
+                                    ));
+                                    return false;
+                                }
+                            }
+                            EdgeAddResult::NoCycle => {
+                                // Safe to add - no action needed
+                            }
+                        }
+                    }
+            }
+        }
+    }
+
+    // Modify the task in a block so the mutable borrow is released afterwards
+    {
+        let task = match graph.get_task_mut(task_id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", task_id));
+                return false;
+            }
+        };
 
         {
             let task = graph.get_task_mut_or_err(task_id)?;
 
-            if let Some(new_title) = title {
-                let old = task.title.clone();
-                task.title = new_title.to_string();
-                field_changes.push(serde_json::json!({"field": "title", "old": old, "new": new_title}));
-                println!("Updated title: {}", new_title);
+        // Update description
+        if let Some(new_description) = description {
+            let old = task.description.clone();
+            task.description = Some(new_description.to_string());
+            field_changes.push(
+                serde_json::json!({"field": "description", "old": old, "new": new_description}),
+            );
+            println!("Updated description");
+            changed = true;
+        }
+
+        // Add after dependencies (already validated above)
+        for dep in add_after {
+            if !task.after.contains(dep) {
+                task.after.push(dep.clone());
+                println!("Added after: {}", dep);
                 changed = true;
             }
 
@@ -71,23 +219,150 @@ pub fn run(
                 changed = true;
             }
 
-            for dep in add_after {
-                if !task.after.contains(dep) {
-                    task.after.push(dep.clone());
-                    println!("Added after: {}", dep);
+        // Add tags
+        for tag in add_tag {
+            if !task.tags.contains(tag) {
+                task.tags.push(tag.clone());
+                println!("Added tag: {}", tag);
+                changed = true;
+            } else {
+                println!("Already has tag: {}", tag);
+            }
+        }
+
+        // Remove tags
+        for tag in remove_tag {
+            if let Some(pos) = task.tags.iter().position(|x| x == tag) {
+                task.tags.remove(pos);
+                println!("Removed tag: {}", tag);
+                changed = true;
+            } else {
+                println!("Does not have tag: {}", tag);
+            }
+        }
+
+        // Update model
+        if let Some(new_model) = model {
+            task.model = Some(new_model.to_string());
+            println!("Updated model: {}", new_model);
+            changed = true;
+        }
+
+        // Update provider
+        if let Some(new_provider) = provider {
+            task.provider = Some(new_provider.to_string());
+            println!("Updated provider: {}", new_provider);
+            changed = true;
+        }
+
+        // --verify is deprecated
+        if verify.is_some() {
+            error = Some(anyhow::anyhow!(
+                "--verify is deprecated and no longer accepted.\n\
+                 Put validation criteria in a ## Validation section of the task description; \
+                 the agency evaluator scores against it."
+            ));
+            return false;
+        }
+
+        // Add skills
+        for skill in add_skill {
+            if !task.skills.contains(skill) {
+                task.skills.push(skill.clone());
+                println!("Added skill: {}", skill);
+                changed = true;
+            } else {
+                println!("Already has skill: {}", skill);
+            }
+        }
+
+        // Remove skills
+        for skill in remove_skill {
+            if let Some(pos) = task.skills.iter().position(|x| x == skill) {
+                task.skills.remove(pos);
+                println!("Removed skill: {}", skill);
+                changed = true;
+            } else {
+                println!("Does not have skill: {}", skill);
+            }
+        }
+
+        // Update cycle config
+        if let Some(max_iter) = max_iterations {
+            let guard = match cycle_guard {
+                Some(expr) => match crate::commands::add::parse_guard_expr(expr) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        error = Some(e);
+                        return false;
+                    }
+                },
+                None => task.cycle_config.as_ref().and_then(|c| c.guard.clone()),
+            };
+            let delay = match cycle_delay {
+                Some(d) => {
+                    if parse_delay(d).is_none() {
+                        error = Some(anyhow::anyhow!(
+                            "Invalid cycle delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d",
+                            d
+                        ));
+                        return false;
+                    }
+                    Some(d.to_string())
+                }
+                None => task.cycle_config.as_ref().and_then(|c| c.delay.clone()),
+            };
+            task.cycle_config = Some(CycleConfig {
+                max_iterations: max_iter,
+                guard,
+                delay,
+                no_converge,
+                restart_on_failure: !no_restart_on_failure,
+                max_failure_restarts,
+            });
+            println!(
+                "Set cycle_config: max_iterations={}{}",
+                max_iter,
+                if no_converge { " (no-converge)" } else { "" }
+            );
+            changed = true;
+        } else {
+            // Allow updating guard/delay/no_converge on existing cycle config
+            if let Some(expr) = cycle_guard {
+                if let Some(ref mut config) = task.cycle_config {
+                    config.guard = match crate::commands::add::parse_guard_expr(expr) {
+                        Ok(g) => Some(g),
+                        Err(e) => {
+                            error = Some(e);
+                            return false;
+                        }
+                    };
+                    println!("Updated cycle guard");
                     changed = true;
                 } else {
-                    println!("Already blocked by: {}", dep);
+                    error = Some(anyhow::anyhow!(
+                        "Cannot set --cycle-guard without --max-iterations: task has no cycle_config"
+                    ));
+                    return false;
                 }
             }
-
-            for dep in remove_after {
-                if let Some(pos) = task.after.iter().position(|x| x == dep) {
-                    task.after.remove(pos);
-                    println!("Removed after: {}", dep);
+            if let Some(d) = cycle_delay {
+                if let Some(ref mut config) = task.cycle_config {
+                    if parse_delay(d).is_none() {
+                        error = Some(anyhow::anyhow!(
+                            "Invalid cycle delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d",
+                            d
+                        ));
+                        return false;
+                    }
+                    config.delay = Some(d.to_string());
+                    println!("Updated cycle delay: {}", d);
                     changed = true;
                 } else {
-                    println!("Not blocked by: {}", dep);
+                    error = Some(anyhow::anyhow!(
+                        "Cannot set --cycle-delay without --max-iterations: task has no cycle_config"
+                    ));
+                    return false;
                 }
             }
 
@@ -97,7 +372,10 @@ pub fn run(
                     println!("Added tag: {}", tag);
                     changed = true;
                 } else {
-                    println!("Already has tag: {}", tag);
+                    error = Some(anyhow::anyhow!(
+                        "Cannot set --no-converge without --max-iterations: task has no cycle_config"
+                    ));
+                    return false;
                 }
             }
 
@@ -107,7 +385,10 @@ pub fn run(
                     println!("Removed tag: {}", tag);
                     changed = true;
                 } else {
-                    println!("Does not have tag: {}", tag);
+                    error = Some(anyhow::anyhow!(
+                        "Cannot set --no-restart-on-failure without --max-iterations: task has no cycle_config"
+                    ));
+                    return false;
                 }
             }
 
@@ -129,7 +410,10 @@ pub fn run(
                     println!("Added skill: {}", skill);
                     changed = true;
                 } else {
-                    println!("Already has skill: {}", skill);
+                    error = Some(anyhow::anyhow!(
+                        "Cannot set --max-failure-restarts without --max-iterations: task has no cycle_config"
+                    ));
+                    return false;
                 }
             }
 
@@ -141,203 +425,165 @@ pub fn run(
                 } else {
                     println!("Does not have skill: {}", skill);
                 }
-            }
-
-            if let Some(max_iter) = max_iterations {
-                let guard = match cycle_guard {
-                    Some(expr) => Some(crate::commands::add::parse_guard_expr(expr)?),
-                    None => task.cycle_config.as_ref().and_then(|c| c.guard.clone()),
-                };
-                let delay = match cycle_delay {
-                    Some(d) => {
-                        parse_delay(d).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Invalid cycle delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d",
-                                d
-                            )
-                        })?;
-                        Some(d.to_string())
-                    }
-                    None => task.cycle_config.as_ref().and_then(|c| c.delay.clone()),
-                };
-                task.cycle_config = Some(CycleConfig {
-                    max_iterations: max_iter,
-                    guard,
-                    delay,
-                    no_converge,
-                    restart_on_failure: !no_restart_on_failure,
-                    max_failure_restarts,
-                });
-                println!(
-                    "Set cycle_config: max_iterations={}{}",
-                    max_iter,
-                    if no_converge { " (no-converge)" } else { "" }
-                );
-                changed = true;
-            } else {
-                if let Some(expr) = cycle_guard {
-                    if let Some(ref mut config) = task.cycle_config {
-                        config.guard = Some(crate::commands::add::parse_guard_expr(expr)?);
-                        println!("Updated cycle guard");
-                        changed = true;
-                    } else {
-                        anyhow::bail!(
-                            "Cannot set --cycle-guard without --max-iterations: task has no cycle_config"
-                        );
-                    }
-                }
-                if let Some(d) = cycle_delay {
-                    if let Some(ref mut config) = task.cycle_config {
-                        parse_delay(d).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Invalid cycle delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d",
-                                d
-                            )
-                        })?;
-                        config.delay = Some(d.to_string());
-                        println!("Updated cycle delay: {}", d);
-                        changed = true;
-                    } else {
-                        anyhow::bail!(
-                            "Cannot set --cycle-delay without --max-iterations: task has no cycle_config"
-                        );
-                    }
-                }
-                if no_converge {
-                    if let Some(ref mut config) = task.cycle_config {
-                        config.no_converge = true;
-                        println!("Set no-converge on cycle");
-                        changed = true;
-                    } else {
-                        anyhow::bail!(
-                            "Cannot set --no-converge without --max-iterations: task has no cycle_config"
-                        );
-                    }
-                }
-                if no_restart_on_failure {
-                    if let Some(ref mut config) = task.cycle_config {
-                        config.restart_on_failure = false;
-                        println!("Disabled restart-on-failure for cycle");
-                        changed = true;
-                    } else {
-                        anyhow::bail!(
-                            "Cannot set --no-restart-on-failure without --max-iterations: task has no cycle_config"
-                        );
-                    }
-                }
-                if let Some(max) = max_failure_restarts {
-                    if let Some(ref mut config) = task.cycle_config {
-                        config.max_failure_restarts = Some(max);
-                        println!("Set max-failure-restarts: {}", max);
-                        changed = true;
-                    } else {
-                        anyhow::bail!(
-                            "Cannot set --max-failure-restarts without --max-iterations: task has no cycle_config"
-                        );
-                    }
-                }
-            }
-
-            if let Some(vis) = visibility {
-                match vis {
-                    "internal" | "public" | "peer" => {
-                        let old = task.visibility.clone();
-                        task.visibility = vis.to_string();
-                        field_changes
-                            .push(serde_json::json!({"field": "visibility", "old": old, "new": vis}));
-                        println!("Updated visibility: {}", vis);
-                        changed = true;
-                    }
-                    _ => anyhow::bail!(
+                _ => {
+                    error = Some(anyhow::anyhow!(
                         "Invalid visibility '{}'. Valid values: internal, public, peer",
                         vis
-                    ),
+                    ));
+                    return false;
                 }
             }
 
-            if let Some(scope) = context_scope {
-                scope
-                    .parse::<workgraph::context_scope::ContextScope>()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let old = task.context_scope.clone();
-                task.context_scope = Some(scope.to_string());
-                field_changes
-                    .push(serde_json::json!({"field": "context_scope", "old": old, "new": scope}));
-                println!("Updated context_scope: {}", scope);
-                changed = true;
+        // Update context scope
+        if let Some(scope) = context_scope {
+            // Validate
+            if let Err(e) = scope.parse::<workgraph::context_scope::ContextScope>() {
+                error = Some(anyhow::anyhow!("{}", e));
+                return false;
             }
+            let old = task.context_scope.clone();
+            task.context_scope = Some(scope.to_string());
+            field_changes
+                .push(serde_json::json!({"field": "context_scope", "old": old, "new": scope}));
+            println!("Updated context_scope: {}", scope);
+            changed = true;
+        }
 
-            if let Some(mode) = exec_mode {
-                match mode {
-                    "full" | "light" | "bare" | "shell" => {
-                        let old = task.exec_mode.clone();
-                        task.exec_mode = Some(mode.to_string());
-                        field_changes
-                            .push(serde_json::json!({"field": "exec_mode", "old": old, "new": mode}));
-                        println!("Updated exec_mode: {}", mode);
+        // Update exec mode
+        if let Some(mode) = exec_mode {
+            if let Err(e) = mode.parse::<workgraph::config::ExecMode>() {
+                error = Some(anyhow::anyhow!("{}", e));
+                return false;
+            }
+            let old = task.exec_mode.clone();
+            task.exec_mode = Some(mode.to_string());
+            field_changes.push(serde_json::json!({"field": "exec_mode", "old": old, "new": mode}));
+            println!("Updated exec_mode: {}", mode);
+            changed = true;
+        }
+
+        // Update not_before (from --delay or --not-before)
+        if delay.is_some() && not_before.is_some() {
+            error = Some(anyhow::anyhow!("Cannot specify both --delay and --not-before"));
+            return false;
+        }
+        if let Some(d) = delay {
+            let secs = match workgraph::graph::parse_delay(d) {
+                Some(s) => s,
+                None => {
+                    error = Some(anyhow::anyhow!("Invalid delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d", d));
+                    return false;
+                }
+            };
+            let new_ts = (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339();
+            let old = task.not_before.clone();
+            task.not_before = Some(new_ts.clone());
+            field_changes
+                .push(serde_json::json!({"field": "not_before", "old": old, "new": new_ts}));
+            println!("Set not_before: {} (delay {})", new_ts, d);
+            changed = true;
+        } else if let Some(ts) = not_before {
+            if ts.parse::<chrono::DateTime<chrono::Utc>>().is_err()
+                && chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S").is_err()
+            {
+                error = Some(anyhow::anyhow!("Invalid timestamp '{}'. Use ISO 8601 format", ts));
+                return false;
+            }
+            let old = task.not_before.clone();
+            task.not_before = Some(ts.to_string());
+            field_changes.push(serde_json::json!({"field": "not_before", "old": old, "new": ts}));
+            println!("Set not_before: {}", ts);
+            changed = true;
+        }
+        // Update cron schedule
+        if let Some(cron_expr) = cron {
+            if cron_expr.is_empty() {
+                // Clear cron scheduling
+                task.cron_schedule = None;
+                task.cron_enabled = false;
+                task.next_cron_fire = None;
+                task.last_cron_fire = None;
+                println!("Cleared cron schedule");
+                changed = true;
+            } else {
+                // Set or update cron schedule
+                match workgraph::cron::parse_cron_expression(cron_expr) {
+                    Ok(schedule) => {
+                        task.cron_schedule = Some(cron_expr.to_string());
+                        task.cron_enabled = true;
+                        task.next_cron_fire = workgraph::cron::calculate_next_fire_with_jitter(
+                            &task.id,
+                            &schedule,
+                            chrono::Utc::now(),
+                        )
+                        .map(|dt| dt.to_rfc3339());
+                        println!(
+                            "Set cron schedule: {} (next fire: {})",
+                            cron_expr,
+                            task.next_cron_fire.as_deref().unwrap_or("unknown")
+                        );
                         changed = true;
                     }
-                    _ => anyhow::bail!(
-                        "Invalid exec_mode '{}'. Valid values: full, light, bare, shell",
-                        mode
-                    ),
+                    Err(e) => {
+                        error = Some(anyhow::anyhow!(
+                            "Invalid cron expression '{}': {}",
+                            cron_expr,
+                            e
+                        ));
+                        return false;
+                    }
                 }
-            }
-
-            if delay.is_some() && not_before.is_some() {
-                anyhow::bail!("Cannot specify both --delay and --not-before");
-            }
-            if let Some(d) = delay {
-                let secs = workgraph::graph::parse_delay(d).ok_or_else(|| {
-                    anyhow::anyhow!("Invalid delay '{}'. Use format: 30s, 5m, 1h, 24h, 7d", d)
-                })?;
-                let new_ts = (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339();
-                let old = task.not_before.clone();
-                task.not_before = Some(new_ts.clone());
-                field_changes
-                    .push(serde_json::json!({"field": "not_before", "old": old, "new": new_ts}));
-                println!("Set not_before: {} (delay {})", new_ts, d);
-                changed = true;
-            } else if let Some(ts) = not_before {
-                ts.parse::<chrono::DateTime<chrono::Utc>>()
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S")
-                            .map(|ndt| ndt.and_utc())
-                    })
-                    .map_err(|_| anyhow::anyhow!("Invalid timestamp '{}'. Use ISO 8601 format", ts))?;
-                let old = task.not_before.clone();
-                task.not_before = Some(ts.to_string());
-                field_changes.push(serde_json::json!({"field": "not_before", "old": old, "new": ts}));
-                println!("Set not_before: {}", ts);
-                changed = true;
             }
         }
 
-        // Clear auto-assignment when new dependencies are added
-        if !add_after.is_empty() && changed {
-            let assign_task_id = format!(".assign-{}", task_id);
-            let legacy_assign_id = format!("assign-{}", task_id);
-            let found_id = if graph.get_task(&assign_task_id).is_some() {
-                Some(assign_task_id)
-            } else if graph.get_task(&legacy_assign_id).is_some() {
-                Some(legacy_assign_id)
-            } else {
-                None
-            };
-            if let Some(ref aid) = found_id {
-                if let Some(assign_task) = graph.get_task_mut(aid) {
-                    match assign_task.status {
-                        workgraph::graph::Status::Open | workgraph::graph::Status::InProgress => {
-                            assign_task.status = workgraph::graph::Status::Abandoned;
-                            println!(
-                                "Abandoned assignment task '{}' (dependencies changed)",
-                                aid
-                            );
-                        }
-                        _ => {}
-                    }
+        // Reset spawn failure counter on any edit — the user may have fixed
+        // the root cause (e.g., exec_mode mismatch), so the circuit breaker
+        // should give the task a fresh set of attempts.
+        if changed && task.spawn_failures > 0 {
+            task.spawn_failures = 0;
+            println!("Reset spawn failure counter");
+        }
+    } // task borrow released here
+
+    // When new dependencies are added, clear any existing auto-assignment.
+    // This prevents the race where a task gets assigned before its real
+    // dependencies are wired (e.g., `wg add` then `wg edit --add-after`).
+    if !add_after.is_empty() && changed {
+        // Check dot-prefix first, fall back to legacy prefix
+        let assign_task_id = format!(".assign-{}", task_id);
+        let legacy_assign_id = format!("assign-{}", task_id);
+        let found_id = if graph.get_task(&assign_task_id).is_some() {
+            Some(assign_task_id)
+        } else if graph.get_task(&legacy_assign_id).is_some() {
+            Some(legacy_assign_id)
+        } else {
+            None
+        };
+        if let Some(ref aid) = found_id
+            && let Some(assign_task) = graph.get_task_mut(aid)
+        {
+            match assign_task.status {
+                workgraph::graph::Status::Open | workgraph::graph::Status::InProgress => {
+                    assign_task.status = workgraph::graph::Status::Abandoned;
+                    println!("Abandoned assignment task '{}' (dependencies changed)", aid);
                 }
+                _ => {}
             }
+        }
+
+        // Clear the agent field so the task gets re-assigned when actually ready
+        let task = match graph.get_task_mut(task_id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", task_id));
+                return false;
+            }
+        };
+        if task.agent.is_some() {
+            task.agent = None;
+            println!("Cleared agent assignment (dependencies changed, will re-assign when ready)");
+        }
+    }
 
             let task = graph.get_task_mut_or_err(task_id)?;
             if task.agent.is_some() {
@@ -346,23 +592,13 @@ pub fn run(
             }
         }
 
-        // Maintain bidirectional consistency
-        let task_id_owned = task_id.to_string();
-        for dep in add_after {
-            if let Some(blocker) = graph.get_task_mut(dep)
-                && !blocker.before.contains(&task_id_owned)
-            {
-                blocker.before.push(task_id_owned.clone());
-            }
-        }
-        for dep in remove_after {
-            if let Some(blocker) = graph.get_task_mut(dep) {
-                blocker.before.retain(|b| b != &task_id_owned);
-            }
-        }
-
-        Ok((changed, field_changes))
-    })?;
+    // Return whether changes were made
+    changed
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
 
     if changed {
         super::notify_graph_changed(dir);
@@ -390,6 +626,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use workgraph::parser::{load_graph, save_graph};
 
     fn create_test_graph(dir: &Path) -> Result<()> {
         // Create the workgraph directory if it doesn't exist
@@ -414,9 +651,13 @@ mod tests {
             &[],
             &[],
             None,
-            Some("sonnet"),
+            Some("claude:sonnet"),
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -426,9 +667,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            true,  // allow_phantom: test graph uses phantom deps
+            false, // independent
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )?;
 
         Ok(())
@@ -456,7 +709,11 @@ mod tests {
             None,
             None,
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -466,9 +723,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,  // iteration_config
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )?;
 
         crate::commands::add::run(
@@ -485,9 +754,13 @@ mod tests {
             &[],
             &[],
             None,
-            Some("sonnet"),
+            Some("claude:sonnet"),
             None,
-            None,
+            None, // verify
+            None, // verify_timeout
+            None, // validation
+            None, // validator_agent
+            None, // validator_model
             None,
             None,
             None,
@@ -497,9 +770,21 @@ mod tests {
             "internal",
             None,
             None,
+            None,
+            None,
             false,
+            false,
+            &[],
+            &[],
             None,
             None,
+            false,
+            false,
+            false, // no_tier_escalation
+            None,
+            None,  // priority
+            None,  // cron
+            false, // subtask
         )?;
 
         Ok(())
@@ -534,6 +819,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -572,6 +861,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -610,6 +903,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,  // cron
+            true,  // allow_phantom: dep2 doesn't exist in test graph
+            false, // allow_cycle: tests should not allow cycles by default
         );
         assert!(result.is_ok());
 
@@ -649,6 +946,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -687,6 +988,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -726,6 +1031,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -749,7 +1058,7 @@ mod tests {
             &[],
             &[],
             &[],
-            Some("opus"),
+            Some("claude:opus"),
             None,
             &[],
             &[],
@@ -764,13 +1073,17 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
         let path = graph_path(temp_dir.path());
         let graph = load_graph(&path).unwrap();
         let task = graph.get_task("test-task").unwrap();
-        assert_eq!(task.model, Some("opus".to_string()));
+        assert_eq!(task.model, Some("claude:opus".to_string()));
     }
 
     #[test]
@@ -802,6 +1115,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -841,6 +1158,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -879,6 +1200,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -913,6 +1238,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
     }
@@ -946,6 +1275,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_err());
         assert!(
@@ -986,6 +1319,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -1030,6 +1367,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         )
         .unwrap();
 
@@ -1058,6 +1399,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         );
         assert!(result.is_ok());
 
@@ -1111,6 +1456,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         )
         .unwrap();
 
@@ -1172,6 +1521,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         )
         .unwrap();
 
@@ -1214,6 +1567,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         )
         .unwrap();
 
@@ -1251,6 +1608,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None, // cron
+            false,
+            false,
         )
         .unwrap();
 
@@ -1261,5 +1622,139 @@ mod tests {
             task.agent.is_some(),
             "agent should NOT be cleared when no new deps are actually added"
         );
+    }
+
+    #[test]
+    fn test_cycle_detection_blocks_unconfigured_cycle() {
+        use crate::commands::graph_path;
+        use tempfile::TempDir;
+        use workgraph::graph::{Node, Status, Task, WorkGraph};
+        use workgraph::parser::save_graph;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = graph_path(temp_dir.path());
+
+        // Create a simple graph with: task-a → task-b
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = Task::default();
+        task_a.id = "task-a".to_string();
+        task_a.title = "Task A".to_string();
+        task_a.status = Status::Open;
+
+        let mut task_b = Task::default();
+        task_b.id = "task-b".to_string();
+        task_b.title = "Task B".to_string();
+        task_b.status = Status::Open;
+        task_b.after.push("task-a".to_string()); // task-b depends on task-a
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        save_graph(&graph, &path).unwrap();
+
+        // Try to add task-a -> task-b (would create cycle task-a -> task-b -> task-a)
+        let result = run(
+            temp_dir.path(),
+            "task-a",
+            None,
+            None,
+            &["task-b".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // cron
+            false,
+            false, // allow_cycle = false
+        );
+
+        // Should fail with cycle detection message
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("would create a cycle without CycleConfig"));
+        assert!(error_msg.contains("--allow-cycle"));
+    }
+
+    #[test]
+    fn test_cycle_detection_allows_with_flag() {
+        use crate::commands::{graph_path, load_graph};
+        use tempfile::TempDir;
+        use workgraph::graph::{Node, Status, Task, WorkGraph};
+        use workgraph::parser::save_graph;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = graph_path(temp_dir.path());
+
+        // Create a simple graph with: task-a → task-b
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = Task::default();
+        task_a.id = "task-a".to_string();
+        task_a.title = "Task A".to_string();
+        task_a.status = Status::Open;
+
+        let mut task_b = Task::default();
+        task_b.id = "task-b".to_string();
+        task_b.title = "Task B".to_string();
+        task_b.status = Status::Open;
+        task_b.after.push("task-a".to_string());
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        save_graph(&graph, &path).unwrap();
+
+        // Try to add task-a -> task-b with --allow-cycle
+        let result = run(
+            temp_dir.path(),
+            "task-a",
+            None,
+            None,
+            &["task-b".to_string()],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // cron
+            false,
+            true, // allow_cycle = true
+        );
+
+        // Should succeed when allow_cycle is true
+        assert!(result.is_ok());
+
+        // Verify the cycle was actually created
+        let graph = load_graph(&path).unwrap();
+        let task_a = graph.get_task("task-a").unwrap();
+        assert!(task_a.after.contains(&"task-b".to_string()));
     }
 }

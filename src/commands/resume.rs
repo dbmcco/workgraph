@@ -3,6 +3,9 @@ use chrono::Utc;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use workgraph::graph::{LogEntry, WorkGraph};
+use workgraph::parser::modify_graph;
+
+use super::eval_scaffold;
 
 #[cfg(test)]
 use super::graph_path;
@@ -19,34 +22,82 @@ pub fn publish(dir: &Path, id: &str, only: bool) -> Result<()> {
 }
 
 fn run_inner(dir: &Path, id: &str, only: bool, is_publish: bool) -> Result<()> {
-    let unpaused_count = super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_or_err(id)?;
+    let path = super::graph_path(dir);
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    // Use modify_graph for atomic load-modify-save under a single exclusive
+    // lock.  This prevents the coordinator's own modify_graph from
+    // interleaving and overwriting our paused-flag change with a stale
+    // snapshot (the root cause of the "publish doesn't clear paused" bug).
+    let mut error: Option<anyhow::Error> = None;
+    let mut unpaused: Vec<String> = Vec::new();
+
+    let _graph = modify_graph(&path, |graph| {
+        // Verify seed task exists and is paused
+        let task = match graph.get_task(id) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", id));
+                return false;
+            }
+        };
         if !task.paused {
-            anyhow::bail!("Task '{}' is not paused", id);
+            error = Some(anyhow::anyhow!("Task '{}' is not paused", id));
+            return false;
         }
 
         if only {
-            validate_task_deps(graph, id, is_publish)?;
+            // Single-task mode: validate just this task's deps, then unpause
+            if let Err(e) = validate_task_deps(graph, id, is_publish) {
+                error = Some(e);
+                return false;
+            }
             let action = if is_publish { "published" } else { "resumed" };
             unpause_task(graph, id, action);
-            Ok(1usize)
+            unpaused.push(id.to_string());
+
+            // Eagerly scaffold agency pipeline (idempotent — skips if already scaffolded)
+            scaffold_eval_for_unpaused(dir, graph, &[id.to_string()], action);
         } else {
+            // Propagating mode: discover subgraph, validate all, unpause all
             let subgraph = discover_downstream(graph, id);
-            validate_subgraph(graph, &subgraph, is_publish)?;
+
+            // Validate the entire subgraph structure
+            if let Err(e) = validate_subgraph(graph, &subgraph, is_publish) {
+                error = Some(e);
+                return false;
+            }
+
+            // Atomic unpause: all paused tasks in the subgraph
             let action = if is_publish { "published" } else { "resumed" };
-            let mut unpaused = Vec::new();
             for task_id in &subgraph {
-                if graph.get_task(task_id).unwrap().paused {
+                let t = graph.get_task(task_id).unwrap();
+                if t.paused {
                     unpaused.push(task_id.clone());
                 }
             }
             for task_id in &unpaused {
                 unpause_task(graph, task_id, action);
             }
-            Ok(unpaused.len())
+
+            // Eagerly scaffold agency pipeline (idempotent — skips if already scaffolded)
+            scaffold_eval_for_unpaused(dir, graph, &unpaused, action);
         }
-    })?;
-    super::notify_graph_changed(dir);
+
+        true
+    })
+    .context("Failed to save graph")?;
+
+    // Propagate any validation/logic error that occurred inside the closure
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    // Kick the dispatcher: bypass settling delay so the user sees agent
+    // activity within sub-second after publish/resume succeeds.
+    super::notify_kick(dir);
     record_provenance(dir, id, is_publish);
 
     if only {
@@ -56,9 +107,17 @@ fn run_inner(dir: &Path, id: &str, only: bool, is_publish: bool) -> Result<()> {
             println!("Resumed '{}'", id);
         }
     } else if is_publish {
-        println!("Published '{}' and {} downstream task(s)", id, unpaused_count.saturating_sub(1));
+        println!(
+            "Published '{}' and {} downstream task(s)",
+            id,
+            unpaused.len().saturating_sub(1)
+        );
     } else {
-        println!("Resumed '{}' and {} downstream task(s)", id, unpaused_count.saturating_sub(1));
+        println!(
+            "Resumed '{}' and {} downstream task(s)",
+            id,
+            unpaused.len().saturating_sub(1)
+        );
     }
 
     Ok(())
@@ -214,8 +273,35 @@ fn unpause_task(graph: &mut WorkGraph, task_id: &str, action: &str) {
     task.log.push(LogEntry {
         timestamp: Utc::now().to_rfc3339(),
         actor: None,
+        user: Some(workgraph::current_user()),
         message: format!("Task {}", action),
     });
+}
+
+/// Create the full agency pipeline (`.assign-*`, `.flip-*`,
+/// `.evaluate-*`) for each unpaused task in one atomic pass.
+///
+/// All tasks and their edges are written together into the same graph
+/// object before the caller saves — guaranteeing a single, atomic write.
+/// Idempotent: skips tasks that already have scaffold siblings.
+fn scaffold_eval_for_unpaused(dir: &Path, graph: &mut WorkGraph, task_ids: &[String], action: &str) {
+    let config = workgraph::config::Config::load_or_default(dir);
+
+    // Collect (id, title) pairs, filtering out system tasks
+    let candidates: Vec<(String, String)> = task_ids
+        .iter()
+        .filter(|id| !workgraph::graph::is_system_task(id))
+        .filter_map(|id| graph.get_task(id).map(|t| (id.clone(), t.title.clone())))
+        .collect();
+
+    // Scaffold the full pipeline (.place → .assign → task → .flip → .evaluate)
+    let count = eval_scaffold::scaffold_full_pipeline_batch(dir, graph, &candidates, &config);
+    if count > 0 {
+        eprintln!(
+            "[{}] Eagerly scaffolded full agency pipeline for {} task(s)",
+            action, count
+        );
+    }
 }
 
 fn record_provenance(dir: &Path, id: &str, is_publish: bool) {
@@ -237,6 +323,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use workgraph::graph::{CycleConfig, Node, Status, Task, WorkGraph};
+    use workgraph::parser::save_graph;
 
     fn make_task(id: &str, title: &str, status: Status) -> Task {
         Task {
@@ -602,5 +689,134 @@ mod tests {
         let graph = load_graph(graph_path(dir.path())).unwrap();
         assert!(!graph.get_task("a").unwrap().paused);
         assert!(!graph.get_task("b").unwrap().paused);
+    }
+
+    #[test]
+    fn test_publish_creates_pipeline_tasks_with_auto_place() {
+        // Verify that publish creates .assign-* and .evaluate-* tasks
+        // (placement is handled by the assignment step, no separate .place-* tasks).
+        let dir = tempdir().unwrap();
+        let mut task = make_task("my-task", "My Task", Status::Open);
+        task.paused = true;
+        setup_workgraph(dir.path(), vec![task]);
+
+        // Enable auto_place in config (dir.path() IS the .workgraph dir)
+        fs::write(
+            dir.path().join("config.toml"),
+            "[agency]\nauto_place = true\nauto_assign = true\nauto_evaluate = true\n",
+        )
+        .unwrap();
+
+        let result = publish(dir.path(), "my-task", false);
+        assert!(result.is_ok());
+
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        assert!(
+            graph.get_task(".assign-my-task").is_some(),
+            ".assign-my-task must be created at publish time"
+        );
+        assert!(
+            graph.get_task(".evaluate-my-task").is_some(),
+            ".evaluate-my-task must be created at publish time"
+        );
+    }
+
+    // --- Resume scaffolding tests ---
+
+    #[test]
+    fn test_resume_scaffolds_agency_pipeline_for_draft_task() {
+        let dir = tempdir().unwrap();
+        let mut task = make_task("my-task", "My Task", Status::Open);
+        task.paused = true;
+        setup_workgraph(dir.path(), vec![task]);
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "[agency]\nauto_place = true\nauto_assign = true\nauto_evaluate = true\n",
+        )
+        .unwrap();
+
+        let result = run(dir.path(), "my-task", false);
+        assert!(result.is_ok());
+
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        assert!(
+            graph.get_task(".assign-my-task").is_some(),
+            ".assign-my-task must be created at resume time"
+        );
+        assert!(
+            graph.get_task(".evaluate-my-task").is_some(),
+            ".evaluate-my-task must be created at resume time"
+        );
+    }
+
+    #[test]
+    fn test_resume_scaffolds_agency_pipeline_only_mode() {
+        let dir = tempdir().unwrap();
+        let mut task = make_task("my-task", "My Task", Status::Open);
+        task.paused = true;
+        setup_workgraph(dir.path(), vec![task]);
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "[agency]\nauto_assign = true\nauto_evaluate = true\n",
+        )
+        .unwrap();
+
+        let result = run(dir.path(), "my-task", true);
+        assert!(result.is_ok());
+
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        assert!(
+            graph.get_task(".assign-my-task").is_some(),
+            ".assign-my-task must be created at resume time (--only)"
+        );
+        assert!(
+            graph.get_task(".evaluate-my-task").is_some(),
+            ".evaluate-my-task must be created at resume time (--only)"
+        );
+    }
+
+    #[test]
+    fn test_resume_does_not_double_scaffold_already_published_task() {
+        let dir = tempdir().unwrap();
+        let mut task = make_task("my-task", "My Task", Status::Open);
+        task.paused = true;
+        setup_workgraph(dir.path(), vec![task]);
+
+        fs::write(
+            dir.path().join("config.toml"),
+            "[agency]\nauto_assign = true\nauto_evaluate = true\n",
+        )
+        .unwrap();
+
+        // First: publish (creates scaffold tasks)
+        publish(dir.path(), "my-task", false).unwrap();
+
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        let assign = graph.get_task(".assign-my-task").unwrap();
+        let assign_created_at = assign.created_at.clone();
+        let eval = graph.get_task(".evaluate-my-task").unwrap();
+        let eval_created_at = eval.created_at.clone();
+
+        // Now pause and resume the task
+        {
+            let path = graph_path(dir.path());
+            workgraph::parser::modify_graph(&path, |g| {
+                let t = g.get_task_mut("my-task").unwrap();
+                t.paused = true;
+                true
+            })
+            .unwrap();
+        }
+
+        run(dir.path(), "my-task", false).unwrap();
+
+        // Scaffold tasks should still be the same (not recreated)
+        let graph = load_graph(graph_path(dir.path())).unwrap();
+        let assign = graph.get_task(".assign-my-task").unwrap();
+        assert_eq!(assign.created_at, assign_created_at);
+        let eval = graph.get_task(".evaluate-my-task").unwrap();
+        assert_eq!(eval.created_at, eval_created_at);
     }
 }

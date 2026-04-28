@@ -1,0 +1,286 @@
+# Smoke gate manifest
+#
+# `wg done <task>` runs every scenario whose `owners` list contains the task
+# id. If any scenario FAILs (any non-zero exit code other than 77), `wg done`
+# refuses with the broken scenario name. Exit 77 = loud SKIP (e.g. endpoint
+# unreachable). Exit 0 = PASS.
+#
+# This manifest is grow-only: every regression in this codebase that a smoke
+# would have caught becomes a permanent scenario. Do not delete entries —
+# extend.
+#
+# Scenarios run as `bash <script>` from the directory containing this
+# manifest. Each scenario receives `WG_SMOKE_SCENARIO` and
+# `WG_SMOKE_TIMEOUT_SECS` in its environment.
+#
+# Owners are task ids (kebab-case). When in doubt, include the task that
+# introduced the regression and the task that fixed it.
+
+[[scenario]]
+name = "nex_two_message_against_lambda01"
+script = "scenarios/nex_two_message_against_lambda01.sh"
+owners = [
+    "wg-nex-native",
+    "wg-nex-native-2",
+    "wg-nex-native-3",
+    "fix-compaction-llm",
+    "smoke-test-gap",
+    "smoke-gate-is",
+]
+description = "Live two-message wg chat against a real lambda01 endpoint via wg nex. Repros the user-reported 'why isn't this working' first-message regression."
+timeout_seconds = 240
+
+[[scenario]]
+name = "dispatcher_boot_no_orphan_supervisor"
+script = "scenarios/dispatcher_boot_no_orphan_supervisor.sh"
+owners = [
+    "rename-dispatcher-daemon",
+    "bug-a-regression-test",
+    "smoke-gate-is",
+]
+description = "Boot dispatcher and confirm no orphan supervisor / ghost task is registered (Bug A regression check)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "claude_executor_with_global_openrouter_default"
+script = "scenarios/claude_executor_with_global_openrouter_default.sh"
+owners = [
+    "model-is-not",
+    "wire-priority-field",
+    "smoke-gate-is",
+]
+description = "Local executor=claude + a global openrouter is_default endpoint must spawn with executor=claude (no native-exec routing leak)."
+timeout_seconds = 30
+
+[[scenario]]
+name = "priority_int_and_string_deserialize"
+script = "scenarios/priority_int_and_string_deserialize.sh"
+owners = [
+    "wire-priority-field",
+    "smoke-gate-is",
+]
+description = "graph.jsonl rows containing priority as either integer or string load cleanly (regression for the priority schema migration)."
+timeout_seconds = 20
+
+[[scenario]]
+name = "chat_create_via_ipc_works"
+script = "scenarios/chat_create_via_ipc_works.sh"
+owners = [
+    "wg-nex-native",
+    "wg-nex-native-2",
+    "fix-tui-coordinator-2",
+    "fix-tui-new",
+    "smoke-gate-is",
+]
+description = "Open a chat and send 'hi'; expect a non-error coordinator response within 30s of dispatcher boot."
+timeout_seconds = 90
+
+[[scenario]]
+name = "setup_routes_complete_configs"
+script = "scenarios/setup_routes_complete_configs.sh"
+owners = [
+    "wg-setup-5-smooth-2",
+    "wg-setup-5-smooth",
+    "improve-wg-setup",
+]
+description = "Five setup routes (openrouter / claude-cli / codex-cli / local / nex-custom) each write a complete config (filled [tiers] + endpoint when applicable). `wg init -x claude` populates [tiers] (the bug). `wg config reset` backs up. `wg setup --route nex-custom --yes` without --url refuses."
+timeout_seconds = 60
+
+[[scenario]]
+name = "setup_scope_flag"
+script = "scenarios/setup_scope_flag.sh"
+owners = [
+    "improve-wg-setup",
+]
+description = "`wg setup --scope global|local|both` writes the requested target only. --scope global writes only ~/.wg/config.toml; --scope local writes only ./.wg/config.toml; --scope both writes both. Invalid --scope refuses with helpful message. Summary screen prints DELTA: 'Will write N keys' + 'Will NOT write (built-in defaults): M more' (per docs/config-ux-design.md §4)."
+timeout_seconds = 30
+
+[[scenario]]
+name = "nex_resume_oversized_journal_does_not_loop"
+script = "scenarios/nex_resume_oversized_journal_does_not_loop.sh"
+owners = [
+    "wg-nex-resume-311",
+    "smoke-gate-is",
+]
+description = "Resume a 500-msg journal against a 32k context window must truncate to fit and surface; HTTP 400 must NOT retry; 429 must back off. Regression bar for the autohaiku 311-msg lambda01 400-flood."
+timeout_seconds = 300
+
+[[scenario]]
+name = "tui_log_pane_renders_raw_stream"
+script = "scenarios/tui_log_pane_renders_raw_stream.sh"
+owners = [
+    "tui-agent-activity",
+    "tui-log-view",
+    "smoke-gate-is",
+]
+description = "wg tui's '4: Log' pane renders raw_stream.jsonl events for an in-progress task's assigned agent on first draw, and picks up new events as they're appended. Regression for the tui-agent-activity merge that surfaced 'no agent output yet' to users despite stream files existing."
+timeout_seconds = 60
+
+[[scenario]]
+name = "evaluate_record_flag_args"
+script = "scenarios/evaluate_record_flag_args.sh"
+owners = [
+    "wg-evaluate-record",
+    "smoke-gate-is",
+]
+description = "wg evaluate record requires --task/--score/--source (flag-style). Regression for the inline-eval wrapper script in coordinator.rs that passed positionally and silently dropped every FLIP / agency eval result."
+timeout_seconds = 30
+
+[[scenario]]
+name = "agency_local_model_overrides_claude_executor"
+script = "scenarios/agency_local_model_overrides_claude_executor.sh"
+owners = [
+    "agency-picks-claude",
+    "agency-still-picks",
+    "smoke-gate-is",
+]
+description = "Agency MUST NOT pick the claude executor for an agent whose role defaults to claude when the task model has a non-Anthropic provider prefix (local:, openrouter:, oai-compat:, openai:). Regression for the autohaiku 100% failure: agent.executor=claude (default) + model=local:qwen3-coder routed every spawn through the claude CLI which 404'd. Asserts the dispatcher's SpawnPlan provenance line shows executor=native, never claude, for a local: model assigned to a default-claude agent."
+timeout_seconds = 30
+
+[[scenario]]
+name = "dispatcher_codex_wins_over_agency"
+script = "scenarios/dispatcher_codex_wins_over_agency.sh"
+owners = [
+    "agency-still-picks",
+    "smoke-gate-is",
+]
+description = "Dispatcher's explicit `-x codex` MUST win when the assigned agent has only the default claude executor and the task model is `local:qwen3-coder`. Regression for agency-still-picks: the previous fix (agency-picks-claude) put the model-compat override INSIDE the agency, where it fired BEFORE the dispatcher's executor floor in resolve_executor's precedence — silently rewriting `-x codex` to native. Asserts SpawnPlan executor=codex (never native, never claude) for the codex+local: combo."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_new_chat_creates_fresh_ids"
+script = "scenarios/tui_new_chat_creates_fresh_ids.sh"
+owners = [
+    "tui-new-chat",
+    "tui-new-coordinator",
+    "smoke-gate-is",
+]
+description = "Three back-to-back `wg service create-coordinator` IPCs (the call the TUI launcher dialog drives) MUST allocate three distinct .chat-N task ids — not reuse the most recent slot. Pins the user-reported regression on tui-new-chat: 'it doesnt convert into chat-2 or whatever it takes over the last coordinator chat.' Independent of LLM credentials — a graph + IPC correctness check."
+timeout_seconds = 60
+
+[[scenario]]
+name = "chat_idle_does_not_respawn_loop"
+script = "scenarios/chat_idle_does_not_respawn_loop.sh"
+owners = [
+    "chat-agent-loops",
+    "chat-agent-loops-2",
+    "smoke-gate-is",
+]
+description = "Marking a chat-loop tagged task Done MUST NOT trigger cycle reactivation. The user-reported bug had .chat-2 dispatched 458 times in autohaiku/workgraph because Mode 2 implicit cycle iteration re-Opened the chat task on every wg done, the supervisor re-spawned, the new agent called wg done, repeat. Asserts the chat task stays status=done with loop_iteration=0 and zero 'Re-activated by cycle iteration' log entries after wg done. No LLM credentials needed."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_chat_switch_keystrokes"
+script = "scenarios/tui_chat_switch_keystrokes.sh"
+owners = [
+    "tui-chat-tab",
+    "tui-still-cannot",
+    "smoke-gate-is",
+    "tui-tab-bar",
+]
+description = "With multiple chats present, plain number-key presses ('1', '2', '3') MUST visibly switch the active chat in `wg tui`. Pins the user-reported tui-still-cannot regression: tui-chat-tab merged claiming chat-switching worked, but the handlers were gated to RightPanel focus and plain digits clashed with right-panel-tab nav, so nothing happened in the live TUI. Drives a real `wg tui` inside tmux, sends synthetic '2'/'3'/'1' keystrokes via tmux send-keys, and asserts `wg tui-dump`'s coordinator_id changes between presses. Also pins the tui-tab-bar fix: tab labels MUST be `.chat-N` (canonical task id), never the deprecated `coord:N` shorthand."
+timeout_seconds = 90
+
+[[scenario]]
+name = "evaluate_accepts_pending_eval"
+script = "scenarios/evaluate_accepts_pending_eval.sh"
+owners = [
+    "bug-flip-and",
+    "smoke-gate-is",
+]
+description = "wg evaluate run (and --flip) MUST accept Status::PendingEval as a valid input state. Regression for the 2026-04-27 mass-fail: ~30 .flip-* / .evaluate-* tasks auto-failed with 'has status PendingEval — must be done or failed to evaluate' because the dispatcher correctly fires those tasks while parent is still PendingEval (per the eval-gated unblock contract) but evaluate.rs's precondition rejected it."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_retire_chat_via_ctrl_w"
+script = "scenarios/tui_retire_chat_via_ctrl_w.sh"
+owners = [
+    "tui-cannot-retire",
+    "smoke-gate-is",
+]
+description = "Pins user-reported tui-cannot-retire regression: 'man why can't we retire the .chat-4 ???'. The embedded vendor CLI (claude --resume) shows a session-resume modal that swallows Esc/digit keys, so the user has no way to reach wg's Archive/Stop/Abandon dialog. Ctrl+W must be a global escape hatch that breaks out of PTY forwarding AND opens the retire dialog. Drives a real `wg tui` with three live chats, sends Ctrl+T (focus PTY) → Ctrl+W → 'x' (Abandon hotkey), and asserts the visible chat-tab count drops AND graph.jsonl shows ≥1 abandoned task."
+timeout_seconds = 90
+
+[[scenario]]
+name = "smoke_cleanup_survives_panic"
+script = "scenarios/smoke_cleanup_survives_panic.sh"
+owners = [
+    "smoke-tests-leak",
+    "smoke-gate-is",
+]
+description = "Pins the smoke-tests-leak regression: production runs left 70+ orphaned `wg service daemon` processes and 200+ /tmp scratch dirs because per-test traps did not survive SIGKILL/panic. Spawns a real daemon in a child shell, kills the child with SIGKILL (no trap fires), then asserts wg_smoke_sweep reaps both the re-parented daemon and the leftover scratch dir. Defense in depth for the central trap in `tests/smoke/scenarios/_helpers.sh`."
+timeout_seconds = 60
+
+[[scenario]]
+name = "reaper_retry_in_place_protected"
+script = "scenarios/reaper_retry_in_place_protected.sh"
+owners = [
+    "reaper-edge-case",
+    "worktree-target-dirs",
+    "smoke-gate-is",
+]
+description = "Pins reaper-edge-case: `wg sweep --reap-targets` MUST NOT remove `target/` from a worktree currently occupied by a `wg retry`-in-place agent whose ID differs from the directory name. Asserts (a) live agent-B at $$ + worktree_path = .wg-worktrees/agent-A protects target/ even though agent-A (matching the dir name) is dead, and (b) negative control — once agent-B is also marked dead with an unreachable PID, target/ is correctly reaped. No LLM credentials needed; pure registry+filesystem assertions."
+timeout_seconds = 30
+
+[[scenario]]
+name = "retry_kills_in_progress_agent"
+script = "scenarios/retry_kills_in_progress_agent.sh"
+owners = [
+    "add-wg-retry",
+    "smoke-gate-is",
+]
+description = "Pins add-wg-retry: `wg retry <task>` and `wg agents kill <agent>` MUST terminate hung worker processes, mark the agent Dead in the registry, and reset in-progress tasks to Open with retry_count incremented. Spawns real long-running `sleep 600` processes to stand in for hung workers; hand-crafts graph.jsonl + registry.json to bind them to in-progress tasks; asserts (a) `wg agents kill` kills the live PID and marks the agent Dead, (b) re-running `wg agents kill` on a now-dead or absent agent succeeds (no-op semantics), (c) `wg retry` on an in-progress hung task kills the worker, transitions to Open, increments retry_count 0→1, and records --reason in the log. No LLM required; pure process+graph assertions."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_chat_redesign_modal_close_persist"
+script = "scenarios/tui_chat_redesign_modal_close_persist.sh"
+owners = [
+    "integrate-tui-chat",
+    "implement-tui-modal",
+    "implement-tui-tabs",
+    "implement-tui-tab",
+    "smoke-gate-is",
+]
+description = "Pins the three critical invariants of the TUI chat redesign (umbrella: integrate-tui-chat). (1) MODAL TOGGLE: chat tab shows [PTY]/[CMD] modal indicator; Ctrl+T flips between them. Without this, users have no visual cue that the modal contract — which stops Ctrl+N/Ctrl+W/letters from being intercepted as global hotkeys inside the embedded vendor CLI — is in effect. (2) CLOSE IS NON-DESTRUCTIVE: Ctrl+W in command mode closes the active tab (visible tab count drops by 1), the underlying graph task status stays unchanged (NOT marked abandoned/archived), and NO ChoiceDialog appears. The redesign explicitly removed the close-confirmation dialog from the tab-close path. (3) PERSISTENCE: relaunching `wg tui` after a kill restores the last-active coordinator id from tui-state.json. Drives a real `wg tui` inside tmux, sends synthetic Ctrl+T / Ctrl+W / digit keys via tmux send-keys, and asserts on `wg --json tui-dump`'s screen text + graph.jsonl statuses + tui-state.json contents."
+timeout_seconds = 120
+
+[[scenario]]
+name = "native_executor_keyless_init"
+script = "scenarios/native_executor_keyless_init.sh"
+owners = [
+    "native-executor-client",
+    "smoke-gate-is",
+]
+description = "Pins the user contract: `wg init -m qwen3-coder -e <URL> --executor nex` with NO env vars MUST be sufficient. The autohaiku 100%-failure regression had wg native-exec bailing at init with 'No Anthropic API key found' because the OAI-compat client init path called the Anthropic key resolver as a fallback. This scenario asserts (a) init succeeds without any *_API_KEY env var, (b) config.toml has a complete [[llm_endpoints.endpoints]] block, (c) wg list does not surface ANTHROPIC_API_KEY in errors, (d) native-exec --help advertises --api-key. The wire-level assertions (Authorization header omitted on no-key, configured key wins over env vars, 401 surfaces config-block-named error) live in tests/integration_native_coordinator.rs::credential_wire_contract."
+timeout_seconds = 30
+
+[[scenario]]
+name = "agency_inline_spawn_registers_executor_claude"
+script = "scenarios/agency_inline_spawn_registers_executor_claude.sh"
+owners = [
+    "migrate-agency-tasks",
+    "smoke-gate-is",
+]
+description = "Inline spawn of an `.evaluate-*` task must register the agent with `executor=\"claude\"` (not legacy `\"eval\"`) in both registry.json and the agent's metadata.json. Regression: agency one-shot LLM calls share the claude CLI dispatch path with worker agents, so the registered executor label must reflect that — `executor=\"eval\"` was misleading observability noise that masked today's openrouter-cascade outage."
+timeout_seconds = 60
+
+[[scenario]]
+name = "dispatcher_kick_bypasses_settling_delay"
+script = "scenarios/dispatcher_kick_bypasses_settling_delay.sh"
+owners = [
+    "dispatcher-poll-lower",
+    "smoke-gate-is",
+]
+description = "Pins the kick-dispatcher contract for user-initiated state mutations. After `wg add --immediate` (and equivalently `wg publish` / `wg unclaim` / `wg service resume`), the daemon log MUST show `KickDispatcher received, ticking immediately` and a coordinator tick MUST fire within 1 second — bypassing the 2s settling delay used by GraphChanged. Pre-fix the dispatcher waited the full settling_delay on every CLI mutation, on top of a 30-60s safety-timer poll, so users perceived dead air after every state-changing command. If a future change reverts callers to notify_graph_changed (or removes the kick fast-path in the daemon loop), this scenario fails."
+timeout_seconds = 30
+
+[[scenario]]
+name = "reset_clears_claim"
+script = "scenarios/reset_clears_claim.sh"
+owners = [
+    "fold-unclaim-semantics",
+    "smoke-gate-is",
+]
+description = "`wg reset` must clear the `assigned` claim field so reset tasks are immediately ready for fresh dispatch. Regression: dead-agent claims survived reset; user had to `wg unclaim` each task by hand or it looked identical to the dispatcher-poll bug."
+timeout_seconds = 30

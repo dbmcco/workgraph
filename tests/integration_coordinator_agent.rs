@@ -19,6 +19,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+extern crate libc;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -38,11 +40,21 @@ fn wg_binary() -> PathBuf {
     path
 }
 
+/// Derive a fake HOME from the wg_dir path so global config doesn't leak in.
+fn fake_home_for(wg_dir: &Path) -> PathBuf {
+    // wg_dir is typically <tmp>/.workgraph — use <tmp> as fake home
+    wg_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| wg_dir.to_path_buf())
+}
+
 fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(wg_binary())
         .arg("--dir")
         .arg(wg_dir)
         .args(args)
+        .env("HOME", fake_home_for(wg_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -55,6 +67,7 @@ fn wg_cmd_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::p
     cmd.arg("--dir")
         .arg(wg_dir)
         .args(args)
+        .env("HOME", fake_home_for(wg_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -111,7 +124,7 @@ fn wg_ok_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> String 
 /// Initialise a fresh workgraph in a temp directory and return the .workgraph path.
 fn init_workgraph(tmp: &TempDir) -> PathBuf {
     let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--executor", "shell"]);
     wg_dir
 }
 
@@ -124,12 +137,16 @@ fn enable_coordinator_agent(wg_dir: &Path) {
 
 /// Stop the daemon, ignoring errors (best-effort cleanup).
 fn stop_daemon(wg_dir: &Path) {
-    let _ = wg_cmd(wg_dir, &["service", "stop"]);
+    let _ = wg_cmd(wg_dir, &["service", "stop", "--force", "--kill-agents"]);
 }
 
 /// Stop daemon with custom env vars.
 fn stop_daemon_env(wg_dir: &Path, env_vars: &[(&str, &str)]) {
-    let _ = wg_cmd_env(wg_dir, &["service", "stop"], env_vars);
+    let _ = wg_cmd_env(
+        wg_dir,
+        &["service", "stop", "--force", "--kill-agents"],
+        env_vars,
+    );
 }
 
 /// Wait for the daemon socket to appear.
@@ -429,6 +446,18 @@ impl<'a> CoordinatorDaemonGuard<'a> {
 impl Drop for CoordinatorDaemonGuard<'_> {
     fn drop(&mut self) {
         stop_daemon_env(self.wg_dir, &self.env_refs());
+
+        // Belt-and-suspenders: kill daemon by PID directly
+        let state_path = self.wg_dir.join("service").join("state.json");
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(pid) = state["pid"].as_u64() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -839,6 +868,7 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
 fn coordinator_agent_fallback_when_unavailable() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
+    let _guard = RealDaemonGuard { wg_dir: &wg_dir };
     enable_coordinator_agent(&wg_dir);
 
     // Start daemon WITHOUT mock claude on PATH — claude binary won't be found.
@@ -897,8 +927,6 @@ fn coordinator_agent_fallback_when_unavailable() {
         "Expected Phase 1 stub response, got: {}",
         stdout
     );
-
-    stop_daemon_env(&wg_dir, &[("PATH", &path_env)]);
 }
 
 /// Verify that the response arrives quickly when the coordinator agent is active
@@ -969,6 +997,27 @@ fn coordinator_agent_storage_consistency() {
 // Real E2E tests (require Claude CLI installed, run with --ignored)
 // ===========================================================================
 
+/// Guard for real E2E tests that kills the daemon on drop.
+struct RealDaemonGuard<'a> {
+    wg_dir: &'a Path,
+}
+
+impl Drop for RealDaemonGuard<'_> {
+    fn drop(&mut self) {
+        stop_daemon(self.wg_dir);
+        let state_path = self.wg_dir.join("service").join("state.json");
+        if let Ok(content) = std::fs::read_to_string(&state_path) {
+            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(pid) = state["pid"].as_u64() {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start a daemon with the real Claude CLI as coordinator agent.
 fn start_real_coordinator_daemon(wg_dir: &Path) {
     enable_coordinator_agent(wg_dir);
@@ -1008,6 +1057,7 @@ fn coordinator_agent_real_list_tasks() {
     );
 
     start_real_coordinator_daemon(&wg_dir);
+    let _guard = RealDaemonGuard { wg_dir: &wg_dir };
 
     let output = wg_cmd(
         &wg_dir,
@@ -1028,8 +1078,6 @@ fn coordinator_agent_real_list_tasks() {
         "Expected response about tasks, got: {}",
         stdout
     );
-
-    stop_daemon(&wg_dir);
 }
 
 /// Real E2E: ask the coordinator to create a task, verify it appears in the graph.
@@ -1039,6 +1087,7 @@ fn coordinator_agent_real_create_task() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
     start_real_coordinator_daemon(&wg_dir);
+    let _guard = RealDaemonGuard { wg_dir: &wg_dir };
 
     let output = wg_cmd(
         &wg_dir,
@@ -1069,8 +1118,6 @@ fn coordinator_agent_real_create_task() {
         list_output,
         stdout
     );
-
-    stop_daemon(&wg_dir);
 }
 
 /// Real E2E: multi-turn conversation with context retention.
@@ -1080,6 +1127,7 @@ fn coordinator_agent_real_multi_turn() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
     start_real_coordinator_daemon(&wg_dir);
+    let _guard = RealDaemonGuard { wg_dir: &wg_dir };
 
     // First turn: establish context
     let r1 = wg_cmd(
@@ -1124,8 +1172,6 @@ fn coordinator_agent_real_multi_turn() {
         "Expected second response to reference auth context.\nResponse: {}",
         r2_stdout
     );
-
-    stop_daemon(&wg_dir);
 }
 
 /// Real E2E: verify the coordinator can execute wg show and wg edit.
@@ -1147,6 +1193,7 @@ fn coordinator_agent_real_inspect_and_edit() {
     );
 
     start_real_coordinator_daemon(&wg_dir);
+    let _guard = RealDaemonGuard { wg_dir: &wg_dir };
 
     // Ask to show the task
     let r1 = wg_cmd(
@@ -1196,6 +1243,4 @@ fn coordinator_agent_real_inspect_and_edit() {
         "Task should have 'urgent' tag after edit.\nShow output: {}",
         show
     );
-
-    stop_daemon(&wg_dir);
 }

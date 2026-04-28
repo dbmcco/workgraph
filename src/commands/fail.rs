@@ -2,7 +2,11 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
-use workgraph::graph::{LogEntry, Status, Task, evaluate_cycle_on_failure};
+use workgraph::graph::{
+    LogEntry, Status, evaluate_cycle_on_failure, parse_token_usage, parse_wg_tokens,
+};
+use workgraph::parser::modify_graph;
+use workgraph::service::registry::AgentRegistry;
 
 #[cfg(test)]
 use super::graph_path;
@@ -26,58 +30,154 @@ struct FailResult {
 }
 
 fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> Result<()> {
-    let result = super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(id)?;
+    // Pre-check with a non-atomic read (gate only — not used for mutation).
+    {
+        let (graph, _path) = super::load_workgraph_mut(dir)?;
+        let task = graph.get_task_or_err(id)?;
+
         if task.status == Status::Done && !eval_reject {
-            anyhow::bail!("Task '{}' is already done and cannot be marked as failed", id);
+            anyhow::bail!(
+                "Task '{}' is already done and cannot be marked as failed",
+                id
+            );
         }
+
         if task.status == Status::Abandoned {
             anyhow::bail!("Task '{}' is already abandoned", id);
         }
+
         if task.status == Status::Failed {
-            return Ok(None); // already failed — no-op
+            println!(
+                "Task '{}' is already failed (retry_count: {})",
+                id, task.retry_count
+            );
+            return Ok(());
         }
+
+        // PendingEval is the new soft-done state: eval-gated rejection from
+        // this state is the primary path. External `wg fail` is also allowed
+        // (no special-case needed — the generic "anything non-terminal can be
+        // failed" branch below covers it).
+    }
+
+    let path = super::graph_path(dir);
+
+    // Resolve token usage outside the lock (registry read + file I/O).
+    let token_usage = AgentRegistry::load(dir).ok().and_then(|registry| {
+        let agent = registry.get_agent_by_task(id)?;
+        let output_path = std::path::Path::new(&agent.output_file);
+        let abs_path = if output_path.is_absolute() {
+            output_path.to_path_buf()
+        } else {
+            dir.parent().unwrap_or(dir).join(output_path)
+        };
+        parse_token_usage(&abs_path).or_else(|| parse_wg_tokens(&abs_path))
+    });
+
+    // Atomically load the freshest graph, apply the mutation, and save.
+    // Using modify_graph prevents lost updates from concurrent graph writers.
+    let mut retry_count = 0u32;
+    let mut max_retries = None;
+    let mut agent_id_for_archive = None;
+    let mut cycle_reactivated = Vec::new();
+    let mut already_failed = false;
+
+    let id_owned = id.to_string();
+    let reason_owned = reason.map(String::from);
+    let graph = modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(&id_owned) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Re-check status under lock
+        if task.status == Status::Failed {
+            already_failed = true;
+            retry_count = task.retry_count;
+            return false;
+        }
+        if task.status == Status::Abandoned {
+            return false;
+        }
+        if task.status == Status::Done && !eval_reject {
+            return false;
+        }
+        // PendingEval → Failed is allowed from both `wg fail` and the
+        // eval-reject path. Falls through to the generic mutation below.
 
         task.status = Status::Failed;
         task.retry_count += 1;
-        task.failure_reason = reason.map(String::from);
+        task.failure_reason = reason_owned.clone();
+
+        let log_message = if eval_reject {
+            match reason_owned.as_deref() {
+                Some(r) => format!("Evaluation rejected task: {}", r),
+                None => "Evaluation rejected task".to_string(),
+            }
+        } else {
+            match reason_owned.as_deref() {
+                Some(r) => format!("Task marked as failed: {}", r),
+                None => "Task marked as failed".to_string(),
+            }
+        };
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: task.assigned.clone(),
-            message: if eval_reject {
-                match reason { Some(r) => format!("Evaluation rejected task: {}", r), None => "Evaluation rejected task".to_string() }
-            } else {
-                match reason { Some(r) => format!("Task marked as failed: {}", r), None => "Task marked as failed".to_string() }
-            },
+            user: Some(workgraph::current_user()),
+            message: log_message,
         });
 
-        let retry_count = task.retry_count;
-        let max_retries = task.max_retries;
-        let agent_id = task.assigned.clone();
-
-        let id_owned = id.to_string();
-        let cycle_analysis = graph.compute_cycle_analysis();
-        let cycle_reactivated = evaluate_cycle_on_failure(graph, &id_owned, &cycle_analysis);
-
-        let task_snapshot = graph.get_task(id).unwrap().clone();
-        Ok(Some(FailResult { retry_count, max_retries, agent_id, cycle_reactivated, task_snapshot }))
-    })?;
-
-    let result = match result {
-        Some(r) => r,
-        None => {
-            // Already failed — printed inside closure would need graph access,
-            // so we use a read to get retry_count
-            let (graph, _) = super::load_workgraph(dir)?;
-            let task = graph.get_task_or_err(id)?;
-            println!("Task '{}' is already failed (retry_count: {})", id, task.retry_count);
-            return Ok(());
+        // Apply pre-resolved token usage
+        if task.token_usage.is_none()
+            && let Some(ref usage) = token_usage
+        {
+            task.token_usage = Some(usage.clone());
         }
-    };
+
+        // Extract values we need before cycle restart may modify the task
+        retry_count = task.retry_count;
+        max_retries = task.max_retries;
+        agent_id_for_archive = task.assigned.clone();
+
+        // Evaluate cycle failure restart — if this task is part of a cycle with
+        // restart_on_failure (default true), reset all cycle members to Open.
+        let cycle_analysis = graph.compute_cycle_analysis();
+        cycle_reactivated = evaluate_cycle_on_failure(graph, &id_owned, &cycle_analysis);
+
+        true
+    })
+    .context("Failed to save graph")?;
+
+    if already_failed {
+        println!(
+            "Task '{}' is already failed (retry_count: {})",
+            id, retry_count
+        );
+        return Ok(());
+    }
+
     super::notify_graph_changed(dir);
 
-    if !result.cycle_reactivated.is_empty() {
-        println!("  Cycle failure restart: re-activated {} task(s): {:?}", result.cycle_reactivated.len(), result.cycle_reactivated);
+    // Update agent registry to reflect task failure.
+    // Without this, the registry entry stays at Working until the daemon's
+    // periodic triage detects the dead process.
+    if let Ok(mut locked_registry) = AgentRegistry::load_locked(dir) {
+        if let Some(agent) = locked_registry.get_agent_by_task_mut(id) {
+            use workgraph::service::registry::AgentStatus;
+            agent.status = AgentStatus::Failed;
+            if agent.completed_at.is_none() {
+                agent.completed_at = Some(Utc::now().to_rfc3339());
+            }
+        }
+        let _ = locked_registry.save_ref();
+    }
+
+    if !cycle_reactivated.is_empty() {
+        println!(
+            "  Cycle failure restart: re-activated {} task(s): {:?}",
+            cycle_reactivated.len(),
+            cycle_reactivated
+        );
     }
 
     let config = workgraph::config::Config::load_or_default(dir);
@@ -362,5 +462,40 @@ mod tests {
         let graph = load_graph(&path).unwrap();
         let task = graph.get_task("t1").unwrap();
         assert_eq!(task.retry_count, 1); // Unchanged
+    }
+
+    #[test]
+    fn test_fail_updates_agent_registry() {
+        // When a task is marked failed, the agent registry entry should also
+        // transition to Failed so the agent slot is freed immediately.
+        use workgraph::service::registry::{AgentRegistry, AgentStatus};
+
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let mut task = make_task("t1", "Test task", Status::InProgress);
+        task.assigned = Some("agent-1".to_string());
+        setup_workgraph(dir_path, vec![task]);
+
+        // Set up a registry with an agent working on this task
+        let mut registry = AgentRegistry::new();
+        registry.register_agent(99999, "t1", "claude", "/tmp/output.log");
+        registry.save(dir_path).unwrap();
+
+        let result = run(dir_path, "t1", Some("test failure"));
+        assert!(result.is_ok());
+
+        // Verify registry was updated
+        let registry = AgentRegistry::load(dir_path).unwrap();
+        let agent = registry.get_agent("agent-1").unwrap();
+        assert_eq!(
+            agent.status,
+            AgentStatus::Failed,
+            "Agent registry should be updated to Failed when task fails"
+        );
+        assert!(
+            agent.completed_at.is_some(),
+            "Agent should have a completed_at timestamp"
+        );
     }
 }

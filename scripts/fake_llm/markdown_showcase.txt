@@ -1,0 +1,34 @@
+# Markdown Rendering Smoke
+
+This paragraph is deliberately long and wraps across several lines when the terminal is narrower than 80 columns, which is the exact case where the row-count-based erase used to undercount and leave duplicated text fragments on screen before the re-rendered version. Now rendering should wipe every row cleanly.
+
+## Bullets
+
+- Short bullet
+- Longer bullet that should wrap at typical widths and still render cleanly with the `•` glyph intact
+- Third bullet with `inline code` span
+
+## Code
+
+Here is a fenced code block:
+
+```rust
+fn main() {
+    println!("hello from the fake LLM");
+}
+```
+
+## Inline elements
+
+The word **bold** should be bold; *italic* should be italic; `inline code` should have a highlight background; [a link](https://example.com) should be styled.
+
+## Ending
+
+That is the whole showcase turn. Sending the next message replays the same content so you can rapid-fire-test resize behavior by yanking the terminal width mid-turn.
+---
+
+# Turn 2: a shorter response
+
+Just a quick reply with one paragraph and one bullet:
+
+- OK

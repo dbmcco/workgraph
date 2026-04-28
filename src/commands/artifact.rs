@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
+use workgraph::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
@@ -8,15 +9,30 @@ use workgraph::parser::load_graph;
 
 /// Register an artifact (produced output) for a task
 pub fn run_add(dir: &Path, task_id: &str, artifact_path: &str) -> Result<()> {
-    let already_registered = super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(task_id)?;
-        if task.artifacts.contains(&artifact_path.to_string()) {
-            return Ok(true);
+    let path = super::graph_path(dir);
+    let mut error: Option<anyhow::Error> = None;
+    let mut already_registered = false;
+    let artifact_str = artifact_path.to_string();
+    let task_id_owned = task_id.to_string();
+    modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(&task_id_owned) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", task_id_owned));
+                return false;
+            }
+        };
+        if task.artifacts.contains(&artifact_str) {
+            already_registered = true;
+            return false;
         }
-        task.artifacts.push(artifact_path.to_string());
-        Ok(false)
-    })?;
-
+        task.artifacts.push(artifact_str.clone());
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
     if already_registered {
         println!(
             "Artifact '{}' already registered for task '{}'",
@@ -24,7 +40,6 @@ pub fn run_add(dir: &Path, task_id: &str, artifact_path: &str) -> Result<()> {
         );
         return Ok(());
     }
-
     super::notify_graph_changed(dir);
     let config = workgraph::config::Config::load_or_default(dir);
     let _ = workgraph::provenance::record(
@@ -45,19 +60,34 @@ pub fn run_add(dir: &Path, task_id: &str, artifact_path: &str) -> Result<()> {
 
 /// Remove an artifact from a task
 pub fn run_remove(dir: &Path, task_id: &str, artifact_path: &str) -> Result<()> {
-    super::mutate_workgraph(dir, |graph| {
-        let task = graph.get_task_mut_or_err(task_id)?;
+    let path = super::graph_path(dir);
+    let mut error: Option<anyhow::Error> = None;
+    let artifact_str = artifact_path.to_string();
+    let task_id_owned = task_id.to_string();
+    modify_graph(&path, |graph| {
+        let task = match graph.get_task_mut(&task_id_owned) {
+            Some(t) => t,
+            None => {
+                error = Some(anyhow::anyhow!("Task '{}' not found", task_id_owned));
+                return false;
+            }
+        };
         let original_len = task.artifacts.len();
-        task.artifacts.retain(|a| a != artifact_path);
+        task.artifacts.retain(|a| a != &artifact_str);
         if task.artifacts.len() == original_len {
-            anyhow::bail!(
+            error = Some(anyhow::anyhow!(
                 "Artifact '{}' not found on task '{}'",
-                artifact_path,
-                task_id
-            );
+                artifact_str,
+                task_id_owned
+            ));
+            return false;
         }
-        Ok(())
-    })?;
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
+    }
     super::notify_graph_changed(dir);
 
     let config = workgraph::config::Config::load_or_default(dir);

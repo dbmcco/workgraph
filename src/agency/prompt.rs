@@ -160,14 +160,9 @@ pub fn resolve_all_components(
                     Ok(resolved) => resolved.content,
                     Err(_) => comp.description.clone(),
                 };
-                let category_label = match comp.category {
-                    ComponentCategory::Translated => "Translated",
-                    ComponentCategory::Enhanced => "Enhanced",
-                    ComponentCategory::Novel => "Novel",
-                };
                 return Some(ResolvedSkill {
                     name: comp.name,
-                    content: format!("[{}] {}\n{}", category_label, comp.description, content),
+                    content: format!("{}\n{}", comp.description, content),
                 });
             }
 
@@ -177,14 +172,9 @@ pub fn resolve_all_components(
                     Ok(resolved) => resolved.content,
                     Err(_) => comp.description.clone(),
                 };
-                let category_label = match comp.category {
-                    ComponentCategory::Translated => "Translated",
-                    ComponentCategory::Enhanced => "Enhanced",
-                    ComponentCategory::Novel => "Novel",
-                };
                 return Some(ResolvedSkill {
                     name: comp.name,
-                    content: format!("[{}] {}\n{}", category_label, comp.description, content),
+                    content: format!("{}\n{}", comp.description, content),
                 });
             }
 
@@ -342,6 +332,25 @@ pub struct EvaluatorInput<'a> {
     /// Downstream task context for organizational impact scoring.
     /// Each entry: (task_title, status_str, description_snippet).
     pub downstream_tasks: &'a [(String, String, Option<String>)],
+    /// FLIP score for the source task (from source: "flip" evaluation), if available.
+    pub flip_score: Option<f64>,
+    /// Verification status from .verify-<task>: "passed" or "failed", if available.
+    pub verify_status: Option<&'a str>,
+    /// Log entries from the .verify-<task> task, if available.
+    pub verify_findings: Option<&'a str>,
+    /// Resolved outcome name for the evaluated agent's role (avoids showing raw hash).
+    /// When `None`, falls back to `role.outcome_id` (which may be a content hash).
+    pub resolved_outcome_name: Option<&'a str>,
+    /// Child task context for decomposition detection.
+    /// Each entry: (task_title, status_str, description_snippet).
+    /// When populated, indicates the task decomposed work into subtasks.
+    pub child_tasks: &'a [(String, String, Option<String>)],
+    /// Constraint-fidelity score (from deterministic lint), if available.
+    /// When present, indicates unanchored gating constraints were detected
+    /// in the task description.
+    pub constraint_fidelity_score: Option<f64>,
+    /// Number of unanchored constraints detected by constraint-fidelity lint.
+    pub constraint_fidelity_unanchored: Option<usize>,
 }
 
 /// Render the evaluator prompt that an LLM evaluator will receive.
@@ -398,7 +407,8 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
     if let Some(role) = input.role {
         let _ = writeln!(out, "**Role:** {} ({})", role.name, role.id);
         let _ = writeln!(out, "{}\n", role.description);
-        let _ = writeln!(out, "**Desired Outcome:** {}\n", role.outcome_id);
+        let outcome_display = input.resolved_outcome_name.unwrap_or(&role.outcome_id);
+        let _ = writeln!(out, "**Desired Outcome:** {}\n", outcome_display);
     } else {
         out.push_str("*No role was assigned.*\n\n");
     }
@@ -472,13 +482,118 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
         for (title, status, desc) in input.downstream_tasks {
             let _ = write!(out, "- **{}** ({})", title, status);
             if let Some(d) = desc {
-                // Truncate long descriptions to save tokens
-                let snippet = if d.len() > 120 { &d[..120] } else { d.as_str() };
+                // Truncate long descriptions to save tokens (char-boundary safe)
+                let snippet = if d.len() > 120 {
+                    let mut end = 120;
+                    while !d.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    &d[..end]
+                } else {
+                    d.as_str()
+                };
                 let _ = write!(out, " — {}", snippet);
             }
             out.push('\n');
         }
         out.push('\n');
+    }
+
+    // -- Task Decomposition Detection --
+    if !input.child_tasks.is_empty() {
+        out.push_str("## Task Decomposition Detected\n\n");
+        out.push_str(
+            "This task created subtasks, indicating intentional work decomposition rather than\n\
+             direct implementation. Subtasks created:\n\n",
+        );
+        for (title, status, desc) in input.child_tasks {
+            let _ = write!(out, "- **{}** ({})", title, status);
+            if let Some(d) = desc {
+                // Truncate long descriptions to save tokens (char-boundary safe)
+                let snippet = if d.len() > 120 {
+                    let mut end = 120;
+                    while !d.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    &d[..end]
+                } else {
+                    d.as_str()
+                };
+                let _ = write!(out, " — {}", snippet);
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(
+            "IMPORTANT: When a task decomposes into subtasks, evaluate the DECOMPOSITION QUALITY\n\
+             rather than direct verify criteria fulfillment. Consider:\n\
+             - Was the decomposition appropriate for the task complexity?\n\
+             - Do subtasks adequately cover the parent task's requirements?\n\
+             - Is there clear handoff and verify criteria inheritance?\n\
+             - Does the decomposition structure enable effective parallel work?\n\n\
+             Do NOT penalize correctness/completeness dimensions for verification failures\n\
+             when work was properly delegated to subtasks.\n\n",
+        );
+    }
+
+    // -- FLIP Verification Results (when available) --
+    if input.flip_score.is_some() || input.verify_status.is_some() {
+        out.push_str("## FLIP Verification Results\n\n");
+        if let Some(score) = input.flip_score {
+            let threshold = 0.70;
+            let relation = if score >= threshold {
+                "at or above"
+            } else {
+                "below"
+            };
+            let _ = writeln!(
+                out,
+                "FLIP Score: {:.2} ({} threshold {:.2})",
+                score, relation, threshold
+            );
+        }
+        if let Some(status) = input.verify_status {
+            let _ = writeln!(out, "Verification Status: {}", status.to_uppercase());
+        }
+        if let Some(findings) = input.verify_findings {
+            out.push_str("Verification Findings:\n");
+            out.push_str(findings);
+            out.push('\n');
+        }
+        out.push('\n');
+        let decomposed = !input.child_tasks.is_empty();
+        if decomposed {
+            out.push_str(
+                "NOTE: This task was decomposed into subtasks. If verification failed,\n\
+                 this likely indicates proper work delegation rather than task failure.\n\
+                 Score the decomposition quality instead of penalizing for verify criteria\n\
+                 not met directly. If verification passed despite low FLIP, the FLIP\n\
+                 may have been a false alarm.\n\n",
+            );
+        } else {
+            out.push_str(
+                "NOTE: Verification is a strong signal. If verification failed, significantly\n\
+                 reduce the overall score. If verification passed despite low FLIP, the FLIP\n\
+                 may have been a false alarm.\n\n",
+            );
+        }
+    }
+
+    // -- Constraint-fidelity lint results --
+    if let Some(cf_score) = input.constraint_fidelity_score {
+        out.push_str("## Constraint-Fidelity Lint Results\n\n");
+        let _ = writeln!(out, "Constraint-Fidelity Score: {:.2}", cf_score);
+        if let Some(count) = input.constraint_fidelity_unanchored {
+            let _ = writeln!(out, "Unanchored Constraints: {}", count);
+        }
+        out.push('\n');
+        out.push_str(
+            "NOTE: `constraint_fidelity` is mechanically injected from the lint and does not \
+             need to be scored by the evaluator. Do not include it in your output dimensions.\n\
+             A low score indicates the task description may contain fabricated gating constraints \
+             not present in the user's original request. Consider whether the agent's output was \
+             influenced by phantom restrictions.\n\n",
+        );
     }
 
     // -- Evaluation rubric & output format --
@@ -515,7 +630,9 @@ pub fn render_evaluator_prompt(input: &EvaluatorInput) -> String {
          - style_adherence: 10%\n\
          - downstream_usability: 15%\n\
          - coordination_overhead: 10%\n\
-         - blocking_impact: 5%\n\n",
+         - blocking_impact: 5%\n\n\
+         Note: `intent_fidelity` is mechanically injected from the FLIP score and does not \
+         need to be scored by the evaluator. Do not include it in your output dimensions.\n\n",
     );
 
     // -- Rubric spectrum --
@@ -785,16 +902,10 @@ pub fn render_flip_comparison_prompt(input: &FlipComparisonInput) -> String {
 
 /// Input data for assigner mode context.
 pub struct AssignerModeContext<'a> {
-    /// Current run_mode value.
-    pub run_mode: f64,
-    /// Effective exploration rate (max of run_mode and min_exploration_rate).
-    pub effective_exploration_rate: f64,
     /// Which assignment path was selected.
     pub assignment_path: AssignmentPath,
     /// For learning mode: the experiment specification.
     pub experiment: Option<&'a AssignmentExperiment>,
-    /// For performance mode: top cached agents with scores.
-    pub cached_agents: &'a [(String, f64)],
     /// Total assignment count so far.
     pub total_assignments: u32,
 }
@@ -802,99 +913,69 @@ pub struct AssignerModeContext<'a> {
 /// Render mode context for the assigner prompt.
 ///
 /// Extends the assigner prompt with:
-/// 1. Mode context (run_mode, effective rate, selected path).
-/// 2. Experiment specification (learning mode).
-/// 3. Cache contents (performance mode).
+/// 1. Assignment path (Learning or ForcedExploration).
+/// 2. Experiment specification.
 pub fn render_assigner_mode_context(ctx: &AssignerModeContext) -> String {
     let mut out = String::new();
 
     out.push_str("## Assignment Mode Context\n\n");
-    let _ = writeln!(out, "- **Run mode:** {:.2}", ctx.run_mode);
-    let _ = writeln!(
-        out,
-        "- **Effective exploration rate:** {:.2}",
-        ctx.effective_exploration_rate
-    );
     let _ = writeln!(
         out,
         "- **Assignment path:** {}",
         match ctx.assignment_path {
-            AssignmentPath::Performance => "Performance (cache-first)",
             AssignmentPath::Learning => "Learning (structured experiment)",
             AssignmentPath::ForcedExploration => "Forced Exploration (interval trigger)",
         }
     );
     let _ = writeln!(out, "- **Total assignments:** {}\n", ctx.total_assignments);
 
-    match ctx.assignment_path {
-        AssignmentPath::Performance => {
-            if ctx.cached_agents.is_empty() {
-                out.push_str(
-                    "### Cache Status\n\n\
-                     No cached agents available. Use best-guess composition.\n\n",
-                );
-            } else {
-                out.push_str("### Cached Agents (ranked by fit)\n\n");
-                for (name, score) in ctx.cached_agents {
-                    let _ = writeln!(out, "- {} (score: {:.2})", name, score);
+    if let Some(exp) = ctx.experiment {
+        out.push_str("### Experiment Specification\n\n");
+        if exp.bizarre_ideation {
+            out.push_str(
+                "**Bizarre ideation mode:** Compose from random primitives with no\n\
+                 attractor guidance. Maximise novelty.\n\n",
+            );
+        } else {
+            match &exp.dimension {
+                ExperimentDimension::RoleComponent {
+                    replaced,
+                    introduced,
+                } => {
+                    let _ = writeln!(out, "**Experiment type:** ComponentSwap");
+                    if let Some(r) = replaced {
+                        let _ = writeln!(out, "- Replace component: `{}`", r);
+                    } else {
+                        out.push_str("- Add new component (no replacement)\n");
+                    }
+                    let _ = writeln!(out, "- Introduce component: `{}`", introduced);
                 }
-                out.push('\n');
-                out.push_str(
-                    "Deploy the highest-scoring cached agent if its score meets the threshold.\n\
-                     Do NOT vary composition dimensions — deterministic selection only.\n\n",
-                );
-            }
-        }
-        AssignmentPath::Learning | AssignmentPath::ForcedExploration => {
-            if let Some(exp) = ctx.experiment {
-                out.push_str("### Experiment Specification\n\n");
-                if exp.bizarre_ideation {
+                ExperimentDimension::TradeoffConfig {
+                    replaced,
+                    introduced,
+                } => {
+                    let _ = writeln!(out, "**Experiment type:** ConfigSwap");
+                    if let Some(r) = replaced {
+                        let _ = writeln!(out, "- Replace tradeoff: `{}`", r);
+                    }
+                    let _ = writeln!(out, "- Introduce tradeoff: `{}`", introduced);
+                }
+                ExperimentDimension::NovelComposition => {
                     out.push_str(
-                        "**Bizarre ideation mode:** Compose from random primitives with no\n\
-                         attractor guidance. Maximise novelty.\n\n",
+                        "**Experiment type:** NovelComposition\n\
+                         Compose entirely from primitives. No base composition.\n",
                     );
-                } else {
-                    match &exp.dimension {
-                        ExperimentDimension::RoleComponent {
-                            replaced,
-                            introduced,
-                        } => {
-                            let _ = writeln!(out, "**Experiment type:** ComponentSwap");
-                            if let Some(r) = replaced {
-                                let _ = writeln!(out, "- Replace component: `{}`", r);
-                            } else {
-                                out.push_str("- Add new component (no replacement)\n");
-                            }
-                            let _ = writeln!(out, "- Introduce component: `{}`", introduced);
-                        }
-                        ExperimentDimension::TradeoffConfig {
-                            replaced,
-                            introduced,
-                        } => {
-                            let _ = writeln!(out, "**Experiment type:** ConfigSwap");
-                            if let Some(r) = replaced {
-                                let _ = writeln!(out, "- Replace tradeoff: `{}`", r);
-                            }
-                            let _ = writeln!(out, "- Introduce tradeoff: `{}`", introduced);
-                        }
-                        ExperimentDimension::NovelComposition => {
-                            out.push_str(
-                                "**Experiment type:** NovelComposition\n\
-                                 Compose entirely from primitives. No base composition.\n",
-                            );
-                        }
-                    }
-                    if let Some(base) = &exp.base_composition {
-                        let _ = writeln!(out, "\n**Base composition:** `{}`", base);
-                    }
                 }
-                out.push('\n');
-                out.push_str(
-                    "Your role is to construct a coherent agent from the specified primitives.\n\
-                     The experiment design (what to vary) is algorithmic — do NOT override it.\n\n",
-                );
+            }
+            if let Some(base) = &exp.base_composition {
+                let _ = writeln!(out, "\n**Base composition:** `{}`", base);
             }
         }
+        out.push('\n');
+        out.push_str(
+            "Your role is to construct a coherent agent from the specified primitives.\n\
+             The experiment design (what to vary) is algorithmic — do NOT override it.\n\n",
+        );
     }
 
     out
@@ -1180,11 +1261,13 @@ mod tests {
             crate::graph::LogEntry {
                 timestamp: "2025-05-01T10:00:00Z".into(),
                 actor: Some("agent-1".into()),
+                user: None,
                 message: "Starting implementation".into(),
             },
             crate::graph::LogEntry {
                 timestamp: "2025-05-01T10:30:00Z".into(),
                 actor: None,
+                user: None,
                 message: "Completed core logic".into(),
             },
         ]
@@ -1212,6 +1295,13 @@ mod tests {
             artifact_diff: None,
             evaluator_identity: None,
             downstream_tasks: &[],
+            flip_score: None,
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1303,6 +1393,13 @@ mod tests {
             artifact_diff: None,
             evaluator_identity: None,
             downstream_tasks: &[],
+            flip_score: None,
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1342,6 +1439,13 @@ mod tests {
             artifact_diff: None,
             evaluator_identity: None,
             downstream_tasks: &[],
+            flip_score: None,
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1394,6 +1498,13 @@ mod tests {
             artifact_diff: None,
             evaluator_identity: None,
             downstream_tasks: &downstream,
+            flip_score: None,
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
         };
 
         let output = render_evaluator_prompt(&input);
@@ -1416,6 +1527,182 @@ mod tests {
         assert!(output.contains("**downstream_usability**"));
         assert!(output.contains("**coordination_overhead**"));
         assert!(output.contains("**blocking_impact**"));
+    }
+
+    #[test]
+    fn test_render_evaluator_prompt_with_flip_verify() {
+        let input = EvaluatorInput {
+            task_title: "Task with verify",
+            task_description: Some("A task that was verified."),
+            task_skills: &[],
+            verify: None,
+            agent: None,
+            role: None,
+            tradeoff: None,
+            artifacts: &[],
+            log_entries: &[],
+            started_at: None,
+            completed_at: None,
+            artifact_diff: None,
+            evaluator_identity: None,
+            downstream_tasks: &[],
+            flip_score: Some(0.45),
+            verify_status: Some("passed"),
+            verify_findings: Some(
+                "[2025-01-01] (agent-1): Tests pass\n[2025-01-01] (agent-1): Artifacts verified",
+            ),
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
+        };
+
+        let output = render_evaluator_prompt(&input);
+
+        // FLIP Verification Results section should appear
+        assert!(output.contains("## FLIP Verification Results"));
+        assert!(output.contains("FLIP Score: 0.45 (below threshold 0.70)"));
+        assert!(output.contains("Verification Status: PASSED"));
+        assert!(output.contains("Verification Findings:"));
+        assert!(output.contains("Tests pass"));
+        assert!(output.contains("Artifacts verified"));
+        assert!(output.contains("NOTE: Verification is a strong signal"));
+    }
+
+    #[test]
+    fn test_render_evaluator_prompt_no_flip_verify() {
+        let input = EvaluatorInput {
+            task_title: "Task without verify",
+            task_description: None,
+            task_skills: &[],
+            verify: None,
+            agent: None,
+            role: None,
+            tradeoff: None,
+            artifacts: &[],
+            log_entries: &[],
+            started_at: None,
+            completed_at: None,
+            artifact_diff: None,
+            evaluator_identity: None,
+            downstream_tasks: &[],
+            flip_score: None,
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
+        };
+
+        let output = render_evaluator_prompt(&input);
+
+        // FLIP Verification Results section should NOT appear
+        assert!(!output.contains("## FLIP Verification Results"));
+        assert!(!output.contains("FLIP Score"));
+        assert!(!output.contains("Verification Status"));
+        assert!(!output.contains("NOTE: Verification is a strong signal"));
+    }
+
+    #[test]
+    fn test_render_evaluator_prompt_with_decomposition() {
+        let child_tasks = vec![
+            (
+                "Subtask 1: Parse input".to_string(),
+                "Done".to_string(),
+                Some("Parse input data".to_string()),
+            ),
+            (
+                "Subtask 2: Process data".to_string(),
+                "In-progress".to_string(),
+                None,
+            ),
+        ];
+
+        let input = EvaluatorInput {
+            task_title: "Decomposed task",
+            task_description: Some("A task that was decomposed into subtasks."),
+            task_skills: &[],
+            verify: Some("cargo test passes"),
+            agent: None,
+            role: None,
+            tradeoff: None,
+            artifacts: &[],
+            log_entries: &[],
+            started_at: None,
+            completed_at: None,
+            artifact_diff: None,
+            evaluator_identity: None,
+            downstream_tasks: &[],
+            flip_score: None,
+            verify_status: Some("failed"),
+            verify_findings: Some("Verification failed - verify criteria not met directly"),
+            resolved_outcome_name: None,
+            child_tasks: &child_tasks,
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
+        };
+
+        let output = render_evaluator_prompt(&input);
+
+        // Should contain decomposition detection section
+        assert!(output.contains("## Task Decomposition Detected"));
+        assert!(
+            output
+                .contains("This task created subtasks, indicating intentional work decomposition")
+        );
+        assert!(output.contains("Subtask 1: Parse input"));
+        assert!(output.contains("Subtask 2: Process data"));
+
+        // Should contain adjusted verification note for decomposition
+        assert!(output.contains("This task was decomposed into subtasks"));
+        assert!(
+            output
+                .contains("this likely indicates proper work delegation rather than task failure")
+        );
+        assert!(
+            output.contains(
+                "Score the decomposition quality instead of penalizing for verify criteria"
+            )
+        );
+
+        // Should NOT contain the standard verification note that penalizes failures
+        assert!(!output.contains(
+            "If verification failed, significantly\n             reduce the overall score"
+        ));
+    }
+
+    #[test]
+    fn test_render_evaluator_prompt_flip_above_threshold() {
+        let input = EvaluatorInput {
+            task_title: "High FLIP",
+            task_description: None,
+            task_skills: &[],
+            verify: None,
+            agent: None,
+            role: None,
+            tradeoff: None,
+            artifacts: &[],
+            log_entries: &[],
+            started_at: None,
+            completed_at: None,
+            artifact_diff: None,
+            evaluator_identity: None,
+            downstream_tasks: &[],
+            flip_score: Some(0.85),
+            verify_status: None,
+            verify_findings: None,
+            resolved_outcome_name: None,
+            child_tasks: &[],
+            constraint_fidelity_score: None,
+            constraint_fidelity_unanchored: None,
+        };
+
+        let output = render_evaluator_prompt(&input);
+
+        assert!(output.contains("## FLIP Verification Results"));
+        assert!(output.contains("FLIP Score: 0.85 (at or above threshold 0.70)"));
+        assert!(!output.contains("Verification Status"));
     }
 
     // -- Rich component resolution tests ------------------------------------
@@ -1455,7 +1742,6 @@ mod tests {
         let resolved = resolve_all_components(&role, dir.path(), &agency_dir);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "Rust Expert");
-        assert!(resolved[0].content.contains("[Translated]"));
         assert!(
             resolved[0]
                 .content
@@ -1515,7 +1801,7 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         // Store component
         assert_eq!(resolved[0].name, "Testing");
-        assert!(resolved[0].content.contains("[Enhanced]"));
+        assert!(resolved[0].content.contains("Write comprehensive tests."));
         assert!(resolved[0].content.contains("Always test edge cases."));
         // Inline fallback
         assert_eq!(resolved[1].name, "inline");
@@ -1619,5 +1905,64 @@ mod tests {
         assert!(output.contains("All work is complete."));
         // No criteria section when empty
         assert!(!output.contains("**Success Criteria:**"));
+    }
+
+    // -- regression test: hash IDs must be dereferenced, not shown raw ----------
+
+    #[test]
+    fn identity_prompt_shows_content_not_hashes() {
+        // Simulates the bug: a role has hash-based component_ids and outcome_id.
+        // resolve_all_components + resolve_outcome must dereference them so the
+        // rendered prompt contains actual text, not raw hashes.
+        use super::super::starters::seed_starters;
+
+        let dir = TempDir::new().unwrap();
+        let agency_dir = dir.path().join(".workgraph/agency");
+        seed_starters(&agency_dir).unwrap();
+
+        // Pick any seeded role (they all have hash-based component_ids/outcome_id)
+        let roles = super::super::starters::special_agent_roles();
+        let role = roles.iter().find(|r| r.name == "Evaluator").unwrap();
+
+        let tradeoffs = super::super::starters::special_agent_tradeoffs();
+        let tradeoff = tradeoffs
+            .iter()
+            .find(|t| t.name == "Evaluator Balanced")
+            .unwrap();
+
+        let workgraph_root = agency_dir.parent().unwrap();
+        let resolved_skills = resolve_all_components(role, workgraph_root, &agency_dir);
+        let outcome = resolve_outcome(&role.outcome_id, &agency_dir);
+
+        let prompt =
+            render_identity_prompt_rich(role, tradeoff, &resolved_skills, outcome.as_ref());
+
+        // The prompt MUST NOT contain any raw hash IDs from the role
+        for comp_id in &role.component_ids {
+            assert!(
+                !prompt.contains(comp_id),
+                "Prompt should not contain raw component hash '{}', got:\n{}",
+                comp_id,
+                prompt
+            );
+        }
+        assert!(
+            !prompt.contains(&role.outcome_id),
+            "Prompt should not contain raw outcome hash '{}', got:\n{}",
+            role.outcome_id,
+            prompt
+        );
+
+        // It MUST contain actual content
+        assert!(prompt.contains("#### Skills"));
+        assert!(prompt.contains("#### Desired Outcome"));
+        assert!(outcome.is_some(), "Outcome should resolve from the store");
+        let outcome = outcome.unwrap();
+        assert!(
+            prompt.contains(&outcome.name),
+            "Prompt should contain outcome name '{}', got:\n{}",
+            outcome.name,
+            prompt
+        );
     }
 }

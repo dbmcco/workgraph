@@ -78,6 +78,9 @@ pub struct LogEntry {
     pub timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// The user who created this log entry (from `current_user()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     pub message: String,
 }
 
@@ -128,6 +131,13 @@ pub enum Status {
     Blocked,
     Failed,
     Abandoned,
+    PendingValidation,
+    /// Soft-done: agent called `wg done`, awaiting `.evaluate-X` to score the
+    /// task. On pass (≥ `eval_gate_threshold`) the task transitions to `Done`
+    /// and downstream dependents unblock. On fail, the existing
+    /// `auto_rescue_on_eval_fail` path runs (Failed + rescue task).
+    PendingEval,
+    Incomplete,
 }
 
 impl std::fmt::Display for Status {
@@ -140,6 +150,9 @@ impl std::fmt::Display for Status {
             Status::Blocked => write!(f, "blocked"),
             Status::Failed => write!(f, "failed"),
             Status::Abandoned => write!(f, "abandoned"),
+            Status::PendingValidation => write!(f, "pending-validation"),
+            Status::PendingEval => write!(f, "pending-eval"),
+            Status::Incomplete => write!(f, "incomplete"),
         }
     }
 }
@@ -159,6 +172,9 @@ impl<'de> serde::Deserialize<'de> for Status {
             "blocked" => Ok(Status::Blocked),
             "failed" => Ok(Status::Failed),
             "abandoned" => Ok(Status::Abandoned),
+            "pending-validation" => Ok(Status::PendingValidation),
+            "pending-eval" => Ok(Status::PendingEval),
+            "incomplete" => Ok(Status::Incomplete),
             // Migration: pending-review is treated as done
             "pending-review" => Ok(Status::Done),
             other => Err(serde::de::Error::unknown_variant(
@@ -171,6 +187,9 @@ impl<'de> serde::Deserialize<'de> for Status {
                     "blocked",
                     "failed",
                     "abandoned",
+                    "pending-validation",
+                    "pending-eval",
+                    "incomplete",
                 ],
             )),
         }
@@ -184,6 +203,79 @@ impl Status {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Status::Done | Status::Failed | Status::Abandoned)
     }
+
+    /// Whether this status counts as "active" for HUD/viz consistency:
+    /// the task is currently being worked on or sitting in a post-work gate
+    /// that the user expects to see highlighted as "running" in `wg viz`.
+    /// Includes:
+    /// - InProgress: agent is currently working
+    /// - PendingValidation: agent finished, --verify gate pending
+    /// - PendingEval: agent called `wg done`, awaiting evaluation
+    ///
+    /// Excludes Open (not started), Waiting (gated on a wait condition),
+    /// Blocked (dependency unmet), and all terminal states.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Status::InProgress | Status::PendingValidation | Status::PendingEval
+        )
+    }
+}
+
+/// Task priority as an unbounded u32. Higher number = higher priority.
+pub type Priority = u32;
+
+pub const PRIORITY_CRITICAL: Priority = 100;
+pub const PRIORITY_HIGH: Priority = 50;
+pub const PRIORITY_NORMAL: Priority = 10;
+pub const PRIORITY_LOW: Priority = 5;
+pub const PRIORITY_IDLE: Priority = 0;
+pub const PRIORITY_DEFAULT: Priority = PRIORITY_NORMAL;
+
+/// Deserialize priority from either a u32 or a legacy named string ("critical", "high", etc.).
+fn deserialize_priority<'de, D>(deserializer: D) -> Result<Option<Priority>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => {
+            Ok(Some(n.as_u64().unwrap_or(PRIORITY_DEFAULT as u64) as u32))
+        }
+        Some(serde_json::Value::String(s)) => Ok(Some(match s.to_lowercase().as_str() {
+            "critical" => PRIORITY_CRITICAL,
+            "high" => PRIORITY_HIGH,
+            "normal" => PRIORITY_NORMAL,
+            "low" => PRIORITY_LOW,
+            "idle" => PRIORITY_IDLE,
+            _ => PRIORITY_DEFAULT,
+        })),
+        Some(_) => Ok(Some(PRIORITY_DEFAULT)),
+    }
+}
+
+/// Boost priority by one tier (for urgent/triage tags and starvation prevention).
+pub fn boost_priority(p: Priority) -> Priority {
+    match p {
+        0 => PRIORITY_LOW,
+        1..=5 => PRIORITY_NORMAL,
+        6..=10 => PRIORITY_HIGH,
+        11..=50 => PRIORITY_CRITICAL,
+        _ => p, // already above critical
+    }
+}
+
+/// Lower priority by one tier (for eval/flip scaffolding tasks).
+pub fn lower_priority(p: Priority) -> Priority {
+    match p {
+        0 => 0,
+        1..=5 => PRIORITY_IDLE,
+        6..=10 => PRIORITY_LOW,
+        11..=50 => PRIORITY_NORMAL,
+        51..=100 => PRIORITY_HIGH,
+        _ => PRIORITY_CRITICAL,
+    }
 }
 
 /// A task node.
@@ -193,7 +285,7 @@ impl Status {
 /// Custom `Deserialize` handles migration from the old `identity` field
 /// (`{"role_id": "...", "motivation_id": "..."}`) to the new `agent` field
 /// (content-hash string).
-#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -202,6 +294,8 @@ pub struct Task {
     pub description: Option<String>,
     #[serde(default)]
     pub status: Status,
+    #[serde(default = "default_priority")]
+    pub priority: Priority,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +323,10 @@ pub struct Task {
     /// Shell command to execute for this task (optional, for wg exec)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<String>,
+    /// Per-task timeout duration string (e.g., "30m", "4h"). Takes priority over
+    /// executor config and coordinator config in timeout resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
     /// Task is not ready until this timestamp (ISO 8601 / RFC 3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
@@ -259,15 +357,26 @@ pub struct Task {
     /// Provider override for this task (anthropic, openai, openrouter, local)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Named endpoint for this task (matches a name in [llm_endpoints])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Verification criteria - if set, task requires review before done
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
+    /// Verification timeout override for this specific task (e.g., "15m", "900s")
+    /// Takes priority over global WG_VERIFY_TIMEOUT and coordinator defaults
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_timeout: Option<String>,
     /// Agent assigned to this task (content-hash of an Agent in the agency)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// Current cycle iteration (0 = first run, incremented on each re-activation)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub loop_iteration: u32,
+    /// Timestamp when the most recent cycle iteration completed (before re-activation).
+    /// Preserved across cycle resets so timing displays can show "last iteration completed X ago".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_iteration_completed_at: Option<String>,
     /// Number of failure-triggered cycle restarts consumed (on cycle config owner only)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cycle_failure_restarts: u32,
@@ -293,9 +402,11 @@ pub struct Task {
     /// Context scope for prompt assembly: clean, task, graph, full
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_scope: Option<String>,
-    /// Execution mode: "full" (default, full Claude Code session with all tools)
-    /// or "bare" (lightweight --system-prompt path, no file I/O tools).
-    /// Use "bare" for pure-reasoning tasks: synthesis, triage, summarization, abstract reasoning.
+    /// Execution weight tier controlling agent tool access:
+    /// - "shell": no LLM, run task.exec command directly
+    /// - "bare": LLM with wg CLI only, --system-prompt path
+    /// - "light": LLM with read-only file access (Read, Glob, Grep, WebFetch)
+    /// - "full" (default): full Claude Code session with all tools
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_mode: Option<String>,
     /// Token usage and cost data extracted from agent output.log
@@ -310,20 +421,295 @@ pub struct Task {
     /// Checkpoint summary written by agent before parking via `wg wait`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Number of times this task has been requeued via failed-dependency triage
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub triage_count: u32,
     /// Number of times this task has been resurrected (Done → Open) due to messages
     #[serde(default, skip_serializing_if = "is_zero")]
     pub resurrection_count: u32,
     /// Timestamp of last resurrection (for cooldown enforcement)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resurrected_at: Option<String>,
+    /// Validation mode: "none" (default/backward-compat), "integrated", "external", or "llm"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<String>,
+    /// Commands to run during validation
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_commands: Vec<String>,
+    /// Optional pin for which agent runs the LLM gate for this task (content-hash).
+    /// When None, falls back to config.agency.evaluator_agent then the assigner default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_agent: Option<String>,
+    /// Optional model override for the gate eval call only.
+    /// Resolution: validator_model > config.agency.evaluator_model > task.model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_model: Option<String>,
+    /// Attempt counter for gate evaluations. Increments each time the gate
+    /// runs (pass or uncertain). Used against config.agency.gate_max_attempts
+    /// to bound cost on oscillation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gate_attempts: u32,
+    /// If true, validator rejects when no test files were modified
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub test_required: bool,
+    /// Number of times this task has been rejected by validation
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rejection_count: u32,
+    /// Maximum rejections before task fails (default 3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rejections: Option<u32>,
+    /// Number of consecutive verify command failures (circuit breaker counter)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub verify_failures: u32,
+    /// Number of times this task has been rescued via auto-rescue on eval-fail.
+    /// Used to cap cascade-failure loops: when this exceeds
+    /// `coordinator.max_verify_failures`, eval rejection no longer spawns a rescue
+    /// and the task stays Failed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rescue_count: u32,
+    /// Number of consecutive spawn failures (spawn circuit breaker counter)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spawn_failures: u32,
+    /// Quality tier override set by tier escalation on retry.
+    /// When present, overrides the role's default_tier() during dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Opt out of tier escalation for cost-sensitive tasks.
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub no_tier_escalation: bool,
+    /// Models already tried for this task (for tier escalation on retry).
+    /// Each entry is the model ID string that was used for a failed attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tried_models: Vec<String>,
+    /// Tasks that this task was replaced by (set on abandon with --superseded-by)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_by: Vec<String>,
+    /// Task that this task replaces (set on new tasks created as replacements)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// When true, task was created with --no-place and should skip automatic placement.
+    /// The assignment step will not include placement (dependency edge) decisions.
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub unplaced: bool,
+    /// Placement hint: place near these tasks (IDs). Used by the assignment step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub place_near: Vec<String>,
+    /// Placement hint: place before these tasks (IDs). Used by the assignment step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub place_before: Vec<String>,
+    /// When true, task was created with --independent and has no implicit dependency
+    /// on the task that created it. Explicit --after deps are still honored.
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub independent: bool,
+    /// Iteration tracking: which iteration round this task is (0 = not an iteration)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub iteration_round: u32,
+    /// Iteration tracking: ID of the original task this iterates from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_anchor: Option<String>,
+    /// Iteration tracking: ID of the immediate prior iteration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_parent: Option<String>,
+    /// Iteration configuration (max_retries, propagation, retry_strategy)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_config: Option<crate::agency::IterationConfig>,
+    /// Number of times this task has been dispatched to an agent (CFS-like vruntime proxy).
+    /// Used within a priority level to prefer tasks with less accumulated dispatch work.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dispatch_count: u32,
+    /// Cron schedule expression (e.g., "0 2 * * *" for daily at 2am)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_schedule: Option<String>,
+    /// Whether this task has cron scheduling enabled
+    #[serde(default, skip_serializing_if = "is_bool_false")]
+    pub cron_enabled: bool,
+    /// Timestamp of last cron trigger (ISO 8601 / RFC 3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cron_fire: Option<String>,
+    /// Timestamp of next scheduled cron trigger (ISO 8601 / RFC 3339)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cron_fire: Option<String>,
+}
+
+impl Default for Task {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            description: None,
+            status: Status::default(),
+            priority: PRIORITY_DEFAULT,
+            assigned: None,
+            estimate: None,
+            before: vec![],
+            after: vec![],
+            requires: vec![],
+            tags: vec![],
+            skills: vec![],
+            inputs: vec![],
+            deliverables: vec![],
+            artifacts: vec![],
+            exec: None,
+            timeout: None,
+            not_before: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+            log: vec![],
+            retry_count: 0,
+            max_retries: None,
+            failure_reason: None,
+            model: None,
+            provider: None,
+            endpoint: None,
+            verify: None,
+            verify_timeout: None,
+            agent: None,
+            loop_iteration: 0,
+            last_iteration_completed_at: None,
+            cycle_failure_restarts: 0,
+            cycle_config: None,
+            ready_after: None,
+            paused: false,
+            visibility: "internal".to_string(),
+            context_scope: None,
+            exec_mode: None,
+            token_usage: None,
+            session_id: None,
+            wait_condition: None,
+            checkpoint: None,
+            triage_count: 0,
+            resurrection_count: 0,
+            last_resurrected_at: None,
+            validation: None,
+            validation_commands: vec![],
+            validator_agent: None,
+            validator_model: None,
+            gate_attempts: 0,
+            test_required: false,
+            rejection_count: 0,
+            max_rejections: None,
+            verify_failures: 0,
+            rescue_count: 0,
+            spawn_failures: 0,
+            tier: None,
+            no_tier_escalation: false,
+            tried_models: vec![],
+            superseded_by: vec![],
+            supersedes: None,
+            unplaced: false,
+            place_near: vec![],
+            place_before: vec![],
+            independent: false,
+            dispatch_count: 0,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
+            cron_schedule: None,
+            cron_enabled: false,
+            last_cron_fire: None,
+            next_cron_fire: None,
+        }
+    }
 }
 
 /// Returns `true` if the task ID represents a system-generated task.
 /// System tasks use a `.` prefix (e.g. `.evaluate-foo`, `.assign-foo`).
 pub fn is_system_task(task_id: &str) -> bool {
-    task_id.starts_with('.')  
+    task_id.starts_with('.')
 }
 
+/// Returns `true` if the task ID represents a user board (`.user-*`).
+pub fn is_user_board(task_id: &str) -> bool {
+    task_id.starts_with(".user-")
+}
+
+/// Resolve a user board alias like `.user-erik` to the active `.user-erik-N`.
+/// Returns the original ID if it's already fully qualified or not a user board alias.
+pub fn resolve_user_board_alias(graph: &WorkGraph, id: &str) -> String {
+    if !id.starts_with(".user-") {
+        return id.to_string();
+    }
+    let suffix = &id[".user-".len()..];
+    // If suffix already ends with -N (numeric), it's fully qualified
+    if suffix
+        .rsplit('-')
+        .next()
+        .is_some_and(|s| s.parse::<u32>().is_ok())
+    {
+        return id.to_string();
+    }
+    // Find highest active .user-{handle}-N
+    let prefix = format!("{}-", id);
+    graph
+        .tasks()
+        .filter(|t| t.id.starts_with(&prefix))
+        .filter(|t| !t.status.is_terminal())
+        .filter_map(|t| {
+            t.id.rsplit('-')
+                .next()
+                .and_then(|n| n.parse::<u32>().ok())
+                .map(|n| (n, t.id.clone()))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Create a user board task for the given handle and sequence number.
+/// Returns the task ID and the fully constructed Task.
+pub fn create_user_board_task(handle: &str, seq: u32) -> Task {
+    let task_id = format!(".user-{}-{}", handle, seq);
+    Task {
+        id: task_id,
+        title: format!("User board: {}", handle),
+        description: Some(format!(
+            "User board for {} — persistent conversation surface.",
+            handle
+        )),
+        status: Status::InProgress,
+        tags: vec!["user-board".to_string()],
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Task::default()
+    }
+}
+
+/// Find the next available sequence number for a user board handle.
+/// Scans existing `.user-{handle}-N` tasks and returns max(N) + 1, or 0 if none exist.
+pub fn next_user_board_seq(graph: &WorkGraph, handle: &str) -> u32 {
+    let prefix = format!(".user-{}-", handle);
+    graph
+        .tasks()
+        .filter(|t| t.id.starts_with(&prefix))
+        .filter_map(|t| t.id.rsplit('-').next().and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(0)
+}
+
+/// Extract the handle portion from a user board task ID.
+/// E.g., `.user-erik-0` → `Some("erik")`, `.user-alice-bob-3` → `Some("alice-bob")`.
+/// Returns `None` if the ID doesn't match the `.user-{handle}-{N}` pattern.
+pub fn user_board_handle(task_id: &str) -> Option<&str> {
+    let rest = task_id.strip_prefix(".user-")?;
+    // The last `-N` segment is the sequence number
+    let last_dash = rest.rfind('-')?;
+    let seq_part = &rest[last_dash + 1..];
+    if seq_part.parse::<u32>().is_ok() {
+        Some(&rest[..last_dash])
+    } else {
+        None
+    }
+}
+
+/// Extract the sequence number from a user board task ID.
+/// E.g., `.user-erik-0` → `Some(0)`.
+pub fn user_board_seq(task_id: &str) -> Option<u32> {
+    let rest = task_id.strip_prefix(".user-")?;
+    rest.rsplit('-').next().and_then(|s| s.parse::<u32>().ok())
+}
 
 /// Token usage and cost data from a Claude CLI agent run.
 /// Extracted from the final `type=result` line in the agent's output.log.
@@ -332,16 +718,16 @@ pub struct TokenUsage {
     /// Total cost in USD
     #[serde(default, skip_serializing_if = "is_f64_zero")]
     pub cost_usd: f64,
-    /// Input tokens (non-cached)
+    /// Input tokens sent this turn (non-cached portion; what you pay full price for)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub input_tokens: u64,
     /// Output tokens
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub output_tokens: u64,
-    /// Cache read input tokens
+    /// Tokens served from cache (already paid at discount)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub cache_read_input_tokens: u64,
-    /// Cache creation input tokens
+    /// Tokens newly cached this turn (paid at premium)
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub cache_creation_input_tokens: u64,
 }
@@ -379,6 +765,9 @@ impl TokenUsage {
 ///
 /// Reads the file from the end, looking for the last JSON line with `"type":"result"`.
 /// Returns `None` if the file doesn't exist, is empty, or has no result line.
+///
+/// Supports both Claude CLI format (`"usage": {...}`, `"total_cost_usd": X`)
+/// and native executor format (`"total_usage": {...}`).
 pub fn parse_token_usage(output_log_path: &std::path::Path) -> Option<TokenUsage> {
     let content = std::fs::read_to_string(output_log_path).ok()?;
 
@@ -397,7 +786,8 @@ pub fn parse_token_usage(output_log_path: &std::path::Path) -> Option<TokenUsage
             .get("total_cost_usd")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
-        let usage = val.get("usage");
+        // Claude CLI uses "usage", native executor uses "total_usage"
+        let usage = val.get("usage").or_else(|| val.get("total_usage"));
 
         let input_tokens = usage
             .and_then(|u| u.get("input_tokens"))
@@ -434,10 +824,13 @@ pub fn parse_token_usage(output_log_path: &std::path::Path) -> Option<TokenUsage
     None
 }
 
-/// Parse token usage from a Claude CLI output.log, including mid-run data.
+/// Parse token usage from an agent output.log, including mid-run data.
 ///
 /// First tries to find a `type=result` line (completed runs). If none exists,
-/// sums up `message.usage` blocks from `type=assistant` lines (in-progress runs).
+/// sums up per-turn usage from either:
+/// - Claude CLI format: `type=assistant` with `message.usage`
+/// - Native executor format: `type=turn` with top-level `usage`
+///
 /// Returns `None` if the file doesn't exist or has no usable data.
 pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<TokenUsage> {
     // Try the fast path first: completed result line
@@ -445,7 +838,7 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
         return Some(usage);
     }
 
-    // Fall back: sum per-turn usage from assistant messages
+    // Fall back: sum per-turn usage from assistant/turn messages
     let content = std::fs::read_to_string(output_log_path).ok()?;
 
     let mut total_input = 0u64;
@@ -459,19 +852,23 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
         if line.is_empty() || !line.starts_with('{') {
             continue;
         }
-        // Quick check before full parse
-        if !line.contains("\"type\":\"assistant\"") {
+        // Quick check before full parse — match Claude CLI "assistant" or native "turn"
+        if !line.contains("\"type\":\"assistant\"") && !line.contains("\"type\":\"turn\"") {
             continue;
         }
         let val: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
-        // Usage is nested under message.usage
-        let usage = val.get("message").and_then(|m| m.get("usage"));
+        let event_type = val.get("type").and_then(|v| v.as_str());
+
+        // Claude CLI: usage nested under message.usage
+        // Native executor: usage at top level
+        let usage = match event_type {
+            Some("assistant") => val.get("message").and_then(|m| m.get("usage")),
+            Some("turn") => val.get("usage"),
+            _ => continue,
+        };
         if let Some(usage) = usage {
             found_any = true;
             total_input += usage
@@ -508,51 +905,75 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
     }
 }
 
+/// Parse token usage from `__WG_TOKENS__:` lines in an output log.
+///
+/// Eval agents (`.evaluate-*`, `.flip-*`) emit `__WG_TOKENS__:{json}` to stderr
+/// during `wg evaluate run`. This function extracts and sums those lines.
+/// Returns `None` if the file doesn't exist or has no `__WG_TOKENS__` lines.
+pub fn parse_wg_tokens(output_log_path: &std::path::Path) -> Option<TokenUsage> {
+    let content = std::fs::read_to_string(output_log_path).ok()?;
+
+    let mut total = TokenUsage {
+        cost_usd: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    let mut found_any = false;
+
+    for line in content.lines() {
+        if let Some(json) = line.strip_prefix("__WG_TOKENS__:")
+            && let Ok(usage) = serde_json::from_str::<TokenUsage>(json.trim())
+        {
+            found_any = true;
+            total.accumulate(&usage);
+        }
+    }
+
+    if found_any { Some(total) } else { None }
+}
+
 /// Format token usage in compact slash notation: in/out or in/out/val
 /// Input = total input (uncached + cache_read + cache_creation).
 /// Validation shown only when > 0.
 /// `usage` is the work task's token usage, `validation` is the optional assign+eval token usage.
 pub fn format_token_display(
     usage: Option<&TokenUsage>,
-    assign_usage: Option<&TokenUsage>,
-    eval_usage: Option<&TokenUsage>,
+    agency_usage: Option<&TokenUsage>,
 ) -> Option<String> {
     let has_work = usage.is_some();
-    let has_assign = assign_usage.is_some_and(|a| a.total_input() + a.output_tokens > 0);
-    let has_eval = eval_usage.is_some_and(|e| e.total_input() + e.output_tokens > 0);
+    let has_agency = agency_usage.is_some_and(|a| a.input_tokens + a.output_tokens > 0);
 
-    if !has_work && !has_assign && !has_eval {
+    if !has_work && !has_agency {
         return None;
     }
 
     let mut s = String::new();
 
     if let Some(u) = usage {
-        let cache_total = u.cache_read_input_tokens + u.cache_creation_input_tokens;
+        // With prompt caching, `input_tokens` only counts tokens outside any cache
+        // block (typically 1-3 per turn). The actual novel input is better represented
+        // by `input_tokens + cache_creation_input_tokens` (content newly written to cache).
+        let novel_in = u.input_tokens + u.cache_creation_input_tokens;
         s.push_str(&format!(
             "→{} ←{}",
-            format_tokens(u.total_input()),
+            format_tokens(novel_in),
             format_tokens(u.output_tokens)
         ));
-        if cache_total > 0 {
-            // ◎ disk/circle symbol for cached tokens
-            s.push_str(&format!(" ◎{}", format_tokens(cache_total)));
+        if u.cache_read_input_tokens > 0 {
+            // ◎ disk/circle symbol for cached tokens (read from existing cache)
+            s.push_str(&format!(" ◎{}", format_tokens(u.cache_read_input_tokens)));
         }
     }
 
-    if let Some(a) = assign_usage {
-        let atok = a.total_input() + a.output_tokens;
-        if atok > 0 {
-            // ⊳ triangle for assignment
-            s.push_str(&format!(" ⊳{}", format_tokens(atok)));
-        }
-    }
-
-    if let Some(e) = eval_usage {
-        let etok = e.total_input() + e.output_tokens;
-        if etok > 0 {
-            // ∴ QED for evaluation
-            s.push_str(&format!(" ∴{}", format_tokens(etok)));
+    if let Some(a) = agency_usage {
+        let novel_in = a.input_tokens;
+        let novel_out = a.output_tokens;
+        let total = novel_in + novel_out;
+        if total > 0 {
+            // § agency overhead (sum of input + output)
+            s.push_str(&format!(" §{}", format_tokens(total)));
         }
     }
 
@@ -582,6 +1003,10 @@ pub fn format_tokens(tokens: u64) -> String {
 
 fn default_visibility() -> String {
     "internal".to_string()
+}
+
+fn default_priority() -> Priority {
+    PRIORITY_DEFAULT
 }
 
 /// Deserialize loops_to accepting both old string format and array format.
@@ -649,6 +1074,8 @@ struct TaskHelper {
     description: Option<String>,
     #[serde(default)]
     status: Status,
+    #[serde(default, deserialize_with = "deserialize_priority")]
+    priority: Option<Priority>,
     #[serde(default)]
     assigned: Option<String>,
     #[serde(default)]
@@ -672,6 +1099,8 @@ struct TaskHelper {
     #[serde(default)]
     exec: Option<String>,
     #[serde(default)]
+    timeout: Option<String>,
+    #[serde(default)]
     not_before: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
@@ -692,7 +1121,11 @@ struct TaskHelper {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
     verify: Option<String>,
+    #[serde(default)]
+    verify_timeout: Option<String>,
     #[serde(default)]
     agent: Option<String>,
     /// Deprecated: silently ignored on deserialization for backward compatibility.
@@ -702,6 +1135,8 @@ struct TaskHelper {
     loops_to: Vec<serde_json::Value>,
     #[serde(default)]
     loop_iteration: u32,
+    #[serde(default)]
+    last_iteration_completed_at: Option<String>,
     #[serde(default)]
     cycle_failure_restarts: u32,
     #[serde(default)]
@@ -725,12 +1160,66 @@ struct TaskHelper {
     #[serde(default)]
     checkpoint: Option<String>,
     #[serde(default)]
+    triage_count: u32,
+    #[serde(default)]
     resurrection_count: u32,
     #[serde(default)]
     last_resurrected_at: Option<String>,
+    #[serde(default)]
+    validation: Option<String>,
+    #[serde(default)]
+    validation_commands: Vec<String>,
+    #[serde(default)]
+    validator_agent: Option<String>,
+    #[serde(default)]
+    validator_model: Option<String>,
+    #[serde(default)]
+    gate_attempts: u32,
+    #[serde(default)]
+    test_required: bool,
+    #[serde(default)]
+    rejection_count: u32,
+    #[serde(default)]
+    max_rejections: Option<u32>,
+    #[serde(default)]
+    verify_failures: u32,
+    #[serde(default)]
+    rescue_count: u32,
+    #[serde(default)]
+    spawn_failures: u32,
+    #[serde(default)]
+    tier: Option<String>,
+    #[serde(default)]
+    no_tier_escalation: bool,
+    #[serde(default)]
+    tried_models: Vec<String>,
+    #[serde(default)]
+    superseded_by: Vec<String>,
+    #[serde(default)]
+    supersedes: Option<String>,
+    #[serde(default)]
+    unplaced: bool,
+    #[serde(default)]
+    place_near: Vec<String>,
+    #[serde(default)]
+    place_before: Vec<String>,
     /// Old format: inline identity object. Migrated to `agent` hash on read.
     #[serde(default)]
     identity: Option<LegacyIdentity>,
+    #[serde(default)]
+    dispatch_count: u32,
+    /// Cron schedule expression (e.g., "0 2 * * *" for daily at 2am)
+    #[serde(default)]
+    cron_schedule: Option<String>,
+    /// Whether this task has cron scheduling enabled
+    #[serde(default)]
+    cron_enabled: bool,
+    /// Timestamp of last cron trigger (ISO 8601 / RFC 3339)
+    #[serde(default)]
+    last_cron_fire: Option<String>,
+    /// Timestamp of next scheduled cron trigger (ISO 8601 / RFC 3339)
+    #[serde(default)]
+    next_cron_fire: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Task {
@@ -755,6 +1244,7 @@ impl<'de> Deserialize<'de> for Task {
             title: helper.title,
             description: helper.description,
             status: helper.status,
+            priority: helper.priority.unwrap_or(PRIORITY_DEFAULT),
             assigned: helper.assigned,
             estimate: helper.estimate,
             before: helper.before,
@@ -766,6 +1256,7 @@ impl<'de> Deserialize<'de> for Task {
             deliverables: helper.deliverables,
             artifacts: helper.artifacts,
             exec: helper.exec,
+            timeout: helper.timeout,
             not_before: helper.not_before,
             created_at: helper.created_at,
             started_at: helper.started_at,
@@ -776,9 +1267,12 @@ impl<'de> Deserialize<'de> for Task {
             failure_reason: helper.failure_reason,
             model: helper.model,
             provider: helper.provider,
+            endpoint: helper.endpoint,
             verify: helper.verify,
+            verify_timeout: helper.verify_timeout,
             agent,
             loop_iteration: helper.loop_iteration,
+            last_iteration_completed_at: helper.last_iteration_completed_at,
             cycle_failure_restarts: helper.cycle_failure_restarts,
             cycle_config: helper.cycle_config,
             ready_after: helper.ready_after,
@@ -790,8 +1284,38 @@ impl<'de> Deserialize<'de> for Task {
             session_id: helper.session_id,
             wait_condition: helper.wait_condition,
             checkpoint: helper.checkpoint,
+            triage_count: helper.triage_count,
             resurrection_count: helper.resurrection_count,
             last_resurrected_at: helper.last_resurrected_at,
+            validation: helper.validation,
+            validation_commands: helper.validation_commands,
+            validator_agent: helper.validator_agent,
+            validator_model: helper.validator_model,
+            gate_attempts: helper.gate_attempts,
+            test_required: helper.test_required,
+            rejection_count: helper.rejection_count,
+            max_rejections: helper.max_rejections,
+            verify_failures: helper.verify_failures,
+            rescue_count: helper.rescue_count,
+            spawn_failures: helper.spawn_failures,
+            tier: helper.tier,
+            no_tier_escalation: helper.no_tier_escalation,
+            tried_models: helper.tried_models,
+            superseded_by: helper.superseded_by,
+            supersedes: helper.supersedes,
+            unplaced: helper.unplaced,
+            place_near: helper.place_near,
+            place_before: helper.place_before,
+            independent: false,
+            dispatch_count: helper.dispatch_count,
+            iteration_round: 0,
+            iteration_anchor: None,
+            iteration_parent: None,
+            iteration_config: None,
+            cron_schedule: helper.cron_schedule,
+            cron_enabled: helper.cron_enabled,
+            last_cron_fire: helper.last_cron_fire,
+            next_cron_fire: helper.next_cron_fire,
         })
     }
 }
@@ -877,13 +1401,37 @@ impl CycleAnalysis {
     pub fn from_graph(graph: &WorkGraph) -> Self {
         use crate::cycle::NamedGraph;
 
-        let mut named = NamedGraph::new();
-        for task in graph.tasks() {
-            named.add_node(&task.id);
+        // Filter out system scaffolding tasks (.assign-*, .flip-*, .evaluate-*,
+        // .place-*) from cycle analysis. These are auto-generated by the
+        // coordinator pipeline and add external dependency edges to cycle
+        // members, which causes Havlak's algorithm to misclassify user-defined
+        // cycles as IRREDUCIBLE (multiple entry points).
+        fn is_system_scaffolding(id: &str) -> bool {
+            id.starts_with(".assign-")
+                || id.starts_with(".flip-")
+                || id.starts_with(".evaluate-")
+                || id.starts_with(".place-")
         }
-        for task in graph.tasks() {
+
+        // Sort tasks by ID for deterministic node numbering and adjacency
+        // list ordering. Back-edge detection via DFS is sensitive to
+        // successor order; non-deterministic HashMap iteration previously
+        // caused different back-edge sets across runs.
+        let mut sorted_tasks: Vec<&Task> = graph.tasks().collect();
+        sorted_tasks.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut named = NamedGraph::new();
+        for task in &sorted_tasks {
+            if !is_system_scaffolding(&task.id) {
+                named.add_node(&task.id);
+            }
+        }
+        for task in &sorted_tasks {
+            if is_system_scaffolding(&task.id) {
+                continue;
+            }
             for dep_id in &task.after {
-                if graph.get_task(dep_id).is_some() {
+                if !is_system_scaffolding(dep_id) && graph.get_task(dep_id).is_some() {
                     named.add_edge(dep_id, &task.id);
                 }
             }
@@ -900,11 +1448,23 @@ impl CycleAnalysis {
                 .iter()
                 .map(|&nid| named.get_name(nid).to_string())
                 .collect();
-            let header = named.get_name(meta.header).to_string();
+            let havlak_header = named.get_name(meta.header).to_string();
+
+            // The effective header (cycle entry point) is determined by
+            // Havlak's DFS algorithm on the sorted task graph. Task IDs
+            // are sorted alphabetically for deterministic back-edge
+            // detection. The cycle_config field is iteration metadata
+            // (max_iterations, restart_on_failure) and does not influence
+            // header selection — the graph structure determines execution
+            // order.
+            let effective_header = havlak_header.clone();
 
             for member in &members {
                 task_to_cycle.insert(member.clone(), idx);
             }
+
+            // Use Havlak's back-edges directly. These are edges from
+            // DFS descendants back to ancestors within the SCC.
             for &(src, tgt) in &meta.back_edges {
                 back_edges.insert((
                     named.get_name(src).to_string(),
@@ -913,7 +1473,7 @@ impl CycleAnalysis {
             }
             cycles.push(DetectedCycle {
                 members,
-                header,
+                header: effective_header,
                 reducible: meta.reducible,
             });
         }
@@ -1007,6 +1567,15 @@ impl WorkGraph {
                 }
             }
         }
+    }
+
+    /// Remove a node by its current map key, returning it if it existed.
+    /// Used by migrations that need to re-key a task whose `task.id` field
+    /// has been rewritten. Callers are expected to re-insert the returned
+    /// node via `add_node`.
+    pub fn take_node(&mut self, id: &str) -> Option<Node> {
+        self.cycle_analysis = None;
+        self.nodes.remove(id)
     }
 
     /// Look up a node by ID.
@@ -1273,27 +1842,74 @@ fn reactivate_cycle(
     config_owner_id: &str,
     cycle_config: &CycleConfig,
 ) -> Vec<String> {
-    // Check if ALL members are Done
-    for member_id in members {
-        match graph.get_task(member_id) {
-            Some(t) if t.status == Status::Done => {}
-            _ => return vec![], // Not all done yet
-        }
+    // If the cycle header (config owner) is archived, suppress the entire cycle.
+    // An archived header means the cycle was intentionally retired — no further
+    // iterations should occur, even if non-archived members complete afterward.
+    if let Some(owner) = graph.get_task(config_owner_id)
+        && owner.tags.contains(&"archived".to_string())
+    {
+        return vec![];
     }
 
-    // Check convergence tag on config owner — but only if no external guard
+    // Chat-loop tasks are event-driven (woken on inbox writes by the daemon's
+    // chat supervisor), NOT polled by cycle reactivation. If the chat agent
+    // marks its task done with no pending input, the task must STAY done until
+    // a real user message arrives — otherwise the cycle loop fires on every
+    // `wg done` (sync, here) and on every dispatcher tick (via
+    // evaluate_all_cycle_iterations), which is the chat-agent-loops bug:
+    // .chat-N gets re-Opened in microseconds, the supervisor spawns another
+    // worker, the worker calls `wg done`, repeat — burning tokens with no
+    // user input. See task chat-agent-loops-2.
+    if let Some(owner) = graph.get_task(config_owner_id)
+        && owner.tags.iter().any(|t| crate::chat_id::is_chat_loop_tag(t))
+    {
+        return vec![];
+    }
+
+    // Check if ALL members are terminal (Done or Abandoned).
+    // Abandoned and archived-Done are terminal — they won't produce more work.
+    let mut has_done_member = false;
+    for member_id in members {
+        match graph.get_task(member_id) {
+            Some(t) if t.status == Status::Done => {
+                // Archived Done members are permanently terminal (like Abandoned)
+                if !t.tags.contains(&"archived".to_string()) {
+                    has_done_member = true;
+                }
+            }
+            Some(t) if t.status == Status::Abandoned => {
+                // Abandoned is terminal — don't wait for it
+            }
+            _ => return vec![], // Not terminal yet
+        }
+    }
+    // If ALL members are abandoned/archived, don't iterate — there's no work to redo
+    if !has_done_member {
+        return vec![];
+    }
+
+    // Check convergence tag on ANY cycle member — but only if no external guard
     // is set and no_converge is false. When a guard is present, the guard is
     // authoritative over convergence. When no_converge is set, convergence
     // signals are always ignored.
+    //
+    // Any member can signal convergence (not just the config owner). Since we
+    // only reach this point after ALL members are terminal, the current
+    // iteration has already completed — convergence only prevents the NEXT
+    // iteration from starting.
     let guard_is_set =
         cycle_config.guard.is_some() && !matches!(cycle_config.guard, Some(LoopGuard::Always));
 
-    if !guard_is_set
-        && !cycle_config.no_converge
-        && let Some(owner) = graph.get_task(config_owner_id)
-        && owner.tags.contains(&"converged".to_string())
-    {
-        return vec![];
+    if !guard_is_set && !cycle_config.no_converge {
+        let any_converged = members.iter().any(|mid| {
+            graph
+                .get_task(mid)
+                .map(|t| t.tags.contains(&"converged".to_string()))
+                .unwrap_or(false)
+        });
+        if any_converged {
+            return vec![];
+        }
     }
 
     // Check max_iterations — use the NEXT iteration value so that
@@ -1303,7 +1919,7 @@ fn reactivate_cycle(
         .map(|t| t.loop_iteration)
         .unwrap_or(0);
     let new_iteration = current_iter + 1;
-    if new_iteration >= cycle_config.max_iterations {
+    if cycle_config.max_iterations > 0 && new_iteration >= cycle_config.max_iterations {
         return vec![];
     }
 
@@ -1317,7 +1933,7 @@ fn reactivate_cycle(
         return vec![];
     }
 
-    // All checks passed — re-open all members
+    // All checks passed — re-open Done members (skip Abandoned ones)
     let ready_after = cycle_config
         .delay
         .as_ref()
@@ -1332,10 +1948,22 @@ fn reactivate_cycle(
 
     for member_id in members {
         if let Some(task) = graph.get_task_mut(member_id) {
+            // Abandoned or archived members stay as-is — they opted out of future iterations
+            if task.status == Status::Abandoned {
+                continue;
+            }
+            if task.tags.contains(&"archived".to_string()) {
+                continue;
+            }
+            // Preserve completed_at as last_iteration_completed_at before clearing
+            if task.completed_at.is_some() {
+                task.last_iteration_completed_at = task.completed_at.clone();
+            }
             task.status = Status::Open;
             task.assigned = None;
             task.started_at = None;
             task.completed_at = None;
+            task.triage_count = 0;
             task.loop_iteration = new_iteration;
             if *member_id == config_owner_id {
                 task.ready_after = ready_after.clone();
@@ -1344,10 +1972,18 @@ fn reactivate_cycle(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: None,
-                message: format!(
-                    "Re-activated by cycle iteration (iteration {}/{})",
-                    new_iteration, cycle_config.max_iterations
-                ),
+                user: Some(crate::current_user()),
+                message: if cycle_config.max_iterations == 0 {
+                    format!(
+                        "Re-activated by cycle iteration (iteration {}/unlimited)",
+                        new_iteration
+                    )
+                } else {
+                    format!(
+                        "Re-activated by cycle iteration (iteration {}/{})",
+                        new_iteration, cycle_config.max_iterations
+                    )
+                },
             });
 
             reactivated.push(member_id.clone());
@@ -1390,6 +2026,27 @@ pub fn evaluate_all_cycle_iterations(
         let Some((config_owner_id, cycle_config)) = found else {
             continue; // No config = no cycle iteration
         };
+
+        // Chat-loop tasks are event-driven (wake on inbox writes by the
+        // daemon's chat supervisor), NOT polled by cycle reactivation. Skip
+        // them — otherwise the chat agent gets re-spawned on every dispatcher
+        // tick when its inbox is empty, burning tokens to dutifully report
+        // "nothing to do" + wg done + cycle resets, repeat forever (458
+        // dispatches observed in the wild before manual archive).
+        //
+        // This is the dispatcher's safety-net path; the synchronous wg-done
+        // path is also guarded inside reactivate_cycle (defense-in-depth so
+        // a future caller of reactivate_cycle from elsewhere is also safe).
+        // Bandaid until wg-chat-as ships (chat as first-class entity, not a
+        // graph cycle).
+        if let Some(owner_task) = graph.get_task(&config_owner_id)
+            && owner_task
+                .tags
+                .iter()
+                .any(|t| crate::chat_id::is_chat_loop_tag(t))
+        {
+            continue;
+        }
 
         let reactivated = reactivate_cycle(graph, &cycle.members, &config_owner_id, &cycle_config);
         all_reactivated.extend(reactivated);
@@ -1498,6 +2155,16 @@ fn reactivate_cycle_on_failure(
         return vec![];
     }
 
+    // Chat-loop tasks: the chat supervisor restarts the agent on its own
+    // restart-window policy. Don't double-restart via cycle-failure-restart
+    // (would re-Open a Failed chat task that the supervisor is about to
+    // respawn anyway, racing the supervisor's own backoff).
+    if let Some(owner) = graph.get_task(config_owner_id)
+        && owner.tags.iter().any(|t| crate::chat_id::is_chat_loop_tag(t))
+    {
+        return vec![];
+    }
+
     // Verify the failed task is actually Failed
     if let Some(task) = graph.get_task(failed_task_id) {
         if task.status != Status::Failed {
@@ -1518,6 +2185,7 @@ fn reactivate_cycle_on_failure(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: None,
+                user: Some(crate::current_user()),
                 message: format!(
                     "Cycle failure restart budget exhausted ({}/{}). Task '{}' failed — cycle dead-ended.",
                     failure_restarts, max_failure_restarts, failed_task_id
@@ -1563,6 +2231,7 @@ fn reactivate_cycle_on_failure(
             task.started_at = None;
             task.completed_at = None;
             task.failure_reason = None;
+            task.triage_count = 0;
             // loop_iteration stays the same — this is a retry of the same iteration
             if *member_id == config_owner_id {
                 task.ready_after = ready_after.clone();
@@ -1573,6 +2242,7 @@ fn reactivate_cycle_on_failure(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: None,
+                user: Some(crate::current_user()),
                 message: format!(
                     "Cycle failure restart {}/{} (iteration {}). Failed: [{}]",
                     new_failure_restarts, max_failure_restarts, current_iter, failure_info
@@ -1685,6 +2355,38 @@ mod tests {
         assert!(Status::Done.is_terminal());
         assert!(Status::Failed.is_terminal());
         assert!(Status::Abandoned.is_terminal());
+        assert!(!Status::PendingValidation.is_terminal());
+        // PendingEval is non-terminal — downstream dependents must wait until
+        // the eval flips it to Done (or Failed via auto-rescue).
+        assert!(!Status::PendingEval.is_terminal());
+    }
+
+    #[test]
+    fn test_status_is_active() {
+        // Active = "agent has touched this and it's not finished" — what
+        // viz highlights as running and what the HUD counts as in_progress.
+        assert!(Status::InProgress.is_active());
+        assert!(Status::PendingValidation.is_active());
+        assert!(Status::PendingEval.is_active());
+
+        // Not yet started, gated, or terminal — not active.
+        assert!(!Status::Open.is_active());
+        assert!(!Status::Waiting.is_active());
+        assert!(!Status::Blocked.is_active());
+        assert!(!Status::Incomplete.is_active());
+        assert!(!Status::Done.is_active());
+        assert!(!Status::Failed.is_active());
+        assert!(!Status::Abandoned.is_active());
+    }
+
+    #[test]
+    fn test_pending_eval_status_round_trip() {
+        // Display + deserialize as the canonical kebab-case "pending-eval".
+        assert_eq!(Status::PendingEval.to_string(), "pending-eval");
+        let json = serde_json::to_string(&Status::PendingEval).unwrap();
+        assert_eq!(json, "\"pending-eval\"");
+        let parsed: Status = serde_json::from_str("\"pending-eval\"").unwrap();
+        assert_eq!(parsed, Status::PendingEval);
     }
 
     #[test]
@@ -2204,42 +2906,33 @@ mod tests {
             cache_read_input_tokens: 100_000,
             cache_creation_input_tokens: 5_000,
         };
-        let assign = TokenUsage {
+        // Aggregated agency usage (assign + eval combined, novel only)
+        let agency = TokenUsage {
             cost_usd: 0.0,
-            input_tokens: 500,
-            output_tokens: 200,
+            input_tokens: 1300, // 500 assign + 800 eval novel input
+            output_tokens: 600, // 200 assign + 400 eval novel output
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
-        let eval = TokenUsage {
-            cost_usd: 0.0,
-            input_tokens: 800,
-            output_tokens: 400,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        };
-        // →in ←out ◎cached ⊳assign ∴eval format
+        // →novel_in ←out ◎cached ☀agency_total
+        // novel_in = input_tokens(4600) + cache_creation(5000) = 9600
+        // cached = cache_read(100000)
         assert_eq!(
-            format_token_display(Some(&usage), Some(&assign), Some(&eval)),
-            Some("→110k ←3.9k ◎105k ⊳700 ∴1.2k".to_string())
+            format_token_display(Some(&usage), Some(&agency)),
+            Some("→9.6k ←3.9k ◎100k §1.9k".to_string())
         );
         assert_eq!(
-            format_token_display(Some(&usage), None, None),
-            Some("→110k ←3.9k ◎105k".to_string())
+            format_token_display(Some(&usage), None),
+            Some("→9.6k ←3.9k ◎100k".to_string())
         );
-        // Only eval, no assign
+        // Only agency, no task usage
         assert_eq!(
-            format_token_display(None, None, Some(&eval)),
-            Some(" ∴1.2k".to_string())
+            format_token_display(None, Some(&agency)),
+            Some(" §1.9k".to_string())
         );
-        // Only assign, no eval
-        assert_eq!(
-            format_token_display(None, Some(&assign), None),
-            Some(" ⊳700".to_string())
-        );
-        assert_eq!(format_token_display(None, None, None), None);
+        assert_eq!(format_token_display(None, None), None);
 
-        // Zero validation tokens should not show assign/eval
+        // Zero agency tokens should not show § section
         let zero_val = TokenUsage {
             cost_usd: 0.0,
             input_tokens: 0,
@@ -2248,10 +2941,10 @@ mod tests {
             cache_creation_input_tokens: 0,
         };
         assert_eq!(
-            format_token_display(Some(&usage), Some(&zero_val), Some(&zero_val)),
-            Some("→110k ←3.9k ◎105k".to_string())
+            format_token_display(Some(&usage), Some(&zero_val)),
+            Some("→9.6k ←3.9k ◎100k".to_string())
         );
-        assert_eq!(format_token_display(None, Some(&zero_val), None), None);
+        assert_eq!(format_token_display(None, Some(&zero_val)), None);
     }
 
     #[test]
@@ -2366,6 +3059,112 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_token_usage_native_executor_result() {
+        // Native executor writes "total_usage" instead of "usage" in result lines
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn","turn":1,"role":"assistant","content":[],"usage":{"input_tokens":500,"output_tokens":100}}
+{"type":"result","final_text":"Done.","turns":2,"total_usage":{"input_tokens":1234,"output_tokens":567,"cache_read_input_tokens":800,"cache_creation_input_tokens":50}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.output_tokens, 567);
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        assert_eq!(usage.cache_creation_input_tokens, 50);
+        assert_eq!(usage.cost_usd, 0.0); // native executor doesn't track cost
+    }
+
+    #[test]
+    fn test_parse_token_usage_live_native_turn_format() {
+        // Native executor writes type=turn with top-level usage (not message.usage)
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn","turn":1,"role":"assistant","content":[],"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":200}}
+{"type":"turn","turn":2,"role":"assistant","content":[],"usage":{"input_tokens":600,"output_tokens":150,"cache_creation_input_tokens":50}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage_live(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 1100);
+        assert_eq!(usage.output_tokens, 250);
+        assert_eq!(usage.cache_read_input_tokens, 200);
+        assert_eq!(usage.cache_creation_input_tokens, 50);
+    }
+
+    #[test]
+    fn test_parse_token_usage_live_native_result_preferred() {
+        // If native executor has both turn and result lines, result should be used
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn","turn":1,"role":"assistant","content":[],"usage":{"input_tokens":500,"output_tokens":100}}
+{"type":"result","final_text":"Done.","turns":1,"total_usage":{"input_tokens":500,"output_tokens":100}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage_live(&log_path).unwrap();
+        // Should use the result line, not sum of turns
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 100);
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            "FLIP Phase 1: Inferring prompt from output...\nFLIP Phase 2: Comparing prompts...\n__WG_TOKENS__:{\"cost_usd\":0.12,\"input_tokens\":500,\"output_tokens\":200,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":50}\n",
+        ).unwrap();
+
+        let usage = parse_wg_tokens(&log_path).unwrap();
+        assert!((usage.cost_usd - 0.12).abs() < f64::EPSILON);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.cache_creation_input_tokens, 50);
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_multiple_lines_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            &log_path,
+            "__WG_TOKENS__:{\"cost_usd\":0.1,\"input_tokens\":100,\"output_tokens\":50}\n__WG_TOKENS__:{\"cost_usd\":0.2,\"input_tokens\":200,\"output_tokens\":80}\n",
+        ).unwrap();
+
+        let usage = parse_wg_tokens(&log_path).unwrap();
+        assert!((usage.cost_usd - 0.3).abs() < f64::EPSILON);
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 130);
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_missing_file() {
+        let result = parse_wg_tokens(std::path::Path::new("/nonexistent/output.log"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_wg_tokens_no_tokens_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(&log_path, "Some eval output\nAnother line\n").unwrap();
+        assert!(parse_wg_tokens(&log_path).is_none());
+    }
+
+    #[test]
     fn test_token_usage_serialization_skips_zeros() {
         let usage = TokenUsage {
             cost_usd: 1.5,
@@ -2406,5 +3205,336 @@ mod tests {
         } else {
             panic!("Expected Task node");
         }
+    }
+
+    #[test]
+    fn test_reactivate_cycle_skips_archived_members() {
+        let mut graph = WorkGraph::new();
+
+        // Two cycle members: one archived, one normal Done
+        let mut archived = make_task("coord-a", "Archived coordinator");
+        archived.status = Status::Done;
+        archived.tags = vec!["archived".to_string()];
+        archived.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+
+        let mut normal = make_task("coord-b", "Normal member");
+        normal.status = Status::Done;
+        normal.after = vec!["coord-a".to_string()];
+
+        graph.add_node(Node::Task(archived));
+        graph.add_node(Node::Task(normal));
+
+        let members = vec!["coord-a".to_string(), "coord-b".to_string()];
+        let config = CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        };
+
+        let reactivated = reactivate_cycle(&mut graph, &members, "coord-a", &config);
+
+        // Archived header suppresses the entire cycle — nothing reactivated
+        assert_eq!(reactivated.len(), 0);
+
+        // Both members should still be Done
+        let archived = graph.get_task("coord-a").unwrap();
+        assert_eq!(archived.status, Status::Done);
+
+        let normal = graph.get_task("coord-b").unwrap();
+        assert_eq!(normal.status, Status::Done);
+    }
+
+    #[test]
+    fn test_reactivate_cycle_all_archived_does_not_iterate() {
+        let mut graph = WorkGraph::new();
+
+        let mut archived = make_task("coord-only", "Solo archived coordinator");
+        archived.status = Status::Done;
+        archived.tags = vec!["archived".to_string()];
+        archived.cycle_config = Some(CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+
+        graph.add_node(Node::Task(archived));
+
+        let members = vec!["coord-only".to_string()];
+        let config = CycleConfig {
+            max_iterations: 5,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        };
+
+        let reactivated = reactivate_cycle(&mut graph, &members, "coord-only", &config);
+
+        // No reactivation — the only member is archived
+        assert!(reactivated.is_empty());
+    }
+
+    // ---- User board helper tests ----
+
+    #[test]
+    fn test_is_user_board() {
+        assert!(is_user_board(".user-erik-0"));
+        assert!(is_user_board(".user-alice-bob-3"));
+        assert!(is_user_board(".user-x"));
+        assert!(!is_user_board("user-erik-0"));
+        assert!(!is_user_board(".coordinator-0"));
+        assert!(!is_user_board("some-task"));
+    }
+
+    #[test]
+    fn test_user_board_handle() {
+        assert_eq!(user_board_handle(".user-erik-0"), Some("erik"));
+        assert_eq!(user_board_handle(".user-erik-5"), Some("erik"));
+        assert_eq!(user_board_handle(".user-alice-bob-3"), Some("alice-bob"));
+        assert_eq!(user_board_handle(".user-x"), None); // no -N suffix
+        assert_eq!(user_board_handle("not-a-board"), None);
+    }
+
+    #[test]
+    fn test_user_board_seq() {
+        assert_eq!(user_board_seq(".user-erik-0"), Some(0));
+        assert_eq!(user_board_seq(".user-erik-42"), Some(42));
+        assert_eq!(user_board_seq(".user-alice-bob-3"), Some(3));
+        assert_eq!(user_board_seq("not-a-board"), None);
+    }
+
+    #[test]
+    fn test_resolve_user_board_alias_no_match() {
+        let graph = WorkGraph::new();
+        // No tasks in graph — alias returns original
+        assert_eq!(resolve_user_board_alias(&graph, ".user-erik"), ".user-erik");
+    }
+
+    #[test]
+    fn test_resolve_user_board_alias_finds_active() {
+        let mut graph = WorkGraph::new();
+        let mut t0 = make_task(".user-erik-0", "Board 0");
+        t0.status = Status::Done;
+        let mut t1 = make_task(".user-erik-1", "Board 1");
+        t1.status = Status::InProgress;
+        graph.add_node(Node::Task(t0));
+        graph.add_node(Node::Task(t1));
+
+        assert_eq!(
+            resolve_user_board_alias(&graph, ".user-erik"),
+            ".user-erik-1"
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_board_alias_skips_terminal() {
+        let mut graph = WorkGraph::new();
+        let mut t0 = make_task(".user-erik-0", "Board 0");
+        t0.status = Status::Done;
+        let mut t1 = make_task(".user-erik-1", "Board 1");
+        t1.status = Status::Done;
+        graph.add_node(Node::Task(t0));
+        graph.add_node(Node::Task(t1));
+
+        // All boards are terminal — no active board found
+        assert_eq!(resolve_user_board_alias(&graph, ".user-erik"), ".user-erik");
+    }
+
+    #[test]
+    fn test_resolve_user_board_alias_fully_qualified_passthrough() {
+        let graph = WorkGraph::new();
+        // Already has -N suffix — passthrough
+        assert_eq!(
+            resolve_user_board_alias(&graph, ".user-erik-0"),
+            ".user-erik-0"
+        );
+    }
+
+    #[test]
+    fn test_resolve_user_board_alias_non_user_board_passthrough() {
+        let graph = WorkGraph::new();
+        assert_eq!(resolve_user_board_alias(&graph, "my-task"), "my-task");
+    }
+
+    #[test]
+    fn test_next_user_board_seq_empty() {
+        let graph = WorkGraph::new();
+        assert_eq!(next_user_board_seq(&graph, "erik"), 0);
+    }
+
+    #[test]
+    fn test_next_user_board_seq_existing() {
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(".user-erik-0", "Board 0")));
+        graph.add_node(Node::Task(make_task(".user-erik-1", "Board 1")));
+        assert_eq!(next_user_board_seq(&graph, "erik"), 2);
+    }
+
+    #[test]
+    fn test_create_user_board_task() {
+        let task = create_user_board_task("erik", 0);
+        assert_eq!(task.id, ".user-erik-0");
+        assert_eq!(task.status, Status::InProgress);
+        assert!(task.tags.contains(&"user-board".to_string()));
+        assert!(task.assigned.is_none());
+        assert!(task.agent.is_none());
+        assert!(task.created_at.is_some());
+        assert!(task.started_at.is_some());
+    }
+
+    #[test]
+    fn test_create_user_board_task_seq_increment() {
+        let task = create_user_board_task("alice", 5);
+        assert_eq!(task.id, ".user-alice-5");
+        assert_eq!(task.status, Status::InProgress);
+    }
+
+    #[test]
+    fn test_cycle_analysis_excludes_system_scaffolding() {
+        // System scaffolding tasks (.assign-*, .flip-*, etc.) should be
+        // excluded from cycle analysis so they don't cause false IRREDUCIBLE
+        // classifications by adding external entry points to user cycles.
+        let mut graph = WorkGraph::new();
+
+        // Create a simple 3-task cycle: a -> b -> c -> a
+        let mut task_a = make_task("task-a", "Task A");
+        task_a.after = vec!["task-c".into(), ".assign-task-a".into()];
+        task_a.cycle_config = Some(CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+
+        let mut task_b = make_task("task-b", "Task B");
+        task_b.after = vec!["task-a".into(), ".assign-task-b".into()];
+
+        let mut task_c = make_task("task-c", "Task C");
+        task_c.after = vec!["task-b".into(), ".assign-task-c".into()];
+
+        // Create system scaffolding tasks
+        let assign_a = make_task(".assign-task-a", "Assign task-a");
+        let assign_b = make_task(".assign-task-b", "Assign task-b");
+        let assign_c = make_task(".assign-task-c", "Assign task-c");
+        let flip_a = make_task(".flip-task-a", "FLIP task-a");
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(task_c));
+        graph.add_node(Node::Task(assign_a));
+        graph.add_node(Node::Task(assign_b));
+        graph.add_node(Node::Task(assign_c));
+        graph.add_node(Node::Task(flip_a));
+
+        let analysis = graph.compute_cycle_analysis();
+
+        // Should detect exactly one cycle with members {task-a, task-b, task-c}
+        assert_eq!(analysis.cycles.len(), 1);
+        let cycle = &analysis.cycles[0];
+        assert_eq!(cycle.members.len(), 3);
+        assert!(cycle.members.contains(&"task-a".to_string()));
+        assert!(cycle.members.contains(&"task-b".to_string()));
+        assert!(cycle.members.contains(&"task-c".to_string()));
+
+        // The cycle should be REDUCIBLE (single entry point) since .assign-*
+        // tasks are filtered out and don't create external entry points
+        assert!(
+            cycle.reducible,
+            "Cycle should be REDUCIBLE when system scaffolding is excluded"
+        );
+
+        // System tasks should NOT appear in task_to_cycle mapping
+        assert!(analysis.task_to_cycle.get(".assign-task-a").is_none());
+        assert!(analysis.task_to_cycle.get(".assign-task-b").is_none());
+        assert!(analysis.task_to_cycle.get(".assign-task-c").is_none());
+        assert!(analysis.task_to_cycle.get(".flip-task-a").is_none());
+    }
+
+    #[test]
+    fn test_priority_is_u32() {
+        assert_eq!(PRIORITY_DEFAULT, 10u32);
+        assert_eq!(PRIORITY_CRITICAL, 100u32);
+        assert_eq!(PRIORITY_HIGH, 50u32);
+        assert_eq!(PRIORITY_NORMAL, 10u32);
+        assert_eq!(PRIORITY_LOW, 5u32);
+        assert_eq!(PRIORITY_IDLE, 0u32);
+
+        // Higher number = higher priority
+        assert!(PRIORITY_CRITICAL > PRIORITY_HIGH);
+        assert!(PRIORITY_HIGH > PRIORITY_NORMAL);
+        assert!(PRIORITY_NORMAL > PRIORITY_LOW);
+        assert!(PRIORITY_LOW > PRIORITY_IDLE);
+
+        let task = Task {
+            id: "test-task".to_string(),
+            title: "Test Task".to_string(),
+            priority: PRIORITY_HIGH,
+            ..Task::default()
+        };
+        assert_eq!(task.priority, 50);
+
+        let default_task = Task::default();
+        assert_eq!(default_task.priority, PRIORITY_DEFAULT);
+    }
+
+    #[test]
+    fn test_priority_serde_migration_from_named_enum() {
+        // Old graph.jsonl entries with string-enum values must deserialize to u32
+        let json_critical =
+            r#"{"id":"t1","title":"T","status":"open","priority":"critical"}"#;
+        let task: Task = serde_json::from_str(json_critical).unwrap();
+        assert_eq!(task.priority, PRIORITY_CRITICAL);
+
+        let json_high = r#"{"id":"t2","title":"T","status":"open","priority":"high"}"#;
+        let task: Task = serde_json::from_str(json_high).unwrap();
+        assert_eq!(task.priority, PRIORITY_HIGH);
+
+        let json_normal = r#"{"id":"t3","title":"T","status":"open","priority":"normal"}"#;
+        let task: Task = serde_json::from_str(json_normal).unwrap();
+        assert_eq!(task.priority, PRIORITY_NORMAL);
+
+        let json_low = r#"{"id":"t4","title":"T","status":"open","priority":"low"}"#;
+        let task: Task = serde_json::from_str(json_low).unwrap();
+        assert_eq!(task.priority, PRIORITY_LOW);
+
+        let json_idle = r#"{"id":"t5","title":"T","status":"open","priority":"idle"}"#;
+        let task: Task = serde_json::from_str(json_idle).unwrap();
+        assert_eq!(task.priority, PRIORITY_IDLE);
+
+        // New u32 format
+        let json_u32 = r#"{"id":"t6","title":"T","status":"open","priority":42}"#;
+        let task: Task = serde_json::from_str(json_u32).unwrap();
+        assert_eq!(task.priority, 42);
+
+        // Missing priority → default
+        let json_none = r#"{"id":"t7","title":"T","status":"open"}"#;
+        let task: Task = serde_json::from_str(json_none).unwrap();
+        assert_eq!(task.priority, PRIORITY_DEFAULT);
+
+        // Serialization writes u32
+        let task = Task {
+            id: "t8".to_string(),
+            title: "T".to_string(),
+            priority: PRIORITY_CRITICAL,
+            ..Task::default()
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains("\"priority\":100"));
     }
 }

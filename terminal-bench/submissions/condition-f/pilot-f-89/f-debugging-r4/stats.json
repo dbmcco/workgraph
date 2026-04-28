@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "counts": {
+    "done": 2,
+    "cycles": 1,
+    "show": 10,
+    "msg": 2,
+    "artifact": 1,
+    "edit": 1,
+    "add": 3,
+    "native-exec": 2,
+    "log": 4,
+    "service": 2
+  }
+}

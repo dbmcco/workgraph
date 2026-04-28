@@ -14,175 +14,28 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use workgraph::config::Config;
+use workgraph::config::{Config, DispatchRole};
 use workgraph::executor::native::agent::AgentLoop;
 use workgraph::executor::native::bundle::resolve_bundle;
-use workgraph::executor::native::client::{AnthropicClient, LlmClient};
-use workgraph::executor::native::openai_client::OpenAiClient;
+use workgraph::executor::native::journal;
+use workgraph::executor::native::provider::create_provider_ext;
 use workgraph::executor::native::tools::ToolRegistry;
-
-const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250514";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedNativeClientConfig {
-    provider: String,
-    api_base: Option<String>,
-    api_key: Option<String>,
-    max_tokens: Option<u32>,
-}
-
-fn resolve_legacy_native_executor_settings(
-    workgraph_dir: &Path,
-) -> (Option<String>, Option<String>, Option<String>, Option<u32>) {
-    let config_path = workgraph_dir.join("config.toml");
-    let config_val: Option<toml::Value> = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|content| toml::from_str(&content).ok());
-    let native_cfg = config_val
-        .as_ref()
-        .and_then(|value| value.get("native_executor"));
-
-    let provider = native_cfg
-        .and_then(|cfg| cfg.get("provider"))
-        .and_then(|value| value.as_str())
-        .map(String::from);
-    let api_base = native_cfg
-        .and_then(|cfg| cfg.get("api_base"))
-        .and_then(|value| value.as_str())
-        .map(String::from);
-    let api_key = native_cfg
-        .and_then(|cfg| cfg.get("api_key"))
-        .and_then(|value| value.as_str())
-        .map(String::from)
-        .filter(|value| !value.trim().is_empty());
-    let max_tokens = native_cfg
-        .and_then(|cfg| cfg.get("max_tokens"))
-        .and_then(|value| value.as_integer())
-        .map(|value| value as u32);
-
-    (provider, api_base, api_key, max_tokens)
-}
-
-fn resolve_native_client_config(workgraph_dir: &Path, model: &str) -> ResolvedNativeClientConfig {
-    let config = Config::load_or_default(workgraph_dir);
-    let (legacy_provider, legacy_api_base, legacy_api_key, max_tokens) =
-        resolve_legacy_native_executor_settings(workgraph_dir);
-
-    let named_endpoint = std::env::var("WG_ENDPOINT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("WG_ENDPOINT_NAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .and_then(|name| config.llm_endpoints.find_by_name(&name));
-
-    let provider = std::env::var("WG_LLM_PROVIDER")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| named_endpoint.map(|endpoint| endpoint.provider.clone()))
-        .or(legacy_provider)
-        .unwrap_or_else(|| {
-            if model.contains('/') {
-                "openai".to_string()
-            } else {
-                "anthropic".to_string()
-            }
-        });
-
-    let endpoint = named_endpoint
-        .or_else(|| config.llm_endpoints.find_for_provider(&provider))
-        .or_else(|| config.llm_endpoints.find_default());
-
-    let api_base = std::env::var("WG_ENDPOINT_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| endpoint.and_then(|ep| ep.url.clone()))
-        .or(legacy_api_base);
-
-    let api_key = std::env::var("WG_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| endpoint.and_then(|ep| ep.resolve_api_key().ok().flatten()))
-        .or(legacy_api_key);
-
-    ResolvedNativeClientConfig {
-        provider,
-        api_base,
-        api_key,
-        max_tokens,
-    }
-}
-
-/// Resolve which LLM provider to use and create the appropriate client.
-///
-/// Resolution order:
-/// 1. Spawn-resolved `WG_*` endpoint env vars
-/// 2. Matching/default `[llm_endpoints]` config
-/// 3. Legacy `[native_executor]` config
-/// 4. Model heuristic / provider-specific env fallback
-fn create_client(workgraph_dir: &Path, model: &str) -> Result<Box<dyn LlmClient>> {
-    let resolved = resolve_native_client_config(workgraph_dir, model);
-
-    match resolved.provider.as_str() {
-        "openai" | "openrouter" => {
-            let api_key = resolved
-                .api_key
-                .clone()
-                .or_else(|| {
-                    workgraph::executor::native::openai_client::resolve_openai_api_key_from_dir(
-                        workgraph_dir,
-                    )
-                    .ok()
-                })
-                .or_else(|| {
-                    workgraph::executor::native::client::resolve_api_key_from_dir(workgraph_dir)
-                        .ok()
-                })
-                .context("Failed to initialize OpenAI-compatible client")?;
-            let mut client = OpenAiClient::new(api_key, model, resolved.api_base.as_deref())
-                .context("Failed to initialize OpenAI-compatible client")?;
-            if let Some(mt) = resolved.max_tokens {
-                client = client.with_max_tokens(mt);
-            }
-            eprintln!(
-                "[native-exec] Using OpenAI-compatible provider ({})",
-                client.model
-            );
-            Ok(Box::new(client))
-        }
-        _ => {
-            let api_key = resolved
-                .api_key
-                .clone()
-                .or_else(|| {
-                    workgraph::executor::native::client::resolve_api_key_from_dir(workgraph_dir)
-                        .ok()
-                })
-                .context("Failed to initialize Anthropic client")?;
-            let mut client = AnthropicClient::from_config(&api_key, model)
-                .context("Failed to initialize Anthropic client")?;
-            if let Some(base) = resolved.api_base {
-                client = client.with_base_url(&base);
-            }
-            if let Some(mt) = resolved.max_tokens {
-                client = client.with_max_tokens(mt);
-            }
-            eprintln!("[native-exec] Using Anthropic provider ({})", client.model);
-            Ok(Box::new(client))
-        }
-    }
-}
+use workgraph::models::ModelRegistry;
 
 /// Run the native executor agent loop.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     workgraph_dir: &Path,
     prompt_file: &str,
     exec_mode: &str,
     task_id: &str,
     model: Option<&str>,
+    provider: Option<&str>,
+    endpoint_name: Option<&str>,
+    endpoint_url: Option<&str>,
+    api_key: Option<&str>,
     max_turns: usize,
+    no_resume: bool,
 ) -> Result<()> {
     let prompt = std::fs::read_to_string(prompt_file)
         .with_context(|| format!("Failed to read prompt file: {}", prompt_file))?;
@@ -190,7 +43,12 @@ pub fn run(
     let effective_model = model
         .map(String::from)
         .or_else(|| std::env::var("WG_MODEL").ok())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| {
+            Config::load(workgraph_dir)
+                .ok()
+                .map(|c| c.resolve_model_for_role(DispatchRole::TaskAgent).model)
+                .unwrap_or_else(|| "sonnet".to_string())
+        });
 
     // Resolve the working directory (parent of .workgraph/)
     let working_dir = workgraph_dir
@@ -199,8 +57,12 @@ pub fn run(
         .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    // Build the tool registry
-    let mut registry = ToolRegistry::default_all(workgraph_dir, &working_dir);
+    // Load config for native executor settings
+    let config = Config::load(workgraph_dir).unwrap_or_default();
+
+    // Build the tool registry with config
+    let mut registry =
+        ToolRegistry::default_all_with_config(workgraph_dir, &working_dir, &config.native_executor);
 
     // Resolve bundle and filter tools
     let system_suffix = if let Some(bundle) = resolve_bundle(exec_mode, workgraph_dir) {
@@ -233,18 +95,127 @@ pub fn run(
         task_id, effective_model, exec_mode, max_turns
     );
 
-    // Create the API client (auto-selects provider)
-    let client = create_client(workgraph_dir, &effective_model)?;
+    // Create the LLM provider (auto-selects by model name).
+    // Provider resolution: CLI --provider > WG_LLM_PROVIDER env var > create_provider_ext fallback.
+    let effective_provider = provider
+        .map(String::from)
+        .or_else(|| std::env::var("WG_LLM_PROVIDER").ok());
+    let effective_endpoint = endpoint_name
+        .map(String::from)
+        .or_else(|| std::env::var("WG_ENDPOINT").ok());
+    // If endpoint_url was passed explicitly, set WG_ENDPOINT_URL so create_provider_ext picks it up.
+    if let Some(url) = endpoint_url {
+        // SAFETY: native-exec is single-threaded at this point (before tokio runtime creation).
+        unsafe { std::env::set_var("WG_ENDPOINT_URL", url) };
+    }
+    let client = create_provider_ext(
+        workgraph_dir,
+        &effective_model,
+        effective_provider.as_deref(),
+        effective_endpoint.as_deref(),
+        api_key,
+    )?;
+
+    // Check if the model supports tool use
+    let model_registry = ModelRegistry::load(workgraph_dir).unwrap_or_default();
+    let supports_tools = model_registry.supports_tool_use(&effective_model);
+    if !supports_tools {
+        eprintln!(
+            "[native-exec] Model '{}' does not support tool use, sending requests without tools",
+            effective_model
+        );
+    }
 
     // Create and run the agent loop
-    let agent = AgentLoop::new(client, registry, system_prompt, max_turns, output_log);
+    let journal_path = journal::journal_path(workgraph_dir, task_id);
+
+    // Resolve session summary path: .workgraph/agents/<agent-id>/session-summary.md
+    let session_summary_path = std::env::var("WG_AGENT_ID").ok().map(|agent_id| {
+        workgraph_dir
+            .join("agents")
+            .join(&agent_id)
+            .join("session-summary.md")
+    });
+
+    // Register this task-agent session in the chat-sessions registry
+    // so it's discoverable via `wg chat list`, `wg chat attach
+    // task-<id>`, etc. The journal + inbox/outbox live in the
+    // existing `output/<task_id>/` dir (keeps legacy tests + readers
+    // happy); we expose it under `chat/task-<id>/` via a symlink so
+    // the chat surface addresses it uniformly with coordinators and
+    // interactive sessions.
+    let session_alias = format!("task-{}", task_id);
+    let output_dir = workgraph_dir.join("output").join(task_id);
+    let _ = std::fs::create_dir_all(&output_dir);
+    let chat_link = workgraph_dir.join("chat").join(&session_alias);
+    let _ = std::fs::create_dir_all(workgraph_dir.join("chat"));
+    if !chat_link.exists() && !chat_link.is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = format!("../output/{}", task_id);
+            let _ = std::os::unix::fs::symlink(&target, &chat_link);
+        }
+    }
+    // Register by task-id — task-ids are already unique within a
+    // workgraph, so we use them as the session key directly instead
+    // of a fresh UUID.
+    let mut reg = workgraph::chat_sessions::load(workgraph_dir).unwrap_or_default();
+    reg.sessions.entry(task_id.to_string()).or_insert_with(|| {
+        workgraph::chat_sessions::SessionMeta {
+            kind: workgraph::chat_sessions::SessionKind::TaskAgent,
+            created: chrono::Utc::now().to_rfc3339(),
+            aliases: vec![session_alias.clone()],
+            label: Some(format!("task {}", task_id)),
+            forked_from: None,
+            archived_at: None,
+        }
+    });
+    let _ = workgraph::chat_sessions::save(workgraph_dir, &reg);
+
+    let mut agent = AgentLoop::with_tool_support(
+        client,
+        registry,
+        system_prompt,
+        max_turns,
+        output_log,
+        supports_tools,
+    )
+    .with_journal(journal_path, task_id.to_string())
+    .with_resume(!no_resume)
+    .with_working_dir(working_dir.clone())
+    // Mount the chat surface so `wg chat attach task-<id>` works: a
+    // watcher sees tokens land in `.streaming` and final turns in
+    // `outbox.jsonl`. `resume_existing=true` here because for an
+    // autonomous task agent, any pre-existing inbox messages (from
+    // the user interjecting while the task was in flight) SHOULD be
+    // consumed, not skipped.
+    .with_chat_ref(workgraph_dir.to_path_buf(), session_alias, true)
+    .with_workgraph_dir(workgraph_dir.to_path_buf());
+
+    // Add registry entry for cost tracking if available
+    let config = Config::load_or_default(workgraph_dir);
+    if let Some(entry) = config.registry_lookup(&effective_model) {
+        agent = agent.with_registry_entry(entry);
+    }
+
+    if let Some(path) = session_summary_path {
+        agent = agent.with_session_summary_path(path);
+    }
+
+    // Enable mid-turn state injection when we have an agent ID
+    if let Ok(agent_id) = std::env::var("WG_AGENT_ID") {
+        agent =
+            agent.with_state_injection(workgraph_dir.to_path_buf(), task_id.to_string(), agent_id);
+    }
+
+    let mut agent = agent;
 
     // Run the async agent loop
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
     let result = rt.block_on(agent.run(&format!(
         "You are working on task '{}'. Complete the task as described in your system prompt. \
-         When done, use the wg_done tool with task_id '{}'. \
-         If you cannot complete the task, use the wg_fail tool with a reason.",
+         When done, call wg_done with task_id '{}'. If you genuinely cannot complete the \
+         task, call wg_fail with what you tried and what blocked you.",
         task_id, task_id
     )))?;
 

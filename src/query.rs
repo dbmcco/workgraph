@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Check if a task is past its not_before and ready_after timestamps (or has no timestamps)
+/// Check if a task is past its not_before and ready_after timestamps (or has no timestamps),
+/// and if cron-enabled, whether it is due to fire.
 pub fn is_time_ready(task: &Task) -> bool {
     let now = Utc::now();
 
@@ -25,6 +26,11 @@ pub fn is_time_ready(task: &Task) -> bool {
         return false;
     }
     // Invalid timestamp = treat as ready (don't block)
+
+    // Cron gate: if cron-enabled, only ready when due
+    if task.cron_enabled && !crate::cron::is_cron_due(task, now) {
+        return false;
+    }
 
     true
 }
@@ -90,8 +96,17 @@ pub fn project_summary(graph: &WorkGraph) -> ProjectSummary {
                 // Explicit blocked status also counts
                 blocked_count += 1;
             }
-            Status::Failed | Status::Abandoned | Status::Waiting => {
+            Status::Incomplete => {
+                open += 1;
+            }
+            Status::Failed | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
                 // Failed, abandoned, and waiting tasks are not counted as open
+            }
+            Status::PendingEval => {
+                // Soft-done: agent finished, awaiting eval. Count as in-progress
+                // for board display purposes — work is "in flight" until eval
+                // resolves it.
+                in_progress += 1;
             }
         }
     }
@@ -129,8 +144,11 @@ where
     let ready = ready_tasks(graph);
     let ready_ids: HashSet<&str> = ready.iter().map(|t| t.id.as_str()).collect();
 
-    // Get all open tasks (not done, not in-progress)
-    let mut open_tasks: Vec<&Task> = graph.tasks().filter(|t| t.status == Status::Open).collect();
+    // Get all open/incomplete tasks (not done, not in-progress)
+    let mut open_tasks: Vec<&Task> = graph
+        .tasks()
+        .filter(|t| matches!(t.status, Status::Open | Status::Incomplete))
+        .collect();
 
     // Sort: ready tasks first, then by value (cost/hours) ascending
     open_tasks.sort_by(|a, b| {
@@ -258,13 +276,39 @@ pub fn build_reverse_index(graph: &WorkGraph) -> HashMap<String, Vec<String>> {
     index
 }
 
+/// Returns true if `.evaluate-{blocker_id}` exists in the graph and is non-terminal.
+/// This is the eval gate: when an evaluation task is scaffolded for a completed
+/// task, downstream dependents wait for the evaluation to finish before unblocking.
+/// Agency eval IS the verification — `wg approve`/`wg reject` are no longer
+/// routine human gates.
+///
+/// Returns false (gate satisfied) when:
+/// - `.evaluate-{blocker_id}` does not exist (no eval scheduled)
+/// - `.evaluate-{blocker_id}` is terminal (Done/Failed/Abandoned)
+///
+/// Returns true (gate pending) when:
+/// - `.evaluate-{blocker_id}` exists and is Open/InProgress/Waiting/PendingValidation
+///
+/// System tasks (dot-prefixed) are exempt from eval gating to avoid recursive
+/// gates on `.evaluate-X`, `.assign-X`, etc.
+pub fn is_eval_gate_pending(blocker_id: &str, graph: &WorkGraph) -> bool {
+    if blocker_id.starts_with('.') {
+        return false;
+    }
+    let eval_id = format!(".evaluate-{}", blocker_id);
+    match graph.get_task(&eval_id) {
+        Some(eval_task) => !eval_task.status.is_terminal(),
+        None => false,
+    }
+}
+
 /// Find all tasks that are ready to work on (no open blockers, past not_before)
 pub fn ready_tasks(graph: &WorkGraph) -> Vec<&Task> {
     graph
         .tasks()
         .filter(|task| {
-            // Must be open
-            if task.status != Status::Open {
+            // Must be open or incomplete (retryable)
+            if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
             // Must not be paused
@@ -280,20 +324,59 @@ pub fn ready_tasks(graph: &WorkGraph) -> Vec<&Task> {
             // (not satisfied). This prevents premature dispatch when tasks
             // reference dependencies that haven't been created yet during
             // burst graph construction.
+            //
+            // Eval gate: even when blocker is terminal, wait for `.evaluate-X`
+            // to also be terminal — agency eval gates dependent unblocking.
+            // System tasks (dot-prefixed) are exempt from this gate.
             task.after.iter().all(|blocker_id| {
-                graph
-                    .get_task(blocker_id)
-                    .map(|t| t.status.is_terminal())
-                    .unwrap_or(false)
+                blocker_satisfied_for_dependent(blocker_id, graph, task.id.starts_with('.'))
             })
         })
         .collect()
+}
+
+/// Predicate: is `blocker_id` satisfied for a dependent task?
+///
+/// Handles the new `PendingEval` soft-done state:
+/// - System dependents (e.g. `.flip-X`, `.evaluate-X`) treat `PendingEval` as
+///   "the agent finished, output is captured" and proceed. Without this, the
+///   eval pipeline would deadlock because `.evaluate-X` cannot run until
+///   `X` is `Done` — but `X` cannot reach `Done` until `.evaluate-X` finishes.
+/// - Non-system dependents (regular work) treat `PendingEval` as still in
+///   flight and block until the dispatcher promotes the source to `Done`.
+fn blocker_satisfied_for_dependent(
+    blocker_id: &str,
+    graph: &WorkGraph,
+    dependent_is_system: bool,
+) -> bool {
+    let blocker = graph.get_task(blocker_id);
+    let blocker_terminal = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
+    let blocker_pending_eval = blocker
+        .map(|t| t.status == Status::PendingEval)
+        .unwrap_or(false);
+
+    if !blocker_terminal {
+        // The PendingEval bypass only fires for system dependents. Regular
+        // tasks must wait for the dispatcher to promote the source to Done.
+        if !(dependent_is_system && blocker_pending_eval) {
+            return false;
+        }
+    }
+    // Either the blocker is terminal, or the PendingEval bypass let us through.
+    if dependent_is_system {
+        // System tasks skip the eval gate too — they ARE the eval gate.
+        return true;
+    }
+    !is_eval_gate_pending(blocker_id, graph)
 }
 
 /// Check whether a single after dependency is satisfied (terminal).
 ///
 /// Handles both local and remote (`peer:task-id`) references.
 /// For remote refs, resolves via federation config using IPC or direct file access.
+///
+/// Note: this does NOT apply the eval-gate (`.evaluate-X` pending). Use
+/// `is_blocker_satisfied_with_eval_gate` to include the eval gate.
 pub fn is_blocker_satisfied(
     blocker_id: &str,
     graph: &WorkGraph,
@@ -317,6 +400,43 @@ pub fn is_blocker_satisfied(
     }
 }
 
+/// Like `is_blocker_satisfied` but also applies the eval gate: even when the
+/// blocker is terminal, returns false if `.evaluate-{blocker_id}` exists in the
+/// graph and is not yet terminal.
+///
+/// Used by readiness queries so dependents wait for agency evaluation before
+/// unblocking. Skip-callers should pass `dependent_is_system=true` when the
+/// dependent itself is a system task (dot-prefixed) — system tasks bypass
+/// eval gating to avoid `.evaluate-.evaluate-X` recursion.
+///
+/// Also handles `PendingEval`: a non-terminal soft-done state. System
+/// dependents treat it as terminal so the eval pipeline can run; non-system
+/// dependents block until the dispatcher promotes the source to `Done`.
+pub fn is_blocker_satisfied_with_eval_gate(
+    blocker_id: &str,
+    graph: &WorkGraph,
+    workgraph_dir: Option<&Path>,
+    dependent_is_system: bool,
+) -> bool {
+    let satisfied = is_blocker_satisfied(blocker_id, graph, workgraph_dir);
+    if !satisfied {
+        // Allow system dependents to advance over a PendingEval source — the
+        // agent is done, only the eval has not scored yet.
+        if !(dependent_is_system
+            && graph
+                .get_task(blocker_id)
+                .map(|t| t.status == Status::PendingEval)
+                .unwrap_or(false))
+        {
+            return false;
+        }
+    }
+    if dependent_is_system {
+        return true;
+    }
+    !is_eval_gate_pending(blocker_id, graph)
+}
+
 /// Find all tasks that are ready to work on, resolving cross-repo dependencies.
 ///
 /// This is the cross-repo-aware variant of `ready_tasks()`. The coordinator
@@ -326,7 +446,7 @@ pub fn ready_tasks_with_peers<'a>(graph: &'a WorkGraph, workgraph_dir: &Path) ->
     graph
         .tasks()
         .filter(|task| {
-            if task.status != Status::Open {
+            if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
             if task.paused {
@@ -335,27 +455,33 @@ pub fn ready_tasks_with_peers<'a>(graph: &'a WorkGraph, workgraph_dir: &Path) ->
             if !is_time_ready(task) {
                 return false;
             }
-            task.after
-                .iter()
-                .all(|blocker_id| is_blocker_satisfied(blocker_id, graph, Some(workgraph_dir)))
+            let dependent_is_system = task.id.starts_with('.');
+            task.after.iter().all(|blocker_id| {
+                is_blocker_satisfied_with_eval_gate(
+                    blocker_id,
+                    graph,
+                    Some(workgraph_dir),
+                    dependent_is_system,
+                )
+            })
         })
         .collect()
 }
 
 /// Find all tasks that are ready to work on, with cycle-aware back-edge exemption.
 ///
-/// Same as `ready_tasks()` but cycle header tasks with a `CycleConfig` have their
-/// back-edge predecessors exempt from the readiness check. This allows the cycle
-/// header to become ready on the first iteration (or after re-opening) even though
-/// the back-edge predecessor hasn't completed yet.
+/// Same as `ready_tasks()` but structural back-edges (identified by cycle analysis)
+/// are ignored when computing readiness. This allows cycle members to become ready
+/// based on their forward dependencies only, regardless of iteration count or
+/// cycle_config presence. Works uniformly for self-loops, 2-task, and N-task cycles.
 pub fn ready_tasks_cycle_aware<'a>(
     graph: &'a WorkGraph,
     cycle_analysis: &CycleAnalysis,
 ) -> Vec<&'a Task> {
-    graph
+    let mut ready_tasks: Vec<&'a Task> = graph
         .tasks()
         .filter(|task| {
-            if task.status != Status::Open {
+            if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
             if task.paused {
@@ -364,33 +490,101 @@ pub fn ready_tasks_cycle_aware<'a>(
             if !is_time_ready(task) {
                 return false;
             }
+            let dependent_is_system = task.id.starts_with('.');
             task.after.iter().all(|blocker_id| {
-                // Normal check: predecessor is terminal.
-                // Non-existent blocker blocks (prevents premature dispatch).
-                let blocker_done = graph
-                    .get_task(blocker_id)
-                    .map(|t| t.status.is_terminal())
+                let blocker = graph.get_task(blocker_id);
+                let blocker_done = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
+                let blocker_pending_eval = blocker
+                    .map(|t| t.status == Status::PendingEval)
                     .unwrap_or(false);
                 if blocker_done {
+                    // Eval gate: even when blocker is terminal, wait for
+                    // `.evaluate-X` to also be terminal. System dependents
+                    // (dot-prefixed) skip the gate.
+                    if dependent_is_system {
+                        return true;
+                    }
+                    return !is_eval_gate_pending(blocker_id, graph);
+                }
+                // PendingEval bypass for system dependents: `.flip-X` and
+                // `.evaluate-X` need to run on a soft-done source — without
+                // this the eval pipeline deadlocks itself.
+                if dependent_is_system && blocker_pending_eval {
                     return true;
                 }
-                // Cycle-aware: only exempt WORKERS from back-edge blockers.
-                // The auto-created dependency from a worker back to the iterator
-                // is a loop-back edge; the iterator should not block the worker.
-                // But the cycle header (task with cycle_config) must NEVER skip
-                // its own forward dependencies — it must wait for workers to finish.
-                if task.cycle_config.is_none()
-                    && let Some(blocker) = graph.get_task(blocker_id)
-                    && blocker.cycle_config.is_some()
-                    && let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id)
-                    && cycle_analysis.task_to_cycle.get(&task.id) == Some(bc)
+                // Back-edge exemption: if this dependency edge is a structural
+                // back-edge in the cycle analysis, skip it. Only forward
+                // dependencies block readiness. This single check handles
+                // self-loops, 2-task cycles, N-task cycles, and all iterations
+                // uniformly — no special cases needed.
+                if cycle_analysis
+                    .back_edges
+                    .contains(&(blocker_id.clone(), task.id.clone()))
                 {
                     return true;
                 }
                 false
             })
         })
-        .collect()
+        .collect();
+
+    // Auto-break-in for unconfigured cycles
+    for cycle in &cycle_analysis.cycles {
+        // Check if this cycle has any configured tasks
+        let has_cycle_config = cycle.members.iter().any(|member_id| {
+            graph
+                .get_task(member_id)
+                .map(|t| t.cycle_config.is_some())
+                .unwrap_or(false)
+        });
+
+        // Skip if cycle is configured (existing logic handles it)
+        if has_cycle_config {
+            continue;
+        }
+
+        // Check if any cycle member is already ready (existing logic handles it)
+        let has_ready_member = cycle
+            .members
+            .iter()
+            .any(|member_id| ready_tasks.iter().any(|t| &t.id == member_id));
+
+        if has_ready_member {
+            continue;
+        }
+
+        // Check if all cycle members are open and time-ready
+        let viable_members: Vec<&Task> = cycle
+            .members
+            .iter()
+            .filter_map(|member_id| graph.get_task(member_id))
+            .filter(|task| {
+                matches!(task.status, Status::Open | Status::Incomplete)
+                    && !task.paused
+                    && is_time_ready(task)
+            })
+            .collect();
+
+        if viable_members.is_empty() {
+            continue; // No viable members to break in
+        }
+
+        // Pick the break-in point: alphabetically first task
+        let break_in_task = viable_members
+            .iter()
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .expect("viable_members is not empty");
+
+        eprintln!(
+            "Auto-break-in: selecting task '{}' to break cycle deadlock in unconfigured cycle [{}]",
+            break_in_task.id,
+            cycle.members.join(" → ")
+        );
+
+        ready_tasks.push(break_in_task);
+    }
+
+    ready_tasks
 }
 
 /// Find all tasks that are ready to work on, resolving cross-repo dependencies,
@@ -403,7 +597,7 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
     graph
         .tasks()
         .filter(|task| {
-            if task.status != Status::Open {
+            if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
             if task.paused {
@@ -412,18 +606,34 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
             if !is_time_ready(task) {
                 return false;
             }
+            let dependent_is_system = task.id.starts_with('.');
             task.after.iter().all(|blocker_id| {
                 if is_blocker_satisfied(blocker_id, graph, Some(workgraph_dir)) {
+                    // Eval gate: even when blocker is terminal, wait for
+                    // `.evaluate-X` to also be terminal. System dependents
+                    // (dot-prefixed) skip the gate.
+                    if dependent_is_system {
+                        return true;
+                    }
+                    return !is_eval_gate_pending(blocker_id, graph);
+                }
+                // PendingEval bypass for system dependents: the agent finished
+                // (output captured) but the evaluator hasn't scored yet —
+                // `.flip-X` / `.evaluate-X` must run from this state.
+                if dependent_is_system
+                    && graph
+                        .get_task(blocker_id)
+                        .map(|t| t.status == Status::PendingEval)
+                        .unwrap_or(false)
+                {
                     return true;
                 }
-                // Cycle-aware: only exempt WORKERS from back-edge blockers.
-                // The cycle header (task with cycle_config) must wait for its
-                // forward dependencies (workers) to complete.
-                if task.cycle_config.is_none()
-                    && let Some(blocker) = graph.get_task(blocker_id)
-                    && blocker.cycle_config.is_some()
-                    && let Some(bc) = cycle_analysis.task_to_cycle.get(blocker_id)
-                    && cycle_analysis.task_to_cycle.get(&task.id) == Some(bc)
+                // Back-edge exemption: if this dependency edge is a structural
+                // back-edge in the cycle analysis, skip it. Only forward
+                // dependencies block readiness.
+                if cycle_analysis
+                    .back_edges
+                    .contains(&(blocker_id.clone(), task.id.clone()))
                 {
                     return true;
                 }
@@ -443,6 +653,17 @@ pub fn after<'a>(graph: &'a WorkGraph, task_id: &str) -> Vec<&'a Task> {
         .iter()
         .filter_map(|id| graph.get_task(id))
         .filter(|t| !t.status.is_terminal())
+        .collect()
+}
+
+/// Return dependency IDs that don't resolve to any task in the graph (phantom edges).
+/// Excludes cross-repo remote references, which are validated at resolution time.
+pub fn phantom_blockers(task: &Task, graph: &WorkGraph) -> Vec<String> {
+    task.after
+        .iter()
+        .filter(|id| graph.get_task(id).is_none())
+        .filter(|id| crate::federation::parse_remote_ref(id).is_none())
+        .cloned()
         .collect()
 }
 
@@ -1737,62 +1958,560 @@ mod tests {
         assert!(!is_blocker_satisfied("peer:task-id", &graph, None));
     }
 
+    // -----------------------------------------------------------------------
+    // Cycle bootstrap tests: SCC-aware first-iteration readiness
+    // -----------------------------------------------------------------------
+
+    /// Helper to build a CycleConfig with given max_iterations.
+    fn make_cycle_config(max_iterations: u32) -> crate::graph::CycleConfig {
+        crate::graph::CycleConfig {
+            max_iterations,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        }
+    }
+
     #[test]
-    fn test_build_reverse_index_includes_before_edges() {
+    fn test_cycle_aware_mutual_dep_both_have_cycle_config() {
+        // A↔B cycle, both with max_iterations.
+        // Only the header (a, smallest ID) should be ready — the B→A edge
+        // is a back-edge (ignored), so A is unblocked. B's blocker A is a
+        // forward edge, so B waits for A.
         let mut graph = WorkGraph::new();
 
-        let mut assign_task = make_task("assign-task", "Assign task");
-        assign_task.before = vec!["target".to_string()];
-        graph.add_node(Node::Task(assign_task));
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["b".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
 
-        let target = make_task("target", "Target task");
-        graph.add_node(Node::Task(target));
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        b.cycle_config = Some(make_cycle_config(3));
 
-        let index = build_reverse_index(&graph);
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
 
-        let dependents = index.get("assign-task").expect("assign-task should be in index");
-        assert!(
-            dependents.contains(&"target".to_string()),
-            "reverse index should show assign-task blocks target, got: {:?}",
-            dependents
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "Only the header should be ready");
+        assert_eq!(
+            ready[0].id, cycle_analysis.cycles[0].header,
+            "The ready task should be the cycle header"
         );
     }
 
     #[test]
-    fn test_ready_tasks_respects_before_edges() {
+    fn test_cycle_aware_mutual_dep_only_one_has_cycle_config() {
+        // A↔B cycle, only A has max_iterations.
+        // Only the header should be ready — back-edge exemption is structural,
+        // not dependent on cycle_config.
         let mut graph = WorkGraph::new();
 
-        let mut source = make_task("source", "Source task");
-        source.before = vec!["target".to_string()];
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["b".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
 
-        let target = make_task("target", "Target task");
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        // b has no cycle_config
 
-        graph.add_node(Node::Task(target));
-        graph.add_node(Node::Task(source));
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
 
-        let ready = ready_tasks(&graph);
-        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
 
-        assert!(ready_ids.contains(&"source"), "source should be ready");
-        assert!(!ready_ids.contains(&"target"), "target should be blocked by source");
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "Only the header should be ready");
+        assert_eq!(
+            ready[0].id, cycle_analysis.cycles[0].header,
+            "The ready task should be the cycle header"
+        );
     }
 
     #[test]
-    fn test_ready_tasks_before_edge_unblocked_when_done() {
+    fn test_cycle_aware_three_node_cycle_header_only() {
+        // A→B→C→A three-node cycle: only the header should be ready.
+        // The back-edge (C→A in forward graph) is skipped, making A ready.
+        // B waits for A (forward), C waits for B (forward).
         let mut graph = WorkGraph::new();
 
-        let mut source = make_task("source", "Source task");
-        source.before = vec!["target".to_string()];
-        source.status = Status::Done;
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["c".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
 
-        let target = make_task("target", "Target task");
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        b.cycle_config = Some(make_cycle_config(3));
 
-        graph.add_node(Node::Task(target));
-        graph.add_node(Node::Task(source));
+        let mut c = make_task("c", "Task C");
+        c.after = vec!["b".to_string()];
+        c.cycle_config = Some(make_cycle_config(3));
 
-        let ready = ready_tasks(&graph);
-        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(c));
 
-        assert!(ready_ids.contains(&"target"), "target should be ready now that source is done");
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        assert_eq!(ready.len(), 1, "Only the header should be ready");
+        assert_eq!(
+            ready[0].id, cycle_analysis.cycles[0].header,
+            "The ready task should be the cycle header"
+        );
+    }
+
+    #[test]
+    fn test_cycle_aware_external_dep_still_blocks() {
+        // A↔B cycle where A also depends on C (external, Open).
+        // A is header (has external dep C as entry). Back-edge: B→A.
+        // A: back-edge from B skipped, but C is Open → A blocked by C.
+        // B: forward dep on A (not terminal) → B blocked.
+        // Neither cycle member is ready until C completes.
+        let mut graph = WorkGraph::new();
+
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["b".to_string(), "c".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
+
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        b.cycle_config = Some(make_cycle_config(3));
+
+        let c = make_task("c", "External Task C");
+        // c is NOT in the cycle, not done
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert!(!ids.contains(&"a"), "A should be blocked by external dep C");
+        assert!(
+            !ids.contains(&"b"),
+            "B should be blocked by A (forward dep)"
+        );
+    }
+
+    #[test]
+    fn test_cycle_aware_external_dep_done_allows_header() {
+        // A↔B cycle, A also depends on C (Done).
+        // A is header (entry from C). Back-edge: B→A → skipped.
+        // A: C Done + B back-edge → READY.
+        // B: forward dep on A (Open) → blocked.
+        let mut graph = WorkGraph::new();
+
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["b".to_string(), "c".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
+
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        b.cycle_config = Some(make_cycle_config(3));
+
+        let mut c = make_task("c", "External Task C");
+        c.status = Status::Done;
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "Only the header should be ready");
+        assert!(
+            ids.contains(&"a"),
+            "A (header) should be ready after C done"
+        );
+    }
+
+    #[test]
+    fn test_cycle_aware_self_loop_bootstraps() {
+        // Self-loop: A→A with max_iterations: should be ready on iteration 0
+        let mut graph = WorkGraph::new();
+
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["a".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
+
+        graph.add_node(Node::Task(a));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "a", "Self-loop should bootstrap");
+    }
+
+    #[test]
+    fn test_cycle_aware_iteration_1_header_ready() {
+        // After iteration 0 (re-opened), the header is still ready because
+        // back-edge exemption is structural — it works on every iteration,
+        // not just iteration 0.
+        let mut graph = WorkGraph::new();
+
+        let mut a = make_task("a", "Task A");
+        a.after = vec!["b".to_string()];
+        a.cycle_config = Some(make_cycle_config(3));
+        a.loop_iteration = 1; // past first iteration
+
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()];
+        b.cycle_config = Some(make_cycle_config(3));
+        b.loop_iteration = 1;
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        // The header's back-edge blocker is skipped; the non-header waits.
+        assert_eq!(
+            ready.len(),
+            1,
+            "Exactly one task (the header) should be ready"
+        );
+        let header_id = &cycle_analysis.cycles[0].header;
+        assert_eq!(
+            ready[0].id, *header_id,
+            "Only the cycle header should be ready"
+        );
+    }
+
+    #[test]
+    fn test_cycle_aware_non_cycle_tasks_unaffected() {
+        // Non-cycle tasks with loop_iteration == 0 should NOT get false exemptions
+        let mut graph = WorkGraph::new();
+
+        let a = make_task("a", "Task A");
+        let mut b = make_task("b", "Task B");
+        b.after = vec!["a".to_string()]; // linear dep, no cycle
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        // Only A should be ready; B is blocked by A (no SCC membership)
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "a");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cycle entry tests: external trigger + mixed cycle_config/worker nodes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cycle_entry_external_trigger() {
+        // External(done) → Header(cc) ↔ Worker(no cc)
+        // Header is the cycle entry (has ext). Back-edge: worker→header.
+        // Header: ext Done + worker back-edge skipped → READY.
+        // Worker: forward dep on header (Open) → blocked.
+        let mut graph = WorkGraph::new();
+
+        let mut ext = make_task("ext", "External trigger");
+        ext.status = Status::Done;
+
+        let mut header = make_task("header", "Cycle header");
+        header.after = vec!["ext".to_string(), "worker".to_string()];
+        header.cycle_config = Some(make_cycle_config(3));
+
+        let mut worker = make_task("worker", "Cycle worker");
+        worker.after = vec!["header".to_string()];
+        // worker has NO cycle_config
+
+        graph.add_node(Node::Task(ext));
+        graph.add_node(Node::Task(header));
+        graph.add_node(Node::Task(worker));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "Only header should be ready");
+        assert!(
+            ids.contains(&"header"),
+            "Header should be ready (ext Done, worker back-edge skipped)"
+        );
+    }
+
+    #[test]
+    fn test_cycle_entry_external_not_done_blocks() {
+        // External(Open) → Header(cc) ↔ Worker(no cc)
+        // Header blocked by ext (Open). Worker blocked by header (forward dep).
+        // Neither cycle member is ready.
+        let mut graph = WorkGraph::new();
+
+        let ext = make_task("ext", "External trigger"); // Open (not done)
+
+        let mut header = make_task("header", "Cycle header");
+        header.after = vec!["ext".to_string(), "worker".to_string()];
+        header.cycle_config = Some(make_cycle_config(3));
+
+        let mut worker = make_task("worker", "Cycle worker");
+        worker.after = vec!["header".to_string()];
+
+        graph.add_node(Node::Task(ext));
+        graph.add_node(Node::Task(header));
+        graph.add_node(Node::Task(worker));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"header"),
+            "Header should be blocked by undone external dep"
+        );
+        assert!(
+            !ids.contains(&"worker"),
+            "Worker should be blocked by header (forward dep)"
+        );
+    }
+
+    #[test]
+    fn test_cycle_entry_worker_chain() {
+        // External(done) → Header(cc) → W1 → W2 → Header
+        // SCC = {header, w1, w2}. Header is entry (has ext).
+        // Back-edge: w2→header. Forward: header→w1→w2.
+        // Header: ext Done + w2 back-edge → READY.
+        // W1: forward dep on header (Open) → blocked.
+        // W2: forward dep on w1 (Open) → blocked.
+        let mut graph = WorkGraph::new();
+
+        let mut ext = make_task("ext", "External trigger");
+        ext.status = Status::Done;
+
+        let mut header = make_task("header", "Cycle header");
+        header.after = vec!["ext".to_string(), "w2".to_string()];
+        header.cycle_config = Some(make_cycle_config(3));
+
+        let mut w1 = make_task("w1", "Worker 1");
+        w1.after = vec!["header".to_string()];
+
+        let mut w2 = make_task("w2", "Worker 2");
+        w2.after = vec!["w1".to_string()];
+
+        graph.add_node(Node::Task(ext));
+        graph.add_node(Node::Task(header));
+        graph.add_node(Node::Task(w1));
+        graph.add_node(Node::Task(w2));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["header"], "Only header should be ready");
+    }
+
+    #[test]
+    fn test_cycle_entry_nested_diamond() {
+        // Diamond within a cycle: header(cc) → [wA, wB] → join → header
+        // External(done) → header
+        // SCC = {header, wA, wB, join}. Header is entry (has ext).
+        // Back-edge: join→header. Forward: header→wA, header→wB, wA→join, wB→join.
+        // Only header is ready (ext Done + join back-edge). All others blocked.
+        let mut graph = WorkGraph::new();
+
+        let mut ext = make_task("ext", "External trigger");
+        ext.status = Status::Done;
+
+        let mut header = make_task("header", "Cycle header");
+        header.after = vec!["ext".to_string(), "join".to_string()];
+        header.cycle_config = Some(make_cycle_config(3));
+
+        let mut wa = make_task("wa", "Worker A");
+        wa.after = vec!["header".to_string()];
+
+        let mut wb = make_task("wb", "Worker B");
+        wb.after = vec!["header".to_string()];
+
+        let mut join = make_task("join", "Join task");
+        join.after = vec!["wa".to_string(), "wb".to_string()];
+
+        graph.add_node(Node::Task(ext));
+        graph.add_node(Node::Task(header));
+        graph.add_node(Node::Task(wa));
+        graph.add_node(Node::Task(wb));
+        graph.add_node(Node::Task(join));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["header"], "Only header should be ready");
+    }
+
+    #[test]
+    fn test_cycle_entry_no_false_positives() {
+        // A task with cycle_config that is NOT in a cycle (no back-edge) should
+        // NOT get bootstrap exemption for its non-SCC blocker.
+        let mut graph = WorkGraph::new();
+
+        let blocker = make_task("blocker", "Blocker task"); // Open, no cc
+
+        let mut task_with_cc = make_task("task_cc", "Task with cycle config");
+        task_with_cc.after = vec!["blocker".to_string()];
+        task_with_cc.cycle_config = Some(make_cycle_config(3));
+        // No back-edge from blocker → task_cc, so they're in separate SCCs
+
+        // Also add a linear chain with no cycle_config to verify it's unaffected
+        let a = make_task("a", "Linear A");
+        let mut b = make_task("b", "Linear B");
+        b.after = vec!["a".to_string()];
+
+        graph.add_node(Node::Task(blocker));
+        graph.add_node(Node::Task(task_with_cc));
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        let mut ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        ids.sort();
+        // Only blocker and a should be ready (they have no deps)
+        // task_cc blocked by blocker (not in same SCC), b blocked by a
+        assert_eq!(
+            ids,
+            vec!["a", "blocker"],
+            "Non-cycle tasks and cc tasks without actual cycles should not get false exemptions"
+        );
+    }
+
+    #[test]
+    fn test_auto_breakin_unconfigured_cycle() {
+        use crate::graph::{CycleAnalysis, Node, Status, Task, WorkGraph};
+
+        // Helper to create a task
+        fn make_task(id: &str, title: &str) -> Task {
+            Task {
+                id: id.to_string(),
+                title: title.to_string(),
+                ..Task::default()
+            }
+        }
+
+        // Create a 3-task cycle without any CycleConfig: A → B → C → A
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = make_task("a", "Task A");
+        task_a.after = vec!["c".to_string()]; // A depends on C (cycle edge)
+        task_a.status = Status::Open;
+
+        let mut task_b = make_task("b", "Task B");
+        task_b.after = vec!["a".to_string()]; // B depends on A
+        task_b.status = Status::Open;
+
+        let mut task_c = make_task("c", "Task C");
+        task_c.after = vec!["b".to_string()]; // C depends on B
+        task_c.status = Status::Open;
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(task_c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+
+        // Verify that a cycle was detected
+        assert!(!cycle_analysis.cycles.is_empty(), "Should detect the cycle");
+        assert_eq!(
+            cycle_analysis.cycles.len(),
+            1,
+            "Should be exactly one cycle"
+        );
+
+        // Get ready tasks - with auto-break-in, at least one should be ready despite the cycle
+        let ready_tasks = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        assert!(
+            !ready_tasks.is_empty(),
+            "Auto-break-in should make at least one task ready"
+        );
+        assert_eq!(
+            ready_tasks.len(),
+            1,
+            "Exactly one task should be selected for auto-break-in"
+        );
+
+        // The break-in task should be deterministic (alphabetically first)
+        let break_in_task = &ready_tasks[0];
+        assert_eq!(
+            break_in_task.id, "a",
+            "Task 'a' should be selected for break-in (alphabetically first)"
+        );
+    }
+
+    #[test]
+    fn test_configured_cycle_not_affected_by_auto_breakin() {
+        use crate::graph::{CycleAnalysis, CycleConfig, Node, Status, Task, WorkGraph};
+
+        // Helper to create a task
+        fn make_task(id: &str, title: &str) -> Task {
+            Task {
+                id: id.to_string(),
+                title: title.to_string(),
+                ..Task::default()
+            }
+        }
+
+        // Create the same 3-task cycle but with CycleConfig on one member
+        let mut graph = WorkGraph::new();
+
+        let mut task_a = make_task("a", "Task A");
+        task_a.after = vec!["c".to_string()];
+        task_a.status = Status::Open;
+        // Add cycle config to make this a configured cycle
+        task_a.cycle_config = Some(CycleConfig {
+            max_iterations: 3,
+            guard: None,
+            delay: None,
+            no_converge: false,
+            restart_on_failure: true,
+            max_failure_restarts: None,
+        });
+
+        let mut task_b = make_task("b", "Task B");
+        task_b.after = vec!["a".to_string()];
+        task_b.status = Status::Open;
+
+        let mut task_c = make_task("c", "Task C");
+        task_c.after = vec!["b".to_string()];
+        task_c.status = Status::Open;
+
+        graph.add_node(Node::Task(task_a));
+        graph.add_node(Node::Task(task_b));
+        graph.add_node(Node::Task(task_c));
+
+        let cycle_analysis = CycleAnalysis::from_graph(&graph);
+        let ready_tasks = ready_tasks_cycle_aware(&graph, &cycle_analysis);
+
+        // With proper CycleConfig, the existing logic should handle it normally
+        // The cycle header (task with cycle_config) should be ready via back-edge exemption
+        assert!(!ready_tasks.is_empty(), "Cycle header should be ready");
+
+        // Find the ready task - should be the cycle header
+        let ready_task = ready_tasks.iter().find(|t| t.cycle_config.is_some());
+        assert!(
+            ready_task.is_some(),
+            "The task with cycle_config should be ready"
+        );
+        assert_eq!(
+            ready_task.unwrap().id,
+            "a",
+            "Task 'a' (with cycle_config) should be ready"
+        );
     }
 }

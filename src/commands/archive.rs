@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
+use workgraph::parser::{load_graph, modify_graph};
 
 use super::graph_path;
 
@@ -13,6 +13,42 @@ use workgraph::parser::load_graph;
 
 fn archive_path(dir: &Path) -> std::path::PathBuf {
     dir.join("archive.jsonl")
+}
+
+fn last_batch_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("archive-last-batch.json")
+}
+
+/// Store batch metadata so we can undo the last archive operation
+fn save_batch_metadata(dir: &Path, task_ids: &[String]) -> Result<()> {
+    let metadata = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "task_ids": task_ids,
+    });
+    let path = last_batch_path(dir);
+    let content = serde_json::to_string_pretty(&metadata)?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write batch metadata to {:?}", path))?;
+    Ok(())
+}
+
+/// Load the last batch metadata for undo
+fn load_batch_metadata(dir: &Path) -> Result<Vec<String>> {
+    let path = last_batch_path(dir);
+    if !path.exists() {
+        anyhow::bail!("No archive batch to undo. No previous archive operation found.");
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read batch metadata from {:?}", path))?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&content).with_context(|| "Failed to parse batch metadata")?;
+    let task_ids = metadata["task_ids"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid batch metadata: missing task_ids"))?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    Ok(task_ids)
 }
 
 /// Parse a duration string like "30d", "7d", "1w" into a chrono Duration
@@ -45,24 +81,40 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     }
 }
 
-/// Check if a task should be archived based on the --older filter
+/// Check if a task should be archived based on the --older filter.
+/// Only Done and Abandoned tasks are archivable.
 fn should_archive(task: &Task, older_than: Option<&Duration>) -> bool {
-    if task.status != Status::Done {
+    if !matches!(task.status, Status::Done | Status::Abandoned) {
         return false;
     }
 
     if let Some(min_age) = older_than {
-        if let Some(completed_at) = &task.completed_at
-            && let Ok(completed) = DateTime::parse_from_rfc3339(completed_at)
+        // Use completed_at for Done tasks, or created_at as fallback for Abandoned
+        let timestamp = task.completed_at.as_deref().or(task.created_at.as_deref());
+        if let Some(ts) = timestamp
+            && let Ok(parsed) = DateTime::parse_from_rfc3339(ts)
         {
-            let age = Utc::now().signed_duration_since(completed);
+            let age = Utc::now().signed_duration_since(parsed);
             return age > *min_age;
         }
-        // If no completion timestamp or can't parse, don't archive with --older filter
+        // If no timestamp or can't parse, don't archive with --older filter
         return false;
     }
 
     true
+}
+
+/// Check if a task has active (non-terminal) downstream dependents.
+/// Tasks with active dependents should not be archived.
+pub fn has_active_dependents(task: &Task, graph: &workgraph::graph::WorkGraph) -> bool {
+    for dep_id in &task.before {
+        if let Some(dep) = graph.get_task(dep_id)
+            && !dep.status.is_terminal()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Append tasks to the archive file
@@ -217,17 +269,24 @@ pub fn restore(dir: &Path, task_id: &str, reopen: bool) -> Result<()> {
         restored_task.assigned = None;
     }
 
-    // Add back to graph
-    let _lock = lock_graph_file(&path).context("Failed to lock graph")?;
-    let mut graph = load_graph_locked(&path, &_lock).context("Failed to load graph")?;
-    if graph.get_task(&restored_task.id).is_some() {
-        anyhow::bail!(
-            "Task '{}' already exists in the active graph",
-            restored_task.id
-        );
+    // Add back to graph atomically
+    let restored_task_clone = restored_task.clone();
+    let mut error: Option<anyhow::Error> = None;
+    modify_graph(&path, |graph| {
+        if graph.get_task(&restored_task_clone.id).is_some() {
+            error = Some(anyhow::anyhow!(
+                "Task '{}' already exists in the active graph",
+                restored_task_clone.id
+            ));
+            return false;
+        }
+        graph.add_node(Node::Task(restored_task_clone.clone()));
+        true
+    })
+    .context("Failed to modify graph")?;
+    if let Some(e) = error {
+        return Err(e);
     }
-    graph.add_node(Node::Task(restored_task.clone()));
-    save_graph_locked(&graph, &path, &_lock).context("Failed to save graph")?;
 
     // Remove from archive
     remove_from_archive(&arch_path, task_id)?;
@@ -243,7 +302,85 @@ pub fn restore(dir: &Path, task_id: &str, reopen: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: bool) -> Result<()> {
+/// Undo the last archive operation by restoring all tasks from the last batch.
+pub fn undo(dir: &Path) -> Result<()> {
+    let path = graph_path(dir);
+    let arch_path = archive_path(dir);
+
+    if !path.exists() {
+        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+    }
+
+    let task_ids = load_batch_metadata(dir)?;
+    if task_ids.is_empty() {
+        anyhow::bail!("No tasks in the last archive batch to restore.");
+    }
+
+    let archived_tasks = load_archive(&arch_path)?;
+
+    let mut restored_count = 0;
+    let mut skipped = Vec::new();
+
+    // Pre-compute which tasks to restore (need archive removal outside closure)
+    let mut to_restore: Vec<(String, Task)> = Vec::new();
+    for task_id in &task_ids {
+        if let Some(task) = archived_tasks.iter().find(|t| &t.id == task_id) {
+            to_restore.push((task_id.clone(), task.clone()));
+        } else {
+            skipped.push(task_id.clone());
+        }
+    }
+
+    modify_graph(&path, |graph| {
+        let mut changed = false;
+        for (task_id, task) in &to_restore {
+            if graph.get_task(task_id).is_some() {
+                skipped.push(task_id.clone());
+                continue;
+            }
+            graph.add_node(Node::Task(task.clone()));
+            restored_count += 1;
+            changed = true;
+        }
+        changed
+    })
+    .context("Failed to modify graph")?;
+
+    // Remove restored tasks from archive
+    for (task_id, _) in &to_restore {
+        if !skipped.contains(task_id) {
+            remove_from_archive(&arch_path, task_id)?;
+        }
+    }
+    super::notify_graph_changed(dir);
+
+    // Remove the batch metadata file since undo is done
+    let batch_path = last_batch_path(dir);
+    if batch_path.exists() {
+        std::fs::remove_file(&batch_path).ok();
+    }
+
+    println!("Restored {} tasks from last archive batch.", restored_count);
+    if !skipped.is_empty() {
+        println!(
+            "Skipped {} tasks (not found in archive or already in graph): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+pub fn run(
+    dir: &Path,
+    dry_run: bool,
+    older: Option<&str>,
+    list: bool,
+    yes: bool,
+    ids: &[String],
+    json: bool,
+) -> Result<()> {
     let path = graph_path(dir);
     let arch_path = archive_path(dir);
 
@@ -289,11 +426,40 @@ pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: boo
     let graph = load_graph_locked(&path, &_lock).context("Failed to load graph")?;
 
     // Find tasks to archive
-    let tasks_to_archive: Vec<Task> = graph
-        .tasks()
-        .filter(|t| should_archive(t, older_duration.as_ref()))
-        .cloned()
-        .collect();
+    let tasks_to_archive: Vec<Task> = if !ids.is_empty() {
+        // Archive specific tasks by ID
+        let mut tasks = Vec::new();
+        for id in ids {
+            if let Some(task) = graph.get_task(id) {
+                if !matches!(task.status, Status::Done | Status::Abandoned) {
+                    anyhow::bail!(
+                        "Task '{}' has status '{}' — only done/abandoned tasks can be archived. \
+                         Use `wg done {}` first.",
+                        id,
+                        task.status,
+                        id
+                    );
+                }
+                if has_active_dependents(task, &graph) {
+                    anyhow::bail!(
+                        "Task '{}' has active downstream dependents — cannot archive.",
+                        id
+                    );
+                }
+                tasks.push(task.clone());
+            } else {
+                anyhow::bail!("Task '{}' not found in the graph.", id);
+            }
+        }
+        tasks
+    } else {
+        graph
+            .tasks()
+            .filter(|t| should_archive(t, older_duration.as_ref()))
+            .filter(|t| !has_active_dependents(t, &graph))
+            .cloned()
+            .collect()
+    };
 
     if tasks_to_archive.is_empty() {
         println!("No tasks to archive.");
@@ -309,18 +475,37 @@ pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: boo
         return Ok(());
     }
 
+    // For bulk operations (no explicit IDs), require --yes confirmation
+    let is_bulk = ids.is_empty();
+    if is_bulk && !yes {
+        println!("Would archive {} tasks:", tasks_to_archive.len());
+        for task in &tasks_to_archive {
+            let completed = task.completed_at.as_deref().unwrap_or("unknown");
+            println!("  {} - {} (completed: {})", task.id, task.title, completed);
+        }
+        println!();
+        anyhow::bail!(
+            "Use --yes to confirm, or specify task IDs explicitly: wg archive <id1> <id2> ..."
+        );
+    }
+
     // Perform the archive operation
     // 1. Append tasks to archive file
     append_to_archive(&tasks_to_archive, &arch_path)?;
 
-    // 2. Remove archived tasks from the main graph
-    let mut modified_graph = graph;
-    for task in &tasks_to_archive {
-        modified_graph.remove_node(&task.id);
-    }
+    // 2. Save batch metadata for undo
+    let archived_ids: Vec<String> = tasks_to_archive.iter().map(|t| t.id.clone()).collect();
+    save_batch_metadata(dir, &archived_ids)?;
 
-    // 3. Save the modified graph
-    save_graph_locked(&modified_graph, &path, &_lock).context("Failed to save graph")?;
+    // 3. Remove archived tasks from the main graph atomically
+    let archive_ids: Vec<String> = tasks_to_archive.iter().map(|t| t.id.clone()).collect();
+    modify_graph(&path, |graph| {
+        for id in &archive_ids {
+            graph.remove_node(id);
+        }
+        true
+    })
+    .context("Failed to modify graph")?;
     super::notify_graph_changed(dir);
 
     // Record operation
@@ -336,12 +521,74 @@ pub fn run(dir: &Path, dry_run: bool, older: Option<&str>, list: bool, json: boo
     );
 
     println!(
-        "Archived {} tasks to {:?}",
+        "Archived {} tasks. Use `wg archive --undo` to reverse.",
         tasks_to_archive.len(),
-        arch_path
     );
 
     Ok(())
+}
+
+/// Run automatic archival (called by the daemon's archive cycle).
+/// Archives done/abandoned tasks older than `retention_days` that have no active dependents.
+/// Returns the number of tasks archived.
+pub fn run_automatic(dir: &Path, retention_days: u64) -> Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+
+    let path = graph_path(dir);
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let older_duration = Duration::days(retention_days as i64);
+    let graph = load_graph(&path).context("Failed to load graph")?;
+    let arch_path = archive_path(dir);
+
+    // Find archivable tasks: done/abandoned, old enough, no active dependents, not system tasks
+    let tasks_to_archive: Vec<Task> = graph
+        .tasks()
+        .filter(|t| should_archive(t, Some(&older_duration)))
+        .filter(|t| !has_active_dependents(t, &graph))
+        .filter(|t| !t.id.starts_with('.')) // Skip system/internal tasks
+        .cloned()
+        .collect();
+
+    if tasks_to_archive.is_empty() {
+        return Ok(0);
+    }
+
+    // Append to archive
+    append_to_archive(&tasks_to_archive, &arch_path)?;
+
+    // Save batch metadata for undo
+    let archived_ids: Vec<String> = tasks_to_archive.iter().map(|t| t.id.clone()).collect();
+    save_batch_metadata(dir, &archived_ids)?;
+
+    // Remove from main graph atomically
+    let auto_archive_ids: Vec<String> = tasks_to_archive.iter().map(|t| t.id.clone()).collect();
+    modify_graph(&path, |graph| {
+        for id in &auto_archive_ids {
+            graph.remove_node(id);
+        }
+        true
+    })
+    .context("Failed to modify graph")?;
+    super::notify_graph_changed(dir);
+
+    // Record provenance
+    let config = workgraph::config::Config::load_or_default(dir);
+    let task_ids: Vec<&str> = tasks_to_archive.iter().map(|t| t.id.as_str()).collect();
+    let _ = workgraph::provenance::record(
+        dir,
+        "archive",
+        None,
+        None,
+        serde_json::json!({ "task_ids": task_ids, "automatic": true, "retention_days": retention_days }),
+        config.log.rotation_threshold,
+    );
+
+    Ok(tasks_to_archive.len())
 }
 
 #[cfg(test)]
@@ -349,7 +596,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use workgraph::graph::WorkGraph;
-    use workgraph::parser::{load_graph, save_graph};
+    use workgraph::parser::save_graph;
 
     fn make_task(id: &str, title: &str, status: Status, completed_at: Option<&str>) -> Task {
         Task {
@@ -454,7 +701,7 @@ mod tests {
         save_graph(&graph, &graph_file).unwrap();
 
         // Run in dry-run mode
-        run(wg_dir, true, None, false, false).unwrap();
+        run(wg_dir, true, None, false, false, &[], false).unwrap();
 
         // Verify graph is unchanged
         let loaded = load_graph(&graph_file).unwrap();
@@ -485,8 +732,8 @@ mod tests {
         graph.add_node(Node::Task(make_task("t2", "Open Task", Status::Open, None)));
         save_graph(&graph, &graph_file).unwrap();
 
-        // Run archive
-        run(wg_dir, false, None, false, false).unwrap();
+        // Run archive (with --yes to skip confirmation)
+        run(wg_dir, false, None, false, true, &[], false).unwrap();
 
         // Verify done task removed from graph
         let loaded = load_graph(&graph_file).unwrap();
@@ -525,7 +772,7 @@ mod tests {
         append_to_archive(&tasks, &arch_path).unwrap();
 
         // Run list - should not error
-        run(wg_dir, false, None, true, false).unwrap();
+        run(wg_dir, false, None, true, false, &[], false).unwrap();
     }
 
     #[test]
@@ -560,7 +807,7 @@ mod tests {
         append_to_archive(&tasks, &arch_path).unwrap();
 
         // Run list with json=true (output goes to stdout, just verify no error)
-        run(wg_dir, false, None, true, true).unwrap();
+        run(wg_dir, false, None, true, false, &[], true).unwrap();
     }
 
     fn make_task_with_tags(
@@ -980,5 +1227,388 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].id, "t1");
         assert_eq!(remaining[1].id, "t3");
+    }
+
+    #[test]
+    fn test_archive_specific_ids() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        // Create a graph with multiple done tasks
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(
+            "t1",
+            "Done Task 1",
+            Status::Done,
+            Some("2024-01-01T00:00:00Z"),
+        )));
+        graph.add_node(Node::Task(make_task(
+            "t2",
+            "Done Task 2",
+            Status::Done,
+            Some("2024-01-02T00:00:00Z"),
+        )));
+        graph.add_node(Node::Task(make_task(
+            "t3",
+            "Done Task 3",
+            Status::Done,
+            Some("2024-01-03T00:00:00Z"),
+        )));
+        graph.add_node(Node::Task(make_task("t4", "Open Task", Status::Open, None)));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // Archive only t1 and t3 by ID
+        let ids = vec!["t1".to_string(), "t3".to_string()];
+        run(wg_dir, false, None, false, false, &ids, false).unwrap();
+
+        // Verify only t1 and t3 were archived
+        let loaded = load_graph(&graph_file).unwrap();
+        assert!(loaded.get_task("t1").is_none());
+        assert!(loaded.get_task("t2").is_some());
+        assert!(loaded.get_task("t3").is_none());
+        assert!(loaded.get_task("t4").is_some());
+
+        let arch_path = wg_dir.join("archive.jsonl");
+        let archived = load_archive(&arch_path).unwrap();
+        assert_eq!(archived.len(), 2);
+        let archived_ids: Vec<&str> = archived.iter().map(|t| t.id.as_str()).collect();
+        assert!(archived_ids.contains(&"t1"));
+        assert!(archived_ids.contains(&"t3"));
+    }
+
+    #[test]
+    fn test_archive_specific_ids_rejects_non_done() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("t1", "Open Task", Status::Open, None)));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // Trying to archive a non-done task should fail
+        let ids = vec!["t1".to_string()];
+        let result = run(wg_dir, false, None, false, false, &ids, false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("only done/abandoned tasks")
+        );
+    }
+
+    #[test]
+    fn test_archive_specific_ids_rejects_missing() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+        save_graph(&WorkGraph::new(), &graph_file).unwrap();
+
+        let ids = vec!["nonexistent".to_string()];
+        let result = run(wg_dir, false, None, false, false, &ids, false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_archive_yes_flag() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(
+            "t1",
+            "Done Task",
+            Status::Done,
+            Some("2024-01-01T00:00:00Z"),
+        )));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // With --yes, bulk archive proceeds without error
+        run(wg_dir, false, None, false, true, &[], false).unwrap();
+
+        let loaded = load_graph(&graph_file).unwrap();
+        assert!(loaded.get_task("t1").is_none());
+    }
+
+    #[test]
+    fn test_archive_undo() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        // Create graph with two done tasks
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(
+            "t1",
+            "Done Task 1",
+            Status::Done,
+            Some("2024-01-01T00:00:00Z"),
+        )));
+        graph.add_node(Node::Task(make_task(
+            "t2",
+            "Done Task 2",
+            Status::Done,
+            Some("2024-01-02T00:00:00Z"),
+        )));
+        graph.add_node(Node::Task(make_task("t3", "Open Task", Status::Open, None)));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // Archive with --yes
+        run(wg_dir, false, None, false, true, &[], false).unwrap();
+
+        // Verify tasks are archived
+        let loaded = load_graph(&graph_file).unwrap();
+        assert!(loaded.get_task("t1").is_none());
+        assert!(loaded.get_task("t2").is_none());
+        assert!(loaded.get_task("t3").is_some());
+
+        // Undo the archive
+        undo(wg_dir).unwrap();
+
+        // Verify tasks are restored
+        let loaded = load_graph(&graph_file).unwrap();
+        assert!(loaded.get_task("t1").is_some());
+        assert!(loaded.get_task("t2").is_some());
+        assert!(loaded.get_task("t3").is_some());
+
+        // Verify archive is now empty for those tasks
+        let arch_path = wg_dir.join("archive.jsonl");
+        let archived = load_archive(&arch_path).unwrap();
+        assert!(archived.is_empty());
+
+        // Verify batch metadata file is removed
+        let batch_path = wg_dir.join("archive-last-batch.json");
+        assert!(!batch_path.exists());
+    }
+
+    #[test]
+    fn test_archive_undo_no_batch() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+        save_graph(&WorkGraph::new(), &graph_file).unwrap();
+
+        // Undo without a previous archive should fail
+        let result = undo(wg_dir);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No archive batch to undo")
+        );
+    }
+
+    #[test]
+    fn test_archive_batch_metadata_roundtrip() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+
+        let ids = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()];
+        save_batch_metadata(wg_dir, &ids).unwrap();
+
+        let loaded = load_batch_metadata(wg_dir).unwrap();
+        assert_eq!(loaded, ids);
+    }
+
+    #[test]
+    fn test_should_archive_abandoned_task() {
+        let task = make_task("t1", "Test", Status::Abandoned, None);
+        assert!(should_archive(&task, None));
+    }
+
+    #[test]
+    fn test_should_archive_abandoned_with_older() {
+        // Abandoned task with created_at 40 days ago
+        let mut task = make_task("t1", "Test", Status::Abandoned, None);
+        task.created_at = Some((Utc::now() - Duration::days(40)).to_rfc3339());
+        let min_age = Duration::days(30);
+        assert!(should_archive(&task, Some(&min_age)));
+    }
+
+    #[test]
+    fn test_should_not_archive_recent_abandoned() {
+        let mut task = make_task("t1", "Test", Status::Abandoned, None);
+        task.created_at = Some((Utc::now() - Duration::days(5)).to_rfc3339());
+        let min_age = Duration::days(30);
+        assert!(!should_archive(&task, Some(&min_age)));
+    }
+
+    #[test]
+    fn test_has_active_dependents_blocks_archive() {
+        let mut graph = WorkGraph::new();
+
+        // t1 is done, t2 (depends on t1 via t1.before) is still open
+        let mut t1 = make_task(
+            "t1",
+            "Done Task",
+            Status::Done,
+            Some("2024-01-01T00:00:00Z"),
+        );
+        t1.before = vec!["t2".to_string()];
+        let t2 = make_task("t2", "Open Task", Status::Open, None);
+
+        graph.add_node(Node::Task(t1.clone()));
+        graph.add_node(Node::Task(t2));
+
+        assert!(has_active_dependents(&t1, &graph));
+    }
+
+    #[test]
+    fn test_no_active_dependents_allows_archive() {
+        let mut graph = WorkGraph::new();
+
+        // t1 is done, t2 (depends on t1) is also done
+        let mut t1 = make_task(
+            "t1",
+            "Done Task",
+            Status::Done,
+            Some("2024-01-01T00:00:00Z"),
+        );
+        t1.before = vec!["t2".to_string()];
+        let t2 = make_task(
+            "t2",
+            "Also Done",
+            Status::Done,
+            Some("2024-01-02T00:00:00Z"),
+        );
+
+        graph.add_node(Node::Task(t1.clone()));
+        graph.add_node(Node::Task(t2));
+
+        assert!(!has_active_dependents(&t1, &graph));
+    }
+
+    #[test]
+    fn test_run_automatic() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        // Create a graph with old done task and recent open task
+        let mut graph = WorkGraph::new();
+        let mut done_task = make_task(
+            "t1",
+            "Old Done Task",
+            Status::Done,
+            Some(&(Utc::now() - Duration::days(40)).to_rfc3339()),
+        );
+        done_task.created_at = Some((Utc::now() - Duration::days(40)).to_rfc3339());
+        graph.add_node(Node::Task(done_task));
+        graph.add_node(Node::Task(make_task("t2", "Open Task", Status::Open, None)));
+
+        // Recent done task (should NOT be archived with 30d retention)
+        let mut recent_done = make_task(
+            "t3",
+            "Recent Done",
+            Status::Done,
+            Some(&(Utc::now() - Duration::days(5)).to_rfc3339()),
+        );
+        recent_done.created_at = Some((Utc::now() - Duration::days(5)).to_rfc3339());
+        graph.add_node(Node::Task(recent_done));
+
+        save_graph(&graph, &graph_file).unwrap();
+
+        // Run automatic with 30 day retention
+        let count = run_automatic(wg_dir, 30).unwrap();
+        assert_eq!(count, 1);
+
+        // Verify old done task is archived, recent ones remain
+        let loaded = load_graph(&graph_file).unwrap();
+        assert!(loaded.get_task("t1").is_none()); // archived
+        assert!(loaded.get_task("t2").is_some()); // open, not archived
+        assert!(loaded.get_task("t3").is_some()); // recent done, not archived
+
+        // Verify archived task is in archive file
+        let arch_path = wg_dir.join("archive.jsonl");
+        let archived = load_archive(&arch_path).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "t1");
+    }
+
+    #[test]
+    fn test_run_automatic_skips_system_tasks() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut sys_task = make_task(
+            ".compact-0",
+            "System Task",
+            Status::Done,
+            Some(&(Utc::now() - Duration::days(40)).to_rfc3339()),
+        );
+        sys_task.created_at = Some((Utc::now() - Duration::days(40)).to_rfc3339());
+        graph.add_node(Node::Task(sys_task));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // System tasks should not be auto-archived
+        let count = run_automatic(wg_dir, 7).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_run_automatic_disabled_with_zero_retention() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task(
+            "t1",
+            "Done Task",
+            Status::Done,
+            Some(&(Utc::now() - Duration::days(40)).to_rfc3339()),
+        )));
+        save_graph(&graph, &graph_file).unwrap();
+
+        // retention_days=0 disables archival
+        let count = run_automatic(wg_dir, 0).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_run_automatic_skips_tasks_with_active_dependents() {
+        let dir = tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::create_dir_all(wg_dir).unwrap();
+        let graph_file = wg_dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut done_task = make_task(
+            "t1",
+            "Done With Deps",
+            Status::Done,
+            Some(&(Utc::now() - Duration::days(40)).to_rfc3339()),
+        );
+        done_task.created_at = Some((Utc::now() - Duration::days(40)).to_rfc3339());
+        done_task.before = vec!["t2".to_string()];
+        graph.add_node(Node::Task(done_task));
+
+        // t2 is still in progress — t1 should not be archived
+        graph.add_node(Node::Task(make_task(
+            "t2",
+            "In Progress Task",
+            Status::InProgress,
+            None,
+        )));
+        save_graph(&graph, &graph_file).unwrap();
+
+        let count = run_automatic(wg_dir, 7).unwrap();
+        assert_eq!(count, 0);
     }
 }

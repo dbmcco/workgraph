@@ -177,7 +177,10 @@ fn print_task(task: &workgraph::graph::Task, with_artifacts: bool) {
 
     if let Some(last_log) = task.log.last() {
         let msg = if last_log.message.len() > 100 {
-            format!("{}...", &last_log.message[..97])
+            format!(
+                "{}...",
+                &last_log.message[..last_log.message.floor_char_boundary(97)]
+            )
         } else {
             last_log.message.clone()
         };
@@ -276,6 +279,7 @@ mod tests {
         task.log = vec![LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: None,
+            user: Some(workgraph::current_user()),
             message: "Done!".to_string(),
         }];
         setup_graph(dir, vec![task]);

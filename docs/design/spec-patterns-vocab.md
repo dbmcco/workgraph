@@ -141,6 +141,109 @@ wg add "Write" --id write --after revise --max-iterations 5 \
 
 ---
 
+### 1.5 Chat Room (Deliberation)
+
+**What:** A shared discussion space where multiple agents contribute perspectives via messages, producing a synthesis or decision. Unlike scatter-gather (where workers produce independent artifacts), chat room agents interact through a shared message stream on a single task.
+
+**Shape:**
+```
+         ┌── perspective-1 ──┐
+prep ────┼── perspective-2 ──┼──→ discussion ──→ synthesize
+         ├── perspective-3 ──┤       ▲
+         ├── perspective-4 ──┤       │ (agents send messages
+         └── perspective-5 ──┘         to this task)
+```
+
+**When to use:**
+- Design decisions requiring multiple viewpoints ("Should we use X or Y?")
+- Multi-perspective analysis where positions should respond to each other
+- Strategy or prioritization discussions
+- Any question where the answer improves with deliberation, not just aggregation
+
+**How it differs from scatter-gather:**
+| | Scatter-Gather | Chat Room |
+|---|---|---|
+| **Communication** | Each worker writes an independent artifact | Agents send messages to a shared task |
+| **Interaction** | Workers don't see each other's output | Agents read and respond to prior messages |
+| **Output** | Collection of independent assessments | Threaded discussion that builds toward consensus |
+| **Best for** | Independent reviews (security, perf, UX) | Interactive deliberation on open questions |
+
+**Setup — three phases:**
+
+**Phase 1: Preparation** — research tasks gather context in parallel:
+```bash
+# Each perspective agent does research first
+wg add "Research: TUI defaults in similar tools" --id prep-ux \
+  -d "Survey 5+ CLI/TUI tools for their default visibility settings. Produce findings doc."
+wg add "Research: system task volume and noise" --id prep-noise \
+  -d "Analyze how many system tasks exist in a typical graph and their signal-to-noise ratio."
+wg add "Research: user onboarding friction" --id prep-onboard \
+  -d "Identify how system task visibility affects new user experience."
+```
+
+**Phase 2: Discussion** — a single task serves as the chat room:
+```bash
+# The discussion task depends on all preparation
+wg add "Discussion: Should TUI default to showing system tasks?" \
+  --id discuss-tui-defaults \
+  --after prep-ux,prep-noise,prep-onboard \
+  -d "## Chat Room Discussion
+
+Each participant: read the preparation artifacts (wg context), then post your
+position via wg msg. Read others' messages and respond to strengthen, challenge,
+or synthesize.
+
+Participants post via:
+  wg msg send discuss-tui-defaults 'My position: ... because ...'
+
+After all perspectives are posted, the assigned agent writes a summary of
+positions and emerging consensus as a log entry, then marks done.
+
+## Question
+Should the TUI default to showing system tasks (like .place-*, .assign-*,
+.evaluate-*), or hide them behind a toggle?
+
+## Ground Rules
+- Reference specific findings from preparation tasks
+- Engage with other positions, don't just state your own
+- Flag any critical constraints or non-negotiables"
+```
+
+**Phase 3: Synthesis** — extract actionable output:
+```bash
+wg add "Synthesize: TUI default visibility decision" \
+  --id synth-tui-defaults \
+  --after discuss-tui-defaults \
+  -d "Read the discussion messages (wg msg list discuss-tui-defaults).
+Produce:
+1. A decision with rationale
+2. Dissenting views and why they were not adopted
+3. Implementation tasks if needed"
+```
+
+**Key properties:**
+- **5-8 participants** is the sweet spot. Fewer loses diversity; more creates noise.
+- **Preparation is mandatory.** Agents that enter without research produce shallow positions. Each prep task should reference specific data or artifacts.
+- **Messages are the medium.** Unlike stigmergic coordination (where the graph mediates), chat room agents communicate directly via `wg msg send` and `wg msg read`.
+- **The synthesis task is not optional.** Without it, the discussion is interesting but not actionable.
+
+**CLI quick reference for participants:**
+```bash
+# Read what others have said
+wg msg list discuss-tui-defaults
+
+# Post your position
+wg msg send discuss-tui-defaults "Position: hide by default. Rationale: ..."
+
+# Respond to another's point
+wg msg send discuss-tui-defaults "Re @agent-42's point about discoverability: ..."
+
+# Read preparation artifacts
+wg context discuss-tui-defaults
+```
+
+---
+
 ## 2. Agency Patterns
 
 Agency patterns describe how to staff work — which roles to define and how to assign them.
@@ -162,11 +265,11 @@ wg role add "Architect" --outcome "Clear decomposition with non-overlapping boun
 wg role add "Implementer" --outcome "Working, tested code for assigned module" --skill coding --skill testing
 wg role add "Integrator" --outcome "Cohesive merged output with conflicts resolved" --skill integration
 
-wg motivation add "Thorough" --accept "Slower delivery" --reject "Skipping edge cases"
+wg tradeoff add "Thorough" --accept "Slower delivery" --reject "Skipping edge cases"
 
-wg agent create "Planner" --role <architect-hash> --motivation <thorough-hash>
-wg agent create "Worker" --role <implementer-hash> --motivation <thorough-hash>
-wg agent create "Synthesizer" --role <integrator-hash> --motivation <thorough-hash>
+wg agent create "Planner" --role <architect-hash> --tradeoff <thorough-hash>
+wg agent create "Worker" --role <implementer-hash> --tradeoff <thorough-hash>
+wg agent create "Synthesizer" --role <integrator-hash> --tradeoff <thorough-hash>
 
 wg assign planner <planner-agent-hash>
 wg assign worker-a <worker-agent-hash>
@@ -371,6 +474,7 @@ Quick vocabulary for conversations, task descriptions, and documentation.
 | **loop** | Iterate until convergence via structural cycle | §1.4 |
 | **map-reduce** | Data-parallel diamond: planner decomposes → N workers → reducer aggregates | §1.2 variant |
 | **scaffold** | Platform role produces infrastructure that stream-aligned roles depend on | §2.4 |
+| **chatroom** | Deliberation: prep → parallel perspectives → discussion via messages → synthesis | §1.5 |
 | **evolve** | Evaluate → mutate roles → better agents | §3.3 |
 
 ### The Key Phrase
@@ -415,6 +519,7 @@ Real workflows combine patterns. The table below shows common compositions.
 | **Diamond with pipeline workers** | Fork to workers, each worker is a mini-pipeline | Plan → [design-A → impl-A, design-B → impl-B] → integrate |
 | **Loop around a diamond** | Iterate a fork-join until convergence | [write-spec, write-impl, write-tests] → review → (back to specs if review fails) |
 | **Scaffold then stream** | Platform role first, then stream-aligned parallel work | setup-ci → [feature-A, feature-B, feature-C] |
+| **Chat room with research** | Preparation diamond feeds into message-based deliberation | [prep-A, prep-B, prep-C] → discussion → synthesis |
 
 ---
 
@@ -447,6 +552,7 @@ wg show <task-id>              # check deliverables for overlap
 | Multiple perspectives on same artifact | **scatter-gather** | Like diamond, but heterogeneous workers |
 | Data-parallel analysis | **map-reduce** | Planner → N workers → reducer |
 | Iterative refinement | **loop** | Cycle: A → B → C → A (with `--max-iterations`) |
+| Deliberation / multi-perspective decision | **chatroom** | Prep → discussion (via messages) → synthesis |
 | One thinker, many doers | **planner-workers-synthesizer** | Diamond staffing pattern |
 | Deep domain expertise needed | **specialist** | Role per domain |
 | End-to-end feature ownership | **stream-aligned** | Role per feature |
@@ -468,6 +574,8 @@ wg show <task-id>              # check deliverables for overlap
 | **Never evolve** | Roles ossify while task landscape changes → performance plateau | Run `wg evolve` after accumulating evaluations |
 | **Unbounded loop** | Cycle without `--max-iterations` → infinite iteration | Always set `--max-iterations` on cycle headers |
 | **Skip evaluation** | No monitoring → quality drift → no evolution signal | Enable `--auto-evaluate` |
+| **Unprepared chatroom** | Agents enter discussion without research → shallow positions | Always include preparation tasks before the discussion task |
+| **Chatroom without synthesis** | Rich discussion but no actionable output | Always add a synthesis task `--after` the discussion |
 
 ---
 
@@ -477,6 +585,7 @@ wg show <task-id>              # check deliverables for overlap
 |------|-----------|
 | **after** | Edge expressing temporal ordering. "A is after B" means B runs before A. Stored field on tasks. |
 | **before** | Computed inverse of `after`. "A is before B" means A runs before B. |
+| **chatroom** | A deliberation pattern: preparation tasks feed into a discussion task where agents interact via messages, followed by a synthesis task. |
 | **cycle** | A set of tasks whose `after` edges form a loop, detected by Tarjan's SCC algorithm. |
 | **cycle header** | The task in a cycle that carries `CycleConfig` (max_iterations, guard, delay). |
 | **convergence** | A cycle stops iterating because an agent signals `--converged` on `wg done`. |

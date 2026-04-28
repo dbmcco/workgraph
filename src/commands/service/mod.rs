@@ -12,7 +12,7 @@
 //! The daemon respects coordinator config from .workgraph/config.toml:
 //!   [coordinator]
 //!   max_agents = 4       # Maximum parallel agents
-//!   poll_interval = 60   # Background safety-net poll interval (seconds)
+//!   poll_interval = 5    # Background safety-net poll interval (seconds)
 //!   interval = 30        # Coordinator tick interval (standalone command)
 //!   executor = "claude"  # Executor for spawned agents
 
@@ -21,14 +21,17 @@ mod coordinator;
 pub(crate) mod coordinator_agent;
 pub mod ipc;
 mod triage;
-mod worktree;
+pub(crate) mod worktree;
+pub(crate) mod zero_output;
 
 pub use ipc::{IpcRequest, IpcResponse};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::IsTerminal;
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
@@ -46,6 +49,69 @@ use workgraph::service::registry::AgentRegistry;
 
 use super::{graph_path, is_process_alive, kill_process_force, kill_process_graceful};
 
+fn resolve_service_coordinator_settings(
+    dir: &Path,
+    config: &Config,
+    cli_executor: Option<&str>,
+    cli_model: Option<&str>,
+    no_coordinator_agent: bool,
+) -> Result<(String, Option<String>)> {
+    let effective_executor = cli_executor
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| config.coordinator.effective_executor());
+    let explicit_model = cli_model
+        .map(std::string::ToString::to_string)
+        .or_else(|| config.coordinator.model.clone());
+
+    if no_coordinator_agent || !config.coordinator.coordinator_agent {
+        return Ok((effective_executor, explicit_model));
+    }
+
+    // Preflight native provider for coordinator agent when using native executor
+    if effective_executor == "native" {
+        let resolved = if let Some(raw_model) = explicit_model.clone() {
+            let spec = workgraph::config::parse_model_spec(&raw_model);
+            let provider = spec
+                .provider
+                .as_deref()
+                .map(workgraph::config::provider_to_native_provider)
+                .map(String::from)
+                .or_else(|| config.coordinator.provider.clone());
+            let endpoint = config
+                .registry_lookup(&spec.model_id)
+                .and_then(|entry| entry.endpoint.clone());
+            (spec.model_id, provider, endpoint)
+        } else {
+            let resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Default);
+            let provider = resolved
+                .provider
+                .or_else(|| config.coordinator.provider.clone());
+            let endpoint = resolved.endpoint.or_else(|| {
+                resolved
+                    .registry_entry
+                    .and_then(|entry| entry.endpoint.clone())
+            });
+            (resolved.model, provider, endpoint)
+        };
+
+        workgraph::executor::native::provider::create_provider_ext(
+            dir,
+            &resolved.0,
+            resolved.1.as_deref(),
+            resolved.2.as_deref(),
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "Coordinator native provider preflight failed for model '{}'",
+                resolved.0
+            )
+        })?;
+    }
+
+    Ok((effective_executor, explicit_model))
+}
+
 // ---------------------------------------------------------------------------
 // Persistent daemon logger
 // ---------------------------------------------------------------------------
@@ -56,6 +122,75 @@ const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Path to the daemon log file
 pub fn log_file_path(dir: &Path) -> PathBuf {
     dir.join("service").join("daemon.log")
+}
+
+/// Create a self-pipe with both ends set to non-blocking and CLOEXEC.
+///
+/// Used by the daemon's main loop to wake `poll()` from a background thread
+/// (specifically: the graph filesystem watcher writes a byte when a debounced
+/// change arrives). Returns `(read_fd, write_fd)`.
+///
+/// Both ends are leaked into raw fds; the daemon owns them for the life of the
+/// process and never closes them explicitly (the kernel reaps them on exit).
+/// Non-blocking write means the watcher callback never stalls if the read end
+/// hasn't drained the previous wake.
+#[cfg(unix)]
+fn make_self_pipe() -> std::io::Result<(std::os::raw::c_int, std::os::raw::c_int)> {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let r = fds[0];
+    let w = fds[1];
+    for fd in [r, w] {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Best-effort CLOEXEC so child agents don't inherit it.
+            let cflags = libc::fcntl(fd, libc::F_GETFD);
+            if cflags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, cflags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    Ok((r, w))
+}
+
+/// Drain all bytes currently buffered on a non-blocking pipe read fd.
+///
+/// Returns the number of bytes drained. Used to clear graph-watcher wake
+/// signals after the daemon has handled them.
+#[cfg(unix)]
+fn drain_pipe(fd: std::os::raw::c_int) -> usize {
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 256];
+    let mut total = 0usize;
+    loop {
+        let n = unsafe {
+            libc::read(
+                fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len() as libc::size_t,
+            )
+        };
+        if n <= 0 {
+            // 0 = EOF (pipe closed, write end gone); negative = error or EAGAIN.
+            break;
+        }
+        total += n as usize;
+        if (n as usize) < buf.len() {
+            break;
+        }
+    }
+    total
 }
 
 /// A simple file-based logger with timestamps and size-based rotation.
@@ -186,6 +321,61 @@ pub fn tail_log(dir: &Path, n: usize, level_filter: Option<&str>) -> Vec<String>
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Binary hash for self-restart detection
+// ---------------------------------------------------------------------------
+
+/// Compute SHA-256 of the file at `path`.
+///
+/// Uses streaming reads to avoid loading the entire binary into memory at once.
+/// Returns the 32-byte digest on success.
+fn compute_exe_hash(path: &Path) -> std::io::Result<[u8; 32]> {
+    compute_exe_hash_inner(path, false)
+}
+
+/// Low-priority variant that throttles I/O so the background hash thread
+/// stays below ~5 % of a CPU core.  Used for the initial baseline hash.
+fn compute_exe_hash_background(path: &Path) -> std::io::Result<[u8; 32]> {
+    compute_exe_hash_inner(path, true)
+}
+
+/// Compute SHA-256 of the file at `path`.
+///
+/// When `throttle` is true, the computation sleeps between chunks to avoid
+/// pegging a CPU core (important for large debug binaries — the unoptimised
+/// debug build can be 250 MB+).
+fn compute_exe_hash_inner(path: &Path, throttle: bool) -> std::io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut bytes_since_yield: usize = 0;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        if throttle {
+            bytes_since_yield += n;
+            // Sleep 200 ms every 256 KB of data hashed.  In debug mode each
+            // 256 KB chunk takes ~7 ms of CPU, so the duty cycle is roughly
+            // 7 / (7 + 200) ≈ 3.4 %.  For a 257 MB debug binary the total
+            // wall-clock time is ~218 s — acceptable for a one-time
+            // background baseline that runs after a 5 s startup delay.
+            if bytes_since_yield >= 256 * 1024 {
+                bytes_since_yield = 0;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Format first 12 hex chars of a 32-byte hash for log messages.
+fn short_hash(hash: &[u8; 32]) -> String {
+    hex::encode(&hash[..6])
+}
+
 /// Default socket path (project-specific, inside .workgraph dir)
 pub fn default_socket_path(dir: &Path) -> PathBuf {
     dir.join("service").join("daemon.sock")
@@ -242,9 +432,61 @@ impl ServiceState {
     }
 }
 
-/// Path to the coordinator state file
-pub fn coordinator_state_path(dir: &Path) -> PathBuf {
+/// Path to the legacy (shared) coordinator state file.
+/// Used only for backward-compatible fallback reads when no per-ID file exists.
+pub fn coordinator_state_path_legacy(dir: &Path) -> PathBuf {
     dir.join("service").join("coordinator-state.json")
+}
+
+/// Path to a per-coordinator state file: `coordinator-state-{id}.json`.
+pub fn coordinator_state_path(dir: &Path, coordinator_id: u32) -> PathBuf {
+    dir.join("service")
+        .join(format!("coordinator-state-{}.json", coordinator_id))
+}
+
+/// Session cost tracking for OpenRouter cost caps
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCostTracking {
+    /// Total cost for this coordinator session (USD)
+    pub session_cost_usd: f64,
+    /// Session start time
+    pub session_start: chrono::DateTime<chrono::Utc>,
+    /// Last OpenRouter key status check
+    pub last_key_check: Option<chrono::DateTime<chrono::Utc>>,
+    /// Cached key status from last check
+    pub key_status: Option<workgraph::executor::native::openai_client::OpenRouterKeyStatus>,
+}
+
+impl Default for SessionCostTracking {
+    fn default() -> Self {
+        Self {
+            session_cost_usd: 0.0,
+            session_start: chrono::Utc::now(),
+            last_key_check: None,
+            key_status: None,
+        }
+    }
+}
+
+impl SessionCostTracking {
+    /// Check if key status should be refreshed based on interval
+    pub fn should_check_key_status(&self, interval_minutes: u32) -> bool {
+        if let Some(last_check) = self.last_key_check {
+            let elapsed = chrono::Utc::now() - last_check;
+            elapsed > chrono::Duration::minutes(interval_minutes as i64)
+        } else {
+            true // Never checked before
+        }
+    }
+
+    /// Update the cached key status
+    pub fn update_key_status(
+        &mut self,
+        status: workgraph::executor::native::openai_client::OpenRouterKeyStatus,
+    ) {
+        self.last_key_check = Some(chrono::Utc::now());
+        self.key_status = Some(status);
+    }
 }
 
 /// Runtime coordinator state persisted to disk for status queries
@@ -280,30 +522,87 @@ pub struct CoordinatorState {
     /// Whether the coordinator is paused (no new agent spawns)
     #[serde(default)]
     pub paused: bool,
+    /// Whether agents are frozen (SIGSTOP sent to all agent processes)
+    #[serde(default)]
+    pub frozen: bool,
+    /// PIDs that were frozen (for thaw to target the right processes)
+    #[serde(default)]
+    pub frozen_pids: Vec<u32>,
+    /// Accumulated coordinator conversation tokens since last compaction.
+    /// Incremented by the coordinator agent thread after each LLM turn.
+    /// Resets to 0 after successful compaction.
+    #[serde(default)]
+    pub accumulated_tokens: u64,
+    /// Session cost tracking for OpenRouter cost caps
+    #[serde(default)]
+    pub cost_tracking: SessionCostTracking,
+    /// Per-coordinator model override. When set, the coordinator agent uses this
+    /// model instead of the daemon-wide default. Persists across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Per-coordinator executor override. When set, the coordinator agent uses this
+    /// executor instead of the daemon-wide default. Persists across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_override: Option<String>,
 }
 
 impl CoordinatorState {
-    pub fn load(dir: &Path) -> Option<Self> {
-        let path = coordinator_state_path(dir);
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return None, // file doesn't exist yet
-        };
-        match serde_json::from_str(&content) {
-            Ok(state) => Some(state),
-            Err(e) => {
-                eprintln!(
-                    "Warning: corrupt coordinator state at {}: {}",
-                    path.display(),
-                    e
-                );
-                None
+    /// Load coordinator state for a specific coordinator ID.
+    /// Checks the per-ID file first, then falls back to the legacy shared file
+    /// for coordinator 0.
+    pub fn load_for(dir: &Path, coordinator_id: u32) -> Option<Self> {
+        let path = coordinator_state_path(dir, coordinator_id);
+        if let Ok(content) = fs::read_to_string(&path) {
+            return match serde_json::from_str(&content) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: corrupt coordinator state at {}: {}",
+                        path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+        }
+        // Backward compat: fall back to legacy shared file for coordinator 0
+        if coordinator_id == 0 {
+            let legacy = coordinator_state_path_legacy(dir);
+            if let Ok(content) = fs::read_to_string(&legacy) {
+                return match serde_json::from_str(&content) {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: corrupt coordinator state at {}: {}",
+                            legacy.display(),
+                            e
+                        );
+                        None
+                    }
+                };
             }
         }
+        None
     }
 
-    pub fn save(&self, dir: &Path) {
-        let path = coordinator_state_path(dir);
+    /// Load coordinator 0 state (backward-compatible shorthand).
+    pub fn load(dir: &Path) -> Option<Self> {
+        Self::load_for(dir, 0)
+    }
+
+    /// Save coordinator state to the per-ID file.
+    pub fn save_for(&self, dir: &Path, coordinator_id: u32) {
+        let path = coordinator_state_path(dir, coordinator_id);
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Warning: failed to create coordinator state dir {}: {}",
+                parent.display(),
+                e
+            );
+            return;
+        }
         match serde_json::to_string_pretty(self) {
             Ok(content) => {
                 if let Err(e) = fs::write(&path, content) {
@@ -320,15 +619,145 @@ impl CoordinatorState {
         }
     }
 
-    /// Load coordinator state, defaulting to empty if missing or corrupt.
+    /// Save coordinator 0 state (backward-compatible shorthand).
+    pub fn save(&self, dir: &Path) {
+        self.save_for(dir, 0);
+    }
+
+    /// Load coordinator state for a specific ID, defaulting to empty if missing or corrupt.
+    pub fn load_or_default_for(dir: &Path, coordinator_id: u32) -> Self {
+        Self::load_for(dir, coordinator_id).unwrap_or_default()
+    }
+
+    /// Load coordinator 0 state, defaulting to empty if missing or corrupt.
     /// Corrupt files already emit a warning via `load()`.
     pub fn load_or_default(dir: &Path) -> Self {
         Self::load(dir).unwrap_or_default()
     }
 
-    pub fn remove(dir: &Path) {
-        let path = coordinator_state_path(dir);
+    /// Load all coordinator states from per-ID files in the service directory.
+    /// Falls back to the legacy shared file when no per-ID files are found.
+    /// Returns a sorted vec of (coordinator_id, state) pairs.
+    pub fn load_all(dir: &Path) -> Vec<(u32, Self)> {
+        let service_dir = dir.join("service");
+        let mut results = Vec::new();
+        if let Ok(entries) = fs::read_dir(&service_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if let Some(id_str) = name_str
+                    .strip_prefix("coordinator-state-")
+                    .and_then(|s| s.strip_suffix(".json"))
+                    && let Ok(id) = id_str.parse::<u32>()
+                    && let Some(state) = Self::load_for(dir, id)
+                {
+                    results.push((id, state));
+                }
+            }
+        }
+        // Fall back to legacy file if no per-ID files found
+        if results.is_empty()
+            && let Some(state) = Self::load(dir)
+        {
+            results.push((0, state));
+        }
+        results.sort_by_key(|(id, _)| *id);
+        results
+    }
+
+    /// Sum `accumulated_tokens` across all per-coordinator state files.
+    /// Falls back to the legacy shared file when no per-ID files are found.
+    /// Currently exercised only by tests now that the graph-cycle compaction
+    /// widget has been retired; kept as a stable API for future per-chat
+    /// memory accounting.
+    #[allow(dead_code)]
+    pub fn total_accumulated_tokens(dir: &Path) -> u64 {
+        let service_dir = dir.join("service");
+        let entries = match fs::read_dir(&service_dir) {
+            Ok(e) => e,
+            Err(_) => return Self::load(dir).map(|s| s.accumulated_tokens).unwrap_or(0),
+        };
+        let mut total: u64 = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("coordinator-state-")
+                && name_str.ends_with(".json")
+                && let Ok(content) = fs::read_to_string(entry.path())
+                && let Ok(state) = serde_json::from_str::<Self>(&content)
+            {
+                total += state.accumulated_tokens;
+            }
+        }
+        // Fall back to legacy file if no per-ID files found
+        if total == 0 {
+            total = Self::load(dir).map(|s| s.accumulated_tokens).unwrap_or(0);
+        }
+        total
+    }
+
+    /// Remove the per-ID state file for a specific coordinator.
+    pub fn remove_for(dir: &Path, coordinator_id: u32) {
+        let path = coordinator_state_path(dir, coordinator_id);
         let _ = fs::remove_file(&path);
+    }
+
+    /// Remove coordinator 0 state file(s), including legacy shared file.
+    pub fn remove(dir: &Path) {
+        Self::remove_for(dir, 0);
+        // Also clean up the legacy shared file
+        let _ = fs::remove_file(coordinator_state_path_legacy(dir));
+    }
+
+    /// Remove ALL per-coordinator state files and the legacy shared file.
+    /// Used on daemon shutdown to clean up all coordinator state.
+    #[allow(dead_code)]
+    pub fn remove_all(dir: &Path) {
+        let service_dir = dir.join("service");
+        if let Ok(entries) = fs::read_dir(&service_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("coordinator-state") && name_str.ends_with(".json") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Reset accumulated_tokens to 0 in all per-coordinator state files.
+    #[allow(dead_code)]
+    pub fn reset_all_accumulated_tokens(dir: &Path) {
+        for (id, mut state) in Self::load_all(dir) {
+            state.accumulated_tokens = 0;
+            state.save_for(dir, id);
+        }
+    }
+
+    /// Migrate legacy coordinator-state.json to per-ID file (coordinator-state-0.json).
+    /// No-op if the legacy file doesn't exist or a per-ID file already exists.
+    #[allow(dead_code)]
+    pub fn migrate_legacy(dir: &Path) {
+        let legacy_path = coordinator_state_path_legacy(dir);
+        let per_id_path = coordinator_state_path(dir, 0);
+        if legacy_path.exists()
+            && !per_id_path.exists()
+            && let Ok(content) = fs::read_to_string(&legacy_path)
+            && let Ok(state) = serde_json::from_str::<Self>(&content)
+        {
+            state.save_for(dir, 0);
+            let _ = fs::remove_file(&legacy_path);
+        }
+    }
+
+    /// Update a field across all per-coordinator state files.
+    /// Used for global operations like pause/resume/freeze/thaw.
+    #[allow(dead_code)]
+    pub fn update_all(dir: &Path, mutator: impl Fn(&mut Self)) {
+        for (id, mut state) in Self::load_all(dir) {
+            mutator(&mut state);
+            state.save_for(dir, id);
+        }
     }
 }
 
@@ -417,7 +846,7 @@ pub fn run_tick(
     executor: Option<&str>,
     model: Option<&str>,
 ) -> Result<()> {
-    let config = Config::load(dir)?;
+    let config = Config::load_merged(dir)?;
     let max_agents = max_agents.unwrap_or(config.coordinator.max_agents);
     let executor = executor
         .map(std::string::ToString::to_string)
@@ -521,6 +950,8 @@ pub fn run_start(
     force: bool,
     no_coordinator_agent: bool,
 ) -> Result<()> {
+    let config = Config::load_merged(dir)?;
+
     // Check if service is already running
     if let Some(state) = ServiceState::load(dir)? {
         if is_process_alive(state.pid) {
@@ -684,23 +1115,93 @@ pub fn run_start(
     };
     state.save(dir)?;
 
-    // Wait a moment for the daemon to start
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait for daemon to start, showing an animated spinner on TTYs
+    let daemon_alive = if !json && std::io::stdout().is_terminal() {
+        use std::io::Write as _;
+        // Wave spinner constants
+        const BOLT: &str = "↯";
+        const NUM_BOLTS: usize = 5;
+        const FRAME_MS: u64 = 120;
+        // Fixed rainbow spectrum: Red, Orange, Green, Cyan, Violet
+        const SPECTRAL_BRIGHT: [u8; NUM_BOLTS] = [196, 214, 46, 33, 129];
+        const SPECTRAL_DIM: [u8; NUM_BOLTS] = [52, 94, 22, 17, 53];
+
+        let start = Instant::now();
+        let mut stdout = std::io::stdout();
+        let mut alive = false;
+
+        // Animate for at least 600ms so the wave is visible, up to 2s max
+        while start.elapsed() < Duration::from_millis(2000) {
+            let elapsed_ms = start.elapsed().as_millis() as usize;
+            let wave_pos = (elapsed_ms / FRAME_MS as usize) % NUM_BOLTS;
+
+            // Build the colored bolt string — peak bolt is bright, others dimmed
+            let mut line = String::with_capacity(80);
+            line.push_str("  ");
+            for i in 0..NUM_BOLTS {
+                let dist = (i as isize - wave_pos as isize).unsigned_abs();
+                let color = if dist <= 1 {
+                    SPECTRAL_BRIGHT[i]
+                } else {
+                    SPECTRAL_DIM[i]
+                };
+                if dist == 0 {
+                    // Bold the peak bolt for extra pop
+                    line.push_str(&format!("\x1b[1;38;5;{}m{}\x1b[0m", color, BOLT));
+                } else {
+                    line.push_str(&format!("\x1b[38;5;{}m{}\x1b[0m", color, BOLT));
+                }
+            }
+            line.push_str(" Starting service...");
+
+            // Overwrite current line
+            print!("\r\x1b[2K{}", line);
+            let _ = stdout.flush();
+
+            std::thread::sleep(Duration::from_millis(FRAME_MS));
+
+            // Check if daemon is alive and socket is accepting connections
+            // after minimum animation time
+            if start.elapsed() >= Duration::from_millis(600)
+                && is_process_alive(pid)
+                && socket_accepting(&socket)
+            {
+                alive = true;
+                break;
+            }
+        }
+
+        // Clear the spinner line
+        print!("\r\x1b[2K");
+        let _ = stdout.flush();
+        alive
+    } else {
+        // Non-TTY or JSON mode: wait for process alive + socket accepting
+        let start = Instant::now();
+        let mut alive = false;
+        while start.elapsed() < Duration::from_millis(3000) {
+            std::thread::sleep(Duration::from_millis(100));
+            if is_process_alive(pid) && socket_accepting(&socket) {
+                alive = true;
+                break;
+            }
+        }
+        alive
+    };
 
     // Verify daemon started successfully
-    if !is_process_alive(pid) {
+    if !daemon_alive {
         ServiceState::remove(dir)?;
         anyhow::bail!("Daemon process exited immediately. Check logs.");
     }
 
     // Resolve effective config for display (CLI flags override config.toml)
-    let config = Config::load_or_default(dir);
     let eff_max_agents = max_agents.unwrap_or(config.coordinator.max_agents);
     let eff_poll_interval = interval.unwrap_or(config.coordinator.poll_interval);
     let eff_executor = executor
         .map(std::string::ToString::to_string)
         .unwrap_or_else(|| config.coordinator.effective_executor());
-    let eff_model: Option<String> = model
+    let eff_model = model
         .map(std::string::ToString::to_string)
         .or_else(|| config.coordinator.model.clone());
 
@@ -738,7 +1239,7 @@ pub fn run_start(
         println!("Log: {}", log_path_str);
         let model_str = eff_model.as_deref().unwrap_or("default");
         println!(
-            "Coordinator: max_agents={}, poll_interval={}s, executor={}, model={}",
+            "Dispatcher: max_agents={}, poll_interval={}s, executor={}, model={}",
             eff_max_agents, eff_poll_interval, eff_executor, model_str
         );
         if warn_no_agents {
@@ -789,6 +1290,7 @@ pub(crate) struct DaemonConfig {
     executor: String,
     poll_interval: Duration,
     model: Option<String>,
+    provider: Option<String>,
     paused: bool,
     /// Settling delay after GraphChanged events. During burst graph construction,
     /// multiple adds fire in rapid succession. Instead of ticking immediately on
@@ -797,62 +1299,7 @@ pub(crate) struct DaemonConfig {
     settling_delay: Duration,
 }
 
-pub(crate) const COORDINATOR_RUNTIME_EXECUTOR_ENV: &str = "WG_COORDINATOR_RUNTIME_EXECUTOR";
-pub(crate) const COORDINATOR_MODEL_OVERRIDE_ENV: &str = "WG_COORDINATOR_MODEL_OVERRIDE";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CoordinatorRuntimeIntent {
-    pub executor: String,
-    pub model: Option<String>,
-}
-
-impl CoordinatorRuntimeIntent {
-    fn from_daemon_config(daemon_cfg: &DaemonConfig) -> Self {
-        Self {
-            executor: daemon_cfg.executor.clone(),
-            model: daemon_cfg.model.clone(),
-        }
-    }
-}
-
-fn resolve_daemon_config(
-    dir: &Path,
-    cli_max_agents: Option<usize>,
-    cli_executor: Option<&str>,
-    cli_interval: Option<u64>,
-    cli_model: Option<&str>,
-) -> DaemonConfig {
-    let config = Config::load_or_default(dir);
-    let coord_state = CoordinatorState::load(dir).unwrap_or_default();
-
-    let model = cli_model
-        .map(std::string::ToString::to_string)
-        .or_else(|| coord_state.model_override.clone())
-        .or_else(|| config.coordinator.model.clone());
-
-    let executor = cli_executor
-        .map(std::string::ToString::to_string)
-        .or_else(|| coord_state.executor_override.clone())
-        .unwrap_or_else(|| {
-            let mut coordinator_cfg = workgraph::config::CoordinatorConfig::default();
-            coordinator_cfg.executor = config.coordinator.executor.clone();
-            coordinator_cfg.model = model.clone();
-            coordinator_cfg.effective_executor()
-        });
-
-    DaemonConfig {
-        max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
-        executor,
-        poll_interval: Duration::from_secs(
-            cli_interval.unwrap_or(config.coordinator.poll_interval),
-        ),
-        model,
-        paused: false,
-        settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
-    }
-}
-
-/// Route new chat inbox messages to the persistent coordinator agent.
+/// Route new chat inbox messages to the persistent coordinator agent for a specific coordinator.
 ///
 /// Reads the inbox since the coordinator cursor and signals the coordinator
 /// supervisor about each new message. The handler subprocess owns cursor
@@ -861,38 +1308,79 @@ fn resolve_daemon_config(
 /// Returns the number of messages routed.
 fn route_chat_to_agent(
     dir: &Path,
+    coordinator_id: u32,
     agent: &coordinator_agent::CoordinatorAgent,
     logger: &DaemonLogger,
 ) -> Result<usize> {
-    let chat_dir = dir.join("chat");
+    let chat_dir = dir.join("chat").join(coordinator_id.to_string());
     if !chat_dir.exists() {
         return Ok(0);
     }
 
-    let inbox_cursor = workgraph::chat::read_coordinator_cursor(dir)?;
-    let new_messages = workgraph::chat::read_inbox_since(dir, inbox_cursor)?;
+    let inbox_cursor = workgraph::chat::read_coordinator_cursor_for(dir, coordinator_id)?;
+    let new_messages = workgraph::chat::read_inbox_since_for(dir, coordinator_id, inbox_cursor)?;
 
     if new_messages.is_empty() {
         return Ok(0);
     }
 
     let count = new_messages.len();
+    let use_subprocess = agent.uses_subprocess();
     for msg in &new_messages {
-        if let Err(e) = agent.send_message(msg.request_id.clone(), msg.content.clone()) {
+        // Subprocess-backed coordinators read the inbox directly — the
+        // message is already there (the TUI or whoever appended it did
+        // so before we got here). Re-sending via send_message would
+        // double-append. Skip that path; still do the user-board
+        // forwarding below.
+        if !use_subprocess
+            && let Err(e) = agent.send_message(msg.request_id.clone(), msg.content.clone())
+        {
             logger.error(&format!(
-                "Failed to send chat message to coordinator agent: {}",
-                e
+                "Failed to send chat message to coordinator agent {}: {}",
+                coordinator_id, e
             ));
             // Write an error response so the user isn't left hanging
-            let _ = workgraph::chat::append_error(
+            let _ = workgraph::chat::append_outbox_for(
                 dir,
-                &format!("The coordinator agent is not available.\n\nError:\n{:#}", e),
+                coordinator_id,
+                "The chat agent is not available. Please try again.",
                 &msg.request_id,
             );
         }
+
+        // Forward the chat message to the user board
+        coordinator::forward_chat_to_user_board(dir, &msg.content, coordinator_id);
+    }
+
+    // Advance the coordinator cursor past these messages
+    if let Some(last) = new_messages.last() {
+        workgraph::chat::write_coordinator_cursor_for(dir, coordinator_id, last.id)?;
     }
 
     Ok(count)
+}
+
+/// Route chat messages to all active coordinator agents.
+/// Checks each coordinator's inbox and routes pending messages.
+/// Returns total number of messages routed across all coordinators.
+fn route_chat_to_all_agents(
+    dir: &Path,
+    agents: &std::collections::HashMap<u32, coordinator_agent::CoordinatorAgent>,
+    logger: &DaemonLogger,
+) -> Result<usize> {
+    let mut total = 0;
+    for (&cid, agent) in agents {
+        match route_chat_to_agent(dir, cid, agent, logger) {
+            Ok(count) => total += count,
+            Err(e) => {
+                logger.error(&format!(
+                    "Failed to route chat to coordinator {}: {}",
+                    cid, e
+                ));
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Record events from the latest coordinator tick into the event log.
@@ -1126,6 +1614,280 @@ fn try_dispatch_notifications(dir: &Path, logger: &DaemonLogger) {
     }
 }
 
+/// Mark legacy daemon-managed graph tasks as abandoned.
+///
+/// Older coordinator implementations represented daemon control flow as
+/// graph tasks (`.archive-*`, `.registry-refresh-*`, `.user-*`,
+/// `.compact-*`). These are abandoned to keep the control plane out of
+/// the graph.
+///
+/// Chat tasks (`.coordinator-*` / `.chat-*`) are preserved because the
+/// TUI depends on them for chat discovery and tab restoration.
+fn cleanup_legacy_daemon_tasks(dir: &Path, logger: &DaemonLogger) {
+    let gp = graph_path(dir);
+    let Ok(graph) = load_graph(&gp) else {
+        return;
+    };
+
+    let mut stale_ids = Vec::new();
+    for task in graph.tasks() {
+        // Don't abandon chat tasks - TUI depends on them for chat discovery
+        let is_legacy = task.id.starts_with(".archive-")
+            || task.id.starts_with(".registry-refresh-")
+            || task.id.starts_with(".user-")
+            || task.id.starts_with(".compact-");
+        if is_legacy && task.status != workgraph::graph::Status::Abandoned {
+            stale_ids.push(task.id.clone());
+        }
+    }
+
+    if stale_ids.is_empty() {
+        return;
+    }
+
+    let ids_for_log = stale_ids.clone();
+    let has_compact_or_archive = stale_ids
+        .iter()
+        .any(|id| id.starts_with(".compact-") || id.starts_with(".archive-"));
+    match workgraph::parser::modify_graph(&gp, |graph| {
+        let mut changed = false;
+        for task_id in &stale_ids {
+            if let Some(task) = graph.get_task_mut(task_id) {
+                task.status = workgraph::graph::Status::Abandoned;
+                task.completed_at
+                    .get_or_insert_with(|| Utc::now().to_rfc3339());
+                task.cycle_config = None;
+                let msg = if task_id.starts_with(".compact-") || task_id.starts_with(".archive-") {
+                    "Retired: .compact-N / .archive-N cycles were removed; \
+                     archival now runs natively in the dispatcher"
+                        .to_string()
+                } else {
+                    "Superseded by native coordinator control plane; no longer graph-managed"
+                        .to_string()
+                };
+                task.log.push(workgraph::graph::LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: Some("daemon".to_string()),
+                    user: Some(workgraph::current_user()),
+                    message: msg,
+                });
+                // Also drop dependencies on .compact-* / .archive-* tasks from
+                // any other task's `after` list so chat agents don't stay
+                // blocked waiting on retired companions.
+                changed = true;
+            }
+        }
+        if has_compact_or_archive {
+            let all_ids: Vec<String> = graph.tasks().map(|t| t.id.clone()).collect();
+            for tid in &all_ids {
+                if let Some(t) = graph.get_task_mut(tid) {
+                    t.after.retain(|dep| {
+                        !(dep.starts_with(".compact-") || dep.starts_with(".archive-"))
+                    });
+                }
+            }
+        }
+        changed
+    }) {
+        Ok(_) => logger.info(&format!(
+            "Abandoned {} legacy daemon task(s): {}",
+            ids_for_log.len(),
+            ids_for_log.join(", ")
+        )),
+        Err(e) => logger.warn(&format!(
+            "Failed to abandon legacy daemon-managed tasks: {}",
+            e
+        )),
+    }
+}
+
+/// Run per-coordinator chat compaction when the message threshold is exceeded.
+fn run_pending_chat_compactions(dir: &Path, logger: &DaemonLogger) {
+    for coordinator_id in workgraph::chat::list_coordinator_ids(dir) {
+        if !workgraph::service::chat_compactor::should_compact(dir, coordinator_id) {
+            continue;
+        }
+
+        // Capture state before compaction for the event log
+        let state_before =
+            workgraph::service::chat_compactor::ChatCompactorState::load(dir, coordinator_id);
+        let msgs_before = state_before.last_message_count;
+
+        match workgraph::service::chat_compactor::run_chat_compaction(dir, coordinator_id) {
+            Ok(path) => {
+                // Record compaction event to operations.jsonl so the TUI can show it
+                let state_after = workgraph::service::chat_compactor::ChatCompactorState::load(
+                    dir,
+                    coordinator_id,
+                );
+                let detail = serde_json::json!({
+                    "coordinator_id": coordinator_id,
+                    "output_path": path.display().to_string(),
+                    "messages_before": msgs_before,
+                    "messages_after": state_after.last_message_count,
+                    "compaction_count_before": state_before.compaction_count,
+                    "compaction_count_after": state_after.compaction_count,
+                });
+                let _ = workgraph::provenance::record(
+                    dir,
+                    "compact",
+                    None,
+                    Some(&format!("coordinator-{}", coordinator_id)),
+                    detail,
+                    u64::MAX, // Use MAX to avoid rotation during daemon tick
+                );
+
+                logger.info(&format!(
+                    "Chat compaction complete for coordinator {} → {}",
+                    coordinator_id,
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                logger.warn(&format!(
+                    "Chat compaction failed for coordinator {}: {:#}",
+                    coordinator_id, e
+                ));
+            }
+        }
+    }
+}
+
+/// Run automatic archival directly from the daemon without graph control tasks.
+fn run_automatic_archival(dir: &Path, archival_error_count: &mut u64, logger: &DaemonLogger) {
+    let config = workgraph::config::Config::load_or_default(dir);
+    let retention_days = config.coordinator.archive_retention_days;
+
+    match crate::commands::archive::run_automatic(dir, retention_days) {
+        Ok(count) => {
+            if *archival_error_count > 0 {
+                logger.info(&format!(
+                    "Archival recovered after {} consecutive error(s)",
+                    *archival_error_count
+                ));
+            }
+            *archival_error_count = 0;
+            logger.info(&format!(
+                "Archival complete: {} tasks archived (retention: {}d)",
+                count, retention_days
+            ));
+        }
+        Err(e) => {
+            *archival_error_count += 1;
+            if *archival_error_count == 1 || (*archival_error_count).is_multiple_of(5) {
+                logger.error(&format!(
+                    "Archival error (#{} consecutive): {:#}",
+                    *archival_error_count, e
+                ));
+            }
+        }
+    }
+}
+
+/// Run model registry refresh directly from the daemon without graph control tasks.
+///
+/// Time-gated: only fires when at least `registry_refresh_interval` seconds
+/// have elapsed since the last successful refresh (stored in
+/// `model_benchmarks.json`'s `fetched_at` field). Set interval to 0 to disable.
+fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &DaemonLogger) {
+    let config = workgraph::config::Config::load_or_default(dir);
+    let interval = config.coordinator.registry_refresh_interval;
+    if interval == 0 {
+        return; // Disabled
+    }
+
+    // Time gate: check if enough time has elapsed since the last fetch.
+    {
+        if let Ok(Some(existing)) = workgraph::model_benchmarks::BenchmarkRegistry::load(dir)
+            && let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&existing.fetched_at)
+        {
+            let age = chrono::Utc::now().signed_duration_since(fetched);
+            if age.num_seconds() < interval as i64 {
+                return; // Not yet time
+            }
+        }
+        // If no existing registry or unparseable date, proceed (initial population).
+    }
+
+    // Run the actual refresh
+    match do_registry_refresh(dir) {
+        Ok(summary) => {
+            if *refresh_error_count > 0 {
+                logger.info(&format!(
+                    "Registry refresh recovered after {} consecutive error(s)",
+                    *refresh_error_count
+                ));
+            }
+            *refresh_error_count = 0;
+            logger.info(&format!("Registry refresh complete: {}", summary));
+        }
+        Err(e) => {
+            *refresh_error_count += 1;
+            if *refresh_error_count == 1 || (*refresh_error_count).is_multiple_of(5) {
+                logger.error(&format!(
+                    "Registry refresh error (#{} consecutive): {:#}",
+                    *refresh_error_count, e
+                ));
+            }
+        }
+    }
+}
+
+/// Execute the actual registry refresh: fetch from OpenRouter, diff, save.
+/// Returns a human-readable summary string on success.
+fn do_registry_refresh(dir: &Path) -> Result<String> {
+    use workgraph::executor::native::openai_client::{
+        fetch_openrouter_models_blocking, resolve_openai_api_key_from_dir,
+    };
+    use workgraph::model_benchmarks::{self, BenchmarkRegistry, diff_registries, format_changes};
+
+    // Load existing registry (if any) for diffing.
+    let old_registry = BenchmarkRegistry::load(dir)?;
+
+    // Fetch fresh model data from OpenRouter.
+    let api_key = resolve_openai_api_key_from_dir(dir)?;
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .or_else(|_| std::env::var("OPENROUTER_BASE_URL"))
+        .ok();
+    let or_models = fetch_openrouter_models_blocking(&api_key, base_url.as_deref())?;
+
+    let mut registry = model_benchmarks::build_from_openrouter(&or_models);
+
+    // Preserve existing benchmark scores (manually or externally added).
+    if let Some(ref existing) = old_registry {
+        for (id, existing_model) in &existing.models {
+            if let Some(new_model) = registry.models.get_mut(id) {
+                if existing_model.benchmarks.coding_index.is_some()
+                    || existing_model.benchmarks.intelligence_index.is_some()
+                    || existing_model.benchmarks.agentic.is_some()
+                {
+                    new_model.benchmarks = existing_model.benchmarks.clone();
+                }
+                if existing_model.popularity.provider_count.is_some() {
+                    new_model.popularity = existing_model.popularity.clone();
+                }
+            }
+        }
+    }
+
+    // Compute fitness scores.
+    model_benchmarks::compute_fitness_scores(&mut registry);
+
+    // Diff against the old registry.
+    let diff_summary = if let Some(ref old) = old_registry {
+        let changes = diff_registries(old, &registry, 20, 2.0);
+        format_changes(&changes)
+    } else {
+        "Initial population (no previous registry)".to_string()
+    };
+
+    // Save the new registry.
+    let model_count = registry.models.len();
+    registry.save(dir)?;
+
+    Ok(format!("{} models, diff: {}", model_count, diff_summary))
+}
+
 /// Run the actual daemon loop (called by forked process)
 #[cfg(unix)]
 pub fn run_daemon(
@@ -1148,6 +1910,40 @@ pub fn run_daemon(
         std::process::id(),
         socket_path,
     ));
+
+    // --- Binary self-restart detection ---
+    // Record the exe path and its metadata at startup so we can detect when
+    // `cargo install` (or similar) replaces the binary on disk.  We use
+    // mtime + size as the cheap per-tick check (instant), then compute a
+    // SHA-256 hash to confirm the content actually changed and the write is
+    // complete.  The initial reference hash is computed in a background thread
+    // to avoid blocking the main loop (important for large debug binaries).
+    let exe_path = std::env::current_exe().ok();
+    let exe_initial_meta = exe_path.as_ref().and_then(|p| fs::metadata(p).ok());
+    let original_args: Vec<String> = std::env::args().collect();
+    let exe_hash_receiver: Option<std::sync::mpsc::Receiver<[u8; 32]>> =
+        exe_path.as_ref().map(|p| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = p.clone();
+            std::thread::spawn(move || {
+                // Delay before hashing so short-lived daemons (e.g. tests)
+                // exit before we spend CPU.  The 5 s window is long enough
+                // for most integration-test lifetimes.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                if let Ok(h) = compute_exe_hash_background(&path) {
+                    let _ = tx.send(h);
+                }
+            });
+            rx
+        });
+    let mut exe_initial_hash: Option<[u8; 32]> = None;
+    if let (Some(p), Some(meta)) = (&exe_path, &exe_initial_meta) {
+        logger.info(&format!(
+            "Binary change detection armed: {} (size={})",
+            p.display(),
+            meta.len(),
+        ));
+    }
 
     // Ensure socket directory exists
     if let Some(parent) = socket.parent()
@@ -1179,12 +1975,68 @@ pub fn run_daemon(
     let dir = dir.to_path_buf();
     let mut running = true;
 
-    // Load coordinator config, CLI args override config values, and persisted
-    // reload overrides survive daemon restarts until explicitly cleared.
-    let config = Config::load_or_default(&dir);
-    let mut daemon_cfg =
-        resolve_daemon_config(&dir, cli_max_agents, cli_executor, cli_interval, cli_model);
-    let previous_coord_state = CoordinatorState::load_or_default(&dir);
+    // Load coordinator config strictly: invalid config must abort startup.
+    let config = Config::load_merged(&dir)?;
+
+    // Surface legacy / deprecated config keys before we start the loop, so
+    // users see a one-shot warning per legacy key they're still using.
+    // This scans the merged TOML directly because by the time it lands in
+    // `Config`, serde aliases have collapsed the old and new names together.
+    let legacy_global = Config::global_config_path()
+        .ok()
+        .and_then(|p| Config::load_toml_value(&p).ok());
+    let legacy_local = Config::load_toml_value(&dir.join("config.toml")).ok();
+    for raw in [legacy_global, legacy_local].into_iter().flatten() {
+        for dep in workgraph::config::detect_deprecated_keys(&raw) {
+            logger.warn(&format!(
+                "Deprecated config key '{}' is still accepted; please rename to '{}'",
+                dep.path, dep.replacement,
+            ));
+        }
+    }
+
+    // Validate configuration before starting
+    let validation = config.validate_config();
+    for diag in &validation.warnings {
+        logger.warn(&format!("Config warning: {}", diag.message));
+    }
+    if !validation.is_ok() {
+        for diag in &validation.errors {
+            logger.error(&format!("Config error: {}", diag.message));
+            logger.error(&format!("  Fix: {}", diag.fix));
+        }
+        // Clean up socket before bailing
+        if socket.exists() {
+            let _ = fs::remove_file(&socket);
+        }
+        anyhow::bail!(
+            "Configuration validation failed with {} error(s). \
+             Run 'wg config --show' for details.",
+            validation.errors.len()
+        );
+    }
+
+    let (resolved_executor, resolved_model) = resolve_service_coordinator_settings(
+        &dir,
+        &config,
+        cli_executor,
+        cli_model,
+        no_coordinator_agent,
+    )?;
+
+    let mut daemon_cfg = DaemonConfig {
+        max_agents: cli_max_agents.unwrap_or(config.coordinator.max_agents),
+        executor: resolved_executor,
+        // The poll_interval is the slow background safety-net timer.
+        // CLI --interval overrides it; otherwise use config.coordinator.poll_interval.
+        poll_interval: Duration::from_secs(
+            cli_interval.unwrap_or(config.coordinator.poll_interval),
+        ),
+        model: resolved_model,
+        provider: config.coordinator.provider.clone(),
+        paused: false,
+        settling_delay: Duration::from_millis(config.coordinator.settling_delay_ms),
+    };
 
     logger.info(&format!(
         "Coordinator config: poll_interval={}s, max_agents={}, executor={}, model={}",
@@ -1223,49 +2075,134 @@ pub fn run_daemon(
         tasks_ready: 0,
         agents_spawned: 0,
         paused: false,
+        frozen: false,
+        frozen_pids: Vec::new(),
+        accumulated_tokens: CoordinatorState::load(&dir)
+            .map(|cs| cs.accumulated_tokens)
+            .unwrap_or(0),
+        cost_tracking: SessionCostTracking::default(),
+        model_override: None,
+        executor_override: None,
     };
     coord_state.save(&dir);
+
+    // Record executor/model combo in launcher history
+    if let Err(e) =
+        workgraph::launcher_history::record_use(&workgraph::launcher_history::HistoryEntry::new(
+            &daemon_cfg.executor,
+            daemon_cfg.model.as_deref(),
+            None,
+            "cli",
+        ))
+    {
+        logger.warn(&format!("Failed to record launcher history: {}", e));
+    }
+
+    // Clean up legacy daemon-managed graph tasks from older coordinator models.
+    cleanup_legacy_daemon_tasks(&dir, &logger);
+
+    // Auto-bootstrap agency when auto_evolve is enabled and agency isn't initialized.
+    if config.agency.auto_evolve {
+        let agency_dir = dir.join("agency");
+        let roles_dir = agency_dir.join("cache/roles");
+        if !roles_dir.exists()
+            || agency::load_all_roles(&roles_dir)
+                .map(|r| r.is_empty())
+                .unwrap_or(true)
+        {
+            logger.info("auto_evolve enabled but agency not initialized — bootstrapping agency");
+            match super::agency_init::run(&dir) {
+                Ok(()) => logger.info("Agency auto-bootstrap complete"),
+                Err(e) => logger.warn(&format!("Agency auto-bootstrap failed: {}", e)),
+            }
+        }
+    }
 
     // Create the shared event log for coordinator context refresh.
     // The daemon records events (task completions, agent spawns, etc.) and the
     // coordinator agent reads them when building context for each interaction.
     let event_log = coordinator_agent::new_event_log();
 
-    // Spawn the persistent coordinator agent (LLM session for chat).
-    // The coordinator agent is a long-lived Claude CLI session that interprets
-    // user intent, replacing the simple stub responses.
+    // Spawn the persistent coordinator agent(s) (LLM sessions for chat).
+    //
+    // Bug A (orphan chat supervisor) regression-guard: enumerate the live
+    // graph for tasks tagged with a chat-loop tag (`.chat-N` and legacy
+    // `.coordinator-N`) and spawn ONE supervisor per task. Do NOT hardcode
+    // 'always spawn coordinator-0' — a fresh `wg init` has no `.chat-0`, so
+    // hardcoding sends `wg spawn-task .chat-0` into a perpetual restart loop
+    // chasing a task that does not exist. See `tests/integration_dispatch_boot.rs`
+    // for the regression tests that pin this behavior.
+    //
+    // Additional supervisors for new chats are created on-demand via the
+    // CreateCoordinator IPC request, which appends a `.chat-N` task to the
+    // graph and tells the daemon to spawn a supervisor for it.
+    //
     // Enabled by default; disable with --no-coordinator-agent or
     // coordinator.coordinator_agent = false in config.toml.
     let enable_coordinator_agent = !no_coordinator_agent && config.coordinator.coordinator_agent;
-    let coordinator_agent = if enable_coordinator_agent {
-        let runtime_intent = CoordinatorRuntimeIntent::from_daemon_config(&daemon_cfg);
-        match coordinator_agent::CoordinatorAgent::spawn(
-            &dir,
-            runtime_intent,
-            &logger,
-            event_log.clone(),
-        ) {
-            Ok(agent) => {
-                logger.info("Coordinator agent spawned successfully");
-                Some(agent)
-            }
-            Err(e) => {
-                logger.warn(&format!(
-                    "Failed to spawn coordinator agent: {}. Chat will use stub responses.",
-                    e
-                ));
-                None
-            }
-        }
-    } else {
-        if no_coordinator_agent {
-            logger.info("Coordinator agent disabled via --no-coordinator-agent flag");
-        } else {
+    let mut coordinator_agents: std::collections::HashMap<
+        u32,
+        coordinator_agent::CoordinatorAgent,
+    > = std::collections::HashMap::new();
+    if enable_coordinator_agent {
+        let to_spawn = workgraph::service::enumerate_chat_supervisors_for_boot(&dir);
+        if to_spawn.is_empty() {
             logger.info(
-                "Coordinator agent disabled (set coordinator.coordinator_agent = true to enable)",
+                "No chat-loop tasks in graph — no chat supervisors spawned at boot. \
+                 Use `wg chat new` (or the TUI '+' key) to create a chat agent.",
             );
+        } else {
+            logger.info(&format!(
+                "Spawning {} chat supervisor(s) from graph: {}",
+                to_spawn.len(),
+                to_spawn
+                    .iter()
+                    .map(|s| if s.is_legacy {
+                        format!(".coordinator-{}", s.chat_id)
+                    } else {
+                        format!(".chat-{}", s.chat_id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
         }
-        None
+        for spec in to_spawn {
+            if spec.is_legacy {
+                logger.warn(&format!(
+                    "Loading legacy `.coordinator-{}` task; please run `wg migrate chat-rename` to rename to `.chat-{}` (deprecation will be removed in a future release)",
+                    spec.chat_id, spec.chat_id
+                ));
+            }
+            match coordinator_agent::CoordinatorAgent::spawn(
+                &dir,
+                spec.chat_id,
+                daemon_cfg.model.as_deref(),
+                Some(&daemon_cfg.executor),
+                daemon_cfg.provider.as_deref(),
+                &logger,
+                event_log.clone(),
+            ) {
+                Ok(agent) => {
+                    logger.info(&format!(
+                        "Coordinator agent {} spawned successfully",
+                        spec.chat_id
+                    ));
+                    coordinator_agents.insert(spec.chat_id, agent);
+                }
+                Err(e) => {
+                    logger.warn(&format!(
+                        "Failed to spawn coordinator agent {}: {}. Chat will use stub responses.",
+                        spec.chat_id, e
+                    ));
+                }
+            }
+        }
+    } else if no_coordinator_agent {
+        logger.info("Coordinator agent disabled via --no-coordinator-agent flag");
+    } else {
+        logger.info(
+            "Coordinator agent disabled (set coordinator.coordinator_agent = true to enable)",
+        );
     };
 
     // Track last coordinator tick time - run immediately on start
@@ -1276,10 +2213,116 @@ pub fn run_daemon(
     // debouncing burst additions so the coordinator sees the full graph.
     let mut settling_deadline: Option<Instant> = None;
 
+    // Self-write quiet window: a coordinator tick can itself write the graph
+    // (status transitions, auto-assign placeholders, agency phases, etc.). Each
+    // such write triggers an inotify event that arrives ~debounce_ms later,
+    // which would re-wake us in a tight feedback loop. We track when those
+    // self-induced events are expected to land and silently drain them when
+    // they do.
+    //
+    // Window = (graph debounce) + slack for kernel/notify queue delay. External
+    // writes that happen *after* the quiet window expires still trigger a wake;
+    // external writes during the window are absorbed and picked up either by a
+    // later external write or by the safety timer (poll_interval).
+    let self_write_quiet_window = Duration::from_millis(
+        config
+            .coordinator
+            .graph_watch_debounce_ms
+            .saturating_add(150),
+    );
+    let mut self_write_quiet_until: Option<Instant> = None;
+
+    // ---- Graph filesystem watcher + self-pipe wakeup ----------------------
+    //
+    // The watcher runs in a background thread (spawned by notify) and observes
+    // writes to `graph.jsonl`. To wake the daemon's main poll() syscall as
+    // soon as a debounced event arrives, we use a self-pipe: the watcher
+    // writes one byte to the write end, which makes poll() return on the
+    // read end. The daemon then drains the pipe and treats it like a
+    // GraphChanged IPC event (sets the settling deadline).
+    //
+    // If the watcher fails to initialise (rare: NFS mounts, certain WSL
+    // setups), we log one warning and fall back to safety-timer-only polling.
+    // The pipe is created either way so the poll() call sites stay uniform.
+    let (graph_pipe_read_fd, graph_pipe_write_fd) = match make_self_pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            logger.error(&format!(
+                "Failed to create graph watcher self-pipe: {} — proceeding with polling only",
+                e
+            ));
+            // Use sentinel -1 fds; poll() will skip them via revents stays 0
+            // because we'll mark them as non-watched in the pollfd array below.
+            (-1, -1)
+        }
+    };
+
+    let _graph_watcher: Option<workgraph::service::graph_watcher::GraphWatcher> =
+        if config.coordinator.graph_watch_enabled && graph_pipe_write_fd >= 0 {
+            let debounce_ms = config.coordinator.graph_watch_debounce_ms;
+            let graph_file = super::graph_path(&dir);
+            let pipe_w = graph_pipe_write_fd;
+            match workgraph::service::graph_watcher::GraphWatcher::start(
+                &graph_file,
+                Duration::from_millis(debounce_ms),
+                move || {
+                    // Best-effort wake: write one byte. EAGAIN means the pipe
+                    // is already non-empty (a previous wake hasn't been drained
+                    // yet) which is fine — that wake is still pending.
+                    let byte: u8 = 1;
+                    unsafe {
+                        libc::write(pipe_w, std::ptr::from_ref(&byte).cast::<libc::c_void>(), 1);
+                    }
+                },
+            ) {
+                Ok(watcher) => {
+                    logger.info(&format!(
+                        "Graph watcher active on {} (debounce={}ms, primary trigger; safety_interval={}s)",
+                        graph_file.display(),
+                        debounce_ms,
+                        daemon_cfg.poll_interval.as_secs(),
+                    ));
+                    Some(watcher)
+                }
+                Err(e) => {
+                    logger.warn(&format!(
+                        "Graph watcher init failed ({}); falling back to safety-timer polling at {}s",
+                        e,
+                        daemon_cfg.poll_interval.as_secs(),
+                    ));
+                    None
+                }
+            }
+        } else {
+            if !config.coordinator.graph_watch_enabled {
+                logger.info(&format!(
+                    "Graph watcher disabled (coordinator.graph_watch_enabled = false); using safety-timer polling at {}s",
+                    daemon_cfg.poll_interval.as_secs(),
+                ));
+            }
+            None
+        };
+
     // Urgent wake: when a UserChat IPC arrives, tick immediately without settling delay.
     // This flag bypasses both the settling delay and the paused state, because
     // chat is a user-facing interaction that expects sub-second acknowledgement.
     let mut urgent_wake = false;
+    let mut pending_coordinator_ids: Vec<u32> = Vec::new();
+
+    // Load max_coordinators limit from config
+    let max_coordinators = config.coordinator.max_coordinators;
+
+    // Restore error counts from persisted state so they survive daemon restarts
+    let mut archival_error_count: u64 = 0;
+    let mut refresh_error_count: u64 = 0;
+
+    // Obtain the raw fd for poll()-based waiting. This lets the daemon
+    // sleep until an IPC connection arrives OR a timeout expires, instead
+    // of busy-polling with a fixed sleep.
+    let listener_fd = {
+        use std::os::unix::io::AsRawFd;
+        listener.as_raw_fd()
+    };
 
     while running {
         // Reap zombie child processes (agents that have exited).
@@ -1289,26 +2332,145 @@ pub fn run_daemon(
         // zombies and is_process_alive(pid) keeps returning true.
         reap_zombies();
 
+        // Calculate how long to sleep. We wake on: incoming IPC connection,
+        // settling deadline, or poll interval — whichever comes first.
+        // Cap at 2s so zombie reaping and binary-change checks aren't delayed
+        // too long.
+        let mut poll_timeout_ms: i32 = 2000;
+        if let Some(deadline) = settling_deadline {
+            let until = deadline.saturating_duration_since(Instant::now());
+            poll_timeout_ms = poll_timeout_ms.min(until.as_millis().min(i32::MAX as u128) as i32);
+        }
+        if !daemon_cfg.paused {
+            let until_tick = daemon_cfg
+                .poll_interval
+                .saturating_sub(last_coordinator_tick.elapsed());
+            poll_timeout_ms =
+                poll_timeout_ms.min(until_tick.as_millis().min(i32::MAX as u128) as i32);
+        }
+        // Floor: don't spin faster than 50ms even with a deadline in the past.
+        poll_timeout_ms = poll_timeout_ms.max(50);
+
+        // Wait for an incoming connection, a graph-watcher wake, or timeout.
+        // pollfds[0] = unix socket listener; pollfds[1] = graph-watcher self-pipe.
+        // When the self-pipe fd is -1 (creation failed), libc::poll() returns
+        // POLLNVAL on it — we tolerate that and ignore the entry.
+        let mut pollfds = [
+            libc::pollfd {
+                fd: listener_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: graph_pipe_read_fd,
+                events: if graph_pipe_read_fd >= 0 {
+                    libc::POLLIN
+                } else {
+                    0
+                },
+                revents: 0,
+            },
+        ];
+        let poll_ret = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, poll_timeout_ms) };
+
+        if poll_ret < 0 {
+            // EINTR (e.g. SIGCHLD) — just loop back to reap and retry.
+            continue;
+        }
+
+        // Drain any graph-watcher wakes and treat them as a GraphChanged event:
+        // schedule a settled tick. This is the primary trigger now; CLI commands
+        // sending IPC GraphChanged remain a redundant secondary trigger.
+        //
+        // Self-write filter: events that arrive while we're inside the post-tick
+        // quiet window are almost always echoes of writes the dispatcher itself
+        // just made. Drain them so the pipe doesn't stay readable, but don't
+        // schedule a tick.
+        if graph_pipe_read_fd >= 0 && (pollfds[1].revents & libc::POLLIN) != 0 {
+            let drained = drain_pipe(graph_pipe_read_fd);
+            let in_quiet = self_write_quiet_until
+                .as_ref()
+                .map(|q| Instant::now() < *q)
+                .unwrap_or(false);
+            if drained > 0 && !in_quiet {
+                let new_deadline = Instant::now() + daemon_cfg.settling_delay;
+                let was_pending = settling_deadline.is_some();
+                settling_deadline = Some(new_deadline);
+                if !was_pending {
+                    logger.info(&format!(
+                        "Graph file changed (fs watcher), scheduling dispatcher tick in {}ms (settling delay)",
+                        daemon_cfg.settling_delay.as_millis()
+                    ));
+                }
+            }
+            // Once we observe events past the quiet window, the dispatcher's
+            // own echoes are gone; clear the marker so it's not unnecessarily
+            // checked next iteration.
+            if !in_quiet {
+                self_write_quiet_until = None;
+            }
+        }
+
+        // Try to accept; may still get WouldBlock if poll was a timeout.
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut wake_coordinator = false;
+                let mut kick_dispatcher = false;
                 let mut conn_urgent_wake = false;
+                let mut conn_delete_coordinator_ids = Vec::new();
+                let mut conn_interrupt_coordinator_ids = Vec::new();
                 if let Err(e) = ipc::handle_connection(
                     &dir,
                     stream,
                     &mut running,
                     &mut wake_coordinator,
+                    &mut kick_dispatcher,
                     &mut conn_urgent_wake,
+                    &mut pending_coordinator_ids,
+                    &mut conn_delete_coordinator_ids,
+                    &mut conn_interrupt_coordinator_ids,
                     &mut daemon_cfg,
                     &logger,
                 ) {
                     logger.error(&format!("Error handling connection: {}", e));
                 }
+                // Interrupt coordinator agents (SIGINT, no kill/restart).
+                for cid in conn_interrupt_coordinator_ids {
+                    if let Some(agent) = coordinator_agents.get(&cid) {
+                        let sent = agent.interrupt();
+                        logger.info(&format!(
+                            "Interrupted coordinator {} (SIGINT sent: {})",
+                            cid, sent
+                        ));
+                    } else {
+                        logger.warn(&format!(
+                            "InterruptCoordinator: no agent for coordinator {}",
+                            cid
+                        ));
+                    }
+                }
+                // Stop and remove any coordinator agents marked for deletion.
+                for cid in conn_delete_coordinator_ids {
+                    if let Some(agent) = coordinator_agents.remove(&cid) {
+                        logger.info(&format!(
+                            "Shutting down coordinator agent {} (deleted via IPC)",
+                            cid
+                        ));
+                        agent.shutdown();
+                    }
+                }
                 if conn_urgent_wake {
                     urgent_wake = true;
                     logger.info("Urgent wake (UserChat), will tick immediately");
                 }
-                if wake_coordinator {
+                if kick_dispatcher {
+                    // KickDispatcher: bypass settling delay, tick on the next
+                    // loop iteration. Used by user-initiated state mutations
+                    // (publish, unclaim, resume, immediate-add) that expect
+                    // sub-second visible activity.
+                    settling_deadline = Some(Instant::now());
+                    logger.info("KickDispatcher received, ticking immediately (no settling delay)");
+                } else if wake_coordinator {
                     // Debounce: (re)set the settling deadline. Each GraphChanged
                     // pushes the deadline forward, so burst additions all land
                     // before the coordinator tick fires.
@@ -1329,13 +2491,17 @@ pub fn run_daemon(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No connection, sleep briefly
-                std::thread::sleep(Duration::from_millis(100));
+                // poll() timed out — no connection pending, fall through to
+                // tick checks.
             }
             Err(e) => {
                 logger.error(&format!("Accept error: {}", e));
             }
         }
+
+        // Keep coordinator chat history compacted so native coordinator sessions
+        // can reset their in-memory conversation between exchanges.
+        run_pending_chat_compactions(&dir, &logger);
 
         // Determine whether to run a coordinator tick.
         // Three triggers: (1) urgent wake (UserChat), (2) settling deadline expired,
@@ -1347,28 +2513,91 @@ pub fn run_daemon(
         if urgent_wake {
             urgent_wake = false;
 
-            if let Some(ref agent) = coordinator_agent {
-                // Route chat messages to the persistent coordinator agent.
-                // Read new inbox messages and send them to the agent thread.
-                match route_chat_to_agent(&dir, agent, &logger) {
-                    Ok(count) if count > 0 => {
+            if enable_coordinator_agent {
+                // Lazy-spawn coordinator agents for any pending coordinator IDs
+                // that don't already have a running agent.
+                for &cid in &pending_coordinator_ids {
+                    if !coordinator_agents.contains_key(&cid) {
+                        if coordinator_agents.len() >= max_coordinators {
+                            logger.warn(&format!(
+                                "Cannot spawn coordinator {}: at max_coordinators limit ({})",
+                                cid, max_coordinators
+                            ));
+                            continue;
+                        }
+                        // Check for per-coordinator model/executor overrides
+                        let coord_state = CoordinatorState::load_for(&dir, cid);
+                        let spawn_model = coord_state
+                            .as_ref()
+                            .and_then(|s| s.model_override.clone())
+                            .or_else(|| daemon_cfg.model.clone());
+                        let spawn_executor = coord_state
+                            .as_ref()
+                            .and_then(|s| s.executor_override.clone())
+                            .unwrap_or_else(|| daemon_cfg.executor.clone());
                         logger.info(&format!(
-                            "Routed {} chat message(s) to coordinator agent",
-                            count
+                            "Lazy-spawning coordinator agent {} (first message received, model={}, executor={})",
+                            cid,
+                            spawn_model.as_deref().unwrap_or("default"),
+                            &spawn_executor
                         ));
-                    }
-                    Ok(_) => {} // No new messages
-                    Err(e) => {
-                        logger.error(&format!("Failed to route chat to agent: {}", e));
-                        // Fall through to tick for stub response
-                        should_tick = true;
+                        match coordinator_agent::CoordinatorAgent::spawn(
+                            &dir,
+                            cid,
+                            spawn_model.as_deref(),
+                            Some(&spawn_executor),
+                            daemon_cfg.provider.as_deref(),
+                            &logger,
+                            event_log.clone(),
+                        ) {
+                            Ok(agent) => {
+                                logger.info(&format!(
+                                    "Coordinator agent {} spawned successfully ({}/{} coordinators)",
+                                    cid,
+                                    coordinator_agents.len() + 1,
+                                    max_coordinators
+                                ));
+                                coordinator_agents.insert(cid, agent);
+                            }
+                            Err(e) => {
+                                logger.warn(&format!(
+                                    "Failed to lazy-spawn coordinator agent {}: {}",
+                                    cid, e
+                                ));
+                            }
+                        }
                     }
                 }
+                pending_coordinator_ids.clear();
+
+                if !coordinator_agents.is_empty() {
+                    // Route chat messages to all active coordinator agents.
+                    // Each coordinator checks its own inbox for pending messages.
+                    match route_chat_to_all_agents(&dir, &coordinator_agents, &logger) {
+                        Ok(count) if count > 0 => {
+                            logger.info(&format!(
+                                "Routed {} chat message(s) to coordinator agent(s)",
+                                count
+                            ));
+                        }
+                        Ok(_) => {} // No new messages
+                        Err(e) => {
+                            logger.error(&format!("Failed to route chat to agents: {}", e));
+                            // Fall through to tick for stub response
+                            should_tick = true;
+                        }
+                    }
+                } else {
+                    // All coordinator agent spawns failed — fall through to stub
+                    should_tick = true;
+                    logger.info("Urgent wake (all coordinator spawns failed): using stub response");
+                }
             } else {
-                // No coordinator agent — fall through to coordinator tick
+                pending_coordinator_ids.clear();
+                // No coordinator agents — fall through to coordinator tick
                 // which will use the stub response via process_chat_inbox.
                 should_tick = true;
-                logger.info("Urgent wake (no coordinator agent): running coordinator tick");
+                logger.info("Urgent wake (coordinator agents disabled): running coordinator tick");
             }
         }
 
@@ -1386,8 +2615,28 @@ pub fn run_daemon(
                 should_tick = true;
             }
         }
+        // Short-circuit the tick phase if Shutdown was just processed.
+        // Without this, an IPC Shutdown that arrives while should_tick is
+        // already set (settling deadline elapsed, poll interval reached,
+        // etc.) will spawn one final coordinator tick AFTER `running` was
+        // set to false — creating a "ghost agent" that appears after
+        // `wg service stop` has returned. Root cause of the 16844
+        // incident on 2026-04-16.
+        if !running {
+            should_tick = false;
+        }
         if should_tick {
             last_coordinator_tick = Instant::now();
+
+            // Open the self-write quiet window: any graph-watcher events that
+            // arrive between now and `tick_end + window` are very likely echoes
+            // of writes we're about to make ourselves (status transitions,
+            // agency-phase task creation, etc.). The pipe drain logic above
+            // silently absorbs them while this window is active. The window
+            // also stays open for a short slack past the tick so the debounced
+            // event (~debounce_ms after the tick's last write) is still inside
+            // it.
+            self_write_quiet_until = Some(Instant::now() + self_write_quiet_window);
 
             // Aggregate usage stats periodically
             match workgraph::usage::aggregate_usage_stats(&dir) {
@@ -1422,12 +2671,15 @@ pub fn run_daemon(
                     coord_state.agents_alive = result.agents_alive;
                     coord_state.tasks_ready = result.tasks_ready;
                     coord_state.agents_spawned = result.agents_spawned;
+                    // Reload accumulated_tokens from disk before saving to avoid clobbering
+                    // increments written by the coordinator agent thread.
+                    if let Some(disk) = CoordinatorState::load(&dir) {
+                        coord_state.accumulated_tokens = disk.accumulated_tokens;
+                    }
                     coord_state.save(&dir);
 
-                    // Record agent spawn events in the event log
-                    if result.agents_spawned > 0 {
-                        record_tick_events(&dir, &event_log, &logger);
-                    }
+                    // Record tick events (spawns, completions, failures, zero-output kills)
+                    record_tick_events(&dir, &event_log, &logger);
 
                     logger.info(&format!(
                         "Coordinator tick #{} complete: agents_alive={}, tasks_ready={}, spawned={}",
@@ -1436,11 +2688,136 @@ pub fn run_daemon(
 
                     // Dispatch notifications for task state changes (failures, blocks)
                     try_dispatch_notifications(&dir, &logger);
+
+                    // Keep per-coordinator chat history compact without polluting the graph.
+                    run_pending_chat_compactions(&dir, &logger);
+
+                    // Automatic archival runs directly in the daemon.
+                    run_automatic_archival(&dir, &mut archival_error_count, &logger);
+
+                    // Registry refresh runs directly in the daemon and is time-gated.
+                    run_registry_refresh(&dir, &mut refresh_error_count, &logger);
+
+                    // Re-arm the self-write quiet window after the tick: the
+                    // archival / registry-refresh phases above can also write
+                    // the graph, and inotify events for any of those writes
+                    // arrive ~debounce_ms later. We extend the window from
+                    // *now* so the post-tick wake gets absorbed even if the
+                    // tick itself was long-running.
+                    self_write_quiet_until = Some(Instant::now() + self_write_quiet_window);
                 }
                 Err(e) => {
                     coord_state.ticks += 1;
+                    if let Some(disk) = CoordinatorState::load(&dir) {
+                        coord_state.accumulated_tokens = disk.accumulated_tokens;
+                    }
                     coord_state.save(&dir);
                     logger.error(&format!("Coordinator tick error: {}", e));
+                    self_write_quiet_until = Some(Instant::now() + self_write_quiet_window);
+                }
+            }
+
+            // --- Binary self-restart check ---
+            // After each tick, see if the wg binary on disk has been replaced
+            // (e.g. by `cargo install --path .`).  If so, exec-replace the
+            // current process with the new binary, preserving all CLI args.
+            //
+            // Flow: (1) compute initial hash on first tick (lazy, avoids
+            // blocking startup), (2) cheap mtime+size gate each tick,
+            // (3) hash only when metadata changes, (4) compare to initial
+            // hash to avoid false restarts on `touch`.
+            if let Some(path) = &exe_path {
+                // Check if the background hash computation has finished.
+                if exe_initial_hash.is_none()
+                    && let Some(rx) = &exe_hash_receiver
+                    && let Ok(h) = rx.try_recv()
+                {
+                    logger.info(&format!("Binary hash recorded: {}", short_hash(&h),));
+                    exe_initial_hash = Some(h);
+                }
+
+                // Cheap metadata check: skip hash if mtime+size unchanged.
+                if let (Some(initial_meta), Some(old_hash)) = (&exe_initial_meta, &exe_initial_hash)
+                {
+                    let meta_changed = fs::metadata(path).ok().is_some_and(|m| {
+                        m.modified().ok() != initial_meta.modified().ok()
+                            || m.len() != initial_meta.len()
+                    });
+                    if meta_changed {
+                        logger.info("Binary metadata changed, verifying with hash...");
+                        if let Ok(hash1) = compute_exe_hash(path) {
+                            if hash1 == *old_hash {
+                                // Content unchanged (e.g. `touch`), no restart.
+                                logger.info("Binary content unchanged despite metadata change");
+                            } else {
+                                // Content differs — wait and re-hash for stability.
+                                std::thread::sleep(Duration::from_secs(1));
+                                match compute_exe_hash(path) {
+                                    Ok(hash2) if hash2 == hash1 => {
+                                        logger.info(&format!(
+                                            "Detected wg binary change (old: {}, new: {}), restarting service...",
+                                            short_hash(old_hash),
+                                            short_hash(&hash1),
+                                        ));
+
+                                        // Pre-exec cleanup: save coordinator state.
+                                        coord_state.save(&dir);
+
+                                        // Shut down coordinator agents (LLM sessions).
+                                        // Running task agents are separate processes
+                                        // and survive exec.
+                                        let agents_to_shutdown: Vec<(
+                                            u32,
+                                            coordinator_agent::CoordinatorAgent,
+                                        )> = coordinator_agents.drain().collect();
+                                        for (cid, agent) in agents_to_shutdown {
+                                            logger.info(&format!(
+                                                "Shutting down coordinator agent {} before exec-restart",
+                                                cid
+                                            ));
+                                            agent.shutdown();
+                                        }
+
+                                        // Remove the socket so the new process can
+                                        // re-bind. The listener fd is closed by exec().
+                                        let _ = fs::remove_file(&socket);
+
+                                        logger.info(&format!(
+                                            "Exec-replacing with: {} {}",
+                                            path.display(),
+                                            original_args[1..].join(" "),
+                                        ));
+
+                                        // exec() replaces the process image — only
+                                        // returns on error.
+                                        use std::os::unix::process::CommandExt;
+                                        let err = process::Command::new(path)
+                                            .args(&original_args[1..])
+                                            .exec();
+                                        // If we get here, exec failed.
+                                        logger.error(&format!(
+                                            "Exec-restart failed: {}. Continuing with old binary.",
+                                            err
+                                        ));
+                                        // Update stored hash so we don't retry.
+                                        exe_initial_hash = Some(hash1);
+                                    }
+                                    Ok(_) => {
+                                        // Hash changed between checks — still writing.
+                                        logger.info(
+                                            "Binary hash unstable (mid-write?), deferring restart check",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        logger.warn(&format!(
+                                            "Failed to re-read binary for restart check: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1448,10 +2825,14 @@ pub fn run_daemon(
 
     logger.info("Daemon shutting down");
 
-    // Shut down the coordinator agent
-    if let Some(agent) = coordinator_agent {
-        logger.info("Shutting down coordinator agent");
+    // Shut down all coordinator agents
+    let agent_count = coordinator_agents.len();
+    for (cid, agent) in coordinator_agents {
+        logger.info(&format!("Shutting down coordinator agent {}", cid));
         agent.shutdown();
+    }
+    if agent_count > 0 {
+        logger.info(&format!("Shut down {} coordinator agent(s)", agent_count));
     }
 
     // Cleanup
@@ -1479,9 +2860,25 @@ pub fn run_daemon(
     anyhow::bail!("Daemon is only supported on Unix systems")
 }
 
+/// Check if the caller is an agent and refuse stop/pause operations.
+/// Returns `Err` if `WG_AGENT_ID` is set, `Ok(())` otherwise.
+fn guard_agent_stop_pause() -> Result<()> {
+    if std::env::var("WG_AGENT_ID").is_ok() {
+        anyhow::bail!("agents cannot stop/pause the service. Use `wg service restart` instead.");
+    }
+    Ok(())
+}
+
 /// Stop the service daemon
 #[cfg(unix)]
 pub fn run_stop(dir: &Path, force: bool, kill_agents: bool, json: bool) -> Result<()> {
+    guard_agent_stop_pause()?;
+    run_stop_inner(dir, force, kill_agents, json)
+}
+
+/// Inner stop logic (no agent guard) — used by `run_restart` to bypass the guard.
+#[cfg(unix)]
+fn run_stop_inner(dir: &Path, force: bool, kill_agents: bool, json: bool) -> Result<()> {
     let state = match ServiceState::load(dir)? {
         Some(s) => s,
         None => {
@@ -1573,6 +2970,46 @@ pub fn run_stop(_dir: &Path, _force: bool, _kill_agents: bool, _json: bool) -> R
     anyhow::bail!("Service daemon is only supported on Unix systems")
 }
 
+/// Restart the service daemon: graceful stop (agents kept alive) then start.
+///
+/// Reads the running daemon's effective config (max_agents, executor, model,
+/// poll_interval) before stopping, and passes it to the new daemon so the
+/// restart is transparent.
+#[cfg(unix)]
+pub fn run_restart(dir: &Path, json: bool) -> Result<()> {
+    // Capture the current daemon's effective config before stopping.
+    let prior_config = CoordinatorState::load(dir);
+
+    // Stop gracefully — agents continue running independently.
+    // Use inner variant to bypass the agent guard (agents may restart).
+    run_stop_inner(dir, false, false, json)?;
+
+    // Derive start parameters from the previous daemon's state.
+    let (max_agents, executor, interval, model) = match &prior_config {
+        Some(cs) => (
+            Some(cs.max_agents),
+            Some(cs.executor.as_str()),
+            Some(cs.poll_interval),
+            cs.model.as_deref(),
+        ),
+        None => (None, None, None, None),
+    };
+
+    // Start a new daemon with the same config.
+    run_start(
+        dir, None, // socket — use default
+        None, // port
+        max_agents, executor, interval, model, json,
+        true,  // force — clean up any leftover state
+        false, // no_coordinator_agent — use default
+    )
+}
+
+#[cfg(not(unix))]
+pub fn run_restart(_dir: &Path, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
 /// Show service status
 #[cfg(unix)]
 pub fn run_status(dir: &Path, json: bool) -> Result<()> {
@@ -1652,6 +3089,8 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
             "coordinator": {
                 "enabled": coord.enabled,
                 "paused": coord.paused,
+                "frozen": coord.frozen,
+                "frozen_pids": coord.frozen_pids,
                 "max_agents": coord.max_agents,
                 "poll_interval": coord.poll_interval,
                 "executor": coord.executor,
@@ -1711,11 +3150,20 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
             }
         }
         let model_str = coord.model.as_deref().unwrap_or("default");
-        let pause_str = if coord.paused { ", PAUSED" } else { "" };
+        let state_str = if coord.frozen {
+            ", FROZEN"
+        } else if coord.paused {
+            ", PAUSED"
+        } else {
+            ""
+        };
         println!(
-            "Coordinator: enabled{}, max_agents={}, poll_interval={}s, executor={}, model={}",
-            pause_str, coord.max_agents, coord.poll_interval, coord.executor, model_str
+            "Dispatcher: enabled{}, max_agents={}, poll_interval={}s, executor={}, model={}",
+            state_str, coord.max_agents, coord.poll_interval, coord.executor, model_str
         );
+        if coord.frozen && !coord.frozen_pids.is_empty() {
+            println!("  Frozen PIDs: {:?}", coord.frozen_pids);
+        }
         if let Some(ref last) = coord.last_tick {
             println!(
                 "  Last tick: {} (#{}, agents_alive={}/{}, tasks_ready={}, spawned={})",
@@ -1864,6 +3312,8 @@ pub fn run_set_executor(
 /// Pause the coordinator (no new agent spawns, running agents unaffected)
 #[cfg(unix)]
 pub fn run_pause(dir: &Path, json: bool) -> Result<()> {
+    guard_agent_stop_pause()?;
+
     let response = send_request(dir, &IpcRequest::Pause)?;
 
     if !response.ok {
@@ -1895,9 +3345,45 @@ pub fn run_pause(_dir: &Path, _json: bool) -> Result<()> {
     anyhow::bail!("Service daemon is only supported on Unix systems")
 }
 
-/// Resume the coordinator (triggers immediate tick)
+/// Resume the coordinator (triggers immediate tick) and clear provider health pauses
 #[cfg(unix)]
 pub fn run_resume(dir: &Path, json: bool) -> Result<()> {
+    // Clear provider health pause state before resuming coordinator
+    match workgraph::service::ProviderHealth::load(dir) {
+        Ok(mut provider_health) => {
+            let was_paused = provider_health.service_paused;
+            let paused_providers: Vec<_> = provider_health
+                .providers
+                .values()
+                .filter(|p| p.is_paused)
+                .map(|p| p.provider_id.clone())
+                .collect();
+
+            provider_health.resume_service();
+            if let Err(e) = provider_health.save(dir) {
+                eprintln!(
+                    "[resume] Warning: failed to save provider health state: {}",
+                    e
+                );
+            }
+
+            if !json && (was_paused || !paused_providers.is_empty()) {
+                if was_paused {
+                    println!("Cleared service pause due to provider failures");
+                }
+                if !paused_providers.is_empty() {
+                    println!("Resumed providers: {}", paused_providers.join(", "));
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[resume] Warning: failed to load provider health state: {}",
+                e
+            );
+        }
+    }
+
     let response = send_request(dir, &IpcRequest::Resume)?;
 
     if !response.ok {
@@ -1929,6 +3415,497 @@ pub fn run_resume(_dir: &Path, _json: bool) -> Result<()> {
     anyhow::bail!("Service daemon is only supported on Unix systems")
 }
 
+/// Freeze all running agents (SIGSTOP) and pause the coordinator
+#[cfg(unix)]
+pub fn run_freeze(dir: &Path, json: bool) -> Result<()> {
+    guard_agent_stop_pause()?;
+
+    let response = send_request(dir, &IpcRequest::Freeze)?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if json {
+        if let Some(data) = &response.data {
+            println!("{}", serde_json::to_string_pretty(data)?);
+        }
+    } else {
+        let frozen_count = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("frozen_count"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let status = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("frozen");
+
+        if status == "already_frozen" {
+            println!("Service is already frozen.");
+        } else {
+            println!("Froze {} agent(s). Service paused.", frozen_count);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_freeze(_dir: &Path, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Thaw all frozen agents (SIGCONT) and resume the coordinator
+#[cfg(unix)]
+pub fn run_thaw(dir: &Path, json: bool) -> Result<()> {
+    let response = send_request(dir, &IpcRequest::Thaw)?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if json {
+        if let Some(data) = &response.data {
+            println!("{}", serde_json::to_string_pretty(data)?);
+        }
+    } else {
+        let thawed_count = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("thawed_count"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let dead_count = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("dead_pids"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let status = response
+            .data
+            .as_ref()
+            .and_then(|d| d.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("thawed");
+
+        if status == "not_frozen" {
+            println!("Service is not frozen.");
+        } else {
+            let mut msg = format!("Thawed {} agent(s). Service resumed.", thawed_count);
+            if dead_count > 0 {
+                msg.push_str(&format!(" ({} agent(s) died while frozen.)", dead_count));
+            }
+            println!("{}", msg);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_thaw(_dir: &Path, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Create a new coordinator session via IPC
+#[cfg(unix)]
+pub fn run_create_coordinator(
+    dir: &Path,
+    name: Option<&str>,
+    model: Option<&str>,
+    executor: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let response = send_request(
+        dir,
+        &IpcRequest::CreateChat {
+            name: name.map(|s| s.to_string()),
+            model: model.map(|s| s.to_string()),
+            executor: executor.map(|s| s.to_string()),
+        },
+    )?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if let Some(data) = &response.data {
+        println!("{}", serde_json::to_string_pretty(data)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_create_coordinator(
+    _dir: &Path,
+    _name: Option<&str>,
+    _model: Option<&str>,
+    _executor: Option<&str>,
+    _json: bool,
+) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Delete a coordinator session via IPC
+#[cfg(unix)]
+pub fn run_delete_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
+    let response = send_request(dir, &IpcRequest::DeleteChat { chat_id: coordinator_id })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if let Some(data) = &response.data {
+        println!("{}", serde_json::to_string_pretty(data)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_delete_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Hot-swap a coordinator's executor / model via IPC.
+#[cfg(unix)]
+pub fn run_set_coordinator_executor(
+    dir: &Path,
+    coordinator_id: u32,
+    executor: Option<&str>,
+    model: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let response = send_request(
+        dir,
+        &IpcRequest::SetChatExecutor {
+            chat_id: coordinator_id,
+            executor: executor.map(String::from),
+            model: model.map(String::from),
+        },
+    )?;
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({"error": msg}))?
+            );
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+    if let Some(data) = &response.data {
+        if json {
+            println!("{}", serde_json::to_string_pretty(data)?);
+        } else {
+            println!(
+                "Coordinator {} reconfigured. Supervisor will respawn the handler shortly.",
+                coordinator_id
+            );
+            if let Some(e) = data.get("executor").and_then(|v| v.as_str()) {
+                println!("  executor = {}", e);
+            }
+            if let Some(m) = data.get("model").and_then(|v| v.as_str()) {
+                println!("  model    = {}", m);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_set_coordinator_executor(
+    _dir: &Path,
+    _coordinator_id: u32,
+    _executor: Option<&str>,
+    _model: Option<&str>,
+    _json: bool,
+) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Archive a coordinator session via IPC (mark as Done)
+#[cfg(unix)]
+pub fn run_archive_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
+    let response = send_request(dir, &IpcRequest::ArchiveChat { chat_id: coordinator_id })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if let Some(data) = &response.data {
+        println!("{}", serde_json::to_string_pretty(data)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_archive_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Stop a coordinator session via IPC (kill agent, reset to Open)
+#[cfg(unix)]
+pub fn run_stop_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
+    let response = send_request(dir, &IpcRequest::StopChat { chat_id: coordinator_id })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if let Some(data) = &response.data {
+        println!("{}", serde_json::to_string_pretty(data)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_stop_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Bulk-purge all chat agents via IPC.
+///
+/// Archives every chat-loop task in the graph, kills any live chat handler
+/// processes, and prevents respawn on daemon restart. Idempotent — re-running
+/// when no chats exist (or all are already purged) is a no-op.
+///
+/// Preserves chat task nodes + history. Reversible via `wg chat new`.
+#[cfg(unix)]
+pub fn run_purge_chats(dir: &Path, json: bool) -> Result<()> {
+    // If the daemon isn't running, fall back to direct graph mutation so the
+    // user can clean up post-crash without needing to restart the daemon
+    // first. This keeps the command useful when the supervisor itself is
+    // wedged.
+    let socket_path = default_socket_path(dir);
+    if socket_accepting(&socket_path) {
+        let response = send_request(dir, &IpcRequest::PurgeChats)?;
+        if !response.ok {
+            let msg = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
+            if json {
+                let output = serde_json::json!({ "error": msg });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                eprintln!("Error: {}", msg);
+            }
+            anyhow::bail!("{}", msg);
+        }
+        if let Some(data) = &response.data {
+            if json {
+                println!("{}", serde_json::to_string_pretty(data)?);
+            } else {
+                let purged = data
+                    .get("purged")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let skipped = data
+                    .get("skipped")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                println!(
+                    "Purged {} chat agent(s), skipped {} already-archived",
+                    purged, skipped
+                );
+            }
+        }
+        Ok(())
+    } else {
+        // Daemon not running: do the same archive operation directly via the
+        // graph, then clean up coordinator-state files so a future daemon
+        // start does not see stale state.
+        let purged = direct_purge_chats(dir)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "purged": purged,
+                    "daemon_running": false,
+                }))?
+            );
+        } else {
+            println!(
+                "Daemon not running — purged {} chat agent(s) directly via graph",
+                purged.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+pub fn run_purge_chats(_dir: &Path, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Direct graph-mutation purge used when the daemon is not running.
+/// Archives every chat-loop task and removes per-coordinator state files so
+/// the next daemon boot does not resurrect them.
+#[cfg(unix)]
+fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
+    let graph_path = crate::commands::graph_path(dir);
+    let mut purged: Vec<u32> = Vec::new();
+    workgraph::parser::modify_graph(&graph_path, |graph| {
+        let mut chat_ids: std::collections::BTreeSet<u32> =
+            std::collections::BTreeSet::new();
+        for task in graph.tasks() {
+            let has_chat_tag = task
+                .tags
+                .iter()
+                .any(|t| workgraph::chat_id::is_chat_loop_tag(t));
+            if !has_chat_tag {
+                continue;
+            }
+            if task.tags.iter().any(|t| t == "archived") {
+                continue;
+            }
+            if let Some(id) = workgraph::chat_id::parse_chat_task_id(&task.id) {
+                chat_ids.insert(id);
+            }
+        }
+        let mut changed = false;
+        for id in &chat_ids {
+            let new_id = workgraph::chat_id::format_chat_task_id(*id);
+            let legacy_id = format!(".coordinator-{}", id);
+            let resolved = if graph.get_task(&new_id).is_some() {
+                Some(new_id.clone())
+            } else if graph.get_task(&legacy_id).is_some() {
+                Some(legacy_id.clone())
+            } else {
+                None
+            };
+            let Some(rid) = resolved else { continue };
+            let task = graph.get_task_mut(&rid).unwrap();
+            task.status = workgraph::graph::Status::Done;
+            task.tags
+                .retain(|t| !workgraph::chat_id::is_chat_loop_tag(t));
+            if !task.tags.contains(&"archived".to_string()) {
+                task.tags.push("archived".to_string());
+            }
+            task.log.push(workgraph::graph::LogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                actor: Some("wg service purge-chats".to_string()),
+                user: Some(workgraph::current_user()),
+                message: format!("Chat {} purged (daemon offline)", id),
+            });
+            purged.push(*id);
+            changed = true;
+        }
+        changed
+    })?;
+    // Best-effort: remove per-coordinator state files so a daemon restart
+    // does not see stale executor/model overrides for purged chats.
+    for id in &purged {
+        CoordinatorState::remove_for(dir, *id);
+    }
+    Ok(purged)
+}
+
+/// Interrupt a coordinator's current generation via IPC (sends SIGINT, does NOT kill).
+#[cfg(unix)]
+pub fn run_interrupt_coordinator(dir: &Path, coordinator_id: u32, json: bool) -> Result<()> {
+    let response = send_request(dir, &IpcRequest::InterruptChat { chat_id: coordinator_id })?;
+
+    if !response.ok {
+        let msg = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        if json {
+            let output = serde_json::json!({ "error": msg });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    if let Some(data) = &response.data {
+        println!("{}", serde_json::to_string_pretty(data)?);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn run_interrupt_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -> Result<()> {
+    anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Check if a Unix socket is accepting connections by doing a quick connect+drop.
+#[cfg(unix)]
+fn socket_accepting(socket: &Path) -> bool {
+    UnixStream::connect(socket).is_ok()
+}
+
 /// Public wrapper: check if the service process is alive
 pub fn is_service_alive(pid: u32) -> bool {
     is_process_alive(pid)
@@ -1939,33 +3916,92 @@ pub fn is_service_paused(dir: &Path) -> bool {
     CoordinatorState::load(dir).is_some_and(|c| c.paused)
 }
 
-/// Send an IPC request to the running service
+/// Send an IPC request to the running service.
+///
+/// Retries transient connection failures (ECONNREFUSED, broken pipe) up to 2
+/// times with short exponential backoff (50ms, 100ms) before giving up.
+/// Distinguishes "daemon not running" from "daemon unreachable" in errors.
 #[cfg(unix)]
 pub fn send_request(dir: &Path, request: &IpcRequest) -> Result<IpcResponse> {
-    let state = ServiceState::load(dir)?.ok_or_else(|| anyhow::anyhow!("Service not running"))?;
+    let state = ServiceState::load(dir)?.ok_or_else(|| {
+        anyhow::anyhow!("Service not running (no state file). Start it with 'wg service start'.")
+    })?;
+
+    if !is_process_alive(state.pid) {
+        anyhow::bail!(
+            "Service daemon (PID {}) is not running. \
+             The state file is stale — start a new service with 'wg service start'.",
+            state.pid
+        );
+    }
 
     let socket = PathBuf::from(&state.socket_path);
-    let mut stream = UnixStream::connect(&socket)
-        .with_context(|| format!("Failed to connect to service at {:?}", socket))?;
+    if !socket.exists() {
+        anyhow::bail!(
+            "Service socket {:?} does not exist, but daemon PID {} is alive. \
+             The daemon may still be starting up — try again shortly, \
+             or restart with 'wg service start --force'.",
+            socket,
+            state.pid
+        );
+    }
 
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // Retry transient connection failures with short backoff.
+    const MAX_RETRIES: u32 = 2;
+    const BASE_BACKOFF_MS: u64 = 50;
 
-    let json = serde_json::to_string(&request)?;
-    writeln!(stream, "{}", json)?;
-    stream.flush()?;
+    let mut last_err = None;
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(
+                BASE_BACKOFF_MS * (1 << (attempt - 1)),
+            ));
+        }
 
-    let reader = BufReader::new(&stream);
-    for line in reader.lines() {
-        let line = line.context("Failed to read response")?;
-        if !line.is_empty() {
-            let response: IpcResponse =
-                serde_json::from_str(&line).context("Failed to parse response")?;
-            return Ok(response);
+        match UnixStream::connect(&socket) {
+            Ok(mut stream) => {
+                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+                let json = serde_json::to_string(&request)?;
+                writeln!(stream, "{}", json)?;
+                stream.flush()?;
+
+                let reader = BufReader::new(&stream);
+                for line in reader.lines() {
+                    let line = line.context("Failed to read response")?;
+                    if !line.is_empty() {
+                        let response: IpcResponse =
+                            serde_json::from_str(&line).context("Failed to parse response")?;
+                        return Ok(response);
+                    }
+                }
+
+                anyhow::bail!("No response from service")
+            }
+            Err(e) => {
+                let retryable = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::BrokenPipe
+                );
+                if !retryable || attempt == MAX_RETRIES {
+                    last_err = Some(e);
+                    break;
+                }
+                last_err = Some(e);
+            }
         }
     }
 
-    anyhow::bail!("No response from service")
+    let err = last_err.unwrap();
+    anyhow::bail!(
+        "Could not connect to service at {:?} (PID {}, {} retries exhausted): {}. \
+         The daemon may be overloaded — try again, or restart with 'wg service start --force'.",
+        socket,
+        state.pid,
+        MAX_RETRIES,
+        err
+    )
 }
 
 #[cfg(not(unix))]
@@ -2314,5 +4350,765 @@ poll_interval = 60
             status_line
         );
         assert!(status_line.contains("0 alive"));
+    }
+
+    #[test]
+    fn test_guard_agent_stop_pause_blocks_when_agent() {
+        // SAFETY: test-only env manipulation; these tests are not parallel-safe
+        // but each test restores the var before returning.
+        unsafe { std::env::set_var("WG_AGENT_ID", "test-agent") };
+        let result = guard_agent_stop_pause();
+        unsafe { std::env::remove_var("WG_AGENT_ID") };
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("agents cannot stop/pause the service"),
+            "Expected agent guard message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_guard_agent_stop_pause_allows_when_not_agent() {
+        // Ensure WG_AGENT_ID is not set
+        unsafe { std::env::remove_var("WG_AGENT_ID") };
+        let result = guard_agent_stop_pause();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cleanup_legacy_daemon_tasks_preserves_coordinator_tasks() {
+        use workgraph::graph::{Node, Status, Task};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        // .compact-* and .archive-* are now retired and should be abandoned on boot.
+        for id in [
+            ".coordinator-0",
+            ".archive-0",
+            ".registry-refresh-0",
+            ".user-erik-0",
+            ".compact-0",
+        ] {
+            graph.add_node(Node::Task(Task {
+                id: id.to_string(),
+                title: id.to_string(),
+                status: Status::Open,
+                ..Default::default()
+            }));
+        }
+        graph.add_node(Node::Task(Task {
+            id: "real-task".to_string(),
+            title: "real-task".to_string(),
+            status: Status::Open,
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        cleanup_legacy_daemon_tasks(dir, &logger);
+
+        let graph = load_graph(&gp).unwrap();
+        // Chat tasks should NOT be abandoned (TUI needs them for discovery)
+        assert_eq!(
+            graph.get_task(".coordinator-0").unwrap().status,
+            Status::Open
+        );
+
+        // All legacy daemon-managed tasks (including retired compact/archive) are abandoned.
+        for id in [
+            ".archive-0",
+            ".registry-refresh-0",
+            ".user-erik-0",
+            ".compact-0",
+        ] {
+            assert_eq!(graph.get_task(id).unwrap().status, Status::Abandoned);
+        }
+        assert_eq!(graph.get_task("real-task").unwrap().status, Status::Open);
+    }
+
+    #[test]
+    fn test_cleanup_legacy_daemon_tasks_noop_on_bare_graph() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gp = dir.join("graph.jsonl");
+
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &gp).unwrap();
+
+        let logger = DaemonLogger::open(dir).unwrap();
+        cleanup_legacy_daemon_tasks(dir, &logger);
+
+        let graph = load_graph(&gp).unwrap();
+        assert_eq!(graph.tasks().count(), 0);
+    }
+
+    #[test]
+    fn test_compute_exe_hash_known_file() {
+        // Create a temp file with known content and verify hash is deterministic.
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test_binary");
+        fs::write(&path, b"hello world").unwrap();
+
+        let hash1 = compute_exe_hash(&path).unwrap();
+        let hash2 = compute_exe_hash(&path).unwrap();
+        assert_eq!(
+            hash1, hash2,
+            "hashing the same file twice should be identical"
+        );
+
+        // Verify against known SHA-256 of "hello world"
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert_eq!(hex::encode(hash1), expected);
+    }
+
+    #[test]
+    fn test_compute_exe_hash_detects_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test_binary");
+        fs::write(&path, b"version 1").unwrap();
+        let hash1 = compute_exe_hash(&path).unwrap();
+
+        fs::write(&path, b"version 2").unwrap();
+        let hash2 = compute_exe_hash(&path).unwrap();
+        assert_ne!(
+            hash1, hash2,
+            "different content should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_compute_exe_hash_nonexistent() {
+        let result = compute_exe_hash(Path::new("/nonexistent/binary"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_short_hash_format() {
+        let hash = [
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let s = short_hash(&hash);
+        assert_eq!(s, "abcdef012345");
+        assert_eq!(s.len(), 12, "short_hash should produce 12 hex chars");
+    }
+
+    #[test]
+    fn test_per_user_coord_state_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let path0 = coordinator_state_path(temp_dir.path(), 0);
+        assert_eq!(
+            path0,
+            temp_dir
+                .path()
+                .join("service")
+                .join("coordinator-state-0.json")
+        );
+        let path1 = coordinator_state_path(temp_dir.path(), 1);
+        assert_eq!(
+            path1,
+            temp_dir
+                .path()
+                .join("service")
+                .join("coordinator-state-1.json")
+        );
+        let path42 = coordinator_state_path(temp_dir.path(), 42);
+        assert_eq!(
+            path42,
+            temp_dir
+                .path()
+                .join("service")
+                .join("coordinator-state-42.json")
+        );
+    }
+
+    #[test]
+    fn test_per_user_coord_state_per_id_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Save state for coordinator 0
+        let state0 = CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            accumulated_tokens: 1000,
+            ..Default::default()
+        };
+        state0.save_for(dir, 0);
+
+        // Save state for coordinator 1
+        let state1 = CoordinatorState {
+            enabled: true,
+            max_agents: 2,
+            accumulated_tokens: 5000,
+            ..Default::default()
+        };
+        state1.save_for(dir, 1);
+
+        // Load each and verify independence
+        let loaded0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded0.max_agents, 4);
+        assert_eq!(loaded0.accumulated_tokens, 1000);
+
+        let loaded1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(loaded1.max_agents, 2);
+        assert_eq!(loaded1.accumulated_tokens, 5000);
+
+        // Coordinator 2 should not exist
+        assert!(CoordinatorState::load_for(dir, 2).is_none());
+    }
+
+    #[test]
+    fn test_per_user_coord_backward_compat_legacy_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Write to legacy shared file (coordinator-state.json)
+        let legacy_state = CoordinatorState {
+            enabled: true,
+            max_agents: 8,
+            accumulated_tokens: 42,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        let content = serde_json::to_string_pretty(&legacy_state).unwrap();
+        fs::write(&legacy_path, content).unwrap();
+
+        // No per-ID file for coordinator 0 → should fall back to legacy
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 8);
+        assert_eq!(loaded.accumulated_tokens, 42);
+
+        // load() shorthand should also work (backward compat)
+        let loaded_compat = CoordinatorState::load(dir).unwrap();
+        assert_eq!(loaded_compat.max_agents, 8);
+
+        // Non-zero coordinator should NOT fall back to legacy
+        assert!(CoordinatorState::load_for(dir, 1).is_none());
+    }
+
+    #[test]
+    fn test_per_user_coord_per_id_overrides_legacy() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Write legacy file
+        let legacy = CoordinatorState {
+            max_agents: 8,
+            accumulated_tokens: 100,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        // Write per-ID file for coordinator 0
+        let per_id = CoordinatorState {
+            max_agents: 16,
+            accumulated_tokens: 9999,
+            ..Default::default()
+        };
+        per_id.save_for(dir, 0);
+
+        // Per-ID file should take precedence over legacy
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 16);
+        assert_eq!(loaded.accumulated_tokens, 9999);
+    }
+
+    #[test]
+    fn test_per_user_coord_two_coordinators_no_state_conflict() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Simulate alice's coordinator (ID 1)
+        let mut alice_state = CoordinatorState {
+            enabled: true,
+            max_agents: 3,
+            accumulated_tokens: 0,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        alice_state.save_for(dir, 1);
+
+        // Simulate bob's coordinator (ID 2)
+        let mut bob_state = CoordinatorState {
+            enabled: true,
+            max_agents: 5,
+            accumulated_tokens: 0,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        bob_state.save_for(dir, 2);
+
+        // Update alice's tokens independently
+        alice_state.accumulated_tokens = 500;
+        alice_state.save_for(dir, 1);
+
+        // Update bob's tokens independently
+        bob_state.accumulated_tokens = 1200;
+        bob_state.save_for(dir, 2);
+
+        // Verify no cross-contamination
+        let alice_loaded = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(alice_loaded.accumulated_tokens, 500);
+        assert_eq!(alice_loaded.max_agents, 3);
+
+        let bob_loaded = CoordinatorState::load_for(dir, 2).unwrap();
+        assert_eq!(bob_loaded.accumulated_tokens, 1200);
+        assert_eq!(bob_loaded.max_agents, 5);
+    }
+
+    #[test]
+    fn test_per_user_coord_remove_per_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let state = CoordinatorState {
+            enabled: true,
+            ..Default::default()
+        };
+        state.save_for(dir, 3);
+        assert!(CoordinatorState::load_for(dir, 3).is_some());
+
+        CoordinatorState::remove_for(dir, 3);
+        assert!(CoordinatorState::load_for(dir, 3).is_none());
+    }
+
+    #[test]
+    fn test_per_user_coord_remove_cleans_legacy() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create both legacy and per-ID file for coordinator 0
+        let state = CoordinatorState {
+            enabled: true,
+            ..Default::default()
+        };
+        state.save_for(dir, 0);
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, "{}").unwrap();
+
+        // remove() should clean up both
+        CoordinatorState::remove(dir);
+        assert!(CoordinatorState::load_for(dir, 0).is_none());
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn test_per_coord_state_load_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // No files → empty
+        assert!(CoordinatorState::load_all(dir).is_empty());
+
+        // Create three coordinators
+        CoordinatorState {
+            enabled: true,
+            max_agents: 4,
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            enabled: true,
+            max_agents: 2,
+            accumulated_tokens: 200,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        CoordinatorState {
+            enabled: true,
+            max_agents: 6,
+            accumulated_tokens: 300,
+            ..Default::default()
+        }
+        .save_for(dir, 5);
+
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 3);
+        // Should be sorted by ID
+        assert_eq!(all[0].0, 0);
+        assert_eq!(all[1].0, 1);
+        assert_eq!(all[2].0, 5);
+        assert_eq!(all[0].1.accumulated_tokens, 100);
+        assert_eq!(all[1].1.accumulated_tokens, 200);
+        assert_eq!(all[2].1.accumulated_tokens, 300);
+    }
+
+    #[test]
+    fn test_per_coord_state_load_all_legacy_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Write only a legacy file
+        let legacy = CoordinatorState {
+            enabled: true,
+            max_agents: 8,
+            accumulated_tokens: 42,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, 0);
+        assert_eq!(all[0].1.accumulated_tokens, 42);
+    }
+
+    #[test]
+    fn test_per_coord_state_total_accumulated_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Empty dir → 0
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 0);
+
+        // Coordinator 0: 100 tokens
+        CoordinatorState {
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        // Coordinator 1: 250 tokens
+        CoordinatorState {
+            accumulated_tokens: 250,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        // Coordinator 2: 650 tokens
+        CoordinatorState {
+            accumulated_tokens: 650,
+            ..Default::default()
+        }
+        .save_for(dir, 2);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 1000);
+    }
+
+    #[test]
+    fn test_per_coord_state_reset_all_accumulated_tokens() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        CoordinatorState {
+            accumulated_tokens: 5000,
+            max_agents: 4,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            accumulated_tokens: 3000,
+            max_agents: 2,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 8000);
+
+        CoordinatorState::reset_all_accumulated_tokens(dir);
+
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 0);
+        // Non-token fields should be preserved
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(c0.max_agents, 4);
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(c1.max_agents, 2);
+    }
+
+    #[test]
+    fn test_per_coord_state_remove_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create per-ID files and a legacy file
+        CoordinatorState::default().save_for(dir, 0);
+        CoordinatorState::default().save_for(dir, 1);
+        CoordinatorState::default().save_for(dir, 5);
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, "{}").unwrap();
+
+        assert_eq!(CoordinatorState::load_all(dir).len(), 3);
+        assert!(legacy_path.exists());
+
+        CoordinatorState::remove_all(dir);
+
+        assert!(CoordinatorState::load_all(dir).is_empty());
+        assert!(!legacy_path.exists());
+        assert!(CoordinatorState::load_for(dir, 0).is_none());
+        assert!(CoordinatorState::load_for(dir, 1).is_none());
+        assert!(CoordinatorState::load_for(dir, 5).is_none());
+    }
+
+    #[test]
+    fn test_per_coord_state_migrate_legacy() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let legacy = CoordinatorState {
+            enabled: true,
+            max_agents: 8,
+            accumulated_tokens: 999,
+            executor: "claude".to_string(),
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let per_id_path = coordinator_state_path(dir, 0);
+        assert!(!per_id_path.exists());
+
+        CoordinatorState::migrate_legacy(dir);
+
+        // Legacy file should be removed
+        assert!(!legacy_path.exists());
+        // Per-ID file should exist with same data
+        assert!(per_id_path.exists());
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 8);
+        assert_eq!(loaded.accumulated_tokens, 999);
+        assert_eq!(loaded.executor, "claude");
+    }
+
+    #[test]
+    fn test_per_coord_state_migrate_legacy_noop_when_per_id_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create both legacy and per-ID files
+        let legacy = CoordinatorState {
+            max_agents: 99,
+            ..Default::default()
+        };
+        let legacy_path = coordinator_state_path_legacy(dir);
+        fs::write(&legacy_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let per_id = CoordinatorState {
+            max_agents: 4,
+            ..Default::default()
+        };
+        per_id.save_for(dir, 0);
+
+        CoordinatorState::migrate_legacy(dir);
+
+        // Per-ID file should keep its original data (not overwritten by legacy)
+        let loaded = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(loaded.max_agents, 4);
+        // Legacy file should NOT be removed (migration is a no-op)
+        assert!(legacy_path.exists());
+    }
+
+    #[test]
+    fn test_per_coord_state_update_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        CoordinatorState {
+            paused: false,
+            max_agents: 4,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            paused: false,
+            max_agents: 2,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        // Pause all coordinators
+        CoordinatorState::update_all(dir, |cs| cs.paused = true);
+
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert!(c0.paused);
+        assert_eq!(c0.max_agents, 4); // Unchanged
+
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert!(c1.paused);
+        assert_eq!(c1.max_agents, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_per_coord_state_two_coordinators_simultaneous_write() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Initialize state for two coordinators
+        CoordinatorState::default().save_for(dir, 0);
+        CoordinatorState::default().save_for(dir, 1);
+
+        let dir_a = dir.to_path_buf();
+        let dir_b = dir.to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+
+        // Thread A writes coordinator 0 repeatedly
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            for i in 0..100u64 {
+                let mut state = CoordinatorState::load_or_default_for(&dir_a, 0);
+                state.accumulated_tokens = i;
+                state.ticks = i;
+                state.max_agents = 4;
+                state.save_for(&dir_a, 0);
+            }
+        });
+
+        // Thread B writes coordinator 1 repeatedly
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            for i in 0..100u64 {
+                let mut state = CoordinatorState::load_or_default_for(&dir_b, 1);
+                state.accumulated_tokens = i * 10;
+                state.ticks = i;
+                state.max_agents = 8;
+                state.save_for(&dir_b, 1);
+            }
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // Both files should exist and be valid JSON (no corruption from concurrent writes)
+        let c0 = CoordinatorState::load_for(dir, 0).unwrap();
+        assert_eq!(c0.max_agents, 4);
+        assert_eq!(c0.ticks, 99);
+        assert_eq!(c0.accumulated_tokens, 99);
+
+        let c1 = CoordinatorState::load_for(dir, 1).unwrap();
+        assert_eq!(c1.max_agents, 8);
+        assert_eq!(c1.ticks, 99);
+        assert_eq!(c1.accumulated_tokens, 990);
+    }
+
+    #[test]
+    fn test_per_coord_state_service_status_reads_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        // Create state for coordinators 0, 1, 2
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 100,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 200,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+
+        CoordinatorState {
+            enabled: true,
+            accumulated_tokens: 300,
+            ..Default::default()
+        }
+        .save_for(dir, 2);
+
+        // load_all should return all three
+        let all = CoordinatorState::load_all(dir);
+        assert_eq!(all.len(), 3);
+
+        // total_accumulated_tokens should sum all
+        assert_eq!(CoordinatorState::total_accumulated_tokens(dir), 600);
+
+        // Coordinator 0 should be loadable independently
+        let c0 = CoordinatorState::load_or_default_for(dir, 0);
+        assert_eq!(c0.accumulated_tokens, 100);
+    }
+
+    /// `direct_purge_chats` is the daemon-offline path of `run_purge_chats`.
+    /// It must archive every chat-loop task in-place AND remove per-coord
+    /// state files so a future daemon start does not see stale state.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_purge_chats_archives_and_removes_state_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+            id: ".chat-0".to_string(),
+            title: "Chat 0".to_string(),
+            status: workgraph::graph::Status::InProgress,
+            tags: vec!["chat-loop".to_string()],
+            ..Default::default()
+        }));
+        graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+            id: ".chat-1".to_string(),
+            title: "Chat 1".to_string(),
+            status: workgraph::graph::Status::InProgress,
+            tags: vec!["chat-loop".to_string()],
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // Per-coord state files should be removed by purge.
+        CoordinatorState {
+            enabled: true,
+            ..Default::default()
+        }
+        .save_for(dir, 0);
+        CoordinatorState {
+            enabled: true,
+            ..Default::default()
+        }
+        .save_for(dir, 1);
+        assert!(CoordinatorState::load_for(dir, 0).is_some());
+        assert!(CoordinatorState::load_for(dir, 1).is_some());
+
+        let purged = direct_purge_chats(dir).expect("direct_purge_chats");
+        assert_eq!(purged.len(), 2);
+
+        // Graph: both chats archived.
+        let g = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        let t0 = g.get_task(".chat-0").unwrap();
+        assert_eq!(t0.status, workgraph::graph::Status::Done);
+        assert!(t0.tags.contains(&"archived".to_string()));
+        let t1 = g.get_task(".chat-1").unwrap();
+        assert_eq!(t1.status, workgraph::graph::Status::Done);
+        assert!(t1.tags.contains(&"archived".to_string()));
+
+        // State files: gone.
+        assert!(CoordinatorState::load_for(dir, 0).is_none());
+        assert!(CoordinatorState::load_for(dir, 1).is_none());
+
+        // Idempotent: re-running on already-archived graph yields zero new
+        // archives, and does not error.
+        let purged2 = direct_purge_chats(dir).expect("idempotent re-purge");
+        assert!(purged2.is_empty());
     }
 }

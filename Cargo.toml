@@ -33,26 +33,38 @@ toml = "0.8"
 serde_yaml = "0.9"
 dirs = "5.0"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process"] }
-ratatui = "0.29"
-crossterm = "0.28"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "signal"] }
+rustyline = "14"
+ratatui = "0.30"
+crossterm = "0.29"
 ascii-dag = "0.8"
 zstd = "0.13"
 dialoguer = "0.11"
 walkdir = "2"
-ansi-to-tui = "7"
+ansi-to-tui = "8"
 strip-ansi-escapes = "0.2"
 fuzzy-matcher = "0.3"
-tui-tree-widget = "0.23"
+tui-tree-widget = "0.24"
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
-syntect-tui = { version = "3", default-features = false }
+# syntect-tui 3.0.6 is pinned to ratatui 0.29 and isn't yet updated
+# for ratatui 0.30. We inline the (small) Style/Span conversion in
+# `src/tui/syntect_convert.rs` to avoid being stuck on the older
+# ratatui until upstream catches up.
 regex = "1"
 async-trait = "0.1"
+html-escape = "0.2"
 futures-util = "0.3"
-reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "stream", "rustls-tls"], default-features = false }
 glob = "0.3"
 unicode-width = "0.2"
-edtui = "0.9"
+edtui = "0.11"
+csv = "1.3"
+cron = "0.12"
+log = "0.4"
+env_logger = "0.11"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+rquest = { version = "5", features = ["json", "gzip", "brotli"] }
+rquest-util = "2"
 
 # Optional Matrix integration (requires sqlite3)
 matrix-sdk = { version = "0.16", features = ["e2e-encryption", "sqlite"], optional = true }
@@ -65,9 +77,22 @@ teloxide = { version = "0.13", features = ["macros"], optional = true }
 # Optional Email integration (SMTP via lettre)
 lettre = { version = "0.11", features = ["tokio1-native-tls", "builder", "hostname"], optional = true }
 
+fast_html2md = "0.0.61"
+url = "2.4"
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-mini = "0.5"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+tiktoken-rs = "0.7"
 pulldown-cmark = "0.13.1"
 hmac = "0.12.1"
 hex = "0.4.3"
+
+# PTY-embed: spawn `wg nex` (or any command) as a child of the
+# ratatui TUI with a pseudo-terminal, render its output as a
+# terminal-cell grid, forward key events to its stdin.
+portable-pty = "0.9"
+vt100 = "0.16"
+tui-term = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

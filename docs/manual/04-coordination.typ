@@ -18,36 +18,64 @@ One detail matters more than it might seem: agents spawned by the daemon are _de
 
 The coordinator's heartbeat is the _tick_—a single pass through the scheduling logic. Two things trigger ticks: IPC events (immediate, reactive) and a background poll timer (a safety net that catches manual edits to the graph file). The poll interval defaults to 60 seconds and is configurable via `config.toml` or `wg service reload --poll-interval N`.
 
-Each tick has six phases:
+Each tick proceeds through a series of phases. A preliminary phase zero processes the coordinator's chat inbox (user-facing messages that arrived since the last tick). Then the numbered phases run:
 
-+ *Reap zombies.* Even though agents run in their own sessions, they remain children of the daemon process. When an agent exits, it becomes a zombie until the parent calls `waitpid`. The tick begins by reaping all zombies so that subsequent PID checks return accurate results.
+*Phase 1: Clean up dead agents and count slots.* The coordinator walks the agent registry and checks each alive agent's PID. If the process is gone, the agent is dead. Dead agents have their tasks unclaimed—the task status reverts to open, ready for re-dispatch. The coordinator then counts truly alive agents (not just registry entries, but processes with running PIDs) and compares against `max_agents`. If all slots are full, the tick ends early.
 
-+ *Clean up dead agents and count slots.* The coordinator walks the agent registry and checks each alive agent's PID. If the process is gone, the agent is dead. Dead agents have their tasks unclaimed—the task status reverts to open, ready for re-dispatch. The coordinator then counts truly alive agents (not just registry entries, but processes with running PIDs) and compares against `max_agents`. If all slots are full, the tick ends early.
+*Phase 1.3: Zero-output agent detection.* Agents alive for five or more minutes with zero bytes written to their output stream are considered zombies—processes that launched but never produced work (typically due to API failures or stuck sessions). The coordinator kills these agents and unclaims their tasks. A three-layer circuit breaker prevents cascading waste: at the _agent_ level, the zombie is killed immediately; at the _per-task_ level, after two consecutive zero-output spawns for the same task, the task is failed rather than retried; at the _global_ level, if 50% or more of alive agents are zero-output, the coordinator pauses all spawning with exponential backoff (60 seconds up to a 15-minute maximum), preventing the system from burning compute against a downed API.
 
-+ *Build auto-assign meta-tasks.* If `auto_assign` is enabled in the agency configuration, the coordinator scans for ready tasks that have no agent identity bound to them. For each, it creates an `assign-{task-id}` meta-task that the original task is after. This meta-task, when dispatched, will spawn an assigner agent that inspects the agency's roster and picks the best fit. The meta-task is tagged `"assignment"` to prevent recursive auto-assignment—the coordinator never creates an assignment task for an assignment task.
+*Phase 1.5: Auto-checkpoint alive agents.* The coordinator saves a checkpoint for agents that have exceeded a configured turn count or elapsed time threshold. This preserves context for recovery if the agent is later killed or dies unexpectedly. A replacement agent can resume from the checkpoint rather than starting from scratch.
 
-+ *Build auto-evaluate meta-tasks.* If `auto_evaluate` is enabled, the coordinator creates `evaluate-{task-id}` meta-tasks that are after each work task. When the work task reaches a terminal status, the evaluation task becomes ready. Evaluation tasks use the shell executor to run `wg evaluate run`, which spawns a separate evaluator to score the work. Tasks assigned to human agents are skipped—the system does not presume to evaluate human judgment. Meta-tasks tagged `"evaluation"`, `"assignment"`, or `"evolution"` are excluded to prevent infinite regress.
+*Phase 2: Load graph.* The graph file is read from disk.
 
-+ *Save graph and find ready tasks.* If the auto-assign or auto-evaluate phases modified the graph (adding meta-tasks, adjusting dependencies), the coordinator saves it before proceeding. Then it computes the set of ready tasks. If no tasks are ready, the tick ends. If all tasks in the graph are terminal, the coordinator logs that the project is complete.
+*Phase 2.5: Cycle iteration evaluation.* If all members of a structural cycle are done and the cycle has not converged or hit `max_iterations`, the coordinator re-opens all members for the next iteration.
 
-+ *Spawn agents.* For each ready task, up to the number of available slots, the coordinator dispatches an agent. This is where the dispatch cycle—the core of the system—begins.
+*Phase 2.6: Cycle failure restart.* If a cycle member has failed and `restart_on_failure` is true (the default in `CycleConfig`), the coordinator re-activates the cycle for another attempt. This prevents a single transient failure from permanently halting an iterative workflow.
+
+*Phase 2.7: Wait/resume evaluation.* The coordinator checks all tasks in _waiting_ status for satisfied conditions—another task reaching a specified state, a timer expiring, a message arriving, or a human signal. Satisfied tasks transition back to _open_. The coordinator also detects and fails circular waits (task A waiting on task B waiting on task A).
+
+*Phase 2.8: Message-triggered resurrection.* Done tasks that have unread messages from whitelisted senders (the user, the coordinator, or dependent-task agents) are reopened so the next agent can address the message. Rate-limited to a maximum of three resurrections per task with a cooldown period.
+
+*Phase 3: Build auto-assign meta-tasks.* If `auto_assign` is enabled in the agency configuration, the coordinator scans for ready tasks that have no agent identity bound to them. For each, it creates an `assign-{task-id}` meta-task that the original task is after. This meta-task, when dispatched, will spawn an assigner agent that inspects the agency's roster and picks the best fit. The meta-task is tagged `"assignment"` to prevent recursive auto-assignment—the coordinator never creates an assignment task for an assignment task.
+
+*Phase 4: Build auto-evaluate meta-tasks.* If `auto_evaluate` is enabled, the coordinator creates `evaluate-{task-id}` meta-tasks that are after each work task. When the work task reaches a terminal status, the evaluation task becomes ready. Evaluation tasks use the shell executor to run `wg evaluate run`, which spawns a separate evaluator to score the work. Tasks assigned to human agents are skipped—the system does not presume to evaluate human judgment. Meta-tasks tagged `"evaluation"`, `"assignment"`, or `"evolution"` are excluded to prevent infinite regress.
+
+*Phase 4.5: FLIP verification.* If `flip_verification_threshold` is configured, the coordinator scans for tasks with FLIP scores below the threshold and creates `.verify-flip-{task-id}` verification tasks dispatched to a stronger model (Opus by default). FLIP (Fidelity via Latent Intent Probing) is an independent fidelity check that reconstructs what the task prompt must have been from the agent's output alone, then scores the match—see @sec-evolution for details.
+
+*Phase 4.6: Auto-evolve.* If `auto_evolve` is enabled, the coordinator triggers agent evolution when evaluation data warrants it. The evolver reads performance summaries and proposes structured operations—mutations, crossovers, gap-analysis, retirements—to improve the agency's identity space.
+
+*Phase 4.7: Auto-create.* If `auto_create` is enabled, the coordinator invokes the creator agent to expand the primitive store (roles, tradeoffs) when enough tasks have completed since the last invocation. The threshold is configurable via `auto_create_threshold` (default: 20 completed tasks).
+
+*Phase 5: Save graph and find ready tasks.* If previous phases modified the graph (adding meta-tasks, adjusting dependencies), the coordinator saves it before proceeding. Then it computes the set of ready tasks. If no tasks are ready, the tick ends. If all tasks in the graph are terminal, the coordinator logs that the project is complete. A global zero-output backoff check also runs here: if the backoff is active (from phase 1.3), spawning is skipped entirely.
+
+*Phase 6: Spawn agents.* For each ready task, up to the number of available slots, the coordinator dispatches an agent. This is where the dispatch cycle—the core of the system—begins.
 
 #figure(
   ```
-  ┌──────────────────────────────────────────────────┐
-  │                   TICK LOOP                       │
-  │                                                   │
-  │  1. reap_zombies()                                │
-  │  2. cleanup_dead_agents → count alive slots       │
-  │  3. build_auto_assign_tasks    (if enabled)       │
-  │  4. build_auto_evaluate_tasks  (if enabled)       │
-  │  5. save graph → find ready tasks                 │
-  │  6. spawn_agents_for_ready_tasks(slots_available) │
-  │                                                   │
-  │  Triggered by: IPC graph_changed │ poll timer     │
-  └──────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────┐
+  │                      TICK LOOP                        │
+  │                                                       │
+  │  0.  process_chat_inbox()                             │
+  │  1.  cleanup_dead_agents → count alive slots          │
+  │  1.3 zero_output_detection (circuit breaker)          │
+  │  1.5 auto_checkpoint_alive_agents                     │
+  │  2.  load graph                                       │
+  │  2.5 cycle_iteration_evaluation                       │
+  │  2.6 cycle_failure_restart                            │
+  │  2.7 wait_resume_evaluation                           │
+  │  2.8 message_triggered_resurrection                   │
+  │  3.  build_auto_assign_tasks       (if enabled)       │
+  │  4.  build_auto_evaluate_tasks     (if enabled)       │
+  │  4.5 build_flip_verification_tasks (if enabled)       │
+  │  4.6 auto_evolve                   (if enabled)       │
+  │  4.7 auto_create                   (if enabled)       │
+  │  5.  save graph → find ready tasks                    │
+  │  6.  spawn_agents_for_ready_tasks(slots_available)    │
+  │                                                       │
+  │  Triggered by: IPC graph_changed │ poll timer         │
+  └───────────────────────────────────────────────────────┘
   ```,
-  caption: [The six phases of a coordinator tick.],
+  caption: [The phases of a coordinator tick.],
 ) <fig-tick>
 
 == The Dispatch Cycle <dispatch>
@@ -56,9 +84,11 @@ Dispatch is the act of selecting a ready task and spawning an agent for it. It i
 
 For each ready task, the coordinator proceeds as follows:
 
-*Resolve the executor.* If the task has an `exec` field (a shell command), the executor is `shell`—no AI agent needed. Otherwise, the coordinator checks whether the task has an assigned agent identity. If it does, it looks up that agent's `executor` field (which might be `claude`, `shell`, or a custom executor). If no agent is assigned, the coordinator falls back to the service-level default executor (typically `claude`).
+*Resolve the executor and exec-mode.* If the task has an `exec` field (a shell command), the executor is `shell`—no AI agent needed. Otherwise, the coordinator checks whether the task has an assigned agent identity. If it does, it looks up that agent's `executor` field (which might be `claude`, `shell`, or a custom executor). If no agent is assigned, the coordinator falls back to the service-level default executor (typically `claude`).
 
-*Resolve the model.* Model selection follows a priority chain: the task's own `model` field takes precedence, then the coordinator's configured model, then the agent identity's model preference. This lets you pin specific tasks to specific models—a cheap model for routine evaluation tasks, a capable one for complex implementation.
+The task's `exec_mode` field further controls execution weight: `full` (default—complete tool access), `light` (read-only tools, suitable for analysis and review tasks), `bare` (only `wg` CLI commands, no file editing), or `shell` (no LLM—runs the task's `exec` field directly, like the shell executor). Exec-mode and executor are complementary: the executor determines _which backend_ runs the task; exec-mode determines _how much autonomy_ the agent has within that backend.
+
+*Resolve the model and provider.* Model selection uses a _dispatch role routing_ system. Every system function---task agents, evaluators, assigners, evolvers, triage, verifiers, compactors, placers---has its own configurable model and provider assignment, managed via `wg model routing` and `wg model set`. The task's own `model` field overrides the routing table for work tasks. Models can be specified using the unified `provider/model-name` format (e.g., `openrouter/meta-llama/llama-3.3-70b-instruct`) or as bare model names with a separate `--provider` flag. Provider options include `anthropic`, `openai`, `openrouter`, or `local`. This architecture lets you assign cheap, fast models to routine roles (evaluation, triage, assignment) while reserving capable models for complex work and evolution.
 
 *Build context from dependencies.* The coordinator reads each terminal dependency's artifacts (file paths recorded by the previous agent) and recent log entries. This context is injected into the prompt so the new agent knows what upstream work produced and what decisions were made. The agent does not start from a blank slate—it inherits the trail of work that came before it.
 
@@ -202,9 +232,84 @@ The full set of IPC commands:
   [`resume`], [Resumes the coordinator and triggers an immediate tick.],
   [`reconfigure`], [Updates `max_agents`, `executor`, `poll_interval`, or `model` at runtime without restart.],
   [`heartbeat`], [Records a heartbeat for an agent (used for liveness tracking).],
+  [`freeze`], [SIGSTOP all running agents and pause the coordinator.],
+  [`thaw`], [SIGCONT all frozen agents and resume the coordinator.],
+  [`add_task`], [Create a task (supports cross-repo dispatch via peers).],
+  [`query_task`], [Query a task's status (supports cross-repo query via peers).],
+  [`send_message`], [Send a message to a task's message queue.],
+  [`user_chat`], [Send a chat message to the coordinator agent.],
+  [`create_coordinator`], [Create a new coordinator instance.],
+  [`delete_coordinator`], [Delete a coordinator instance.],
+  [`archive_coordinator`], [Archive a coordinator (mark as Done).],
+  [`stop_coordinator`], [Stop a coordinator (kill agent, reset to Open).],
+  [`interrupt_coordinator`], [Interrupt a coordinator's current generation (SIGINT, does not kill).],
+  [`list_coordinators`], [List all active coordinators.],
 )
 
 The `reconfigure` command is particularly useful for live tuning. If a fan-out creates twenty parallel tasks and you only have five slots, you can bump `max_agents` to ten without stopping anything. When the fan-out completes and work converges, scale back down.
+
+== Multi-Coordinator Sessions <multi-coordinator>
+
+A single service daemon can host multiple coordinator sessions, each managing an independent scheduling context. This enables parallel workstreams within the same project—for example, one coordinator handling feature development while another handles maintenance tasks.
+
+Coordinator sessions are managed via service subcommands:
+
+- `wg service create-coordinator` creates a new session.
+- `wg service stop-coordinator` stops a running session (kills its agent and resets to open).
+- `wg service archive-coordinator` archives a completed session (marks it done).
+- `wg service delete-coordinator` removes a session entirely.
+
+The maximum number of concurrent coordinators is configured via `wg config --max-coordinators`. The `wg chat --coordinator <ID>` flag targets messages to a specific coordinator session. Coordinators share context across sessions---completed work and decisions from one coordinator's scope are visible to agents dispatched by another, preventing duplication and enabling continuity across workstreams.
+
+== Peer Communication <peer-communication>
+
+Workgraph projects can communicate across repository boundaries through the _peer_ system. `wg peer add <name> <path>` registers another workgraph instance as a named peer. Tasks can be created in a peer's graph via `wg add "title" --repo <peer-name>`, enabling cross-repo task dispatch without leaving the local CLI.
+
+`wg peer list` shows all configured peers with their service status (whether the peer's daemon is running). `wg peer status` performs a quick health check across all peers. This is distinct from agency federation (which shares identities and evaluations)---peer communication shares _work_ across project boundaries.
+
+== Compaction, Sweep, and Checkpoint <maintenance>
+
+Three maintenance commands support long-running projects:
+
+*Compaction.* `wg compact` distills the current graph state into a condensed summary file (`context.md`), providing a snapshot of project status, recent decisions, and key patterns. Within the service daemon, compaction runs as the `.compact-0` task—a structural cycle where the coordinator periodically introspects its own state and produces a compressed context for future agent prompts.
+
+*Sweep.* `wg sweep` detects orphaned in-progress tasks—tasks claimed by agents whose processes have died without triggering normal cleanup. It scans the agent registry, checks PIDs, and offers to reclaim or reset affected tasks. Sweep is a manual recovery tool for cases where the coordinator's normal dead-agent detection misses something (e.g., after a system reboot).
+
+*Checkpoint.* `wg checkpoint` lets a running agent save a progress snapshot during a long-running task. If the agent is interrupted—OOM-killed, timed out, or manually stopped—a replacement agent can resume from the checkpoint rather than starting from scratch. Checkpoints are stored alongside the task's artifacts and injected into the recovery context.
+
+== Service Restart and Coordinator Persistence <service-restart>
+
+`wg service restart` performs a graceful stop-then-start cycle. Running agents continue undisturbed (they are detached processes), but the coordinator re-reads configuration and starts fresh. This is the standard way to pick up configuration changes that `wg service reload` cannot apply.
+
+Coordinator tasks are preserved across restarts. When the daemon starts, it discovers existing coordinator tasks (those tagged `"coordinator-loop"`) and resumes them rather than creating new ones. This means the TUI, which depends on coordinator tasks for discovery, does not lose track of active coordinator sessions after a restart. Only truly legacy meta-tasks (archive, registry-refresh, and user tasks) are cleaned up during startup.
+
+== User Boards <user-boards>
+
+Humans need a persistent channel for asynchronous communication with the coordinator and agents. _User boards_ provide this. `wg user init` creates a per-user conversation board---a `.user-NAME` task with a message queue. The coordinator treats user boards specially: when a new message arrives on a board, the coordinator reopens it so the next agent can address the message.
+
+User boards enable the human-in-the-loop pattern without requiring the human to be present at dispatch time. A human can send a message to a board, go offline, and the coordinator will process it on the next tick. Messages can include task creation requests, status inquiries, or design feedback that the coordinator translates into graph operations.
+
+`wg user list` shows all boards (active and archived). `wg user archive` archives the current board and creates a fresh successor, preserving the conversation history while starting a clean thread. Boards are lightweight---they are regular tasks with a messaging convention, not a separate subsystem.
+
+== Provider Profiles and Cost Tracking <profiles-cost>
+
+Managing model and provider assignments across many dispatch roles can be tedious. _Provider profiles_ simplify this with named presets.
+
+`wg profile set <name>` activates a profile that maps model tiers (`haiku`, `sonnet`, `opus`) to specific provider/model combinations. For example, an `openrouter-budget` profile might map `haiku` to a cheap OpenRouter model, `sonnet` to a mid-range one, and `opus` to a capable reasoning model. `wg profile show` displays the active profile and its resolved model mappings. `wg profile list` shows all available profiles. `wg profile refresh` updates model rankings from OpenRouter's leaderboard API.
+
+Profiles interact with the dispatch role routing system: when a profile is active, roles that request a tier (e.g., `haiku` for triage, `opus` for evolution) resolve through the profile's mappings. Per-task and per-role overrides still take precedence---profiles are defaults, not mandates.
+
+Two commands provide visibility into cost:
+
+- `wg spend` summarizes token usage and estimated costs across all agents. It reads API usage metadata from agent output logs and computes cumulative input, output, and cached token counts with USD estimates. The `--today` flag filters to the current day. The `--json` flag produces machine-readable output for integration with budgeting tools.
+
+- `wg openrouter` provides OpenRouter-specific cost monitoring when using OpenRouter as a provider. `wg openrouter status` shows API key status and usage. `wg openrouter session` shows session-level cost summaries. `wg openrouter set-limit` configures cost caps to prevent runaway spending.
+
+== Requeue <requeue>
+
+Sometimes a task is in-progress but its environment has changed---a dependency was re-evaluated, a fix task was created for a problem the agent will encounter, or the task needs to wait for new prerequisites. `wg requeue <task-id> --reason "..."` returns the task from in-progress to open status, recording the reason for the change. The task becomes eligible for re-dispatch on the next coordinator tick.
+
+Requeue is distinct from `wg retry` (which resets a _failed_ task) and from the coordinator's automatic dead-agent triage (which handles agents that crash). Requeue is an intentional, human- or agent-initiated action to pause and reschedule in-progress work---typically because the task should wait for other work to land first.
 
 == Observing the System <observing>
 

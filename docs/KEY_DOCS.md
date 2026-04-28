@@ -2,7 +2,7 @@
 
 Canonical list of all key documentation files and their purpose. Used as the reference for future doc-sync runs.
 
-Last updated: 2026-02-26 (verified by doc-sync run 3)
+Last updated: 2026-04-12 (verified by doc-sync-apr12-doc-sync-mar28-ds4-doc-sync-ds3-ds2-doc-sync-spec)
 
 ---
 
@@ -15,9 +15,19 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 | `docs/COMMANDS.md` | Complete CLI command reference with examples | Users, agents |
 | `docs/AGENT-GUIDE.md` | How spawned agents should think about task graphs: patterns, structures, anti-patterns | AI agents, advanced users |
 | `docs/AGENT-SERVICE.md` | Service daemon architecture: coordinator tick, dispatch cycle, agent lifecycle | Operators, contributors |
-| `docs/AGENCY.md` | Agency system: roles, motivations, evaluation, evolution, skill system | Users setting up agency |
+| `docs/AGENCY.md` | Agency system: roles, tradeoffs, evaluation, evolution, skill system | Users setting up agency |
 | `docs/LOGGING.md` | Logging and provenance system: operation log, agent archives, rotation | Operators, integrators |
 | `docs/DEV.md` | Development notes: build, test, reusable functions, common pitfalls | Contributors |
+| `docs/WORKTREE-ISOLATION.md` | Worktree-based isolation for concurrent agents | Operators, contributors |
+| `docs/COORDINATOR_ENTITY.md` | Design: coordinator as visible entity | Contributors |
+| `docs/models.md` | Model, endpoint, and API key management guide | Users, agents |
+| `docs/MODEL_REGISTRY.md` | Model provider registry with quality tiers | Contributors |
+| `docs/AGENCY_AUDIT.md` | Agency audit | Contributors, operators |
+| `docs/AGENT-LIFECYCLE.md` | Hardened agent lifecycle: spawn, work, complete, die — full state machine | Operators, contributors |
+| `docs/SECURITY.md` | Security guide: pre-commit hooks, GitGuardian, secret management | Operators, contributors |
+| `docs/agent-git-hygiene.md` | Git hygiene rules for multi-agent shared repos | Agents, operators |
+| `docs/guides/openrouter-setup.md` | OpenRouter provider setup guide | Users, operators |
+| `docs/guides/server-setup.md` | Server setup guide | Users, operators |
 
 ## Embedded Documentation
 
@@ -25,7 +35,7 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 |------|---------|----------|
 | `src/commands/quickstart.rs` | Quickstart text shown by `wg quickstart` — onboarding cheat sheet | AI agents, new users |
 | `CLAUDE.md` | Project-level Claude Code instructions | AI agents |
-| `~/.claude/CLAUDE.md` | Global Claude Code instructions | AI agents |
+| `~/.claude/CLAUDE.md` | Global Claude Code instructions (may not exist) | AI agents |
 
 ## Manual (Typst)
 
@@ -33,13 +43,39 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 |------|---------|----------|
 | `docs/manual/01-overview.typ` | System overview: graph, agency, core loop, agency loop | Deep readers |
 | `docs/manual/02-task-graph.typ` | Task graph: nodes, status, dependencies, cycles, readiness, analysis | Deep readers |
-| `docs/manual/03-agency.typ` | Agency model: roles, motivations, agents, content-hash IDs, skills, trust, federation | Deep readers |
+| `docs/manual/03-agency.typ` | Agency model: roles, tradeoffs, agents, content-hash IDs, skills, trust, federation | Deep readers |
 | `docs/manual/04-coordination.typ` | Coordination & execution: daemon, tick, dispatch, wrapper, IPC, watch, custom executors | Deep readers |
 | `docs/manual/05-evolution.typ` | Evolution & improvement: evaluation, performance, strategies, lineage, autopoiesis | Deep readers |
 | `docs/manual/workgraph-manual.typ` | Manual entry point (imports all chapters) | Deep readers |
+| `docs/manual/workgraph-manual.md` | Full assembled manual (Markdown, derived from Typst) | Deep readers |
+| `docs/manual/01-overview.md` | System overview (Markdown, derived from Typst) | Deep readers |
+| `docs/manual/02-task-graph.md` | Task graph chapter (Markdown, derived from Typst) | Deep readers |
+| `docs/manual/03-agency.md` | Agency chapter (Markdown, derived from Typst) | Deep readers |
+| `docs/manual/04-coordination.md` | Coordination chapter (Markdown, derived from Typst) | Deep readers |
+| `docs/manual/05-evolution.md` | Evolution chapter (Markdown, derived from Typst) | Deep readers |
 | `docs/manual/README.md` | Manual build instructions | Contributors |
 | `docs/manual/PLAN.md` | Manual chapter planning notes | Contributors |
 | `docs/manual/UPDATE-SPEC.md` | Spec for manual updates | Contributors |
+
+## Report Documents
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `docs/reports/spark-v3-retrospective.md` | SPARK v3 retrospective: 9-day cycle analysis | Current |
+| `docs/reports/autopoietic-validation.md` | Capstone synthesis: autopoietic validation | Current |
+| `docs/reports/validate-core-dispatch.md` | Dispatch validation report | Current |
+| `docs/reports/validate-safety-resilience.md` | Safety and resilience validation report | Current |
+| `docs/reports/validate-agency-pipeline.md` | Agency pipeline validation report | Current |
+| `docs/reports/validate-tui-observability.md` | TUI and observability validation report | Current |
+| `docs/reports/self-hosting-integration-validation.md` | Self-hosting integration validation | Current |
+| `docs/reports/messaging-research-report.md` | Messaging system research report | Current |
+| `docs/reports/amplifier-research-report.md` | Amplifier research report | Current |
+| `docs/reports/openrouter-research.md` | OpenRouter integration research | Current |
+| `docs/reports/openrouter-validation.md` | OpenRouter validation report | Current |
+| `docs/reports/openrouter-design.md` | OpenRouter design report | Current |
+| `docs/reports/or-audit-results.md` | OpenRouter audit results | Current |
+| `docs/reports/or-agent-model-design.md` | OpenRouter agent model design | Current |
+| `docs/reports/or-integration-report.md` | OpenRouter integration report | Current |
 
 ## Design Documents
 
@@ -59,6 +95,65 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 | `docs/design/smooth-integration.md` | Smooth integration design | Reference |
 | `docs/design/vx-integration-response.md` | Veracity exchange integration | Design |
 | `docs/design/spec-vx-integration-impl.md` | VX integration implementation spec | Design |
+| `docs/design/outbound-edge-viz.md` | Outbound edge visualization design | Implemented |
+| `docs/design/reopen-on-new-dep.md` | Reopen on new dependency design | Implemented |
+| `docs/design/cycle-delay-semantics.md` | Cycle delay semantics design | Implemented |
+| `docs/design/agent-isolation-decision.md` | Agent isolation architecture decision | Implemented |
+| `docs/design/agent-isolation-implementation.md` | Agent isolation implementation plan | Implemented |
+| `docs/design/agent-lifecycle.md` | Agent lifecycle state machine design | Implemented |
+| `docs/design/agent-message-queue.md` | Agent message queue design | Implemented |
+| `docs/design/automatic-task-placement.md` | Automatic task placement design | Implemented |
+| `docs/design/blog-setup-recommendation.md` | Blog/website setup recommendation | Reference |
+| `docs/design/coordinator-add-remove-modal.md` | TUI coordinator add/remove modal design | Implemented |
+| `docs/design/coordinator-agent-prompt.md` | Coordinator agent prompt design | Implemented |
+| `docs/design/coordinator-as-regular-agent.md` | Coordinator as regular agent refactor | Implemented |
+| `docs/design/coordinator-chat-protocol.md` | Coordinator chat protocol design | Implemented |
+| `docs/design/cycle-edge-viz.md` | Cycle edge visualization design | Implemented |
+| `docs/design/dangling-dependency-resolution.md` | Dangling dependency resolution design | Implemented |
+| `docs/design/design-deliberation-synthesis.md` | Deliberation pattern synthesis | Reference |
+| `docs/design/evolver-fanout.md` | Evolution fan-out design | Implemented |
+| `docs/design/executor-weight-tiers.md` | Executor weight tiers (exec-mode) design | Implemented |
+| `docs/design/generic-executor-design.md` | Generic executor design | Implemented |
+| `docs/design/liveness-detection.md` | Agent liveness detection design | Implemented |
+| `docs/design/mandatory-validation.md` | Mandatory validation gates design | Implemented |
+| `docs/design/message-discipline-design.md` | Message discipline design | Implemented |
+| `docs/design/model-cost-tracking.md` | Model cost tracking design | Implemented |
+| `docs/design/model-endpoint-key-ux.md` | Model/endpoint/key UX design | Implemented |
+| `docs/design/native-executor.md` | Native executor design | Design |
+| `docs/design/node-specific-chat-design.md` | Per-node chat design | Implemented |
+| `docs/design/self-hosting-architecture.md` | Self-hosting architecture design | Reference |
+| `docs/design/sleep-aware-liveness.md` | Sleep-aware liveness detection design | Implemented |
+| `docs/design/trace-functions.md` | Trace functions design (predecessor to func-rename) | Implemented |
+| `docs/design/tui-multi-panel.md` | TUI multi-panel layout design | Implemented |
+| `docs/design/unified-lifecycle-state-machine.md` | Unified lifecycle state machine design | Implemented |
+| `docs/design/wg-wait-design.md` | `wg wait` command design | Implemented |
+| `docs/design/agent-roundtable-cycle.md` | Agent roundtable cycle design | Design |
+| `docs/design/client-implementation-plan.md` | Client implementation plan | Design |
+| `docs/design/demo-medley-catalog.md` | Demo/screencast medley catalog | Reference |
+| `docs/design/federation-architecture.md` | Federation architecture design | Design |
+| `docs/design/hero-screencast-scenarios.md` | Hero screencast scenarios | Reference |
+| `docs/design/hero-screencast-storyboard-v2.md` | Hero screencast storyboard v2 | Reference |
+| `docs/design/heroview-screencast-v2-script.md` | Heroview screencast v2 script | Reference |
+| `docs/design/live-sync-and-liveness.md` | Live sync and liveness design | Design |
+| `docs/design/multi-user-platform-architecture.md` | Multi-user platform architecture | Design |
+| `docs/design/provider-model-naming.md` | Provider/model naming conventions | Design |
+| `docs/design/screencast-freshness-pipeline.md` | Screencast freshness pipeline design | Design |
+| `docs/design/screencast-interaction-flow.md` | Screencast interaction flow design | Reference |
+| `docs/design/screencast-repertoire.md` | Screencast repertoire catalog | Reference |
+| `docs/design/terminal-wrapping-strategy.md` | Terminal wrapping strategy design | Design |
+| `docs/design/tui-inspector-tri-state.md` | TUI inspector tri-state design | Implemented |
+| `docs/design/tui-multiplexing-concurrent-access.md` | TUI multiplexing concurrent access | Design |
+| `docs/design/bare-coordinator.md` | Bare coordinator (minimal coordinator) design | Design |
+| `docs/design/coordinator-id-assignment.md` | Coordinator ID assignment design | Implemented |
+| `docs/design/design-autopoietic-task-agency.md` | Autopoietic task agency design | Design |
+| `docs/design/native-graph-iteration.md` | Native graph iteration design | Design |
+| `docs/design/phantom-edge-prevention.md` | Phantom edge prevention design | Implemented |
+| `docs/design/safe-coordinator-cycle.md` | Safe coordinator cycle design | Implemented |
+| `docs/design-shell-executor.md` | Shell executor design | Implemented |
+| `docs/designs/chat-message-ordering-and-delivery.md` | Chat message ordering and delivery | Implemented |
+| `docs/designs/failed-dep-triage.md` | Failed dependency triage design | Implemented |
+| `docs/designs/quality-pass.md` | Quality pass design | Design |
+| `docs/designs/tui-iteration-history-and-viz-selfloop.md` | TUI iteration history and viz self-loop | Implemented |
 
 ## Research Documents
 
@@ -84,6 +179,111 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 | `docs/research/agent-context-awareness.md` | Agent context awareness research | Research |
 | `docs/research/agent-context-scopes.md` | Configurable agent context scopes design | Implemented (shipped in `wg add --context-scope`) |
 | `docs/research/organizational-patterns.typ` | Organizational patterns research (Typst) | Research |
+| `docs/research/organizational-patterns.md` | Organizational patterns research (Markdown) | Research |
+| `docs/research/flip-pipeline-ordering.md` | FLIP pipeline ordering research | Research |
+| `docs/research/gitbutler-virtual-branches.md` | GitButler virtual branches research | Research |
+| `docs/research/git-worktrees-agent-isolation.md` | Git worktrees for agent isolation | Research |
+| `docs/research/human-in-the-loop-channels.md` | Human-in-the-loop communication channels | Research |
+| `docs/research/validation-current-mechanisms.md` | Validation: current mechanisms survey | Research |
+| `docs/research/validation-graph-structure.md` | Validation: graph structure analysis | Research |
+| `docs/research/validation-cycles.md` | Validation: cycle handling analysis | Research |
+| `docs/research/validation-evaluation-quality.md` | Validation: evaluation quality | Research |
+| `docs/research/validation-agent-self-checks.md` | Validation: agent self-check mechanisms | Research |
+| `docs/research/validation-teaching-agents.md` | Validation: teaching agents validation skills | Research |
+| `docs/research/validation-synthesis.md` | Validation: synthesis and recommendations | Research |
+| `docs/research/a2a-protocol-applicability.md` | A2A protocol applicability analysis | Research |
+| `docs/research/agency-pipeline-lifecycle.md` | Agency pipeline lifecycle research | Research |
+| `docs/research/agency-research.md` | Agency system research | Research |
+| `docs/research/agent-askuser-cross-executor-human-input.md` | Cross-executor human input research | Research |
+| `docs/research/checkpointing-systems-analysis.md` | Checkpointing systems analysis | Research |
+| `docs/research/communication-topology.md` | Communication topology research | Research |
+| `docs/research/compaction-regimes.md` | Compaction regimes research | Research |
+| `docs/research/compaction-timing-data-availability.md` | Compaction timing and data availability | Research |
+| `docs/research/coordination-model-design.md` | Coordination model design research | Research |
+| `docs/research/coordinator-interruption-mechanisms.md` | Coordinator interruption mechanisms | Research |
+| `docs/research/cycle-topology-analysis.md` | Cycle topology analysis | Research |
+| `docs/research/design-deliberation-consensus.md` | Design deliberation consensus | Research |
+| `docs/research/generic-tool-use-research.md` | Generic tool use research | Research |
+| `docs/research/local-model-integration.md` | Local model integration research | Research |
+| `docs/research/mcp-rust-integration.md` | MCP Rust integration research | Research |
+| `docs/research/message-triggered-resurrection.md` | Message-triggered resurrection research | Implemented |
+| `docs/research/model-provider-audit.md` | Model provider audit | Research |
+| `docs/research/native-executor-tool-gaps.md` | Native executor tool gaps analysis | Research |
+| `docs/research/openrouter-ecosystem-research.md` | OpenRouter ecosystem research | Research |
+| `docs/research/openrouter-integration.md` | OpenRouter integration research | Research |
+| `docs/research/placement-context-research.md` | Placement context research | Research |
+| `docs/research/placement-output-handling.md` | Placement output handling research | Research |
+| `docs/research/realtime-agent-chat.md` | Realtime agent chat research | Research |
+| `docs/research/task-priority-scheduling.md` | Task priority scheduling research | Research |
+| `docs/research/telegram-global-routing.md` | Telegram global routing research | Research |
+| `docs/research/tui-editor-widget-comparison.md` | TUI editor widget comparison | Research |
+| `docs/research/verify-cycle-interaction.md` | Verify/cycle interaction research | Research |
+| `docs/research/web-search-api-comparison.md` | Web search API comparison | Research |
+| `docs/research/agency-bureau-pull-mechanism.md` | Agency bureau pull mechanism research | Research |
+| `docs/research/compaction-metrics-and-visibility.md` | Compaction metrics and visibility | Research |
+| `docs/research/compaction-metrics-visibility.md` | Compaction metrics visibility (alternate) | Research |
+| `docs/research/coordinator-spawn-vs-task-agent-spawn.md` | Coordinator vs task agent spawn comparison | Research |
+| `docs/research/hero-screencast-pacing.md` | Hero screencast pacing research | Research |
+| `docs/research/log-view-scrollbar-research.md` | Log view scrollbar research | Research |
+| `docs/research/multi-user-tui-feasibility.md` | Multi-user TUI feasibility study | Research |
+| `docs/research/native-executor-dual-api-audit.md` | Native executor dual API audit | Research |
+| ~~`docs/research/primitive-pool-sync.md`~~ | ~~Primitive pool sync research~~ | ~~Removed (file no longer exists)~~ |
+| ~~`docs/research/ranked-model-list.md`~~ | ~~Ranked model list research~~ | ~~Removed (file no longer exists)~~ |
+| `docs/research/unified-conversation-layer-design.md` | Unified conversation layer design | Research |
+| `docs/research/primitive-pool-location.md` | Primitive pool location research | Research |
+| `docs/research/agency-primitive-sync-model.md` | Agency primitive sync model research | Research |
+| `docs/research/tui-inspector-panel-resizing.md` | TUI inspector panel resizing research | Research |
+| `docs/research/spiral-cycle-unrolling-gap-analysis.md` | Spiral cycle unrolling gap analysis | Research |
+| `docs/research/iterate-vs-retry-design.md` | Iterate vs retry design research | Research |
+| `docs/research/openrouter-leaderboard-api.md` | OpenRouter leaderboard API research | Research |
+| `docs/research/profile-research.md` | Provider profile research | Research |
+| `docs/research/wg-config-profiles.md` | Config profiles research | Research |
+| `docs/research/evolve-yaml-cache-paths.md` | Evolve YAML cache paths research | Research |
+| `docs/research/config-structure-and-setup.md` | Config structure and setup research | Research |
+| `docs/research/stuck-detection-research.md` | Stuck detection research | Research |
+| `docs/research/thinking-token-patterns.md` | Thinking token patterns research | Research |
+| `docs/research/tb-autopoietic-integration.md` | TB autopoietic integration research | Research |
+| `docs/research/litellm-executor-fallback-analysis.md` | LiteLLM executor fallback analysis | Research |
+| `docs/research/supervisor-agent-loop.md` | Supervisor agent loop research | Research |
+| `docs/research/phantom-edge-analysis.md` | Phantom edge analysis research | Research |
+| `docs/research/shell-executor-and-retry-patterns.md` | Shell executor and retry patterns research | Research |
+| `docs/research/native-executor-compact-messages-pattern.md` | Native executor compact messages pattern | Research |
+| `docs/research/existing-design-documents-journal-compaction.md` | Existing design docs on journal compaction | Research |
+
+## Report Documents (additional)
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `docs/reports/openrouter-model-config-guide.md` | OpenRouter model configuration guide | Current |
+| `docs/reports/per-task-model-override.md` | Per-task model override report | Current |
+| `docs/reports/or-executor-research.md` | OpenRouter executor research | Current |
+| ~~`docs/reports/bug-report-dynamic-model-list-browsing.md`~~ | ~~Bug report: dynamic model list browsing~~ | ~~Removed (file no longer exists)~~ |
+| `docs/reports/native-executor-streaming-investigation.md` | Native executor streaming investigation | Current |
+| `docs/reports/vizview-notification-investigation.md` | VizView notification investigation | Current |
+| `docs/reports/tui-chat-message-interleaving-investigation.md` | TUI chat message interleaving investigation | Current |
+| `docs/reports/cycle-deadlock-investigation.md` | Cycle deadlock investigation | Current |
+| `docs/reports/bug-report-assign-task-not-blocking.md` | Bug report: assign task not blocking | Current |
+| `docs/reports/bug-report-user-board-leak.md` | Bug report: user board leak | Current |
+| `docs/reports/openrouter-new-repo-setup-guide.md` | OpenRouter new repo setup guide | Current |
+| `docs/reports/research-coordinator-chat-ordering.md` | Coordinator chat ordering research | Current |
+| `docs/reports/smoke-test-cycle-lifecycle.md` | Cycle lifecycle smoke test report | Current |
+| `docs/reports/triage-task-naming-investigation.md` | Triage task naming investigation | Current |
+
+## Plan Documents
+
+| File | Purpose |
+|------|---------|
+| `docs/plans/server-side-multi-user-workplan.md` | Server-side multi-user work plan |
+| `docs/plans/tui-liveness-monitoring-workplan.md` | TUI liveness monitoring work plan |
+| ~~`docs/plans/federation-and-distributed-sync.md`~~ | ~~Federation and distributed sync plan~~ | ~~Removed (file no longer exists)~~ |
+| `docs/plans/integrated-multi-user-roadmap.md` | Integrated multi-user roadmap |
+| `docs/plans/fs-watcher-validation.md` | FS watcher validation plan |
+| `docs/plans/coordinator-chat-history-design.md` | Coordinator chat history design plan |
+| `docs/plans/assignment-time-placement-guard.md` | Assignment-time placement guard plan |
+| `docs/plans/model-registry-and-update-trace.md` | Model registry and update trace plan |
+| `docs/plans/provider-profiles.md` | Provider profiles plan |
+| `docs/plans/spiral-unrolling-design.md` | Spiral unrolling design plan |
+| `docs/plans/user-board-design.md` | User board design plan |
 
 ## Other Documentation
 
@@ -97,8 +297,27 @@ Last updated: 2026-02-26 (verified by doc-sync run 3)
 | `docs/spec-bugfixes.md` | Bug fix specs |
 | `docs/fix-dag-terminology.md` | DAG terminology fix notes |
 | `docs/design-cyclic-workgraph.md` | Cyclic workgraph design |
+| `docs/design-cycle-failure-restart.md` | Cycle failure restart design |
+| `docs/design-bidirectional-agent-communication.md` | Bidirectional agent communication design |
+| `docs/design-pan-executor.md` | Pan-executor design |
+| `docs/design-unified-message-pane.md` | Unified message pane design |
+| `docs/design-verify-first-eval-pipeline.md` | Verify-first evaluation pipeline design |
 | `docs/survey-context-management.md` | Context management survey |
+| `docs/audit/agent-work-integrity.md` | Agent work integrity audit |
+| `docs/doc-sync-audit-2026-04-12.md` | Documentation audit checklist (2026-04-12) |
+| `docs/prompts/selfhost.md` | Self-hosting prompt template |
+| `docs/smoke-test-coordinator-modals.md` | Coordinator modals smoke test spec |
 | `docs/test-specs/trace-replay-test-spec.md` | Test specifications |
+| `docs/terminal-bench/DESIGN-native-executor-improvements.md` | Native executor improvements design (terminal bench) |
+| `docs/terminal-bench/REFERENCE-terminal-bench-campaign.md` | Terminal bench campaign reference |
+| `docs/terminal-bench/REVIEW-doc-analysis.md` | Terminal bench doc analysis review |
+| `docs/terminal-bench/ROADMAP-terminal-bench.md` | Terminal bench roadmap |
+
+## Audit Documents
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `docs/audit/doc-sync-apr12-delta-checklist.md` | Documentation audit delta checklist (2026-04-12) | Current |
 
 ## Archive
 

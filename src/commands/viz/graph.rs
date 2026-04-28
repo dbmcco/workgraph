@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, format_token_display};
+use workgraph::graph::{PRIORITY_DEFAULT, Status, Task, TokenUsage, WorkGraph, format_token_display};
 
 use super::ascii::visible_len;
 
@@ -17,10 +17,9 @@ pub fn generate_graph(
     graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     live_token_usage: &HashMap<String, TokenUsage>,
-    assign_token_usage: &HashMap<String, TokenUsage>,
-    eval_token_usage: &HashMap<String, TokenUsage>,
+    agency_token_usage: &HashMap<String, TokenUsage>,
     context_ids: &HashSet<String>,
 ) -> String {
     generate_graph_with_overrides(
@@ -30,8 +29,7 @@ pub fn generate_graph(
         annotations,
         &HashMap::new(),
         live_token_usage,
-        assign_token_usage,
-        eval_token_usage,
+        agency_token_usage,
         context_ids,
     )
 }
@@ -43,11 +41,10 @@ pub fn generate_graph_with_overrides(
     _graph: &WorkGraph,
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
     status_overrides: &HashMap<&str, Status>,
     live_token_usage: &HashMap<String, TokenUsage>,
-    assign_token_usage: &HashMap<String, TokenUsage>,
-    eval_token_usage: &HashMap<String, TokenUsage>,
+    agency_token_usage: &HashMap<String, TokenUsage>,
     context_ids: &HashSet<String>,
 ) -> String {
     if tasks.is_empty() {
@@ -88,7 +85,9 @@ pub fn generate_graph_with_overrides(
             Status::Blocked => "\x1b[90m",
             Status::Failed => "\x1b[31m",
             Status::Abandoned => "\x1b[90m",
-            Status::Waiting => "\x1b[33m",
+            Status::Waiting | Status::PendingValidation => "\x1b[33m",
+            Status::PendingEval => "\x1b[38;5;154m",
+            Status::Incomplete => "\x1b[38;5;208m",
         }
     };
     let reset = if use_color { "\x1b[0m" } else { "" };
@@ -101,7 +100,9 @@ pub fn generate_graph_with_overrides(
             Status::Blocked => "blocked",
             Status::Failed => "failed",
             Status::Abandoned => "abandoned",
-            Status::Waiting => "waiting",
+            Status::Waiting | Status::PendingValidation => "waiting",
+            Status::PendingEval => "pending-eval",
+            Status::Incomplete => "incomplete",
         }
     };
 
@@ -202,16 +203,21 @@ pub fn generate_graph_with_overrides(
         let effective_status = status_overrides.get(id).copied().unwrap_or(task.status);
         let status = status_label(&effective_status);
 
+        let is_chat_agent = super::is_chat_agent_task(task);
+        let is_legacy_coord = super::is_legacy_coordinator_task(task);
+
         // Context nodes: dimmed, reduced detail (just ID and status)
         let (line1, line2) = if is_context {
             (display_id, status.to_string())
         } else {
             let phase = annotations
                 .get(id)
-                .map(|a| format!(" {}", a))
+                .map(|a| format!(" {}", a.text))
                 .unwrap_or_default();
 
-            let loop_info = if let Some(ref cfg) = task.cycle_config {
+            let loop_info = if is_chat_agent {
+                format!(" [turn {}]", task.loop_iteration)
+            } else if let Some(ref cfg) = task.cycle_config {
                 if cfg.max_iterations > 0 {
                     if cfg.no_converge {
                         format!(" ↺ forced {}/{}", task.loop_iteration, cfg.max_iterations)
@@ -231,20 +237,30 @@ pub fn generate_graph_with_overrides(
                 .token_usage
                 .as_ref()
                 .or_else(|| live_token_usage.get(id));
-            let atok_usage = assign_token_usage.get(id);
-            let etok_usage = eval_token_usage.get(id);
-            let token_info = format_token_display(usage, atok_usage, etok_usage)
+            let agency_usage = agency_token_usage.get(id);
+            let token_info = format_token_display(usage, agency_usage)
                 .map(|s| format!(" · {}", s))
                 .unwrap_or_default();
+            let priority_info = if task.priority != PRIORITY_DEFAULT {
+                format!(" · ⌁{}", task.priority)
+            } else {
+                String::new()
+            };
 
             (
                 display_id,
-                format!("{}{}{}{}", status, token_info, phase, loop_info),
+                format!("{}{}{}{}{}", status, token_info, priority_info, phase, loop_info),
             )
         };
         let width = line1.len().max(line2.len());
 
-        let color = if is_context {
+        let color = if is_chat_agent && use_color {
+            if is_legacy_coord {
+                "\x1b[90m" // dark gray — muted for legacy .coordinator-N
+            } else {
+                "\x1b[36m" // cyan — accent for current .chat-N
+            }
+        } else if is_context {
             dim
         } else {
             status_color(&effective_status)
@@ -612,7 +628,6 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &HashSet::new(),
         );
         assert_eq!(result, "(no tasks to display)");
@@ -632,7 +647,6 @@ mod tests {
             &tasks,
             &task_ids,
             &no_annots,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -669,7 +683,6 @@ mod tests {
             &tasks,
             &task_ids,
             &no_annots,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -711,7 +724,6 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &HashSet::new(),
         );
 
@@ -746,7 +758,6 @@ mod tests {
             &tasks,
             &task_ids,
             &no_annots,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -785,7 +796,6 @@ mod tests {
             &tasks,
             &task_ids,
             &no_annots,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
@@ -834,7 +844,6 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &HashSet::new(),
         );
 
@@ -880,7 +889,6 @@ mod tests {
             &no_annots,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &HashSet::new(),
         );
 
@@ -910,7 +918,6 @@ mod tests {
             &tasks,
             &task_ids,
             &no_annots,
-            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),

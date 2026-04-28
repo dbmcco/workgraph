@@ -1,17 +1,88 @@
 use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use workgraph::agency::{
     self, AccessControl, ComponentCategory, ContentRef, Lineage, PerformanceRecord, Role,
     TradeoffConfig,
 };
+use workgraph::config::Config;
 
-use super::deferred::{defer_operation, should_defer};
+use super::deferred::{defer_operation, defer_self_mutation, should_defer};
 use super::meta::{
     apply_bizarre_ideation, apply_meta_compose_agent, apply_meta_swap_role,
     apply_meta_swap_tradeoff, apply_random_compose_agent, apply_random_compose_role,
 };
 use super::strategy::EvolverOperation;
+
+/// Resolve the evolver agent's own role and tradeoff IDs from config.
+/// Returns an empty set if no evolver_agent is configured.
+fn evolver_entity_ids(agency_dir: &Path, dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let config = Config::load_or_default(dir);
+    if let Some(ref agent_hash) = config.agency.evolver_agent {
+        let agent_path = agency_dir
+            .join("agents")
+            .join(format!("{}.yaml", agent_hash));
+        if let Ok(agent) = agency::load_agent(&agent_path) {
+            ids.insert(agent.role_id.clone());
+            ids.insert(agent.tradeoff_id);
+        }
+    }
+    ids
+}
+
+/// Check if an operation is a self-mutation (targets the evolver's own identity)
+/// and defer it if so. Returns `Some(result)` if deferred, `None` if safe to proceed.
+pub(crate) fn check_self_mutation(
+    op: &EvolverOperation,
+    agency_dir: &Path,
+    dir: &Path,
+    run_id: &str,
+) -> Option<Result<serde_json::Value>> {
+    let entity_ids = evolver_entity_ids(agency_dir, dir);
+
+    // Check 1: operation target_id matches evolver's role or tradeoff
+    if !entity_ids.is_empty()
+        && let Some(ref target) = op.target_id
+    {
+        let target_ids: Vec<&str> = target
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if target_ids.iter().any(|tid| entity_ids.contains(*tid)) {
+            return Some(defer_self_mutation(op, dir, run_id).map(|task_id| {
+                serde_json::json!({
+                    "op": op.op,
+                    "target_id": op.target_id,
+                    "status": "deferred_for_review",
+                    "review_task": task_id,
+                    "reason": "Operation targets evolver's own identity — requires human approval",
+                })
+            }));
+        }
+    }
+
+    // Check 2: meta operations targeting the "evolver" slot
+    if matches!(
+        op.op.as_str(),
+        "meta_swap_role" | "meta_swap_tradeoff" | "meta_compose_agent"
+    ) && op.meta_role.as_deref() == Some("evolver")
+    {
+        return Some(defer_self_mutation(op, dir, run_id).map(|task_id| {
+            serde_json::json!({
+                "op": op.op,
+                "meta_role": "evolver",
+                "status": "deferred_for_review",
+                "review_task": task_id,
+                "reason": "Operation targets evolver's own configuration — requires human approval",
+            })
+        }));
+    }
+
+    None
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_operation(
@@ -24,6 +95,14 @@ pub(crate) fn apply_operation(
     agency_dir: &Path,
     dir: &Path,
 ) -> Result<serde_json::Value> {
+    // Self-mutation safety: operations targeting the evolver's own
+    // role or tradeoff are deferred to a verified workgraph task
+    // that requires human approval. This protects both single-shot
+    // and fan-out evolution paths.
+    if let Some(result) = check_self_mutation(op, agency_dir, dir, run_id) {
+        return result;
+    }
+
     match op.op.as_str() {
         // Legacy operations
         "create_role" => apply_create_role(op, run_id, roles_dir),
@@ -56,6 +135,8 @@ pub(crate) fn apply_operation(
         "meta_swap_role" => apply_meta_swap_role(op, run_id, agency_dir, dir),
         "meta_swap_tradeoff" => apply_meta_swap_tradeoff(op, run_id, agency_dir, dir),
         "meta_compose_agent" => apply_meta_compose_agent(op, run_id, agency_dir, dir),
+        // Coordinator prompt evolution
+        "modify_coordinator_prompt" => apply_modify_coordinator_prompt(op, agency_dir),
         other => bail!("Unknown operation type: '{}'", other),
     }
 }
@@ -233,6 +314,8 @@ fn apply_create_motivation(
             created_at: chrono::Utc::now(),
         },
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     };
@@ -306,6 +389,8 @@ fn apply_modify_motivation(
         performance: PerformanceRecord::default(),
         lineage,
         access_control: AccessControl::default(),
+        domain_tags: vec![],
+        metadata: HashMap::new(),
         former_agents: vec![],
         former_deployments: vec![],
     };
@@ -466,6 +551,8 @@ fn apply_wording_mutation(
                 performance: PerformanceRecord::default(),
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -506,6 +593,8 @@ fn apply_wording_mutation(
                 performance: PerformanceRecord::default(),
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -542,6 +631,8 @@ fn apply_wording_mutation(
                 lineage: Lineage::mutation(target_id, source.lineage.generation, run_id),
                 access_control: source.access_control.clone(),
                 requires_human_oversight: source.requires_human_oversight,
+                domain_tags: source.domain_tags.clone(),
+                metadata: source.metadata.clone(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -857,6 +948,56 @@ fn apply_config_swap_tradeoff(
         "new_tradeoff_id": new_tid,
         "new_id": new_agent_id,
         "path": path.display().to_string(),
+        "status": "applied",
+    }))
+}
+
+/// Apply a coordinator prompt modification.
+///
+/// `target_id` must be "evolved-amendments" or "common-patterns" (the mutable files).
+/// `new_content` is written to the file (replacing existing content).
+fn apply_modify_coordinator_prompt(
+    op: &EvolverOperation,
+    agency_dir: &Path,
+) -> Result<serde_json::Value> {
+    let target = op
+        .target_id
+        .as_deref()
+        .context("modify_coordinator_prompt requires target_id")?;
+
+    // Only allow modification of mutable prompt files
+    let allowed = ["evolved-amendments", "common-patterns"];
+    if !allowed.contains(&target) {
+        bail!(
+            "Cannot modify coordinator prompt file '{}'. Only {:?} are mutable.",
+            target,
+            allowed
+        );
+    }
+
+    let content = op
+        .new_content
+        .as_deref()
+        .context("modify_coordinator_prompt requires new_content")?;
+
+    let filename = format!("{}.md", target);
+    let prompt_dir = agency_dir.join("coordinator-prompt");
+    std::fs::create_dir_all(&prompt_dir)
+        .context("Failed to create coordinator-prompt directory")?;
+
+    let path = prompt_dir.join(&filename);
+    std::fs::write(&path, content).with_context(|| {
+        format!(
+            "Failed to write coordinator prompt file: {}",
+            path.display()
+        )
+    })?;
+
+    Ok(serde_json::json!({
+        "op": "modify_coordinator_prompt",
+        "target_id": target,
+        "path": path.display().to_string(),
+        "content_length": content.len(),
         "status": "applied",
     }))
 }

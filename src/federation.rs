@@ -1127,6 +1127,8 @@ fn merge_component(target: &RoleComponent, source: &RoleComponent) -> RoleCompon
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1151,6 +1153,8 @@ fn merge_outcome(target: &DesiredOutcome, source: &DesiredOutcome) -> DesiredOut
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
         requires_human_oversight: target.requires_human_oversight,
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1190,6 +1194,8 @@ fn merge_tradeoff(target: &TradeoffConfig, source: &TradeoffConfig) -> TradeoffC
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
         access_control: target.access_control.clone(),
+        domain_tags: target.domain_tags.clone(),
+        metadata: target.metadata.clone(),
         former_agents: target.former_agents.clone(),
         former_deployments: target.former_deployments.clone(),
     }
@@ -1215,6 +1221,14 @@ fn merge_agent(target: &Agent, source: &Agent) -> Agent {
         deployment_history: target.deployment_history.clone(),
         attractor_weight: target.attractor_weight,
         staleness_flags: target.staleness_flags.clone(),
+        preferred_model: target
+            .preferred_model
+            .clone()
+            .or_else(|| source.preferred_model.clone()),
+        preferred_provider: target
+            .preferred_provider
+            .clone()
+            .or_else(|| source.preferred_provider.clone()),
     }
 }
 
@@ -1279,6 +1293,8 @@ mod tests {
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }
@@ -1579,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_errors_on_corrupt_target_yaml() {
+    fn transfer_skips_corrupt_target_yaml_gracefully() {
         let tmp = TempDir::new().unwrap();
         let source = setup_store(&tmp, "source");
         let target = setup_store(&tmp, "target");
@@ -1593,19 +1609,19 @@ mod tests {
         let corrupt_path = target.roles_dir().join("corrupt.yaml");
         std::fs::write(&corrupt_path, "{{{{not valid yaml!!!!").unwrap();
 
+        // Transfer should succeed — corrupt files are skipped with warnings
         let result = transfer(&source, &target, &TransferOptions::default());
         assert!(
-            result.is_err(),
-            "transfer should fail on corrupt target YAML"
+            result.is_ok(),
+            "transfer should skip corrupt target YAML gracefully, got: {:?}",
+            result.unwrap_err()
         );
-        let err_msg = result.unwrap_err().to_string();
+
+        // The valid role should still be present after transfer
+        let roles = target.load_roles().unwrap();
         assert!(
-            err_msg.contains("yaml")
-                || err_msg.contains("YAML")
-                || err_msg.contains("parse")
-                || err_msg.contains("scan"),
-            "error should mention YAML parsing: {}",
-            err_msg
+            roles.iter().any(|r| r.id == "r1"),
+            "valid role r1 should survive transfer alongside corrupt file"
         );
     }
 
@@ -1831,6 +1847,8 @@ mod tests {
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }
@@ -1846,6 +1864,8 @@ mod tests {
             lineage: Lineage::default(),
             access_control: agency::AccessControl::default(),
             requires_human_oversight: true,
+            domain_tags: vec![],
+            metadata: HashMap::new(),
             former_agents: Vec::new(),
             former_deployments: Vec::new(),
         }

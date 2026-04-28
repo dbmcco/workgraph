@@ -235,6 +235,8 @@ pub(crate) fn apply_bizarre_ideation(
                     created_at: Utc::now(),
                 },
                 access_control: AccessControl::default(),
+                domain_tags: vec![],
+                metadata: std::collections::HashMap::new(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };
@@ -275,6 +277,8 @@ pub(crate) fn apply_bizarre_ideation(
                     created_at: Utc::now(),
                 },
                 access_control: AccessControl::default(),
+                domain_tags: vec![],
+                metadata: std::collections::HashMap::new(),
                 former_agents: vec![],
                 former_deployments: vec![],
             };

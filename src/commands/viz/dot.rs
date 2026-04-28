@@ -9,7 +9,7 @@ pub(crate) fn generate_dot(
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
     critical_path: &HashSet<String>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
 ) -> String {
     let mut lines = vec![
         "digraph workgraph {".to_string(),
@@ -27,7 +27,9 @@ pub(crate) fn generate_dot(
             Status::Open => "style=filled, fillcolor=white",
             Status::Failed => "style=filled, fillcolor=salmon",
             Status::Abandoned => "style=filled, fillcolor=lightgray",
-            Status::Waiting => "style=filled, fillcolor=lightyellow",
+            Status::Waiting | Status::PendingValidation => "style=filled, fillcolor=lightyellow",
+            Status::PendingEval => "style=filled, fillcolor=chartreuse",
+            Status::Incomplete => "style=filled, fillcolor=orange",
         };
 
         // Build label with hours estimate if available
@@ -41,7 +43,7 @@ pub(crate) fn generate_dot(
         // Add phase annotation if present
         let phase_str = annotations
             .get(&task.id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         let label = format!("{}\\n{}{}{}", task.id, task.title, hours_str, phase_str);
@@ -162,7 +164,7 @@ pub(crate) fn generate_mermaid(
     tasks: &[&Task],
     task_ids: &HashSet<&str>,
     critical_path: &HashSet<String>,
-    annotations: &HashMap<String, String>,
+    annotations: &HashMap<String, super::AnnotationInfo>,
 ) -> String {
     let mut lines = Vec::new();
 
@@ -183,7 +185,7 @@ pub(crate) fn generate_mermaid(
         // Add phase annotation if present
         let phase_str = annotations
             .get(&task.id)
-            .map(|a| format!(" {}", a))
+            .map(|a| format!(" {}", a.text))
             .unwrap_or_default();
 
         let label = format!("{}: {}{}{}", task.id, title, hours_str, phase_str);
@@ -196,7 +198,11 @@ pub(crate) fn generate_mermaid(
             Status::Open => format!("  {}[\"{}\"]", task.id, label),
             Status::Failed => format!("  {}{{{{\"{}\"}}}}!", task.id, label),
             Status::Abandoned => format!("  {}[\"{}\"]:::abandoned", task.id, label),
-            Status::Waiting => format!("  {}[\"{}\"]:::waiting", task.id, label),
+            Status::Waiting | Status::PendingValidation => {
+                format!("  {}[\"{}\"]:::waiting", task.id, label)
+            }
+            Status::PendingEval => format!("  {}[\"{}\"]:::pending-eval", task.id, label),
+            Status::Incomplete => format!("  {}[\"{}\"]:::incomplete", task.id, label),
         };
         lines.push(node);
     }
@@ -456,7 +462,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -469,7 +475,7 @@ mod tests {
 
         assert!(!result.contains("assign-my-task"));
         assert!(result.contains("my-task"));
-        assert!(result.contains("[assigning]"));
+        assert!(result.contains("[⊞ assigning]"));
     }
 
     #[test]
@@ -488,7 +494,7 @@ mod tests {
         graph.add_node(Node::Task(parent));
         graph.add_node(Node::Task(assign));
 
-        let annotations = HashMap::new();
+        let annotations: HashMap<String, crate::commands::viz::AnnotationInfo> = HashMap::new();
         let (filtered, annots) = crate::commands::viz::filter_internal_tasks(
             &graph,
             graph.tasks().collect(),
@@ -501,7 +507,7 @@ mod tests {
 
         assert!(!result.contains("assign-my-task"));
         assert!(result.contains("my-task"));
-        assert!(result.contains("[assigning]"));
+        assert!(result.contains("[⊞ assigning]"));
     }
 
     #[test]

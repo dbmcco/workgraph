@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use workgraph::function::{
     self, FunctionInput, InputType, PlanningConfig, TaskTemplate, TraceFunction,
 };
-use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::{load_graph_locked, lock_graph_file, save_graph_locked};
+use workgraph::graph::{Node, PRIORITY_DEFAULT, Status, Task};
+use workgraph::parser::{load_graph, modify_graph};
 
 use super::graph_path;
 
@@ -247,6 +247,7 @@ pub fn run(
                 title: rendered.title.clone(),
                 description: Some(rendered.description.clone()),
                 status: Status::Open,
+                priority: PRIORITY_DEFAULT,
                 assigned: None,
                 estimate: None,
                 before: vec![],
@@ -258,6 +259,7 @@ pub fn run(
                 deliverables: rendered.deliverables.clone(),
                 artifacts: vec![],
                 exec: None,
+                timeout: None,
                 not_before: None,
                 created_at: Some(Utc::now().to_rfc3339()),
                 started_at: None,
@@ -268,9 +270,12 @@ pub fn run(
                 failure_reason: None,
                 model: task_model,
                 provider: None,
+                endpoint: None,
                 verify: rendered.verify.clone(),
+                verify_timeout: None,
                 agent: None,
                 loop_iteration: 0,
+                last_iteration_completed_at: None,
                 cycle_failure_restarts: 0,
                 ready_after: None,
                 paused: false,
@@ -281,9 +286,39 @@ pub fn run(
                 session_id: None,
                 wait_condition: None,
                 checkpoint: None,
+                triage_count: 0,
                 resurrection_count: 0,
                 last_resurrected_at: None,
+                validation: None,
+                validation_commands: vec![],
+                validator_agent: None,
+                validator_model: None,
+                gate_attempts: 0,
+                test_required: false,
+                rejection_count: 0,
+                max_rejections: None,
                 exec_mode: None,
+                verify_failures: 0,
+                rescue_count: 0,
+                spawn_failures: 0,
+                dispatch_count: 0,
+                tier: None,
+                no_tier_escalation: false,
+                tried_models: vec![],
+                superseded_by: vec![],
+                supersedes: None,
+                unplaced: false,
+                place_near: vec![],
+                place_before: vec![],
+                independent: false,
+                iteration_round: 0,
+                iteration_anchor: None,
+                iteration_parent: None,
+                iteration_config: None,
+                cron_schedule: None,
+                cron_enabled: false,
+                last_cron_fire: None,
+                next_cron_fire: None,
             };
 
             graph.add_node(Node::Task(task));
@@ -321,8 +356,32 @@ pub fn run(
         return Ok(());
     }
 
-    // Save graph
-    save_graph_locked(&graph, &graph_file, &_lock).context("Failed to save graph")?;
+    // Save graph atomically
+    // The graph was already built up with all tasks; now save atomically via modify_graph
+    // We re-load and re-apply since modify_graph handles locking
+    let created_ids_for_save = created_ids.clone();
+    modify_graph(&graph_file, |existing_graph| {
+        // Apply all nodes from our computed graph that don't exist yet
+        for id in &created_ids_for_save {
+            if existing_graph.get_node(id).is_none() {
+                if let Some(node) = graph.get_node(id) {
+                    existing_graph.add_node(node.clone());
+                }
+                // Update bidirectional edges
+                if let Some(task) = graph.get_task(id) {
+                    for dep in &task.after {
+                        if let Some(blocker) = existing_graph.get_task_mut(dep)
+                            && !blocker.before.contains(id)
+                        {
+                            blocker.before.push(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        !created_ids_for_save.is_empty()
+    })
+    .context("Failed to save graph")?;
     super::notify_graph_changed(dir);
 
     // Record provenance
@@ -646,7 +705,7 @@ mod tests {
     use tempfile::TempDir;
     use workgraph::function::*;
     use workgraph::graph::WorkGraph;
-    use workgraph::parser::{load_graph, save_graph};
+    use workgraph::parser::save_graph;
 
     fn sample_function() -> TraceFunction {
         TraceFunction {
@@ -1825,6 +1884,7 @@ mod tests {
             log: vec![LogEntry {
                 timestamp: "2026-02-21T12:00:00Z".to_string(),
                 actor: Some("agent".to_string()),
+                user: Some(workgraph::current_user()),
                 message: planner_yaml.to_string(),
             }],
             ..Task::default()

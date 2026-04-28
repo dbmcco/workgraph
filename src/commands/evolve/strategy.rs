@@ -13,6 +13,7 @@ pub enum Strategy {
     ComponentMutation,
     Randomisation,
     BizarreIdeation,
+    CoordinatorEvolution,
 }
 
 impl Strategy {
@@ -27,15 +28,42 @@ impl Strategy {
             "component-mutation" => Ok(Self::ComponentMutation),
             "randomisation" => Ok(Self::Randomisation),
             "bizarre-ideation" => Ok(Self::BizarreIdeation),
+            "coordinator" | "coordinator-evolution" => Ok(Self::CoordinatorEvolution),
             other => bail!(
                 "Unknown strategy '{}'. Valid: mutation, crossover, gap-analysis, retirement, \
-                 motivation-tuning, component-mutation, randomisation, bizarre-ideation, all",
+                 motivation-tuning, component-mutation, randomisation, bizarre-ideation, coordinator, all",
                 other
             ),
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    /// Returns all individual strategies (excludes `All`).
+    pub fn all_individual() -> Vec<Self> {
+        vec![
+            Self::Mutation,
+            Self::Crossover,
+            Self::GapAnalysis,
+            Self::Retirement,
+            Self::MotivationTuning,
+            Self::ComponentMutation,
+            Self::Randomisation,
+            Self::BizarreIdeation,
+            Self::CoordinatorEvolution,
+        ]
+    }
+
+    /// Whether this strategy can produce useful output without any evaluations.
+    pub fn needs_no_evals(self) -> bool {
+        matches!(
+            self,
+            Self::GapAnalysis
+                | Self::Randomisation
+                | Self::BizarreIdeation
+                | Self::CoordinatorEvolution
+        )
+    }
+
+    pub fn label(self) -> &'static str {
         match self {
             Self::Mutation => "mutation",
             Self::Crossover => "crossover",
@@ -46,6 +74,7 @@ impl Strategy {
             Self::ComponentMutation => "component-mutation",
             Self::Randomisation => "randomisation",
             Self::BizarreIdeation => "bizarre-ideation",
+            Self::CoordinatorEvolution => "coordinator",
         }
     }
 }
@@ -114,7 +143,7 @@ pub struct EvolverOperation {
     /// retire_role, retire_motivation, wording_mutation, component_substitution,
     /// config_add_component, config_remove_component, config_swap_outcome,
     /// config_swap_tradeoff, random_compose_role, random_compose_agent, bizarre_ideation,
-    /// meta_swap_role, meta_swap_tradeoff, meta_compose_agent
+    /// meta_swap_role, meta_swap_tradeoff, meta_compose_agent, modify_coordinator_prompt
     pub op: String,
 
     // -- Targeting --
@@ -211,6 +240,15 @@ pub struct EvolverOperation {
     /// For bizarre ideation: the prompt used to generate the new primitive.
     #[serde(default)]
     pub ideation_prompt: Option<String>,
+
+    // -- Fan-out analyzer fields --
+    /// Analyzer's confidence in this operation (0.0-1.0).
+    /// Used by synthesizer for priority scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Expected impact description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_impact: Option<String>,
 }
 
 /// Top-level structured output from the evolver agent.

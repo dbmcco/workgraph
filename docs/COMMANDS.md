@@ -15,6 +15,9 @@ Complete reference for all `wg` commands. Most query commands support `--json` f
 - [Peer Commands](#peer-commands)
 - [Service Commands](#service-commands)
 - [Monitoring Commands](#monitoring-commands)
+- [Communication Commands](#communication-commands)
+- [Model and Endpoint Management](#model-and-endpoint-management)
+- [Cost and Usage](#cost-and-usage)
 - [Utility Commands](#utility-commands)
 
 ---
@@ -53,6 +56,25 @@ wg add <TITLE> [OPTIONS]
 | `--max-iterations <N>` | Maximum cycle iterations — sets `CycleConfig` on this task, making it a cycle header |
 | `--cycle-guard <EXPR>` | Guard condition for cycle iteration: `task:<id>=<status>` or `always` |
 | `--cycle-delay <DUR>` | Delay between cycle iterations (e.g., `30s`, `5m`, `1h`) |
+| `--exec-mode <MODE>` | Execution weight: `full` (default), `light` (read-only tools), `bare` (wg CLI only), `shell` (no LLM) |
+| `--exec <CMD>` | Shell command to execute for this task (auto-sets exec_mode=shell) |
+| `--timeout <DUR>` | Per-task timeout (e.g., `30s`, `5m`, `1h`, `4h`, `1d`) |
+| `--provider <PROVIDER>` | **[DEPRECATED]** Provider — use `provider:model` format in `--model` instead |
+| `--verify-timeout <DUR>` | Verification timeout (e.g., `15m`, `900s`). Overrides global `WG_VERIFY_TIMEOUT` |
+| `--allow-phantom` | Allow phantom (forward-reference) dependencies without error |
+| `--independent` | Suppress implicit `--after` dependency on the creating task (alias: `--no-after`) |
+| `--propagation <POLICY>` | Retry propagation policy: `conservative`, `aggressive`, or `conditional:<float>` |
+| `--retry-strategy <STRATEGY>` | Retry strategy: `same-model`, `upgrade-model`, or `escalate-to-human` |
+| `--cron <EXPR>` | Cron schedule expression (6-field format: `"sec min hour day month dow"`) |
+| `--paused` | Create the task in paused state (default for interactive use) |
+| `--no-place` | Skip automatic placement — make task immediately available for dispatch |
+| `--place-near <IDS>` | Placement hint: place near these tasks (comma-separated IDs) |
+| `--place-before <IDS>` | Placement hint: place before these tasks (comma-separated IDs) |
+| `--delay <DUR>` | Delay before task becomes ready (e.g., `30s`, `5m`, `1h`, `1d`) |
+| `--not-before <TIMESTAMP>` | Absolute timestamp before which task won't be dispatched (ISO 8601) |
+| `--no-converge` | Force all cycle iterations to run (agents cannot signal convergence) |
+| `--no-restart-on-failure` | Disable automatic cycle restart on failure (restart is on by default) |
+| `--max-failure-restarts <N>` | Maximum failure-triggered cycle restarts (default: 3) |
 | `--context-scope <SCOPE>` | Context scope for prompt assembly: `clean`, `task`, `graph`, `full` (see below) |
 
 **Context scopes** control how much context the coordinator assembles into the agent's prompt. Each level includes everything from the previous level:
@@ -127,7 +149,16 @@ wg edit <ID> [OPTIONS]
 | `--cycle-delay <DUR>` | Set delay between cycle iterations |
 | `--visibility <LEVEL>` | Set task visibility zone: `internal`, `peer`, `public` |
 | `--context-scope <SCOPE>` | Set context scope for prompt assembly: `clean`, `task`, `graph`, `full` |
-| `--exec-mode <MODE>` | Set execution mode: `full` (default) or `bare` (lightweight, no file I/O tools) |
+| `--exec-mode <MODE>` | Set execution weight: `full` (default), `light` (read-only tools), `bare` (wg CLI only), `shell` (no LLM) |
+| `--provider <PROVIDER>` | **[DEPRECATED]** Update provider — use `provider:model` format in `--model` instead |
+| `--verify <CRITERIA>` | Set or update verification criteria (shell command that must pass before done) |
+| `--delay <DUR>` | Delay before task becomes ready (e.g., `30s`, `5m`, `1h`, `1d`) |
+| `--not-before <TIMESTAMP>` | Absolute timestamp before which task won't be dispatched (ISO 8601) |
+| `--no-converge` | Force all cycle iterations to run (agents cannot signal convergence) |
+| `--no-restart-on-failure` | Disable automatic cycle restart on failure |
+| `--max-failure-restarts <N>` | Maximum failure-triggered cycle restarts (default: 3) |
+| `--allow-phantom` | Allow phantom (forward-reference) dependencies without error |
+| `--allow-cycle` | Allow cycle creation without CycleConfig (overrides cycle detection guard) |
 
 Triggers a `graph_changed` IPC notification to the service daemon, so the coordinator picks up changes immediately.
 
@@ -154,8 +185,17 @@ wg edit my-task --cycle-delay "5m"
 # Reduce context for a simple task
 wg edit my-task --context-scope clean
 
-# Use bare execution mode (no file I/O tools)
+# Use bare execution mode (wg CLI only)
 wg edit my-task --exec-mode bare
+
+# Set or update verification criteria
+wg edit my-task --verify "cargo test test_feature passes"
+
+# Set a provider (use provider:model format — --provider is deprecated)
+wg edit my-task --model openai:gpt-4o
+
+# Schedule a delay
+wg edit my-task --delay 1h
 ```
 
 ---
@@ -174,6 +214,7 @@ Sets status to `done`, records `completed_at` timestamp, and unblocks dependent 
 | Option | Description |
 |--------|-------------|
 | `--converged` | Stop the cycle — adds a `"converged"` tag to the cycle header, preventing further iterations even if `max_iterations` hasn't been reached |
+| `--skip-verify` | Skip the verify command gate (human escape hatch, blocked when `WG_AGENT_ID` is set) |
 
 **Examples:**
 ```bash
@@ -194,8 +235,14 @@ wg done review-task --converged
 Mark a task as failed (can be retried later).
 
 ```bash
-wg fail <ID> [--reason <TEXT>]
+wg fail <ID> [OPTIONS]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--reason <REASON>` | Reason for failure |
+| `--eval-reject` | Reject a done task via evaluation gate — allows failing a task that is already Done because the evaluator determined the work is unacceptable. The task transitions to Failed and its dependents become blocked |
 
 **Example:**
 ```bash
@@ -209,14 +256,21 @@ wg fail deploy-prod --reason "AWS credentials expired"
 Mark a task as abandoned (will not be completed).
 
 ```bash
-wg abandon <ID> [--reason <TEXT>]
+wg abandon <ID> [OPTIONS]
 ```
 
 Abandoned is a terminal state — the task will not be retried.
 
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--reason <REASON>` | Reason for abandonment |
+| `--superseded-by <IDS>` | Task IDs that supersede/replace this task (comma-separated) |
+
 **Example:**
 ```bash
 wg abandon legacy-migration --reason "Feature deprecated"
+wg abandon old-approach --superseded-by new-approach-a,new-approach-b
 ```
 
 ---
@@ -235,6 +289,30 @@ Increments the retry counter and sets status back to `open`.
 ```bash
 wg retry deploy-prod
 # Resets deploy-prod to open status with incremented retry count
+```
+
+---
+
+### `wg requeue`
+
+Requeue an in-progress task for failed-dependency triage (resets to open).
+
+```bash
+wg requeue <TASK> --reason <REASON>
+```
+
+**Arguments:**
+- `TASK` - Task ID to requeue (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--reason <REASON>` | Reason for requeue — what fix tasks were created (required) |
+
+**Example:**
+```bash
+wg requeue implement-api --reason "Created fix-dep task to resolve failing dependency"
+# Resets implement-api to open status for re-dispatch after fix
 ```
 
 ---
@@ -308,12 +386,28 @@ wg log <ID> <MESSAGE> [--actor <ACTOR>]
 
 # View log entries
 wg log <ID> --list
+
+# View agent prompts and outputs
+wg log <ID> --agent
+
+# View the operations log
+wg log --operations
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--actor <ACTOR>` | Actor adding the log entry |
+| `--list` | List log entries instead of adding |
+| `--agent` | Show archived agent prompts and outputs for a task |
+| `--operations` | Show the operations log (reads current and rotated files) |
 
 **Examples:**
 ```bash
 wg log implement-api "Completed endpoint handlers" --actor erik
 wg log implement-api --list
+wg log implement-api --agent
+wg log --operations
 ```
 
 ---
@@ -325,14 +419,22 @@ Assign an agent identity to a task (or clear the assignment).
 ```bash
 wg assign <TASK> <AGENT-HASH>    # Assign agent to task
 wg assign <TASK> --clear         # Remove assignment
+wg assign <TASK> --auto          # Auto-select agent via LLM
 ```
 
 When the service spawns that task, the agent's role and tradeoff are injected into the prompt. The agent hash can be a prefix (minimum 4 characters).
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--clear` | Clear the agent assignment from the task |
+| `--auto` | Automatically select an agent using LLM |
 
 **Example:**
 ```bash
 wg assign my-task a3f7c21d
 wg assign my-task --clear
+wg assign my-task --auto
 ```
 
 ---
@@ -367,16 +469,171 @@ wg pause implement-api
 
 ### `wg resume`
 
-Resume a paused task.
+Resume a paused task (propagates to downstream subgraph by default).
 
 ```bash
-wg resume <ID>
+wg resume <ID> [OPTIONS]
 ```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--only` | Only resume this single task (skip subgraph propagation) |
 
 **Example:**
 ```bash
 wg resume implement-api
-# Task is eligible for coordinator dispatch again
+# Task and downstream subgraph are eligible for coordinator dispatch again
+
+wg resume implement-api --only
+# Only resume this task, not its dependents
+```
+
+---
+
+### `wg approve`
+
+Approve a task pending validation (transitions to Done).
+
+```bash
+wg approve <TASK>
+```
+
+**Arguments:**
+- `TASK` - Task ID to approve (required)
+
+**Example:**
+```bash
+wg approve security-audit
+# Transitions the task from pending-validation to done
+```
+
+---
+
+### `wg reject`
+
+Reject a task pending validation (reopens with feedback, or fails after max rejections).
+
+```bash
+wg reject <TASK> --reason <REASON>
+```
+
+**Arguments:**
+- `TASK` - Task ID to reject (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--reason <REASON>` | Reason for rejection (required) |
+
+**Example:**
+```bash
+wg reject security-audit --reason "Missing severity ratings for 3 findings"
+# Reopens the task with feedback so the agent can address issues
+```
+
+---
+
+### `wg publish`
+
+Publish a draft task (validates dependencies, then resumes entire subgraph).
+
+```bash
+wg publish <TASK> [OPTIONS]
+```
+
+**Arguments:**
+- `TASK` - Task ID to publish (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--only` | Only publish this single task (skip subgraph propagation) |
+
+**Examples:**
+```bash
+wg publish my-draft-task
+# Validates dependencies and resumes the entire subgraph
+
+wg publish my-draft-task --only
+# Publish just this task without propagating to the subgraph
+```
+
+---
+
+### `wg add-dep`
+
+Add a dependency edge between two tasks.
+
+```bash
+wg add-dep <TASK> <DEPENDENCY>
+```
+
+**Arguments:**
+- `TASK` - The task that will depend on the dependency (required)
+- `DEPENDENCY` - The dependency (blocker) task (required)
+
+**Example:**
+```bash
+wg add-dep deploy-prod run-tests
+# deploy-prod now waits for run-tests to complete
+```
+
+---
+
+### `wg rm-dep`
+
+Remove a dependency edge between two tasks.
+
+```bash
+wg rm-dep <TASK> <DEPENDENCY>
+```
+
+**Arguments:**
+- `TASK` - The task to remove the dependency from (required)
+- `DEPENDENCY` - The dependency to remove (required)
+
+**Example:**
+```bash
+wg rm-dep deploy-prod run-tests
+# deploy-prod no longer waits for run-tests
+```
+
+---
+
+### `wg wait`
+
+Park a task and exit — sets status to Waiting until a condition is met.
+
+```bash
+wg wait <TASK> --until <UNTIL> [OPTIONS]
+```
+
+**Arguments:**
+- `TASK` - Task ID to park (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--until <UNTIL>` | Condition to wait for: `task:<id>=<status>`, `timer:<duration>`, `message`, `human-input`, `file:<path>` (required) |
+| `--checkpoint <CHECKPOINT>` | Checkpoint summary of progress so far |
+
+**Examples:**
+```bash
+wg wait my-task --until "task:dep-a=done"
+# Park until dep-a completes
+
+wg wait my-task --until "timer:5m"
+# Park for 5 minutes
+
+wg wait my-task --until "message" --checkpoint "Completed phase 1, waiting for review feedback"
+# Park until a message arrives, saving a checkpoint of progress
+
+wg wait my-task --until "human-input"
+# Park until a human sends a message
+
+wg wait my-task --until "file:path/to/file"
+# Park until a file changes
 ```
 
 ---
@@ -396,6 +653,7 @@ wg list [--status <STATUS>]
 |--------|-------------|
 | `--status <STATUS>` | Filter by status (open, in-progress, done, failed, abandoned) |
 | `--paused` | Only show paused tasks |
+| `--tag <TAG>` | Filter by tag (repeatable, multiple `--tag` flags use AND semantics) |
 
 ---
 
@@ -503,6 +761,34 @@ wg status
 ```bash
 wg status
 # Shows task counts by status, recent activity, and overall progress
+```
+
+---
+
+### `wg discover`
+
+Show recently completed tasks and their artifacts (stigmergic discovery).
+
+```bash
+wg discover [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--since <SINCE>` | Time window (e.g. `24h`, `7d`, `30m`). Default: `24h` |
+| `--with-artifacts` | Include artifact paths in output |
+
+**Examples:**
+```bash
+wg discover
+# Show tasks completed in the last 24 hours
+
+wg discover --since 7d
+# Show tasks completed in the last 7 days
+
+wg discover --since 1h --with-artifacts
+# Show recently completed tasks with their artifact paths
 ```
 
 ---
@@ -812,6 +1098,7 @@ Supports two modes:
 | `--generative` | Multi-trace mode: compare multiple traces to produce a version 2 (generative) function |
 | `--output <PATH>` | Write to specific path instead of `.workgraph/functions/` |
 | `--force` | Overwrite existing function with same name |
+| `--include-evaluations` | Include coordinator-generated evaluation and assignment tasks (`evaluate-*`, `assign-*`) that are normally filtered out |
 
 **Examples:**
 ```bash
@@ -1146,11 +1433,11 @@ wg matrix <SUBCOMMAND> [OPTIONS]
 **Subcommands:**
 | Subcommand | Description |
 |------------|-------------|
-| `listen` | Listen for Matrix messages |
-| `send` | Send a message to Matrix |
-| `status` | Check Matrix connection status |
-| `login` | Authenticate with Matrix server |
-| `logout` | Disconnect from Matrix server |
+| `listen` | Start the Matrix message listener |
+| `send` | Send a message to a Matrix room |
+| `status` | Show Matrix connection status |
+| `login` | Login with password (caches access token) |
+| `logout` | Logout and clear cached credentials |
 
 ---
 
@@ -1182,6 +1469,260 @@ wg agency init
 ```bash
 wg agency init
 # Creates default roles and tradeoffs to get started with agent identities
+```
+
+---
+
+### `wg agency migrate`
+
+Migrate old-format agency store (`roles/`, `motivations/`, `agents/`) to the `primitives/` + `cache/` format.
+
+```bash
+wg agency migrate [--dry-run]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be migrated without writing |
+
+---
+
+### `wg agency scan`
+
+Scan the filesystem for agency stores.
+
+```bash
+wg agency scan <ROOT> [--max-depth <N>]
+```
+
+**Arguments:**
+- `ROOT` — Root directory to scan (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--max-depth <N>` | Maximum recursion depth (default: 10) |
+
+**Example:**
+```bash
+wg agency scan /home/erik --max-depth 5
+# Find all agency stores under the given root
+```
+
+---
+
+### `wg agency pull`
+
+Pull entities from another agency store into the local project.
+
+```bash
+wg agency pull <SOURCE> [OPTIONS]
+```
+
+**Arguments:**
+- `SOURCE` — Source store (path, named remote, or directory)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--entity <IDS>` | Only pull specific entity IDs (prefix match) |
+| `--type <TYPE>` | Only pull entities of this type (`role`, `tradeoff`, `agent`) |
+| `--dry-run` | Show what would be pulled without writing |
+| `--no-performance` | Skip merging performance data (copy definitions only) |
+| `--no-evaluations` | Skip copying evaluation JSON files |
+| `--force` | Overwrite local metadata instead of merging |
+| `--global` | Pull into `~/.workgraph/agency/` instead of local project |
+
+**Example:**
+```bash
+wg agency pull /home/alice/project
+# Pull all entities from Alice's agency store
+
+wg agency pull my-remote --type role --dry-run
+# Preview pulling only roles from a named remote
+```
+
+---
+
+### `wg agency push`
+
+Push local entities to another agency store.
+
+```bash
+wg agency push <TARGET> [OPTIONS]
+```
+
+**Arguments:**
+- `TARGET` — Target store (path, named remote, or directory)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--entity <IDS>` | Only push specific entity IDs |
+| `--type <TYPE>` | Only push entities of this type (`role`, `tradeoff`, `agent`) |
+| `--dry-run` | Show what would be pushed without writing |
+| `--no-performance` | Skip merging performance data (copy definitions only) |
+| `--no-evaluations` | Skip copying evaluation JSON files |
+| `--force` | Overwrite target metadata instead of merging |
+| `--global` | Push from `~/.workgraph/agency/` instead of local project |
+
+**Example:**
+```bash
+wg agency push /home/alice/project --type role
+# Push only roles to Alice's agency store
+```
+
+---
+
+### `wg agency merge`
+
+Merge entities from multiple agency stores.
+
+```bash
+wg agency merge [SOURCES]... [OPTIONS]
+```
+
+**Arguments:**
+- `[SOURCES]...` — Source stores (paths, named remotes, or directories)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--into <PATH>` | Merge into a specific target path instead of local project |
+| `--dry-run` | Show what would be merged without writing |
+
+**Example:**
+```bash
+wg agency merge /home/alice/project /home/bob/project
+# Merge entities from two stores into local
+
+wg agency merge store-a store-b --into /shared/agency --dry-run
+# Preview merging into a shared target
+```
+
+---
+
+### `wg agency remote`
+
+Manage named references to other agency stores.
+
+```bash
+wg agency remote <COMMAND>
+```
+
+| Command | Description |
+|---------|-------------|
+| `add <NAME> <PATH> [-d <TEXT>]` | Add a named remote agency store |
+| `remove <NAME>` | Remove a named remote |
+| `list` | List all configured remotes |
+| `show <NAME>` | Show details of a remote including entity counts |
+
+**Example:**
+```bash
+wg agency remote add alice /home/alice/project -d "Alice's agency"
+wg agency remote list
+wg agency remote show alice
+wg agency remote remove alice
+```
+
+---
+
+### `wg agency deferred`
+
+List pending deferred evolver operations awaiting human review.
+
+```bash
+wg agency deferred
+```
+
+---
+
+### `wg agency approve`
+
+Approve a deferred evolver operation.
+
+```bash
+wg agency approve <ID> [-n <NOTE>]
+```
+
+**Arguments:**
+- `ID` — Deferred operation ID (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-n, --note <NOTE>` | Optional note explaining approval |
+
+---
+
+### `wg agency reject`
+
+Reject a deferred evolver operation.
+
+```bash
+wg agency reject <ID> [-n <NOTE>]
+```
+
+**Arguments:**
+- `ID` — Deferred operation ID (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-n, --note <NOTE>` | Optional note explaining rejection |
+
+---
+
+### `wg agency create`
+
+Invoke the creator agent to discover and add new primitives.
+
+```bash
+wg agency create [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--model <MODEL>` | Model to use for the creator agent |
+| `--dry-run` | Show what would be created without writing |
+
+**Example:**
+```bash
+wg agency create --model opus
+# Use LLM to discover and add new roles/tradeoffs
+
+wg agency create --dry-run
+# Preview what would be created
+```
+
+---
+
+### `wg agency import`
+
+Import Agency's starter.csv primitives into WorkGraph.
+
+```bash
+wg agency import <CSV_PATH> [OPTIONS]
+```
+
+**Arguments:**
+- `CSV_PATH` — Path to the CSV file to import (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Show what would be imported without writing files |
+| `--tag <TAG>` | Provenance tag (default: `agency-import`) |
+
+**Example:**
+```bash
+wg agency import starter.csv --dry-run
+# Preview what would be imported
+
+wg agency import starter.csv --tag "external-v2"
+# Import with a custom provenance tag
 ```
 
 ---
@@ -1259,6 +1800,8 @@ wg agent create <NAME> [OPTIONS]
 | `--trust-level <LEVEL>` | `verified`, `provisional` (default), or `unknown` |
 | `--contact <STRING>` | Contact info (email, Matrix ID, etc.) |
 | `--executor <NAME>` | Executor backend: `claude` (default), `matrix`, `email`, `shell` |
+| `--model <MODEL>` | Preferred model (e.g., opus, sonnet, haiku, or full model ID) |
+| `--provider <PROVIDER>` | Preferred provider (e.g., anthropic, openrouter) |
 
 IDs can be prefixes (minimum unique match).
 
@@ -1318,7 +1861,7 @@ wg evaluate <SUBCOMMAND>
 Trigger LLM-based evaluation of a completed task.
 
 ```bash
-wg evaluate run <TASK> [--evaluator-model <MODEL>] [--dry-run]
+wg evaluate run <TASK> [OPTIONS]
 ```
 
 **Options:**
@@ -1326,6 +1869,7 @@ wg evaluate run <TASK> [--evaluator-model <MODEL>] [--dry-run]
 |--------|-------------|
 | `--evaluator-model <MODEL>` | Model for the evaluator (overrides config) |
 | `--dry-run` | Show what would be evaluated without spawning the evaluator |
+| `--flip` | Run FLIP (roundtrip intent fidelity) evaluation instead of direct evaluation |
 
 The task must be done or failed. Spawns an evaluator agent that scores the task across four dimensions:
 - **correctness** (40%) — output matches desired outcome
@@ -1370,16 +1914,19 @@ wg evaluate record --task deploy-prod --score 0.85 --source "manual" \
 
 #### `wg evaluate show`
 
-Show evaluation history with optional filters.
+Show evaluation history with optional filters. When a positional `TASK` is given, shows both task-level and org-level scores side by side.
 
 ```bash
-wg evaluate show [OPTIONS]
+wg evaluate show [TASK] [OPTIONS]
 ```
+
+**Arguments:**
+- `[TASK]` - Show both task-level and org-level scores side by side for this task (optional)
 
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--task <TASK>` | Filter by task ID (prefix match) |
+| `--task <TASK>` | Filter by task ID (prefix match, when no positional TASK arg) |
 | `--agent <AGENT>` | Filter by agent ID (prefix match) |
 | `--source <SOURCE>` | Filter by source (exact match or glob, e.g. `"outcome:*"`) |
 | `--limit <N>` | Show only the N most recent evaluations |
@@ -1405,12 +1952,13 @@ wg evolve <SUBCOMMAND>
 | Subcommand | Description |
 |------------|-------------|
 | `run` | Trigger an evolution cycle on agency roles and tradeoffs |
+| `apply` | Apply a `synthesis-result.json` from a fan-out evolution run |
 | `review` | Review deferred evolver operations (list, approve, reject) |
 
 #### `wg evolve run`
 
 ```bash
-wg evolve run [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-run]
+wg evolve run [OPTIONS]
 ```
 
 **Options:**
@@ -1420,6 +1968,11 @@ wg evolve run [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-ru
 | `--budget <N>` | Maximum number of operations to apply |
 | `--model <MODEL>` | LLM model for the evolver agent |
 | `--dry-run` | Show proposed changes without applying them |
+| `--autopoietic` | Enable autopoietic cycle mode (back-edge from evaluate to partition) |
+| `--max-iterations <N>` | Max cycle iterations (default: 3, requires `--autopoietic`) |
+| `--cycle-delay <SECS>` | Seconds between cycle iterations (default: 3600, requires `--autopoietic`) |
+| `--force-fanout` | Force fan-out mode even with <50 evaluations |
+| `--single-shot` | Force legacy single-shot mode even with ≥50 evaluations |
 
 **Strategies:**
 | Strategy | Description |
@@ -1430,6 +1983,33 @@ wg evolve run [--strategy <STRATEGY>] [--budget <N>] [--model <MODEL>] [--dry-ru
 | `retirement` | Remove consistently poor-performing entities |
 | `tradeoff-tuning` | Adjust constraints on existing tradeoffs |
 | `all` | Use all strategies as appropriate (default) |
+
+#### `wg evolve apply`
+
+Apply a synthesis-result.json from a fan-out evolution run.
+
+```bash
+wg evolve apply <SYNTHESIS_FILE> [OPTIONS]
+```
+
+**Arguments:**
+- `SYNTHESIS_FILE` — Path to `synthesis-result.json` (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-o, --output <PATH>` | Output path for `apply-results.json` (default: auto-derived from synthesis file path) |
+
+**Example:**
+```bash
+wg evolve apply .workgraph/agency/synthesis-result.json
+# Apply the synthesized evolution operations
+
+wg evolve apply synthesis-result.json -o results.json
+# Apply with a custom output path
+```
+
+---
 
 #### `wg evolve review`
 
@@ -1704,6 +2284,47 @@ wg dead-agents --purge --delete-dirs
 
 ---
 
+### `wg checkpoint`
+
+Save a checkpoint for context preservation during long-running tasks.
+
+```bash
+wg checkpoint <TASK> --summary <SUMMARY> [OPTIONS]
+```
+
+**Arguments:**
+- `TASK` - Task ID (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-s, --summary <SUMMARY>` | Summary of progress (~500 tokens) (required) |
+| `--agent <AGENT>` | Agent ID (default: `WG_AGENT_ID` env var or task assignee) |
+| `-f, --file <FILES>` | Files modified since last checkpoint (repeatable) |
+| `--stream-offset <OFFSET>` | Stream byte offset |
+| `--turn-count <N>` | Conversation turn count |
+| `--token-input <N>` | Input tokens used |
+| `--token-output <N>` | Output tokens used |
+| `--checkpoint-type <TYPE>` | Checkpoint type: `explicit` (default) or `auto` |
+| `--list` | List checkpoints instead of creating one |
+
+**Examples:**
+```bash
+wg checkpoint my-task --summary "Completed auth module, starting API routes"
+# Save a progress checkpoint
+
+wg checkpoint my-task --summary "Phase 2 done" -f src/api.rs -f src/auth.rs
+# Checkpoint with modified file tracking
+
+wg checkpoint my-task --summary "Midway" --token-input 50000 --token-output 8000
+# Checkpoint with token usage metrics
+
+wg checkpoint my-task --list
+# List all checkpoints for a task
+```
+
+---
+
 ## Peer Commands
 
 Manage peer workgraph instances for cross-repo communication and function sharing.
@@ -1791,11 +2412,13 @@ wg service start [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port <PORT>` | Port for HTTP API (optional) |
-| `--socket <PATH>` | Unix socket path (default: /tmp/wg-{project}.sock) |
+| `--socket <PATH>` | Unix socket path (default: `.workgraph/service/daemon.sock`) |
 | `--max-agents <N>` | Max parallel agents (overrides config) |
 | `--executor <NAME>` | Executor for spawned agents (overrides config) |
 | `--interval <SECS>` | Background poll interval in seconds (overrides config) |
 | `--model <MODEL>` | Model for spawned agents (overrides config) |
+| `--force` | Kill existing daemon before starting (prevents stacked daemons) |
+| `--no-coordinator-agent` | Disable the persistent coordinator agent (LLM chat session) |
 
 **Example:**
 ```bash
@@ -1823,6 +2446,22 @@ wg service stop [--force] [--kill-agents]
 ```bash
 wg service stop --kill-agents
 # Stop daemon and terminate all running agents
+```
+
+---
+
+### `wg service restart`
+
+Restart the service daemon (graceful stop then start).
+
+```bash
+wg service restart
+```
+
+**Example:**
+```bash
+wg service restart
+# Gracefully stops the daemon and starts it again with the same config
 ```
 
 ---
@@ -1941,6 +2580,133 @@ wg service install
 # Outputs a systemd unit file; follow instructions to enable auto-start
 ```
 
+### `wg service create-coordinator`
+
+Create a new coordinator session.
+
+```bash
+wg service create-coordinator [--name <NAME>]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--name <NAME>` | Optional name for the coordinator |
+
+**Example:**
+```bash
+wg service create-coordinator --name "release-v2"
+# Creates a new coordinator session with the given name
+```
+
+---
+
+### `wg service delete-coordinator`
+
+Delete a coordinator session.
+
+```bash
+wg service delete-coordinator <ID>
+```
+
+**Arguments:**
+- `ID` — Coordinator ID to delete (required)
+
+**Example:**
+```bash
+wg service delete-coordinator 2
+# Permanently removes coordinator session 2
+```
+
+---
+
+### `wg service archive-coordinator`
+
+Archive a coordinator session (mark as Done).
+
+```bash
+wg service archive-coordinator <ID>
+```
+
+**Arguments:**
+- `ID` — Coordinator ID to archive (required)
+
+**Example:**
+```bash
+wg service archive-coordinator 1
+# Marks coordinator 1 as Done — preserved in history but no longer active
+```
+
+---
+
+### `wg service freeze`
+
+Freeze all agents (SIGSTOP) and pause the service. Agents are suspended in place and no new agents are spawned.
+
+```bash
+wg service freeze
+```
+
+**Example:**
+```bash
+wg service freeze
+# Suspend all running agents and pause the coordinator
+```
+
+---
+
+### `wg service thaw`
+
+Thaw frozen agents (SIGCONT) and resume the service.
+
+```bash
+wg service thaw
+```
+
+**Example:**
+```bash
+wg service thaw
+# Resume suspended agents and restart coordinator dispatch
+```
+
+---
+
+### `wg service interrupt-coordinator`
+
+Interrupt a coordinator's current generation (sends SIGINT, preserves context).
+
+```bash
+wg service interrupt-coordinator <ID>
+```
+
+**Arguments:**
+- `ID` — Coordinator ID to interrupt (required)
+
+**Example:**
+```bash
+wg service interrupt-coordinator 0
+# Interrupts the coordinator's current LLM generation without killing the session
+```
+
+---
+
+### `wg service stop-coordinator`
+
+Stop a coordinator session (kill agent, reset to Open).
+
+```bash
+wg service stop-coordinator <ID>
+```
+
+**Arguments:**
+- `ID` — Coordinator ID to stop (required)
+
+**Example:**
+```bash
+wg service stop-coordinator 1
+# Kills the coordinator agent and resets the session to Open
+```
+
 ---
 
 ## Monitoring Commands
@@ -1974,6 +2740,619 @@ wg watch --task deploy --replay 20
 
 ---
 
+### `wg stats`
+
+Show time counters and agent statistics.
+
+```bash
+wg stats
+```
+
+**Example:**
+```bash
+wg stats
+# Displays agent time counters, task throughput, and resource usage
+```
+
+### `wg metrics`
+
+Display detailed cleanup and monitoring metrics for troubleshooting and observability.
+
+```bash
+wg metrics [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--json` | Output metrics as JSON for machine consumption |
+
+Shows detailed statistics including:
+- Cleanup operation success/failure rates
+- Recovery branch management metrics
+- Dead agent cleanup statistics
+- Timing statistics for cleanup operations
+- Resource recovery statistics
+
+**Examples:**
+```bash
+# Show metrics in human-readable format
+wg metrics
+
+# Output metrics as JSON
+wg metrics --json
+```
+
+---
+
+## Communication Commands
+
+### `wg msg`
+
+Send and receive messages to/from tasks and agents.
+
+```bash
+wg msg <COMMAND>
+```
+
+**Subcommands:**
+
+#### `wg msg send`
+
+Send a message to a task/agent.
+
+```bash
+wg msg send <TASK_ID> [MESSAGE] [OPTIONS]
+```
+
+**Arguments:**
+- `TASK_ID` - Task ID (required)
+- `MESSAGE` - Message body (optional if `--stdin` is used)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--from <FROM>` | Sender identifier (default: `user`) |
+| `--priority <PRIORITY>` | Message priority: `normal` or `urgent` (default: `normal`) |
+| `--stdin` | Read message body from stdin |
+
+**Examples:**
+```bash
+wg msg send my-task "Please also update the README"
+# Send a message to a task
+
+wg msg send my-task "Urgent: API key rotated" --priority urgent
+# Send an urgent message
+
+echo "Long feedback..." | wg msg send my-task --stdin --from reviewer
+# Pipe message from stdin
+```
+
+---
+
+#### `wg msg list`
+
+List all messages for a task.
+
+```bash
+wg msg list <TASK_ID>
+```
+
+**Example:**
+```bash
+wg msg list my-task
+# Show all messages associated with the task
+```
+
+---
+
+#### `wg msg read`
+
+Read unread messages (marks as read, advances cursor).
+
+```bash
+wg msg read <TASK_ID> [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--agent <AGENT>` | Agent ID (default: from `WG_AGENT_ID` env var, or `user`) |
+
+**Example:**
+```bash
+wg msg read my-task --agent agent-1234
+# Read unread messages for this agent on the task
+```
+
+---
+
+#### `wg msg poll`
+
+Poll for new messages (exit code 0 = new messages, 1 = none).
+
+```bash
+wg msg poll <TASK_ID> [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--agent <AGENT>` | Agent ID (default: from `WG_AGENT_ID` env var, or `user`) |
+
+**Example:**
+```bash
+wg msg poll my-task --agent agent-1234
+# Check if new messages exist (useful in scripts)
+```
+
+---
+
+### `wg chat`
+
+Chat with the coordinator agent.
+
+```bash
+wg chat [OPTIONS] [MESSAGE]
+```
+
+**Arguments:**
+- `MESSAGE` - Message to send (omit for interactive mode)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-i, --interactive` | Interactive REPL mode |
+| `--history` | Show chat history |
+| `--clear` | Clear chat history |
+| `--timeout <TIMEOUT>` | Timeout in seconds waiting for response (default: 120) |
+| `--attachment <ATTACHMENT>` | Attach a file (copied to `.workgraph/attachments/`) |
+| `--coordinator <ID>` | Target coordinator ID (default: 0) — for multi-coordinator setups |
+| `--history-depth <N>` | Show only the last N messages (with `--history`) or load only the last N messages in interactive mode |
+| `--no-history` | Start with no history loaded. History is still persisted — this only affects the initial display |
+| `--rotate` | Rotate chat files to archive (force-rotate regardless of thresholds) |
+| `--cleanup` | Clean up archived files older than the retention period |
+| `--compact` | Compact chat history into a context summary |
+| `--share-from <FROM_ID>` | Share context from another coordinator into this one. Copies the source coordinator's compacted summary as imported context. Use with `--coordinator` to specify the target (default: 0) |
+
+**Examples:**
+```bash
+wg chat "What tasks are blocked?"
+# Send a one-shot message to the coordinator
+
+wg chat -i
+# Start an interactive chat session
+
+wg chat --history
+# View previous chat messages
+
+wg chat "Review this file" --attachment src/main.rs
+# Send a message with a file attachment
+```
+
+---
+
+## Model and Endpoint Management
+
+See [docs/models.md](models.md) for the full guide including architecture, security model, and common configurations.
+
+### `wg model`
+
+Model registry and routing management.
+
+```bash
+wg model <SUBCOMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `list` | Show all models in the registry (built-in + user-defined) |
+| `add <ALIAS>` | Add or update a model in the config registry |
+| `remove <ALIAS>` | Remove a model from the config registry |
+| `set-default <ALIAS>` | Set the default model for agent dispatch |
+| `routing` | Show per-role model routing configuration |
+| `set <ROLE> <MODEL>` | Set the model for a specific dispatch role |
+
+#### `wg model list`
+
+```bash
+wg model list [--tier <TIER>]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--tier <TIER>` | Filter by tier: `fast`, `standard`, `premium` |
+
+#### `wg model add`
+
+```bash
+wg model add <ALIAS> --provider <PROVIDER> [OPTIONS]
+```
+
+**Arguments:**
+- `ALIAS` — Short alias for the model (e.g., `gpt-4o`, `claude-via-openrouter`)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--provider <PROVIDER>` | Provider: `anthropic`, `openai`, `openrouter`, `local` (required) |
+| `--model-id <ID>` | Full API model identifier (defaults to alias if omitted) |
+| `--tier <TIER>` | Quality tier: `fast`, `standard`, `premium` (default: `standard`) |
+| `--endpoint <NAME>` | Named endpoint to use for this model |
+| `--context-window <N>` | Context window in tokens |
+| `--cost-in <N>` | Cost per million input tokens (USD) |
+| `--cost-out <N>` | Cost per million output tokens (USD) |
+| `--global` | Write to global config (`~/.workgraph/config.toml`) |
+
+#### `wg model remove`
+
+```bash
+wg model remove <ALIAS> [--force] [--global]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--force` | Skip confirmation for entries referenced by roles |
+| `--global` | Write to global config |
+
+#### `wg model set-default`
+
+```bash
+wg model set-default <ALIAS> [--global]
+```
+
+Sets the default model for agent dispatch. The alias must exist in the registry.
+
+#### `wg model routing`
+
+```bash
+wg model routing
+```
+
+Show per-role model routing configuration.
+
+#### `wg model set`
+
+```bash
+wg model set <ROLE> <MODEL> [OPTIONS]
+```
+
+**Arguments:**
+- `ROLE` — Role name (e.g., `default`, `evaluator`, `triage`, `compactor`)
+- `MODEL` — Model alias or ID
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--provider <PROVIDER>` | Also set provider for this role |
+| `--endpoint <ENDPOINT>` | Also set endpoint for this role |
+| `--tier <TIER>` | Set tier override instead of direct model |
+| `--global` | Write to global config |
+
+**Examples:**
+```bash
+# List all models
+wg model list
+
+# Filter by tier
+wg model list --tier premium
+
+# Add a model
+wg model add gpt-4o --provider openai --tier standard --cost-in 2.5 --cost-out 10.0
+
+# Set the default model
+wg model set-default sonnet
+
+# Show routing
+wg model routing
+
+# Set evaluator to use opus
+wg model set evaluator opus
+
+# Set triage to use haiku via openrouter
+wg model set triage haiku --provider openrouter
+```
+
+---
+
+### `wg key`
+
+Manage API keys for LLM providers.
+
+```bash
+wg key <SUBCOMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `set <PROVIDER>` | Configure an API key for a provider |
+| `check [PROVIDER]` | Validate API key availability and status |
+| `list` | Show key configuration status for all providers |
+
+#### `wg key set`
+
+```bash
+wg key set <PROVIDER> [OPTIONS]
+```
+
+**Arguments:**
+- `PROVIDER` — Provider name (e.g., `openrouter`, `anthropic`, `openai`)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--env <VAR>` | Reference an environment variable by name |
+| `--file <PATH>` | Path to a file containing the key |
+| `--value <VALUE>` | Store key value directly (written to `~/.workgraph/keys/<provider>.key`, NOT to config) |
+| `--global` | Apply to global config (`~/.workgraph/config.toml`) |
+
+#### `wg key check`
+
+```bash
+wg key check [PROVIDER]
+```
+
+Validate API key availability and status. Omit provider to check all.
+
+#### `wg key list`
+
+```bash
+wg key list
+```
+
+Show key configuration status for all providers.
+
+**Examples:**
+```bash
+# Set a key from a file
+wg key set openrouter --file ~/.secrets/openrouter.key
+
+# Set a key from an environment variable
+wg key set anthropic --env ANTHROPIC_API_KEY
+
+# Store a key value directly
+wg key set openai --value sk-abc123...
+
+# Check all keys
+wg key check
+
+# Check a specific provider
+wg key check openrouter
+
+# Show key status
+wg key list
+```
+
+---
+
+### `wg models`
+
+Browse and search available models.
+
+```bash
+wg models <SUBCOMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List models from the local registry |
+| `search <QUERY>` | Search models from OpenRouter by name, ID, or description |
+| `remote` | List all models available on OpenRouter |
+| `add <ID>` | Add a custom model to the local registry |
+| `set-default <ID>` | Set the default model |
+| `init` | Initialize models.yaml with defaults |
+
+**Examples:**
+
+```bash
+# List all local models
+wg models list
+
+# Filter by tier
+wg models list --tier frontier
+
+# Search OpenRouter for Claude models
+wg models search claude
+
+# Search for tool-capable models only
+wg models search gemini --tools
+
+# Add a custom model
+wg models add "custom/my-model" --cost-in 1.0 --cost-out 5.0 --tier mid
+
+# Set default
+wg models set-default "anthropic/claude-sonnet-4-6"
+```
+
+---
+
+### `wg endpoints`
+
+Manage LLM endpoints (connection targets with URL + auth).
+
+```bash
+wg endpoints <SUBCOMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `add <NAME>` | Add a new endpoint |
+| `list` | List all configured endpoints |
+| `remove <NAME>` | Remove an endpoint by name |
+| `set-default <NAME>` | Set an endpoint as the default |
+| `test <NAME>` | Test endpoint connectivity |
+
+**Examples:**
+
+```bash
+# Add an OpenRouter endpoint
+wg endpoints add openrouter --provider openrouter --default
+
+# Add with a key file
+wg endpoints add anthropic --provider anthropic --api-key-file ~/.secrets/anthropic.key
+
+# Add a local Ollama endpoint
+wg endpoints add ollama --provider local --url http://localhost:11434/v1
+
+# List endpoints
+wg endpoints list
+
+# Test connectivity
+wg endpoints test openrouter
+
+# Remove an endpoint
+wg endpoints remove openai
+
+# Add to global config
+wg endpoints add openrouter --provider openrouter --global
+```
+
+---
+
+### `wg profile`
+
+Manage provider profiles (model tier presets).
+
+```bash
+wg profile <COMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `set <NAME>` | Set the active provider profile |
+| `show` | Show current profile and resolved model mappings |
+| `list` | List available profiles |
+| `refresh` | Refresh model data from OpenRouter and recompute rankings |
+
+#### `wg profile set`
+
+```bash
+wg profile set <NAME> [OPTIONS]
+```
+
+**Arguments:**
+- `NAME` — Profile name (e.g., `anthropic`, `openrouter`, `openai`)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--fast <MODEL>` | Pin the fast tier to a specific model (e.g., `openrouter:qwen/qwen3-coder`) |
+| `--standard <MODEL>` | Pin the standard tier to a specific model (e.g., `openrouter:deepseek/deepseek-r1`) |
+| `--premium <MODEL>` | Pin the premium tier to a specific model (e.g., `openrouter:qwen/qwen3-max`) |
+
+#### `wg profile show`
+
+```bash
+wg profile show [--verbose]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Show raw metrics (pricing, context length, benchmark scores) per model |
+
+**Examples:**
+```bash
+# Set active profile to OpenRouter
+wg profile set openrouter
+
+# Pin specific models per tier
+wg profile set openrouter --fast openrouter:qwen/qwen3-coder --premium openrouter:qwen/qwen3-max
+
+# Show current profile with resolved model mappings
+wg profile show
+
+# Show detailed model metrics
+wg profile show --verbose
+
+# List available profiles
+wg profile list
+
+# Refresh model data from OpenRouter
+wg profile refresh
+```
+
+---
+
+## Cost and Usage
+
+### `wg spend`
+
+Show token usage and estimated cost summaries.
+
+```bash
+wg spend [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `-t, --today` | Show only today's spend |
+| `-j, --json` | Output as JSON |
+
+**Examples:**
+```bash
+wg spend
+# Show cumulative token usage and cost
+
+wg spend --today
+# Show only today's spend
+
+wg spend --json
+# Output spend data as JSON
+```
+
+---
+
+### `wg openrouter`
+
+OpenRouter cost monitoring and management.
+
+```bash
+wg openrouter <COMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `status` | Show OpenRouter API key status and usage |
+| `session` | Show session cost summary |
+| `set-limit` | Set cost cap limits |
+
+#### `wg openrouter set-limit`
+
+```bash
+wg openrouter set-limit [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--global <USD>` | Global cost cap in USD |
+| `--session <USD>` | Session cost cap in USD |
+| `--task <USD>` | Task cost cap in USD |
+
+**Examples:**
+```bash
+wg openrouter status
+# Show API key status and usage
+
+wg openrouter session
+# Show current session cost summary
+
+wg openrouter set-limit --global 100 --session 10 --task 2
+# Set cost caps at global, session, and task levels
+```
+
+---
+
 ## Utility Commands
 
 ### `wg init`
@@ -1990,6 +3369,61 @@ Creates `.workgraph/` directory with `graph.jsonl`.
 ```bash
 cd my-project && wg init
 # Creates .workgraph/ directory ready for task management
+```
+
+### `wg cleanup`
+
+Manual cleanup commands for edge case recovery. Provides commands to manually clean up orphaned worktrees, recovery branches, and other edge cases that may not be handled by automatic cleanup operations.
+
+```bash
+wg cleanup <SUBCOMMAND>
+```
+
+#### `wg cleanup orphaned`
+
+Clean up orphaned worktrees that have no corresponding agent metadata.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--execute` | Actually perform the cleanup (dry-run by default) |
+| `--force` | Force cleanup even if errors occur |
+| `--dir <PATH>` | Directory to search for orphaned worktrees (defaults to current directory) |
+
+**Examples:**
+```bash
+# Dry-run to see what would be cleaned up
+wg cleanup orphaned
+
+# Actually perform the cleanup
+wg cleanup orphaned --execute
+
+# Force cleanup even if some operations fail
+wg cleanup orphaned --execute --force
+```
+
+#### `wg cleanup recovery-branches`
+
+Clean up old recovery branches based on age.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--max-age-days <N>` | Maximum age of recovery branches to keep (default: 30) |
+| `--execute` | Actually perform the cleanup (dry-run by default) |
+| `--force` | Force cleanup even if errors occur |
+| `--dir <PATH>` | Directory containing git repository (defaults to current directory) |
+
+**Examples:**
+```bash
+# See what recovery branches older than 30 days exist
+wg cleanup recovery-branches
+
+# Clean up recovery branches older than 7 days
+wg cleanup recovery-branches --max-age-days 7 --execute
+
+# Force cleanup of old branches even if some deletions fail
+wg cleanup recovery-branches --execute --force
 ```
 
 ---
@@ -2034,6 +3468,11 @@ wg viz [OPTIONS] [TASK_ID]...
 | `--show-internal` | Show internal tasks (`assign-*`, `evaluate-*`) normally hidden |
 | `--tui` | Launch interactive TUI mode instead of static output |
 | `--no-tui` | Force static output even when stdout is an interactive terminal |
+| `--no-mouse` | Disable mouse capture in TUI mode (useful in tmux) |
+| `--layout <LAYOUT>` | Layout strategy: `diamond` (default, fan-in nodes under common ancestor) or `tree` (classic DFS order) |
+| `--tag <TAG>` | Filter by tag (repeatable, multiple `--tag` flags use AND semantics) |
+| `--edge-color <STYLE>` | Edge color style: `gray` (default), `white`, or `mixed` (tree=white, arcs=gray) |
+| `--columns <COLUMNS>` | Force a specific output width in columns (default: auto-detect terminal width) |
 
 **Examples:**
 ```bash
@@ -2069,8 +3508,17 @@ wg viz --no-tui
 Archive completed tasks to a separate file.
 
 ```bash
-wg archive [--dry-run] [--older <DURATION>] [--list]
+wg archive [OPTIONS] [IDS]...
 ```
+
+**Arguments:**
+- `[IDS]...` - Specific task IDs to archive (optional; archives all eligible tasks if omitted)
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `search` | Search archived tasks by title, description, and tags |
+| `restore` | Restore an archived task back into the active graph |
 
 **Options:**
 | Option | Description |
@@ -2078,8 +3526,10 @@ wg archive [--dry-run] [--older <DURATION>] [--list]
 | `--dry-run` | Show what would be archived without archiving |
 | `--older <DURATION>` | Only archive tasks older than this (e.g., 30d, 7d, 1w) |
 | `--list` | List already-archived tasks instead of archiving |
+| `-y, --yes` | Skip confirmation prompt for bulk archive operations |
+| `--undo` | Undo the last archive operation (restore all tasks from the last batch) |
 
-**Example:**
+**Examples:**
 ```bash
 wg archive --dry-run
 # Preview which tasks would be archived
@@ -2089,6 +3539,18 @@ wg archive --older 30d
 
 wg archive --list
 # Show previously archived tasks
+
+wg archive my-task-1 my-task-2
+# Archive specific tasks
+
+wg archive --undo
+# Undo the last archive operation
+
+wg archive search "auth"
+# Search archived tasks
+
+wg archive restore my-old-task
+# Restore an archived task back into the active graph
 ```
 
 ---
@@ -2155,21 +3617,58 @@ With no options (or `--show`), displays current configuration.
 | `--coordinator-interval <SECS>` | Set coordinator tick interval |
 | `--poll-interval <SECS>` | Set service daemon background poll interval |
 | `--coordinator-executor <NAME>` | Set coordinator executor |
+| `--coordinator-model <MODEL>` | Set coordinator model (e.g., opus, sonnet, haiku) |
+| `--coordinator-provider <PROVIDER>` | **[DEPRECATED]** Set coordinator provider — use `provider:model` format in `--coordinator-model` instead |
+| `--max-coordinators <N>` | Set max concurrent coordinator agents (LLM sessions). Default: 4 |
 | `--auto-evaluate <BOOL>` | Enable/disable automatic evaluation |
 | `--auto-assign <BOOL>` | Enable/disable automatic identity assignment |
-| `--assigner-model <MODEL>` | Set model for assigner agents |
-| `--evaluator-model <MODEL>` | Set model for evaluator agents |
-| `--evolver-model <MODEL>` | Set model for evolver agents |
+| `--auto-place <BOOL>` | Enable/disable automatic placement analysis on new tasks |
+| `--auto-create <BOOL>` | Enable/disable automatic creator agent invocation |
+| `--flip-model <MODEL>` | Set both FLIP inference and comparison models to the same value |
 | `--assigner-agent <HASH>` | Set assigner agent (content-hash) |
 | `--evaluator-agent <HASH>` | Set evaluator agent (content-hash) |
 | `--evolver-agent <HASH>` | Set evolver agent (content-hash) |
 | `--creator-agent <HASH>` | Set creator agent (content-hash) |
-| `--creator-model <MODEL>` | Set model for creator agents |
+| `--creator-model <MODEL>` | **[DEPRECATED]** Use `--set-model creator <MODEL>` instead |
 | `--retention-heuristics <TEXT>` | Set retention heuristics (prose policy for evolver) |
+| `--max-child-tasks <N>` | Max tasks a single agent can create per execution (default: 10) |
+| `--max-task-depth <N>` | Max depth of task dependency chains from root (default: 8) |
 | `--auto-triage <BOOL>` | Enable/disable automatic triage of dead agents |
-| `--triage-model <MODEL>` | Set model for triage (default: haiku) |
+| `--triage-model <MODEL>` | **[DEPRECATED]** Use `--set-model triage <MODEL>` instead |
 | `--triage-timeout <SECS>` | Set timeout for triage calls (default: 30) |
 | `--triage-max-log-bytes <N>` | Set max bytes for triage log reading (default: 50000) |
+| `--eval-gate-threshold <N>` | Set evaluation gate threshold (0.0–1.0). Evaluations below this score reject the original task. Only applies to tasks tagged `eval-gate` unless `--eval-gate-all` is set |
+| `--eval-gate-all <BOOL>` | Apply eval gate to ALL evaluated tasks, not just those tagged `eval-gate` |
+| `--flip-enabled <BOOL>` | Enable or disable FLIP (roundtrip intent fidelity) evaluation |
+| `--flip-inference-model <MODEL>` | Model for FLIP inference phase (reconstructing prompt from output) |
+| `--flip-comparison-model <MODEL>` | Model for FLIP comparison phase (scoring similarity) |
+| `--flip-verification-threshold <N>` | FLIP score threshold for triggering verification (default: 0.7) |
+| `--flip-verification-model <MODEL>` | **[DEPRECATED]** Use `--set-model verification <MODEL>` instead |
+| `--chat-history <BOOL>` | Enable/disable chat history persistence across TUI restarts |
+| `--chat-history-max <N>` | Maximum number of chat messages to persist (default: 1000) |
+| `--tui-counters <LIST>` | TUI time counters (comma-separated: `uptime`, `cumulative`, `active`, `session`) |
+| `--retry-context-tokens <N>` | Max tokens of previous-attempt context to inject on retry (default: 2000, 0 = disabled) |
+| `--viz-edge-color <STYLE>` | Viz edge color style: `gray` (default), `white`, or `mixed` |
+| `--install-global` | Install project config as global default (`~/.workgraph/config.toml`) |
+| `--force` | Skip confirmation when overwriting existing global config |
+| `--homeserver <URL>` | Set Matrix homeserver URL |
+| `--username <USER>` | Set Matrix username |
+| `--password <PASS>` | Set Matrix password |
+| `--access-token <TOKEN>` | Set Matrix access token |
+| `--room <ROOM>` | Set Matrix default room |
+| `--models` | Show all model routing assignments (per-role model+provider) |
+| `--set-model <ROLE> <MODEL>` | Set model for a dispatch role |
+| `--set-provider <ROLE> <PROVIDER>` | **[DEPRECATED]** Set provider for a dispatch role — use `provider:model` format in `--set-model` instead |
+| `--set-endpoint <ROLE> <ENDPOINT>` | Bind a named endpoint to a dispatch role |
+| `--role-model <ROLE=MODEL>` | Set model for a role (key=value syntax) |
+| `--role-provider <ROLE=PROVIDER>` | **[DEPRECATED]** Set provider for a role — use `provider:model` format in `--role-model` instead |
+| `--registry` | Show all model registry entries (built-in + user-defined) |
+| `--registry-add` | Add a model to the registry (use with `--id`, `--provider`, `--reg-model`, `--reg-tier`, `--endpoint`, `--context-window`, `--cost-input`, `--cost-output`) |
+| `--registry-remove <ID>` | Remove a model from the registry |
+| `--tiers` | Show current tier→model assignments |
+| `--tier <TIER=MODEL_ID>` | Set which model a tier uses (e.g., `--tier standard=gpt-4o`) |
+| `--set-key <PROVIDER>` | Set API key file for a provider (use with `--file`) |
+| `--check-key` | Check OpenRouter API key validity and credit status |
 
 **Examples:**
 
@@ -2190,7 +3689,47 @@ wg config --global --model sonnet
 wg config --auto-evaluate true --auto-assign true
 
 # Set per-role model overrides
-wg config --assigner-model haiku --evaluator-model opus --evolver-model opus
+wg config --set-model assigner haiku
+wg config --set-model evaluator opus
+wg config --set-model evolver opus
+
+# Model routing: show and set per-role model assignments
+wg config --models
+wg config --set-model evaluator sonnet
+wg config --set-model triage haiku
+wg config --role-model evaluator=sonnet
+
+# Tier management
+wg config --tiers
+wg config --tier fast=haiku
+wg config --tier standard=sonnet
+
+# Model registry
+wg config --registry
+wg config --registry-add --id gpt-4o --provider openai --reg-model gpt-4o --reg-tier standard
+
+# API key management
+wg config --set-key openrouter --file ~/.secrets/openrouter.key
+wg config --check-key
+
+# Eval gate and FLIP
+wg config --eval-gate-threshold 0.7 --eval-gate-all true
+wg config --flip-enabled true --flip-verification-threshold 0.7
+
+# Automation flags
+wg config --auto-place true --auto-create true
+
+# Multi-coordinator
+wg config --max-coordinators 6
+
+# Chat history
+wg config --chat-history true --chat-history-max 500
+
+# Install project config as global default
+wg config --install-global
+
+# Matrix integration
+wg config --homeserver https://matrix.example.com --username bot --room '#ops:example.com'
 ```
 
 ---
@@ -2216,21 +3755,32 @@ wg quickstart
 Launch the interactive terminal dashboard.
 
 ```bash
-wg tui [--refresh-rate <MS>]
+wg tui [OPTIONS]
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--refresh-rate <MS>` | Data refresh rate in milliseconds (default: 2000) |
+| `--no-mouse` | Disable mouse capture (useful in tmux) |
+| `--recording` | Recording mode: disable mouse capture and keyboard enhancement queries for clean asciinema/terminal recording. Auto-enabled when `ASCIINEMA_REC` is set |
+| `--trace <FILE>` | Record all input events to a JSONL file for replay-based screencasts |
+| `--show-keys` | Show key press feedback overlay (useful for screencasts/demos). Also enabled by `tui.show_keys` config |
+| `--history-depth <N>` | Load only the last N chat messages on startup (overrides default pagination window) |
+| `--no-history` | Start with a clean chat view (no history loaded). History is still persisted — this only affects the initial display |
 
 **Example:**
 ```bash
 wg tui
-# Opens the interactive TUI with default 2s refresh
+# Opens the interactive TUI dashboard
 
-wg tui --refresh-rate 500
-# Open TUI with faster 500ms refresh rate
+wg tui --recording
+# Launch TUI in recording mode for clean asciinema capture
+
+wg tui --trace events.jsonl --show-keys
+# Record input events with key press overlay for screencasts
+
+wg tui --no-history --no-mouse
+# Clean chat view, no mouse capture (good for tmux)
 ```
 
 ---
@@ -2333,6 +3883,7 @@ wg gc [OPTIONS]
 |--------|-------------|
 | `--dry-run` | Show what would be removed without actually removing |
 | `--include-done` | Also remove done tasks (by default only failed + abandoned) |
+| `--older <DURATION>` | Only remove tasks older than this duration (e.g., `30d`, `7d`, `1w`, `24h`) |
 
 **Examples:**
 ```bash
@@ -2344,6 +3895,296 @@ wg gc
 
 wg gc --include-done
 # Also remove completed tasks
+
+wg gc --older 30d
+# Only remove tasks older than 30 days
+```
+
+---
+
+### `wg compact`
+
+Compact: distill graph state into context.md.
+
+```bash
+wg compact
+```
+
+**Example:**
+```bash
+wg compact
+# Distills current graph state into .workgraph/context.md for context preservation
+```
+
+---
+
+### `wg sweep`
+
+Detect and recover orphaned in-progress tasks with dead agents.
+
+```bash
+wg sweep [--dry-run]
+```
+
+Sweep detects in-progress tasks whose assigned agent has died, been marked Dead, or is missing from the registry. It resets them to Open so the coordinator can re-dispatch. Safe to run anytime — it is idempotent.
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--dry-run` | Only report orphaned tasks, don't fix them |
+
+**Examples:**
+```bash
+wg sweep --dry-run
+# Preview orphaned tasks without fixing them
+
+wg sweep
+# Reset all orphaned in-progress tasks to Open
+```
+
+---
+
+### `wg telegram`
+
+Telegram integration commands.
+
+```bash
+wg telegram <COMMAND>
+```
+
+**Subcommands:**
+
+#### `wg telegram listen`
+
+Start the Telegram bot listener.
+
+```bash
+wg telegram listen [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--chat-id <CHAT_ID>` | Telegram chat ID to listen in (uses configured chat_id if not specified) |
+
+**Example:**
+```bash
+wg telegram listen
+# Start listening for Telegram messages using configured chat ID
+
+wg telegram listen --chat-id 123456789
+# Listen on a specific chat
+```
+
+---
+
+#### `wg telegram send`
+
+Send a message to the configured Telegram chat.
+
+```bash
+wg telegram send <MESSAGE> [OPTIONS]
+```
+
+**Arguments:**
+- `MESSAGE` - Message to send (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--chat-id <CHAT_ID>` | Target chat ID (uses configured chat_id if not specified) |
+
+**Example:**
+```bash
+wg telegram send "Deploy complete — all tests passing"
+# Send a notification to the configured Telegram chat
+
+wg telegram send "Alert: build failed" --chat-id 123456789
+# Send to a specific chat
+```
+
+---
+
+#### `wg telegram status`
+
+Show Telegram configuration status.
+
+```bash
+wg telegram status
+```
+
+**Example:**
+```bash
+wg telegram status
+# Shows whether Telegram is configured and the current chat ID
+```
+
+---
+
+### `wg screencast`
+
+Render TUI event traces into asciinema screencasts.
+
+```bash
+wg screencast <COMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `render` | Render a TUI event trace into an asciinema `.cast` file |
+| `autopilot` | Launch an autopilot that drives the TUI for screencast recording |
+
+#### `wg screencast render`
+
+```bash
+wg screencast render --trace <TRACE> --output <OUTPUT> [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--trace <TRACE>` | Path to the trace JSONL file produced by `wg tui --trace` (required) |
+| `--output <OUTPUT>` | Output `.cast` file path (required) |
+| `--compress-idle <RATIO>` | Idle compression ratio as threshold:target (e.g., `5:2` compresses gaps >5s to 2s) [default: `5:2`] |
+| `--target-duration <SECS>` | Target total recording duration in seconds |
+| `--width <WIDTH>` | Terminal width for the recording [default: 120] |
+| `--height <HEIGHT>` | Terminal height for the recording [default: 36] |
+
+**Example:**
+```bash
+wg screencast render --trace events.jsonl --output demo.cast
+# Render a trace file into an asciinema screencast
+
+wg screencast render --trace events.jsonl --output demo.cast \
+  --compress-idle 3:1 --target-duration 30 --width 100 --height 30
+# Render with custom compression, target duration, and dimensions
+```
+
+#### `wg screencast autopilot`
+
+```bash
+wg screencast autopilot [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--output <OUTPUT>` | Output `.cast` file path [default: `screencast.cast`] |
+| `--cols <COLS>` | Terminal width [default: 80] |
+| `--rows <ROWS>` | Terminal height [default: 24] |
+| `--duration <DURATION>` | Maximum recording duration in seconds [default: 60] |
+
+**Example:**
+```bash
+wg screencast autopilot --output demo.cast --duration 30
+# Launch autopilot to drive the TUI and record a 30-second screencast
+```
+
+---
+
+### `wg server`
+
+Multi-user server setup automation.
+
+```bash
+wg server <COMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `init` | Initialize multi-user server setup (dry-run by default) |
+| `connect` | Create or attach to a user's tmux session |
+
+#### `wg server init`
+
+```bash
+wg server init [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--apply` | Actually apply changes (default is dry-run) |
+| `--group <GROUP>` | Unix group name (default: `wg-<project>`) |
+| `--user <USERS>` | Users to add to the project group (repeatable) |
+| `--ttyd` | Generate ttyd configuration for web terminal access |
+| `--caddy` | Generate Caddy reverse-proxy configuration |
+| `--ttyd-port <PORT>` | Port for ttyd web terminal [default: 7681] |
+
+**Example:**
+```bash
+wg server init --user alice --user bob --ttyd --caddy
+# Dry-run: preview multi-user server setup with web terminal and reverse proxy
+
+wg server init --apply --user alice --user bob
+# Apply the multi-user server configuration
+```
+
+#### `wg server connect`
+
+```bash
+wg server connect [--user <USER>]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--user <USER>` | User name (defaults to `$WG_USER`) |
+
+**Example:**
+```bash
+wg server connect --user alice
+# Create or attach to Alice's tmux session
+```
+
+---
+
+### `wg user`
+
+Manage per-user conversation boards (`.user-NAME` tasks).
+
+```bash
+wg user <COMMAND>
+```
+
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `init [NAME]` | Create a user board (defaults to `$WG_USER` or `$USER`) |
+| `list` | List all user boards (active + archived) |
+| `archive [NAME]` | Archive the active board and create a successor |
+
+**Examples:**
+```bash
+wg user init
+# Create a user board for the current user
+
+wg user init alice
+# Create a user board for alice
+
+wg user list
+# List all user boards (active and archived)
+
+wg user archive
+# Archive the current user's board and create a successor
+```
+
+---
+
+### `wg tui-dump`
+
+Dump the current TUI screen contents (requires a running `wg tui`).
+
+```bash
+wg tui-dump
+```
+
+**Example:**
+```bash
+wg tui-dump
+# Print the current TUI screen to stdout (useful for debugging or automated testing)
 ```
 
 ---
