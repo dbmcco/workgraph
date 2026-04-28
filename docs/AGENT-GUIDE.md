@@ -691,7 +691,7 @@ Spawned agents receive environment variables indicating their runtime context:
 # .workgraph/config.toml
 [dispatcher]
 max_agents = 4
-poll_interval = 60
+poll_interval = 5
 model = "claude:opus"  # provider:model — handler is implied (claude CLI)
 
 [agent]

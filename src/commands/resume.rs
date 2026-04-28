@@ -95,7 +95,9 @@ fn run_inner(dir: &Path, id: &str, only: bool, is_publish: bool) -> Result<()> {
         return Err(e);
     }
 
-    super::notify_graph_changed(dir);
+    // Kick the dispatcher: bypass settling delay so the user sees agent
+    // activity within sub-second after publish/resume succeeds.
+    super::notify_kick(dir);
     record_provenance(dir, id, is_publish);
 
     if only {

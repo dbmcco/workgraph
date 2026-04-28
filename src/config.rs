@@ -2810,8 +2810,10 @@ pub struct CoordinatorConfig {
     /// watcher cannot start (some NFS mounts, WSL1, certain sandbox FS): the
     /// daemon then polls at this interval as the only trigger.
     ///
-    /// Default: 30s. The forward-looking key name is `safety_interval`; the
-    /// legacy `poll_interval` continues to work as an alias.
+    /// Default: 5s. Fast enough that newly-added tasks visibly start working
+    /// "right away" if the watcher misses an event; slow enough that idle
+    /// polling stays trivial. The forward-looking key name is `safety_interval`;
+    /// the legacy `poll_interval` continues to work as an alias.
     #[serde(default = "default_poll_interval", alias = "safety_interval")]
     pub poll_interval: u64,
 
@@ -3133,11 +3135,12 @@ fn default_coordinator_agent() -> bool {
 }
 
 fn default_poll_interval() -> u64 {
-    // Safety-timer interval (seconds). With graph watching enabled by default,
-    // the loop is event-driven; this is just the slow safety net. 30s is a
-    // good balance between catching missed events promptly and not waking the
-    // daemon constantly on idle systems.
-    30
+    // Safety-timer interval (seconds). With graph watching + IPC kick enabled
+    // by default, the loop is event-driven; this is just the safety net for
+    // missed wakeups. 5s keeps interactive UX snappy ('is this thing on?'
+    // threshold is ~3s, lost confidence at ~10s) while idle polling remains
+    // trivial (a graph traversal + cheap return).
+    5
 }
 
 fn default_graph_watch_enabled() -> bool {

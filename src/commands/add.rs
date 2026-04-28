@@ -673,7 +673,16 @@ pub fn run(
     }
 
     let task_id = task_id_out;
-    super::notify_graph_changed(dir);
+    if paused {
+        // Draft tasks can't be dispatched until published. Notify the daemon
+        // (so TUIs can refresh) but don't wake it for dispatch — that would
+        // produce a no-op tick.
+        super::notify_graph_changed(dir);
+    } else {
+        // Published-immediately: kick the dispatcher so the user sees agent
+        // activity within sub-second.
+        super::notify_kick(dir);
+    }
     super::notify_new_task_focus(dir, &task_id);
 
     // Record operation (include agent_id if running in agent context for guardrail tracking)

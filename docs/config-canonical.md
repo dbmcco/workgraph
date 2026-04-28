@@ -87,7 +87,7 @@ The whole table renames `[coordinator]` → `[dispatcher]` automatically (`LEGAC
 |-----|--------------|------|---------|-------|--------|
 | `max_agents` | Concurrent worker agent cap. | `:2743, 3064` | `8` | B | current |
 | `interval` | Standalone-coordinator-cmd poll interval (s). | `:2747, 3068` | `30` | G | current |
-| `poll_interval` (alias `safety_interval`) | Daemon safety-timer interval (s). With graph-fs watching, this is just the slow safety net. | `:2764, 3080` | `30` | G | current — `poll_interval` deprecated in favor of `safety_interval` (alias still works; `detect_deprecated_keys` warns, `src/config.rs:3624`) |
+| `poll_interval` (alias `safety_interval`) | Daemon safety-timer interval (s). With graph-fs watching + IPC kick, this is just the safety net for missed events. | `:2764, 3080` | `5` | G | current — `poll_interval` deprecated in favor of `safety_interval` (alias still works; `detect_deprecated_keys` warns, `src/config.rs:3624`) |
 | `graph_watch_enabled` | Use `notify` watcher on graph.jsonl as primary trigger. | `:2774, 3088` | `true` | G | current |
 | `graph_watch_debounce_ms` | Debounce window for graph fs watcher. | `:2783, 3092` | `100` | G | current |
 | `executor` | Executor for spawned agents (None = derived from `model`). | `:2789, 3179` | `None` | — | **deprecated** — see `agent.executor` |

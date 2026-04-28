@@ -12,7 +12,7 @@
 //! The daemon respects coordinator config from .workgraph/config.toml:
 //!   [coordinator]
 //!   max_agents = 4       # Maximum parallel agents
-//!   poll_interval = 60   # Background safety-net poll interval (seconds)
+//!   poll_interval = 5    # Background safety-net poll interval (seconds)
 //!   interval = 30        # Coordinator tick interval (standalone command)
 //!   executor = "claude"  # Executor for spawned agents
 
@@ -2407,6 +2407,7 @@ pub fn run_daemon(
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut wake_coordinator = false;
+                let mut kick_dispatcher = false;
                 let mut conn_urgent_wake = false;
                 let mut conn_delete_coordinator_ids = Vec::new();
                 let mut conn_interrupt_coordinator_ids = Vec::new();
@@ -2415,6 +2416,7 @@ pub fn run_daemon(
                     stream,
                     &mut running,
                     &mut wake_coordinator,
+                    &mut kick_dispatcher,
                     &mut conn_urgent_wake,
                     &mut pending_coordinator_ids,
                     &mut conn_delete_coordinator_ids,
@@ -2453,7 +2455,14 @@ pub fn run_daemon(
                     urgent_wake = true;
                     logger.info("Urgent wake (UserChat), will tick immediately");
                 }
-                if wake_coordinator {
+                if kick_dispatcher {
+                    // KickDispatcher: bypass settling delay, tick on the next
+                    // loop iteration. Used by user-initiated state mutations
+                    // (publish, unclaim, resume, immediate-add) that expect
+                    // sub-second visible activity.
+                    settling_deadline = Some(Instant::now());
+                    logger.info("KickDispatcher received, ticking immediately (no settling delay)");
+                } else if wake_coordinator {
                     // Debounce: (re)set the settling deadline. Each GraphChanged
                     // pushes the deadline forward, so burst additions all land
                     // before the coordinator tick fires.

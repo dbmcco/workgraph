@@ -357,7 +357,7 @@ The service reads from `.workgraph/config.toml`:
 ```toml
 [dispatcher]           # legacy alias [coordinator] still accepted
 max_agents = 4         # max parallel agents (default: 4)
-poll_interval = 60     # seconds between safety-net ticks (default: 60)
+poll_interval = 5      # seconds between safety-net ticks (default: 5)
 model = "claude:opus"  # provider:model — handler is implied (claude CLI here)
 
 [agent]
@@ -1011,7 +1011,7 @@ interval = 10
 
 [coordinator]
 max_agents = 4
-poll_interval = 60
+poll_interval = 5
 
 [agency]
 auto_evaluate = false

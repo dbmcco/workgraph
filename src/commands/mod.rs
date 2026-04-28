@@ -191,6 +191,18 @@ pub fn notify_graph_changed(dir: &Path) {
     let _ = service::send_request(dir, &service::IpcRequest::GraphChanged);
 }
 
+/// Best-effort kick to the service daemon: wake up and run one tick *now*,
+/// bypassing the settling delay. Sent by user-initiated state mutations
+/// (`wg publish`, `wg unclaim`, immediate `wg add`) where the user expects
+/// sub-second visible activity.
+///
+/// Silently ignores all errors (daemon offline, socket unavailable). The
+/// periodic poll_interval safety net catches anything that would have been
+/// missed if the kick failed to deliver.
+pub fn notify_kick(dir: &Path) {
+    let _ = service::send_request(dir, &service::IpcRequest::KickDispatcher);
+}
+
 /// Write a marker file so the TUI can auto-focus on a newly created task.
 /// Best-effort: silently ignores errors.
 pub fn notify_new_task_focus(dir: &Path, task_id: &str) {
@@ -1141,5 +1153,21 @@ mod tests {
             graph_path(dir),
             std::path::PathBuf::from("/tmp/test-wg/graph.jsonl")
         );
+    }
+
+    #[test]
+    fn notify_kick_offline_daemon_is_silent_noop() {
+        // No service/state.json present, no socket — kick must not panic
+        // or surface any error to the caller. Used by `wg publish` etc.
+        let dir = tempfile::tempdir().unwrap();
+        notify_kick(dir.path());
+        // (no assertion needed: any panic/error would fail the test)
+    }
+
+    #[test]
+    fn notify_graph_changed_offline_daemon_is_silent_noop() {
+        // Same contract for the existing GraphChanged path.
+        let dir = tempfile::tempdir().unwrap();
+        notify_graph_changed(dir.path());
     }
 }

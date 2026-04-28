@@ -55,6 +55,15 @@ pub enum IpcRequest {
     },
     /// Notify that the graph has changed; triggers an immediate coordinator tick
     GraphChanged,
+    /// Wake the dispatcher and run one tick *now*, bypassing the settling delay.
+    ///
+    /// Sent by user-initiated state mutations (`wg publish`, `wg unclaim`,
+    /// `wg service resume`, immediate `wg add`) where the user expects visible
+    /// agent activity within sub-second. Unlike `GraphChanged`, which schedules
+    /// a tick after `settling_delay_ms` (debounces burst graph construction),
+    /// `KickDispatcher` ticks on the next loop iteration. Safe to send to an
+    /// offline daemon: `notify_kick` silently ignores socket errors.
+    KickDispatcher,
     /// Pause the coordinator (no new agent spawns, running agents unaffected)
     Pause,
     /// Resume the coordinator (triggers immediate tick)
@@ -233,6 +242,7 @@ pub(crate) fn handle_connection(
     stream: UnixStream,
     running: &mut bool,
     wake_coordinator: &mut bool,
+    kick_dispatcher: &mut bool,
     urgent_wake: &mut bool,
     pending_coordinator_ids: &mut Vec<u32>,
     delete_coordinator_ids: &mut Vec<u32>,
@@ -280,6 +290,7 @@ pub(crate) fn handle_connection(
             request,
             running,
             wake_coordinator,
+            kick_dispatcher,
             urgent_wake,
             pending_coordinator_ids,
             delete_coordinator_ids,
@@ -313,6 +324,7 @@ fn handle_request(
     request: IpcRequest,
     running: &mut bool,
     wake_coordinator: &mut bool,
+    kick_dispatcher: &mut bool,
     urgent_wake: &mut bool,
     pending_coordinator_ids: &mut Vec<u32>,
     delete_coordinator_ids: &mut Vec<u32>,
@@ -377,6 +389,14 @@ fn handle_request(
                 "action": "coordinator_wake_scheduled",
             }))
         }
+        IpcRequest::KickDispatcher => {
+            // Bypass settling delay: tick on the next loop iteration.
+            *kick_dispatcher = true;
+            IpcResponse::success(serde_json::json!({
+                "status": "ok",
+                "action": "dispatcher_kicked",
+            }))
+        }
         IpcRequest::Pause => {
             logger.info("IPC Pause: pausing coordinator");
             daemon_cfg.paused = true;
@@ -393,7 +413,9 @@ fn handle_request(
             let mut coord_state = CoordinatorState::load_or_default(dir);
             coord_state.paused = false;
             coord_state.save(dir);
-            *wake_coordinator = true;
+            // Resume is a user-initiated wakeup — kick the dispatcher
+            // immediately, no settling debounce.
+            *kick_dispatcher = true;
             IpcResponse::success(serde_json::json!({
                 "status": "resumed",
             }))
@@ -1925,6 +1947,20 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_kick_dispatcher_serialization() {
+        let req = IpcRequest::KickDispatcher;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"cmd\":\"kick_dispatcher\""));
+
+        let parsed: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcRequest::KickDispatcher));
+
+        let raw = r#"{"cmd":"kick_dispatcher"}"#;
+        let parsed: IpcRequest = serde_json::from_str(raw).unwrap();
+        assert!(matches!(parsed, IpcRequest::KickDispatcher));
+    }
+
+    #[test]
     fn test_ipc_response_success() {
         let resp = IpcResponse::success(serde_json::json!({"agent_id": "agent-1"}));
         assert!(resp.ok);
@@ -2316,6 +2352,7 @@ poll_interval = 120
 
         let mut running = true;
         let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
         let mut urgent_wake = false;
         let mut pending_coordinator_ids = Vec::new();
         let mut delete_coordinator_ids = Vec::new();
@@ -2341,6 +2378,7 @@ poll_interval = 120
             },
             &mut running,
             &mut wake_coordinator,
+            &mut kick_dispatcher,
             &mut urgent_wake,
             &mut pending_coordinator_ids,
             &mut delete_coordinator_ids,
@@ -2383,6 +2421,7 @@ poll_interval = 120
 
         let mut running = true;
         let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
         let mut urgent_wake = false;
         let mut pending_coordinator_ids = Vec::new();
         let mut delete_coordinator_ids = Vec::new();
@@ -2409,6 +2448,7 @@ poll_interval = 120
             },
             &mut running,
             &mut wake_coordinator,
+            &mut kick_dispatcher,
             &mut urgent_wake,
             &mut pending_coordinator_ids,
             &mut delete_coordinator_ids,
@@ -2441,6 +2481,7 @@ poll_interval = 120
 
         let mut running = true;
         let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
         let mut urgent_wake = false;
         let mut pending_coordinator_ids = Vec::new();
         let mut delete_coordinator_ids = Vec::new();
@@ -2461,6 +2502,7 @@ poll_interval = 120
             IpcRequest::GraphChanged,
             &mut running,
             &mut wake_coordinator,
+            &mut kick_dispatcher,
             &mut urgent_wake,
             &mut pending_coordinator_ids,
             &mut delete_coordinator_ids,
@@ -2469,7 +2511,7 @@ poll_interval = 120
             &logger,
         );
 
-        // GraphChanged should set wake_coordinator, NOT urgent_wake
+        // GraphChanged should set wake_coordinator, NOT urgent_wake or kick_dispatcher
         assert!(
             wake_coordinator,
             "wake_coordinator should be true after GraphChanged"
@@ -2477,6 +2519,114 @@ poll_interval = 120
         assert!(
             !urgent_wake,
             "urgent_wake should NOT be set by GraphChanged"
+        );
+        assert!(
+            !kick_dispatcher,
+            "kick_dispatcher should NOT be set by GraphChanged (uses settling delay)"
+        );
+    }
+
+    #[test]
+    fn test_kick_dispatcher_sets_kick_not_wake() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let mut running = true;
+        let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
+        let mut urgent_wake = false;
+        let mut pending_coordinator_ids = Vec::new();
+        let mut delete_coordinator_ids = Vec::new();
+        let mut interrupt_coordinator_ids = Vec::new();
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(5),
+            model: None,
+            provider: None,
+            paused: false,
+            settling_delay: Duration::from_millis(2000),
+        };
+        let logger = DaemonLogger::open(dir).unwrap();
+
+        let resp = handle_request(
+            dir,
+            IpcRequest::KickDispatcher,
+            &mut running,
+            &mut wake_coordinator,
+            &mut kick_dispatcher,
+            &mut urgent_wake,
+            &mut pending_coordinator_ids,
+            &mut delete_coordinator_ids,
+            &mut interrupt_coordinator_ids,
+            &mut cfg,
+            &logger,
+        );
+
+        assert!(resp.ok);
+        assert!(
+            kick_dispatcher,
+            "kick_dispatcher should be set by KickDispatcher IPC"
+        );
+        assert!(
+            !wake_coordinator,
+            "wake_coordinator should NOT be set by KickDispatcher (kick bypasses settling)"
+        );
+        assert!(
+            !urgent_wake,
+            "urgent_wake should NOT be set by KickDispatcher (only UserChat)"
+        );
+    }
+
+    #[test]
+    fn test_resume_sets_kick_not_wake() {
+        // Resume is a user-initiated wakeup; should kick immediately, not
+        // schedule via settling delay.
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+
+        let mut running = true;
+        let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
+        let mut urgent_wake = false;
+        let mut pending_coordinator_ids = Vec::new();
+        let mut delete_coordinator_ids = Vec::new();
+        let mut interrupt_coordinator_ids = Vec::new();
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(5),
+            model: None,
+            provider: None,
+            paused: true,
+            settling_delay: Duration::from_millis(2000),
+        };
+        let logger = DaemonLogger::open(dir).unwrap();
+
+        handle_request(
+            dir,
+            IpcRequest::Resume,
+            &mut running,
+            &mut wake_coordinator,
+            &mut kick_dispatcher,
+            &mut urgent_wake,
+            &mut pending_coordinator_ids,
+            &mut delete_coordinator_ids,
+            &mut interrupt_coordinator_ids,
+            &mut cfg,
+            &logger,
+        );
+
+        assert!(!cfg.paused, "Resume should clear paused flag");
+        assert!(
+            kick_dispatcher,
+            "Resume should kick dispatcher (immediate, no settling)"
+        );
+        assert!(
+            !wake_coordinator,
+            "Resume should NOT use wake_coordinator (would add settling delay)"
         );
     }
 

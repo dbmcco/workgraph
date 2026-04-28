@@ -266,6 +266,16 @@ description = "Inline spawn of an `.evaluate-*` task must register the agent wit
 timeout_seconds = 60
 
 [[scenario]]
+name = "dispatcher_kick_bypasses_settling_delay"
+script = "scenarios/dispatcher_kick_bypasses_settling_delay.sh"
+owners = [
+    "dispatcher-poll-lower",
+    "smoke-gate-is",
+]
+description = "Pins the kick-dispatcher contract for user-initiated state mutations. After `wg add --immediate` (and equivalently `wg publish` / `wg unclaim` / `wg service resume`), the daemon log MUST show `KickDispatcher received, ticking immediately` and a coordinator tick MUST fire within 1 second — bypassing the 2s settling delay used by GraphChanged. Pre-fix the dispatcher waited the full settling_delay on every CLI mutation, on top of a 30-60s safety-timer poll, so users perceived dead air after every state-changing command. If a future change reverts callers to notify_graph_changed (or removes the kick fast-path in the daemon loop), this scenario fails."
+timeout_seconds = 30
+
+[[scenario]]
 name = "reset_clears_claim"
 script = "scenarios/reset_clears_claim.sh"
 owners = [

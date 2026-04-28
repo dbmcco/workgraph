@@ -72,11 +72,11 @@ poll_interval = 5
 }
 
 #[test]
-fn default_safety_interval_is_30_seconds() {
+fn default_safety_interval_is_5_seconds() {
     let cfg = Config::default();
     assert_eq!(
-        cfg.coordinator.poll_interval, 30,
-        "Default safety timer interval should be 30s (task spec)"
+        cfg.coordinator.poll_interval, 5,
+        "Default safety timer interval should be 5s for snappy interactive UX"
     );
 }
 

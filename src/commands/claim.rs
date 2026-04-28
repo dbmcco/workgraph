@@ -238,7 +238,9 @@ pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
         return Err(e);
     }
 
-    super::notify_graph_changed(dir);
+    // Kick: unclaiming may free a previously-blocked task for dispatch; user
+    // expects immediate response, not a settling-delayed tick.
+    super::notify_kick(dir);
 
     // Record operation
     let config = workgraph::config::Config::load_or_default(dir);
