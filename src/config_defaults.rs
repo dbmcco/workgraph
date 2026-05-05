@@ -13,6 +13,14 @@ use crate::config::{
     Config, EndpointConfig, EndpointsConfig, ModelRegistryEntry, ModelRoutingConfig,
     RoleModelConfig, Tier, TierConfig,
 };
+use crate::model_routes::{
+    WORKGRAPH_CLAUDE_CLI_FAST_ROUTE, WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE,
+    WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE, WORKGRAPH_CODEX_CLI_FAST_ROUTE,
+    WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE, WORKGRAPH_CODEX_CLI_STANDARD_ROUTE,
+    WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE, WORKGRAPH_LOCAL_DEFAULT_ROUTE,
+    WORKGRAPH_OPENROUTER_FAST_ROUTE, WORKGRAPH_OPENROUTER_PREMIUM_ROUTE,
+    WORKGRAPH_OPENROUTER_STANDARD_ROUTE, model_for_route, spec_for_route,
+};
 
 /// One of the five smooth setup routes. Each route returns a complete,
 /// working `Config` end-to-end.
@@ -195,29 +203,25 @@ fn openrouter_config(params: &RouteParams) -> Config {
 
     // Tiers fully populated. Stored in provider:model format so the
     // strict model-spec validator accepts them on reload.
+    let openrouter_fast = spec_for_route("openrouter", WORKGRAPH_OPENROUTER_FAST_ROUTE);
+    let openrouter_standard = spec_for_route("openrouter", WORKGRAPH_OPENROUTER_STANDARD_ROUTE);
+    let openrouter_premium = spec_for_route("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE);
     config.tiers = TierConfig {
-        fast: Some("openrouter:anthropic/claude-haiku-4-5".to_string()),
-        standard: Some("openrouter:anthropic/claude-sonnet-4-6".to_string()),
-        premium: Some("openrouter:anthropic/claude-opus-4-7".to_string()),
+        fast: Some(openrouter_fast.clone()),
+        standard: Some(openrouter_standard),
+        premium: Some(openrouter_premium.clone()),
     };
 
     // Worker default: premium tier (opus) — real implementation needs the
     // strongest model. User --model overrides.
-    let agent_model = params
-        .model
-        .clone()
-        .unwrap_or_else(|| "openrouter:anthropic/claude-opus-4-7".to_string());
+    let agent_model = params.model.clone().unwrap_or(openrouter_premium);
     let agent_model = ensure_provider_prefix(&agent_model, "openrouter");
     config.agent.model = agent_model.clone();
     config.coordinator.model = Some(agent_model.clone());
 
     // Eval / assign default to haiku — summarization + scoring is fine on
     // the cheap tier, ~10x cost vs sonnet for nearly identical scores.
-    config.models = split_role_models_routing(
-        &agent_model,
-        "openrouter:anthropic/claude-haiku-4-5",
-        "openrouter:anthropic/claude-haiku-4-5",
-    );
+    config.models = split_role_models_routing(&agent_model, &openrouter_fast, &openrouter_fast);
 
     config
 }
@@ -234,25 +238,25 @@ fn claude_cli_config(params: &RouteParams) -> Config {
     config.model_registry = Vec::new();
 
     // Tiers: provider-prefixed claude aliases (the CLI resolves them).
+    let claude_fast = spec_for_route("claude", WORKGRAPH_CLAUDE_CLI_FAST_ROUTE);
+    let claude_standard = spec_for_route("claude", WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE);
+    let claude_premium = spec_for_route("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE);
     config.tiers = TierConfig {
-        fast: Some("claude:haiku".to_string()),
-        standard: Some("claude:sonnet".to_string()),
-        premium: Some("claude:opus".to_string()),
+        fast: Some(claude_fast.clone()),
+        standard: Some(claude_standard),
+        premium: Some(claude_premium.clone()),
     };
 
     // Worker default: claude:opus (premium tier) — workers do real
     // implementation. User --model overrides.
-    let agent_model = params
-        .model
-        .clone()
-        .unwrap_or_else(|| "claude:opus".to_string());
+    let agent_model = params.model.clone().unwrap_or(claude_premium);
     let agent_model = ensure_provider_prefix(&agent_model, "claude");
     config.agent.model = agent_model.clone();
     config.coordinator.model = Some(agent_model.clone());
 
     // Eval / assign default to haiku — scoring + assignment is mostly
     // summarization, sonnet adds ~10x cost for nearly identical scores.
-    config.models = split_role_models_routing(&agent_model, "claude:haiku", "claude:haiku");
+    config.models = split_role_models_routing(&agent_model, &claude_fast, &claude_fast);
 
     config
 }
@@ -266,27 +270,26 @@ fn codex_cli_config(params: &RouteParams) -> Config {
 
     config.llm_endpoints = EndpointsConfig::default();
 
-    // Model registry: codex CLI accepts these as of 2026-04 — gpt-5-mini,
-    // gpt-5, o1-pro per task description.
+    // Model registry: codex CLI route models come from the central registry.
     config.model_registry = codex_default_registry();
 
+    let codex_fast = spec_for_route("codex", WORKGRAPH_CODEX_CLI_FAST_ROUTE);
+    let codex_standard = spec_for_route("codex", WORKGRAPH_CODEX_CLI_STANDARD_ROUTE);
+    let codex_premium = spec_for_route("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE);
     config.tiers = TierConfig {
-        fast: Some("codex:gpt-5-mini".to_string()),
-        standard: Some("codex:gpt-5".to_string()),
-        premium: Some("codex:o1-pro".to_string()),
+        fast: Some(codex_fast.clone()),
+        standard: Some(codex_standard),
+        premium: Some(codex_premium.clone()),
     };
 
-    // Worker default: codex:o1-pro (premium tier). User --model overrides.
-    let agent_model = params
-        .model
-        .clone()
-        .unwrap_or_else(|| "codex:o1-pro".to_string());
+    // Worker default: premium tier. User --model overrides.
+    let agent_model = params.model.clone().unwrap_or(codex_premium);
     let agent_model = ensure_provider_prefix(&agent_model, "codex");
     config.agent.model = agent_model.clone();
     config.coordinator.model = Some(agent_model.clone());
 
-    // Eval / assign default to the cheap tier (gpt-5-mini).
-    config.models = split_role_models_routing(&agent_model, "codex:gpt-5-mini", "codex:gpt-5-mini");
+    // Eval / assign default to the cheap tier from the central registry.
+    config.models = split_role_models_routing(&agent_model, &codex_fast, &codex_fast);
 
     config
 }
@@ -323,7 +326,7 @@ fn local_config(params: &RouteParams) -> Config {
     let model_id = params
         .model
         .clone()
-        .unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+        .unwrap_or_else(|| model_for_route(WORKGRAPH_LOCAL_DEFAULT_ROUTE));
 
     config.model_registry = vec![ModelRegistryEntry {
         id: model_id.clone(),
@@ -365,7 +368,7 @@ fn nex_custom_config(params: &RouteParams) -> Config {
     let model_id = params
         .model
         .clone()
-        .unwrap_or_else(|| "custom-model".to_string());
+        .unwrap_or_else(|| model_for_route(WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE));
 
     config.llm_endpoints = EndpointsConfig {
         inherit_global: false,
@@ -416,7 +419,7 @@ fn openrouter_default_registry() -> Vec<ModelRegistryEntry> {
         ModelRegistryEntry {
             id: "haiku".to_string(),
             provider: "openrouter".to_string(),
-            model: "anthropic/claude-haiku-4-5".to_string(),
+            model: model_for_route(WORKGRAPH_OPENROUTER_FAST_ROUTE),
             tier: Tier::Fast,
             context_window: 200_000,
             max_output_tokens: 8_192,
@@ -425,7 +428,7 @@ fn openrouter_default_registry() -> Vec<ModelRegistryEntry> {
         ModelRegistryEntry {
             id: "sonnet".to_string(),
             provider: "openrouter".to_string(),
-            model: "anthropic/claude-sonnet-4-6".to_string(),
+            model: model_for_route(WORKGRAPH_OPENROUTER_STANDARD_ROUTE),
             tier: Tier::Standard,
             context_window: 200_000,
             max_output_tokens: 64_000,
@@ -434,7 +437,7 @@ fn openrouter_default_registry() -> Vec<ModelRegistryEntry> {
         ModelRegistryEntry {
             id: "opus".to_string(),
             provider: "openrouter".to_string(),
-            model: "anthropic/claude-opus-4-7".to_string(),
+            model: model_for_route(WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
             tier: Tier::Premium,
             context_window: 200_000,
             max_output_tokens: 32_000,
@@ -446,23 +449,23 @@ fn openrouter_default_registry() -> Vec<ModelRegistryEntry> {
 fn codex_default_registry() -> Vec<ModelRegistryEntry> {
     vec![
         ModelRegistryEntry {
-            id: "gpt-5-mini".to_string(),
+            id: model_for_route(WORKGRAPH_CODEX_CLI_FAST_ROUTE),
             provider: "codex".to_string(),
-            model: "gpt-5-mini".to_string(),
+            model: model_for_route(WORKGRAPH_CODEX_CLI_FAST_ROUTE),
             tier: Tier::Fast,
             ..Default::default()
         },
         ModelRegistryEntry {
-            id: "gpt-5".to_string(),
+            id: model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
             provider: "codex".to_string(),
-            model: "gpt-5".to_string(),
+            model: model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
             tier: Tier::Standard,
             ..Default::default()
         },
         ModelRegistryEntry {
-            id: "o1-pro".to_string(),
+            id: model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
             provider: "codex".to_string(),
-            model: "o1-pro".to_string(),
+            model: model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
             tier: Tier::Premium,
             ..Default::default()
         },

@@ -456,6 +456,16 @@ pub fn render_minimal_config(
     bare: bool,
 ) -> String {
     use workgraph::config_defaults::SetupRoute as R;
+    use workgraph::model_routes::{
+        WORKGRAPH_CLAUDE_CLI_FAST_ROUTE, WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE,
+        WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE, WORKGRAPH_CODEX_CLI_FAST_ROUTE,
+        WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE, WORKGRAPH_CODEX_CLI_STANDARD_ROUTE,
+        WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE, WORKGRAPH_LOCAL_DEFAULT_ROUTE,
+        WORKGRAPH_OPENROUTER_FAST_ROUTE, WORKGRAPH_OPENROUTER_PREMIUM_ROUTE,
+        WORKGRAPH_OPENROUTER_STANDARD_ROUTE, spec_for_route,
+    };
+
+    let route_spec = |provider: &str, route_id: &str| spec_for_route(provider, route_id);
 
     if bare {
         return match scope {
@@ -468,11 +478,11 @@ pub fn render_minimal_config(
             }
             ConfigScope::Global => {
                 let model = match route {
-                    R::ClaudeCli => "claude:opus",
-                    R::CodexCli => "codex:o1-pro",
-                    R::Openrouter => "openrouter:anthropic/claude-opus-4-7",
-                    R::Local => "local:qwen2.5-coder:7b",
-                    R::NexCustom => "oai-compat:custom-model",
+                    R::ClaudeCli => route_spec("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE),
+                    R::CodexCli => route_spec("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
+                    R::Openrouter => route_spec("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
+                    R::Local => route_spec("local", WORKGRAPH_LOCAL_DEFAULT_ROUTE),
+                    R::NexCustom => route_spec("oai-compat", WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE),
                 };
                 format!(
                     "# ~/.wg/config.toml — written by `wg config init --global --bare`\n\
@@ -507,29 +517,32 @@ pub fn render_minimal_config(
         (R::ClaudeCli, ConfigScope::Global) => format!(
             "{header}\
              [agent]\n\
-             model = \"claude:opus\"\n\
+             model = \"{premium}\"\n\
              \n\
              [tiers]\n\
-             fast = \"claude:haiku\"\n\
-             standard = \"claude:sonnet\"\n\
-             premium = \"claude:opus\"\n\
+             fast = \"{fast}\"\n\
+             standard = \"{standard}\"\n\
+             premium = \"{premium}\"\n\
              \n\
              [models.evaluator]\n\
-             model = \"claude:haiku\"\n\
+             model = \"{fast}\"\n\
              \n\
              [models.assigner]\n\
-             model = \"claude:haiku\"\n",
+             model = \"{fast}\"\n",
+            fast = route_spec("claude", WORKGRAPH_CLAUDE_CLI_FAST_ROUTE),
+            standard = route_spec("claude", WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE),
+            premium = route_spec("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE),
         ),
 
         (R::Openrouter, ConfigScope::Global) => format!(
             "{header}\
              [agent]\n\
-             model = \"openrouter:anthropic/claude-opus-4-7\"\n\
+             model = \"{premium}\"\n\
              \n\
              [tiers]\n\
-             fast = \"openrouter:anthropic/claude-haiku-4-5\"\n\
-             standard = \"openrouter:anthropic/claude-sonnet-4-6\"\n\
-             premium = \"openrouter:anthropic/claude-opus-4-7\"\n\
+             fast = \"{fast}\"\n\
+             standard = \"{standard}\"\n\
+             premium = \"{premium}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"openrouter\"\n\
@@ -537,36 +550,43 @@ pub fn render_minimal_config(
              url = \"https://openrouter.ai/api/v1\"\n\
              api_key_env = \"OPENROUTER_API_KEY\"\n\
              is_default = true\n",
+            fast = route_spec("openrouter", WORKGRAPH_OPENROUTER_FAST_ROUTE),
+            standard = route_spec("openrouter", WORKGRAPH_OPENROUTER_STANDARD_ROUTE),
+            premium = route_spec("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
         ),
 
         (R::CodexCli, ConfigScope::Global) => format!(
             "{header}\
              [agent]\n\
-             model = \"codex:o1-pro\"\n\
+             model = \"{premium}\"\n\
              \n\
              [tiers]\n\
-             fast = \"codex:gpt-5-mini\"\n\
-             standard = \"codex:gpt-5\"\n\
-             premium = \"codex:o1-pro\"\n",
+             fast = \"{fast}\"\n\
+             standard = \"{standard}\"\n\
+             premium = \"{premium}\"\n",
+            fast = route_spec("codex", WORKGRAPH_CODEX_CLI_FAST_ROUTE),
+            standard = route_spec("codex", WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
+            premium = route_spec("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
         ),
 
         (R::Local, ConfigScope::Global) => format!(
             "{header}\
              [agent]\n\
-             model = \"local:qwen2.5-coder:7b\"\n\
+             model = \"{model}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"local\"\n\
              provider = \"local\"\n\
              url = \"http://localhost:11434/v1\"\n\
              is_default = true\n",
+            model = route_spec("local", WORKGRAPH_LOCAL_DEFAULT_ROUTE),
         ),
 
         (R::NexCustom, ConfigScope::Global) => format!(
             "{header}\
              # Edit endpoint url + api_key_env to match your provider.\n\
              [agent]\n\
-             model = \"oai-compat:custom-model\"\n\
+             model = \"{model}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"custom\"\n\
@@ -574,6 +594,7 @@ pub fn render_minimal_config(
              url = \"https://example.com/v1\"\n\
              api_key_env = \"CUSTOM_API_KEY\"\n\
              is_default = true\n",
+            model = route_spec("oai-compat", WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE),
         ),
 
         // Local scope: shadow the global default with a project-specific
@@ -584,7 +605,8 @@ pub fn render_minimal_config(
              name = \"\"\n\
              \n\
              [agent]\n\
-             model = \"claude:opus\"\n",
+             model = \"{model}\"\n",
+            model = route_spec("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE),
         ),
 
         (R::Openrouter, ConfigScope::Local) => format!(
@@ -593,7 +615,7 @@ pub fn render_minimal_config(
              name = \"\"\n\
              \n\
              [agent]\n\
-             model = \"openrouter:anthropic/claude-opus-4-7\"\n\
+             model = \"{model}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"openrouter\"\n\
@@ -601,6 +623,7 @@ pub fn render_minimal_config(
              url = \"https://openrouter.ai/api/v1\"\n\
              api_key_env = \"OPENROUTER_API_KEY\"\n\
              is_default = true\n",
+            model = route_spec("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
         ),
 
         (R::CodexCli, ConfigScope::Local) => format!(
@@ -609,7 +632,8 @@ pub fn render_minimal_config(
              name = \"\"\n\
              \n\
              [agent]\n\
-             model = \"codex:o1-pro\"\n",
+             model = \"{model}\"\n",
+            model = route_spec("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
         ),
 
         (R::Local, ConfigScope::Local) => format!(
@@ -618,13 +642,14 @@ pub fn render_minimal_config(
              name = \"\"\n\
              \n\
              [agent]\n\
-             model = \"local:qwen2.5-coder:7b\"\n\
+             model = \"{model}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"local\"\n\
              provider = \"local\"\n\
              url = \"http://localhost:11434/v1\"\n\
              is_default = true\n",
+            model = route_spec("local", WORKGRAPH_LOCAL_DEFAULT_ROUTE),
         ),
 
         (R::NexCustom, ConfigScope::Local) => format!(
@@ -633,7 +658,7 @@ pub fn render_minimal_config(
              name = \"\"\n\
              \n\
              [agent]\n\
-             model = \"oai-compat:custom-model\"\n\
+             model = \"{model}\"\n\
              \n\
              [[llm_endpoints.endpoints]]\n\
              name = \"custom\"\n\
@@ -641,6 +666,7 @@ pub fn render_minimal_config(
              url = \"https://example.com/v1\"\n\
              api_key_env = \"CUSTOM_API_KEY\"\n\
              is_default = true\n",
+            model = route_spec("oai-compat", WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE),
         ),
     }
 }
@@ -2579,6 +2605,38 @@ fn print_lint_one(r: &crate::commands::migrate::ConfigMigrateResult) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use workgraph::config_defaults::SetupRoute;
+    use workgraph::model_routes::{
+        WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE, WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE,
+        WORKGRAPH_LOCAL_DEFAULT_ROUTE, WORKGRAPH_OPENROUTER_PREMIUM_ROUTE, spec_for_route,
+    };
+
+    #[test]
+    fn test_render_minimal_config_uses_registry_route_specs() {
+        let openrouter = render_minimal_config(SetupRoute::Openrouter, ConfigScope::Global, false);
+        assert!(openrouter.contains(&format!(
+            "model = \"{}\"",
+            spec_for_route("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE)
+        )));
+
+        let claude = render_minimal_config(SetupRoute::ClaudeCli, ConfigScope::Local, false);
+        assert!(claude.contains(&format!(
+            "model = \"{}\"",
+            spec_for_route("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE)
+        )));
+
+        let codex = render_minimal_config(SetupRoute::CodexCli, ConfigScope::Global, true);
+        assert!(codex.contains(&format!(
+            "model = \"{}\"",
+            spec_for_route("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE)
+        )));
+
+        let local = render_minimal_config(SetupRoute::Local, ConfigScope::Local, false);
+        assert!(local.contains(&format!(
+            "model = \"{}\"",
+            spec_for_route("local", WORKGRAPH_LOCAL_DEFAULT_ROUTE)
+        )));
+    }
 
     #[test]
     fn test_init_and_show() {

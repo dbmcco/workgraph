@@ -45,6 +45,7 @@ pub mod matrix_lite;
 pub mod messages;
 pub mod metrics;
 pub mod model_benchmarks;
+pub mod model_routes;
 pub mod models;
 pub mod notify;
 pub mod parser;
