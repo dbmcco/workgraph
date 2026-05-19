@@ -1,7 +1,7 @@
 //! Executor configuration system for spawning agents.
 //!
 //! Provides configuration loading and template variable substitution for
-//! executor configs stored in `.workgraph/executors/<name>.toml`.
+//! executor configs stored in `.wg/executors/<name>.toml`.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -143,7 +143,7 @@ pub const GRAPH_PATTERNS_SECTION: &str = "\
 
 **Golden rule: same files = sequential edges.** NEVER parallelize tasks that modify the same files \u{2014} one will overwrite the other. When unsure, default to pipeline.
 
-**Cycles (back-edges):** Workgraph is a directed graph, NOT a DAG. For repeating workflows \
+**Cycles (back-edges):** the WG task graph is a directed graph, NOT a DAG. For repeating workflows \
 (cleanup\u{2192}commit\u{2192}verify, write\u{2192}review, etc.), create ONE cycle with `--max-iterations` \
 instead of duplicating tasks for each pass. Use `wg done --converged` to stop the cycle \
 when no more changes are needed. If you are inside a cycle, check `wg show` for your \
@@ -168,7 +168,7 @@ pub const REUSABLE_FUNCTIONS_SECTION: &str = "\
 pub const CRITICAL_WG_CLI_SECTION: &str = "\
 ## CRITICAL: Use wg CLI, NOT built-in tools
 - You MUST use `wg` CLI commands for ALL task management
-- NEVER use built-in TaskCreate, TaskUpdate, TaskList, or TaskGet tools \u{2014} they are a completely separate system that does NOT interact with workgraph
+- NEVER use built-in TaskCreate, TaskUpdate, TaskList, or TaskGet tools \u{2014} they are a completely separate system that does NOT interact with WG
 - If you need to create subtasks: `wg add \"title\" --after {{task_id}}`
 - To check task status: `wg show <task-id>`
 - To list tasks: `wg list`\n";
@@ -177,7 +177,7 @@ pub const CRITICAL_WG_CLI_SECTION: &str = "\
 const SYSTEM_AWARENESS_PREAMBLE: &str = "\
 ## System Awareness
 
-You are working within **workgraph**, a task orchestration system. Key concepts:
+You are working within **WG**, a task orchestration system. Key concepts:
 
 - **Coordinator**: A daemon (`wg service start`) that polls for ready tasks and spawns agents.
 - **Agency**: An evolutionary identity system with roles, motivations, and agents. Agents are assigned to tasks based on skills, performance, and fit.
@@ -263,6 +263,36 @@ Add POST /auth/token endpoint.
 - [ ] Failing test written first: test_auth_rejects_expired_token
 - [ ] Implementation makes the test pass
 - [ ] cargo test passes with no regressions'
+```
+
+### User-visible behavior fixes require live human-flow validation
+For any task that fixes a **user-visible behavior** (anything a human notices in the TUI, a browser, terminal output, or another interactive surface), the `## Validation` section MUST require a live or scripted simulation of the *actual* human flow, not only CLI / unit / library paths. A passing CLI test does not prove the TUI keystroke handler, the browser click handler, or the terminal-render path actually works — the CLI path is often already correct while the user-facing caller is the broken one.
+
+Wrong vs right examples:
+- TUI typing should bump `last_interaction_at`. \
+  Wrong: `wg msg send <chat>` then assert mtime advanced (CLI path only). \
+  Right: drive `wg tui` via tmux + `tmux send-keys`, read `last_interaction_at` from the chat file (see `tests/smoke/scenarios/tui_chat_pty_last_interaction.sh`).
+- Web button submit fails. \
+  Wrong: POST the form endpoint directly. \
+  Right: drive the click via a headless browser.
+- Editor cancellation key misbehaves. \
+  Wrong: call `cancel()` in a unit test. \
+  Right: feed keystrokes through the real keymap dispatcher.
+
+For user-visible fixes, write the `## Validation` section in this shape:
+```bash
+wg add 'Fix: <user-visible bug>' --after {{task_id}} \
+  -d '## Description
+<what the user sees, where>
+
+## Validation
+- [ ] Reproducer is a live or scripted simulation of the real human flow
+      (TUI via tmux/PTY, browser via headless driver, terminal via expect),
+      not only a CLI / unit substitute
+- [ ] Reproducer fails on main and passes after the fix
+- [ ] Scenario added to tests/smoke/scenarios/ and listed in owners of
+      tests/smoke/manifest.toml so the smoke gate catches future regressions
+- [ ] cargo build + cargo test pass with no regressions'
 ```
 
 ### Guardrails
@@ -512,6 +542,32 @@ pub fn build_decomposition_guidance(
     ));
 
     parts.push(format!(
+        "\n### User-visible behavior fixes require live human-flow validation\n\
+         For tasks that fix a **user-visible behavior** (TUI, browser, terminal, or any interactive surface), \
+         the `## Validation` section MUST require a live or scripted simulation of the *actual* human flow, \
+         not only CLI / unit / library paths. A passing CLI test does not prove the TUI keystroke handler, \
+         the browser click handler, or the terminal-render path actually works — the CLI path is often \
+         already correct while the user-facing caller is the broken one.\n\n\
+         Example contrast (TUI typing should bump `last_interaction_at`):\n\
+         - Wrong (CLI-only): `wg msg send <chat>` then assert mtime advanced.\n\
+         - Right (human flow): drive `wg tui` via tmux + `tmux send-keys`, read `last_interaction_at` \
+         from the chat file (see `tests/smoke/scenarios/tui_chat_pty_last_interaction.sh`).\n\n\
+         For user-visible fixes, write the `## Validation` section in this shape:\n\
+         ```bash\n\
+         wg add 'Fix: <user-visible bug>' --after {task_id} \\\n  \
+         -d '## Description\n<what the user sees, where>\n\n\
+         ## Validation\n\
+         - [ ] Reproducer is a live or scripted simulation of the real human flow\n  \
+                 (TUI via tmux/PTY, browser via headless driver, terminal via expect),\n  \
+                 not only a CLI / unit substitute\n\
+         - [ ] Reproducer fails on main and passes after the fix\n\
+         - [ ] Scenario added to tests/smoke/scenarios/ and listed in owners of\n  \
+                 tests/smoke/manifest.toml so the smoke gate catches future regressions\n\
+         - [ ] cargo build + cargo test pass with no regressions'\n\
+         ```",
+    ));
+
+    parts.push(format!(
         "\n### Guardrails\n\
          - You can create up to **{max_child_tasks}** subtasks per session (configurable via `wg config`)\n\
          - Task chains have a maximum depth of **{max_task_depth}** levels\n\
@@ -543,20 +599,20 @@ You share a working tree with other agents. Follow these rules strictly:
 - **Don't touch others' changes.** If `git status` shows files you didn't modify, do not stage, commit, stash, or reset them.
 - **Handle locks gracefully.** `.git/index.lock` or cargo target locks mean another agent is working. Wait 2-3 seconds and retry. Don't delete lock files.\n";
 
-/// Worktree isolation warning for agents running in wg-managed worktrees.
-/// Prevents agents from calling EnterWorktree/ExitWorktree which escapes the wg worktree.
+/// Worktree isolation warning for agents running in WG-managed worktrees.
+/// Prevents agents from calling EnterWorktree/ExitWorktree which escapes the WG worktree.
 pub const WORKTREE_ISOLATION_SECTION: &str = "\
 ## CRITICAL: Worktree Isolation
 
-You are running inside a **workgraph-managed worktree**. Your working directory is already isolated.
+You are running inside a **WG-managed worktree**. Your working directory is already isolated.
 
 **NEVER use the `EnterWorktree` or `ExitWorktree` tools.** Using them will:
 1. Create a SECOND worktree in `.claude/worktrees/`, abandoning this one
-2. Switch your session CWD away from the workgraph branch
+2. Switch your session CWD away from the WG branch
 3. Cause ALL your commits to go to the wrong branch
 4. Result in your work being LOST — the merge-back will find no commits
 
-If you see these tools available, **ignore them completely**. Workgraph already provides full git isolation.
+If you see these tools available, **ignore them completely**. WG already provides full git isolation.
 
 ### Prior WIP from a previous attempt
 
@@ -634,7 +690,7 @@ const WG_CONTEXT_HINT: &str = "\
 
 /// Native executor tool guidance. Injected into the prompt only when the
 /// executor is `native`, since these tool names are specific to the native
-/// executor's in-process tool registry — claude/amplifier/etc. have
+/// executor's in-process tool registry — claude/codex/etc. have
 /// different names provided by their own runtimes.
 ///
 /// The goal is to make the full native toolset visible in the system
@@ -701,24 +757,21 @@ issues direct text-in/text-out LLM calls with no tool loop — cheap, predictabl
 and able to handle sources that would otherwise require many turns of manual \
 chunking. Hard ceiling 1 MB by default (raisable via `max_input_bytes`).
 
-### Workgraph task management (in-process, no CLI spawn)
+### WG task management
 
-- `wg_show(task_id)`, `wg_list()`, `wg_log(task_id, message)` — inspect and \
+Use the `bash` tool to run `wg` CLI commands. The CLI is the source of truth for \
+task operations:
+
+- `wg show <task-id>`, `wg list`, `wg log <task-id> \"message\"` — inspect and \
 annotate tasks.
-- `wg_add(title, description?, after?, tags?, skills?)` — create follow-up tasks \
-(e.g., \"Verify: ...\" after your current task for fan-out).
-- `wg_done(task_id)`, `wg_fail(task_id, reason)`, `wg_artifact(task_id, path)` — \
-lifecycle operations.
-
-Prefer these over `bash: wg show ...` — they take structured input and return \
-structured results. For advanced flags not in the tool schemas \
-(`--subtask` for blocking subtask, `--cron \"expr\"` for scheduled tasks), fall \
-back to `bash: wg add --subtask ...` or `bash: wg add --cron ...`.
+- `wg add \"title\" --after <task-id>` — create follow-up tasks.
+- `wg done <task-id>`, `wg fail <task-id> --reason \"...\"`, \
+`wg artifact <task-id> <path>` — lifecycle operations.
 
 ### Channeled tool outputs
 
 When any tool returns more than ~2KB, the full output is saved to \
-`.workgraph/agents/<agent-id>/tool-outputs/NNNNN.log` and replaced in your \
+`.wg/agents/<agent-id>/tool-outputs/NNNNN.log` and replaced in your \
 conversation with a compact handle plus a short preview. The raw bytes are always \
 on disk — do NOT re-fetch from the original source. To read more from a channeled \
 output, use either `read_file` with `offset`/`limit` on the handle path, or `bash` \
@@ -738,13 +791,13 @@ for text slicing (`sed -n 'A,Bp'`, `grep -n`, `wc -l`, `head`, `tail`).
 `read_file(offset, limit)` or `delegate` to a sub-agent
 ";
 
-/// Default workgraph usage guide for non-Claude models.
+/// Default WG usage guide for non-Claude models.
 ///
 /// Injected into the prompt when the executor is non-Claude (native) so that models
 /// without CLAUDE.md context understand wg basics. Users can override this by placing
-/// a custom guide at `.workgraph/wg-guide.md`.
+/// a custom guide at `.wg/wg-guide.md`.
 pub const DEFAULT_WG_GUIDE: &str = "\
-**Workgraph (wg)** is a task coordination graph for AI agents. You are an agent \
+**WG** is a task coordination graph for AI agents. You are an agent \
 working on one task in this graph. Other agents work on other tasks concurrently.
 
 ### Task Lifecycle
@@ -793,6 +846,14 @@ wg add \"Implement feature\" -d \"## Validation
 - [ ] cargo test test_feature passes
 - [ ] feature works end-to-end\"
 ```
+
+For **user-visible behavior fixes** (TUI, browser, terminal — anything a human notices), \
+the `## Validation` section MUST require a live or scripted simulation of the *actual* human flow, \
+not only CLI / unit / library paths. A passing CLI test does not prove the TUI keystroke handler \
+or browser click handler works — the CLI path is often already correct while the user-facing caller \
+is the broken one. Drive the real surface (e.g., `wg tui` via tmux + `tmux send-keys`, headless browser, \
+`expect`) and add a scenario under `tests/smoke/scenarios/` listed in `tests/smoke/manifest.toml` \
+`owners` so the smoke gate catches future regressions.
 
 ### When to Decompose vs Implement Directly
 - **Implement directly** if the task is small, well-scoped, and touches ≤ 2-3 files
@@ -901,7 +962,7 @@ pub struct ScopeContext {
     pub queued_messages: String,
     /// Context from a previous agent attempt (injected on retry)
     pub previous_attempt_context: String,
-    /// Workgraph usage guide for non-Claude models (injected when model lacks CLAUDE.md)
+    /// WG usage guide for non-Claude models (injected when model lacks CLAUDE.md)
     pub wg_guide_content: String,
     /// Discovered test files formatted for prompt injection (task+ scope)
     pub discovered_tests: String,
@@ -938,8 +999,7 @@ pub fn build_prompt(vars: &TemplateVars, scope: ContextScope, ctx: &ScopeContext
 
     // All scopes: task assignment header
     parts.push(
-        "# Task Assignment\n\nYou are an AI agent working on a task in a workgraph project.\n"
-            .to_string(),
+        "# Task Assignment\n\nYou are an AI agent working on a task in a WG project.\n".to_string(),
     );
 
     // All scopes: agent identity
@@ -1015,10 +1075,7 @@ pub fn build_prompt(vars: &TemplateVars, scope: ContextScope, ctx: &ScopeContext
 
     // Task+ scope: wg usage guide for non-Claude models
     if scope >= ContextScope::Task && !ctx.wg_guide_content.is_empty() {
-        parts.push(format!(
-            "## Workgraph Usage Guide\n\n{}",
-            ctx.wg_guide_content
-        ));
+        parts.push(format!("## WG Usage Guide\n\n{}", ctx.wg_guide_content));
     }
 
     // Task+ scope: native-executor file-tool guidance. Teaches the model
@@ -1140,7 +1197,7 @@ pub struct TemplateVars {
 }
 
 impl TemplateVars {
-    /// Create template variables from a task, optional context, and optional workgraph directory.
+    /// Create template variables from a task, optional context, and optional WG directory.
     ///
     /// If the task has an agent set and `workgraph_dir` is provided, the Agent is loaded
     /// by hash and its role and motivation are resolved from agency storage and rendered
@@ -1151,7 +1208,7 @@ impl TemplateVars {
 
         let working_dir = workgraph_dir
             .and_then(|d| {
-                // Canonicalize to resolve relative paths like ".workgraph"
+                // Canonicalize to resolve relative paths like ".wg"
                 // whose parent() would be "" instead of the actual directory.
                 let abs = d.canonicalize().ok()?;
                 abs.parent().map(|p| p.to_string_lossy().to_string())
@@ -1264,7 +1321,7 @@ impl TemplateVars {
             }
         };
 
-        // Resolve skills from the role, using the project root (parent of .workgraph/)
+        // Resolve skills from the role, using the project root (parent of .wg/)
         let workgraph_root = wg_dir.parent().unwrap_or(wg_dir);
         let resolved_skills = agency::resolve_all_components(&role, workgraph_root, &agency_dir);
         let outcome = agency::resolve_outcome(&role.outcome_id, &agency_dir);
@@ -1279,7 +1336,7 @@ impl TemplateVars {
     /// still get the skill-invocation discipline.
     fn resolve_skills_preamble(workgraph_dir: Option<&Path>) -> String {
         let project_root = match workgraph_dir.and_then(|d| {
-            // Canonicalize to handle relative paths like ".workgraph"
+            // Canonicalize to handle relative paths like ".wg"
             d.canonicalize()
                 .ok()
                 .and_then(|abs| abs.parent().map(std::path::Path::to_path_buf))
@@ -1344,7 +1401,7 @@ impl TemplateVars {
     }
 }
 
-/// Configuration for an executor, loaded from `.workgraph/executors/<name>.toml`.
+/// Configuration for an executor, loaded from `.wg/executors/<name>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
     /// The executor configuration section.
@@ -1408,7 +1465,7 @@ impl ExecutorConfig {
         Ok(config)
     }
 
-    /// Load executor configuration from the workgraph executors directory.
+    /// Load executor configuration from the WG executors directory.
     pub fn load_by_name(workgraph_dir: &Path, name: &str) -> Result<Self> {
         let config_path = workgraph_dir
             .join("executors")
@@ -1499,7 +1556,7 @@ impl ExecutorRegistry {
                     env: HashMap::new(),
                     // No default template — built-in executors use scope-based
                     // build_prompt() assembly. Custom configs in
-                    // .workgraph/executors/*.toml can still define a template
+                    // .wg/executors/*.toml can still define a template
                     // to override this behavior.
                     prompt_template: None,
                     working_dir: Some("{{working_dir}}".to_string()),
@@ -1516,6 +1573,14 @@ impl ExecutorRegistry {
                         "--json".to_string(),
                         "--skip-git-repo-check".to_string(),
                         "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                        // Counter gpt-5.x catalog defaults that drive lazy completion:
+                        // low verbosity + truncation bias produce text-only "summaries" instead of tool calls.
+                        "-c".to_string(),
+                        "model_verbosity=\"high\"".to_string(),
+                        "-c".to_string(),
+                        "tool_output_token_limit=32000".to_string(),
+                        "-c".to_string(),
+                        r#"developer_instructions="You are a non-interactive batch worker. You MUST complete the task by writing files to disk and creating at least one git commit before declaring done. A prose summary without file writes or commits is a task failure. Use shell tools (Read, Write, Edit, Bash) to do real work; do not describe work in the response.""#.to_string(),
                     ],
                     env: HashMap::new(),
                     // No default template — uses scope-based build_prompt() assembly.
@@ -1539,29 +1604,6 @@ impl ExecutorRegistry {
                     prompt_template: None,
                     working_dir: None,
                     timeout: None,
-                    model: None,
-                },
-            }),
-            "amplifier" => Ok(ExecutorConfig {
-                executor: ExecutorSettings {
-                    executor_type: "amplifier".to_string(),
-                    command: "amplifier".to_string(),
-                    args: vec![
-                        "run".to_string(),
-                        "--mode".to_string(),
-                        "single".to_string(),
-                        "--output-format".to_string(),
-                        "text".to_string(),
-                    ],
-                    env: {
-                        let mut env = HashMap::new();
-                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
-                        env
-                    },
-                    // No default template — uses scope-based build_prompt() assembly.
-                    prompt_template: None,
-                    working_dir: Some("{{working_dir}}".to_string()),
-                    timeout: Some(600),
                     model: None,
                 },
             }),
@@ -1595,7 +1637,7 @@ impl ExecutorRegistry {
                 },
             }),
             _ => Err(anyhow!(
-                "Unknown executor '{}'. Available: claude, codex, amplifier, native, shell, default",
+                "Unknown executor '{}'. Available: claude, codex, native, shell, default",
                 name,
             )),
         }
@@ -1657,13 +1699,18 @@ mod tests {
             created_at: None,
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             provider: None,
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None,
             verify_timeout: None,
             agent: None,
@@ -1693,6 +1740,8 @@ mod tests {
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -1822,7 +1871,7 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_executor_registry_init() {
         let temp_dir = TempDir::new().unwrap();
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        let workgraph_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&workgraph_dir).unwrap();
 
         let registry = ExecutorRegistry::new(&workgraph_dir);
@@ -1853,7 +1902,7 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_template_vars_identity_resolved_from_agency() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         let roles_dir = wg_dir.join("agency").join("cache/roles");
         let motivations_dir = wg_dir.join("agency").join("primitives/tradeoffs");
         let agents_dir = wg_dir.join("agency").join("cache/agents");
@@ -1914,7 +1963,7 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_template_vars_identity_missing_agent_fallback() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         let agents_dir = wg_dir.join("agency").join("cache/agents");
         fs::create_dir_all(&agents_dir).unwrap();
 
@@ -1942,7 +1991,7 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_load_by_name_missing_config_file() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(wg_dir.join("executors")).unwrap();
 
         let result = ExecutorConfig::load_by_name(&wg_dir, "nonexistent");
@@ -1958,8 +2007,8 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_load_by_name_missing_executors_directory() {
         let temp_dir = TempDir::new().unwrap();
-        // .workgraph exists but executors/ subdirectory does not
-        let wg_dir = temp_dir.path().join(".workgraph");
+        // .wg exists but executors/ subdirectory does not
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         let result = ExecutorConfig::load_by_name(&wg_dir, "claude");
@@ -2120,13 +2169,13 @@ template = "Work on {{task_id}}"
     #[test]
     fn test_template_vars_working_dir_with_real_path() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         let task = make_test_task("task-1", "Test");
         let vars = TemplateVars::from_task(&task, None, Some(&wg_dir));
 
-        // working_dir should be the canonical parent of .workgraph
+        // working_dir should be the canonical parent of .wg
         let expected = temp_dir.path().canonicalize().unwrap();
         assert_eq!(vars.working_dir, expected.to_string_lossy().to_string());
     }
@@ -2184,7 +2233,7 @@ args = ["--custom-flag"]
     #[test]
     fn test_registry_init_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         let registry = ExecutorRegistry::new(&wg_dir);
@@ -2221,14 +2270,29 @@ args = ["--custom-flag"]
 
         assert_eq!(config.executor.executor_type, "codex");
         assert_eq!(config.executor.command, "codex");
+        // Base invocation flags
         assert_eq!(
-            config.executor.args,
-            vec![
+            &config.executor.args[0..4],
+            &[
                 "exec".to_string(),
                 "--json".to_string(),
                 "--skip-git-repo-check".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
             ]
+        );
+        // Completion-forcing overrides added for gpt-5.x lazy-completion fix
+        let args_str = config.executor.args.join(" ");
+        assert!(
+            args_str.contains("model_verbosity"),
+            "should include model_verbosity override"
+        );
+        assert!(
+            args_str.contains("tool_output_token_limit"),
+            "should include tool_output_token_limit override"
+        );
+        assert!(
+            args_str.contains("developer_instructions"),
+            "should include developer_instructions override"
         );
         assert_eq!(
             config.executor.working_dir,
@@ -2354,7 +2418,7 @@ args = ["--custom-flag"]
     #[test]
     fn test_identity_agent_exists_but_role_missing() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         let roles_dir = wg_dir.join("agency").join("cache/roles");
         let motivations_dir = wg_dir.join("agency").join("primitives/tradeoffs");
         let agents_dir = wg_dir.join("agency").join("cache/agents");
@@ -2395,7 +2459,7 @@ args = ["--custom-flag"]
     #[test]
     fn test_skills_preamble_empty_when_no_skill_file() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         let task = make_test_task("task-1", "Test");
@@ -2406,7 +2470,7 @@ args = ["--custom-flag"]
     #[test]
     fn test_skills_preamble_loaded_when_skill_file_exists() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         // Create the skill file at project_root/.claude/skills/using-superpowers/SKILL.md
@@ -2434,7 +2498,7 @@ args = ["--custom-flag"]
     #[test]
     fn test_skills_preamble_strips_yaml_frontmatter() {
         let temp_dir = TempDir::new().unwrap();
-        let wg_dir = temp_dir.path().join(".workgraph");
+        let wg_dir = temp_dir.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
 
         let skill_dir = temp_dir
@@ -2516,18 +2580,6 @@ args = ["--custom-flag"]
         // But should still have task info
         assert!(prompt.contains("task-1"));
         assert!(prompt.contains("Clean Task"));
-    }
-
-    #[test]
-    fn test_default_amplifier_no_prompt_template() {
-        // Built-in amplifier executor uses scope-based build_prompt() instead of a template
-        let temp_dir = TempDir::new().unwrap();
-        let registry = ExecutorRegistry::new(temp_dir.path());
-        let config = registry.load_config("amplifier").unwrap();
-        assert!(
-            config.executor.prompt_template.is_none(),
-            "Built-in amplifier config should have no prompt_template (uses build_prompt)"
-        );
     }
 
     #[test]
@@ -2850,7 +2902,7 @@ args = ["--custom-flag"]
         let prompt = build_prompt(&vars, ContextScope::Task, &ctx);
 
         assert!(
-            prompt.contains("## Workgraph Usage Guide"),
+            prompt.contains("## WG Usage Guide"),
             "Task scope should include wg guide when content is present"
         );
         assert!(
@@ -2868,7 +2920,7 @@ args = ["--custom-flag"]
         let prompt = build_prompt(&vars, ContextScope::Task, &ctx);
 
         assert!(
-            !prompt.contains("## Workgraph Usage Guide"),
+            !prompt.contains("## WG Usage Guide"),
             "Task scope should NOT include wg guide when content is empty"
         );
     }
@@ -2884,7 +2936,7 @@ args = ["--custom-flag"]
         let prompt = build_prompt(&vars, ContextScope::Clean, &ctx);
 
         assert!(
-            !prompt.contains("## Workgraph Usage Guide"),
+            !prompt.contains("## WG Usage Guide"),
             "Clean scope should NOT include wg guide"
         );
     }

@@ -249,7 +249,7 @@ pub fn restore(dir: &Path, task_id: &str, reopen: bool) -> Result<()> {
     let arch_path = archive_path(dir);
 
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let tasks = load_archive(&arch_path)?;
@@ -305,7 +305,7 @@ pub fn undo(dir: &Path) -> Result<()> {
     let arch_path = archive_path(dir);
 
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let task_ids = load_batch_metadata(dir)?;
@@ -382,7 +382,7 @@ pub fn run(
     let arch_path = archive_path(dir);
 
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     // Handle --list: show archived tasks
@@ -682,7 +682,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let wg_dir = dir.path();
 
-        // Create .workgraph directory structure
+        // Create .wg directory structure
         std::fs::create_dir_all(wg_dir).unwrap();
         let graph_file = wg_dir.join("graph.jsonl");
 
@@ -714,7 +714,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let wg_dir = dir.path();
 
-        // Create .workgraph directory structure
+        // Create .wg directory structure
         std::fs::create_dir_all(wg_dir).unwrap();
         let graph_file = wg_dir.join("graph.jsonl");
 
@@ -750,7 +750,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let wg_dir = dir.path();
 
-        // Create .workgraph directory structure
+        // Create .wg directory structure
         std::fs::create_dir_all(wg_dir).unwrap();
         let graph_file = wg_dir.join("graph.jsonl");
         let arch_path = wg_dir.join("archive.jsonl");
@@ -777,7 +777,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let wg_dir = dir.path();
 
-        // Create .workgraph directory structure
+        // Create .wg directory structure
         std::fs::create_dir_all(wg_dir).unwrap();
         let graph_file = wg_dir.join("graph.jsonl");
         let arch_path = wg_dir.join("archive.jsonl");

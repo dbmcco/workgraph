@@ -881,6 +881,7 @@ fn print_recursive_tree(
                 | Status::Waiting
                 | Status::PendingValidation => "\x1b[90m",
                 Status::PendingEval => "\x1b[38;5;154m", // chartreuse (xterm-256: 154 ~ light green)
+                Status::FailedPendingEval => "\x1b[38;5;208m", // orange (xterm-256: 208 ~ warm coral)
                 Status::Incomplete => "\x1b[38;5;208m",
             }
         };
@@ -895,6 +896,7 @@ fn print_recursive_tree(
                 Status::Abandoned => "abandoned",
                 Status::Waiting | Status::PendingValidation => "waiting",
                 Status::PendingEval => "pending-eval",
+                Status::FailedPendingEval => "failed-pending-eval",
                 Status::Incomplete => "incomplete",
             }
         };
@@ -1115,6 +1117,7 @@ fn print_timeline(
                 "\x1b[90m"
             }
             Status::PendingEval => "\x1b[38;5;154m",
+            Status::FailedPendingEval => "\x1b[38;5;208m",
             Status::Incomplete => "\x1b[38;5;208m",
         }
     };
@@ -1480,7 +1483,7 @@ mod tests {
     #[test]
     fn test_trace_basic_task_summary() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1493,7 +1496,7 @@ mod tests {
     #[test]
     fn test_trace_basic_task_json() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1506,7 +1509,7 @@ mod tests {
     #[test]
     fn test_trace_basic_task_full() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1519,7 +1522,7 @@ mod tests {
     #[test]
     fn test_trace_ops_only() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1532,7 +1535,7 @@ mod tests {
     #[test]
     fn test_trace_nonexistent_task() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1546,7 +1549,7 @@ mod tests {
     #[test]
     fn test_trace_with_operations() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1588,7 +1591,7 @@ mod tests {
     #[test]
     fn test_trace_with_agent_archives() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1614,7 +1617,7 @@ mod tests {
     #[test]
     fn test_trace_json_with_agent_archives() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test task")));
@@ -1637,7 +1640,7 @@ mod tests {
     #[test]
     fn test_trace_not_initialized() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let result = run(&dir, "t1", TraceMode::Summary);
         assert!(result.is_err());
@@ -1701,7 +1704,7 @@ mod tests {
     #[test]
     fn test_load_agent_runs_no_archive_dir() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let runs = load_agent_runs(&dir, "nonexistent", false);
         assert!(runs.is_empty());
     }
@@ -1778,7 +1781,7 @@ mod tests {
     #[test]
     fn test_detect_interventions_finds_manual_fail() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&dir).unwrap();
 
         provenance::record(
@@ -1801,7 +1804,7 @@ mod tests {
     #[test]
     fn test_detect_interventions_skips_agent_ops() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&dir).unwrap();
 
         provenance::record(
@@ -1839,7 +1842,7 @@ mod tests {
     #[test]
     fn test_run_recursive_basic() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_done_task("root", "Root task")));
@@ -1858,7 +1861,7 @@ mod tests {
     #[test]
     fn test_run_recursive_json() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_done_task("root", "Root task")));
@@ -1874,7 +1877,7 @@ mod tests {
     #[test]
     fn test_run_recursive_timeline() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         let mut root = make_done_task("root", "Root");
@@ -1900,7 +1903,7 @@ mod tests {
     #[test]
     fn test_run_recursive_nonexistent_task() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test")));
@@ -1945,7 +1948,7 @@ mod tests {
     #[test]
     fn test_run_graph_basic() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_done_task("root", "Root")));
@@ -1961,7 +1964,7 @@ mod tests {
     #[test]
     fn test_run_graph_nonexistent() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
 
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Test")));
@@ -1976,7 +1979,7 @@ mod tests {
     #[test]
     fn test_reconstruct_temporal_empty() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&dir).unwrap();
 
         let subgraph: HashSet<&str> = ["t1"].into_iter().collect();
@@ -1987,7 +1990,7 @@ mod tests {
     #[test]
     fn test_reconstruct_temporal_lifecycle() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&dir).unwrap();
 
         // Record a task lifecycle
@@ -2035,7 +2038,7 @@ mod tests {
     #[test]
     fn test_reconstruct_temporal_filters_subgraph() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&dir).unwrap();
 
         // Record ops for two tasks

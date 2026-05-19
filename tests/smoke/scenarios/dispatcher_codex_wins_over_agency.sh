@@ -28,7 +28,7 @@ require_wg
 
 scratch=$(make_scratch)
 
-# Isolate from any user-level workgraph config.
+# Isolate from any user-level WG config.
 fake_home="$scratch/home"
 mkdir -p "$fake_home/.config/workgraph"
 : >"$fake_home/.config/workgraph/config.toml"
@@ -99,7 +99,7 @@ fi
 wrap_pid=$!
 graph_dir=""
 for _ in $(seq 1 30); do
-    for cand in .wg .workgraph; do
+    for cand in .wg .wg; do
         if [[ -d "$project/$cand" ]]; then
             graph_dir="$project/$cand"
             break
@@ -109,7 +109,7 @@ for _ in $(seq 1 30); do
     sleep 0.2
 done
 if [[ -z "$graph_dir" ]]; then
-    loud_fail "no .wg/ or .workgraph/ directory after wg service start"
+    loud_fail "no .wg/ or .wg/ directory after wg service start"
 fi
 if ! daemon_pid=$(wait_for_daemon_pid "$graph_dir" 30); then
     wait "$wrap_pid" 2>/dev/null || true

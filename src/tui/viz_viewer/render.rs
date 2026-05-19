@@ -8,18 +8,23 @@ use unicode_width::UnicodeWidthStr;
 
 use super::state::{
     ActivityEventKind, ChoiceDialogState, ConfigEditKind, ConfigSection, ConfirmAction,
-    ControlPanelFocus, CoordinatorPlusHit, CoordinatorTabHit, EndpointTestStatus, FocusedPanel,
-    InputMode, LayoutMode, ResponsiveBreakpoint, RightPanelTab, ServiceHealthLevel,
-    SettingsEditScope, SinglePanelView, SortMode, TabBarEntryKind, TaskFormField, TaskFormState,
-    TextPromptAction, ToastSeverity, VitalsStaleness, VizApp, WAVE_BOLT, WAVE_NUM_BOLTS,
-    extract_section_name, format_duration_compact, format_relative_time, spinner_wave_pos,
-    vitals_staleness_color,
+    ControlPanelFocus, CoordinatorArrowHit, CoordinatorPlusHit, CoordinatorTabHit,
+    EndpointTestStatus, ExitPromptState, FocusedPanel, InputMode, LayoutMode, ResponsiveBreakpoint,
+    RightPanelTab, ServiceHealthLevel, SettingsEditScope, SinglePanelView, SortMode,
+    TabBarEntryKind, TaskFormField, TaskFormState, TextPromptAction, ToastSeverity,
+    VitalsStaleness, VizApp, WAVE_BOLT, WAVE_NUM_BOLTS, extract_section_name,
+    format_duration_compact, format_relative_time, spinner_wave_pos, vitals_staleness_color,
 };
 use workgraph::AgentStatus;
 use workgraph::graph::{TokenUsage, format_tokens};
 
 use super::chat_palette::chat_task_label_color;
 use crate::tui::markdown::markdown_to_lines;
+
+/// Primary text foreground: white on dark terminals, terminal-default on light.
+fn text_primary(is_light: bool) -> Color {
+    if is_light { Color::Reset } else { Color::White }
+}
 
 /// Minimum terminal width for side-by-side right panel layout.
 /// When the inspector is currently on the right and terminal shrinks below this,
@@ -678,7 +683,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     // ── Overlay widgets (on top of everything) ──
 
     if app.show_help {
-        draw_help_overlay(frame);
+        draw_help_overlay(frame, app.is_light_theme);
     }
 
     // Confirmation dialog overlay
@@ -686,10 +691,16 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
         app.last_dialog_area = draw_confirm_dialog(frame, action);
     } else if let InputMode::ChoiceDialog(ref state) = app.input_mode {
         app.last_dialog_area = draw_choice_dialog(frame, state);
+    } else if let InputMode::ExitPrompt(ref state) = app.input_mode {
+        app.last_dialog_area = draw_exit_prompt(frame, state);
     } else if matches!(app.input_mode, InputMode::CoordinatorPicker) {
         if let Some(ref picker) = app.coordinator_picker {
             app.last_dialog_area =
                 draw_coordinator_picker(frame, picker, app.active_coordinator_id);
+        }
+    } else if matches!(app.input_mode, InputMode::ChatManager) {
+        if let Some(ref mgr) = app.chat_manager {
+            app.last_dialog_area = draw_chat_manager(frame, mgr);
         }
     } else {
         app.last_dialog_area = Rect::default();
@@ -697,7 +708,12 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
 
     // Text prompt overlay
     if let InputMode::TextPrompt(ref action) = app.input_mode {
-        app.last_text_prompt_area = draw_text_prompt(frame, action, &mut app.text_prompt.editor);
+        app.last_text_prompt_area = draw_text_prompt(
+            frame,
+            action,
+            &mut app.text_prompt.editor,
+            app.is_light_theme,
+        );
     } else {
         app.last_text_prompt_area = Rect::default();
     }
@@ -706,7 +722,7 @@ pub fn draw(frame: &mut Frame, app: &mut VizApp) {
     if app.input_mode == InputMode::TaskForm
         && let Some(ref form) = app.task_form
     {
-        draw_task_form(frame, form);
+        draw_task_form(frame, form, app.is_light_theme);
     }
 
     // Service control panel (modal overlay)
@@ -780,12 +796,13 @@ fn apply_splash_style<'a>(
     flash_color: (u8, u8, u8),
     reduced_motion: bool,
     kind: super::state::AnimationKind,
+    is_light: bool,
 ) -> Line<'a> {
     let is_fade_in = matches!(kind, super::state::AnimationKind::Revealed);
     let is_fade_out = matches!(kind, super::state::AnimationKind::FadeOut);
 
-    // Terminal background color assumption (dark terminal).
-    let terminal_bg: (u8, u8, u8) = (0, 0, 0);
+    // Terminal background assumption: black for dark terminals, white for light.
+    let terminal_bg: (u8, u8, u8) = if is_light { (255, 255, 255) } else { (0, 0, 0) };
 
     if reduced_motion {
         if is_fade_out {
@@ -838,16 +855,26 @@ fn apply_splash_style<'a>(
     // Ease-out curve for a smoother fade (fast initial dim, slow tail-off).
     let t = progress * progress;
 
-    // Interpolate from the flash color to no background.
-    // Since terminals don't have true alpha, we fade toward black (0,0,0).
-    let r = (flash_color.0 as f64 * (1.0 - t)) as u8;
-    let g = (flash_color.1 as f64 * (1.0 - t)) as u8;
-    let b = (flash_color.2 as f64 * (1.0 - t)) as u8;
+    // On dark terminals: fade toward black. On light: fade toward white.
+    let (r, g, b) = if is_light {
+        let r = (flash_color.0 as f64 * (1.0 - t) + 255.0 * t) as u8;
+        let g = (flash_color.1 as f64 * (1.0 - t) + 255.0 * t) as u8;
+        let b = (flash_color.2 as f64 * (1.0 - t) + 255.0 * t) as u8;
+        (r, g, b)
+    } else {
+        let r = (flash_color.0 as f64 * (1.0 - t)) as u8;
+        let g = (flash_color.1 as f64 * (1.0 - t)) as u8;
+        let b = (flash_color.2 as f64 * (1.0 - t)) as u8;
+        (r, g, b)
+    };
 
-    // At low intensity, skip to avoid a visible snap when the animation
-    // ends.  Use generous thresholds so the fade reaches near-invisible
-    // well before the animation timer expires.
-    if r < 25 && g < 25 && b < 15 {
+    // Stop early when the animation color is nearly indistinguishable from the bg.
+    let done = if is_light {
+        r > 230 && g > 230 && b > 230
+    } else {
+        r < 25 && g < 25 && b < 15
+    };
+    if done {
         return line;
     }
 
@@ -1368,6 +1395,7 @@ fn draw_viz_content(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 flash_color,
                 reduced,
                 anim_kind,
+                app.is_light_theme,
             );
         }
 
@@ -2563,6 +2591,133 @@ fn render_iteration_navigator(frame: &mut Frame, app: &VizApp, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+/// Pick the prev/next segment widths for the Detail-tab iteration nav bar
+/// based on available width. The segments are the click targets, so they
+/// must be at least 3 cells wide; we widen them to "[ ◀ Prev ]" / "[ Next ▶ ]"
+/// (12 cells each) when the bar is wide enough to fit a meaningful center
+/// label alongside them.
+///
+/// Returns `(left_segment, right_segment)` strings, each of equal length
+/// (matching segment width).
+fn iter_nav_segments(width: u16) -> (&'static str, &'static str) {
+    let w = width as usize;
+    if w >= 60 {
+        ("  ◀  Prev  ", "  Next  ▶  ")
+    } else if w >= 30 {
+        ("  ◀  ", "  ▶  ")
+    } else {
+        (" ◀ ", " ▶ ")
+    }
+}
+
+/// Layout output for the Detail tab iteration nav bar — the click zones the
+/// caller stores on `app` so the click handler can hit-test.
+pub(super) struct IterNavBarLayout {
+    pub prev_zone: Rect,
+    pub next_zone: Rect,
+}
+
+/// Render the informative iteration-navigation bar at the top of the Detail
+/// tab. Layout (left → right):
+///   [ prev clickable segment ] [ centered iteration label ] [ next clickable segment ]
+///
+/// The prev/next segments are ≥ 3 cells wide so mouse precision isn't
+/// required. The center label is built by the caller (typically via
+/// `VizApp::iteration_bar_label`) and includes iteration N of M, start
+/// time, and outcome / live-state — so a glance at the bar tells the user
+/// what they're looking at and how to navigate.
+///
+/// Pure-functional: takes only the data needed to render. Returns the
+/// hit-test rects so the caller can store them on the app state.
+pub(super) fn render_detail_iteration_bar(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    can_go_prev: bool,
+    can_go_next: bool,
+) -> IterNavBarLayout {
+    use ratatui::layout::Alignment;
+
+    let (left_seg, right_seg) = iter_nav_segments(area.width);
+    let left_w = left_seg.chars().count() as u16;
+    let right_w = right_seg.chars().count() as u16;
+    let center_w = area.width.saturating_sub(left_w + right_w);
+
+    let prev_zone = Rect {
+        x: area.x,
+        y: area.y,
+        width: left_w,
+        height: 1,
+    };
+    let next_zone = Rect {
+        x: area.x + left_w + center_w,
+        y: area.y,
+        width: right_w,
+        height: 1,
+    };
+
+    let active_arrow_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+        .bg(Color::Rgb(30, 30, 50));
+    let inactive_arrow_style = Style::default()
+        .fg(Color::DarkGray)
+        .bg(Color::Rgb(15, 15, 25));
+    let left_style = if can_go_prev {
+        active_arrow_style
+    } else {
+        inactive_arrow_style
+    };
+    let right_style = if can_go_next {
+        active_arrow_style
+    } else {
+        inactive_arrow_style
+    };
+
+    let max_label_len = (center_w as usize).saturating_sub(2);
+    let label_owned: String = if label.chars().count() > max_label_len && max_label_len > 0 {
+        let mut s: String = label
+            .chars()
+            .take(max_label_len.saturating_sub(1))
+            .collect();
+        s.push('…');
+        s
+    } else {
+        label.to_string()
+    };
+    let label_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+        .bg(Color::Rgb(15, 15, 25));
+
+    let center_area = Rect {
+        x: area.x + left_w,
+        y: area.y,
+        width: center_w,
+        height: 1,
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(left_seg, left_style))),
+        prev_zone,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label_owned, label_style)))
+            .style(Style::default().bg(Color::Rgb(15, 15, 25)))
+            .alignment(Alignment::Center),
+        center_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(right_seg, right_style))),
+        next_zone,
+    );
+
+    IterNavBarLayout {
+        prev_zone,
+        next_zone,
+    }
+}
+
 /// Draw the Detail tab content (evolved from HUD).
 fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let detail = match &app.hud_detail {
@@ -2599,89 +2754,17 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     // ── Iteration navigation header ──
     if let Some(ha) = header_area {
+        let label = app.iteration_bar_label();
+        let can_go_prev = app.iter_can_go_prev();
+        let can_go_next = app.iter_can_go_next();
+        let layout = render_detail_iteration_bar(frame, ha, &label, can_go_prev, can_go_next);
         app.last_iter_nav_area = ha;
-
-        let total = app.iteration_archives.len() + 1; // archives + current
-        // Mark the live slot with "(live)" when the task is actively running,
-        // so the user can distinguish "rightmost slot is streaming" from
-        // "rightmost slot is frozen content from the most recent archive".
-        let live_suffix = if app.viewing_iteration.is_none()
-            && app
-                .hud_detail
-                .as_ref()
-                .is_some_and(|d| d.task_status == workgraph::graph::Status::InProgress)
-        {
-            " (live)"
-        } else {
-            ""
-        };
-        let label = match app.viewing_iteration {
-            Some(idx) => format!("{}/{}", idx + 1, total),
-            None => format!("{}/{}{}", total, total, live_suffix),
-        };
-
-        // ◀ arrow: clickable if not at oldest (i.e., viewing_iteration is not Some(0) when set,
-        // or there are archives when viewing current)
-        let can_go_prev = match app.viewing_iteration {
-            None => !app.iteration_archives.is_empty(), // can go to last archive
-            Some(idx) => idx > 0,                       // can go to previous archive
-        };
-        // ▶ arrow: clickable if not at current (viewing_iteration is Some and not at end)
-        let can_go_next = match app.viewing_iteration {
-            Some(idx) => idx + 1 < app.iteration_archives.len(),
-            None => false, // already at current
-        };
-
-        let left_arrow = if can_go_prev {
-            Span::styled(
-                "◀",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("◀", Style::default().fg(Color::DarkGray))
-        };
-        let right_arrow = if can_go_next {
-            Span::styled(
-                "▶",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("▶", Style::default().fg(Color::DarkGray))
-        };
-
-        let middle_text = format!(" iter {} ", label);
-
-        // Build the line: left arrow | center | right arrow
-        // We want them roughly positioned: ◀ on left side, ▶ on right side
-        let usable_width = ha.width.saturating_sub(2) as usize;
-        let center_len = middle_text.len();
-        // Distribute remaining space between/around the arrows
-        let arrow_width = 2; // ◀ or ▶
-        let gap = 2;
-        let side_width = (usable_width.saturating_sub(center_len + arrow_width * 2 + gap * 2)) / 2;
-
-        let line = Line::from(vec![
-            left_arrow,
-            Span::raw(" ".repeat(side_width.max(1))),
-            Span::styled(
-                middle_text,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(side_width.max(1))),
-            right_arrow,
-        ]);
-        frame.render_widget(
-            Paragraph::new(line).style(Style::default().bg(Color::Rgb(15, 15, 25))),
-            ha,
-        );
+        app.iter_nav_prev_zone = layout.prev_zone;
+        app.iter_nav_next_zone = layout.next_zone;
     } else {
         app.last_iter_nav_area = Rect::default();
+        app.iter_nav_prev_zone = Rect::default();
+        app.iter_nav_next_zone = Rect::default();
     }
 
     // Build visible lines: filter out content of collapsed sections, add ▸/▾ indicators.
@@ -2929,6 +3012,137 @@ fn draw_detail_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     }
 }
 
+/// Layout result for the chat tab bar's visible window.
+///
+/// Computed each frame from the per-entry widths plus the user's stored
+/// scroll offset. The renderer auto-adjusts the offset so that the active
+/// tab is always visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ChatBarLayout {
+    /// Index of the first visible entry in the combined entry list.
+    pub offset: usize,
+    /// Exclusive end index — entries `[offset, end)` are visible.
+    pub end: usize,
+    /// True iff there are entries before `offset` (◀ should be drawn).
+    pub show_left_arrow: bool,
+    /// True iff there are entries after `end - 1` (▶ should be drawn).
+    pub show_right_arrow: bool,
+}
+
+/// Compute the visible-window layout for the chat tab bar.
+///
+/// `widths`: per-entry render width (cells) excluding the inter-entry "│"
+///   separator (1 cell), the leading bar space (1 cell), and the trailing
+///   `[+]` button (3 cells) — those are accounted for here.
+/// `active_idx`: position of the active tab (if any). The returned `offset`
+///   guarantees the active tab is in the visible window when at all possible.
+/// `bar_width`: total cells available on the bar (`tab_area.width`).
+/// `requested_offset`: the user's stored scroll offset; used as the starting
+///   point. May shrink (if active is to the left) or grow (if active is to
+///   the right of the window). Clamped to `[0, widths.len())`.
+pub(super) fn compute_chat_bar_layout(
+    widths: &[usize],
+    active_idx: Option<usize>,
+    bar_width: usize,
+    requested_offset: usize,
+) -> ChatBarLayout {
+    let n = widths.len();
+    if n == 0 {
+        return ChatBarLayout {
+            offset: 0,
+            end: 0,
+            show_left_arrow: false,
+            show_right_arrow: false,
+        };
+    }
+
+    let mut offset = requested_offset.min(n - 1);
+    if let Some(a) = active_idx
+        && a < offset
+    {
+        offset = a;
+    }
+
+    // Try a candidate offset and return (end, show_left, show_right) if the
+    // active tab is visible in the resulting window — None otherwise.
+    let try_offset = |off: usize| -> Option<(usize, bool, bool)> {
+        let show_left = off > 0;
+        // Reserve space for leading " " (1) + ◀+space (2 if shown) + [+] (3).
+        let reserve_no_right = 1 + if show_left { 2 } else { 0 } + 3;
+        let avail_no_right = bar_width.saturating_sub(reserve_no_right);
+
+        // First pass: assume no right arrow, see how many fit.
+        let mut col_used: usize = 0;
+        let mut end = off;
+        while end < n {
+            let sep = if end > off { 1 } else { 0 };
+            let needed = sep + widths[end];
+            if col_used + needed > avail_no_right {
+                break;
+            }
+            col_used += needed;
+            end += 1;
+        }
+        let mut show_right = end < n;
+
+        if show_right {
+            // Need 2 more cells for "▶ "; recompute fit.
+            let avail_with_right = avail_no_right.saturating_sub(2);
+            col_used = 0;
+            end = off;
+            while end < n {
+                let sep = if end > off { 1 } else { 0 };
+                let needed = sep + widths[end];
+                if col_used + needed > avail_with_right {
+                    break;
+                }
+                col_used += needed;
+                end += 1;
+            }
+            show_right = end < n;
+        }
+
+        // The active tab must be inside [off, end) for this offset to be
+        // acceptable. (If the active tab is wider than the bar itself,
+        // we'll still rendered it — it just gets clipped by ratatui.)
+        let active_visible = match active_idx {
+            None => true,
+            Some(a) => a >= off && a < end,
+        };
+        if !active_visible {
+            return None;
+        }
+        // Special case: if `end == off` (nothing fit at all — bar way too
+        // narrow), still treat it as a valid placement so we don't loop
+        // forever advancing the offset.
+        Some((end, show_left, show_right))
+    };
+
+    // Advance the offset until the active tab is visible (or we run out).
+    loop {
+        if let Some((end, show_left, show_right)) = try_offset(offset) {
+            return ChatBarLayout {
+                offset,
+                end,
+                show_left_arrow: show_left,
+                show_right_arrow: show_right,
+            };
+        }
+        if offset >= n - 1 {
+            // Fallback: pin to last entry.
+            offset = n - 1;
+            let (end, show_left, show_right) = try_offset(offset).unwrap_or((n, offset > 0, false));
+            return ChatBarLayout {
+                offset,
+                end,
+                show_left_arrow: show_left,
+                show_right_arrow: show_right,
+            };
+        }
+        offset += 1;
+    }
+}
+
 /// Draw the Chat tab content with word-wrapped messages, scrolling, and input area.
 fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let width = area.width as usize;
@@ -2969,9 +3183,13 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         .saturating_sub(search_bar_height);
 
     // Coordinator + user board tab bar — always visible so the user can discover [+]
-    let coordinator_entries = app.active_tab_ids_and_labels();
-    let user_board_entries = app.list_user_board_entries();
-    let total_tab_count = coordinator_entries.len() + user_board_entries.len();
+    // Read from the per-tick cache populated in `maybe_refresh()` instead of
+    // re-loading + re-parsing graph.jsonl (2 MB+) on every render frame.
+    // Each redraw of the chat tab previously did this twice, which under
+    // adaptive 50-200 ms polling produced 10-40 graph reloads/sec and
+    // accounted for ~55 % of `wg tui` CPU (see fix-wg-tui).
+    let coordinator_entries = app.cached_chat_tab_entries.clone();
+    let user_board_entries = app.cached_user_board_entries.clone();
     let tab_bar_height: u16 = 1;
 
     {
@@ -2990,28 +3208,42 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
         let active_snapshot = ActiveChatSnapshot {
             awaiting_response: app.chat.awaiting_response(),
-            // Future: wire chat-level error state if/when surfaced.
             error: false,
         };
         let service_alive = app.chat.coordinator_active;
 
-        // Determine which user board is currently selected (if any).
         let selected_user_board: Option<String> = app
             .selected_task_idx
             .and_then(|idx| app.task_order.get(idx))
             .filter(|id| workgraph::graph::is_user_board(id))
             .cloned();
 
-        let bar_x = tab_area.x;
-        let max_width = tab_area.width as usize;
-        let mut spans = Vec::new();
-        let mut tab_hits = Vec::new();
-        let mut col: usize = 1; // start after leading space
-        let mut overflow = false;
-        let mut tab_index: usize = 0; // combined index across all tabs
+        // Build the unified entry list (coordinator tabs first, then user-board tabs)
+        // and pre-compute each entry's render width so we can compute scroll offset
+        // without rendering twice.
+        struct CoordEntryStyling {
+            cid: u32,
+            tab_state: ChatTabState,
+            effective_color: Color,
+        }
+        enum BarEntryKind2 {
+            Coord(CoordEntryStyling),
+            UserBoard(String),
+        }
+        struct BarEntry {
+            kind: BarEntryKind2,
+            label: String,
+            is_active: bool,
+            /// Cells consumed by this entry on the bar (incl. leading dot,
+            /// label padding, close button, and trailing space; excludes
+            /// the "│" separator between consecutive entries).
+            content_width: usize,
+            /// Global tab index (zero-based); used to render `[N]` hotkey hints.
+            global_idx: usize,
+        }
 
-        // Leading space
-        spans.push(Span::raw(" "));
+        let mut entries: Vec<BarEntry> = Vec::new();
+        let mut active_idx: Option<usize> = None;
 
         for (cid, label) in coordinator_entries.iter() {
             let cid = *cid;
@@ -3024,184 +3256,207 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             let tab_state =
                 infer_tab_state(&app.workgraph_dir, cid, service_alive, snapshot_for_cid);
             let state_color = tab_state.color();
-            // Effective color: legacy .coordinator-N tabs use muted gray regardless
-            // of chat state; current .chat-N tabs use the state color normally.
             let effective_color = chat_task_label_color(label, state_color);
-            // Tab content: "[N] ◉ Label ✕ "
-            // hotkey(3=" [N]") + space+dot(2) + space+label + space+close(2)
-            let label_width = label.len();
-            let close_width: usize = 2; // " ✕"
-            // Hotkey hint: "[1]".."[9]" for the first 9 tabs, blank otherwise.
-            let hotkey_n = tab_index + 1;
-            let hotkey_str: String = if hotkey_n <= 9 {
-                format!(" [{}]", hotkey_n)
-            } else {
-                String::new()
-            };
-            let hotkey_width = hotkey_str.len();
-            // Content: hotkey + " ◉"(2) + " "+label + " "+close(2)
-            let tab_content_width = hotkey_width + 2 + 1 + label_width + 1 + close_width;
-            // Separator: "│" between tabs (1 column wide)
-            let sep_w: usize = if tab_index > 0 { 1 } else { 0 };
-
-            let total_tab_width = sep_w + tab_content_width;
-
-            // Check if this tab fits (also need room for "… [+]" = 5 if there are more tabs)
-            let remaining_tabs = total_tab_count - tab_index - 1;
-            let suffix_width = if remaining_tabs > 0 { 6 } else { 4 }; // "… [+]" or " [+]"
-            if col + total_tab_width + suffix_width > max_width && remaining_tabs > 0 {
-                overflow = true;
-                break;
+            let global_idx = entries.len();
+            let hotkey_n = global_idx + 1;
+            let hotkey_width: usize = if hotkey_n <= 9 { 4 } else { 0 }; // " [N]"
+            let label_width = label.chars().count();
+            // hotkey(0|4) + " ◉"(2) + " "+label(1+label_width) + " ✕"(2) + " "(trailing,1)
+            let content_width = hotkey_width + 2 + 1 + label_width + 2 + 1;
+            if is_active {
+                active_idx = Some(global_idx);
             }
+            entries.push(BarEntry {
+                kind: BarEntryKind2::Coord(CoordEntryStyling {
+                    cid,
+                    tab_state,
+                    effective_color,
+                }),
+                label: label.clone(),
+                is_active,
+                content_width,
+                global_idx,
+            });
+        }
 
-            // Separator
-            if tab_index > 0 {
+        for (task_id, label) in user_board_entries.iter() {
+            let is_active = selected_user_board.as_deref() == Some(task_id.as_str());
+            let global_idx = entries.len();
+            let label_width = label.chars().count();
+            // No hotkey for user board tabs in the current scheme:
+            // " ◉"(2) + " "+label(1+label_width) + " ✕"(2) + " "(trailing,1)
+            let content_width = 2 + 1 + label_width + 2 + 1;
+            if is_active {
+                active_idx = Some(global_idx);
+            }
+            entries.push(BarEntry {
+                kind: BarEntryKind2::UserBoard(task_id.clone()),
+                label: label.clone(),
+                is_active,
+                content_width,
+                global_idx,
+            });
+        }
+
+        let bar_x = tab_area.x;
+        let max_width = tab_area.width as usize;
+
+        // Resolve the visible window: pick a scroll offset that keeps the
+        // active tab visible within `max_width`, using the user's stored
+        // `chat_tab_scroll_offset` as the starting point. The offset may
+        // need to grow if the active tab is to the right of the previous
+        // window, or shrink if active is to the left.
+        let widths: Vec<usize> = entries.iter().map(|e| e.content_width).collect();
+        let layout =
+            compute_chat_bar_layout(&widths, active_idx, max_width, app.chat_tab_scroll_offset);
+        // Persist any offset adjustments back to app state so that the next
+        // frame stays consistent and `wg`'s scroll handlers see the same value.
+        app.chat_tab_scroll_offset = layout.offset;
+
+        let mut spans = Vec::new();
+        let mut tab_hits = Vec::new();
+        let mut col: usize = 0;
+
+        // Leading space
+        spans.push(Span::raw(" "));
+        col += 1;
+
+        // Left scroll arrow when there are tabs hidden to the left.
+        let left_arrow_hit = if layout.show_left_arrow {
+            let start = (bar_x as usize + col) as u16;
+            spans.push(Span::styled("◀", Style::default().fg(Color::Cyan)));
+            col += 1;
+            spans.push(Span::raw(" "));
+            col += 1;
+            let end = (bar_x as usize + col) as u16;
+            CoordinatorArrowHit { start, end }
+        } else {
+            CoordinatorArrowHit::default()
+        };
+
+        // Render visible tabs from layout.offset .. layout.end (exclusive).
+        for vis_pos in 0..(layout.end.saturating_sub(layout.offset)) {
+            let entry_idx = layout.offset + vis_pos;
+            let entry = &entries[entry_idx];
+
+            if vis_pos > 0 {
                 spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                col += sep_w;
+                col += 1;
             }
 
             let tab_start = (bar_x as usize + col) as u16;
+            let label_width = entry.label.chars().count();
 
-            // Hotkey hint (Alt+N jumps to this tab).
-            if hotkey_width > 0 {
-                spans.push(Span::styled(
-                    hotkey_str,
-                    Style::default().fg(Color::DarkGray),
-                ));
-                col += hotkey_width;
+            match &entry.kind {
+                BarEntryKind2::Coord(styling) => {
+                    let hotkey_n = entry.global_idx + 1;
+                    if hotkey_n <= 9 {
+                        let hotkey_str = format!(" [{}]", hotkey_n);
+                        let hk_w = hotkey_str.len();
+                        spans.push(Span::styled(
+                            hotkey_str,
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        col += hk_w;
+                    }
+                    let dot_glyph = if entry.is_active { " ◉" } else { " ●" };
+                    let dot_style = if entry.is_active {
+                        Style::default()
+                            .fg(styling.effective_color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        let dim_color = match styling.tab_state {
+                            ChatTabState::SupervisorDown => Color::DarkGray,
+                            _ => styling.effective_color,
+                        };
+                        Style::default().fg(dim_color)
+                    };
+                    spans.push(Span::styled(dot_glyph, dot_style));
+                    col += 2;
+
+                    let label_style = if entry.is_active {
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(styling.effective_color)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else {
+                        Style::default().fg(styling.effective_color)
+                    };
+                    spans.push(Span::styled(format!(" {}", entry.label), label_style));
+                    col += 1 + label_width;
+
+                    let close_start = (bar_x as usize + col) as u16;
+                    spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
+                    col += 2;
+                    let close_end = (bar_x as usize + col) as u16;
+
+                    spans.push(Span::raw(" "));
+                    col += 1;
+
+                    let tab_end = (bar_x as usize + col) as u16;
+                    tab_hits.push(CoordinatorTabHit {
+                        kind: TabBarEntryKind::Coordinator(styling.cid),
+                        tab_start,
+                        tab_end,
+                        close_start,
+                        close_end,
+                    });
+                }
+                BarEntryKind2::UserBoard(task_id) => {
+                    if entry.is_active {
+                        spans.push(Span::styled(
+                            " ◉",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
+                    }
+                    col += 2;
+
+                    let label_style = if entry.is_active {
+                        Style::default()
+                            .fg(text_primary(app.is_light_theme))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    spans.push(Span::styled(format!(" {}", entry.label), label_style));
+                    col += 1 + label_width;
+
+                    let close_start = (bar_x as usize + col) as u16;
+                    spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
+                    col += 2;
+                    let close_end = (bar_x as usize + col) as u16;
+
+                    spans.push(Span::raw(" "));
+                    col += 1;
+
+                    let tab_end = (bar_x as usize + col) as u16;
+                    tab_hits.push(CoordinatorTabHit {
+                        kind: TabBarEntryKind::UserBoard(task_id.clone()),
+                        tab_start,
+                        tab_end,
+                        close_start,
+                        close_end,
+                    });
+                }
             }
+        }
 
-            // Dot — colored by effective color (muted for legacy, state-color for current).
-            // Active tab uses ◉ + bold; inactive uses ● in the same color.
-            let dot_glyph = if is_active { " ◉" } else { " ●" };
-            let dot_style = if is_active {
-                Style::default()
-                    .fg(effective_color)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                // Inactive: dim the state color slightly so the active tab stands out.
-                let dim_color = match tab_state {
-                    ChatTabState::SupervisorDown => Color::DarkGray,
-                    _ => effective_color,
-                };
-                Style::default().fg(dim_color)
-            };
-            spans.push(Span::styled(dot_glyph, dot_style));
-            col += 2; // " ◉" = space + dot
-
-            // Label — bright + bold + underlined for active; effective-colored for inactive.
-            // Legacy .coordinator-N tabs use muted gray for both active and inactive.
-            let label_style = if is_active {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(effective_color)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(effective_color)
-            };
-            spans.push(Span::styled(format!(" {}", label), label_style));
-            col += 1 + label_width; // " " + label
-
-            // Close button (padded for wider touch target)
-            let close_start = (bar_x as usize + col) as u16;
-            spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
-            col += 2; // " ✕"
-            let close_end = (bar_x as usize + col) as u16;
-
-            // Trailing space
+        // Right scroll arrow when there are tabs hidden to the right.
+        let right_arrow_hit = if layout.show_right_arrow {
+            let start = (bar_x as usize + col) as u16;
+            spans.push(Span::styled("▶", Style::default().fg(Color::Cyan)));
+            col += 1;
             spans.push(Span::raw(" "));
             col += 1;
-
-            let tab_end = (bar_x as usize + col) as u16;
-
-            tab_hits.push(CoordinatorTabHit {
-                kind: TabBarEntryKind::Coordinator(cid),
-                tab_start,
-                tab_end,
-                close_start,
-                close_end,
-            });
-            tab_index += 1;
-        }
-
-        // User board tabs — yellow color scheme
-        if !overflow {
-            for (task_id, label) in user_board_entries.iter() {
-                let is_active = selected_user_board.as_deref() == Some(task_id.as_str());
-                let label_width = label.len();
-                // User board tabs: " ◉ Label ✕ " (no state indicator)
-                let close_width: usize = 2; // " ✕"
-                let tab_content_width = 1 + 1 + label_width + 1 + close_width;
-                let sep_w: usize = if tab_index > 0 { 1 } else { 0 };
-
-                let total_tab_width = sep_w + tab_content_width;
-
-                let remaining_tabs = total_tab_count - tab_index - 1;
-                let suffix_width = if remaining_tabs > 0 { 6 } else { 4 };
-                if col + total_tab_width + suffix_width > max_width && remaining_tabs > 0 {
-                    overflow = true;
-                    break;
-                }
-
-                // Separator
-                if tab_index > 0 {
-                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                    col += sep_w;
-                }
-
-                let tab_start = (bar_x as usize + col) as u16;
-
-                // Dot — yellow for user boards
-                if is_active {
-                    spans.push(Span::styled(
-                        " ◉",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                } else {
-                    spans.push(Span::styled(" ●", Style::default().fg(Color::DarkGray)));
-                }
-                col += 2;
-
-                // Label
-                let label_style = if is_active {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                spans.push(Span::styled(format!(" {}", label), label_style));
-                col += 1 + label_width;
-
-                // Close button
-                let close_start = (bar_x as usize + col) as u16;
-                spans.push(Span::styled(" ✕", Style::default().fg(Color::Red)));
-                col += 2;
-                let close_end = (bar_x as usize + col) as u16;
-
-                // Trailing space
-                spans.push(Span::raw(" "));
-                col += 1;
-
-                let tab_end = (bar_x as usize + col) as u16;
-
-                tab_hits.push(CoordinatorTabHit {
-                    kind: TabBarEntryKind::UserBoard(task_id.clone()),
-                    tab_start,
-                    tab_end,
-                    close_start,
-                    close_end,
-                });
-                tab_index += 1;
-            }
-        }
-
-        if overflow {
-            spans.push(Span::styled("… ", Style::default().fg(Color::DarkGray)));
-            col += 2;
-        }
+            let end = (bar_x as usize + col) as u16;
+            CoordinatorArrowHit { start, end }
+        } else {
+            CoordinatorArrowHit::default()
+        };
 
         let plus_start = (bar_x as usize + col) as u16;
         spans.push(Span::styled("[+]", Style::default().fg(Color::DarkGray)));
@@ -3213,6 +3468,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             start: plus_start,
             end: plus_end,
         };
+        app.coordinator_left_arrow_hit = left_arrow_hit;
+        app.coordinator_right_arrow_hit = right_arrow_hit;
 
         let tab_line = Line::from(spans);
         frame.render_widget(Paragraph::new(vec![tab_line]), tab_area);
@@ -3259,23 +3516,108 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     // the Ctrl+T branch in event.rs.
     if app.chat_pty_mode {
         let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
-        // Dead-handler cleanup: if the embedded process exited, drop
-        // the pane so the next toggle-on respawns.
-        let alive = app
-            .task_panes
-            .get_mut(&task_id)
-            .map(|p| p.is_alive())
-            .unwrap_or(false);
-        if !alive {
+        let cid = app.active_coordinator_id;
+
+        // Dead-handler detection: if the embedded process exited, capture
+        // its exit status into `chat_agent_death` before removing the pane.
+        let pane_exists = app.task_panes.contains_key(&task_id);
+        let alive = pane_exists
+            && app
+                .task_panes
+                .get_mut(&task_id)
+                .map(|p| p.is_alive())
+                .unwrap_or(false);
+        if pane_exists && !alive {
+            // Capture exit status before drop.
+            let exit_status = app
+                .task_panes
+                .get_mut(&task_id)
+                .and_then(|p| p.try_exit_status_desc())
+                .unwrap_or_else(|| "unknown exit status".to_string());
+            let (executor, spawn_cmd) = app
+                .chat_last_spawn_info
+                .get(&cid)
+                .cloned()
+                .unwrap_or_else(|| ("unknown".to_string(), "(unknown command)".to_string()));
+            app.chat_agent_death.insert(
+                cid,
+                super::state::ChatAgentDeathInfo {
+                    exit_status,
+                    executor,
+                    spawn_cmd,
+                },
+            );
             app.task_panes.remove(&task_id);
         }
+
+        // Lazy spawn at the actual msg_area dimensions. If
+        // `maybe_auto_enable_chat_pty` deferred the spawn (because
+        // it was called before any frame had drawn — area unknown),
+        // perform it now that we have real layout dimensions. Spawning
+        // at the right size from the start avoids the SIGWINCH reflow
+        // that would otherwise echo wrap-mismatched content into vt100
+        // scrollback (fix-pty-scrollback).
+        // Skip auto-spawn when the agent just died — user must retry explicitly.
+        if !app.task_panes.contains_key(&task_id) && !app.chat_agent_death.contains_key(&cid) {
+            app.consume_pending_chat_pty_spawn(msg_area.height, msg_area.width);
+        }
+
         if let Some(pane) = app.task_panes.get_mut(&task_id) {
             let _ = pane.resize(msg_area.height, msg_area.width);
             let focused = app.focused_panel == super::state::FocusedPanel::RightPanel;
             pane.render_with_focus(frame, msg_area, focused);
+        } else if let Some(death_info) = app.chat_agent_death.get(&cid).cloned() {
+            // Agent died — show error panel instead of falling back to the
+            // normal file-tailing renderer. The user sees what happened and
+            // can press R to retry, E to edit config, or X to dismiss.
+            draw_chat_agent_death_panel(frame, msg_area, &death_info);
+            draw_chat_input(frame, app, input_area);
+            return;
         } else {
-            // Pane gone (exited or never spawned); fall through to
-            // the normal renderer so the user still sees chat content.
+            // Pane has not spawned yet (just-created chat, dimensions
+            // weren't ready, or auto-PTY deferred to next frame). Show a
+            // booting placeholder so the user immediately sees the new
+            // chat's name + which executor is starting up, instead of
+            // falling through to the generic "Chat with Agent" empty
+            // state. fix-new-chat-4 spec: "<name or model>\n\nBooting
+            // <executor>...".
+            draw_chat_booting_placeholder(frame, msg_area, app, cid);
+            draw_chat_input(frame, app, input_area);
+            return;
+        }
+
+        // Scroll mode banner: overlay a one-row hint at the top of msg_area.
+        if matches!(&app.input_mode, InputMode::ScrollMode { task_id: tid } if *tid == task_id)
+            && msg_area.height > 1
+        {
+            let scroll_offset = app
+                .task_panes
+                .get(&task_id)
+                .map(|p| p.scrollback())
+                .unwrap_or(0);
+            let banner = format!(
+                " SCROLL MODE  ↑↓ line  PgUp/PgDn page  g/G top/bot  Ctrl+]/q/Esc exit  ↓{} ",
+                scroll_offset
+            );
+            let banner_area = Rect {
+                x: msg_area.x,
+                y: msg_area.y,
+                width: msg_area.width,
+                height: 1,
+            };
+            let buf = frame.buffer_mut();
+            let banner_style = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            let banner_chars: Vec<char> = banner.chars().collect();
+            for col in 0..banner_area.width as usize {
+                let cx = banner_area.x + col as u16;
+                let ch = banner_chars.get(col).copied().unwrap_or(' ');
+                let cell = &mut buf[(cx, banner_area.y)];
+                cell.set_char(ch);
+                cell.set_style(banner_style);
+            }
         }
         // Fall through to the input area rendering below — skip the
         // message-widget code path entirely when the pane was drawn.
@@ -3493,7 +3835,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let tool_name_style = Style::default()
             .fg(super::chat_palette::TOOL_CALL)
             .add_modifier(Modifier::BOLD);
-        let tool_content_style = Style::default().fg(super::chat_palette::TOOL_RESULT);
+        let tool_content_style =
+            Style::default().fg(super::chat_palette::tool_result_color(app.is_light_theme));
 
         let wrapped: Vec<Line> = if md_lines.is_empty() {
             vec![Line::from("")]
@@ -3756,7 +4099,8 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
             let tool_name_style = Style::default()
                 .fg(super::chat_palette::TOOL_CALL)
                 .add_modifier(Modifier::BOLD);
-            let tool_content_style = Style::default().fg(super::chat_palette::TOOL_RESULT);
+            let tool_content_style =
+                Style::default().fg(super::chat_palette::tool_result_color(app.is_light_theme));
 
             let wrapped: Vec<Line> = if md_lines.is_empty() {
                 vec![Line::from("")]
@@ -3968,6 +4312,114 @@ fn draw_chat_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     draw_chat_input(frame, app, input_area);
 }
 
+/// Render the "Booting <executor>..." placeholder shown for a freshly-
+/// created chat tab whose PTY pane has not yet emitted any output.
+///
+/// fix-new-chat-4 spec: clicking Launch should immediately focus the
+/// new chat tab; the content area shows the chat's name and the
+/// executor that is starting up, replaced with live PTY content as
+/// soon as the handler emits its first byte.
+fn draw_chat_booting_placeholder(frame: &mut Frame, area: Rect, app: &VizApp, cid: u32) {
+    use ratatui::text::Text;
+
+    let task_id = workgraph::chat_id::format_chat_task_id(cid);
+
+    // Friendly chat label: prefer the graph's canonical task id (which
+    // resolves to `.chat-N` for new chats and `.coordinator-N` for any
+    // legacy graphs), fall back to the synthesized `.chat-N` id for the
+    // race window where the graph has not yet been re-read.
+    let label = app
+        .cached_chat_tab_entries
+        .iter()
+        .find(|(id, _)| *id == cid)
+        .map(|(_, l)| l.clone())
+        .unwrap_or_else(|| task_id.clone());
+
+    // Executor label: prefer the pending-spawn record (set by
+    // `maybe_auto_enable_chat_pty` from the user's launcher choice), fall
+    // back to whatever the most recent spawn used, then to a generic
+    // "agent" string. Avoids re-reading config on every frame.
+    let executor = app
+        .pending_chat_pty_spawn
+        .as_ref()
+        .filter(|p| p.task_id == task_id)
+        .map(|p| p.executor.clone())
+        .or_else(|| app.chat_last_spawn_info.get(&cid).map(|(e, _)| e.clone()))
+        .unwrap_or_else(|| "agent".to_string());
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Chat: {}", label),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Booting {}... (this can take a few seconds)", executor),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Render the "chat agent died" error panel inside `area`.
+/// Shown instead of the normal chat content when the PTY process has exited.
+fn draw_chat_agent_death_panel(
+    frame: &mut Frame,
+    area: Rect,
+    info: &super::state::ChatAgentDeathInfo,
+) {
+    use ratatui::text::Text;
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Chat agent died ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Exit status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            info.exit_status.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Executor:    ", Style::default().fg(Color::DarkGray)),
+        Span::styled(info.executor.clone(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Command:     ", Style::default().fg(Color::DarkGray)),
+        Span::styled(info.spawn_cmd.clone(), Style::default().fg(Color::Yellow)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Stderr not captured for this handler — see daemon.log for details.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press R to retry with same config",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Press E to edit config in launcher dialog",
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Press X to dismiss (show chat history)",
+        Style::default().fg(Color::Cyan),
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 /// Draw the chat search bar showing the current query and match count.
 fn draw_chat_search_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     let is_active = app.input_mode == InputMode::ChatSearch;
@@ -3983,7 +4435,7 @@ fn draw_chat_search_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         ),
         Span::styled(
             app.chat.search.query.clone(),
-            Style::default().fg(Color::White),
+            Style::default().fg(text_primary(app.is_light_theme)),
         ),
     ];
     if !app.chat.search.query.is_empty() {
@@ -4416,7 +4868,7 @@ fn render_editor_word_wrap(
 ///   * `Events` — one structured event per line (legacy view)
 ///   * `HighLevel` — coarse activity summaries
 ///   * `RawPretty` — full pretty-printed transcript
-///   * `WgLog` — workgraph-level log entries only (`wg log` writes,
+///   * `WgLog` — WG-level log entries only (`wg log` writes,
 ///     dispatcher status, lifecycle transitions). NO LLM stream content.
 ///
 /// The first three modes consume `app.log_pane.stream_events` (parsed
@@ -4448,19 +4900,27 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         } else {
             "tail=off"
         };
+        let summary_label = if app.log_pane.summary_mode {
+            "summary=on"
+        } else {
+            "summary=off"
+        };
         Line::from(vec![
             Span::styled(
                 format!(" {} ", task_label),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(text_primary(app.is_light_theme))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {}  {}  {}", agent_label, mode_label, tail_label),
+                format!(
+                    " {}  {}  {}  {}",
+                    agent_label, mode_label, tail_label, summary_label
+                ),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                "    [4] cycle view  [J] json",
+                "    [4] cycle view  [s] summary  [J] json",
                 Style::default().fg(Color::Indexed(239)),
             ),
         ])
@@ -4479,14 +4939,16 @@ fn draw_log_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 
     // Collect display lines for whichever view is active. The first
     // three modes share the same data source (parsed raw_stream events);
-    // WgLog reads workgraph-level entries from `task.log`.
+    // WgLog reads WG-level entries from `task.log`.
     let raw_lines: Vec<Line> = if app.log_pane.view_mode == LogViewMode::WgLog {
         render_wg_log_view(&app.log_pane.rendered_lines)
     } else if !app.log_pane.stream_events.is_empty() {
         match app.log_pane.view_mode {
             LogViewMode::Events => render_events_view(&app.log_pane.stream_events),
             LogViewMode::HighLevel => render_high_level_view(&app.log_pane.stream_events),
-            LogViewMode::RawPretty => render_raw_pretty_view(&app.log_pane.stream_events),
+            LogViewMode::RawPretty => {
+                render_raw_pretty_view(&app.log_pane.stream_events, app.log_pane.summary_mode)
+            }
             LogViewMode::WgLog => unreachable!("handled above"),
         }
     } else {
@@ -4546,7 +5008,7 @@ fn draw_messages_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         Span::styled(
             format!(" {} ", task_label),
             Style::default()
-                .fg(Color::White)
+                .fg(text_primary(app.is_light_theme))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -4871,9 +5333,12 @@ fn build_coordinator_runtime_lines(app: &VizApp) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("· "),
-            Span::styled(executor, Style::default().fg(Color::White)),
+            Span::styled(
+                executor,
+                Style::default().fg(text_primary(app.is_light_theme)),
+            ),
             Span::raw(" · "),
-            Span::styled(model, Style::default().fg(Color::White)),
+            Span::styled(model, Style::default().fg(text_primary(app.is_light_theme))),
         ]),
         Line::from(vec![
             // Coordinator-tab cyan matches the "↯ " prefix branding so the
@@ -4914,7 +5379,7 @@ fn draw_activity_feed(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let mut wrapped_lines: Vec<Line> = Vec::new();
 
     for event in &app.activity_feed.events {
-        let (icon_color, icon_style) = activity_event_style(&event.kind);
+        let (icon_color, icon_style) = activity_event_style(&event.kind, app.is_light_theme);
         // Format: "HH:MM:SS icon summary"
         let time_span = Span::styled(
             format!("{} ", event.time_short),
@@ -4972,7 +5437,7 @@ fn draw_activity_feed(frame: &mut Frame, app: &mut VizApp, area: Rect) {
 }
 
 /// Return (foreground color, icon Style) for an activity event kind.
-fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
+fn activity_event_style(kind: &ActivityEventKind, is_light: bool) -> (Color, Style) {
     match kind {
         ActivityEventKind::TaskCreated => (Color::Blue, Style::default().fg(Color::Blue)),
         ActivityEventKind::StatusChange => (Color::Yellow, Style::default().fg(Color::Yellow)),
@@ -4992,7 +5457,10 @@ fn activity_event_style(kind: &ActivityEventKind) -> (Color, Style) {
         }
         ActivityEventKind::VerificationResult => (Color::Cyan, Style::default().fg(Color::Cyan)),
         ActivityEventKind::Compact => (Color::Magenta, Style::default().fg(Color::Magenta)),
-        ActivityEventKind::UserAction => (Color::White, Style::default().fg(Color::White)),
+        ActivityEventKind::UserAction => {
+            let c = text_primary(is_light);
+            (c, Style::default().fg(c))
+        }
     }
 }
 
@@ -5049,7 +5517,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 Span::styled(
                     format!("Chat #{}", card.id),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(text_primary(app.is_light_theme))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -5063,15 +5531,18 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 Span::styled("    Agents: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}/{}", card.agents_alive, card.max_agents),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(text_primary(app.is_light_theme)),
                 ),
                 Span::styled("  Ready: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{}", card.tasks_ready),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(text_primary(app.is_light_theme)),
                 ),
                 Span::styled("  Ticks: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}", card.ticks), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}", card.ticks),
+                    Style::default().fg(text_primary(app.is_light_theme)),
+                ),
             ]));
 
             // Model + tokens
@@ -5155,7 +5626,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 Span::styled(selector, Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!("{:<12} ", &row.agent_id),
-                    row_style.fg(Color::White),
+                    row_style.fg(text_primary(app.is_light_theme)),
                 ),
                 Span::styled(
                     format!("{:<8} ", row.activity.label()),
@@ -5165,7 +5636,7 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     format!("{:<8} ", elapsed_str),
                     row_style.fg(Color::DarkGray),
                 ),
-                Span::styled(task_display, row_style.fg(Color::White)),
+                Span::styled(task_display, row_style.fg(text_primary(app.is_light_theme))),
             ]));
 
             // Show latest snippet for active agents
@@ -5201,7 +5672,10 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     let tc = &app.task_counts;
     lines.push(Line::from(vec![
         Span::styled("  Total: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", tc.total), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{}", tc.total),
+            Style::default().fg(text_primary(app.is_light_theme)),
+        ),
         Span::styled("  Done: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", tc.done), Style::default().fg(Color::Green)),
         Span::styled("  In-progress: ", Style::default().fg(Color::DarkGray)),
@@ -5212,7 +5686,10 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("  Open: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", tc.open), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{}", tc.open),
+            Style::default().fg(text_primary(app.is_light_theme)),
+        ),
         Span::styled("  Failed: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", tc.failed), Style::default().fg(Color::Red)),
         Span::styled("  Blocked: ", Style::default().fg(Color::DarkGray)),
@@ -5236,7 +5713,10 @@ fn draw_dashboard_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 Style::default().fg(Color::Rgb(60, 60, 60)),
             ),
             Span::styled("] ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}%", pct), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("{}%", pct),
+                Style::default().fg(text_primary(app.is_light_theme)),
+            ),
         ]));
     }
     lines.push(Line::from(""));
@@ -5637,10 +6117,10 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     let label_style = if i == 1 {
                         // Execution phase gets bold
                         Style::default()
-                            .fg(Color::White)
+                            .fg(text_primary(app.is_light_theme))
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::default().fg(text_primary(app.is_light_theme))
                     };
 
                     let mut spans = vec![status_icon, Span::styled(phase_labels[i], label_style)];
@@ -5784,7 +6264,7 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                     format_tokens(total_output)
                 ),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(text_primary(app.is_light_theme))
                     .add_modifier(Modifier::BOLD),
             )];
             if total_cached > 0 {
@@ -5797,7 +6277,7 @@ fn draw_agents_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 spans.push(Span::styled(
                     format!(" ${:.4}", total_cost),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(text_primary(app.is_light_theme))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -6099,6 +6579,163 @@ fn draw_choice_dialog(frame: &mut Frame, state: &ChoiceDialogState) -> Rect {
     area
 }
 
+/// Draw the chat-exit prompt overlay (tmux-persistence UX). Two
+/// layouts: the top-level "leave / close / per-chat" picker, and the
+/// per-chat granular picker shown after the user picks 's'.
+/// Returns the dialog area for mouse hit-testing.
+fn draw_exit_prompt(frame: &mut Frame, state: &ExitPromptState) -> Rect {
+    let size = frame.area();
+    let n = state.chats.len();
+
+    if let Some(idx) = state.per_chat_idx {
+        // Per-chat granular prompt.
+        let chat_id = state.chats.get(idx).copied().unwrap_or(0);
+        let title = format!(" Chat {} of {}: chat-{} ", idx + 1, n, chat_id);
+        let width: u16 = 60.min(size.width.saturating_sub(4));
+        // 4 option lines + 2 description lines + 1 footer + borders
+        let height: u16 = 9;
+        let x = (size.width.saturating_sub(width)) / 2;
+        let y = (size.height.saturating_sub(height)) / 2;
+        let area = Rect::new(x, y, width, height);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let lines = vec![
+            Line::from(format!("What about chat-{}?", chat_id))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    " [l] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Leave running (default — resume next time)"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    " [c] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Close (kill tmux session — no resume)"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    " [b] ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("Back to main exit prompt"),
+            ]),
+            Line::from(vec![
+                Span::styled(" [Esc]", Style::default().fg(Color::DarkGray)),
+                Span::raw(" Cancel exit"),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return area;
+    }
+
+    // Top-level prompt.
+    let title = if n == 1 {
+        " 1 active chat — exit? ".to_string()
+    } else {
+        format!(" {} active chats — exit? ", n)
+    };
+    let width: u16 = 64.min(size.width.saturating_sub(4));
+    // header + 4 options + footer (+ borders)
+    let height: u16 = 10;
+    let x = (size.width.saturating_sub(width)) / 2;
+    let y = (size.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let header = if n == 1 {
+        "You have 1 active chat. What do you want to do?".to_string()
+    } else {
+        format!("You have {} active chats. What do you want to do?", n)
+    };
+
+    let lines = vec![
+        Line::from(header).style(Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " [a] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Leave all running ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "(default — resume next time)",
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " [c] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Close all ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "(kill tmux sessions — can't resume)",
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " [s] ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Select per-chat ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("(decide one at a time)", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" [Esc]", Style::default().fg(Color::DarkGray)),
+            Span::raw(" Cancel exit  "),
+            Span::styled("[Enter]", Style::default().fg(Color::DarkGray)),
+            Span::raw(" Default (leave all)"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+    area
+}
+
 /// Draw the coordinator picker overlay. Returns the dialog area.
 fn draw_coordinator_picker(
     frame: &mut Frame,
@@ -6180,374 +6817,195 @@ fn draw_coordinator_picker(
     area
 }
 
-/// Render a FilterPicker WITH hit-area collection + scroll-window clamping.
-/// Used by the launcher to make rows clickable.
+/// Draw the chat manager pane overlay (fix-tui-chat).
 ///
-/// `parent_line_offset` is the number of lines already pushed into the
-/// containing paragraph so we can compute absolute Y positions for each row.
-/// `parent_area` is the launcher pane rect we're rendering into.
-/// `hits` is appended with one (LauncherListHit, Rect) per visible row.
-/// `list_area` is set to the bounding box of all visible rows (for scroll-wheel routing).
-#[allow(clippy::too_many_arguments)]
-fn render_filter_picker_with_hits(
-    picker: &super::state::FilterPicker,
-    active: bool,
-    w: usize,
-    viewport_height: usize,
-    parent_line_offset: usize,
-    parent_area: Rect,
-    hits: &mut Vec<(super::state::LauncherListHit, Rect)>,
-    list_area: &mut Rect,
-) -> Vec<Line<'static>> {
-    use super::state::LauncherListHit;
+/// Shows every chat-loop task in the graph with status, message count,
+/// and last-activity timestamp; supports multi-select (Space), select-all
+/// visible (a), clear (c), filter cycling (f), abandon (d/Enter).
+fn draw_chat_manager(frame: &mut Frame, mgr: &super::state::ChatManagerState) -> Rect {
+    let size = frame.area();
+    let width: u16 = 76.min(size.width.saturating_sub(4));
+    let visible = mgr.visible_indices();
+    let body_rows = visible.len().max(1) as u16;
+    // border(2) + title(1) + entries + footer(2) + border(0 — overlap)
+    let height: u16 = (4 + body_rows + 2).min(size.height.saturating_sub(2));
+    let x = (size.width.saturating_sub(width)) / 2;
+    let y = (size.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let title = format!(
+        " Chat Manager ({} task{}, filter: {}, {} selected) ",
+        mgr.entries.len(),
+        if mgr.entries.len() == 1 { "" } else { "s" },
+        mgr.filter.label(),
+        mgr.multi_selected.len(),
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
     let mut lines: Vec<Line> = Vec::new();
-    let mut local_offset = parent_line_offset;
-    let row_rect = |line_idx: usize| -> Rect {
-        Rect {
-            x: parent_area.x,
-            y: parent_area.y.saturating_add(line_idx as u16),
-            width: parent_area.width,
-            height: 1,
-        }
-    };
+    // Header row
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {:>3}  {:<14} {:<10} {:>5}  {:<20} {}",
+            "id", "task", "status", "msgs", "last activity", "title"
+        ),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )]));
 
-    // Filter input (consume one line if shown)
-    if active && !picker.filter.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("    Filter: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                picker.filter.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "\u{2588}",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ),
-        ]));
-        local_offset += 1;
-    } else if active {
+    if visible.is_empty() {
         lines.push(Line::from(Span::styled(
-            "    Type to filter...",
+            "  (no chats match this filter)",
             Style::default().fg(Color::DarkGray),
         )));
-        local_offset += 1;
-    }
-
-    if picker.items.is_empty() && !picker.empty_hint.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", picker.empty_hint),
-            Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
-    }
-
-    // Apply scroll window: skip first `scroll_offset` filtered rows, show up
-    // to `viewport_height` of them.
-    let total_filtered = picker.filtered_indices.len();
-    let mut scroll = picker.scroll_offset;
-    // Auto-clamp: if scroll_offset is past the end, render still works.
-    if scroll >= total_filtered && total_filtered > 0 {
-        scroll = total_filtered - 1;
-    }
-    // Auto-scroll selected into view (selected indexes filtered_indices when not custom).
-    let visible_end = if picker.is_custom_selected() {
-        // Custom row is always rendered separately; window can stay where it is.
-        (scroll + viewport_height).min(total_filtered)
     } else {
-        let sel = picker.selected;
-        let mut s = scroll;
-        if sel < s {
-            s = sel;
-        } else if sel >= s + viewport_height && viewport_height > 0 {
-            s = sel + 1 - viewport_height;
-        }
-        scroll = s;
-        (s + viewport_height).min(total_filtered)
-    };
-    let list_first_y = parent_area.y.saturating_add(local_offset as u16);
+        for (row_idx, &orig_idx) in visible.iter().enumerate() {
+            let entry = &mgr.entries[orig_idx];
+            let is_highlighted = row_idx == mgr.selected;
+            let is_selected = mgr.multi_selected.contains(&entry.cid);
 
-    for fi in scroll..visible_end {
-        let item_idx = picker.filtered_indices[fi];
-        let (id, desc) = &picker.items[item_idx];
-        let selected = active && fi == picker.selected && !picker.custom_active;
-        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let desc_short: String = desc.chars().take(w.saturating_sub(id.len() + 14)).collect();
-        let line_idx = local_offset;
-        if desc_short.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("    {}{}", bullet, id),
-                style,
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("    {}{}", bullet, id), style),
-                Span::styled(
-                    format!("  {}", desc_short),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-        hits.push((LauncherListHit::Item(fi), row_rect(line_idx)));
-        local_offset += 1;
-    }
-
-    // "(N/M matches)" / scroll indicator
-    if !picker.filter.is_empty() || total_filtered > viewport_height {
-        let total = picker.items.len();
-        let shown_range_end = visible_end;
-        let prefix = if !picker.filter.is_empty() {
-            format!("({}/{} matches", total_filtered, total)
-        } else {
-            format!("({}-{}/{}", scroll + 1, shown_range_end, total_filtered)
-        };
-        let suffix = if total_filtered > viewport_height {
-            format!(", scroll wheel) [{}+]", scroll)
-        } else {
-            ")".to_string()
-        };
-        lines.push(Line::from(Span::styled(
-            format!("    {}{}", prefix, suffix),
-            Style::default().fg(Color::DarkGray),
-        )));
-        local_offset += 1;
-    }
-
-    // Custom row
-    if picker.allow_custom {
-        let custom_selected = active && picker.is_custom_selected();
-        let custom_style = if picker.custom_active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if custom_selected {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let bullet = if custom_selected || picker.custom_active {
-            " \u{25cf} "
-        } else {
-            " \u{25cb} "
-        };
-        let line_idx = local_offset;
-        if picker.custom_active {
-            lines.push(Line::from(vec![
-                Span::styled(format!("    {}Custom: ", bullet), custom_style),
-                Span::raw(picker.custom_text.clone()),
-                Span::styled(
-                    "\u{2588}",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ]));
-        } else {
-            let display = if picker.custom_text.is_empty() {
-                "Custom: [enter value]".to_string()
+            let bg = if is_highlighted {
+                Color::DarkGray
             } else {
-                format!("Custom: {}", picker.custom_text)
+                Color::Reset
             };
-            lines.push(Line::from(Span::styled(
-                format!("    {}{}", bullet, display),
-                custom_style,
-            )));
-        }
-        hits.push((LauncherListHit::Custom, row_rect(line_idx)));
-        local_offset += 1;
-    }
-
-    // Set list_area to the bounding box of all clickable rows.
-    let list_height = (local_offset as u16).saturating_sub(list_first_y - parent_area.y);
-    *list_area = Rect {
-        x: parent_area.x,
-        y: list_first_y,
-        width: parent_area.width,
-        height: list_height,
-    };
-
-    lines
-}
-
-/// Render a FilterPicker into a list of Lines.
-/// Reused by the launcher (model/endpoint) and config panel (Choice fields).
-fn render_filter_picker(
-    picker: &super::state::FilterPicker,
-    active: bool,
-    w: usize,
-) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Filter input (shown only when active and filter has text or section is active)
-    if active && !picker.filter.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("    Filter: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                picker.filter.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "\u{2588}",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ),
-        ]));
-    } else if active {
-        lines.push(Line::from(Span::styled(
-            "    Type to filter...",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if picker.items.is_empty() && !picker.empty_hint.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", picker.empty_hint),
-            Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
-    }
-
-    for (fi, &item_idx) in picker.filtered_indices.iter().enumerate() {
-        let (ref id, ref desc) = picker.items[item_idx];
-        let selected = active && fi == picker.selected && !picker.custom_active;
-        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let desc_short: String = desc.chars().take(w.saturating_sub(id.len() + 14)).collect();
-        if desc_short.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("    {}{}", bullet, id),
-                style,
-            )));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("    {}{}", bullet, id), style),
-                Span::styled(
-                    format!("  {}", desc_short),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-    }
-
-    // Show match count when filter is active
-    if !picker.filter.is_empty() {
-        let total = picker.items.len();
-        let shown = picker.filtered_indices.len();
-        if shown < total {
-            lines.push(Line::from(Span::styled(
-                format!("    ({}/{} matches)", shown, total),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-
-    // Custom row
-    if picker.allow_custom {
-        let custom_selected = active && picker.is_custom_selected();
-        let custom_style = if picker.custom_active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else if custom_selected {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let bullet = if custom_selected || picker.custom_active {
-            " \u{25cf} "
-        } else {
-            " \u{25cb} "
-        };
-        if picker.custom_active {
-            lines.push(Line::from(vec![
-                Span::styled(format!("    {}Custom: ", bullet), custom_style),
-                Span::raw(picker.custom_text.clone()),
-                Span::styled(
-                    "\u{2588}",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ),
-            ]));
-        } else {
-            let display = if picker.custom_text.is_empty() {
-                "Custom: [enter value]".to_string()
+            let fg = if entry.terminal {
+                Color::DarkGray
+            } else if entry.message_count == 0 {
+                Color::Yellow
             } else {
-                format!("Custom: {}", picker.custom_text)
+                Color::White
             };
-            lines.push(Line::from(Span::styled(
-                format!("    {}{}", bullet, display),
-                custom_style,
-            )));
+            let marker = if is_selected { "✓" } else { " " };
+
+            let last = entry
+                .last_activity
+                .as_deref()
+                .map(|s| s.split('T').next().unwrap_or(s).to_string())
+                .unwrap_or_else(|| "-".to_string());
+            // Truncate title to fit
+            let title_max = (inner.width as usize).saturating_sub(60);
+            let title_disp = if entry.title.len() > title_max && title_max > 3 {
+                format!("{}…", &entry.title[..title_max.saturating_sub(1)])
+            } else {
+                entry.title.clone()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", marker),
+                    Style::default()
+                        .bg(bg)
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:>3}  ", entry.cid),
+                    Style::default().bg(bg).fg(fg),
+                ),
+                Span::styled(
+                    format!("{:<14} ", truncate(&entry.task_id, 14)),
+                    Style::default().bg(bg).fg(fg),
+                ),
+                Span::styled(
+                    format!("{:<10} ", truncate(&entry.status, 10)),
+                    Style::default().bg(bg).fg(fg),
+                ),
+                Span::styled(
+                    format!("{:>5}  ", entry.message_count),
+                    Style::default().bg(bg).fg(fg),
+                ),
+                Span::styled(
+                    format!("{:<20} ", truncate(&last, 20)),
+                    Style::default().bg(bg).fg(fg),
+                ),
+                Span::styled(title_disp, Style::default().bg(bg).fg(fg)),
+            ]));
         }
     }
 
-    lines
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[↑↓]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Nav  "),
+        Span::styled("[Space]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Toggle  "),
+        Span::styled("[a]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" All  "),
+        Span::styled("[c]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Clear  "),
+        Span::styled("[f]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Filter  "),
+        Span::styled("[d/Enter]", Style::default().fg(Color::Red)),
+        Span::raw(" Abandon  "),
+        Span::styled("[Esc]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" Close"),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+    area
 }
 
 pub(crate) fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect) {
-    use super::state::{LauncherListHit, LauncherSection};
+    use super::state::{ADD_NEW_EXECUTOR_CHOICES, AddNewField, LauncherMode, LauncherSection};
 
     // Snapshot read-only data we need from the launcher so we can mutate
     // hit-area buffers on `app` without holding a long borrow.
     let (
+        mode,
         active_section,
         name,
-        executor_list,
-        executor_selected,
-        model_picker,
-        endpoint_picker,
+        presets,
+        default_selected,
+        add_executor_idx,
+        add_model,
+        add_endpoint,
         show_endpoint,
-        recent_list,
-        recent_selected,
+        creating,
+        last_error,
     ) = match app.launcher.as_ref() {
         Some(l) => (
+            l.mode.clone(),
             l.active_section.clone(),
             l.name.clone(),
-            l.executor_list.clone(),
-            l.executor_selected,
-            l.model_picker.clone(),
-            l.endpoint_picker.clone(),
-            l.show_endpoint(),
-            l.recent_list.clone(),
-            l.recent_selected,
+            l.presets.clone(),
+            l.default_selected,
+            l.add_executor_idx,
+            l.add_model.clone(),
+            l.add_endpoint.clone(),
+            l.add_new_show_endpoint(),
+            l.creating,
+            l.last_error.clone(),
         ),
         None => return,
     };
 
     // Reset hit areas for this frame.
     app.last_launcher_area = area;
-    app.launcher_executor_hits.clear();
-    app.launcher_model_hits.clear();
-    app.launcher_endpoint_hits.clear();
-    app.launcher_recent_hits.clear();
+    app.launcher_default_hits.clear();
+    app.launcher_add_executor_hits.clear();
+    app.launcher_add_model_hit = Rect::default();
+    app.launcher_add_endpoint_hit = Rect::default();
     app.launcher_name_hit = Rect::default();
-    app.launcher_model_list_area = Rect::default();
-    app.launcher_endpoint_list_area = Rect::default();
 
     let w = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let add_new_is_command = ADD_NEW_EXECUTOR_CHOICES
+        .get(add_executor_idx)
+        .is_some_and(|choice| choice.internal_executor == "command");
 
-    // Helper: turn the upcoming line index into an absolute row Rect.
     let row_rect = |line_idx: usize| -> Rect {
         Rect {
             x: area.x,
@@ -6557,36 +7015,314 @@ pub(crate) fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect
         }
     };
 
-    let section_style = |active: bool| {
-        if active {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        }
-    };
+    let is_light = app.is_light_theme;
 
-    // Title
+    // Title (flips while the create-coordinator IPC is in flight).
+    let title_text = match (&mode, creating) {
+        (_, true) => "  Creating chat...",
+        (LauncherMode::Default, _) => "  New chat",
+        (LauncherMode::AddNew, _) => "  New chat — Add new",
+    };
+    let title_color = if creating { Color::Yellow } else { Color::Cyan };
     lines.push(Line::from(Span::styled(
-        "  New Chat",
+        title_text.to_string(),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(title_color)
             .add_modifier(Modifier::BOLD),
     )));
+    lines.push(Line::from(""));
 
-    // Action row: [Launch] [Cancel] + Name input live at the TOP. The user
-    // asked for "launch at top of view so its clear why we are doing the
-    // list below" — this is that row. Mouse hits are wired to the same
-    // handlers as the legacy footer buttons.
+    // Persistent error banner (fix-chat-creation).
+    if let Some(ref err) = last_error {
+        let max_w = w.saturating_sub(6).max(20);
+        let truncated: String = err.chars().take(max_w).collect();
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠ {}", truncated),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // Body: one of two compact forms (Default or AddNew).
+    match mode {
+        LauncherMode::Default => {
+            // Render preset rows + "+ Add new..." trailing row. Total
+            // body fits in (presets.len() + 1) lines + a trailing blank
+            // before the action row.
+            for (i, preset) in presets.iter().enumerate() {
+                let selected = active_section == LauncherSection::Defaults && i == default_selected;
+                let bullet = if selected { " \u{25c9} " } else { " \u{25cb} " };
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(text_primary(is_light))
+                };
+                let label_w = preset.label.len();
+                let pad_w = if label_w < 16 { 16 - label_w } else { 1 };
+                let pad: String = std::iter::repeat(' ').take(pad_w).collect();
+                let row_idx = lines.len();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}{}{}", bullet, preset.label, pad), style),
+                    Span::styled(
+                        preset.description.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                app.launcher_default_hits.push((i, row_rect(row_idx)));
+            }
+            // "+ Add new..." row uses index `presets.len()`.
+            let add_idx = presets.len();
+            let add_selected =
+                active_section == LauncherSection::Defaults && default_selected == add_idx;
+            let add_bullet = if add_selected {
+                " \u{25c9} "
+            } else {
+                " \u{25cb} "
+            };
+            let add_style = if add_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let row_idx = lines.len();
+            lines.push(Line::from(Span::styled(
+                format!("  {}+ Add new...", add_bullet),
+                add_style,
+            )));
+            app.launcher_default_hits.push((add_idx, row_rect(row_idx)));
+            lines.push(Line::from(""));
+        }
+        LauncherMode::AddNew => {
+            // Executor radio (claude / codex / nex)
+            let exec_active = active_section == LauncherSection::AddNew(AddNewField::Executor);
+            let exec_label_style = if exec_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text_primary(is_light))
+            };
+            let mut spans: Vec<Span> = vec![Span::styled(
+                if exec_active {
+                    "  \u{25b8} Executor: "
+                } else {
+                    "    Executor: "
+                }
+                .to_string(),
+                exec_label_style,
+            )];
+            for (i, choice) in ADD_NEW_EXECUTOR_CHOICES.iter().enumerate() {
+                let is_chosen = i == add_executor_idx;
+                let bullet = if is_chosen { "\u{25c9}" } else { "\u{25cb}" };
+                let chosen_style = if is_chosen && exec_active {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_chosen {
+                    Style::default().fg(text_primary(is_light))
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(
+                    format!("{} {}", bullet, choice.label),
+                    chosen_style,
+                ));
+                if i + 1 < ADD_NEW_EXECUTOR_CHOICES.len() {
+                    spans.push(Span::raw("  "));
+                }
+            }
+            let exec_row_idx = lines.len();
+            lines.push(Line::from(spans));
+            // Per-choice click areas — approximate tile widths starting
+            // after "    Executor: " (15 cols). Each tile is "◉ label  ".
+            let mut tile_x = area.x.saturating_add(15);
+            let exec_y = area.y.saturating_add(exec_row_idx as u16);
+            for (i, choice) in ADD_NEW_EXECUTOR_CHOICES.iter().enumerate() {
+                let tile_w: u16 = (choice.label.len() as u16) + 4; // "◉ X  "
+                app.launcher_add_executor_hits.push((
+                    i,
+                    Rect {
+                        x: tile_x,
+                        y: exec_y,
+                        width: tile_w,
+                        height: 1,
+                    },
+                ));
+                tile_x = tile_x.saturating_add(tile_w);
+            }
+            lines.push(Line::from(""));
+
+            // Model/command field (always shown, always required).
+            let model_active = active_section == LauncherSection::AddNew(AddNewField::Model);
+            let model_label_style = if model_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text_primary(is_light))
+            };
+            let model_prefix = if add_new_is_command {
+                if model_active {
+                    "  \u{25b8} Command:  "
+                } else {
+                    "    Command:  "
+                }
+            } else if model_active {
+                "  \u{25b8} Model:    "
+            } else {
+                "    Model:    "
+            };
+            let mut model_spans: Vec<Span> =
+                vec![Span::styled(model_prefix.to_string(), model_label_style)];
+            if add_model.is_empty() {
+                model_spans.push(Span::styled(
+                    if model_active {
+                        "\u{2588}".to_string()
+                    } else if add_new_is_command {
+                        "(command line)".to_string()
+                    } else {
+                        "(required)".to_string()
+                    },
+                    if model_active {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::SLOW_BLINK)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ));
+            } else {
+                model_spans.push(Span::raw(add_model.clone()));
+                if model_active {
+                    model_spans.push(Span::styled(
+                        "\u{2588}".to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::SLOW_BLINK),
+                    ));
+                }
+            }
+            let model_row_idx = lines.len();
+            lines.push(Line::from(model_spans));
+            app.launcher_add_model_hit = Rect {
+                x: area.x.saturating_add(13),
+                y: area.y.saturating_add(model_row_idx as u16),
+                width: area.width.saturating_sub(13),
+                height: 1,
+            };
+            lines.push(Line::from(""));
+
+            // Endpoint field (only when executor=nex).
+            if show_endpoint {
+                let ep_active = active_section == LauncherSection::AddNew(AddNewField::Endpoint);
+                let ep_label_style = if ep_active {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(text_primary(is_light))
+                };
+                let ep_prefix = if ep_active {
+                    "  \u{25b8} Endpoint: "
+                } else {
+                    "    Endpoint: "
+                };
+                let mut ep_spans: Vec<Span> =
+                    vec![Span::styled(ep_prefix.to_string(), ep_label_style)];
+                if add_endpoint.is_empty() {
+                    ep_spans.push(Span::styled(
+                        if ep_active {
+                            "\u{2588}".to_string()
+                        } else {
+                            "(URL — required for nex)".to_string()
+                        },
+                        if ep_active {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::SLOW_BLINK)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ));
+                } else {
+                    ep_spans.push(Span::raw(add_endpoint.clone()));
+                    if ep_active {
+                        ep_spans.push(Span::styled(
+                            "\u{2588}".to_string(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::SLOW_BLINK),
+                        ));
+                    }
+                }
+                let ep_row_idx = lines.len();
+                lines.push(Line::from(ep_spans));
+                app.launcher_add_endpoint_hit = Rect {
+                    x: area.x.saturating_add(13),
+                    y: area.y.saturating_add(ep_row_idx as u16),
+                    width: area.width.saturating_sub(13),
+                    height: 1,
+                };
+                lines.push(Line::from(""));
+            }
+        }
+    }
+
+    // Name field (optional, in both modes).
     let name_active = active_section == LauncherSection::Name;
-    let name_style = if name_active {
+    let name_label_style = if name_active {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(text_primary(is_light))
     };
+    let name_prefix = if name_active {
+        "  \u{25b8} Name:     "
+    } else {
+        "    Name:     "
+    };
+    let mut name_spans: Vec<Span> = vec![Span::styled(name_prefix.to_string(), name_label_style)];
+    if name.is_empty() {
+        name_spans.push(Span::styled(
+            if name_active {
+                "\u{2588}".to_string()
+            } else {
+                "(optional)".to_string()
+            },
+            if name_active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    } else {
+        name_spans.push(Span::raw(name.clone()));
+        if name_active {
+            name_spans.push(Span::styled(
+                "\u{2588}".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+    }
+    let name_row_idx = lines.len();
+    lines.push(Line::from(name_spans));
+    app.launcher_name_hit = Rect {
+        x: area.x.saturating_add(13),
+        y: area.y.saturating_add(name_row_idx as u16),
+        width: area.width.saturating_sub(13),
+        height: 1,
+    };
+    lines.push(Line::from(""));
+
+    // Action row: [Launch] [Cancel].
     let action_line_idx = lines.len();
     let action_y = area.y.saturating_add(action_line_idx as u16);
     let launch_x = area.x.saturating_add(2);
@@ -6605,7 +7341,7 @@ pub(crate) fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect
         width: cancel_w,
         height: 1,
     };
-    let mut action_spans: Vec<Span> = vec![
+    lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             "[Launch]",
@@ -6619,232 +7355,21 @@ pub(crate) fn draw_launcher_pane(frame: &mut Frame, app: &mut VizApp, area: Rect
             "[Cancel]",
             Style::default().fg(Color::White).bg(Color::DarkGray),
         ),
-        Span::raw("   "),
-    ];
-    let name_prefix = if name_active {
-        "\u{25b8} Name: "
-    } else {
-        "  Name: "
-    };
-    action_spans.push(Span::styled(name_prefix.to_string(), name_style));
-    if name.is_empty() {
-        action_spans.push(Span::styled(
-            if name_active {
-                "\u{2588}"
-            } else {
-                "(optional)"
-            },
-            if name_active {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::SLOW_BLINK)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            },
-        ));
-    } else {
-        action_spans.push(Span::raw(name.clone()));
-        if name_active {
-            action_spans.push(Span::styled(
-                "\u{2588}",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
-        }
-    }
-    lines.push(Line::from(action_spans));
-    // Hit area for the Name input is the right portion of the action row,
-    // starting after "[Launch] [Cancel]   " (2 + 8 + 1 + 8 + 3 = 22 cols).
-    let name_x = area.x.saturating_add(22);
-    app.launcher_name_hit = Rect {
-        x: name_x,
-        y: action_y,
-        width: area.width.saturating_sub(22),
-        height: 1,
+    ]));
+
+    // Footer hint.
+    lines.push(Line::from(""));
+    let footer_hint = match mode {
+        LauncherMode::Default => "    Enter launch  ·  ↑↓ pick  ·  Tab name  ·  Esc cancel",
+        LauncherMode::AddNew => "    Enter launch  ·  Tab field  ·  ←→ executor  ·  Esc back",
     };
     lines.push(Line::from(Span::styled(
-        format!("  {}", "\u{2500}".repeat(w.saturating_sub(4).min(60))),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    // Executor section
-    let exec_active = active_section == LauncherSection::Executor;
-    lines.push(Line::from(Span::styled(
-        if exec_active {
-            "  \u{25b8} Executor"
-        } else {
-            "    Executor"
-        },
-        section_style(exec_active),
-    )));
-
-    for (i, (ename, desc, available)) in executor_list.iter().enumerate() {
-        let selected = exec_active && i == executor_selected;
-        let bullet = if selected { " \u{25cf} " } else { " \u{25cb} " };
-        let style = if !available {
-            Style::default().fg(Color::DarkGray)
-        } else if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let suffix = if !available { " (not found)" } else { "" };
-        let desc_short: String = desc
-            .chars()
-            .take(w.saturating_sub(ename.len() + 14))
-            .collect();
-        let row_idx = lines.len();
-        lines.push(Line::from(vec![
-            Span::styled(format!("    {}{}", bullet, ename), style),
-            Span::styled(
-                format!("  {}{}", desc_short, suffix),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        app.launcher_executor_hits.push((i, row_rect(row_idx)));
-    }
-    lines.push(Line::from(""));
-
-    // Model section header
-    let model_active = active_section == LauncherSection::Model;
-    lines.push(Line::from(Span::styled(
-        if model_active {
-            "  \u{25b8} Model"
-        } else {
-            "    Model"
-        },
-        section_style(model_active),
-    )));
-
-    // Compute remaining vertical space, reserving room for endpoint + recent + footer.
-    let mut reserved = 1usize; // footer
-    if show_endpoint {
-        // header + items + custom row + blank
-        reserved += 2
-            + endpoint_picker.filtered_indices.len()
-            + if endpoint_picker.allow_custom { 1 } else { 0 };
-    }
-    if !recent_list.is_empty() {
-        reserved += 2 + recent_list.len(); // header + items + blank
-    }
-    let used_so_far = lines.len();
-    let area_h = area.height as usize;
-    let model_room = area_h
-        .saturating_sub(used_so_far)
-        .saturating_sub(reserved)
-        .saturating_sub(2); // blank line + safety
-    // Per-section max items shown in viewport (clamped to at least 3).
-    let model_viewport = model_room.max(3);
-
-    let model_lines = render_filter_picker_with_hits(
-        &model_picker,
-        model_active,
-        w,
-        model_viewport,
-        lines.len(),
-        area,
-        &mut app.launcher_model_hits,
-        &mut app.launcher_model_list_area,
-    );
-    lines.extend(model_lines);
-    lines.push(Line::from(""));
-
-    // Endpoint section
-    if show_endpoint {
-        let ep_active = active_section == LauncherSection::Endpoint;
-        lines.push(Line::from(Span::styled(
-            if ep_active {
-                "  \u{25b8} Endpoint"
-            } else {
-                "    Endpoint"
-            },
-            section_style(ep_active),
-        )));
-        let ep_viewport = endpoint_picker
-            .filtered_indices
-            .len()
-            .max(3)
-            .min(area_h.saturating_sub(lines.len()).saturating_sub(2));
-        let ep_lines = render_filter_picker_with_hits(
-            &endpoint_picker,
-            ep_active,
-            w,
-            ep_viewport.max(3),
-            lines.len(),
-            area,
-            &mut app.launcher_endpoint_hits,
-            &mut app.launcher_endpoint_list_area,
-        );
-        lines.extend(ep_lines);
-        lines.push(Line::from(""));
-    }
-
-    // Recent combos section
-    if !recent_list.is_empty() {
-        let recent_active = active_section == LauncherSection::Recent;
-        lines.push(Line::from(Span::styled(
-            if recent_active {
-                "  \u{25b8} Recent"
-            } else {
-                "    Recent"
-            },
-            section_style(recent_active),
-        )));
-
-        for (i, entry) in recent_list.iter().enumerate() {
-            let selected = recent_active && i == recent_selected;
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let model_str = entry.model.as_deref().unwrap_or("default");
-            let ep_str = entry
-                .endpoint
-                .as_deref()
-                .map(|e| format!(" @ {}", e))
-                .unwrap_or_default();
-            let num = i + 1;
-            let row_idx = lines.len();
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("    {}. ", num),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-                Span::styled(
-                    format!("{} / {}{}", entry.executor, model_str, ep_str),
-                    style,
-                ),
-            ]));
-            app.launcher_recent_hits.push((i, row_rect(row_idx)));
-        }
-        lines.push(Line::from(""));
-    }
-
-    // Footer hint only — the [Launch] / [Cancel] buttons live at the top
-    // of the dialog now (see action row above), so users see the action
-    // before scrolling through the list of choices.
-    lines.push(Line::from(Span::styled(
-        "    Enter / Ctrl+Enter / Shift+Enter launch  ·  Tab section  ·  ↑↓ pgup/pgdn scroll  ·  Esc cancel",
+        footer_hint,
         Style::default().fg(Color::DarkGray),
     )));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
-
-    // Suppress the "LauncherListHit::Custom unused" warning when only Item is constructed.
-    let _ = LauncherListHit::Custom;
 }
 
 /// Draw a text prompt overlay (fail reason, message, edit description).
@@ -6853,6 +7378,7 @@ fn draw_text_prompt(
     frame: &mut Frame,
     action: &TextPromptAction,
     editor: &mut edtui::EditorState,
+    is_light: bool,
 ) -> Rect {
     use edtui::{EditorTheme, EditorView};
     let is_multiline = matches!(action, TextPromptAction::EditDescription(_));
@@ -6886,7 +7412,7 @@ fn draw_text_prompt(
         let edit_area = Rect::new(inner.x, inner.y, inner.width, edit_height);
         let theme = EditorTheme::default()
             .hide_status_line()
-            .base(Style::default().fg(Color::White))
+            .base(Style::default().fg(text_primary(is_light)))
             .cursor_style(Style::default().fg(Color::Black).bg(Color::Yellow));
         frame.render_widget(EditorView::new(editor).wrap(true).theme(theme), edit_area);
         frame.render_widget(
@@ -6924,7 +7450,7 @@ fn draw_text_prompt(
         let editor_area = Rect::new(inner.x + 2, inner.y, inner.width.saturating_sub(2), 1);
         let theme = EditorTheme::default()
             .hide_status_line()
-            .base(Style::default().fg(Color::White))
+            .base(Style::default().fg(text_primary(is_light)))
             .cursor_style(Style::default().fg(Color::Black).bg(Color::Yellow));
         frame.render_widget(EditorView::new(editor).theme(theme), editor_area);
         if inner.height >= 3 {
@@ -6941,7 +7467,7 @@ fn draw_text_prompt(
 }
 
 /// Draw the task creation form overlay.
-fn draw_task_form(frame: &mut Frame, form: &TaskFormState) {
+fn draw_task_form(frame: &mut Frame, form: &TaskFormState, is_light: bool) {
     let size = frame.area();
     let width = 60.min(size.width.saturating_sub(4));
     let height = 20.min(size.height.saturating_sub(4));
@@ -6971,7 +7497,10 @@ fn draw_task_form(frame: &mut Frame, form: &TaskFormState) {
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(format!("  {}:", label), Style::default().fg(Color::White))
+            Span::styled(
+                format!("  {}:", label),
+                Style::default().fg(text_primary(is_light)),
+            )
         }
     };
 
@@ -7176,7 +7705,7 @@ fn draw_action_hints(frame: &mut Frame, app: &VizApp, area: Rect) {
     spans.push(Span::styled(
         format!(" {}", context_label),
         Style::default()
-            .fg(Color::White)
+            .fg(text_primary(app.is_light_theme))
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(separator, sep_style));
@@ -7353,6 +7882,17 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
             Color::Yellow,
             vec![("↑↓", "navigate"), ("Enter", "select"), ("Esc", "cancel")],
         ),
+        InputMode::ExitPrompt(_) => (
+            "Exit",
+            "EDIT",
+            Color::Yellow,
+            vec![
+                ("a", "leave all"),
+                ("c", "close all"),
+                ("s", "per-chat"),
+                ("Esc", "cancel"),
+            ],
+        ),
         InputMode::CoordinatorPicker => (
             "Picker",
             "NAV",
@@ -7363,6 +7903,20 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                 ("+", "new"),
                 ("−", "close"),
                 ("Esc", "cancel"),
+            ],
+        ),
+        InputMode::ChatManager => (
+            "Chats",
+            "NAV",
+            Color::Cyan,
+            vec![
+                ("↑↓", "nav"),
+                ("Space", "toggle"),
+                ("a", "all"),
+                ("c", "clear"),
+                ("f", "filter"),
+                ("d/Enter", "abandon"),
+                ("Esc", "close"),
             ],
         ),
         InputMode::Normal => match app.focused_panel {
@@ -7441,9 +7995,13 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         // is Ctrl+T to enter command mode. Show the
                         // appropriate hint depending on whether we are in
                         // PTY focus or have already broken out.
-                        if app.focused_panel == FocusedPanel::RightPanel {
+                        if matches!(app.input_mode, InputMode::ScrollMode { .. }) {
+                            hints.push(("↑↓/PgUp/Dn", "scroll"));
+                            hints.push(("g/G", "top/bot"));
+                            hints.push(("Ctrl+]/q/Esc", "exit scroll"));
+                        } else if app.focused_panel == FocusedPanel::RightPanel {
                             hints.push(("Ctrl+T", "command mode"));
-                            hints.push(("PgUp/Dn", "scroll"));
+                            hints.push(("Ctrl+]", "scroll mode"));
                         } else {
                             hints.push(("Ctrl+T", "back to chat"));
                             hints.push(("n", "new chat"));
@@ -7462,6 +8020,7 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                         hints.push(("←→", "chats"));
                         hints.push(("+", "new"));
                         hints.push(("-", "close"));
+                        hints.push(("M", "manage chats"));
                         hints.push(("Enter", "chat"));
                         hints.push(("↑↓", "scroll"));
                     }
@@ -7560,6 +8119,17 @@ fn action_hints_parts(app: &VizApp) -> (&str, &str, Color, Vec<(&str, &str)>) {
                 ("Esc", "cancel"),
             ],
         ),
+        InputMode::ScrollMode { .. } => (
+            "0:Chat",
+            "SCROLL",
+            Color::Yellow,
+            vec![
+                ("↑↓/PgUp/Dn", "scroll"),
+                ("g/G", "top/bot"),
+                ("Ctrl+u/d", "half page"),
+                ("Ctrl+]/q/Esc", "exit"),
+            ],
+        ),
     }
 }
 
@@ -7650,8 +8220,8 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
 
     let mut spans: Vec<Span> = Vec::new();
 
-    // Modal mode indicator (PTY vs CMD) — leading badge so it's visible
-    // even when terminal is narrow and the status bar gets truncated by
+    // Modal mode indicator (PTY vs CMD vs SCROLL) — leading badge so it's
+    // visible even when terminal is narrow and the status bar gets truncated by
     // the right-aligned service-health pill. Only meaningful when a chat
     // tab is the active right-panel tab and a PTY is rendering.
     // Implementation gate matches `vendor_pty_active` in event.rs.
@@ -7660,7 +8230,15 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         && app.chat_pty_forwards_stdin
         && !app.chat_pty_observer
     {
-        if app.focused_panel == FocusedPanel::RightPanel {
+        if matches!(app.input_mode, InputMode::ScrollMode { .. }) {
+            spans.push(Span::styled(
+                " [SCROLL] ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if app.focused_panel == FocusedPanel::RightPanel {
             spans.push(Span::styled(
                 " [PTY] ",
                 Style::default()
@@ -7686,7 +8264,7 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
             " {} tasks ({} done, {} open, {} active",
             c.total, c.done, c.open, c.in_progress
         ),
-        Style::default().fg(Color::White),
+        Style::default().fg(text_primary(app.is_light_theme)),
     ));
 
     if c.failed > 0 {
@@ -7696,12 +8274,33 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
         ));
     }
 
-    spans.push(Span::styled(") ", Style::default().fg(Color::White)));
+    spans.push(Span::styled(
+        ") ",
+        Style::default().fg(text_primary(app.is_light_theme)),
+    ));
 
     if c.archived > 0 {
         spans.push(Span::styled(
             format!("{} archived ", c.archived),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // Slow-disk indicator: surfaced when an async-fs operation exceeds
+    // 500ms (network filesystem stalls, NFS hiccups, etc). The TUI never
+    // blocks on these operations — this banner just lets the user know
+    // their underlying storage is slow so they can attribute any
+    // perceived staleness to disk latency rather than a UI bug.
+    if let Some(slow) = app.async_fs.slow_disk_indicator() {
+        spans.push(Span::styled(
+            format!(
+                "| ⚠ disk slow ({} took {:.1}s) ",
+                slow.label,
+                slow.duration.as_secs_f64()
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -7816,7 +8415,7 @@ fn draw_status_bar(frame: &mut Frame, app: &VizApp, area: Rect) {
     spans.push(Span::styled("| ", Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled(
         format!("L{}/{} ", app.scroll.offset_y + 1, app.visible_line_count()),
-        Style::default().fg(Color::White),
+        Style::default().fg(text_primary(app.is_light_theme)),
     ));
 
     // Selected task indicator
@@ -8333,7 +8932,7 @@ fn draw_service_health_detail(frame: &mut Frame, app: &VizApp) {
 
     let mut lines: Vec<Line> = Vec::new();
     let label_style = Style::default().fg(Color::Cyan);
-    let value_style = Style::default().fg(Color::White);
+    let value_style = Style::default().fg(text_primary(app.is_light_theme));
     let dim_style = Style::default().fg(Color::DarkGray);
 
     // PID & uptime
@@ -8515,7 +9114,7 @@ fn draw_service_control_panel(frame: &mut Frame, app: &VizApp) {
     frame.render_widget(block, area);
     let mut lines: Vec<Line> = Vec::new();
     let label_style = Style::default().fg(Color::Cyan);
-    let value_style = Style::default().fg(Color::White);
+    let value_style = Style::default().fg(text_primary(app.is_light_theme));
     let dim_style = Style::default().fg(Color::DarkGray);
     let focus = &health.panel_focus;
     lines.push(Line::from(vec![
@@ -8711,11 +9310,14 @@ fn draw_service_control_panel(frame: &mut Frame, app: &VizApp) {
                     "This will kill {} running agents and stop the service.",
                     health.agents_alive
                 ),
-                Style::default().fg(Color::White),
+                Style::default().fg(text_primary(app.is_light_theme)),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("  Are you sure? ", Style::default().fg(Color::White)),
+            Span::styled(
+                "  Are you sure? ",
+                Style::default().fg(text_primary(app.is_light_theme)),
+            ),
             Span::styled(
                 "[y]",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -8767,7 +9369,7 @@ fn control_panel_line<'a>(
     ])
 }
 
-fn draw_help_overlay(frame: &mut Frame) {
+fn draw_help_overlay(frame: &mut Frame, is_light: bool) {
     let size = frame.area();
     let width = 56.min(size.width.saturating_sub(4));
     let height = 50.min(size.height.saturating_sub(4));
@@ -8800,7 +9402,10 @@ fn draw_help_overlay(frame: &mut Frame) {
     let binding = |key: &str, desc: &str| -> Line {
         Line::from(vec![
             Span::styled(format!("  {:<14}", key), Style::default().fg(Color::Yellow)),
-            Span::styled(desc.to_string(), Style::default().fg(Color::White)),
+            Span::styled(
+                desc.to_string(),
+                Style::default().fg(text_primary(is_light)),
+            ),
         ])
     };
 
@@ -8993,7 +9598,7 @@ fn draw_settings_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
         let value_style = if i == selected && !app.settings_panel.focus_actions {
             Style::default().fg(Color::Black).bg(Color::Yellow)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(text_primary(app.is_light_theme))
         };
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(format!("  {:30}", e.key), key_style));
@@ -9312,12 +9917,12 @@ fn draw_config_tab(frame: &mut Frame, app: &mut VizApp, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(text_primary(app.is_light_theme))
         };
 
         let value_style = if is_editing {
             Style::default()
-                .fg(Color::White)
+                .fg(text_primary(app.is_light_theme))
                 .add_modifier(Modifier::BOLD)
         } else {
             let value_color = match &entry.edit_kind {
@@ -9551,7 +10156,7 @@ fn draw_add_endpoint_form(frame: &mut Frame, app: &VizApp, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(text_primary(app.is_light_theme))
         };
 
         let display = if is_active && app.config_panel.editing {
@@ -9622,7 +10227,7 @@ fn draw_add_model_form(frame: &mut Frame, app: &VizApp, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(text_primary(app.is_light_theme))
         };
 
         let display = if is_active && app.config_panel.editing {
@@ -13074,7 +13679,7 @@ mod tests {
         graph.add_node(Node::Task(regular));
 
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
         // Unknown executor so auto-PTY doesn't fire during the test render.
@@ -13133,6 +13738,63 @@ mod tests {
             })
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// Regression lock for fix-new-chat-4: a freshly-launched chat tab
+    /// (chat_pty_mode set, but no `task_panes` entry yet — the PTY pane
+    /// hasn't spawned) must render the "Booting <executor>..."
+    /// placeholder, NOT the generic "Chat with Agent" empty state. The
+    /// placeholder is what the user sees between clicking Launch and
+    /// the handler emitting its first byte; it must surface the chat's
+    /// label so they know they're looking at the new tab they just
+    /// created.
+    #[test]
+    fn test_chat_booting_placeholder_renders_for_unspawned_pty_pane() {
+        let (mut app, _tmp) = build_app_for_tab_color_test(&[0]);
+        app.chat.coordinator_active = true;
+        app.chat_pty_mode = true;
+        // task_panes is empty → falls into the booting branch.
+        // chat_agent_death is empty → not the death branch.
+        // pending_chat_pty_spawn is None → consume returns false, no
+        //   accidental real spawn during the test.
+        // Seed chat_last_spawn_info so the executor label resolves
+        // without exercising the spawn machinery.
+        app.chat_last_spawn_info.insert(
+            0,
+            ("claude".to_string(), "claude --resume chat-0".to_string()),
+        );
+
+        let buf = render_chat_tab_to_buffer(&mut app);
+        let area = buf.area();
+        let mut text = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                text.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+
+        assert!(
+            text.contains("Booting"),
+            "booting placeholder must render the word 'Booting'.\nBuffer:\n{}",
+            text
+        );
+        assert!(
+            text.contains("claude"),
+            "booting placeholder must surface the executor name 'claude'.\nBuffer:\n{}",
+            text
+        );
+        assert!(
+            text.contains("Chat:"),
+            "booting placeholder must label the chat ('Chat: <name>').\nBuffer:\n{}",
+            text
+        );
+        assert!(
+            !text.contains("Press 'c'"),
+            "booting placeholder must replace the 'Press c' empty state, \
+             not render alongside it.\nBuffer:\n{}",
+            text
+        );
     }
 
     #[test]
@@ -13237,7 +13899,7 @@ mod tests {
         graph.add_node(Node::Task(task));
 
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
         std::fs::write(
@@ -13266,6 +13928,9 @@ mod tests {
         app.right_panel_tab = RightPanelTab::Chat;
         app.active_coordinator_id = 1;
         app.chat.coordinator_active = true;
+        // Populate active_tabs + cached_coordinator_id_set from the graph so the
+        // tab bar actually has an entry to render.
+        app.sync_active_tabs_from_graph();
 
         // Write streaming data for cid=1 — state would normally be Yellow for .chat-N.
         workgraph::chat::write_streaming(&wg_dir, 1, "partial reply").unwrap();
@@ -13285,6 +13950,166 @@ mod tests {
             Color::Yellow,
             "Legacy .coordinator-N tab must NOT use the streaming Yellow color"
         );
+    }
+
+    /// Render `draw_chat_tab` into a TestBackend with a configurable width,
+    /// returning the buffer + a flat string of the first row only (the tab
+    /// bar).
+    fn render_chat_tab_bar_to_string(app: &mut VizApp, width: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_chat_tab(frame, app, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut row = String::new();
+        for x in 0..buf.area().width {
+            row.push_str(buf.cell((x, 0)).unwrap().symbol());
+        }
+        row
+    }
+
+    /// With cap=16 chats spawned at narrow terminal width, the active tab
+    /// must always be reachable: cycling through tabs auto-scrolls the bar
+    /// and overflow arrows surface the hidden state.
+    #[test]
+    fn test_chat_tab_bar_overflow_arrows_at_narrow_width() {
+        let cids: Vec<u32> = (0..16).collect();
+        let (mut app, _tmp) = build_app_for_tab_color_test(&cids);
+        app.chat.coordinator_active = true;
+
+        // Active = first tab → should render right arrow only.
+        app.active_coordinator_id = 0;
+        app.chat_tab_scroll_offset = 0;
+        let row = render_chat_tab_bar_to_string(&mut app, 80);
+        assert!(
+            row.contains('▶'),
+            "right arrow ▶ must appear when tabs are off-screen to the right.\nRow: {row}"
+        );
+        assert!(
+            !row.contains('◀'),
+            "left arrow ◀ must NOT appear when offset == 0.\nRow: {row}"
+        );
+
+        // Active = last tab → bar must auto-scroll, left arrow visible.
+        app.switch_coordinator(15);
+        let row = render_chat_tab_bar_to_string(&mut app, 80);
+        assert!(
+            row.contains('◀'),
+            "left arrow ◀ must appear when tabs are off-screen to the left.\nRow: {row}"
+        );
+        assert!(
+            !row.contains('▶'),
+            "right arrow ▶ must NOT appear once we've scrolled to the end.\nRow: {row}"
+        );
+
+        // Wide terminal — no arrows at all even with 16 tabs. Reset to the
+        // first tab so the renderer's auto-scroll-to-active drops offset to 0.
+        app.switch_coordinator(0);
+        let row_wide = render_chat_tab_bar_to_string(&mut app, 300);
+        assert!(
+            !row_wide.contains('◀'),
+            "no left arrow at wide width with 16 short labels.\nRow: {row_wide}"
+        );
+        assert!(
+            !row_wide.contains('▶'),
+            "no right arrow at wide width with 16 short labels.\nRow: {row_wide}"
+        );
+    }
+
+    /// Cycling through chats with 16 tabs and a narrow width must keep the
+    /// active tab visible at every step. This is the keyboard-reachability
+    /// guarantee from the task validation criteria.
+    #[test]
+    fn test_chat_tab_bar_cycling_keeps_active_visible_at_narrow_width() {
+        let cids: Vec<u32> = (0..16).collect();
+        let (mut app, _tmp) = build_app_for_tab_color_test(&cids);
+        app.chat.coordinator_active = true;
+
+        for &cid in &cids {
+            app.switch_coordinator(cid);
+            let row = render_chat_tab_bar_to_string(&mut app, 80);
+            // The label is the chat task id, e.g. ".chat-7".
+            let label = format!(".chat-{}", cid);
+            assert!(
+                row.contains(&label),
+                "active tab '{label}' must be visible after switching; row: {row}"
+            );
+            // The active marker `◉` must appear somewhere in the row.
+            assert!(
+                row.contains('◉'),
+                "active dot ◉ must appear when there is an active chat tab; row: {row}"
+            );
+        }
+    }
+
+    /// Smoke render at terminal widths 80, 120, 200 with 16 tabs — the bar
+    /// must not garble (no Unicode replacement characters), and at width=200
+    /// there is no overflow so neither arrow is rendered.
+    #[test]
+    fn test_chat_tab_bar_smoke_widths_80_120_200() {
+        let cids: Vec<u32> = (0..16).collect();
+        let (mut app, _tmp) = build_app_for_tab_color_test(&cids);
+        app.chat.coordinator_active = true;
+        app.switch_coordinator(0);
+
+        for &w in &[80u16, 120, 200] {
+            let row = render_chat_tab_bar_to_string(&mut app, w);
+            assert!(
+                row.contains("[+]"),
+                "[+] button must always render at width {w}; row: {row}"
+            );
+            assert!(
+                !row.contains('\u{FFFD}'),
+                "Unicode replacement char must NOT appear at width {w}; row: {row}"
+            );
+            assert!(
+                row.contains('◉'),
+                "active dot must render at width {w}; row: {row}"
+            );
+        }
+
+        // 16 tabs of `.chat-N` are each ~15-17 cells incl. separator, so
+        // they need ~270 cells. 200 is still an overflow case — verify
+        // arrows render correctly and don't garble at that width.
+        let row200 = render_chat_tab_bar_to_string(&mut app, 200);
+        assert!(
+            row200.contains('▶'),
+            "right arrow must render at width 200 (16 tabs > 200 cells); row: {row200}"
+        );
+
+        // 320 fits all 16 — no arrows.
+        let row320 = render_chat_tab_bar_to_string(&mut app, 320);
+        assert!(
+            !row320.contains('◀') && !row320.contains('▶'),
+            "no overflow arrows at width 320 with 16 short labels; row: {row320}"
+        );
+    }
+
+    /// Click on the right arrow should advance `chat_tab_scroll_offset` by 1.
+    /// (Shrinks down again if active tab forces it back.)
+    #[test]
+    fn test_scroll_chat_tabs_advances_and_clamps_offset() {
+        let cids: Vec<u32> = (0..5).collect();
+        let (mut app, _tmp) = build_app_for_tab_color_test(&cids);
+        assert_eq!(app.chat_tab_scroll_offset, 0);
+        app.scroll_chat_tabs(1);
+        assert_eq!(app.chat_tab_scroll_offset, 1);
+        app.scroll_chat_tabs(1);
+        assert_eq!(app.chat_tab_scroll_offset, 2);
+        app.scroll_chat_tabs(-1);
+        assert_eq!(app.chat_tab_scroll_offset, 1);
+        // Cannot go below 0
+        app.scroll_chat_tabs(-10);
+        assert_eq!(app.chat_tab_scroll_offset, 0);
+        // Cannot go above max (n-1 = 4 for 5 tabs)
+        app.scroll_chat_tabs(100);
+        assert_eq!(app.chat_tab_scroll_offset, 4);
     }
 
     #[test]
@@ -14997,7 +15822,7 @@ mod tests {
         use workgraph::parser::save_graph;
         use workgraph::test_helpers::make_task_with_status;
 
-        // 1) Set up a workgraph dir with one in-progress task assigned to agent-77.
+        // 1) Set up a WG dir with one in-progress task assigned to agent-77.
         let mut graph = WorkGraph::new();
         let mut t = make_task_with_status("my-task", "Live Task", Status::InProgress);
         t.assigned = Some("agent-77".to_string());
@@ -15018,7 +15843,7 @@ mod tests {
         // output.log is empty — the only data source must be raw_stream.jsonl.
         std::fs::write(agent_dir.join("output.log"), "").unwrap();
 
-        // 3) Build VizApp pointed at the workgraph dir, select the task,
+        // 3) Build VizApp pointed at the WG dir, select the task,
         //    and switch the right panel to the Log tab — exactly what the
         //    user does when they press '4'.
         let tasks: Vec<_> = graph.tasks().collect();
@@ -15388,5 +16213,389 @@ mod tests {
              Rendered:\n{}",
             rendered
         );
+    }
+
+    /// `compute_chat_bar_layout` regression tests.
+    ///
+    /// These cover the chat-tab-bar overflow scrolling behavior: the layout
+    /// must keep the active tab visible, render arrow indicators when (and
+    /// only when) tabs are off-screen, and respect the user's stored offset
+    /// when it doesn't conflict with the active-visible invariant.
+    mod chat_bar_layout {
+        use super::super::{ChatBarLayout, compute_chat_bar_layout};
+
+        /// 16 tabs of width 12 → all-visible at width=300, no arrows.
+        #[test]
+        fn no_overflow_at_wide_terminal() {
+            let widths = vec![12usize; 16];
+            let layout = compute_chat_bar_layout(&widths, Some(0), 300, 0);
+            assert_eq!(layout.offset, 0);
+            assert_eq!(layout.end, 16);
+            assert!(!layout.show_left_arrow);
+            assert!(!layout.show_right_arrow);
+        }
+
+        /// Narrow bar with 16 tabs, active=0 → offset=0, right arrow visible,
+        /// left arrow hidden, partial set rendered.
+        #[test]
+        fn overflow_active_at_start() {
+            let widths = vec![12usize; 16];
+            let layout = compute_chat_bar_layout(&widths, Some(0), 80, 0);
+            assert_eq!(layout.offset, 0);
+            assert!(layout.end > 0 && layout.end < 16);
+            assert!(!layout.show_left_arrow);
+            assert!(layout.show_right_arrow);
+            // Active tab (idx 0) must be visible.
+            assert!(0 >= layout.offset && 0 < layout.end);
+        }
+
+        /// Active=15 (last tab) at width=80 forces offset to grow until tab 15 is visible.
+        #[test]
+        fn overflow_active_at_end_advances_offset() {
+            let widths = vec![12usize; 16];
+            let layout = compute_chat_bar_layout(&widths, Some(15), 80, 0);
+            assert!(
+                layout.offset > 0,
+                "offset must advance to keep active visible"
+            );
+            assert_eq!(layout.end, 16);
+            assert!(
+                layout.show_left_arrow,
+                "left arrow must show when offset > 0"
+            );
+            assert!(
+                !layout.show_right_arrow,
+                "right arrow must hide when end == n"
+            );
+            assert!(15 >= layout.offset && 15 < layout.end);
+        }
+
+        /// User-supplied offset is respected when active tab is still visible.
+        #[test]
+        fn respects_user_offset_when_active_visible() {
+            let widths = vec![12usize; 16];
+            // Active=5, requested_offset=3 → since 5 is visible from offset 3
+            // (assuming 80 cols fits multiple tabs), the offset stays at 3.
+            let layout = compute_chat_bar_layout(&widths, Some(5), 80, 3);
+            assert_eq!(layout.offset, 3);
+            assert!(5 >= layout.offset && 5 < layout.end);
+        }
+
+        /// Requested offset shrinks when active is to the left of it.
+        #[test]
+        fn shrinks_offset_when_active_to_the_left() {
+            let widths = vec![12usize; 16];
+            let layout = compute_chat_bar_layout(&widths, Some(2), 80, 10);
+            assert_eq!(
+                layout.offset, 2,
+                "offset must shrink to make active visible"
+            );
+            assert!(2 >= layout.offset && 2 < layout.end);
+        }
+
+        /// No active tab + non-zero offset stays where the user put it.
+        #[test]
+        fn no_active_tab_keeps_user_offset() {
+            let widths = vec![12usize; 16];
+            let layout = compute_chat_bar_layout(&widths, None, 80, 4);
+            assert_eq!(layout.offset, 4);
+            assert!(layout.show_left_arrow);
+        }
+
+        /// Empty entries → trivial empty layout, no arrows.
+        #[test]
+        fn empty_entries_returns_empty_layout() {
+            let layout = compute_chat_bar_layout(&[], None, 80, 0);
+            assert_eq!(
+                layout,
+                ChatBarLayout {
+                    offset: 0,
+                    end: 0,
+                    show_left_arrow: false,
+                    show_right_arrow: false,
+                }
+            );
+        }
+
+        /// Width=80, 16 tabs of 12 cells each — assert no clipping (the
+        /// computed end-offset window plus arrows + leading + [+] all fit).
+        #[test]
+        fn visible_window_fits_inside_bar_width() {
+            let widths = vec![12usize; 16];
+            for active in [0, 5, 10, 15] {
+                let layout = compute_chat_bar_layout(&widths, Some(active), 80, 0);
+                let lead = 1usize;
+                let left_arrow = if layout.show_left_arrow { 2 } else { 0 };
+                let right_arrow = if layout.show_right_arrow { 2 } else { 0 };
+                let plus = 3;
+                // Sum of visible widths + (n-1) separators
+                let visible_count = layout.end - layout.offset;
+                let entries_w: usize = widths[layout.offset..layout.end].iter().sum::<usize>()
+                    + visible_count.saturating_sub(1);
+                let total = lead + left_arrow + entries_w + right_arrow + plus;
+                assert!(
+                    total <= 80,
+                    "active={active}: total cells used ({total}) must fit in bar width 80; \
+                     layout={layout:?}"
+                );
+            }
+        }
+
+        /// Mixed widths, narrow bar — verify active is always inside the window.
+        #[test]
+        fn variable_widths_keep_active_visible() {
+            let widths = vec![10, 14, 8, 20, 12, 16, 10, 8, 14, 12];
+            for active in 0..widths.len() {
+                let layout = compute_chat_bar_layout(&widths, Some(active), 60, 0);
+                assert!(
+                    active >= layout.offset && active < layout.end,
+                    "active={active} must be visible; layout={layout:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_text_primary_returns_correct_color_per_theme() {
+        assert_eq!(
+            text_primary(false),
+            Color::White,
+            "dark theme: primary text must be White"
+        );
+        assert_eq!(
+            text_primary(true),
+            Color::Reset,
+            "light theme: primary text must be Reset (terminal default)"
+        );
+    }
+
+    #[test]
+    fn test_is_light_theme_defaults_to_false() {
+        use crate::tui::viz_viewer::state::VizApp;
+        let (viz, _) = build_hud_test_graph();
+        let app = VizApp::from_viz_output_for_test(&viz);
+        assert!(
+            !app.is_light_theme,
+            "default theme should be dark (is_light_theme = false)"
+        );
+    }
+
+    #[test]
+    fn test_light_theme_initialized_from_config() {
+        use crate::tui::viz_viewer::state::VizApp;
+        use workgraph::parser::save_graph;
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&WorkGraph::new(), &wg_dir.join("graph.jsonl")).unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            "[tui]\ncolor_theme = \"light\"\n",
+        )
+        .unwrap();
+        let app = VizApp::new(
+            wg_dir,
+            crate::commands::viz::VizOptions::default(),
+            Some(false),
+            None,
+            true,
+        );
+        assert!(
+            app.is_light_theme,
+            "VizApp::new with color_theme='light' must set is_light_theme=true"
+        );
+    }
+
+    /// Detail tab iteration nav: prev/next click segments must always be at
+    /// least 3 cells wide so mouse precision isn't required, regardless of
+    /// the bar's overall width (very narrow detail panes included).
+    #[test]
+    fn iter_nav_segments_min_width_three_cells() {
+        for width in [1u16, 5, 10, 29, 30, 59, 60, 100, 200] {
+            let (left, right) = iter_nav_segments(width);
+            let lw = left.chars().count();
+            let rw = right.chars().count();
+            assert!(
+                lw >= 3,
+                "left segment for width {} must be ≥ 3 cells, got {} ({:?})",
+                width,
+                lw,
+                left
+            );
+            assert!(
+                rw >= 3,
+                "right segment for width {} must be ≥ 3 cells, got {} ({:?})",
+                width,
+                rw,
+                right
+            );
+        }
+    }
+
+    /// At wider widths the segments should grow to include "Prev"/"Next"
+    /// labels — making the click affordance visible and the segments
+    /// substantially wider than the absolute 3-cell minimum.
+    #[test]
+    fn iter_nav_segments_widen_for_labels_when_room() {
+        let (left, right) = iter_nav_segments(80);
+        assert!(
+            left.contains("Prev"),
+            "wide bar should label the prev segment: {:?}",
+            left
+        );
+        assert!(
+            right.contains("Next"),
+            "wide bar should label the next segment: {:?}",
+            right
+        );
+    }
+
+    /// Render the iteration bar into a test buffer and verify the click
+    /// zones it returns: each must be at least 3 cells wide, and the prev
+    /// zone must sit at the bar's left edge while the next zone sits at
+    /// the right edge — those are the contracts the click handler relies
+    /// on.
+    #[test]
+    fn render_iter_bar_zones_match_segment_layout() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        let mut layout_opt = None;
+        terminal
+            .draw(|f| {
+                let layout = render_detail_iteration_bar(
+                    f,
+                    area,
+                    "Iteration 2 of 3 · started 14:23 · archived",
+                    /*can_go_prev*/ true,
+                    /*can_go_next*/ true,
+                );
+                layout_opt = Some(layout);
+            })
+            .unwrap();
+
+        let layout = layout_opt.unwrap();
+        assert!(
+            layout.prev_zone.width >= 3,
+            "prev zone must be ≥ 3 cells: {:?}",
+            layout.prev_zone
+        );
+        assert!(
+            layout.next_zone.width >= 3,
+            "next zone must be ≥ 3 cells: {:?}",
+            layout.next_zone
+        );
+        assert_eq!(
+            layout.prev_zone.x, area.x,
+            "prev zone must start at the bar's left edge"
+        );
+        assert_eq!(
+            layout.next_zone.x + layout.next_zone.width,
+            area.x + area.width,
+            "next zone must end at the bar's right edge"
+        );
+        // Zones must not overlap.
+        assert!(
+            layout.prev_zone.x + layout.prev_zone.width <= layout.next_zone.x,
+            "prev and next zones must not overlap: prev={:?}, next={:?}",
+            layout.prev_zone,
+            layout.next_zone
+        );
+    }
+
+    /// The bar's center label should reach the rendered buffer — not be
+    /// blank — and should mention the iteration number, the total, and the
+    /// outcome / live state. This is the core regression guard against
+    /// the "bar is just a blank line, kind of crap" complaint.
+    #[test]
+    fn render_iter_bar_label_visible_in_buffer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 1,
+        };
+        terminal
+            .draw(|f| {
+                let _ = render_detail_iteration_bar(
+                    f,
+                    area,
+                    "Iteration 2 of 3 · started 14:23 · archived",
+                    true,
+                    true,
+                );
+            })
+            .unwrap();
+
+        // Capture the rendered text by walking the test buffer.
+        let buf = terminal.backend().buffer();
+        let mut row0 = String::new();
+        for x in 0..80u16 {
+            row0.push_str(buf[(x, 0)].symbol());
+        }
+        // The label content should be present somewhere on the bar.
+        assert!(
+            row0.contains("Iteration 2 of 3"),
+            "rendered bar must include 'Iteration N of M': {:?}",
+            row0
+        );
+        assert!(
+            row0.contains("archived"),
+            "rendered bar must include outcome / state: {:?}",
+            row0
+        );
+        // Both arrow glyphs visible (clickable affordance).
+        assert!(
+            row0.contains('◀'),
+            "rendered bar must include ◀: {:?}",
+            row0
+        );
+        assert!(
+            row0.contains('▶'),
+            "rendered bar must include ▶: {:?}",
+            row0
+        );
+    }
+
+    /// Render at a narrow width (< 30) and verify both segments still
+    /// reach the 3-cell minimum and stay non-overlapping.
+    #[test]
+    fn render_iter_bar_narrow_width_still_clickable() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 1,
+        };
+        let mut layout_opt = None;
+        terminal
+            .draw(|f| {
+                let layout = render_detail_iteration_bar(f, area, "iter 1/2", true, false);
+                layout_opt = Some(layout);
+            })
+            .unwrap();
+
+        let layout = layout_opt.unwrap();
+        assert!(layout.prev_zone.width >= 3);
+        assert!(layout.next_zone.width >= 3);
+        assert!(layout.prev_zone.x + layout.prev_zone.width <= layout.next_zone.x);
     }
 }

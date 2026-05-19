@@ -91,6 +91,7 @@ fn test_record_evaluation_nonexistent_agent() {
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     // Should succeed — evaluation saved, role/motivation updated, agent skipped
@@ -135,6 +136,7 @@ fn test_record_evaluation_empty_agent_id() {
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     let eval_path = agency::record_evaluation(&eval, &agency_dir).unwrap();
@@ -166,6 +168,7 @@ fn test_record_evaluation_nonexistent_role_and_motivation() {
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     // Should succeed — the eval JSON is saved even if role/motivation not found
@@ -246,6 +249,7 @@ fn test_delete_role_referenced_by_agent() {
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
     let eval_path = agency::record_evaluation(&eval, &agency_dir).unwrap();
     assert!(eval_path.exists());
@@ -330,6 +334,7 @@ fn test_delete_motivation_referenced_by_agent() {
         timestamp: "2025-01-01T00:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
     let eval_path = agency::record_evaluation(&eval, &agency_dir).unwrap();
     assert!(eval_path.exists());
@@ -534,22 +539,22 @@ fn test_content_hash_motivation_different_descriptions() {
     );
 }
 
-/// Different tradeoffs produce different hashes.
+/// Tradeoff extension fields no longer affect the agency-compatible primitive hash.
 #[test]
-fn test_content_hash_motivation_different_tradeoffs() {
+fn test_content_hash_motivation_ignores_tradeoff_extensions() {
     let h1 = agency::content_hash_tradeoff(&["speed".to_string()], &[], "desc");
     let h2 = agency::content_hash_tradeoff(&["quality".to_string()], &[], "desc");
-    assert_ne!(h1, h2);
+    assert_eq!(h1, h2);
 }
 
-/// Swapping acceptable and unacceptable tradeoffs produces different hashes.
+/// Swapping acceptable and unacceptable tradeoffs preserves the agency-compatible hash.
 #[test]
-fn test_content_hash_motivation_swapped_tradeoff_categories() {
+fn test_content_hash_motivation_swapped_tradeoff_categories_ignored() {
     let h1 = agency::content_hash_tradeoff(&["X".to_string()], &["Y".to_string()], "desc");
     let h2 = agency::content_hash_tradeoff(&["Y".to_string()], &["X".to_string()], "desc");
-    assert_ne!(
+    assert_eq!(
         h1, h2,
-        "Swapping tradeoff categories must produce different hashes"
+        "Agency-compatible primitive hashes use only the description"
     );
 }
 

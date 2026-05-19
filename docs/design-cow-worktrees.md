@@ -10,7 +10,7 @@ Worktrees are created in `src/commands/spawn/worktree.rs:29-89` via `create_work
 git worktree add .wg-worktrees/<agent-id> -b wg/<agent-id>/<task-id> HEAD
 ```
 
-Then `.workgraph/` is symlinked into the worktree so `wg` CLI works normally.
+Then `.wg/` is symlinked into the worktree so `wg` CLI works normally.
 
 **Gating:** `src/commands/spawn/execution.rs:851-870` (`should_create_worktree()`) decides whether a task gets a worktree:
 - **Always skip:** meta tasks (`.assign-*`, `.flip-*`, `.evaluate-*`, `.place-*`, `.compact-*`), `bare` exec mode, `light` exec mode.
@@ -37,7 +37,7 @@ Two-tier cleanup in `src/commands/service/worktree.rs`:
 
 ### Removal
 
-`remove_worktree()` (line 134): remove `.workgraph` symlink → remove `target/` → `git worktree remove --force` → `git branch -D`.
+`remove_worktree()` (line 134): remove `.wg` symlink → remove `target/` → `git worktree remove --force` → `git branch -D`.
 
 ## 2. Task Categories That Don't Need a Writable Worktree
 
@@ -189,13 +189,13 @@ This phase is explicitly deferred — the data suggests it won't be needed for 9
 
 ## 6. Follow-up Implementation Tasks
 
-These can be filed directly as workgraph tasks:
+These can be filed directly as wg tasks:
 
 1. **`add-isolation-field`** — Add `isolation: Option<String>` to `Task` struct in `graph.rs`, add `--isolation` flag to `wg add` CLI in `cli.rs`. Wire into `should_create_worktree()` in `execution.rs`.
    - Scope: `src/graph.rs`, `src/cli.rs`, `src/commands/spawn/execution.rs`
    - Verify: `cargo test test_worktree_gate`
 
-2. **`read-only-agent-in-main-checkout`** — When `isolation=read-only`, skip worktree creation and run agent in main checkout. Ensure `.workgraph/` access works (it's already in main checkout). Handle `WG_WORKTREE_ACTIVE` / `WG_WORKTREE_PATH` env vars correctly (unset for read-only agents).
+2. **`read-only-agent-in-main-checkout`** — When `isolation=read-only`, skip worktree creation and run agent in main checkout. Ensure `.wg/` access works (it's already in main checkout). Handle `WG_WORKTREE_ACTIVE` / `WG_WORKTREE_PATH` env vars correctly (unset for read-only agents).
    - Scope: `src/commands/spawn/execution.rs`
    - Verify: spawn a `bare` task, confirm no worktree created, task completes
 

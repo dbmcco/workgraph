@@ -1,3 +1,4 @@
+use crate::config::{Config, ModelRegistryEntry};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -119,6 +120,43 @@ pub enum WaitSpec {
     Any(Vec<WaitCondition>),
 }
 
+/// Machine-readable failure classification. Populated by the wrapper (via
+/// `wg classify-failure`) and surfaced in `wg show` / `wg service status`.
+/// Pairs with `failure_reason` which carries human prose. None means either
+/// the task succeeded or the row predates this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailureClass {
+    /// HTTP 400 from the Anthropic API on a document attachment (e.g. malformed/
+    /// encrypted PDF). Action: fix the input before retry — do not auto-retry.
+    ApiError400Document,
+    /// HTTP 429 — rate limit. Auto-retriable after backoff.
+    ApiError429RateLimit,
+    /// HTTP 5xx — transient upstream error. Auto-retriable.
+    ApiError5xxTransient,
+    /// Wrapper hard timeout (exit 124). Not auto-retriable in the same form.
+    AgentHardTimeout,
+    /// Generic non-zero exit with no recognised api_error pattern.
+    /// Equivalent to the pre-classification "Agent exited with code N".
+    AgentExitNonzero,
+    /// Wrapper-side issue (e.g., missing raw_stream.jsonl). Inspect wrapper log.
+    WrapperInternal,
+}
+
+impl std::fmt::Display for FailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FailureClass::ApiError400Document => "api-error-400-document",
+            FailureClass::ApiError429RateLimit => "api-error-429-rate-limit",
+            FailureClass::ApiError5xxTransient => "api-error-5xx-transient",
+            FailureClass::AgentHardTimeout => "agent-hard-timeout",
+            FailureClass::AgentExitNonzero => "agent-exit-nonzero",
+            FailureClass::WrapperInternal => "wrapper-internal",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 /// Task status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -137,6 +175,12 @@ pub enum Status {
     /// and downstream dependents unblock. On fail, the existing
     /// `auto_rescue_on_eval_fail` path runs (Failed + rescue task).
     PendingEval,
+    /// Soft-failed: agent exited with `failure_class=AgentExitNonzero` without
+    /// calling `wg done` or `wg fail`. The dispatcher invokes `.evaluate-X`;
+    /// on a recorded score >= eval_gate_threshold the task is rescued
+    /// (→ Done with rescued=true), otherwise it transitions to Failed
+    /// (terminal, no auto-rescue spawn).
+    FailedPendingEval,
     Incomplete,
 }
 
@@ -152,6 +196,7 @@ impl std::fmt::Display for Status {
             Status::Abandoned => write!(f, "abandoned"),
             Status::PendingValidation => write!(f, "pending-validation"),
             Status::PendingEval => write!(f, "pending-eval"),
+            Status::FailedPendingEval => write!(f, "failed-pending-eval"),
             Status::Incomplete => write!(f, "incomplete"),
         }
     }
@@ -174,6 +219,7 @@ impl<'de> serde::Deserialize<'de> for Status {
             "abandoned" => Ok(Status::Abandoned),
             "pending-validation" => Ok(Status::PendingValidation),
             "pending-eval" => Ok(Status::PendingEval),
+            "failed-pending-eval" => Ok(Status::FailedPendingEval),
             "incomplete" => Ok(Status::Incomplete),
             // Migration: pending-review is treated as done
             "pending-review" => Ok(Status::Done),
@@ -189,6 +235,7 @@ impl<'de> serde::Deserialize<'de> for Status {
                     "abandoned",
                     "pending-validation",
                     "pending-eval",
+                    "failed-pending-eval",
                     "incomplete",
                 ],
             )),
@@ -199,9 +246,21 @@ impl<'de> serde::Deserialize<'de> for Status {
 impl Status {
     /// Whether this status is terminal — the task will not progress further
     /// without explicit intervention (retry, reopen, etc.).
-    /// Terminal statuses should not block dependent tasks.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Status::Done | Status::Failed | Status::Abandoned)
+    }
+
+    /// Whether this status satisfies a dependency edge — i.e. the upstream is
+    /// "done enough" that downstream work may proceed.
+    ///
+    /// `Failed` does NOT satisfy a dependency: it means work was attempted but
+    /// produced no valid output.  Downstream tasks spawned against a failed
+    /// upstream would run against missing/broken artifacts.
+    ///
+    /// `Abandoned` DOES satisfy: an operator explicitly decided not to do that
+    /// work; proceeding downstream is intentional.
+    pub fn is_dep_satisfied(&self) -> bool {
+        matches!(self, Status::Done | Status::Abandoned)
     }
 
     /// Whether this status counts as "active" for HUD/viz consistency:
@@ -211,13 +270,17 @@ impl Status {
     /// - InProgress: agent is currently working
     /// - PendingValidation: agent finished, --verify gate pending
     /// - PendingEval: agent called `wg done`, awaiting evaluation
+    /// - FailedPendingEval: agent exited implicitly, awaiting eval verdict
     ///
     /// Excludes Open (not started), Waiting (gated on a wait condition),
     /// Blocked (dependency unmet), and all terminal states.
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Status::InProgress | Status::PendingValidation | Status::PendingEval
+            Status::InProgress
+                | Status::PendingValidation
+                | Status::PendingEval
+                | Status::FailedPendingEval
         )
     }
 }
@@ -280,7 +343,7 @@ pub fn lower_priority(p: Priority) -> Priority {
 
 /// A task node.
 ///
-/// A task in the workgraph with dependencies, status, and execution metadata.
+/// A task in the WG task graph with dependencies, status, and execution metadata.
 ///
 /// Custom `Deserialize` handles migration from the old `identity` field
 /// (`{"role_id": "...", "motivation_id": "..."}`) to the new `agent` field
@@ -339,6 +402,13 @@ pub struct Task {
     /// Timestamp when the task status changed to Done (ISO 8601 / RFC 3339)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// Timestamp of the most recent substantive interaction with this task
+    /// (state change, log entry, message send/read, chat append, edit).
+    /// Heartbeats and other agent telemetry do NOT bump this field.
+    /// Read by the TUI to bubble actively-touched tasks within their status
+    /// group. Defaults to `created_at` for tasks predating this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_interaction_at: Option<String>,
     /// Progress log entries
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<LogEntry>,
@@ -351,6 +421,10 @@ pub struct Task {
     /// Reason for failure or abandonment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Machine-readable failure classification (set by wrapper via classify-failure).
+    /// None for successful tasks or rows predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
     /// Preferred model for this task (haiku, sonnet, opus)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -360,6 +434,18 @@ pub struct Task {
     /// Named endpoint for this task (matches a name in [llm_endpoints])
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Chat pane command argv. For chat-loop tasks this is the concrete
+    /// command that the TUI runs inside the persistent PTY/tmux pane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_argv: Vec<String>,
+    /// Chat pane working directory. Relative paths are resolved by the
+    /// caller; chat creation stores an absolute project-root path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Optional preset display name for command_argv values derived from
+    /// built-in chat shortcuts (`claude`, `codex`, `nex`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_preset_name: Option<String>,
     /// Verification criteria - if set, task requires review before done
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify: Option<String>,
@@ -467,6 +553,16 @@ pub struct Task {
     /// and the task stays Failed.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rescue_count: u32,
+    /// Whether this task was rescued from implicit failure via eval: agent exited
+    /// without calling `wg done`, but the evaluator scored the output >= threshold.
+    /// Forensic marker for TUI/show/evolution — does not affect state machine.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rescued: bool,
+    /// Number of rescue-eval meta-task failures for this task. Used by the
+    /// bounded-retry logic (Fork 6): retry once if `.evaluate-X` fails;
+    /// after 2 failures, the source lands in terminal Failed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub meta_eval_attempts: u32,
     /// Number of consecutive spawn failures (spawn circuit breaker counter)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub spawn_failures: u32,
@@ -555,13 +651,18 @@ impl Default for Task {
             created_at: None,
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             provider: None,
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None,
             verify_timeout: None,
             agent: None,
@@ -591,6 +692,8 @@ impl Default for Task {
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             tier: None,
             no_tier_escalation: false,
@@ -614,10 +717,58 @@ impl Default for Task {
     }
 }
 
+impl Task {
+    /// Bump `last_interaction_at` to now (UTC, RFC 3339).
+    ///
+    /// Called by `modify_graph` for every task whose persistent fields change
+    /// in a substantive way (state, log, edits, etc.). Heartbeats and other
+    /// agent telemetry live in `service/registry.json` and never reach this
+    /// helper, so the field naturally excludes heartbeat noise.
+    pub fn touch(&mut self) {
+        self.last_interaction_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+
+    /// Returns the timestamp the TUI should sort on. Falls back to
+    /// `created_at` and finally an empty string so two tasks with no timing
+    /// info compare equal (and tie-break by id).
+    pub fn interaction_sort_key(&self) -> &str {
+        self.last_interaction_at
+            .as_deref()
+            .or(self.created_at.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Compare two tasks for the purposes of detecting whether the closure
+    /// passed to `modify_graph` made a *substantive* change. The comparison
+    /// ignores the interaction timestamp itself so the bump pass doesn't
+    /// trigger on the bump.
+    pub fn substantively_eq(&self, other: &Task) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        let mut a = self.clone();
+        let mut b = other.clone();
+        a.last_interaction_at = None;
+        b.last_interaction_at = None;
+        a == b
+    }
+}
+
 /// Returns `true` if the task ID represents a system-generated task.
 /// System tasks use a `.` prefix (e.g. `.evaluate-foo`, `.assign-foo`).
 pub fn is_system_task(task_id: &str) -> bool {
     task_id.starts_with('.')
+}
+
+/// Returns `true` if the task ID represents agency lifecycle scaffolding.
+///
+/// These nodes are real graph tasks so scheduling and audit trails can depend
+/// on them, but they are not user-visible work depth for guardrails.
+pub fn is_agency_scaffold_task(task_id: &str) -> bool {
+    task_id.starts_with(".assign-")
+        || task_id.starts_with(".flip-")
+        || task_id.starts_with(".evaluate-")
+        || task_id.starts_with(".place-")
 }
 
 /// Returns `true` if the task ID represents a user board (`.user-*`).
@@ -761,67 +912,244 @@ impl TokenUsage {
     }
 }
 
-/// Parse token usage data from a Claude CLI output.log file.
+/// Parse token usage data from a Claude/Codex/native output log file.
 ///
 /// Reads the file from the end, looking for the last JSON line with `"type":"result"`.
 /// Returns `None` if the file doesn't exist, is empty, or has no result line.
 ///
-/// Supports both Claude CLI format (`"usage": {...}`, `"total_cost_usd": X`)
-/// and native executor format (`"total_usage": {...}`).
+/// Supports Claude CLI format (`"usage": {...}`, `"total_cost_usd": X`),
+/// native executor format (`"total_usage": {...}`), and Codex CLI
+/// `exec --json` `turn.completed` usage events.
 pub fn parse_token_usage(output_log_path: &std::path::Path) -> Option<TokenUsage> {
     let content = std::fs::read_to_string(output_log_path).ok()?;
+    let model_spec = infer_agent_model_spec(output_log_path);
+    let model_pricing = infer_model_pricing(output_log_path, model_spec.as_deref());
 
-    // Find the last line that parses as JSON with type=result
+    // Prefer the final result object when present.
     for line in content.lines().rev() {
         let line = line.trim();
         if line.is_empty() || !line.starts_with('{') {
             continue;
         }
-        let val: serde_json::Value = serde_json::from_str(line).ok()?;
-        if val.get("type").and_then(|v| v.as_str()) != Some("result") {
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if val.get("type").and_then(|v| v.as_str()) == Some("result") {
+            if let Some(usage) = extract_result_token_usage(&val) {
+                return Some(usage);
+            }
+        }
+    }
+
+    // Codex `exec --json` has no Claude-style `result` usage object;
+    // aggregate completed turns instead.
+    let mut codex_total = TokenUsage {
+        cost_usd: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    let mut found_codex = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || !line.starts_with('{')
+            || !line.contains("\"type\":\"turn.completed\"")
+        {
             continue;
         }
-
-        let cost_usd = val
-            .get("total_cost_usd")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        // Claude CLI uses "usage", native executor uses "total_usage"
-        let usage = val.get("usage").or_else(|| val.get("total_usage"));
-
-        let input_tokens = usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output_tokens = usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_read = usage
-            .and_then(|u| {
-                u.get("cache_read_input_tokens")
-                    .or_else(|| u.get("cacheReadInputTokens"))
-            })
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_creation = usage
-            .and_then(|u| {
-                u.get("cache_creation_input_tokens")
-                    .or_else(|| u.get("cacheCreationInputTokens"))
-            })
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        return Some(TokenUsage {
-            cost_usd,
-            input_tokens,
-            output_tokens,
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: cache_creation,
-        });
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if val.get("type").and_then(|v| v.as_str()) == Some("turn.completed") {
+            if let Some(usage) =
+                extract_codex_token_usage(&val, model_spec.as_deref(), model_pricing.as_ref())
+            {
+                found_codex = true;
+                codex_total.accumulate(&usage);
+            }
+        }
+    }
+    if found_codex {
+        return Some(codex_total);
     }
 
     None
+}
+
+fn extract_result_token_usage(val: &serde_json::Value) -> Option<TokenUsage> {
+    let cost_usd = val
+        .get("total_cost_usd")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    // Claude CLI uses "usage", native executor uses "total_usage".
+    let usage = val.get("usage").or_else(|| val.get("total_usage"))?;
+
+    Some(TokenUsage {
+        cost_usd,
+        input_tokens: usage_u64(usage, &["input_tokens", "inputTokens"]),
+        output_tokens: usage_u64(usage, &["output_tokens", "outputTokens"]),
+        cache_read_input_tokens: usage_u64(
+            usage,
+            &["cache_read_input_tokens", "cacheReadInputTokens"],
+        ),
+        cache_creation_input_tokens: usage_u64(
+            usage,
+            &["cache_creation_input_tokens", "cacheCreationInputTokens"],
+        ),
+    })
+}
+
+fn extract_codex_token_usage(
+    val: &serde_json::Value,
+    model_spec: Option<&str>,
+    pricing: Option<&ModelRegistryEntry>,
+) -> Option<TokenUsage> {
+    let usage = val.get("usage")?;
+    let total_input_tokens = usage_u64(usage, &["input_tokens", "inputTokens"]);
+    let cached_input_tokens = usage_u64(
+        usage,
+        &[
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+        ],
+    );
+    let input_tokens = total_input_tokens.saturating_sub(cached_input_tokens);
+    let output_tokens = usage_u64(usage, &["output_tokens", "outputTokens"])
+        + usage_u64(usage, &["reasoning_output_tokens", "reasoningOutputTokens"]);
+
+    if input_tokens == 0 && output_tokens == 0 && cached_input_tokens == 0 {
+        return None;
+    }
+
+    let cost_usd = val
+        .get("total_cost_usd")
+        .or_else(|| val.get("cost_usd"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or_else(|| {
+            estimate_model_cost_usd(
+                model_spec,
+                pricing,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            )
+        });
+
+    Some(TokenUsage {
+        cost_usd,
+        input_tokens,
+        output_tokens,
+        cache_read_input_tokens: cached_input_tokens,
+        cache_creation_input_tokens: 0,
+    })
+}
+
+fn usage_u64(usage: &serde_json::Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| usage.get(*key).and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
+fn infer_agent_model_spec(output_log_path: &std::path::Path) -> Option<String> {
+    let agent_dir = output_log_path.parent()?;
+    let metadata_path = agent_dir.join("metadata.json");
+    if let Ok(metadata_content) = std::fs::read_to_string(metadata_path)
+        && let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&metadata_content)
+        && let Some(model) = metadata.get("model").and_then(|v| v.as_str())
+    {
+        let executor = metadata.get("executor").and_then(|v| v.as_str());
+        return if model.contains(':') {
+            Some(model.to_string())
+        } else {
+            executor.map(|e| format!("{}:{}", e, model))
+        };
+    }
+
+    let agent_id = agent_dir.file_name().and_then(|name| name.to_str())?;
+    let workgraph_dir = infer_workgraph_dir(output_log_path)?;
+    let graph = crate::parser::load_graph(&workgraph_dir.join("graph.jsonl")).ok()?;
+    graph
+        .tasks()
+        .find(|task| task.assigned.as_deref() == Some(agent_id))
+        .and_then(|task| task.model.clone())
+}
+
+fn estimate_model_cost_usd(
+    model_spec: Option<&str>,
+    pricing: Option<&ModelRegistryEntry>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+) -> f64 {
+    let (input_per_mtok, output_per_mtok, cache_read_discount) = if let Some(entry) = pricing {
+        (
+            entry.cost_per_input_mtok,
+            entry.cost_per_output_mtok,
+            if entry.prompt_caching {
+                entry.cache_read_discount
+            } else {
+                0.0
+            },
+        )
+    } else {
+        let Some(model_spec) = model_spec else {
+            return 0.0;
+        };
+        let Some((input, output)) = fallback_model_pricing_mtok(model_spec) else {
+            return 0.0;
+        };
+        (input, output, 0.0)
+    };
+
+    (input_tokens as f64 / 1_000_000.0) * input_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * output_per_mtok
+        + (cached_input_tokens as f64 / 1_000_000.0) * input_per_mtok * cache_read_discount
+}
+
+fn fallback_model_pricing_mtok(model_spec: &str) -> Option<(f64, f64)> {
+    match model_spec {
+        "codex:gpt-5.5" | "gpt-5.5" => Some((5.0, 30.0)),
+        "codex:gpt-5.4" | "gpt-5.4" => Some((2.5, 15.0)),
+        "claude:opus" | "opus" => Some((15.0, 75.0)),
+        _ => None,
+    }
+}
+
+fn infer_workgraph_dir(output_log_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    output_log_path
+        .ancestors()
+        .find(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some(".wg")
+                && path.join("graph.jsonl").exists()
+        })
+        .map(std::path::Path::to_path_buf)
+}
+
+fn infer_model_pricing(
+    output_log_path: &std::path::Path,
+    model_spec: Option<&str>,
+) -> Option<ModelRegistryEntry> {
+    let workgraph_dir = infer_workgraph_dir(output_log_path)?;
+    let config = Config::load_or_default(&workgraph_dir);
+    let model_spec = model_spec?;
+    let model_without_provider = model_spec
+        .split_once(':')
+        .map(|(_, model)| model)
+        .unwrap_or(model_spec);
+
+    config.effective_registry().into_iter().find(|entry| {
+        entry.id == model_spec
+            || entry.id == model_without_provider
+            || entry.model == model_spec
+            || entry.model == model_without_provider
+            || format!("{}:{}", entry.provider, entry.model) == model_spec
+    })
 }
 
 /// Parse token usage from an agent output.log, including mid-run data.
@@ -830,6 +1158,7 @@ pub fn parse_token_usage(output_log_path: &std::path::Path) -> Option<TokenUsage
 /// sums up per-turn usage from either:
 /// - Claude CLI format: `type=assistant` with `message.usage`
 /// - Native executor format: `type=turn` with top-level `usage`
+/// - Codex CLI format: `type=turn.completed` with top-level `usage`
 ///
 /// Returns `None` if the file doesn't exist or has no usable data.
 pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<TokenUsage> {
@@ -840,11 +1169,14 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
 
     // Fall back: sum per-turn usage from assistant/turn messages
     let content = std::fs::read_to_string(output_log_path).ok()?;
+    let model_spec = infer_agent_model_spec(output_log_path);
+    let model_pricing = infer_model_pricing(output_log_path, model_spec.as_deref());
 
     let mut total_input = 0u64;
     let mut total_output = 0u64;
     let mut total_cache_read = 0u64;
     let mut total_cache_creation = 0u64;
+    let mut total_cost = 0.0f64;
     let mut found_any = false;
 
     for line in content.lines() {
@@ -852,8 +1184,11 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
         if line.is_empty() || !line.starts_with('{') {
             continue;
         }
-        // Quick check before full parse — match Claude CLI "assistant" or native "turn"
-        if !line.contains("\"type\":\"assistant\"") && !line.contains("\"type\":\"turn\"") {
+        // Quick check before full parse — match Claude CLI, native, or Codex usage events.
+        if !line.contains("\"type\":\"assistant\"")
+            && !line.contains("\"type\":\"turn\"")
+            && !line.contains("\"type\":\"turn.completed\"")
+        {
             continue;
         }
         let val: serde_json::Value = match serde_json::from_str(line) {
@@ -864,9 +1199,23 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
 
         // Claude CLI: usage nested under message.usage
         // Native executor: usage at top level
+        // Codex CLI: usage at top level, with cached_input_tokens
         let usage = match event_type {
             Some("assistant") => val.get("message").and_then(|m| m.get("usage")),
             Some("turn") => val.get("usage"),
+            Some("turn.completed") => {
+                if let Some(codex_usage) =
+                    extract_codex_token_usage(&val, model_spec.as_deref(), model_pricing.as_ref())
+                {
+                    found_any = true;
+                    total_input += codex_usage.input_tokens;
+                    total_output += codex_usage.output_tokens;
+                    total_cache_read += codex_usage.cache_read_input_tokens;
+                    total_cache_creation += codex_usage.cache_creation_input_tokens;
+                    total_cost += codex_usage.cost_usd;
+                }
+                continue;
+            }
             _ => continue,
         };
         if let Some(usage) = usage {
@@ -894,7 +1243,7 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
 
     if found_any {
         Some(TokenUsage {
-            cost_usd: 0.0, // Per-turn messages don't include cumulative cost
+            cost_usd: total_cost, // Claude/native per-turn messages don't include cumulative cost
             input_tokens: total_input,
             output_tokens: total_output,
             cache_read_input_tokens: total_cache_read,
@@ -903,6 +1252,56 @@ pub fn parse_token_usage_live(output_log_path: &std::path::Path) -> Option<Token
     } else {
         None
     }
+}
+
+/// Process-wide cache for `parse_token_usage_live`, keyed by output-log path
+/// + mtime. The TUI's `live_token_usage` and `agency_token_usage` maps
+/// previously walked + parsed every active agent's `output.log` (and every
+/// archived `log/agents/<task>/<run>/output.txt`) on every fs-change tick.
+/// `output.log` is appended to many times per second by streaming agents,
+/// but the parse result only changes when the file mtime advances — so
+/// memoizing on (path, mtime) is exact, not approximate.
+type TokenUsageCacheKey = (std::path::PathBuf, Option<std::time::SystemTime>);
+
+fn token_usage_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<TokenUsageCacheKey, Option<TokenUsage>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<TokenUsageCacheKey, Option<TokenUsage>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Cached counterpart of `parse_token_usage_live`. Returns the memoized value
+/// when the file mtime is unchanged; otherwise reparses and updates the cache.
+///
+/// Used by the TUI render path (live + agency token usage maps) where the
+/// same output logs are scanned 5-50 times per second under active load.
+pub fn parse_token_usage_live_cached(output_log_path: &std::path::Path) -> Option<TokenUsage> {
+    let mtime = std::fs::metadata(output_log_path)
+        .and_then(|m| m.modified())
+        .ok();
+    if mtime.is_none() {
+        // File doesn't exist — caller treats this as "no usage", and we
+        // intentionally don't cache absent files (they may appear later).
+        return None;
+    }
+    let key: TokenUsageCacheKey = (output_log_path.to_path_buf(), mtime);
+
+    if let Ok(cache) = token_usage_cache().lock()
+        && let Some(hit) = cache.get(&key)
+    {
+        return hit.clone();
+    }
+
+    let value = parse_token_usage_live(output_log_path);
+
+    if let Ok(mut cache) = token_usage_cache().lock() {
+        if cache.len() > 8192 {
+            cache.clear();
+        }
+        cache.insert(key, value.clone());
+    }
+    value
 }
 
 /// Parse token usage from `__WG_TOKENS__:` lines in an output log.
@@ -1109,6 +1508,8 @@ struct TaskHelper {
     #[serde(default)]
     completed_at: Option<String>,
     #[serde(default)]
+    last_interaction_at: Option<String>,
+    #[serde(default)]
     log: Vec<LogEntry>,
     #[serde(default)]
     retry_count: u32,
@@ -1117,11 +1518,19 @@ struct TaskHelper {
     #[serde(default)]
     failure_reason: Option<String>,
     #[serde(default)]
+    failure_class: Option<FailureClass>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
+    #[serde(default)]
+    command_argv: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    executor_preset_name: Option<String>,
     #[serde(default)]
     verify: Option<String>,
     #[serde(default)]
@@ -1185,6 +1594,10 @@ struct TaskHelper {
     verify_failures: u32,
     #[serde(default)]
     rescue_count: u32,
+    #[serde(default)]
+    rescued: bool,
+    #[serde(default)]
+    meta_eval_attempts: u32,
     #[serde(default)]
     spawn_failures: u32,
     #[serde(default)]
@@ -1258,16 +1671,26 @@ impl<'de> Deserialize<'de> for Task {
             exec: helper.exec,
             timeout: helper.timeout,
             not_before: helper.not_before,
-            created_at: helper.created_at,
+            created_at: helper.created_at.clone(),
             started_at: helper.started_at,
             completed_at: helper.completed_at,
+            // Migration: old tasks without `last_interaction_at` default to
+            // `created_at` (the original add time) so the field is always
+            // populated for tasks that have a creation timestamp.
+            last_interaction_at: helper
+                .last_interaction_at
+                .or_else(|| helper.created_at.clone()),
             log: helper.log,
             retry_count: helper.retry_count,
             max_retries: helper.max_retries,
             failure_reason: helper.failure_reason,
+            failure_class: helper.failure_class,
             model: helper.model,
             provider: helper.provider,
             endpoint: helper.endpoint,
+            command_argv: helper.command_argv,
+            working_dir: helper.working_dir,
+            executor_preset_name: helper.executor_preset_name,
             verify: helper.verify,
             verify_timeout: helper.verify_timeout,
             agent,
@@ -1297,6 +1720,8 @@ impl<'de> Deserialize<'de> for Task {
             max_rejections: helper.max_rejections,
             verify_failures: helper.verify_failures,
             rescue_count: helper.rescue_count,
+            rescued: helper.rescued,
+            meta_eval_attempts: helper.meta_eval_attempts,
             spawn_failures: helper.spawn_failures,
             tier: helper.tier,
             no_tier_escalation: helper.no_tier_escalation,
@@ -1355,7 +1780,7 @@ pub struct Resource {
     pub unit: Option<String>,
 }
 
-/// A node in the work graph (task or resource)
+/// A node in the WG task graph (task or resource)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 #[allow(clippy::large_enum_variant)]
@@ -1397,22 +1822,15 @@ pub struct CycleAnalysis {
 }
 
 impl CycleAnalysis {
-    /// Compute cycle analysis from a WorkGraph's after edges.
+    /// Compute cycle analysis from a `WorkGraph`'s after edges.
     pub fn from_graph(graph: &WorkGraph) -> Self {
         use crate::cycle::NamedGraph;
 
-        // Filter out system scaffolding tasks (.assign-*, .flip-*, .evaluate-*,
+        // Filter out agency scaffolding tasks (.assign-*, .flip-*, .evaluate-*,
         // .place-*) from cycle analysis. These are auto-generated by the
         // coordinator pipeline and add external dependency edges to cycle
         // members, which causes Havlak's algorithm to misclassify user-defined
         // cycles as IRREDUCIBLE (multiple entry points).
-        fn is_system_scaffolding(id: &str) -> bool {
-            id.starts_with(".assign-")
-                || id.starts_with(".flip-")
-                || id.starts_with(".evaluate-")
-                || id.starts_with(".place-")
-        }
-
         // Sort tasks by ID for deterministic node numbering and adjacency
         // list ordering. Back-edge detection via DFS is sensitive to
         // successor order; non-deterministic HashMap iteration previously
@@ -1422,16 +1840,16 @@ impl CycleAnalysis {
 
         let mut named = NamedGraph::new();
         for task in &sorted_tasks {
-            if !is_system_scaffolding(&task.id) {
+            if !is_agency_scaffold_task(&task.id) {
                 named.add_node(&task.id);
             }
         }
         for task in &sorted_tasks {
-            if is_system_scaffolding(&task.id) {
+            if is_agency_scaffold_task(&task.id) {
                 continue;
             }
             for dep_id in &task.after {
-                if !is_system_scaffolding(dep_id) && graph.get_task(dep_id).is_some() {
+                if !is_agency_scaffold_task(dep_id) && graph.get_task(dep_id).is_some() {
                     named.add_edge(dep_id, &task.id);
                 }
             }
@@ -1486,7 +1904,7 @@ impl CycleAnalysis {
     }
 }
 
-/// The work graph: a directed task graph with dependency edges and optional loop edges.
+/// The WG task graph: a directed graph of work with dependency edges and optional loop edges.
 ///
 /// Tasks depend on other tasks via `after`/`blocks` edges. Resources are
 /// consumed by tasks via `requires` edges. The graph is persisted as JSONL
@@ -1655,6 +2073,14 @@ impl WorkGraph {
         })
     }
 
+    /// Mutably iterate over all tasks in the graph, skipping resource nodes.
+    pub fn tasks_mut(&mut self) -> impl Iterator<Item = &mut Task> {
+        self.nodes.values_mut().filter_map(|n| match n {
+            Node::Task(t) => Some(t),
+            _ => None,
+        })
+    }
+
     /// Iterate over all resources in the graph, skipping task nodes.
     pub fn resources(&self) -> impl Iterator<Item = &Resource> {
         self.nodes.values().filter_map(|n| match n {
@@ -1722,6 +2148,19 @@ impl WorkGraph {
         self.task_depth_inner(task_id, &mut memo, &mut HashSet::new())
     }
 
+    /// Compute the user-visible depth of a task.
+    ///
+    /// This is the depth used by task-creation guardrails. It collapses agency
+    /// lifecycle scaffolding (`.assign-*`, `.flip-*`, `.evaluate-*`, and legacy
+    /// `.place-*`) so those internal nodes do not consume graph depth. If a
+    /// visible task depends on `.evaluate-parent`, the edge counts as depending
+    /// on `parent`; if it only depends on its own root `.assign-*`, it remains
+    /// depth 0.
+    pub fn user_visible_task_depth(&self, task_id: &str) -> u32 {
+        let mut memo: HashMap<String, u32> = HashMap::new();
+        self.user_visible_task_depth_inner(task_id, &mut memo, &mut HashSet::new())
+    }
+
     fn task_depth_inner(
         &self,
         task_id: &str,
@@ -1753,6 +2192,65 @@ impl WorkGraph {
         visiting.remove(task_id);
         memo.insert(task_id.to_string(), depth);
         depth
+    }
+
+    fn user_visible_task_depth_inner(
+        &self,
+        task_id: &str,
+        memo: &mut HashMap<String, u32>,
+        visiting: &mut HashSet<String>,
+    ) -> u32 {
+        if let Some(&cached) = memo.get(task_id) {
+            return cached;
+        }
+
+        if !visiting.insert(task_id.to_string()) {
+            return 0;
+        }
+
+        let depth = match self.get_task(task_id) {
+            Some(task) if is_agency_scaffold_task(&task.id) => task
+                .after
+                .iter()
+                .filter_map(|parent_id| {
+                    self.user_visible_dependency_depth(parent_id, memo, visiting)
+                })
+                .max()
+                .unwrap_or(0),
+            Some(task) => task
+                .after
+                .iter()
+                .filter_map(|parent_id| {
+                    self.user_visible_dependency_depth(parent_id, memo, visiting)
+                        .map(|parent_depth| parent_depth + 1)
+                })
+                .max()
+                .unwrap_or(0),
+            None => 0,
+        };
+
+        visiting.remove(task_id);
+        memo.insert(task_id.to_string(), depth);
+        depth
+    }
+
+    fn user_visible_dependency_depth(
+        &self,
+        task_id: &str,
+        memo: &mut HashMap<String, u32>,
+        visiting: &mut HashSet<String>,
+    ) -> Option<u32> {
+        if is_agency_scaffold_task(task_id) {
+            let task = self.get_task(task_id)?;
+            task.after
+                .iter()
+                .filter_map(|parent_id| {
+                    self.user_visible_dependency_depth(parent_id, memo, visiting)
+                })
+                .max()
+        } else {
+            Some(self.user_visible_task_depth_inner(task_id, memo, visiting))
+        }
     }
 }
 
@@ -3124,6 +3622,141 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_token_usage_codex_turn_completed_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"agent_id":"agent-test","executor":"codex","model":"gpt-5.5","task_id":"t"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &log_path,
+            r#"{"type":"thread.started","thread_id":"019deb5c"}
+{"type":"turn.started"}
+{"type":"turn.completed","usage":{"input_tokens":289947,"cached_input_tokens":210560,"output_tokens":2408,"reasoning_output_tokens":873}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 79387);
+        assert_eq!(usage.cache_read_input_tokens, 210560);
+        assert_eq!(usage.output_tokens, 3281);
+        assert!(usage.cost_usd > 0.0);
+        assert!(
+            (usage.cost_usd - 0.495365).abs() < 0.000001,
+            "expected gpt-5.5 pricing ($5/$30 per MTok) with cached input tracked separately, got {}",
+            usage.cost_usd
+        );
+    }
+
+    #[test]
+    fn test_parse_token_usage_live_codex_turn_completed_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("output.log");
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"agent_id":"agent-test","executor":"codex","model":"gpt-5.5","task_id":"t"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":20,"reasoning_output_tokens":5}}
+{"type":"turn.completed","usage":{"input_tokens":2000,"cached_input_tokens":1000,"output_tokens":30}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage_live(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 1600);
+        assert_eq!(usage.cache_read_input_tokens, 1400);
+        assert_eq!(usage.output_tokens, 55);
+        assert!(usage.cost_usd > 0.0);
+    }
+
+    #[test]
+    fn test_parse_token_usage_codex_uses_registry_pricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path().join(".wg");
+        let agent_dir = wg_dir.join("agents").join("agent-test");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            r#"
+[[model_registry]]
+id = "custom-codex"
+provider = "codex"
+model = "custom-codex"
+tier = "standard"
+cost_per_input_mtok = 7.0
+cost_per_output_mtok = 11.0
+prompt_caching = true
+cache_read_discount = 0.5
+"#,
+        )
+        .unwrap();
+
+        let log_path = agent_dir.join("output.log");
+        std::fs::write(
+            agent_dir.join("metadata.json"),
+            r#"{"agent_id":"agent-test","executor":"codex","model":"custom-codex","task_id":"t"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":10}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 750);
+        assert_eq!(usage.cache_read_input_tokens, 250);
+        assert_eq!(usage.output_tokens, 10);
+        assert!(
+            (usage.cost_usd - 0.006235).abs() < 0.000001,
+            "expected registry pricing to override fallback, got {}",
+            usage.cost_usd
+        );
+    }
+
+    #[test]
+    fn test_parse_token_usage_codex_infers_model_from_assigned_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path().join(".wg");
+        let agent_dir = wg_dir.join("agents").join("agent-live-codex");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(wg_dir.join("config.toml"), "").unwrap();
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task("codex-task", "Codex task");
+        task.assigned = Some("agent-live-codex".to_string());
+        task.model = Some("codex:gpt-5.5".to_string());
+        graph.add_node(Node::Task(task));
+        crate::parser::save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+
+        let log_path = agent_dir.join("output.log");
+        std::fs::write(
+            &log_path,
+            r#"{"type":"turn.completed","usage":{"input_tokens":14815,"cached_input_tokens":12160,"output_tokens":7,"reasoning_output_tokens":0}}
+"#,
+        )
+        .unwrap();
+
+        let usage = parse_token_usage(&log_path).unwrap();
+        assert_eq!(usage.input_tokens, 2655);
+        assert_eq!(usage.cache_read_input_tokens, 12160);
+        assert_eq!(usage.output_tokens, 7);
+        assert!(
+            (usage.cost_usd - 0.013485).abs() < 0.000001,
+            "expected task model fallback to price codex usage, got {}",
+            usage.cost_usd
+        );
+    }
+
+    #[test]
     fn test_parse_wg_tokens_single_line() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("output.log");
@@ -3469,6 +4102,40 @@ mod tests {
         assert!(analysis.task_to_cycle.get(".assign-task-b").is_none());
         assert!(analysis.task_to_cycle.get(".assign-task-c").is_none());
         assert!(analysis.task_to_cycle.get(".flip-task-a").is_none());
+    }
+
+    #[test]
+    fn test_user_visible_task_depth_collapses_agency_scaffolding() {
+        let mut graph = WorkGraph::new();
+
+        let assign_root = make_task(".assign-root", "Assign root");
+        let mut root = make_task("root", "Root");
+        root.after = vec![".assign-root".to_string()];
+        let mut flip_root = make_task(".flip-root", "FLIP root");
+        flip_root.after = vec!["root".to_string()];
+        let mut eval_root = make_task(".evaluate-root", "Evaluate root");
+        eval_root.after = vec![".flip-root".to_string()];
+
+        let assign_child = make_task(".assign-child", "Assign child");
+        let mut child = make_task("child", "Child");
+        child.after = vec![".evaluate-root".to_string(), ".assign-child".to_string()];
+
+        graph.add_node(Node::Task(assign_root));
+        graph.add_node(Node::Task(root));
+        graph.add_node(Node::Task(flip_root));
+        graph.add_node(Node::Task(eval_root));
+        graph.add_node(Node::Task(assign_child));
+        graph.add_node(Node::Task(child));
+
+        assert_eq!(
+            graph.task_depth("child"),
+            4,
+            "raw graph depth includes scaffold nodes"
+        );
+        assert_eq!(graph.user_visible_task_depth("root"), 0);
+        assert_eq!(graph.user_visible_task_depth(".flip-root"), 0);
+        assert_eq!(graph.user_visible_task_depth(".evaluate-root"), 0);
+        assert_eq!(graph.user_visible_task_depth("child"), 1);
     }
 
     #[test]

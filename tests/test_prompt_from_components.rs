@@ -19,7 +19,7 @@ use workgraph::config::Config;
 /// Seed an agency dir and return it along with the TempDir handle.
 fn setup_agency() -> (TempDir, std::path::PathBuf) {
     let tmp = TempDir::new().unwrap();
-    let agency_dir = tmp.path().join(".workgraph/agency");
+    let agency_dir = tmp.path().join(".wg/agency");
     seed_starters(&agency_dir).unwrap();
     (tmp, agency_dir)
 }
@@ -561,7 +561,7 @@ fn evolver_prompt_uses_components_when_configured() {
 
     // Should NOT contain the hardcoded evolver intro
     assert!(
-        !identity.contains("You are the evolver agent for a workgraph agency system"),
+        !identity.contains("You are the evolver agent for a WG agency system"),
         "Should NOT contain hardcoded evolver template when agent is configured"
     );
 

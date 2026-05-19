@@ -123,9 +123,9 @@ This reads as the **original design document** for the service layer, not as doc
 | Issue | Severity | Details |
 |-------|---------|---------|
 | IPC protocol description | High | Describes a JSON-over-socket protocol that may not match actual implementation. The real daemon uses a different approach (see review-service-layer.md). |
-| Executor plugin TOML files | High | Describes `.workgraph/executors/claude.toml` config files — these don't exist in the actual implementation. Executors are hardcoded in `src/service/executor.rs`. |
+| Executor plugin TOML files | High | Describes `.wg/executors/claude.toml` config files — these don't exist in the actual implementation. Executors are hardcoded in `src/service/executor.rs`. |
 | Notification config | High | Describes `[service.notifications]` with `on_agent_done`, `on_agent_failed`, etc. — this config section doesn't exist. Matrix notifications are the actual mechanism. |
-| Output routing to `artifacts/` | Medium | Describes `.workgraph/agents/agent-N/artifacts/` — the actual output goes to `.workgraph/service/agents/agent-N/`. |
+| Output routing to `artifacts/` | Medium | Describes `.wg/agents/agent-N/artifacts/` — the actual output goes to `.wg/service/agents/agent-N/`. |
 | `wg service start --port --socket` flags | Medium | Port flag may not be implemented; socket path handling differs. |
 | Coordinator pattern pseudocode | Low | Conceptually correct but doesn't reflect the actual daemon implementation. |
 | Future extensions section | Low | Lists features not yet implemented (web UI, remote agents, resource limits, priority queue, agent pools). |
@@ -185,7 +185,7 @@ Lists 7 architectural issues from early in the project. **All have been resolved
 **Accuracy: N/A (historical)**
 
 This was the original proposal for declarative role definitions. The agency system (AGENCY.md) is the evolved version of this proposal. Key differences:
-- ROLES-IDEA proposed markdown files in `.workgraph/roles/` → Agency uses YAML in `.workgraph/agency/roles/`
+- ROLES-IDEA proposed markdown files in `.wg/roles/` → Agency uses YAML in `.wg/agency/roles/`
 - ROLES-IDEA proposed `--role` on `wg add` → Agency uses `wg assign <task> <agent-hash>`
 - ROLES-IDEA proposed role weight via token counting → Not implemented as described
 
@@ -197,7 +197,7 @@ Correctly instructs agents to use `wg quickstart`, `wg service start`, `cargo in
 
 ### 1.12 NOTES.md (178 lines) — HISTORICAL research notes
 
-Early brainstorming document. Contains the original vision and research synthesis for workgraph. Useful as historical context but not as documentation.
+Early brainstorming document. Contains the original vision and research synthesis for wg. Useful as historical context but not as documentation.
 
 ### 1.13 .claude/skills/wg/SKILL.md — GOOD, accurate
 
@@ -226,7 +226,7 @@ Well-focused skill definition that correctly teaches agents the coordinator patt
 | `petri-nets-research.md` | ~500 | Partially | Same as above |
 | `task-format-research.md` | ~400 | No | Format decisions made (JSONL chosen and implemented) |
 | `beads-gastown-research.md` | ~500 | Partially | Competitive analysis; useful for positioning |
-| `workgraph-analysis-research.md` | ~400 | Yes | Analysis commands design — still useful for extending analysis features |
+| `wg-analysis-research.md` | ~400 | Yes | Analysis commands design — still useful for extending analysis features |
 | `human-interface-research.md` | ~500 | Partially | TUI chosen and built; web/IDE sections still relevant for future |
 | `human-summoning-research.md` | ~500 | Yes | Matrix integration built, but other notification channels not yet explored |
 | `agent-simulation-findings.md` | ~200 | No | Findings from early agent testing; all identified gaps have been fixed |
@@ -313,7 +313,7 @@ Commands and features that exist in code but have **no documentation**:
 
 12. **Keep research docs** — The following are still useful references:
     - `survey-context-management.md` (recent, actionable findings)
-    - `workgraph-analysis-research.md` (useful for extending analysis)
+    - `wg-analysis-research.md` (useful for extending analysis)
     - `human-summoning-research.md` (notification channels not yet fully explored)
     - `csp-process-algebra-research.md` and `petri-nets-research.md` (relevant if formal verification is pursued)
 

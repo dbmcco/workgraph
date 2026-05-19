@@ -46,9 +46,9 @@ These are always seeded by `seed_starters()`, regardless of CSV import status.
 
 ### 1.4 Per-Project Materialized Store
 
-`wg agency init` materializes primitives into `.workgraph/agency/`:
+`wg agency init` materializes primitives into `.wg/agency/`:
 ```
-.workgraph/agency/
+.wg/agency/
 ├── primitives/
 │   ├── components/*.yaml    (one YAML file per role component)
 │   ├── outcomes/*.yaml      (one YAML file per desired outcome)
@@ -81,7 +81,7 @@ The seeding pipeline runs three layers in sequence:
 
 After seeding, `agency_init` creates default + special agents and configures `auto_assign` and `auto_evaluate`.
 
-**Current gap in this project:** The local project (`.workgraph/agency/`) has 110 components, 32 outcomes, 46 tradeoffs — substantially fewer than the full CSV pool (338 + 98 + 201). The `import-manifest.yaml` is absent, meaning the CSV import was never run. This project was initialized before the CSV bundling feature was implemented.
+**Current gap in this project:** The local project (`.wg/agency/`) has 110 components, 32 outcomes, 46 tradeoffs — substantially fewer than the full CSV pool (338 + 98 + 201). The `import-manifest.yaml` is absent, meaning the CSV import was never run. This project was initialized before the CSV bundling feature was implemented.
 
 ---
 
@@ -90,7 +90,7 @@ After seeding, `agency_init` creates default + special agents and configures `au
 ### Option A: Vendored Snapshot (Current Model)
 
 **How it works:**
-- A copy of `agency/starter.csv` is checked into the workgraph repo
+- A copy of `agency/starter.csv` is checked into the wg repo
 - It's embedded into the binary at compile time via `include_bytes!`
 - New projects get the full pool on `wg init` / `wg agency init`
 - To update: copy the latest CSV from the upstream Agency repo, commit, release a new `wg` binary
@@ -141,7 +141,7 @@ After seeding, `agency_init` creates default + special agents and configures `au
 
 **Disadvantages:**
 - Submodule UX is notoriously poor (detached HEAD, forgotten init, CI complexity)
-- Couples the workgraph release cycle to the upstream repo's structure
+- Couples the wg release cycle to the upstream repo's structure
 - Breaks `cargo install --git` (submodules aren't fetched by default)
 - Over-engineered for a single 180 KB file
 - Adds a build-time dependency on the submodule being initialized
@@ -222,7 +222,7 @@ content_hash: abc123...
            │ Manual copy + git commit + code review
            ▼
 ┌─────────────────────────────────┐
-│ Workgraph Repo                  │
+│ wg Repo                  │
 │ agency/starter.csv              │  ← git-tracked, reviewable
 │                                 │
 │ include_bytes!() in binary      │  ← embedded at compile time
@@ -238,8 +238,8 @@ content_hash: abc123...
            ▼
 ┌─────────────────────────────────┐
 │ Per-Project Store               │
-│ .workgraph/agency/primitives/   │  ← content-hash YAML files
-│ .workgraph/agency/cache/        │  ← composed roles + agents
+│ .wg/agency/primitives/   │  ← content-hash YAML files
+│ .wg/agency/cache/        │  ← composed roles + agents
 │ import-manifest.yaml            │  ← provenance tracking
 └─────────────────────────────────┘
 ```
@@ -262,7 +262,7 @@ No network calls at any step. Trust boundary is the `wg` binary.
 
 ## 7. Immediate Action for This Project
 
-This project's `.workgraph/agency/` has 110 components, 32 outcomes, and 46 tradeoffs but no `import-manifest.yaml`. The downstream task (`union-merge-agency`) should:
+This project's `.wg/agency/` has 110 components, 32 outcomes, and 46 tradeoffs but no `import-manifest.yaml`. The downstream task (`union-merge-agency`) should:
 
 1. Run `wg agency import` to import the embedded CSV (or the on-disk `agency/starter.csv`)
 2. This is safe: content-hash dedup ensures no existing entities are overwritten

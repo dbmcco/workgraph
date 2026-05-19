@@ -47,7 +47,7 @@ fn fake_home_for(wg_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| wg_dir.to_path_buf())
 }
 
-/// Helper: run `wg` with given args in a specific workgraph directory.
+/// Helper: run `wg` with given args in a specific WG directory.
 fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
     let wg = wg_binary();
     Command::new(&wg)
@@ -77,12 +77,12 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
     stdout
 }
 
-/// Helper: initialize a fresh workgraph in a temp directory,
+/// Helper: initialize a fresh WG graph in a temp directory,
 /// and configure a shell executor with the correct working_dir
-/// so that the wrapper script's bare `wg` commands can find `.workgraph`.
+/// so that the wrapper script's bare `wg` commands can find `.wg`.
 fn setup_workgraph(tmp_root: &Path) -> PathBuf {
-    let wg_dir = tmp_root.join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp_root.join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     // Get the directory containing the test-built wg binary.
     let wg_bin_dir = wg_binary().parent().unwrap().to_string_lossy().to_string();
@@ -914,7 +914,7 @@ fn test_crash_scenarios_infrastructure() {
     // Test basic temp directory setup
     let tmp = tempfile::tempdir().unwrap();
     let wg_dir = setup_workgraph(tmp.path());
-    assert!(wg_dir.exists(), "Workgraph directory should be created");
+    assert!(wg_dir.exists(), "WG directory should be created");
     assert!(
         wg_dir.join("config.toml").exists(),
         "Config should be created"

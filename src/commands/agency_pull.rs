@@ -27,7 +27,7 @@ fn resolve_source(source: &str, workgraph_dir: &Path) -> Result<LocalStore> {
 fn local_store(workgraph_dir: &Path, global: bool) -> Result<LocalStore> {
     let path = if global {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        home.join(".workgraph").join("agency")
+        home.join(".wg").join("agency")
     } else {
         workgraph_dir.join("agency")
     };
@@ -86,7 +86,7 @@ pub fn run(workgraph_dir: &Path, opts: &PullOptions) -> Result<()> {
             "action": if opts.dry_run { "dry_run" } else { "pull" },
             "source": source.store_path().display().to_string(),
             "target": if opts.global {
-                "~/.workgraph/agency/".to_string()
+                "~/.wg/agency/".to_string()
             } else {
                 target.store_path().display().to_string()
             },
@@ -114,7 +114,7 @@ pub fn run(workgraph_dir: &Path, opts: &PullOptions) -> Result<()> {
     } else {
         let prefix = if opts.dry_run { "Would pull" } else { "Pulled" };
         let target_desc = if opts.global {
-            "~/.workgraph/agency/".to_string()
+            "~/.wg/agency/".to_string()
         } else {
             target.store_path().display().to_string()
         };
@@ -165,6 +165,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: "test motivation".to_string(),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             acceptable_tradeoffs: Vec::new(),
             unacceptable_tradeoffs: Vec::new(),
             performance: PerformanceRecord::default(),
@@ -348,8 +354,8 @@ mod tests {
             .save_tradeoff(&make_motivation("m1", "quality"))
             .unwrap();
 
-        // Set up a workgraph dir for the target
-        let wg_dir = tmp.path().join("project").join(".workgraph");
+        // Set up a WG dir for the target
+        let wg_dir = tmp.path().join("project").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
@@ -366,7 +372,7 @@ mod tests {
             json: false,
         };
 
-        // The run function expects workgraph_dir to be the .workgraph dir
+        // The run function expects workgraph_dir to be the .wg dir
         run(&wg_dir, &opts).unwrap();
 
         let result = LocalStore::new(&agency_dir);
@@ -380,8 +386,8 @@ mod tests {
         let source = setup_store(&tmp, "source");
         source.save_role(&make_role("r1", "remote-role")).unwrap();
 
-        // Set up workgraph dir with federation.yaml
-        let wg_dir = tmp.path().join("project").join(".workgraph");
+        // Set up WG dir with federation.yaml
+        let wg_dir = tmp.path().join("project").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();

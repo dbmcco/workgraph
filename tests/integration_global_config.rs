@@ -5,24 +5,24 @@
 //! annotations (global/local/default), scoped writes, and that downstream
 //! consumers (service daemon config, evaluate config) pick up merged values.
 //!
-//! All tests use temporary directories as fake HOME / local workgraph, so
-//! the real user's `~/.workgraph/config.toml` is never read or modified.
+//! All tests use temporary directories as fake HOME / local WG project, so
+//! the real user's `~/.wg/config.toml` is never read or modified.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-use workgraph::config::{Config, ConfigSource};
+use workgraph::config::{Config, ConfigSource, normalize_legacy_tables};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a fake HOME with `~/.workgraph/` directory and optionally write a
-/// global config.toml there.  Returns the `.workgraph` dir inside fake HOME.
+/// Create a fake HOME with `~/.wg/` directory and optionally write a
+/// global config.toml there.  Returns the `.wg` dir inside fake HOME.
 fn setup_global_dir(tmp: &TempDir, global_toml: Option<&str>) -> PathBuf {
-    let global_dir = tmp.path().join("fakehome").join(".workgraph");
+    let global_dir = tmp.path().join("fakehome").join(".wg");
     fs::create_dir_all(&global_dir).unwrap();
     if let Some(content) = global_toml {
         fs::write(global_dir.join("config.toml"), content).unwrap();
@@ -30,10 +30,10 @@ fn setup_global_dir(tmp: &TempDir, global_toml: Option<&str>) -> PathBuf {
     global_dir
 }
 
-/// Create a local .workgraph directory and optionally write a config.toml
-/// inside it.  Returns the .workgraph directory path.
+/// Create a local .wg directory and optionally write a config.toml
+/// inside it.  Returns the .wg directory path.
 fn setup_local_dir(tmp: &TempDir, local_toml: Option<&str>) -> PathBuf {
-    let wg_dir = tmp.path().join("project").join(".workgraph");
+    let wg_dir = tmp.path().join("project").join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     if let Some(content) = local_toml {
         fs::write(wg_dir.join("config.toml"), content).unwrap();
@@ -50,8 +50,11 @@ fn load_toml_or_empty(path: &Path) -> toml::Value {
 
 /// Load merged config using custom global/local paths (not relying on HOME).
 fn load_merged_custom(global_dir: &Path, local_dir: &Path) -> Config {
-    let global_val = load_toml_or_empty(&global_dir.join("config.toml"));
-    let local_val = load_toml_or_empty(&local_dir.join("config.toml"));
+    let mut global_val = load_toml_or_empty(&global_dir.join("config.toml"));
+    let mut local_val = load_toml_or_empty(&local_dir.join("config.toml"));
+    let mut warnings = Vec::new();
+    normalize_legacy_tables(&mut global_val, "global", &mut warnings);
+    normalize_legacy_tables(&mut local_val, "local", &mut warnings);
     let merged = workgraph::config::merge_toml(global_val, local_val);
     merged.try_into().expect("deserialize merged config")
 }
@@ -61,8 +64,11 @@ fn load_with_sources_custom(
     global_dir: &Path,
     local_dir: &Path,
 ) -> (Config, BTreeMap<String, ConfigSource>) {
-    let global_val = load_toml_or_empty(&global_dir.join("config.toml"));
-    let local_val = load_toml_or_empty(&local_dir.join("config.toml"));
+    let mut global_val = load_toml_or_empty(&global_dir.join("config.toml"));
+    let mut local_val = load_toml_or_empty(&local_dir.join("config.toml"));
+    let mut warnings = Vec::new();
+    normalize_legacy_tables(&mut global_val, "global", &mut warnings);
+    normalize_legacy_tables(&mut local_val, "local", &mut warnings);
 
     let mut sources = BTreeMap::new();
     record_sources(&global_val, "", &ConfigSource::Global, &mut sources);
@@ -113,7 +119,7 @@ fn record_sources(
 }
 
 // ===========================================================================
-// 1. Global config creation at ~/.workgraph/config.toml
+// 1. Global config creation at ~/.wg/config.toml
 // ===========================================================================
 
 #[test]
@@ -276,7 +282,7 @@ executor = "claude"
         Some(
             r#"
 [coordinator]
-executor = "amplifier"
+executor = "native"
 "#,
         ),
     );
@@ -284,12 +290,12 @@ executor = "amplifier"
     let (_config, sources) = load_with_sources_custom(&global_dir, &local_dir);
 
     assert_eq!(
-        sources.get("coordinator.max_agents"),
+        sources.get("dispatcher.max_agents"),
         Some(&ConfigSource::Global),
         "max_agents should be global (only set in global)"
     );
     assert_eq!(
-        sources.get("coordinator.executor"),
+        sources.get("dispatcher.executor"),
         Some(&ConfigSource::Local),
         "executor should be local (local overrides global)"
     );
@@ -355,7 +361,7 @@ max_agents = 6
     assert_eq!(sources.get("agent.interval"), Some(&ConfigSource::Global));
     // Only in local
     assert_eq!(
-        sources.get("coordinator.max_agents"),
+        sources.get("dispatcher.max_agents"),
         Some(&ConfigSource::Local)
     );
     // Only in global
@@ -402,7 +408,7 @@ fn global_write_does_not_affect_local() {
         &tmp,
         Some(
             r#"
-[coordinator]
+[dispatcher]
 max_agents = 2
 "#,
         ),
@@ -493,7 +499,7 @@ poll_interval = 120
         Some(
             r#"
 [coordinator]
-executor = "amplifier"
+executor = "native"
 "#,
         ),
     );
@@ -504,7 +510,7 @@ executor = "amplifier"
     assert_eq!(config.coordinator.max_agents, 8, "inherited from global");
     assert_eq!(
         config.coordinator.executor,
-        Some("amplifier".to_string()),
+        Some("native".to_string()),
         "local overrides"
     );
     assert_eq!(config.coordinator.interval, 30, "inherited from global");
@@ -732,7 +738,7 @@ fn config_source_display_variants() {
 #[test]
 fn load_with_sources_uses_real_api() {
     // Test Config::load_with_sources against a local-only temp dir.
-    // This uses the real API which also reads ~/.workgraph/config.toml
+    // This uses the real API which also reads ~/.wg/config.toml
     // (the user's real global config, if any), so we just verify it doesn't
     // error and returns sensible structure.
     let tmp = TempDir::new().unwrap();
@@ -746,7 +752,7 @@ fn load_with_sources_uses_real_api() {
     let (loaded, sources) = Config::load_with_sources(&local_dir).unwrap();
     assert_eq!(loaded.coordinator.max_agents, 7);
     assert_eq!(
-        sources.get("coordinator.max_agents"),
+        sources.get("dispatcher.max_agents"),
         Some(&ConfigSource::Local)
     );
 }

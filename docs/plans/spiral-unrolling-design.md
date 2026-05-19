@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This design introduces **spiral mode** — an opt-in enhancement to workgraph cycles that preserves per-iteration history as archived snapshot tasks. When a spiral-enabled cycle iterates, completed tasks are cloned as `{task-id}~{iteration}` before the live tasks are reset. This preserves per-iteration FLIP scores, evaluations, token usage, agent assignments, and artifacts while keeping the live task IDs stable for external references.
+This design introduces **spiral mode** — an opt-in enhancement to wg cycles that preserves per-iteration history as archived snapshot tasks. When a spiral-enabled cycle iterates, completed tasks are cloned as `{task-id}~{iteration}` before the live tasks are reset. This preserves per-iteration FLIP scores, evaluations, token usage, agent assignments, and artifacts while keeping the live task IDs stable for external references.
 
 **Key principle**: The cycle definition remains the structural template. Each iteration materializes as a frozen snapshot. Simple cycles (no `spiral: true`) continue to use the existing lightweight in-place reset.
 
@@ -98,7 +98,7 @@ FLIP agent evaluates {task-id}~{N}
 
 Detection logic:
 ```rust
-fn is_in_spiral_cycle(task_id: &str, cycle_analysis: &CycleAnalysis, graph: &WorkGraph) -> bool {
+fn is_in_spiral_cycle(task_id: &str, cycle_analysis: &CycleAnalysis, graph: &wg) -> bool {
     if let Some(&cycle_idx) = cycle_analysis.task_to_cycle.get(task_id) {
         let cycle = &cycle_analysis.cycles[cycle_idx];
         // Find config owner and check spiral flag
@@ -443,7 +443,7 @@ wg config-task .compact-0 --spiral
   - `status: Done`
   - `title: "[iter 0] compact-0"`
   - `tags: ["spiral-archive"]`
-  - `artifacts: [".workgraph/compactor/context.md"]` (moved from live task)
+  - `artifacts: [".wg/compactor/context.md"]` (moved from live task)
   - `token_usage: { input: 15000, output: 2000, cost: 0.05 }` (preserved!)
   - `session_id: "sess-abc123"` (preserved!)
   - `log: [entries from iteration 0 only]`
@@ -453,7 +453,7 @@ wg config-task .compact-0 --spiral
 **Iteration 1 completes**:
 - Archival creates `.compact-0~1`:
   - `token_usage: { input: 18000, output: 2500, cost: 0.06 }`
-  - `artifacts: [".workgraph/compactor/context.md"]` (version from iter 1)
+  - `artifacts: [".wg/compactor/context.md"]` (version from iter 1)
 - `.flip-.compact-0~1` → score: 0.81
 
 **Observable convergence history**:

@@ -71,11 +71,11 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
     stdout
 }
 
-/// Initialize a workgraph in a temp directory and return the .workgraph path.
+/// Initialize WG in a temp directory and return the .wg path.
 fn init_wg() -> (TempDir, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let project_root = tmp.path();
-    let wg_dir = project_root.join(".workgraph");
+    let wg_dir = project_root.join(".wg");
 
     // Initialize git repository (required for worktree creation)
     Command::new("git")
@@ -112,7 +112,7 @@ fn init_wg() -> (TempDir, PathBuf) {
         .output()
         .expect("Failed to git commit");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     (tmp, wg_dir)
 }
 
@@ -134,8 +134,8 @@ fn test_debug_prompt_logging_enabled() {
         &[
             "add",
             "Test debug logging",
-            "--verify",
-            "echo 'test complete'",
+            "-d",
+            "## Validation\n- [ ] echo 'test complete'",
         ],
     );
 
@@ -225,8 +225,8 @@ fn test_debug_prompt_logging_disabled() {
         &[
             "add",
             "Test no debug logging",
-            "--verify",
-            "echo 'test complete'",
+            "-d",
+            "## Validation\n- [ ] echo 'test complete'",
         ],
     );
 

@@ -72,12 +72,12 @@ executor = "claude"
     let legacy_toml = r#"
 [coordinator]
 max_agents = 5
-executor = "amplifier"
+executor = "native"
 "#;
     let legacy_cfg: workgraph::config::Config =
         toml::from_str(legacy_toml).expect("legacy [coordinator] must still parse");
     assert_eq!(legacy_cfg.coordinator.max_agents, 5);
-    assert_eq!(legacy_cfg.coordinator.effective_executor(), "amplifier");
+    assert_eq!(legacy_cfg.coordinator.effective_executor(), "native");
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn test_daemon_log_uses_dispatcher_terminology() {
 fn test_migration_chat_rename_renames_legacy_ids() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
-    let workgraph_dir = dir.join(".workgraph");
+    let workgraph_dir = dir.join(".wg");
     std::fs::create_dir_all(&workgraph_dir).unwrap();
     let graph_path = workgraph_dir.join("graph.jsonl");
 

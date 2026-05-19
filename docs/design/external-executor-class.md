@@ -10,8 +10,8 @@ coordinator path, and the plan to close it.
 Task-agent spawns go through `ExecutorRegistry::load_config(name)`
 (see `src/service/executor.rs:1436+`). Built-in defaults exist for
 `claude`, `codex`, `shell`, and custom override TOML files can
-live at `.workgraph/executors/<name>.toml`. One is already
-checked in: `.workgraph/executors/amplifier.toml`. The schema:
+live at `.wg/executors/<name>.toml`. One is already
+checked in: `.wg/executors/amplifier.toml`. The schema:
 
 ```toml
 [executor]
@@ -35,7 +35,7 @@ differences are the args template and env vars.
 **This is the external-executor class.** It's in place. Task agents
 already benefit. Users can add `crux.toml`, `forgecode.toml`, etc.
 without touching Rust — just drop a TOML file in
-`.workgraph/executors/`.
+`.wg/executors/`.
 
 ## What's not generalized yet
 
@@ -85,7 +85,7 @@ This is **not** a small change. It touches the
 ### Phase 4a — bundle standard executor configs
 
 Low-risk, high-visibility win: check in example
-`.workgraph/executors/claude.toml` and `.workgraph/executors/codex.toml`
+`.wg/executors/claude.toml` and `.wg/executors/codex.toml`
 alongside the existing `amplifier.toml`, so users have concrete
 templates to copy. Current `ExecutorRegistry::default_config`
 already covers these, so the bundled TOMLs are documentation as
@@ -163,7 +163,7 @@ is where most of the value of "pluggable executors" lives.
 ## Relation to self-bootstrap goal
 
 `nex-executor-improvements.md` frames the overall work around:
-make `wg nex` strong enough for workgraph to self-dispatch. Phase
+make `wg nex` strong enough for wg to self-dispatch. Phase
 4a directly helps (users can see claude/codex/amplifier configs
 side-by-side, pick the right one for their billing/capability
 situation). Phases 4b-4c are architectural consolidation — they

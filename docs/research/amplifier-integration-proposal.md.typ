@@ -1,5 +1,5 @@
-= Amplifier × Workgraph Integration Proposal
-<amplifier-workgraph-integration-proposal>
+= Amplifier × wg Integration Proposal
+<amplifier-wg-integration-proposal>
 #strong[Date]: 2026-02-18 #strong[Author]: analyst agent (synthesized
 from three research documents) #strong[Status]: Draft for decision
 
@@ -7,12 +7,12 @@ from three research documents) #strong[Status]: Draft for decision
 
 == 1. Executive Summary
 <executive-summary>
-Integrating Amplifier with workgraph would let wg dispatch tasks to full
+Integrating Amplifier with wg would let wg dispatch tasks to full
 Amplifier sessions — giving each task access to Amplifier’s multi-agent
 delegation, bundle ecosystem, and provider abstraction — while Amplifier
 sessions could decompose complex work into wg graphs for parallel
 execution. The research shows that most of this integration already
-exists as a thin adapter bundle (`amplifier-bundle-workgraph`), and the
+exists as a thin adapter bundle (`amplifier-bundle-wg`), and the
 real question is not "can we integrate" but "is it worth formalizing."
 The answer depends on whether you expect to use Amplifier as a primary
 execution environment. If you do, the executor-side changes are small (5
@@ -78,9 +78,9 @@ competent PR.
 == 3. Option B: wg as an Amplifier Bundle (Status Quo)
 <option-b-wg-as-an-amplifier-bundle-status-quo>
 #strong[What this means]: Amplifier sessions detect complex tasks and
-delegate to wg. This is what `amplifier-bundle-workgraph` already does.
-The bundle installs a behavior (`workgraph.yaml`), a planner agent
-(`workgraph-planner.md`), and context documents (`workgraph-guide.md`)
+delegate to wg. This is what `amplifier-bundle-wg` already does.
+The bundle installs a behavior (`wg.yaml`), a planner agent
+(`wg-planner.md`), and context documents (`wg-guide.md`)
 that teach Amplifier agents how to decompose work into wg graphs.
 
 === Is this sufficient?
@@ -107,7 +107,7 @@ task," yes. The bundle:
   as bare claude. This limits the value of Amplifier’s ecosystem when wg
   is coordinating.
 + #strong[The bundle is maintained externally]
-  (`ramparte/amplifier-bundle-workgraph`). If wg’s executor protocol or
+  (`ramparte/amplifier-bundle-wg`). If wg’s executor protocol or
   template variables change, the bundle breaks silently.
 
 === Verdict
@@ -156,7 +156,7 @@ If you do Option A at all, you get Option C for free. The question isn’t
 Bundles are Amplifier’s distribution and composition unit. They package
 behaviors (what an agent does), context (what it knows), and agents
 (specialized sub-agents it can delegate to) into a single installable
-unit referenced by namespace (`workgraph:workgraph-planner`). They’re
+unit referenced by namespace (`wg:wg-planner`). They’re
 distributed via git URLs and composed via `includes`.
 
 Bundles solve a real problem: how do you share agent configurations
@@ -172,7 +172,7 @@ Consider what wg needs to package per executor: - A TOML config
 (command, args, env, prompt template) - Optionally a wrapper script
 
 This is 1-2 files. wg’s current model — drop files in
-`.workgraph/executors/` — is the right level of abstraction. Bundles add
+`.wg/executors/` — is the right level of abstraction. Bundles add
 namespace resolution, version management, include graphs, and a registry
 — machinery that makes sense when you have dozens of composable
 behaviors, but is over-engineering for a few executor configs.
@@ -181,7 +181,7 @@ Where bundles become interesting is if wg wanted to package
 #strong[entire project templates] (executor config + agency roles + task
 templates + skills). But that’s a different feature from executor
 packaging, and simpler solutions exist (e.g.,
-`wg init --template <git-url>` that clones a `.workgraph/` skeleton).
+`wg init --template <git-url>` that clones a `.wg/` skeleton).
 
 === Verdict
 <verdict-2>

@@ -1,6 +1,6 @@
-//! Project configuration for workgraph
+//! Project configuration for WG
 //!
-//! Configuration is stored in `.workgraph/config.toml` and controls
+//! Configuration is stored in `.wg/config.toml` and controls
 //! agent behavior, executor settings, and project defaults.
 //!
 //! Sensitive credentials (like Matrix login) are stored separately in
@@ -110,9 +110,16 @@ pub struct Config {
     #[serde(default)]
     pub chat: ChatConfig,
 
-    /// OpenRouter cost cap and monitoring configuration
+    /// OpenRouter cost cap and monitoring configuration. Only emitted
+    /// when the user is on the openrouter route or has explicitly added
+    /// an openrouter endpoint — non-openrouter projects don't need a
+    /// cost-cap section sitting in their config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<OpenRouterConfig>,
+
+    /// Credential storage settings
     #[serde(default)]
-    pub openrouter: OpenRouterConfig,
+    pub secrets: crate::secret::SecretsConfig,
 
     /// Native executor settings (web, background, delegate)
     #[serde(default)]
@@ -234,10 +241,10 @@ pub struct NativeExecutorConfig {
 /// Tool permission configuration. First cut is a simple denylist;
 /// room to grow to per-path / pattern matching without schema churn.
 ///
-/// Example `.workgraph/config.toml`:
+/// Example `.wg/config.toml`:
 /// ```toml
 /// [native_executor.permissions]
-/// deny_tools = ["bash", "write_file", "wg_done"]
+/// deny_tools = ["bash", "write_file"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolPermissionsConfig {
@@ -756,6 +763,10 @@ pub struct EndpointConfig {
     /// Environment variable name containing the API key (explicit reference)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Secret store reference: "keyring:<name>", "plain:<name>", "env:<VAR>", "op://<path>", "pass:<path>"
+    /// Preferred over api_key_env for new configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
     /// Whether this is the default endpoint for new agents
     #[serde(default)]
     pub is_default: bool,
@@ -790,7 +801,7 @@ impl EndpointConfig {
         }
     }
 
-    /// Resolve the API key for this endpoint **from workgraph config
+    /// Resolve the API key for this endpoint **from WG config
     /// only** — the strict variant used by the native executor.
     ///
     /// Unlike [`Self::resolve_api_key`], this method does NOT fall back
@@ -799,7 +810,7 @@ impl EndpointConfig {
     /// fields:
     /// 1. `api_key` — inline literal
     /// 2. `api_key_file` — read file contents (with `~`/relative-path expansion)
-    /// 3. `api_key_env` — explicit, user-named env var (this IS workgraph
+    /// 3. `api_key_env` — explicit, user-named env var (this IS WG
     ///    config; the user wrote `api_key_env = "MY_VAR"`)
     ///
     /// Returns `Ok(None)` when no key is configured. Callers should treat
@@ -830,6 +841,20 @@ impl EndpointConfig {
             }
             return Ok(Some(key));
         }
+        // Secret store reference
+        if let Some(ref r) = self.api_key_ref {
+            let secrets_cfg = crate::secret::SecretsConfig::load_global();
+            match crate::secret::resolve_ref(r, &secrets_cfg) {
+                Ok(Some(key)) => {
+                    let key = key.trim().to_string();
+                    if !key.is_empty() {
+                        return Ok(Some(key));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
         if let Some(ref env_name) = self.api_key_env
             && let Ok(key) = std::env::var(env_name)
         {
@@ -846,8 +871,9 @@ impl EndpointConfig {
     /// Priority:
     /// 1. `api_key` — use directly if set
     /// 2. `api_key_file` — read file contents, trim whitespace
-    /// 3. `api_key_env` — read from explicitly named env var
-    /// 4. Environment variable fallback based on provider
+    /// 3. `api_key_ref` — secret store reference (keyring/plain/env/op/pass)
+    /// 4. `api_key_env` — read from explicitly named env var (deprecated; prefer api_key_ref)
+    /// 5. Environment variable fallback based on provider
     ///
     /// For `api_key_file`, supports:
     /// - `~` expansion to home directory
@@ -874,7 +900,21 @@ impl EndpointConfig {
             }
             return Ok(Some(key));
         }
-        // Explicit env var reference
+        // Secret store reference (preferred over api_key_env)
+        if let Some(ref r) = self.api_key_ref {
+            let secrets_cfg = crate::secret::SecretsConfig::load_global();
+            match crate::secret::resolve_ref(r, &secrets_cfg) {
+                Ok(Some(key)) => {
+                    let key = key.trim().to_string();
+                    if !key.is_empty() {
+                        return Ok(Some(key));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Explicit env var reference (deprecated; api_key_ref is preferred)
         if let Some(ref env_name) = self.api_key_env
             && let Ok(key) = std::env::var(env_name)
         {
@@ -1258,7 +1298,7 @@ impl ExecMode {
     /// Return the valid exec_modes for a given executor type.
     ///
     /// - `"shell"` executor: only `Shell`
-    /// - `"claude"`, `"native"`, `"amplifier"`, or any other: `Bare`, `Light`, `Full`
+    /// - `"claude"`, `"native"`, `"codex"`, or any other: `Bare`, `Light`, `Full`
     pub fn valid_for_executor(executor: &str) -> &'static [ExecMode] {
         match executor {
             "shell" => &[ExecMode::Shell],
@@ -1638,25 +1678,38 @@ pub struct ResolvedModel {
 /// The `:` delimiter is unambiguous: provider names never contain `:`,
 /// and model IDs may contain `/` but never `:`.
 ///
-/// "oai-compat" and "openai" are aliases for the same thing: the
-/// OpenAI-compatible HTTP protocol (POST /v1/chat/completions). Any
-/// vLLM/Ollama/SGLang/etc. server speaking that wire format qualifies.
-/// "oai-compat" is the preferred name going forward (more accurate —
-/// "openai" has always been a misnomer referring to the protocol, not
-/// the vendor). Both work in configs and match arms.
+/// `nex` is the canonical prefix for the in-process nex handler (matches
+/// the `wg nex` subcommand name). `local` and `oai-compat` are deprecated
+/// aliases — accepted for one release with a stderr warning, then
+/// rewritten to `nex` by `wg migrate config`. `openai` is a legacy alias
+/// for `oai-compat` (the protocol, not the vendor). All of these route
+/// through the same in-process nex handler.
 pub const KNOWN_PROVIDERS: &[&str] = &[
     "claude",
     "openrouter",
-    "oai-compat",
-    "openai", // alias for "oai-compat" — kept for backwards compatibility
+    "nex",
+    "oai-compat", // deprecated — use "nex"
+    "openai",     // legacy alias for "oai-compat" — kept for backwards compatibility
     "codex",
     "gemini",
     "ollama",
     "llamacpp",
     "vllm",
-    "local",
+    "local", // deprecated — use "nex"
     "native",
 ];
+
+/// Provider prefixes that have been deprecated in favor of the canonical
+/// `nex:` prefix. Returning a non-empty string from this function emits a
+/// one-line stderr deprecation warning at config-load / parse time.
+///
+/// Keep this in sync with `STALE_PROVIDER_REWRITES` in `commands/migrate.rs`.
+pub fn deprecated_provider_prefix_replacement(provider: &str) -> Option<&'static str> {
+    match provider {
+        "local" | "oai-compat" => Some("nex"),
+        _ => None,
+    }
+}
 
 /// Result of parsing a `provider:model` spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1744,6 +1797,22 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
         });
     }
 
+    if let Some((prefix, _rest)) = spec.split_once(':')
+        && prefix == "amplifier"
+    {
+        return Err(ModelSpecError {
+            input: spec.to_string(),
+            message: format!(
+                "amplifier executor was removed; use claude:/codex:/nex: instead \
+                 (got '{}'). The previous `amplifier` handler delegated to a CLI that \
+                 was never tested in this codebase and silently failed at spawn time. \
+                 Migrate to `claude:opus`, `codex:gpt-5.4`, or `nex:<model>` with a \
+                 matching `-e <ENDPOINT>`.",
+                spec,
+            ),
+        });
+    }
+
     if let Some((prefix, rest)) = spec.split_once(':') {
         if KNOWN_PROVIDERS.contains(&prefix) {
             if rest.is_empty() {
@@ -1780,11 +1849,12 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
         input: spec.to_string(),
         message: format!(
             "Invalid model format '{}'. Models must use provider:model format. \
-             For example: 'claude:{}', 'openrouter:{}', 'oai-compat:{}'. \
+             For example: 'claude:{}', 'openrouter:{}', 'nex:{}'. \
              Known providers: {}. \
-             (Note: 'openai' is accepted as a legacy alias for 'oai-compat' — \
-             both refer to the OpenAI-compatible HTTP protocol, not to OpenAI \
-             Inc. specifically.)",
+             (Note: 'nex' is the canonical prefix for the in-process nex handler \
+             — it matches `wg nex`. 'local' and 'oai-compat' are deprecated \
+             aliases retained for one release; 'openai' is a legacy alias for \
+             'oai-compat'.)",
             spec,
             spec,
             spec,
@@ -1798,7 +1868,9 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
 ///
 /// - `claude` → `"claude"` (Claude CLI)
 /// - `codex` → `"codex"` (Codex CLI)
-/// - All others → `"native"` (OpenAI-compatible API)
+/// - `nex` (canonical) / `local` / `oai-compat` / `openrouter` / etc. → `"native"`
+///   (the in-process nex handler — name kept as `"native"` for the legacy
+///   ExecutorKind variant, but the user-facing prefix is `nex:`)
 pub fn provider_to_executor(provider: &str) -> &'static str {
     match provider {
         "claude" => "claude",
@@ -1867,7 +1939,7 @@ pub fn deprecated_executor_warnings_for_toml(content: &str) -> Vec<String> {
             "config key `{0} = \"{1}\"` is deprecated{2}; \
              wg now derives the handler from the model spec's provider \
              prefix (e.g. `model = \"claude:opus\"` → claude CLI, \
-             `model = \"local:qwen3-coder\"` → nex). Remove the explicit \
+             `model = \"nex:qwen3-coder\"` → nex). Remove the explicit \
              `executor` key; use a `provider:model` value in `model` instead.",
             label, exec_v, detail,
         ));
@@ -1883,6 +1955,58 @@ fn lookup_toml_path<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml
         current = current.as_table()?.get(*seg)?;
     }
     Some(current)
+}
+
+/// Inspect a raw config.toml string and produce deprecation warnings for
+/// any model strings that use the deprecated `local:` / `oai-compat:`
+/// provider prefixes. Both prefixes were retired in favor of the canonical
+/// `nex:` (matches the `wg nex` subcommand). Existing configs keep
+/// working for one release; this surface is what tells users to migrate.
+///
+/// Walks every string value in the document and reports each occurrence
+/// once with its dotted-path location so users can find and rewrite it.
+/// Pair with `wg migrate config` for an automated rewrite.
+pub fn deprecated_model_prefix_warnings_for_toml(content: &str) -> Vec<String> {
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk_strings_readonly(&value, "", &mut |path, s| {
+        if let Some((prefix, rest)) = s.split_once(':')
+            && let Some(replacement) = deprecated_provider_prefix_replacement(prefix)
+        {
+            out.push(format!(
+                "model spec `{} = \"{}\"` uses deprecated `{}:` prefix — \
+                 use `{}:{}` instead (the `nex:` prefix matches the `wg nex` \
+                 subcommand). Run `wg migrate config` to rewrite automatically.",
+                path, s, prefix, replacement, rest,
+            ));
+        }
+    });
+    out
+}
+
+fn walk_strings_readonly<'a>(val: &'a toml::Value, path: &str, f: &mut dyn FnMut(&str, &'a str)) {
+    match val {
+        toml::Value::String(s) => f(path, s.as_str()),
+        toml::Value::Array(arr) => {
+            for (i, child) in arr.iter().enumerate() {
+                let child_path = format!("{}[{}]", path, i);
+                walk_strings_readonly(child, &child_path, f);
+            }
+        }
+        toml::Value::Table(tbl) => {
+            for (k, child) in tbl.iter() {
+                let child_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}.{}", path, k)
+                };
+                walk_strings_readonly(child, &child_path, f);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Drop the `executor` keys from `[agent]` / `[dispatcher]` / `[coordinator]`
@@ -1941,10 +2065,13 @@ pub fn provider_to_native_provider(provider: &str) -> &'static str {
         "claude" => "anthropic",
         "codex" => "oai-compat",
         "openrouter" => "openrouter",
-        // "oai-compat" is the canonical name for the OpenAI-compatible
-        // HTTP protocol. "openai" remains accepted as a legacy alias
-        // (both user-input configs and older serialized state), but the
-        // canonical form returned here is "oai-compat".
+        // `nex` is the canonical prefix for the in-process nex handler —
+        // it speaks OAI-compat by default, with `openrouter:` as the
+        // implicit-endpoint convenience case.
+        "nex" => "oai-compat",
+        // "oai-compat" is the legacy alias for the OpenAI-compatible HTTP
+        // protocol — `nex` is the canonical prefix going forward.
+        // "openai" is the older legacy alias retained for back-compat.
         "oai-compat" | "openai" => "oai-compat",
         "gemini" => "oai-compat", // Gemini uses OpenAI-compatible endpoint
         "ollama" | "llamacpp" | "vllm" | "local" => "local",
@@ -1953,17 +2080,35 @@ pub fn provider_to_native_provider(provider: &str) -> &'static str {
     }
 }
 
+/// Map a user-facing provider prefix to the provider label carried by
+/// [`ResolvedModel`].
+///
+/// Most API-backed prefixes use the native provider name because downstream
+/// lightweight calls need to pick an HTTP client. `codex:` is intentionally
+/// preserved as `codex`: it is a CLI-backed route, and collapsing it to the
+/// OAI-compat protocol label makes role routing and `wg config --models`
+/// report `nex` even though the codex CLI is the required handler.
+pub fn provider_to_resolved_provider(provider: &str) -> &'static str {
+    match provider {
+        "codex" => "codex",
+        other => provider_to_native_provider(other),
+    }
+}
+
 /// Reverse map: internal provider name → user-facing `provider:model` prefix.
 ///
 /// This is the inverse of [`provider_to_native_provider`] for display purposes.
+/// Returns `nex` for the OAI-compat / local cases — the canonical prefix
+/// matching the `wg nex` subcommand. `openrouter` keeps its own prefix
+/// because the URL convention (api.openrouter.ai) is implicit when the
+/// user picks it.
 pub fn native_provider_to_prefix(provider: &str) -> &str {
     match provider {
         "anthropic" => "claude",
         "openrouter" => "openrouter",
-        // Both the canonical "oai-compat" and the legacy "openai" internal
-        // tag map to the user-facing "oai-compat:" prefix.
-        "oai-compat" | "openai" => "oai-compat",
-        "local" => "local",
+        // Internal "oai-compat" / "openai" / "local" all map to the
+        // user-facing canonical "nex:" prefix (matches `wg nex`).
+        "oai-compat" | "openai" | "local" => "nex",
         other => other,
     }
 }
@@ -2200,7 +2345,7 @@ impl Config {
                 model: entry.model.clone(),
                 provider: spec
                     .provider
-                    .map(|p| provider_to_native_provider(&p).to_string())
+                    .map(|p| provider_to_resolved_provider(&p).to_string())
                     .or_else(|| Some(entry.provider.clone())),
                 registry_entry: Some(entry),
                 endpoint: None,
@@ -2211,7 +2356,7 @@ impl Config {
                 model: spec.model_id,
                 provider: spec
                     .provider
-                    .map(|p| provider_to_native_provider(&p).to_string()),
+                    .map(|p| provider_to_resolved_provider(&p).to_string()),
                 registry_entry: None,
                 endpoint: None,
             })
@@ -2249,11 +2394,11 @@ impl Config {
         let coordinator_model_provider = self.coordinator.model.as_deref().and_then(|m| {
             parse_model_spec(m)
                 .provider
-                .map(|p| provider_to_native_provider(&p).to_string())
+                .map(|p| provider_to_resolved_provider(&p).to_string())
         });
         let agent_model_provider = parse_model_spec(&self.agent.model)
             .provider
-            .map(|p| provider_to_native_provider(&p).to_string());
+            .map(|p| provider_to_resolved_provider(&p).to_string());
 
         // Helper: resolve provider for a role, cascading through:
         //   models.<role>.provider → models.default.provider
@@ -2284,7 +2429,7 @@ impl Config {
             let spec_provider = spec
                 .provider
                 .as_deref()
-                .map(provider_to_native_provider)
+                .map(provider_to_resolved_provider)
                 .map(String::from);
             let lookup_model = &spec.model_id;
 
@@ -2345,7 +2490,7 @@ impl Config {
             let spec_provider = spec
                 .provider
                 .as_deref()
-                .map(provider_to_native_provider)
+                .map(provider_to_resolved_provider)
                 .map(String::from);
 
             if let Some(entry) = self.registry_lookup(&spec.model_id) {
@@ -2371,7 +2516,7 @@ impl Config {
         let fallback_provider = fallback_spec
             .provider
             .as_deref()
-            .map(provider_to_native_provider)
+            .map(provider_to_resolved_provider)
             .map(String::from);
 
         if let Some(entry) = self.registry_lookup(&fallback_spec.model_id) {
@@ -2935,7 +3080,7 @@ pub struct CoordinatorConfig {
 
     /// Archive tasks completed/abandoned more than this many days ago.
     /// The archive cycle (.archive-0) runs periodically and moves old
-    /// done/abandoned tasks to .workgraph/archive.jsonl. Default: 7 days.
+    /// done/abandoned tasks to .wg/archive.jsonl. Default: 7 days.
     /// Set to 0 to disable automatic archival.
     #[serde(default = "default_archive_retention_days")]
     pub archive_retention_days: u64,
@@ -3192,7 +3337,7 @@ fn default_worktree_isolation() -> bool {
 }
 
 fn default_max_coordinators() -> usize {
-    4
+    16
 }
 
 fn default_archive_retention_days() -> u64 {
@@ -3361,13 +3506,24 @@ impl Default for CoordinatorConfig {
 /// Project metadata
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
-    /// Project name
+    /// Project name (legacy field; new code prefers `title`)
     #[serde(default)]
     pub name: Option<String>,
 
     /// Project description
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Display title shown at the top of `wg html` / `wg html publish`
+    /// rendered pages. Falls back to `name` (then to the WG
+    /// directory name) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    /// One-line byline / tagline shown under the title in `wg html`
+    /// rendered pages. Empty by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byline: Option<String>,
 
     /// Default skills for new actors
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3575,16 +3731,31 @@ fn emit_legacy_warnings(warnings: &[String]) {
 /// set `[llm_endpoints] inherit_global = true` in local config to keep the
 /// legacy "global cascades into local" behavior.
 ///
+/// Active named profiles are the exception: when a profile is active and the
+/// local config does not explicitly declare its own endpoints or
+/// `inherit_global = false`, the profile's global endpoints are part of the
+/// selected route and should flow into the effective config.
+///
 /// This mutates `global_val` in place to drop the `endpoints` array from its
 /// `[llm_endpoints]` table when local hasn't opted in. Call this BEFORE
 /// `merge_toml` so the deep-merge sees an effectively-empty global endpoints
 /// list and the merged config reflects only what local declared.
-fn apply_endpoint_inheritance_policy(global_val: &mut toml::Value, local_val: &toml::Value) {
-    let inherit = local_val
+fn apply_endpoint_inheritance_policy(
+    global_val: &mut toml::Value,
+    local_val: &toml::Value,
+    active_named_profile: bool,
+) {
+    let explicit_inherit = local_val
         .get("llm_endpoints")
         .and_then(|t| t.get("inherit_global"))
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false);
+        .and_then(|b| b.as_bool());
+    let local_declares_endpoints = local_val
+        .get("llm_endpoints")
+        .and_then(|t| t.get("endpoints"))
+        .and_then(|v| v.as_array())
+        .is_some();
+    let inherit =
+        explicit_inherit.unwrap_or_else(|| active_named_profile && !local_declares_endpoints);
     if inherit {
         return;
     }
@@ -3672,6 +3843,11 @@ fn strip_global_only_model_roles(
     }
 }
 
+// `restore_local_profile_overrides` and its `toml_has_path` helper removed
+// (2026-05): profiles are now snapshot file-swaps, not overlays. The
+// global+local merge already gives local config the right precedence — no
+// profile-aware restoration needed.
+
 /// A deprecated config key found in raw TOML, with a human-readable replacement
 /// suggestion the daemon can log on startup.
 ///
@@ -3739,7 +3915,7 @@ fn record_sources(
 }
 
 impl Config {
-    /// Return the global workgraph directory.
+    /// Return the global WG directory.
     ///
     /// Resolution order matches `main.rs::resolve_workgraph_dir`:
     /// 1. `~/.wg` if it exists (modern, written by `wg init`).
@@ -3768,7 +3944,7 @@ impl Config {
         Ok(Self::global_dir()?.join("config.toml"))
     }
 
-    /// Load global configuration from ~/.workgraph/config.toml.
+    /// Load global configuration from ~/.wg/config.toml.
     /// Returns None if the file doesn't exist, Err on parse failure.
     pub fn load_global() -> anyhow::Result<Option<Self>> {
         let global_path = Self::global_config_path()?;
@@ -3782,7 +3958,17 @@ impl Config {
                 e
             )
         })?;
-        let config: Config = toml::from_str(&content).map_err(|e| {
+        let mut val: toml::Value = content.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse global config at {}: {}",
+                global_path.display(),
+                e
+            )
+        })?;
+        let mut warnings = Vec::new();
+        normalize_legacy_tables(&mut val, &global_path.display().to_string(), &mut warnings);
+        emit_legacy_warnings(&warnings);
+        let config: Config = val.try_into().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse global config at {}: {}",
                 global_path.display(),
@@ -3831,7 +4017,8 @@ impl Config {
             &mut warnings,
         );
         emit_legacy_warnings(&warnings);
-        apply_endpoint_inheritance_policy(&mut global_val, &local_val);
+        let active_named_profile = crate::profile::named::active().ok().flatten().is_some();
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, active_named_profile);
         Ok(merge_toml(global_val, local_val))
     }
 
@@ -3870,6 +4057,9 @@ impl Config {
                 for w in deprecated_executor_warnings_for_toml(&content) {
                     eprintln!("warning: ({}) {}", label, w);
                 }
+                for w in deprecated_model_prefix_warnings_for_toml(&content) {
+                    eprintln!("warning: ({}) {}", label, w);
+                }
             }
         }
 
@@ -3879,13 +4069,23 @@ impl Config {
             .and_then(|m| m.as_str())
             .is_some();
 
-        apply_endpoint_inheritance_policy(&mut global_val, &local_val);
+        let active_named_profile = crate::profile::named::active().ok().flatten().is_some();
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, active_named_profile);
         let mut merged = merge_toml(global_val.clone(), local_val.clone());
         strip_global_only_model_roles(&mut merged, &global_val, &local_val);
         let mut config: Config = merged
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to deserialize merged config: {}", e))?;
         config.agent_model_is_local = agent_model_is_local;
+
+        // Note: named profile resolution is now a *file swap*, not an overlay.
+        // `wg profile use <name>` copies `~/.wg/profiles/<name>.toml` over
+        // `~/.wg/config.toml`, so by the time we read the global config above
+        // it already reflects the active profile. The `~/.wg/active-profile`
+        // pointer is used only for user-facing labels and for the endpoint
+        // inheritance exception above; model routing authority is handled by
+        // `wg profile use`, which removes local model-routing keys that would
+        // shadow the selected profile.
 
         config.validate_model_format()?;
 
@@ -3899,7 +4099,7 @@ impl Config {
     /// 2. Environment variables (provider-specific, e.g. OPENROUTER_API_KEY)
     /// 3. `[native_executor]` api_key in config.toml (legacy path)
     ///
-    /// `workgraph_dir` is the `.workgraph/` directory, used for resolving
+    /// `workgraph_dir` is the `.wg/` directory, used for resolving
     /// relative api_key_file paths and reading native_executor config.
     pub fn resolve_api_key_for_provider(
         &self,
@@ -3947,7 +4147,7 @@ impl Config {
             "No API key found for provider '{}'. Configure a key via:\n  \
              - wg endpoints add (recommended)\n  \
              - Set {} environment variable\n  \
-             - Add [native_executor] api_key to .workgraph/config.toml",
+             - Add [native_executor] api_key to .wg/config.toml",
             provider,
             EndpointConfig::env_var_names_for_provider(provider)
                 .first()
@@ -3955,7 +4155,7 @@ impl Config {
         ))
     }
 
-    /// Load configuration from .workgraph/config.toml (local only).
+    /// Load configuration from .wg/config.toml (local only).
     /// Returns default config if file doesn't exist.
     pub fn load(workgraph_dir: &Path) -> anyhow::Result<Self> {
         let config_path = workgraph_dir.join("config.toml");
@@ -3967,7 +4167,13 @@ impl Config {
         let content = fs::read_to_string(&config_path)
             .map_err(|e| anyhow::anyhow!("Failed to read config: {}", e))?;
 
-        let config: Config = toml::from_str(&content).map_err(|e| {
+        let mut val: toml::Value = content.parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse config at {}: {}", config_path.display(), e)
+        })?;
+        let mut warnings = Vec::new();
+        normalize_legacy_tables(&mut val, &config_path.display().to_string(), &mut warnings);
+        emit_legacy_warnings(&warnings);
+        let config: Config = val.try_into().map_err(|e| {
             anyhow::anyhow!("Failed to parse config at {}: {}", config_path.display(), e)
         })?;
 
@@ -3982,6 +4188,13 @@ impl Config {
         // when explicit `executor = …` keys are still in config.toml so
         // users have one release to migrate.
         for warning in deprecated_executor_warnings_for_toml(&content) {
+            eprintln!("warning: {}", warning);
+        }
+
+        // Same one-release deprecation window for the legacy `local:` /
+        // `oai-compat:` model-spec prefixes, replaced by the canonical
+        // `nex:` (matches the `wg nex` subcommand).
+        for warning in deprecated_model_prefix_warnings_for_toml(&content) {
             eprintln!("warning: {}", warning);
         }
 
@@ -4045,7 +4258,7 @@ impl Config {
         }
     }
 
-    /// Save configuration to .workgraph/config.toml
+    /// Save configuration to .wg/config.toml
     pub fn save(&self, workgraph_dir: &Path) -> anyhow::Result<()> {
         let config_path = workgraph_dir.join("config.toml");
 
@@ -4086,10 +4299,10 @@ impl Config {
     ///   no auth) and `is_default = true`. Any preexisting entry named
     ///   `default` is replaced and all other entries lose `is_default`.
     /// - `model` (if Some) goes into `agent.model` and
-    ///   `coordinator.model`. When combined with `endpoint`, the model
-    ///   name is prefixed with `local:` so the provider:model validator
-    ///   accepts it on reload; when `model` is provider-prefixed
-    ///   already (`claude:opus`), it's used verbatim.
+    ///   `dispatcher.model`. When combined with `endpoint`, the model
+    ///   name is prefixed with `nex:` (canonical, matches `wg nex`) so
+    ///   the provider:model validator accepts it on reload; when `model`
+    ///   is provider-prefixed already (`claude:opus`), it's used verbatim.
     /// - `endpoint` must start with `http://` or `https://`; otherwise
     ///   this fn returns an error before mutating anything.
     ///
@@ -4110,14 +4323,16 @@ impl Config {
             anyhow::bail!("Endpoint must be an http:// or https:// URL (got: {})", url);
         }
 
-        // With an endpoint, bare model names need a `local:` prefix to
-        // pass the provider:model validator.
+        // With an endpoint, bare model names need a `nex:` prefix to
+        // pass the provider:model validator. The `nex:` prefix is the
+        // canonical form (matches the `wg nex` subcommand); `local:` and
+        // `oai-compat:` are deprecated aliases retained for back-compat.
         let effective_model: Option<String> = if endpoint.is_some() {
             model.map(|m| {
                 if m.contains(':') {
                     m.to_string()
                 } else {
-                    format!("local:{}", m)
+                    format!("nex:{}", m)
                 }
             })
         } else {
@@ -4140,6 +4355,7 @@ impl Config {
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             });
@@ -4155,8 +4371,8 @@ impl Config {
         Ok(summary)
     }
 
-    /// Save configuration to the global path (~/.workgraph/config.toml).
-    /// Creates the ~/.workgraph/ directory if needed.
+    /// Save configuration to the global path (~/.wg/config.toml).
+    /// Creates the ~/.wg/ directory if needed.
     pub fn save_global(&self) -> anyhow::Result<()> {
         let global_dir = Self::global_dir()?;
         fs::create_dir_all(&global_dir).map_err(|e| {
@@ -4241,7 +4457,8 @@ impl Config {
         // source map reflects the effective merged config: a global endpoint
         // entry that's been suppressed because local opted out should not
         // appear as "from global" in `wg config --list`.
-        apply_endpoint_inheritance_policy(&mut global_val, &local_val);
+        let active_named_profile = crate::profile::named::active().ok().flatten().is_some();
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, active_named_profile);
 
         // Record sources: global first, then local overwrites
         let mut sources = BTreeMap::new();
@@ -4921,7 +5138,7 @@ executor = "claude"
 model = "haiku"
 
 [coordinator]
-executor = "amplifier"
+executor = "native"
 "#,
         )
         .unwrap();
@@ -4941,7 +5158,7 @@ executor = "amplifier"
             t["coordinator"].as_table().unwrap()["executor"]
                 .as_str()
                 .unwrap(),
-            "amplifier"
+            "native"
         );
     }
 
@@ -5162,11 +5379,18 @@ model = "claude:haiku"
 "#;
         fs::write(temp_dir.path().join("config.toml"), local_toml).unwrap();
 
-        // This test depends on whether ~/.workgraph/config.toml exists on the
+        // This test depends on whether ~/.wg/config.toml exists on the
         // machine, but the merge should work either way.  If the global config
         // uses old format, the merge may fail — that's OK in that scenario.
+        //
+        // Under the file-swap profile design, local config always overrides
+        // global (and global IS the active profile snapshot). So regardless of
+        // which profile is active on the test machine, local "claude:haiku"
+        // must win.
         match Config::load_merged(temp_dir.path()) {
-            Ok(config) => assert_eq!(config.agent.model, "claude:haiku"),
+            Ok(config) => {
+                assert_eq!(config.agent.model, "claude:haiku");
+            }
             Err(e) => {
                 let msg = e.to_string();
                 assert!(
@@ -5207,7 +5431,11 @@ model = "claude:haiku"
     #[test]
     fn test_global_config_path() {
         let path = Config::global_config_path().unwrap();
-        assert!(path.ends_with(".workgraph/config.toml"));
+        let s = path.to_string_lossy();
+        assert!(
+            s.ends_with(".wg/config.toml") || s.ends_with(".workgraph/config.toml"),
+            "expected canonical .wg/config.toml or legacy fallback, got {s}"
+        );
     }
 
     #[test]
@@ -5572,6 +5800,7 @@ model = "claude:haiku"
                 api_key: Some("sk-test-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             }],
@@ -5593,6 +5822,7 @@ model = "claude:haiku"
                 api_key: Some("sk-test".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             }],
@@ -5613,6 +5843,7 @@ model = "claude:haiku"
                     api_key: Some("sk-first".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5624,6 +5855,7 @@ model = "claude:haiku"
                     api_key: Some("sk-default".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -5635,6 +5867,7 @@ model = "claude:haiku"
                     api_key: Some("sk-third".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5658,6 +5891,7 @@ model = "claude:haiku"
                     api_key: Some("ant-key".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5669,6 +5903,7 @@ model = "claude:haiku"
                     api_key: Some("sk-first".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5680,6 +5915,7 @@ model = "claude:haiku"
                     api_key: Some("sk-second".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5702,6 +5938,7 @@ model = "claude:haiku"
                 api_key: Some("sk-or-test".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -5734,6 +5971,7 @@ model = "claude:haiku"
                     api_key: None,
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -5745,6 +5983,7 @@ model = "claude:haiku"
                     api_key: None,
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -5766,6 +6005,7 @@ model = "claude:haiku"
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             }],
@@ -5789,6 +6029,7 @@ model = "claude:haiku"
                 api_key: Some("sk-or-test-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -5817,6 +6058,7 @@ model = "claude:haiku"
             api_key: Some("sk-inline".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5834,6 +6076,7 @@ model = "claude:haiku"
             api_key: Some("sk-inline".to_string()),
             api_key_file: Some("/nonexistent/file".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5855,6 +6098,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5875,6 +6119,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5892,6 +6137,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some("/nonexistent/path/key.txt".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5914,6 +6160,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5935,6 +6182,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some("keys/test.key".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5953,6 +6201,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5974,6 +6223,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -5999,6 +6249,7 @@ model = "claude:haiku"
             api_key: Some("sk-inline-wins".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -6026,6 +6277,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -6053,6 +6305,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -6097,6 +6350,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some("~/.config/workgraph/openai.key".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -6118,6 +6372,7 @@ model = "claude:haiku"
                     api_key: Some("sk-or-test".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -6129,6 +6384,7 @@ model = "claude:haiku"
                     api_key: Some("sk-ant-test".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -6531,6 +6787,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some("/nonexistent/path/to/api-key.txt".into()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         });
@@ -6554,6 +6811,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         });
@@ -6577,6 +6835,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         });
@@ -6611,6 +6870,7 @@ model = "claude:haiku"
             api_key: None,
             api_key_file: Some("/nonexistent/path/to/key.txt".into()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         });
@@ -6796,6 +7056,38 @@ provider = "openrouter"
         assert_eq!(provider_to_executor("gemini"), "native");
         assert_eq!(provider_to_executor("ollama"), "native");
         assert_eq!(provider_to_executor("local"), "native");
+        assert_eq!(provider_to_executor("nex"), "native");
+    }
+
+    #[test]
+    fn test_parse_model_spec_strict_rejects_amplifier_with_migration_message() {
+        // amplifier was a CLI handler that was never tested; removed entirely.
+        // Strict parsing must reject `amplifier:foo` with a clear migration
+        // message so users coming back to old configs get pointed at
+        // claude:/codex:/nex: instead of getting a generic "unknown provider"
+        // error.
+        let err = parse_model_spec_strict("amplifier:claude-3-haiku")
+            .expect_err("amplifier: prefix must be rejected");
+        assert!(
+            err.message.contains("amplifier executor was removed"),
+            "error must call out the removal explicitly, got: {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("claude:")
+                && err.message.contains("codex:")
+                && err.message.contains("nex:"),
+            "error must list the three valid handler prefixes, got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_amplifier_not_in_known_providers() {
+        // Belt-and-suspenders: KNOWN_PROVIDERS should never contain "amplifier"
+        // — the strict parser branches on the prefix before this check, but
+        // pinning this guards against a future re-introduction.
+        assert!(!KNOWN_PROVIDERS.contains(&"amplifier"));
     }
 
     #[test]
@@ -6803,11 +7095,134 @@ provider = "openrouter"
         assert_eq!(provider_to_native_provider("openrouter"), "openrouter");
         assert_eq!(provider_to_native_provider("openai"), "oai-compat");
         assert_eq!(provider_to_native_provider("oai-compat"), "oai-compat");
+        assert_eq!(provider_to_native_provider("nex"), "oai-compat");
         assert_eq!(provider_to_native_provider("claude"), "anthropic");
         assert_eq!(provider_to_native_provider("codex"), "oai-compat");
         assert_eq!(provider_to_native_provider("gemini"), "oai-compat");
         assert_eq!(provider_to_native_provider("ollama"), "local");
         assert_eq!(provider_to_native_provider("local"), "local");
+    }
+
+    #[test]
+    fn test_provider_to_resolved_provider_preserves_codex_route() {
+        assert_eq!(provider_to_resolved_provider("codex"), "codex");
+        assert_eq!(provider_to_resolved_provider("nex"), "oai-compat");
+        assert_eq!(provider_to_resolved_provider("openrouter"), "openrouter");
+        assert_eq!(provider_to_resolved_provider("claude"), "anthropic");
+    }
+
+    #[test]
+    fn test_native_provider_to_prefix_canonical_nex() {
+        // Internal "oai-compat" / "openai" / "local" → user-facing "nex:"
+        // (canonical, matches `wg nex`). The deprecated "oai-compat:" /
+        // "local:" forms still parse, but we never emit them.
+        assert_eq!(native_provider_to_prefix("oai-compat"), "nex");
+        assert_eq!(native_provider_to_prefix("openai"), "nex");
+        assert_eq!(native_provider_to_prefix("local"), "nex");
+        // Canonical handler-name prefixes pass through.
+        assert_eq!(native_provider_to_prefix("anthropic"), "claude");
+        assert_eq!(native_provider_to_prefix("openrouter"), "openrouter");
+        assert_eq!(native_provider_to_prefix("codex"), "codex");
+    }
+
+    #[test]
+    fn test_deprecated_provider_prefix_replacement() {
+        assert_eq!(deprecated_provider_prefix_replacement("local"), Some("nex"));
+        assert_eq!(
+            deprecated_provider_prefix_replacement("oai-compat"),
+            Some("nex")
+        );
+        // Not deprecated:
+        assert_eq!(deprecated_provider_prefix_replacement("nex"), None);
+        assert_eq!(deprecated_provider_prefix_replacement("claude"), None);
+        assert_eq!(deprecated_provider_prefix_replacement("openrouter"), None);
+    }
+
+    #[test]
+    fn test_nex_prefix_routes_to_native_handler() {
+        // The whole point of the rename: nex:<model> must route to the
+        // native (in-process nex) handler, just like local:/oai-compat: did.
+        let spec = parse_model_spec("nex:qwen3-coder-30b");
+        assert_eq!(spec.provider.as_deref(), Some("nex"));
+        assert_eq!(spec.model_id, "qwen3-coder-30b");
+        assert_eq!(provider_to_executor("nex"), "native");
+    }
+
+    #[test]
+    fn test_deprecated_model_prefix_warnings_local() {
+        let toml = r#"
+[agent]
+model = "local:qwen3-coder"
+
+[tiers]
+fast = "local:qwen3-coder"
+"#;
+        let warnings = deprecated_model_prefix_warnings_for_toml(toml);
+        // Two model strings with deprecated `local:` prefix → two warnings.
+        assert_eq!(warnings.len(), 2, "got: {:?}", warnings);
+        for w in &warnings {
+            assert!(
+                w.contains("local:"),
+                "warning must mention local: — got {}",
+                w
+            );
+            assert!(w.contains("nex:"), "warning must suggest nex: — got {}", w);
+            assert!(
+                w.contains("wg migrate config"),
+                "warning must hint at migrate command — got {}",
+                w,
+            );
+        }
+    }
+
+    #[test]
+    fn test_deprecated_model_prefix_warnings_oai_compat() {
+        let toml = r#"
+[agent]
+model = "oai-compat:gpt-5"
+"#;
+        let warnings = deprecated_model_prefix_warnings_for_toml(toml);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("oai-compat:"));
+        assert!(warnings[0].contains("nex:gpt-5"));
+    }
+
+    #[test]
+    fn test_deprecated_model_prefix_warnings_canonical_silent() {
+        // `nex:` (canonical) and `claude:` (handler-name match) must NOT
+        // emit a warning. Same for `openrouter:` — that one keeps its
+        // implicit-endpoint convenience and stays.
+        let toml = r#"
+[agent]
+model = "nex:qwen3-coder"
+
+[tiers]
+fast = "claude:haiku"
+standard = "openrouter:anthropic/claude-sonnet-4-6"
+"#;
+        let warnings = deprecated_model_prefix_warnings_for_toml(toml);
+        assert!(
+            warnings.is_empty(),
+            "no warnings expected; got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_deprecated_model_prefix_warnings_includes_path() {
+        // The warning must include a dotted path so users can find the
+        // offending field in their config.toml.
+        let toml = r#"
+[agent]
+model = "local:qwen3-coder"
+"#;
+        let warnings = deprecated_model_prefix_warnings_for_toml(toml);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("agent.model"),
+            "warning must include the dotted path 'agent.model' — got {}",
+            warnings[0],
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6869,6 +7284,20 @@ provider = "openrouter"
         // Model ID should be the bare part without the claude: prefix
         assert_eq!(resolved.model, "claude-sonnet-4-6");
         assert_eq!(resolved.provider, Some("anthropic".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_model_for_role_codex_prefix_preserves_cli_provider() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("codex:gpt-5.4-mini".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
+        assert_eq!(resolved.model, "gpt-5.4-mini");
+        assert_eq!(resolved.provider, Some("codex".to_string()));
     }
 
     #[test]
@@ -7070,6 +7499,7 @@ provider = "openrouter"
             api_key: Some("sk-endpoint-key".into()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         });
@@ -7093,6 +7523,7 @@ provider = "openrouter"
             api_key: None,
             api_key_file: Some(key_file.to_string_lossy().into_owned()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         });
@@ -7138,6 +7569,7 @@ provider = "openrouter"
             api_key: Some("sk-endpoint-wins".into()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         });
@@ -7264,7 +7696,7 @@ model = "claude:haiku"
 "#,
         )
         .unwrap();
-        apply_endpoint_inheritance_policy(&mut global, &local);
+        apply_endpoint_inheritance_policy(&mut global, &local, false);
         let merged = merge_toml(global, local);
         let config: Config = merged.try_into().unwrap();
         assert!(
@@ -7295,7 +7727,7 @@ is_default = true
 "#,
         )
         .unwrap();
-        apply_endpoint_inheritance_policy(&mut global, &local);
+        apply_endpoint_inheritance_policy(&mut global, &local, false);
         let merged = merge_toml(global, local);
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
@@ -7318,7 +7750,7 @@ inherit_global = true
 "#,
         )
         .unwrap();
-        apply_endpoint_inheritance_policy(&mut global, &local);
+        apply_endpoint_inheritance_policy(&mut global, &local, false);
         let merged = merge_toml(global, local);
         let config: Config = merged.try_into().unwrap();
         assert_eq!(
@@ -7352,7 +7784,7 @@ is_default = true
 "#,
         )
         .unwrap();
-        apply_endpoint_inheritance_policy(&mut global, &local);
+        apply_endpoint_inheritance_policy(&mut global, &local, false);
         let merged = merge_toml(global, local);
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.llm_endpoints.endpoints.len(), 1);
@@ -7535,7 +7967,7 @@ is_default = true
 
         let mut global_val = Config::load_toml_value(global_path.path()).unwrap();
         let local_val = Config::load_toml_value(local_path.path()).unwrap();
-        apply_endpoint_inheritance_policy(&mut global_val, &local_val);
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, false);
         let merged = merge_toml(global_val, local_val);
 
         let config: Config = merged.try_into().unwrap();
@@ -7577,7 +8009,7 @@ inherit_global = true
 
         let mut global_val = Config::load_toml_value(global_path.path()).unwrap();
         let local_val = Config::load_toml_value(local_path.path()).unwrap();
-        apply_endpoint_inheritance_policy(&mut global_val, &local_val);
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, false);
         let merged = merge_toml(global_val, local_val);
 
         let config: Config = merged.try_into().unwrap();
@@ -7591,6 +8023,80 @@ inherit_global = true
     }
 
     #[test]
+    fn test_active_named_profile_endpoints_propagate_by_default() {
+        // Named profiles are authoritative route selections. When a profile is
+        // active, its global endpoints should be visible in a repo that has no
+        // local endpoint table, so `wg profile use nex` is enough for routing.
+        let global_path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            global_path.path(),
+            r#"
+[llm_endpoints]
+[[llm_endpoints.endpoints]]
+name = "default"
+provider = "oai-compat"
+url = "http://127.0.0.1:8088"
+is_default = true
+"#,
+        )
+        .unwrap();
+
+        let local_path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(local_path.path(), "").unwrap();
+
+        let mut global_val = Config::load_toml_value(global_path.path()).unwrap();
+        let local_val = Config::load_toml_value(local_path.path()).unwrap();
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, true);
+        let merged = merge_toml(global_val, local_val);
+
+        let config: Config = merged.try_into().unwrap();
+        assert_eq!(config.llm_endpoints.endpoints.len(), 1);
+        assert_eq!(config.llm_endpoints.endpoints[0].provider, "oai-compat");
+        assert_eq!(
+            config.llm_endpoints.endpoints[0].url.as_deref(),
+            Some("http://127.0.0.1:8088")
+        );
+    }
+
+    #[test]
+    fn test_active_named_profile_endpoints_can_be_explicitly_blocked() {
+        let global_path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            global_path.path(),
+            r#"
+[llm_endpoints]
+[[llm_endpoints.endpoints]]
+name = "default"
+provider = "oai-compat"
+url = "http://127.0.0.1:8088"
+is_default = true
+"#,
+        )
+        .unwrap();
+
+        let local_path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            local_path.path(),
+            r#"
+[llm_endpoints]
+inherit_global = false
+"#,
+        )
+        .unwrap();
+
+        let mut global_val = Config::load_toml_value(global_path.path()).unwrap();
+        let local_val = Config::load_toml_value(local_path.path()).unwrap();
+        apply_endpoint_inheritance_policy(&mut global_val, &local_val, true);
+        let merged = merge_toml(global_val, local_val);
+
+        let config: Config = merged.try_into().unwrap();
+        assert!(
+            config.llm_endpoints.endpoints.is_empty(),
+            "explicit inherit_global=false should block active profile endpoints"
+        );
+    }
+
+    #[test]
     fn test_resolve_api_key_from_merged_endpoints() {
         // Build a config with endpoints (as if loaded from global)
         let mut config = Config::default();
@@ -7601,6 +8107,7 @@ inherit_global = true
             api_key: Some("sk-or-from-endpoint".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             model: None,
             is_default: true,
             context_window: None,
@@ -7779,7 +8286,7 @@ fetch_max_chars = 8000
 
     /// Legacy `search_backend` field: no longer declared on the struct,
     /// but existing user configs may still have it set (the project's
-    /// .workgraph/config.toml and tests have shipped with it for a
+    /// .wg/config.toml and tests have shipped with it for a
     /// while). serde silently ignores unknown fields by default, so
     /// deserialization must succeed.
     #[test]
@@ -7801,13 +8308,10 @@ fetch_max_chars = 16000
             .unwrap();
         // Both endpoint + model mentions in summary.
         assert!(summary.iter().any(|s| s.contains("http://lambda01:8089")));
-        assert!(summary.iter().any(|s| s.contains("local:qwen3-coder")));
-        // Model gets the local: prefix.
-        assert_eq!(
-            config.coordinator.model.as_deref(),
-            Some("local:qwen3-coder")
-        );
-        assert_eq!(config.agent.model, "local:qwen3-coder");
+        assert!(summary.iter().any(|s| s.contains("nex:qwen3-coder")));
+        // Model gets the nex: prefix (canonical, matches `wg nex`).
+        assert_eq!(config.coordinator.model.as_deref(), Some("nex:qwen3-coder"));
+        assert_eq!(config.agent.model, "nex:qwen3-coder");
         // Endpoint entry is default.
         let default_ep = config
             .llm_endpoints
@@ -8089,5 +8593,33 @@ executor = "native"
             "second pass must not re-warn after migration, got {:?}",
             warnings2
         );
+    }
+
+    #[test]
+    fn test_local_config_load_normalizes_coordinator_alias() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        fs::create_dir_all(&wg_dir).unwrap();
+        fs::write(
+            wg_dir.join("config.toml"),
+            r#"
+[coordinator]
+max_agents = 2
+model = "claude:opus"
+
+[dispatcher]
+model = "codex:gpt-5.5"
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&wg_dir).expect("legacy+canonical local config should load");
+        assert_eq!(cfg.coordinator.max_agents, 2);
+        assert_eq!(
+            cfg.coordinator.model.as_deref(),
+            Some("codex:gpt-5.5"),
+            "canonical [dispatcher].model must win over legacy [coordinator].model"
+        );
+        assert_eq!(cfg.coordinator.effective_executor(), "codex");
     }
 }

@@ -245,10 +245,10 @@ If no placement changes are needed, set `placement` to null.
 {exec_mode_descriptions}
 
 ## context_scope Selection
-- **clean**: Self-contained computation/writing, no workgraph interaction needed.
+- **clean**: Self-contained computation/writing, no WG interaction needed.
 - **task**: Standard implementation (default if unsure).
 - **graph**: Integration tasks spanning multiple components (3+ dependencies).
-- **full**: Meta-tasks about workgraph itself.
+- **full**: Meta-tasks about WG itself.
 {placement_section}
 ## Response
 
@@ -659,9 +659,5 @@ mod tests {
         // native executor — same valid modes as claude
         assert_eq!(validate_exec_mode(Some("full"), "native"), "full");
         assert_eq!(validate_exec_mode(Some("shell"), "native"), "full");
-
-        // amplifier executor — same valid modes as claude
-        assert_eq!(validate_exec_mode(Some("light"), "amplifier"), "light");
-        assert_eq!(validate_exec_mode(Some("shell"), "amplifier"), "full");
     }
 }

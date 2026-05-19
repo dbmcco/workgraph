@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Manual section 4 (Coordination) provides comprehensive documentation of workgraph's service daemon, coordinator features, dispatch mechanisms, and execution models. The audit reveals **high accuracy** between documented features and current CLI implementation, with all major command groups and configuration options verified as correct.
+Manual section 4 (Coordination) provides comprehensive documentation of wg's service daemon, coordinator features, dispatch mechanisms, and execution models. The audit reveals **high accuracy** between documented features and current CLI implementation, with all major command groups and configuration options verified as correct.
 
 ## Verification Results
 
@@ -222,10 +222,10 @@ The manual documents comprehensive IPC commands table. All major IPC commands ar
 - ✅ `docs/manual/04-coordination.typ` exists (large file)
 
 ### Related Service Files Referenced
-- ✅ `.workgraph/service/state.json` (line 11)
-- ✅ `.workgraph/service/daemon.log` (line 13)
-- ✅ `.workgraph/service/daemon.sock` (line 215)
-- ✅ `.workgraph/agents/registry.json` (line 115)
+- ✅ `.wg/service/state.json` (line 11)
+- ✅ `.wg/service/daemon.log` (line 13)
+- ✅ `.wg/service/daemon.sock` (line 215)
+- ✅ `.wg/agents/registry.json` (line 115)
 
 ## Conclusion
 

@@ -13,7 +13,7 @@ use workgraph::parser::{load_graph, save_graph};
 pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let mut error: Option<anyhow::Error> = None;
@@ -97,6 +97,13 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
                 ));
                 return false;
             }
+            Status::FailedPendingEval => {
+                error = Some(anyhow::anyhow!(
+                    "Cannot claim task '{}': task is pending rescue evaluation",
+                    id
+                ));
+                return false;
+            }
         }
 
         prev_status = format!("{:?}", task.status);
@@ -149,7 +156,7 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
 pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let mut error: Option<anyhow::Error> = None;
@@ -206,6 +213,13 @@ pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
             Status::PendingEval => {
                 error = Some(anyhow::anyhow!(
                     "Cannot unclaim task '{}': task is pending evaluation",
+                    id
+                ));
+                return false;
+            }
+            Status::FailedPendingEval => {
+                error = Some(anyhow::anyhow!(
+                    "Cannot unclaim task '{}': task is pending rescue evaluation",
                     id
                 ));
                 return false;
@@ -418,7 +432,7 @@ mod tests {
     fn test_claim_uninitialized_workgraph_fails() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
-        // Don't initialize workgraph
+        // Don't initialize WG
 
         let result = claim(dir_path, "t1", None);
         assert!(result.is_err());
@@ -497,7 +511,7 @@ mod tests {
     fn test_unclaim_uninitialized_workgraph_fails() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
-        // Don't initialize workgraph
+        // Don't initialize WG
 
         let result = unclaim(dir_path, "t1");
         assert!(result.is_err());

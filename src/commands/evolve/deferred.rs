@@ -51,7 +51,7 @@ pub struct DeferredOperation {
 // Evolver self-mutation deferral
 // ---------------------------------------------------------------------------
 
-/// Create a verified workgraph task for an evolver self-mutation operation.
+/// Create a verified WG task for an evolver self-mutation operation.
 /// The task requires human approval before the mutation can be applied.
 pub(crate) fn defer_self_mutation(
     op: &EvolverOperation,
@@ -109,13 +109,18 @@ pub(crate) fn defer_self_mutation(
         created_at: Some(Utc::now().to_rfc3339()),
         started_at: None,
         completed_at: None,
+        last_interaction_at: None,
         log: vec![],
         retry_count: 0,
         max_retries: None,
         failure_reason: None,
+        failure_class: None,
         model: None,
         provider: None,
         endpoint: None,
+        command_argv: vec![],
+        working_dir: None,
+        executor_preset_name: None,
         verify: Some("Human must approve evolver self-mutation before applying.".to_string()),
         verify_timeout: None,
         agent: None,
@@ -145,6 +150,8 @@ pub(crate) fn defer_self_mutation(
         exec_mode: None,
         verify_failures: 0,
         rescue_count: 0,
+        rescued: false,
+        meta_eval_attempts: 0,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,

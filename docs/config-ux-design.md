@@ -29,13 +29,13 @@ The audit (§2 "Full key inventory") already maps every key to G / P / B / N. Th
 | **MCP servers** | B but typically P | local default; global allowed | `[[mcp.servers]]` (audit §2 `[mcp]`) |
 | **Endpoints** | B (G shared, P override) | global: per route; local: only when shadowing | `[[llm_endpoints.endpoints]]` (audit §2 `[[llm_endpoints.endpoints]]`) |
 | **Agency identity bindings** | B (per-user content hashes) | global: post-`wg agency init` only | `[agency].assigner_agent` etc. (audit §2 `[agency]`) |
-| **External creds** | G-only (separate file) | never written by config init | `~/.config/workgraph/matrix.toml` (audit §2 "Matrix credentials — separate file") |
+| **External creds** | G-only (separate file) | never written by config init | `~/.config/wg/matrix.toml` (audit §2 "Matrix credentials — separate file") |
 | **Deprecated / no-op** | N | never written | `coordinator.compactor_*`, `agent.executor`, `dispatcher.executor`, `coordinator.verify_autospawn_enabled` (audit §2 "Code-level soon-to-deprecate" and §3) |
 
 **One-line reason per scope choice (cite audit):**
 
 - `[agent].model`, `[tiers]`, `[models.*]` are **B**: per-project model choices are common (audit §1 "Resolution cascades for model selection" — `agent.model` in *local* config skips tier cascade for `task_agent`).
-- `[dispatcher]` is functionally **G**: every key in audit §2 `[dispatcher]` is daemon-wide; project-local override is technically allowed but the daemon runs once for all projects in the workgraph dir, so overrides are surprising.
+- `[dispatcher]` is functionally **G**: every key in audit §2 `[dispatcher]` is daemon-wide; project-local override is technically allowed but the daemon runs once for all projects in the wg dir, so overrides are surprising.
 - `[[tag_routing]]`, `[project]` are **P**: explicitly per-project taxonomy (audit §2 `[[tag_routing]]` "P (project-specific tag taxonomies)").
 - `[agency]` identity hashes are **B/G**: content-addressable hashes are user-scoped, but per-project pinning is allowed (audit §2 `[agency]` "B (per project; identity hashes are content-addressable)").
 - Deprecated keys (audit §2 status column "deprecated") are **never written** by `wg config init` — see §6.
@@ -50,7 +50,7 @@ The audit (§4 "Minimal global config") shows the built-ins already cover this �
 
 1. **Stop emitting restated defaults.** When `wg config init` writes a config, it MUST only write keys whose value differs from the built-in default. The current codepath in `src/commands/setup.rs:121` (`build_config`) and `src/commands/config_cmd.rs` writes a full `Config` and serde keeps everything because `#[serde(skip_serializing_if = "is_default_executor")]` is only set on `agent.executor` (audit §2 footnote). **Rule:** every `default_*()` and `Default for *Config` impl gets a matching `skip_serializing_if` so the on-disk file is the *delta*, not the *snapshot*. Reason: the audit §3 "Confirmed staleness" shows that 75% of Erik's local config is restated defaults — the surface area is what makes it fragile.
 
-2. **Fix `Config::global_dir()` to mirror `main.rs::resolve_workgraph_dir`.** Currently `~/.workgraph` literal (audit §1 "Stale alert"); should be `~/.wg` first, fall back to `~/.workgraph` for legacy. Reason: silent divergence breaks new users — `wg init --global` writes `~/.wg/config.toml` but `Config::load_global()` reads `~/.workgraph/config.toml`.
+2. **Fix `Config::global_dir()` to mirror `main.rs::resolve_workgraph_dir`.** Currently `~/.wg` literal (audit §1 "Stale alert"); should be `~/.wg` first, fall back to `~/.wg` for legacy. Reason: silent divergence breaks new users — `wg init --global` writes `~/.wg/config.toml` but `Config::load_global()` reads `~/.wg/config.toml`.
 
 3. **Add `serde(alias)` for the renamed coordinator keys**: `coordinator_agent` accepts `chat_agent`, `max_coordinators` accepts `max_chats`. Reason: audit §1 "Special merge rules" — "Unknown keys are silently dropped" is the #1 footgun, and both keys are in active misuse in Erik's local config (audit §3).
 
@@ -111,7 +111,55 @@ is_default = true
 
 (Audit §3 line-280 footnote: replace stale `claude-sonnet-4` with `claude-sonnet-4-6` in `openrouter_default_registry()` — handled in implement task.)
 
-### 3.3 `.wg/config.toml` — minimal project (the workgraph repo case)
+### 3.2b `~/.wg/config.toml` — codex-cli route (updated 2026-04-28; bumped 2026-04-28 by bump-codex-defaults)
+
+For users running the OpenAI Codex CLI. Model tier mapping as of codex CLI v0.124.0:
+
+| Tier | Model | Notes |
+|------|-------|-------|
+| fast (haiku-equiv) | `codex:gpt-5.4-mini` | OpenAI's recommended subagent model; ~3x cheaper than gpt-5.4 |
+| standard (sonnet-equiv) | `codex:gpt-5.4` | Codex CLI default as of v0.124.0; 1M context |
+| premium (opus-equiv) | `codex:gpt-5.5` | Released 2026-04-23; OpenAI's current frontier model |
+
+Worker default = premium (`codex:gpt-5.5`). User preference: prefer newest
+capability for workers; the 2x cost vs gpt-5.4 is acceptable since gpt-5.5 is
+still ~3x cheaper than `claude:opus` per MTok. Meta-tasks (eval / FLIP /
+assign) stay on `gpt-5.4-mini` — there is no `gpt-5.5-mini`.
+
+**Deprecated model strings** (migrate with `wg migrate config`):
+- `codex:o1-pro` → `codex:gpt-5.4` (shutdown 2026-10-23)
+- `codex:gpt-5-codex` → `codex:gpt-5.4` (shutdown 2026-07-23)
+- `codex:gpt-5-mini` → `codex:gpt-5.4-mini`
+- `codex:gpt-5` → `codex:gpt-5.4`
+- `codex:gpt-5.4-pro` → `codex:gpt-5.5`
+
+```toml
+# ~/.wg/config.toml — written by `wg config init --global --route codex-cli`
+
+[agent]
+model = "codex:gpt-5.5"
+
+[tiers]
+fast = "codex:gpt-5.4-mini"
+standard = "codex:gpt-5.4"
+premium = "codex:gpt-5.5"
+
+[models.evaluator]
+model = "codex:gpt-5.4-mini"
+
+[models.assigner]
+model = "codex:gpt-5.4-mini"
+
+[models.flip_inference]
+model = "codex:gpt-5.4-mini"
+
+[models.flip_comparison]
+model = "codex:gpt-5.4-mini"
+```
+
+The `[models.evaluator]` / `[models.assigner]` / `[models.flip_inference]` / `[models.flip_comparison]` sections are critical — without them, agency meta-tasks (`.evaluate-*`, `.flip-*`, `.assign-*`) silently fall back to the built-in `claude:haiku` even on an all-codex project.
+
+### 3.3 `.wg/config.toml` — minimal project (the wg repo case)
 
 For a project that wants to override the global default to use claude CLI even when global is openrouter:
 
@@ -167,7 +215,7 @@ Per `feedback_launcher_history_in_config_ui.md`: the "what model?" / "what endpo
    ─────
    [Choose route default]
      claude:opus       (claude CLI route)
-     codex:gpt-5       (codex CLI route)
+     codex:gpt-5.5     (codex CLI route)
      openrouter:...    (openrouter route)
      local:...         (local nex route)
    [Type custom...]
@@ -222,7 +270,7 @@ Reason: audit §6 "Migration plan" — the lint pass is the safe first step; rew
 ```
 $ wg setup
 
-Welcome to workgraph. Let's get you configured.
+Welcome to wg. Let's get you configured.
 
 ?  Where should I write your config?
    ❯ Global (~/.wg/config.toml) — applies to every wg project
@@ -327,7 +375,11 @@ For each scope, runs:
 3. **Drop restated defaults** (audit §4 "What you should NOT keep in global"):
    - any key whose serialized value equals the built-in default
 4. **Fix known stale model strings** (audit §3 "Confirmed staleness", line 280):
-   - `openrouter:anthropic/claude-sonnet-4` → `openrouter:anthropic/claude-sonnet-4-6` if the registry doesn't know `-4`
+   - `openrouter:anthropic/claude-sonnet-4` → `openrouter:anthropic/claude-sonnet-4-6`
+   - `codex:o1-pro` → `codex:gpt-5.4` (o1-pro deprecated, shutdown 2026-10-23)
+   - `codex:gpt-5-codex` → `codex:gpt-5.4` (sunset 2026-07-23)
+   - `codex:gpt-5-mini` → `codex:gpt-5.4-mini`, `codex:gpt-5` → `codex:gpt-5.4`
+   - `codex:gpt-5.4-pro` → `codex:gpt-5.5`
 5. **Resolve `[models.default]` mismatch** (audit §3 line 280): if `[models.default].model` is non-default AND the user's `[tiers]` and `[[llm_endpoints.endpoints]]` all use a different provider, leave it alone but emit a one-line warning that says "this looks unintentional" — do NOT silently change a model choice (audit §3 line 281 "internally inconsistent").
 
 **Backup before write:** `~/.wg/config.toml.pre-migrate.<timestamp>`. Always.
@@ -375,7 +427,7 @@ The `wg config init`, `wg config lint`, and `wg migrate config` commands are des
 ## 8. Implementation checklist (for `implement-canonical-wg`)
 
 1. `src/config.rs`: add `skip_serializing_if = "is_default_*"` to every default-having field on every `Config` substruct. (Audit §2 has the full list.)
-2. `src/config.rs`: fix `Config::global_dir()` to mirror `main.rs::resolve_workgraph_dir` order (`~/.wg` → `~/.workgraph` fallback). (Audit §1 "Stale alert".)
+2. `src/config.rs`: fix `Config::global_dir()` to mirror `main.rs::resolve_workgraph_dir` order (`~/.wg` → `~/.wg` fallback). (Audit §1 "Stale alert".)
 3. `src/config.rs`: add `serde(alias = "chat_agent")` on `coordinator_agent` field, `serde(alias = "max_chats")` on `max_coordinators`. (Audit §3 "Naming inconsistencies".)
 4. `src/cli.rs` + `src/commands/config_cmd.rs`: add `wg config init` subcommand with `--global`, `--local`, `--route`, `--bare`, `--force`. Keep `wg config --init` as deprecated alias.
 5. `src/commands/config_cmd.rs`: implement `wg config lint` — walk merged config, flag deprecated/renamed/restated-default keys against the audit allowlist. (Audit §6 item 1.)

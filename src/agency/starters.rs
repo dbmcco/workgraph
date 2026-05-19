@@ -42,6 +42,12 @@ pub fn build_component(
         id,
         name: name.into(),
         description,
+        quality: 100,
+        domain_specificity: 0,
+        domain: vec![],
+        scope: None,
+        origin_instance_id: None,
+        parent_content_hash: None,
         category,
         content,
         performance: PerformanceRecord::default(),
@@ -66,6 +72,12 @@ pub fn build_outcome(
         id,
         name: name.into(),
         description,
+        quality: 100,
+        domain_specificity: 0,
+        domain: vec![],
+        scope: None,
+        origin_instance_id: None,
+        parent_content_hash: None,
         success_criteria,
         performance: PerformanceRecord::default(),
         lineage: Lineage::default(),
@@ -91,6 +103,12 @@ pub fn build_tradeoff(
         id,
         name: name.into(),
         description,
+        quality: 100,
+        domain_specificity: 0,
+        domain: vec![],
+        scope: None,
+        origin_instance_id: None,
+        parent_content_hash: None,
         acceptable_tradeoffs,
         unacceptable_tradeoffs,
         performance: PerformanceRecord::default(),
@@ -266,193 +284,220 @@ pub fn starter_tradeoffs() -> Vec<TradeoffConfig> {
 
 /// Return the role components for the assigner special agent.
 pub fn assigner_components() -> Vec<RoleComponent> {
-    vec![
-        build_component(
-            "task-to-component-matching",
-            "Evaluate closeness of fit between a task description and each candidate role component.",
-            ComponentCategory::Novel,
-            ContentRef::Name("task-to-component-matching".into()),
-        ),
-        build_component(
-            "task-to-outcome-matching",
-            "Evaluate closeness of fit between task requirements and a desired outcome specification.",
-            ComponentCategory::Novel,
-            ContentRef::Name("task-to-outcome-matching".into()),
-        ),
-        build_component(
-            "task-to-tradeoff-matching",
-            "Evaluate whether a task's constraints are compatible with a candidate trade-off configuration.",
-            ComponentCategory::Novel,
-            ContentRef::Name("task-to-tradeoff-matching".into()),
-        ),
-        build_component(
-            "historical-performance-weighting",
-            "Use past evaluation data on agents and primitives to weight match scores. A role component with strong performance in analogous tasks receives higher match weight.",
-            ComponentCategory::Novel,
-            ContentRef::Name("historical-performance-weighting".into()),
-        ),
-        build_component(
-            "composition-cache-search",
-            "Query the composition cache for pre-composed agents, rank by fit score, return best match. Used in performance mode.",
-            ComponentCategory::Novel,
-            ContentRef::Name("composition-cache-search".into()),
-        ),
-        build_component(
-            "primitive-first-composition",
-            "Assemble novel agent configurations from the primitive store without cache bias; record the composition rationale for retrospective analysis. Used in learning mode.",
-            ComponentCategory::Novel,
-            ContentRef::Name("primitive-first-composition".into()),
-        ),
-        build_component(
-            "task-clarification",
-            "When a task is missing one or more well-formed criteria (what it is, how to know when done, how to evaluate quality), request clarification before assigning.",
-            ComponentCategory::Novel,
-            ContentRef::Name("task-clarification".into()),
-        ),
-    ]
+    tag_scope(
+        vec![
+            build_component(
+                "task-to-component-matching",
+                "Evaluate closeness of fit between a task description and each candidate role component.",
+                ComponentCategory::Novel,
+                ContentRef::Name("task-to-component-matching".into()),
+            ),
+            build_component(
+                "task-to-outcome-matching",
+                "Evaluate closeness of fit between task requirements and a desired outcome specification.",
+                ComponentCategory::Novel,
+                ContentRef::Name("task-to-outcome-matching".into()),
+            ),
+            build_component(
+                "task-to-tradeoff-matching",
+                "Evaluate whether a task's constraints are compatible with a candidate trade-off configuration.",
+                ComponentCategory::Novel,
+                ContentRef::Name("task-to-tradeoff-matching".into()),
+            ),
+            build_component(
+                "historical-performance-weighting",
+                "Use past evaluation data on agents and primitives to weight match scores. A role component with strong performance in analogous tasks receives higher match weight.",
+                ComponentCategory::Novel,
+                ContentRef::Name("historical-performance-weighting".into()),
+            ),
+            build_component(
+                "composition-cache-search",
+                "Query the composition cache for pre-composed agents, rank by fit score, return best match. Used in performance mode.",
+                ComponentCategory::Novel,
+                ContentRef::Name("composition-cache-search".into()),
+            ),
+            build_component(
+                "primitive-first-composition",
+                "Assemble novel agent configurations from the primitive store without cache bias; record the composition rationale for retrospective analysis. Used in learning mode.",
+                ComponentCategory::Novel,
+                ContentRef::Name("primitive-first-composition".into()),
+            ),
+            build_component(
+                "task-clarification",
+                "When a task is missing one or more well-formed criteria (what it is, how to know when done, how to evaluate quality), request clarification before assigning.",
+                ComponentCategory::Novel,
+                ContentRef::Name("task-clarification".into()),
+            ),
+        ],
+        "meta:assigner",
+    )
+}
+
+/// Tag every component in `components` with the given scope, leaving other
+/// fields (and the content-derived hash ID) untouched.
+fn tag_scope(components: Vec<RoleComponent>, scope: &str) -> Vec<RoleComponent> {
+    components
+        .into_iter()
+        .map(|mut c| {
+            c.scope = Some(scope.to_string());
+            c
+        })
+        .collect()
 }
 
 /// Return the role components for the evaluator special agent.
 pub fn evaluator_components() -> Vec<RoleComponent> {
-    vec![
-        build_component(
-            "cardinal-scale-grading",
-            "Produce a numerical score (0.0–1.0) with calibrated confidence. The primary grading modality.",
-            ComponentCategory::Novel,
-            ContentRef::Name("cardinal-scale-grading".into()),
-        ),
-        build_component(
-            "ordinal-scale-grading",
-            "Rank performance relative to a reference set (other agents, historical baselines) without producing absolute scores. Useful when absolute calibration is difficult.",
-            ComponentCategory::Novel,
-            ContentRef::Name("ordinal-scale-grading".into()),
-        ),
-        build_component(
-            "rubric-interpretation",
-            "Parse and apply an explicit rubric provided with the task. Maps to rubric specification spectrum levels 1–4.",
-            ComponentCategory::Novel,
-            ContentRef::Name("rubric-interpretation".into()),
-        ),
-        build_component(
-            "domain-specific-evaluation-standards",
-            "Apply evaluation norms from a particular field (e.g., software engineering, research, creative writing). Invoked when task rubric specifies a domain standard.",
-            ComponentCategory::Novel,
-            ContentRef::Name("domain-specific-evaluation-standards".into()),
-        ),
-        build_component(
-            "underspecification-detection",
-            "Identify when a task has no rubric (control by omission) and flag this before grading rather than making arbitrary meaningmaking decisions.",
-            ComponentCategory::Novel,
-            ContentRef::Name("underspecification-detection".into()),
-        ),
-        build_component(
-            "grade-transparency",
-            "Produce grades with sufficient rationale that a human reviewer or peer evaluator can assess the grading quality. Makes the evaluator evaluable.",
-            ComponentCategory::Novel,
-            ContentRef::Name("grade-transparency".into()),
-        ),
-    ]
+    tag_scope(
+        vec![
+            build_component(
+                "cardinal-scale-grading",
+                "Produce a numerical score (0.0–1.0) with calibrated confidence. The primary grading modality.",
+                ComponentCategory::Novel,
+                ContentRef::Name("cardinal-scale-grading".into()),
+            ),
+            build_component(
+                "ordinal-scale-grading",
+                "Rank performance relative to a reference set (other agents, historical baselines) without producing absolute scores. Useful when absolute calibration is difficult.",
+                ComponentCategory::Novel,
+                ContentRef::Name("ordinal-scale-grading".into()),
+            ),
+            build_component(
+                "rubric-interpretation",
+                "Parse and apply an explicit rubric provided with the task. Maps to rubric specification spectrum levels 1–4.",
+                ComponentCategory::Novel,
+                ContentRef::Name("rubric-interpretation".into()),
+            ),
+            build_component(
+                "domain-specific-evaluation-standards",
+                "Apply evaluation norms from a particular field (e.g., software engineering, research, creative writing). Invoked when task rubric specifies a domain standard.",
+                ComponentCategory::Novel,
+                ContentRef::Name("domain-specific-evaluation-standards".into()),
+            ),
+            build_component(
+                "underspecification-detection",
+                "Identify when a task has no rubric (control by omission) and flag this before grading rather than making arbitrary meaningmaking decisions.",
+                ComponentCategory::Novel,
+                ContentRef::Name("underspecification-detection".into()),
+            ),
+            build_component(
+                "grade-transparency",
+                "Produce grades with sufficient rationale that a human reviewer or peer evaluator can assess the grading quality. Makes the evaluator evaluable.",
+                ComponentCategory::Novel,
+                ContentRef::Name("grade-transparency".into()),
+            ),
+        ],
+        "meta:evaluator",
+    )
 }
 
 /// Return the role components for the evolver special agent.
 pub fn evolver_components() -> Vec<RoleComponent> {
-    vec![
-        build_component(
-            "wording-mutation",
-            "Change the wording of a role component while preserving its general meaning. Tests whether articulation precision affects performance.",
-            ComponentCategory::Novel,
-            ContentRef::Name("wording-mutation".into()),
-        ),
-        build_component(
-            "component-substitution",
-            "Swap one role component for a similar-but-different one. Tests whether the conceptual difference between similar components is significant.",
-            ComponentCategory::Novel,
-            ContentRef::Name("component-substitution".into()),
-        ),
-        build_component(
-            "configuration-mutation",
-            "Change how role components are combined into a role or agent without changing the individual components. Tests whether composition structure matters.",
-            ComponentCategory::Novel,
-            ContentRef::Name("configuration-mutation".into()),
-        ),
-        build_component(
-            "randomisation",
-            "Select from the existing primitive pool and recombine without attractor-area bias. Explores existing primitive space without conventional constraints.",
-            ComponentCategory::Novel,
-            ContentRef::Name("randomisation".into()),
-        ),
-        build_component(
-            "bizarre-ideation",
-            "Generate entirely novel primitives unconstrained by the current store. Operates outside the existing primitive space.",
-            ComponentCategory::Novel,
-            ContentRef::Name("bizarre-ideation".into()),
-        ),
-        build_component(
-            "crossover-recombination",
-            "Blend attributes from two parent primitives to produce offspring that combine strengths of both.",
-            ComponentCategory::Novel,
-            ContentRef::Name("crossover-recombination".into()),
-        ),
-        build_component(
-            "gap-analysis",
-            "Identify structural gaps in the current primitive pool where new capabilities would improve coverage.",
-            ComponentCategory::Novel,
-            ContentRef::Name("gap-analysis".into()),
-        ),
-        build_component(
-            "retirement-identification",
-            "Identify and retire underperforming primitives based on evaluation data and usage patterns.",
-            ComponentCategory::Novel,
-            ContentRef::Name("retirement-identification".into()),
-        ),
-    ]
+    tag_scope(
+        vec![
+            build_component(
+                "wording-mutation",
+                "Change the wording of a role component while preserving its general meaning. Tests whether articulation precision affects performance.",
+                ComponentCategory::Novel,
+                ContentRef::Name("wording-mutation".into()),
+            ),
+            build_component(
+                "component-substitution",
+                "Swap one role component for a similar-but-different one. Tests whether the conceptual difference between similar components is significant.",
+                ComponentCategory::Novel,
+                ContentRef::Name("component-substitution".into()),
+            ),
+            build_component(
+                "configuration-mutation",
+                "Change how role components are combined into a role or agent without changing the individual components. Tests whether composition structure matters.",
+                ComponentCategory::Novel,
+                ContentRef::Name("configuration-mutation".into()),
+            ),
+            build_component(
+                "randomisation",
+                "Select from the existing primitive pool and recombine without attractor-area bias. Explores existing primitive space without conventional constraints.",
+                ComponentCategory::Novel,
+                ContentRef::Name("randomisation".into()),
+            ),
+            build_component(
+                "bizarre-ideation",
+                "Generate entirely novel primitives unconstrained by the current store. Operates outside the existing primitive space.",
+                ComponentCategory::Novel,
+                ContentRef::Name("bizarre-ideation".into()),
+            ),
+            build_component(
+                "crossover-recombination",
+                "Blend attributes from two parent primitives to produce offspring that combine strengths of both.",
+                ComponentCategory::Novel,
+                ContentRef::Name("crossover-recombination".into()),
+            ),
+            build_component(
+                "gap-analysis",
+                "Identify structural gaps in the current primitive pool where new capabilities would improve coverage.",
+                ComponentCategory::Novel,
+                ContentRef::Name("gap-analysis".into()),
+            ),
+            build_component(
+                "retirement-identification",
+                "Identify and retire underperforming primitives based on evaluation data and usage patterns.",
+                ComponentCategory::Novel,
+                ContentRef::Name("retirement-identification".into()),
+            ),
+        ],
+        "meta:evolver",
+    )
 }
 
 /// Return the role components for the agent creator special agent.
 pub fn creator_components() -> Vec<RoleComponent> {
-    vec![
-        build_component(
-            "research-literature-search",
-            "Search academic and practitioner literature for documented effective role structures, workflows, or task execution patterns. Target: role components and desired outcomes that have empirical grounding.",
-            ComponentCategory::Novel,
-            ContentRef::Name("research-literature-search".into()),
-        ),
-        build_component(
-            "analogous-domain-identification",
-            "Identify domains with structural similarities to the current work. Enables targeted distant search rather than undirected exploration.",
-            ComponentCategory::Novel,
-            ContentRef::Name("analogous-domain-identification".into()),
-        ),
-        build_component(
-            "structural-similarity-recognition",
-            "Given an existing primitive, recognise structurally similar capabilities in distant domains (e.g., systematic adversarial testing in software engineering maps to red team methodology in security).",
-            ComponentCategory::Novel,
-            ContentRef::Name("structural-similarity-recognition".into()),
-        ),
-        build_component(
-            "absorptive-capacity-assessment",
-            "Evaluate whether the current primitive store has enough related capability to usefully absorb a candidate new primitive (Cohen & Levinthal, 1990). Flag distant primitives that require prerequisite capabilities the agency does not yet have.",
-            ComponentCategory::Novel,
-            ContentRef::Name("absorptive-capacity-assessment".into()),
-        ),
-        build_component(
-            "federation-import",
-            "Recognise and import known-good primitives from other Agency instances. Internal proximity in the proximity continuum.",
-            ComponentCategory::Novel,
-            ContentRef::Name("federation-import".into()),
-        ),
-        build_component(
-            "primitive-candidate-specification",
-            "Articulate a candidate new primitive at the correct granularity: independently testable, meaningfully recombinable, single-typed. Produces specification with provenance notes.",
-            ComponentCategory::Novel,
-            ContentRef::Name("primitive-candidate-specification".into()),
-        ),
-    ]
+    tag_scope(
+        vec![
+            build_component(
+                "research-literature-search",
+                "Search academic and practitioner literature for documented effective role structures, workflows, or task execution patterns. Target: role components and desired outcomes that have empirical grounding.",
+                ComponentCategory::Novel,
+                ContentRef::Name("research-literature-search".into()),
+            ),
+            build_component(
+                "analogous-domain-identification",
+                "Identify domains with structural similarities to the current work. Enables targeted distant search rather than undirected exploration.",
+                ComponentCategory::Novel,
+                ContentRef::Name("analogous-domain-identification".into()),
+            ),
+            build_component(
+                "structural-similarity-recognition",
+                "Given an existing primitive, recognise structurally similar capabilities in distant domains (e.g., systematic adversarial testing in software engineering maps to red team methodology in security).",
+                ComponentCategory::Novel,
+                ContentRef::Name("structural-similarity-recognition".into()),
+            ),
+            build_component(
+                "absorptive-capacity-assessment",
+                "Evaluate whether the current primitive store has enough related capability to usefully absorb a candidate new primitive (Cohen & Levinthal, 1990). Flag distant primitives that require prerequisite capabilities the agency does not yet have.",
+                ComponentCategory::Novel,
+                ContentRef::Name("absorptive-capacity-assessment".into()),
+            ),
+            build_component(
+                "federation-import",
+                "Recognise and import known-good primitives from other Agency instances. Internal proximity in the proximity continuum.",
+                ComponentCategory::Novel,
+                ContentRef::Name("federation-import".into()),
+            ),
+            build_component(
+                "primitive-candidate-specification",
+                "Articulate a candidate new primitive at the correct granularity: independently testable, meaningfully recombinable, single-typed. Produces specification with provenance notes.",
+                ComponentCategory::Novel,
+                ContentRef::Name("primitive-candidate-specification".into()),
+            ),
+        ],
+        "meta:agent_creator",
+    )
 }
 
 /// Return the desired outcomes for special agents.
+///
+/// Each outcome is tagged with the agency v1.2.4 scope of the special agent
+/// it serves so the composer can bias selection at runtime.
 pub fn special_agent_outcomes() -> Vec<DesiredOutcome> {
-    vec![
+    let mut outcomes = vec![
         build_outcome(
             "Optimal agent-task assignment",
             "The closest available agent configuration for the task, with a confidence score, a match rationale, and a flag if the task was underspecified.",
@@ -490,12 +535,26 @@ pub fn special_agent_outcomes() -> Vec<DesiredOutcome> {
                 "Absorptive capacity assessment provided".into(),
             ],
         ),
-    ]
+    ];
+    // Tag in declaration order: assigner, evaluator, evolver, agent_creator.
+    let scopes = [
+        "meta:assigner",
+        "meta:evaluator",
+        "meta:evolver",
+        "meta:agent_creator",
+    ];
+    for (o, scope) in outcomes.iter_mut().zip(scopes.iter()) {
+        o.scope = Some((*scope).to_string());
+    }
+    outcomes
 }
 
 /// Return the trade-off configurations for special agents.
+///
+/// Each tradeoff is tagged with the scope of the special agent it serves
+/// (`meta:assigner`, `meta:evaluator`, …) so the composer can bias selection.
 pub fn special_agent_tradeoffs() -> Vec<TradeoffConfig> {
-    vec![
+    let mut tradeoffs = vec![
         // Assigner tradeoffs
         build_tradeoff(
             "Assigner Balanced",
@@ -584,7 +643,21 @@ pub fn special_agent_tradeoffs() -> Vec<TradeoffConfig> {
                 "Importing without checking existing store overlap".into(),
             ],
         ),
-    ]
+    ];
+    // Tag in declaration order: 1 Assigner, 1 Evaluator, 1 Evolver, then 4 Creator variants.
+    let scopes = [
+        "meta:assigner",
+        "meta:evaluator",
+        "meta:evolver",
+        "meta:agent_creator",
+        "meta:agent_creator",
+        "meta:agent_creator",
+        "meta:agent_creator",
+    ];
+    for (t, scope) in tradeoffs.iter_mut().zip(scopes.iter()) {
+        t.scope = Some((*scope).to_string());
+    }
+    tradeoffs
 }
 
 /// Return the roles for special agents, composed from their specific components and outcomes.
@@ -938,6 +1011,12 @@ pub(crate) fn crossover_tradeoffs(
         id,
         name: name.to_string(),
         description: description.to_string(),
+        quality: 100,
+        domain_specificity: 0,
+        domain: vec![],
+        scope: None,
+        origin_instance_id: None,
+        parent_content_hash: None,
         acceptable_tradeoffs: acceptable,
         unacceptable_tradeoffs: unacceptable,
         performance: PerformanceRecord::default(),
@@ -1047,6 +1126,7 @@ mod tests {
             timestamp: "2025-05-01T12:00:00Z".into(),
             model: None,
             source: "llm".to_string(),
+            loop_iteration: 0,
         }
     }
 
@@ -1273,7 +1353,7 @@ mod tests {
         let lineage = Lineage::mutation("parent-role", 2, "run-42");
         assert_eq!(lineage.parent_ids, vec!["parent-role"]);
         assert_eq!(lineage.generation, 3);
-        assert_eq!(lineage.created_by, "evolver-run-42");
+        assert_eq!(lineage.created_by, "evolver");
     }
 
     #[test]
@@ -1281,7 +1361,7 @@ mod tests {
         let lineage = Lineage::crossover(&["parent-a", "parent-b"], 5, "run-99");
         assert_eq!(lineage.parent_ids, vec!["parent-a", "parent-b"]);
         assert_eq!(lineage.generation, 6);
-        assert_eq!(lineage.created_by, "evolver-run-99");
+        assert_eq!(lineage.created_by, "evolver");
     }
 
     #[test]
@@ -1293,7 +1373,7 @@ mod tests {
         let loaded = load_role(&path).unwrap();
         assert_eq!(loaded.lineage.parent_ids, vec!["old-role"]);
         assert_eq!(loaded.lineage.generation, 2);
-        assert_eq!(loaded.lineage.created_by, "evolver-test-run");
+        assert_eq!(loaded.lineage.created_by, "evolver");
     }
 
     #[test]
@@ -1305,7 +1385,7 @@ mod tests {
         let loaded = load_tradeoff(&path).unwrap();
         assert_eq!(loaded.lineage.parent_ids, vec!["m-a", "m-b"]);
         assert_eq!(loaded.lineage.generation, 4);
-        assert_eq!(loaded.lineage.created_by, "evolver-xover-1");
+        assert_eq!(loaded.lineage.created_by, "evolver");
     }
 
     #[test]
@@ -1379,7 +1459,7 @@ performance:
         // Lineage tracks the parent
         assert_eq!(child.lineage.parent_ids, vec![parent.id.clone()]);
         assert_eq!(child.lineage.generation, parent.lineage.generation + 1);
-        assert_eq!(child.lineage.created_by, "evolver-evo-run-1");
+        assert_eq!(child.lineage.created_by, "evolver");
         // Performance starts fresh
         assert_eq!(child.performance.task_count, 0);
         assert!(child.performance.avg_score.is_none());
@@ -1472,7 +1552,7 @@ performance:
         assert!(child.lineage.parent_ids.contains(&parent_a.id));
         assert!(child.lineage.parent_ids.contains(&parent_b.id));
         assert_eq!(child.lineage.generation, 1); // max(0,0) + 1
-        assert_eq!(child.lineage.created_by, "evolver-xover-run");
+        assert_eq!(child.lineage.created_by, "evolver");
 
         // Name and description match what was passed in
         assert_eq!(child.name, "Careful-Fast Hybrid");
@@ -1888,17 +1968,17 @@ performance:
     }
 
     #[test]
-    fn test_build_tradeoff_different_acceptable_different_id() {
+    fn test_build_tradeoff_different_acceptable_same_id() {
         let m1 = build_tradeoff("M", "D", vec!["x".into()], vec![]);
         let m2 = build_tradeoff("M", "D", vec!["y".into()], vec![]);
-        assert_ne!(m1.id, m2.id);
+        assert_eq!(m1.id, m2.id);
     }
 
     #[test]
-    fn test_build_tradeoff_different_unacceptable_different_id() {
+    fn test_build_tradeoff_different_unacceptable_same_id() {
         let m1 = build_tradeoff("M", "D", vec![], vec!["x".into()]);
         let m2 = build_tradeoff("M", "D", vec![], vec!["y".into()]);
-        assert_ne!(m1.id, m2.id);
+        assert_eq!(m1.id, m2.id);
     }
 
     #[test]

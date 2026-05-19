@@ -1,6 +1,6 @@
-# Workgraph Documentation
+# WG Documentation
 
-Workgraph (`wg`) is a task coordination system designed for both humans and AI agents. It provides a dependency-aware task graph that enables parallel work coordination, progress tracking, and project analysis.
+WG (`wg`) is a task coordination system designed for both humans and AI agents. It provides a dependency-aware task graph that enables parallel work coordination, progress tracking, and project analysis.
 
 ## Table of Contents
 
@@ -159,7 +159,7 @@ The interactive wizard walks you through:
 - **Agency**: Whether to auto-assign agents and auto-evaluate completed work
 - **Max agents**: Number of parallel agents the coordinator can spawn
 
-This creates `~/.workgraph/config.toml`:
+This creates `~/.wg/config.toml`:
 
 ```toml
 [coordinator]
@@ -176,7 +176,7 @@ auto_assign = true
 auto_evaluate = true
 ```
 
-Project-local `.workgraph/config.toml` overrides global settings. Use `wg config --global` or `wg config --local` to adjust individual values, and `wg config --list` to see the merged configuration with source indicators.
+Project-local `.wg/config.toml` overrides global settings. Use `wg config --global` or `wg config --local` to adjust individual values, and `wg config --list` to see the merged configuration with source indicators.
 
 ### Initialize a New Project
 
@@ -184,7 +184,7 @@ Project-local `.workgraph/config.toml` overrides global settings. Use `wg config
 wg init
 ```
 
-Creates `.workgraph/graph.jsonl` in the current directory.
+Creates `.wg/graph.jsonl` in the current directory.
 
 ### Add Tasks
 
@@ -247,7 +247,7 @@ wg forecast
 
 ## Storage Format
 
-All data is stored in `.workgraph/graph.jsonl` - a newline-delimited JSON file with one node per line. This format is:
+All data is stored in `.wg/graph.jsonl` - a newline-delimited JSON file with one node per line. This format is:
 
 - Human-readable and editable
 - Version control friendly (line-based diffs)
@@ -260,7 +260,7 @@ Example content:
 {"kind":"task","id":"impl-api","title":"Implement API","status":"open","after":["design-api"]}
 ```
 
-Configuration is stored in `.workgraph/config.toml`:
+Configuration is stored in `.wg/config.toml`:
 
 ```toml
 [agent]
@@ -297,9 +297,9 @@ wg list --json | jq '[.[] | select(.status == "open")] | length'
 wg ready --json | jq -r '.[].id'
 ```
 
-### Peer Workgraphs
+### Peer WG Instances
 
-Workgraph instances in separate repositories can communicate via the peer system. Register peers with `wg peer add <name> <path>` and create cross-repo tasks with `wg add "Task" --repo <peer>`. See the [Command Reference](./COMMANDS.md) for details.
+WG instances in separate repositories can communicate via the peer system. Register peers with `wg peer add <name> <path>` and create cross-repo tasks with `wg add "Task" --repo <peer>`. See the [Command Reference](./COMMANDS.md) for details.
 
 ## See Also
 

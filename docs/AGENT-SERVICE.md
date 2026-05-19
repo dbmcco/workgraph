@@ -6,10 +6,10 @@ The agent service is a background daemon that automatically spawns agents on rea
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Service Daemon (wg service start)        │
+│              Dispatcher Daemon (wg service start)           │
 │                                                             │
 │  Unix socket listener  ←──── IPC: graph_changed, spawn,    │
-│  Coordinator loop            kill, pause, resume, status    │
+│  Dispatcher loop             kill, pause, resume, status    │
 │  Agent reaper                                               │
 │  Dead agent detector                                        │
 └──────┬──────────────┬──────────────┬───────────────────────┘
@@ -37,9 +37,9 @@ wg service stop                   # stop daemon (agents keep running)
 wg service stop --kill-agents     # stop daemon and agents
 ```
 
-## The Coordinator Tick
+## The Dispatcher Tick
 
-The daemon runs a coordinator tick on two triggers:
+(Historical name: "coordinator tick".) The daemon runs a dispatcher tick on two triggers:
 
 1. **IPC-driven**: Any command that modifies the graph (done, add, edit, fail, etc.) sends a `graph_changed` notification over the Unix socket, triggering an immediate tick
 2. **Safety-net poll**: A background tick every `poll_interval` seconds (default: 60s) catches manual graph.jsonl edits or missed events
@@ -140,11 +140,11 @@ Additional flags:
 | Flag | Description |
 |------|-------------|
 | `--port <PORT>` | Enable HTTP API on this port (optional) |
-| `--socket <SOCKET>` | Unix socket path (default: `.workgraph/service/daemon.sock`) |
+| `--socket <SOCKET>` | Unix socket path (default: `.wg/service/daemon.sock`) |
 | `--force` | Kill any existing daemon before starting (prevents stacked daemons) |
 | `--no-coordinator-agent` | Disable the persistent coordinator agent (LLM chat session) |
 
-CLI flags override config.toml values for the daemon's lifetime. The daemon forks into the background and writes its PID to `.workgraph/service/state.json`.
+CLI flags override config.toml values for the daemon's lifetime. The daemon forks into the background and writes its PID to `.wg/service/state.json`.
 
 ### `wg service stop`
 
@@ -198,7 +198,7 @@ Re-read config.toml or apply specific overrides without restarting.
 wg service reload                                  # re-read config.toml
 wg service reload --max-agents 8 --model claude:haiku  # apply overrides
 wg service reload --interval 120                   # change poll interval
-wg service reload --model local:qwen3-coder        # switch handler by switching model
+wg service reload --model nex:qwen3-coder          # switch handler by switching model
 ```
 
 Sends a `reconfigure` IPC message to the running daemon.
@@ -281,24 +281,25 @@ You don't pick a handler directly — wg derives it from the model spec's provid
 | Model spec example                          | Handler subprocess        | Wire protocol  | Endpoint                  |
 |---------------------------------------------|---------------------------|----------------|---------------------------|
 | `claude:opus` (and bare `opus`/`sonnet`)    | `claude` CLI              | Anthropic      | none (CLI auths itself)   |
-| `codex:gpt-5`                               | `codex` CLI               | OAI-compat     | none (CLI auths itself)   |
-| `local:qwen3-coder`                         | `native` (in-process nex) | OAI-compat     | required (`-e <url>`)     |
-| `openrouter:anthropic/claude-opus-4-6`      | `native` (in-process nex) | OAI-compat     | optional                  |
-| `oai-compat:gpt-5` / `openai:gpt-5`         | `native` (in-process nex) | OAI-compat     | required                  |
+| `codex:gpt-5.5`                             | `codex` CLI               | OAI-compat     | none (CLI auths itself)   |
+| `nex:qwen3-coder`                           | `native` (in-process nex) | OAI-compat     | required (`-e <url>`)     |
+| `openrouter:anthropic/claude-opus-4-7`      | `native` (in-process nex) | OAI-compat     | optional                  |
 | `ollama:llama3` / `vllm:*` / `llamacpp:*`   | `native` (in-process nex) | OAI-compat     | required                  |
 | (task with `exec` field set)                | `shell`                   | n/a            | n/a                       |
+
+The `local:` and `oai-compat:` (and `openai:`) prefixes are deprecated aliases for `nex:`; they still load with a stderr warning, and `wg migrate config` rewrites them.
 
 The mapping lives in one place: `src/dispatch/handler_for_model.rs`. Adding a new handler (aider, llm, …) is a one-arm change there; nothing else in the codebase needs to know.
 
 ```bash
 wg config -m claude:opus                                   # claude CLI
-wg config -m local:qwen3-coder -e http://127.0.0.1:8088    # nex against local server
-wg config -m openrouter:anthropic/claude-opus-4-6          # nex against openrouter
+wg config -m nex:qwen3-coder -e http://127.0.0.1:8088      # nex against local server
+wg config -m openrouter:anthropic/claude-opus-4-7          # nex against openrouter
 ```
 
 Legacy `--executor` / `-x` flags and `[agent].executor` / `[dispatcher].executor` config keys are deprecated. They still work for one release with a deprecation warning, but the model spec is the single source of truth. After the deprecation window, the executor surfaces are removed entirely.
 
-Custom handler argv templates can be defined in `.workgraph/executors/<name>.toml`.
+Custom handler argv templates can be defined in `.wg/executors/<name>.toml`.
 
 ### Environment variables injected into spawned agents
 
@@ -327,7 +328,7 @@ When the coordinator spawns an agent for a task:
 
 1. **Claim**: The task is claimed (status → `in-progress`)
 2. **Model resolution**: task.model > executor.model > coordinator.model/CLI --model
-3. **Identity injection**: If the task has an `agent` field, the agent's role and tradeoff are loaded from `.workgraph/agency/` and rendered into an identity prompt section
+3. **Identity injection**: If the task has an `agent` field, the agent's role and tradeoff are loaded from `.wg/agency/` and rendered into an identity prompt section
 4. **Provider resolution**: If the task has a `provider` field (set via the `provider:model` format in `--model`, e.g., `--model openai:gpt-4o`), the executor uses that provider. Supported providers: `anthropic`, `openai`, `openrouter`, `local`. The standalone `--provider` flag on `wg add`/`wg edit` still works but is deprecated.
 5. **Exec-mode resolution**: The task's `exec_mode` determines the agent's toolset:
    - `full` — all tools (default)
@@ -344,7 +345,7 @@ When the coordinator spawns an agent for a task:
    - The current `loop_iteration` (which pass this is)
    - A note about `--converged`: the agent can signal `wg done <task-id> --converged` to stop the cycle when work has stabilized
    - The `"converged"` tag is placed on the cycle header regardless of which member the agent completes
-8. **Wrapper script**: A bash script is generated at `.workgraph/agents/agent-N/run.sh`:
+8. **Wrapper script**: A bash script is generated at `.wg/agents/agent-N/run.sh`:
    - Runs the executor command (e.g., `claude --model opus --print "..."`)
    - Captures stdout/stderr to `output.log`
    - Sends heartbeats periodically
@@ -362,7 +363,7 @@ wg spawn my-task --model claude:haiku --timeout 30m
 
 ## Agent Registry
 
-Lives at `.workgraph/service/registry.json`. Protected by flock-based locking for concurrent access.
+Lives at `.wg/service/registry.json`. Protected by flock-based locking for concurrent access.
 
 Each entry tracks:
 - `id`: agent-N (incrementing counter)
@@ -416,7 +417,7 @@ wg dead-agents --purge --delete-dirs   # also delete agent work directories
 wg dead-agents --threshold 10         # override heartbeat timeout (minutes)
 ```
 
-These commands are useful for manual intervention when the service is not running. `--purge` cleans up finished entries from the registry; combine with `--delete-dirs` to reclaim disk space by removing `.workgraph/agents/<id>/` directories.
+These commands are useful for manual intervention when the service is not running. `--purge` cleans up finished entries from the registry; combine with `--delete-dirs` to reclaim disk space by removing `.wg/agents/<id>/` directories.
 
 ### Task reclaim
 
@@ -480,18 +481,18 @@ wins (the local list fully replaces global's, regardless of `inherit_global`
 when local declares its own entries — `inherit_global` only matters when
 local has no endpoints of its own).
 
-Writes target local config by default. Use `--global` to write to `~/.workgraph/config.toml`:
+Writes target local config by default. Use `--global` to write to `~/.wg/config.toml`:
 
 ```bash
 wg config --global --model opus   # set default model globally
 ```
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 
 [coordinator]
 max_agents = 4           # max parallel agents (default: 4)
-max_coordinators = 4     # max concurrent coordinator sessions (default: 4)
+max_coordinators = 16    # max concurrent coordinator sessions (default: 16)
 interval = 30            # standalone coordinator tick interval
 poll_interval = 5        # daemon safety-net poll interval (default: 5)
 model = "claude:opus"    # provider:model — handler is implied (claude here)
@@ -580,7 +581,7 @@ For agency meta-tasks:
 
 ## IPC Protocol
 
-The daemon listens on a Unix socket at `.workgraph/service/daemon.sock` (overridable via `wg service start --socket <path>`).
+The daemon listens on a Unix socket at `.wg/service/daemon.sock` (overridable via `wg service start --socket <path>`).
 
 | Command | Description |
 |---------|-------------|
@@ -612,14 +613,14 @@ Commands that modify the graph (`wg done`, `wg add`, `wg edit`, `wg fail`, etc.)
 ## State Files
 
 ```
-.workgraph/service/
+.wg/service/
 ├── state.json              # Daemon PID, socket path, start time
 ├── daemon.log              # Timestamped daemon logs (10MB rotation)
 ├── daemon.log.1            # Rotated backup
 ├── coordinator-state.json  # Coordinator metrics: paused, ticks, agents_alive, etc.
 └── registry.json           # Agent registry (flock-protected)
 
-.workgraph/agents/
+.wg/agents/
 └── agent-N/                # Every spawn path (full and inline) emits these 4 files:
     ├── metadata.json       # Agent metadata: agent_id, task_id, executor, model, started_at, worktree info
     ├── output.log          # Agent stdout/stderr (always present, may be empty initially)
@@ -629,7 +630,7 @@ Commands that modify the graph (`wg done`, `wg add`, `wg edit`, `wg fail`, etc.)
 
 ### Agent Directory Contract
 
-Every agent directory (`.workgraph/agents/agent-N/`) is guaranteed to contain these four files regardless of spawn path:
+Every agent directory (`.wg/agents/agent-N/`) is guaranteed to contain these four files regardless of spawn path:
 
 | File | Content | Purpose |
 |------|---------|---------|
@@ -644,7 +645,7 @@ Every agent directory (`.workgraph/agents/agent-N/`) is guaranteed to contain th
 
 ## Troubleshooting
 
-**Daemon logs**: `.workgraph/service/daemon.log`
+**Daemon logs**: `.wg/service/daemon.log`
 
 ```bash
 wg service status    # shows recent errors

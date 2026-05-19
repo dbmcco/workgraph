@@ -13,7 +13,7 @@ use crate::agency::{
 use crate::service::is_process_alive;
 
 // ---------------------------------------------------------------------------
-// Federation config: named remotes stored in .workgraph/federation.yaml
+// Federation config: named remotes stored in .wg/federation.yaml
 // ---------------------------------------------------------------------------
 
 /// A named remote agency store reference.
@@ -26,7 +26,7 @@ pub struct Remote {
     pub last_sync: Option<String>,
 }
 
-/// A peer workgraph instance (another repo with its own .workgraph/).
+/// A peer WG project (another repo with its own .wg/).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerConfig {
     pub path: String,
@@ -39,12 +39,12 @@ pub struct PeerConfig {
 pub struct FederationConfig {
     #[serde(default)]
     pub remotes: BTreeMap<String, Remote>,
-    /// Peer workgraph instances for cross-repo communication.
+    /// Peer WG projects for cross-repo communication.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peers: BTreeMap<String, PeerConfig>,
 }
 
-/// Load federation config from .workgraph/federation.yaml.
+/// Load federation config from .wg/federation.yaml.
 /// Returns default (empty) if the file doesn't exist.
 pub fn load_federation_config(workgraph_dir: &Path) -> Result<FederationConfig, anyhow::Error> {
     let path = workgraph_dir.join("federation.yaml");
@@ -56,7 +56,7 @@ pub fn load_federation_config(workgraph_dir: &Path) -> Result<FederationConfig, 
     Ok(config)
 }
 
-/// Save federation config to .workgraph/federation.yaml.
+/// Save federation config to .wg/federation.yaml.
 pub fn save_federation_config(
     workgraph_dir: &Path,
     config: &FederationConfig,
@@ -215,10 +215,10 @@ impl std::fmt::Display for TransferSummary {
 /// Resolve a store reference string to a `LocalStore`.
 ///
 /// Resolution order (per §3.1 of the design doc):
-/// 1. Absolute path or `~/` → filesystem path, look for `agency/` or `.workgraph/agency/`
+/// 1. Absolute path or `~/` → filesystem path, look for `agency/` or `.wg/agency/`
 /// 2. Relative path → resolve from CWD
 ///
-/// Named remotes (from `.workgraph/federation.yaml`) are a future extension.
+/// Named remotes (from `.wg/federation.yaml`) are a future extension.
 pub fn resolve_store(reference: &str) -> Result<LocalStore, anyhow::Error> {
     let expanded = if let Some(suffix) = reference.strip_prefix("~/") {
         let home =
@@ -240,7 +240,7 @@ pub fn resolve_store(reference: &str) -> Result<LocalStore, anyhow::Error> {
     // Check for agency store in several locations:
     // 1. path itself is the agency dir (has roles/ or cache/roles/ or evaluations/)
     // 2. path/agency/ is the agency dir
-    // 3. path/.workgraph/agency/ is the agency dir
+    // 3. path/.wg/agency/ is the agency dir
     let is_agency_dir = |p: &PathBuf| {
         p.join("cache/roles").is_dir()
             || p.join("cache/roles").is_dir()
@@ -253,15 +253,15 @@ pub fn resolve_store(reference: &str) -> Result<LocalStore, anyhow::Error> {
     if is_agency_dir(&agency_sub) {
         return Ok(LocalStore::new(agency_sub));
     }
-    let wg_agency = path.join(".workgraph").join("agency");
+    let wg_agency = path.join(".wg").join("agency");
     if is_agency_dir(&wg_agency) {
         return Ok(LocalStore::new(wg_agency));
     }
 
     // Target doesn't exist yet — return the best-guess path.
     // For push, we create it. For pull, the caller can error.
-    // Prefer .workgraph/agency if parent looks like a project dir.
-    if path.join(".workgraph").is_dir() {
+    // Prefer .wg/agency if parent looks like a project dir.
+    if path.join(".wg").is_dir() {
         Ok(LocalStore::new(wg_agency))
     } else if path.join("agency").is_dir()
         || path.file_name().map(|n| n != "agency").unwrap_or(true)
@@ -280,15 +280,15 @@ pub fn resolve_store(reference: &str) -> Result<LocalStore, anyhow::Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Peer resolution: name → path → .workgraph dir → socket discovery
+// Peer resolution: name → path → .wg dir → socket discovery
 // ---------------------------------------------------------------------------
 
 /// Result of resolving a peer reference to a concrete path.
 #[derive(Debug, Clone)]
 pub struct ResolvedPeer {
-    /// The project root (parent of .workgraph/).
+    /// The project root (parent of .wg/).
     pub project_path: PathBuf,
-    /// The .workgraph directory.
+    /// The .wg directory.
     pub workgraph_dir: PathBuf,
 }
 
@@ -327,10 +327,10 @@ pub fn resolve_peer(reference: &str, workgraph_dir: &Path) -> Result<ResolvedPee
     // Canonicalize if possible
     let project_path = project_path.canonicalize().unwrap_or(project_path);
 
-    let wg_dir = project_path.join(".workgraph");
+    let wg_dir = project_path.join(".wg");
     if !wg_dir.is_dir() {
         anyhow::bail!(
-            "No .workgraph directory found at '{}'. Is this a workgraph project?",
+            "No .wg directory found at '{}'. Is this a WG project?",
             project_path.display()
         );
     }
@@ -350,7 +350,7 @@ pub struct PeerServiceStatus {
     pub started_at: Option<String>,
 }
 
-/// Check whether a peer's workgraph service is running.
+/// Check whether a peer's WG service is running.
 ///
 /// Reads `<workgraph_dir>/service/state.json` and checks if the PID is alive.
 pub fn check_peer_service(workgraph_dir: &Path) -> PeerServiceStatus {
@@ -447,7 +447,7 @@ pub enum RemoteResolution {
     Unreachable(String),
 }
 
-/// Resolve the status of a task in a remote peer workgraph.
+/// Resolve the status of a task in a remote peer WG project.
 ///
 /// Resolution order (per §4.4 of cross-repo design doc):
 /// 1. Look up peer path from federation config or parse as path
@@ -1122,6 +1122,12 @@ fn merge_component(target: &RoleComponent, source: &RoleComponent) -> RoleCompon
         id: target.id.clone(),
         name: target.name.clone(),
         description: target.description.clone(),
+        quality: target.quality,
+        domain_specificity: target.domain_specificity,
+        domain: target.domain.clone(),
+        scope: target.scope.clone(),
+        origin_instance_id: target.origin_instance_id.clone(),
+        parent_content_hash: target.parent_content_hash.clone(),
         category: target.category.clone(),
         content: target.content.clone(),
         performance: merge_performance(&target.performance, &source.performance),
@@ -1148,6 +1154,12 @@ fn merge_outcome(target: &DesiredOutcome, source: &DesiredOutcome) -> DesiredOut
         id: target.id.clone(),
         name: target.name.clone(),
         description: target.description.clone(),
+        quality: target.quality,
+        domain_specificity: target.domain_specificity,
+        domain: target.domain.clone(),
+        scope: target.scope.clone(),
+        origin_instance_id: target.origin_instance_id.clone(),
+        parent_content_hash: target.parent_content_hash.clone(),
         success_criteria: target.success_criteria.clone(),
         performance: merge_performance(&target.performance, &source.performance),
         lineage: merge_lineage(&target.lineage, &source.lineage),
@@ -1189,6 +1201,12 @@ fn merge_tradeoff(target: &TradeoffConfig, source: &TradeoffConfig) -> TradeoffC
         id: target.id.clone(),
         name: target.name.clone(),
         description: target.description.clone(),
+        quality: target.quality,
+        domain_specificity: target.domain_specificity,
+        domain: target.domain.clone(),
+        scope: target.scope.clone(),
+        origin_instance_id: target.origin_instance_id.clone(),
+        parent_content_hash: target.parent_content_hash.clone(),
         acceptable_tradeoffs: target.acceptable_tradeoffs.clone(),
         unacceptable_tradeoffs: target.unacceptable_tradeoffs.clone(),
         performance: merge_performance(&target.performance, &source.performance),
@@ -1286,6 +1304,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: "test motivation".to_string(),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             acceptable_tradeoffs: Vec::new(),
             unacceptable_tradeoffs: Vec::new(),
             performance: PerformanceRecord::default(),
@@ -1550,12 +1574,14 @@ mod tests {
             generation: 0,
             created_by: "human".to_string(),
             created_at: chrono::Utc::now(),
+            reframing_potential: None,
         };
         let rich = Lineage {
             parent_ids: vec!["p1".to_string()],
             generation: 1,
             created_by: "evolver-1".to_string(),
             created_at: chrono::Utc::now(),
+            reframing_potential: None,
         };
         let merged = merge_lineage(&sparse, &rich);
         assert_eq!(merged.parent_ids.len(), 1);
@@ -1565,7 +1591,7 @@ mod tests {
     #[test]
     fn resolve_store_finds_project_store() {
         let tmp = TempDir::new().unwrap();
-        let wg = tmp.path().join(".workgraph").join("agency");
+        let wg = tmp.path().join(".wg").join("agency");
         agency::init(&wg).unwrap();
 
         let store = resolve_store(tmp.path().to_str().unwrap()).unwrap();
@@ -1750,13 +1776,13 @@ mod tests {
     fn resolve_remote_task_status_via_direct_file_access() {
         let tmp = TempDir::new().unwrap();
 
-        // Set up local workgraph with federation config pointing to a peer
-        let local_wg = tmp.path().join("local").join(".workgraph");
+        // Set up local WG project with federation config pointing to a peer
+        let local_wg = tmp.path().join("local").join(".wg");
         std::fs::create_dir_all(&local_wg).unwrap();
 
-        // Set up peer workgraph with a task
+        // Set up peer WG project with a task
         let peer_project = tmp.path().join("peer-project");
-        let peer_wg = peer_project.join(".workgraph");
+        let peer_wg = peer_project.join(".wg");
         std::fs::create_dir_all(&peer_wg).unwrap();
 
         // Create a task in the peer's graph
@@ -1795,12 +1821,12 @@ mod tests {
     #[test]
     fn resolve_remote_task_status_not_found() {
         let tmp = TempDir::new().unwrap();
-        let local_wg = tmp.path().join("local").join(".workgraph");
+        let local_wg = tmp.path().join("local").join(".wg");
         std::fs::create_dir_all(&local_wg).unwrap();
 
         // Set up peer with empty graph
         let peer_project = tmp.path().join("peer-project");
-        let peer_wg = peer_project.join(".workgraph");
+        let peer_wg = peer_project.join(".wg");
         std::fs::create_dir_all(&peer_wg).unwrap();
         let peer_graph = crate::graph::WorkGraph::new();
         crate::parser::save_graph(&peer_graph, peer_wg.join("graph.jsonl")).unwrap();
@@ -1840,6 +1866,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: format!("test component {}", name),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             category: agency::ComponentCategory::Translated,
             content: agency::ContentRef::Inline("test content".into()),
             performance: PerformanceRecord::default(),
@@ -1857,6 +1889,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: format!("test outcome {}", name),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             success_criteria: vec!["criterion 1".into()],
             performance: PerformanceRecord::default(),
             lineage: Lineage::default(),
@@ -1997,7 +2035,7 @@ mod tests {
     #[test]
     fn resolve_remote_task_status_unknown_peer() {
         let tmp = TempDir::new().unwrap();
-        let local_wg = tmp.path().join("local").join(".workgraph");
+        let local_wg = tmp.path().join("local").join(".wg");
         std::fs::create_dir_all(&local_wg).unwrap();
 
         // No federation config → empty peers

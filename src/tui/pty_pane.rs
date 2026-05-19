@@ -93,6 +93,28 @@ pub struct PtyPane {
     pub growth_rate_warned: Arc<AtomicBool>,
     #[allow(dead_code)]
     bytes_processed: Arc<AtomicU64>,
+    /// When `Some`, the pane is wrapping a `tmux attach` client whose
+    /// underlying tmux session is named here. The chat process lives
+    /// inside that session, NOT as our direct child — so dropping this
+    /// pane only kills the attach client; the session keeps running.
+    /// Call `kill_underlying_session` to explicitly tear it down (e.g.
+    /// when the user archives / deletes the chat).
+    tmux_session: Option<String>,
+    /// Cumulative bytes written from the host TUI to the embedded
+    /// child's stdin via `send_key` / `send_text`. Tests use this to
+    /// assert that a given event path does NOT forward bytes to the
+    /// child (e.g. fix-mouse-wheel-2: wheel must not produce arrow-key
+    /// bytes). Capability-query replies emitted from the reader thread
+    /// are NOT counted here — only host-driven input is.
+    input_bytes_written: Arc<AtomicU64>,
+    /// Approximate copy-mode scroll offset for tmux-wrapped panes
+    /// (post `implement-tmux-wrapped`). When non-zero, the pane is in
+    /// tmux copy-mode and the user has scrolled `tmux_scroll_lines`
+    /// rows above the live tail. This is host-side bookkeeping driven
+    /// by `scroll_up`/`scroll_down`/`scroll_to_top`/`scroll_to_bottom`
+    /// — NOT a query against tmux's actual scroll position. See
+    /// `scroll_up` for why we track it locally (fix-mouse-wheel-3).
+    tmux_scroll_lines: usize,
 }
 
 impl PtyPane {
@@ -225,6 +247,15 @@ impl PtyPane {
                 let mut buf = [0u8; 8192];
                 let mut window_start = std::time::Instant::now();
                 let mut window_bytes: u64 = 0;
+                // DEC mode 2026 (synchronized output) tracking. See
+                // `manage_sync_mode_scrollback` for the full motivation —
+                // codex's interactive TUI emits each animation frame as a
+                // BSU/ESU-bracketed full-screen repaint whose trailing
+                // newline scrolls one row off the top per frame, and
+                // without trimming, scrolling back through history shows
+                // stacked spinner frames.
+                let mut in_sync_mode = false;
+                let mut sync_start_scrollback_count = 0usize;
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
@@ -233,9 +264,8 @@ impl PtyPane {
                                 let _ = f.write_all(&buf[..n]);
                                 let _ = f.flush();
                             }
-                            respond_to_queries(&buf[..n], &reader_responder);
+                            respond_to_queries(&buf[..n], &reader_responder, &reader_parser);
 
-                            reader_bytes.fetch_add(n as u64, Ordering::Relaxed);
                             window_bytes += n as u64;
                             let elapsed = window_start.elapsed().as_secs();
                             if elapsed >= GROWTH_RATE_WINDOW_SECS && window_bytes > 0 {
@@ -256,9 +286,48 @@ impl PtyPane {
                                 window_bytes = 0;
                             }
 
+                            // Capture pre-process scrollback count for sync-mode
+                            // trim accounting; cheap (a couple of method calls)
+                            // when the chunk has no sync markers, since the
+                            // manage_ helper short-circuits in that case.
+                            let pre_count = if chunk_contains_sync_markers(&buf[..n]) {
+                                if let Ok(mut p) = reader_parser.lock() {
+                                    parser_scrollback_count(&mut p)
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            };
+
                             if let Ok(mut p) = reader_parser.lock() {
                                 p.process(&buf[..n]);
                             }
+
+                            manage_sync_mode_scrollback(
+                                &buf[..n],
+                                &reader_parser,
+                                &mut in_sync_mode,
+                                &mut sync_start_scrollback_count,
+                                pre_count,
+                            );
+
+                            // INVARIANT — `bytes_processed` advances ONLY
+                            // after `parser.process` has fully ingested
+                            // the chunk. Reversing this order opens a
+                            // window where the TUI event loop's
+                            // `chat_pty_has_new_bytes()` /
+                            // `update_task_pane_byte_watermarks()` pair
+                            // races into the gap: it sees the new counter
+                            // value, fires a redraw against the pre-chunk
+                            // parser screen, then snapshots the watermark
+                            // to the new counter value. With no further
+                            // bytes arriving in the typical wg-nex
+                            // single-token-reply case, no further redraws
+                            // fire and the model's reply lives in the
+                            // parser but never reaches the rendered TUI
+                            // pane (fix-nex-tui).
+                            reader_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -279,7 +348,123 @@ impl PtyPane {
             auto_follow: true,
             growth_rate_warned,
             bytes_processed,
+            tmux_session: None,
+            input_bytes_written: Arc::new(AtomicU64::new(0)),
+            tmux_scroll_lines: 0,
         })
+    }
+
+    /// Spawn `command` inside a detached tmux session and return a
+    /// PtyPane attached to it via `tmux attach -t <session>`. When this
+    /// pane drops (TUI exit, panic), only the attach client dies — the
+    /// tmux session keeps the underlying process alive across TUI
+    /// restarts. Use [`kill_underlying_session`] to explicitly tear the
+    /// session down (e.g. when the user archives / deletes the chat).
+    ///
+    /// `session_name` MUST be a valid tmux session id (no whitespace,
+    /// no `:`/`.`). Caller is responsible for namespacing it (e.g.
+    /// `wg-chat-<project>-<chat_ref>`).
+    ///
+    /// If a session named `session_name` already exists (e.g. from a
+    /// prior TUI run), this reattaches to it instead of starting a new
+    /// process — that is the persistence point.
+    ///
+    /// Returns an error if the `tmux` binary is not available; the
+    /// caller is expected to fall back to plain `spawn_in` and warn the
+    /// user.
+    pub fn spawn_via_tmux(
+        session_name: &str,
+        command: &str,
+        args: &[&str],
+        env: &[(String, String)],
+        cwd: Option<&std::path::Path>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self> {
+        if !tmux_available() {
+            anyhow::bail!("tmux not available on PATH");
+        }
+        // Sanity-check the session name. tmux session names cannot
+        // contain `:` or `.`; whitespace is also disallowed in our
+        // contract. Bail explicitly so a malformed name doesn't manifest
+        // later as a confusing tmux error.
+        if session_name.is_empty()
+            || session_name
+                .chars()
+                .any(|c| c.is_whitespace() || c == ':' || c == '.')
+        {
+            anyhow::bail!("invalid tmux session name: {:?}", session_name);
+        }
+
+        let session_exists = tmux_has_session(session_name);
+        if !session_exists {
+            // Build `tmux new-session -d -s <name> [-c cwd] [-e K=V ...] -- <bin> [args...]`
+            let mut tmux_args: Vec<String> = vec![
+                "new-session".to_string(),
+                "-d".to_string(),
+                "-s".to_string(),
+                session_name.to_string(),
+            ];
+            if let Some(c) = cwd {
+                tmux_args.push("-c".to_string());
+                tmux_args.push(c.display().to_string());
+            }
+            for (k, v) in env {
+                tmux_args.push("-e".to_string());
+                tmux_args.push(format!("{}={}", k, v));
+            }
+            // Separator + program + program args. tmux's `--` only
+            // works after the session-creation flags — everything after
+            // is passed to the inner shell exec.
+            tmux_args.push("--".to_string());
+            tmux_args.push(command.to_string());
+            for a in args {
+                tmux_args.push(a.to_string());
+            }
+            let status = std::process::Command::new("tmux")
+                .args(&tmux_args)
+                .status()
+                .context("failed to invoke tmux new-session")?;
+            if !status.success() {
+                anyhow::bail!(
+                    "tmux new-session failed (status {:?}) for session '{}'",
+                    status.code(),
+                    session_name
+                );
+            }
+        }
+
+        // wg owns the desired tmux session state. Re-assert on every
+        // spawn (both fresh-create AND reattach) so any drift since
+        // the last run gets corrected here. See `apply_session_options`
+        // for the centralized list of options wg controls.
+        apply_session_options(session_name);
+
+        // Attach client lives in our PTY child. `-d` detaches any other
+        // clients first — single-attach semantics, even if a prior TUI
+        // (or a stray `tmux attach` from a shell) is still glued on.
+        let attach_args = ["attach", "-d", "-t", session_name];
+        let mut pane = Self::spawn_in("tmux", &attach_args, &[], cwd, rows, cols)?;
+        pane.tmux_session = Some(session_name.to_string());
+        Ok(pane)
+    }
+
+    /// Returns the underlying tmux session name if this pane was
+    /// spawned via [`spawn_via_tmux`].
+    pub fn tmux_session(&self) -> Option<&str> {
+        self.tmux_session.as_deref()
+    }
+
+    /// Explicitly tear down the underlying tmux session (and therefore
+    /// the chat process inside it). No-op for non-tmux-wrapped panes.
+    /// Idempotent — safe to call after `Drop` or `kill`.
+    pub fn kill_underlying_session(&mut self) {
+        if let Some(name) = self.tmux_session.clone() {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .status();
+            self.tmux_session = None;
+        }
     }
 
     /// Render the current terminal screen as a ratatui widget in
@@ -341,17 +526,40 @@ impl PtyPane {
     }
 
     /// Scroll the view up (back through history) by `n` lines.
+    ///
+    /// Two backends:
+    /// 1. tmux-wrapped panes (real chat tabs after
+    ///    `implement-tmux-wrapped`): drive tmux's copy mode via
+    ///    out-of-band IPC (`tmux send-keys -X scroll-up`). Required
+    ///    because tmux uses the alt-screen, so the outer vt100 has
+    ///    no scrollback to advance through — calling vt100
+    ///    `set_scrollback(N)` on a tmux-wrapped pane is silently a
+    ///    no-op (fix-mouse-wheel-3). Walking the outer vt100's
+    ///    scrollback also rendered garble — it contains tmux
+    ///    repaint frames, not clean logical lines (fix-scroll-via).
+    /// 2. raw PTY panes (smoke fixtures, observer-mode panes whose
+    ///    child writes to the primary screen): advance the vt100
+    ///    parser's own scrollback offset.
+    ///
+    /// In both cases zero bytes are written to the PTY child's stdin
+    /// — fix-mouse-wheel-2's invariant is preserved.
     pub fn scroll_up(&mut self, n: usize) {
-        self.auto_follow = false;
-        if let Ok(mut p) = self.parser.lock() {
-            let current = p.screen().scrollback();
-            p.screen_mut().set_scrollback(current.saturating_add(n));
+        if let Some(session) = self.tmux_session.clone() {
+            self.tmux_scroll_up(&session, n);
+        } else {
+            self.auto_follow = false;
+            if let Ok(mut p) = self.parser.lock() {
+                let current = p.screen().scrollback();
+                p.screen_mut().set_scrollback(current.saturating_add(n));
+            }
         }
     }
 
     /// Scroll the view down (toward live output) by `n` lines.
     pub fn scroll_down(&mut self, n: usize) {
-        if let Ok(mut p) = self.parser.lock() {
+        if let Some(session) = self.tmux_session.clone() {
+            self.tmux_scroll_down(&session, n);
+        } else if let Ok(mut p) = self.parser.lock() {
             let current = p.screen().scrollback();
             let new_offset = current.saturating_sub(n);
             p.screen_mut().set_scrollback(new_offset);
@@ -364,23 +572,148 @@ impl PtyPane {
 
     /// Jump to the top of scrollback.
     pub fn scroll_to_top(&mut self) {
-        self.auto_follow = false;
-        if let Ok(mut p) = self.parser.lock() {
-            p.screen_mut().set_scrollback(usize::MAX);
+        if let Some(session) = self.tmux_session.clone() {
+            // Enter copy mode (idempotent) then jump to history top.
+            if self.tmux_scroll_lines == 0 {
+                let _ = std::process::Command::new("tmux")
+                    .args(["copy-mode", "-t", &session])
+                    .status();
+            }
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session, "-X", "history-top"])
+                .status();
+            // Tmux history is bounded; we can't know the exact line
+            // count without querying. Mark "scrolled" via a large
+            // sentinel — render only uses it for the ↓N indicator
+            // and the auto_follow flag.
+            self.tmux_scroll_lines = usize::MAX;
+            self.auto_follow = false;
+        } else {
+            self.auto_follow = false;
+            if let Ok(mut p) = self.parser.lock() {
+                p.screen_mut().set_scrollback(usize::MAX);
+            }
         }
     }
 
     /// Jump to the bottom (live output).
     pub fn scroll_to_bottom(&mut self) {
-        self.auto_follow = true;
-        if let Ok(mut p) = self.parser.lock() {
-            p.screen_mut().set_scrollback(0);
+        if let Some(session) = self.tmux_session.clone() {
+            if self.tmux_scroll_lines > 0 {
+                // `cancel` exits copy mode, restoring the live tail.
+                let _ = std::process::Command::new("tmux")
+                    .args(["send-keys", "-t", &session, "-X", "cancel"])
+                    .status();
+            }
+            self.tmux_scroll_lines = 0;
+            self.auto_follow = true;
+        } else {
+            self.auto_follow = true;
+            if let Ok(mut p) = self.parser.lock() {
+                p.screen_mut().set_scrollback(0);
+            }
         }
+    }
+
+    /// `tmux send-keys -X scroll-up` driver. Called from `scroll_up`
+    /// for tmux-wrapped panes only. Enters copy mode lazily on the
+    /// first scroll-up (if not already in copy mode) so the IPC
+    /// `scroll-up` command has somewhere to land.
+    fn tmux_scroll_up(&mut self, session: &str, n: usize) {
+        if self.tmux_scroll_lines == 0 {
+            let _ = std::process::Command::new("tmux")
+                .args(["copy-mode", "-t", session])
+                .status();
+        }
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "send-keys",
+                "-t",
+                session,
+                "-X",
+                "-N",
+                &n.to_string(),
+                "scroll-up",
+            ])
+            .status();
+        self.tmux_scroll_lines = self.tmux_scroll_lines.saturating_add(n);
+        self.auto_follow = false;
+    }
+
+    /// `tmux send-keys -X scroll-down` driver. Cancels copy mode if
+    /// the scroll brings us back to the live tail.
+    fn tmux_scroll_down(&mut self, session: &str, n: usize) {
+        if self.tmux_scroll_lines == 0 {
+            // Already at live tail — nothing to do.
+            return;
+        }
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "send-keys",
+                "-t",
+                session,
+                "-X",
+                "-N",
+                &n.to_string(),
+                "scroll-down",
+            ])
+            .status();
+        self.tmux_scroll_lines = self.tmux_scroll_lines.saturating_sub(n);
+        if self.tmux_scroll_lines == 0 {
+            // Reached live tail — exit copy mode so subsequent live
+            // output flows through normally.
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", session, "-X", "cancel"])
+                .status();
+            self.auto_follow = true;
+        }
+    }
+
+    /// If the underlying tmux session is in copy-mode (because we
+    /// drove it there via scroll), exit it. Idempotent. No-op for
+    /// non-tmux-wrapped panes and for sessions already at the live
+    /// tail. Called from `send_key` / `send_text` so user typing
+    /// always lands in the live inner CLI rather than tmux's
+    /// copy-mode interpreter (fix-scroll-via).
+    pub fn exit_tmux_copy_mode(&mut self) {
+        if self.tmux_scroll_lines == 0 {
+            return;
+        }
+        if let Some(session) = self.tmux_session.clone() {
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session, "-X", "cancel"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        self.tmux_scroll_lines = 0;
+        self.auto_follow = true;
     }
 
     #[allow(dead_code)]
     pub fn is_scrolled_back(&self) -> bool {
         !self.auto_follow
+    }
+
+    /// Current scrollback offset (lines above live output). 0 means live.
+    /// For tmux-wrapped panes this is host-side bookkeeping
+    /// (`tmux_scroll_lines`), not a query against tmux's actual
+    /// position.
+    pub fn scrollback(&self) -> usize {
+        if self.tmux_session.is_some() {
+            return self.tmux_scroll_lines;
+        }
+        self.parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap_or(0)
+    }
+
+    /// Current vt100 grid dimensions (rows, cols). Useful for tests
+    /// that need to verify a pane was spawned at the right size before
+    /// the first frame triggers any resize — see fix-pty-scrollback.
+    pub fn dims(&self) -> (u16, u16) {
+        (self.rows, self.cols)
     }
 
     #[allow(dead_code)]
@@ -394,10 +727,19 @@ impl PtyPane {
     pub fn send_key(&mut self, key: KeyEvent) -> Result<()> {
         let bytes = key_event_to_bytes(&key);
         if !bytes.is_empty() {
+            // fix-scroll-via: if the underlying tmux is in copy-mode
+            // (we drove it there via scroll), exit copy-mode first so
+            // the keystroke lands in the live inner app, not the
+            // copy-mode command set. tmux's `cancel` returns to the
+            // live shell and re-renders the post-scroll bottom of
+            // history; the keystroke that follows feeds into stdin.
+            self.exit_tmux_copy_mode();
             if let Ok(mut w) = self.writer.lock() {
                 let _ = w.write_all(&bytes);
                 let _ = w.flush();
                 self.tee_input(&bytes);
+                self.input_bytes_written
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
             self.auto_follow = true;
             if let Ok(mut p) = self.parser.lock() {
@@ -407,15 +749,49 @@ impl PtyPane {
         Ok(())
     }
 
+    /// Interrupt the foreground program in the embedded terminal.
+    ///
+    /// Raw PTY panes get the normal terminal ETX byte (`^C`). For
+    /// tmux-wrapped chat panes, drive tmux itself so the interrupt reaches the
+    /// pane inside the persistent session, not merely the outer attach client.
+    pub fn interrupt_foreground(&mut self) -> Result<()> {
+        self.exit_tmux_copy_mode();
+        if let Some(session) = self.tmux_session.clone() {
+            let _ = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &session, "C-c"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            self.auto_follow = true;
+            return Ok(());
+        }
+        self.send_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+    }
+
     /// Forward arbitrary text (e.g. pasted content) to the child's
     /// stdin verbatim, no key-event encoding.
     pub fn send_text(&mut self, text: &str) -> Result<()> {
+        // Same copy-mode bail-out as `send_key`. Pasting while in
+        // copy-mode would hand the bytes to tmux's copy/buffer
+        // interpreter, not the inner CLI.
+        self.exit_tmux_copy_mode();
         if let Ok(mut w) = self.writer.lock() {
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
             self.tee_input(text.as_bytes());
+            self.input_bytes_written
+                .fetch_add(text.len() as u64, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Cumulative bytes written from the host TUI to the embedded
+    /// child's stdin via `send_key`/`send_text`. Reader-thread
+    /// capability-query replies are NOT counted here. Used by tests to
+    /// assert that an event path (e.g. mouse wheel — fix-mouse-wheel-2)
+    /// produces zero forwarded input.
+    pub fn child_input_bytes_written(&self) -> u64 {
+        self.input_bytes_written.load(Ordering::Relaxed)
     }
 
     fn tee_input(&self, bytes: &[u8]) {
@@ -432,6 +808,15 @@ impl PtyPane {
     /// cell layout updates) and the master PTY (so the child sees
     /// SIGWINCH and can reflow its own output). No-op if the size
     /// matches the current one.
+    ///
+    /// vt100 0.16's `Screen::set_size` only resizes the visible row Vec —
+    /// scrollback rows keep their pre-resize cell count and wrap flags
+    /// (vt100/src/grid.rs:66-100). Without further work a width change
+    /// leaves stale wrap state in scrollback and the user sees old wrapped
+    /// rows duplicated against the new width. To avoid that we reflow by
+    /// snapshotting the existing scrollback + visible content into logical
+    /// lines, then re-feeding them into a freshly-sized parser. vt100
+    /// re-wraps at parse time, so the output rows match the new width.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         // Clamp to a workable minimum. A tiny grid makes
         // vt100::Parser panic frequently because drawing_cell(pos)
@@ -445,6 +830,19 @@ impl PtyPane {
         if rows == self.rows && cols == self.cols {
             return Ok(());
         }
+
+        // Reflow scrollback + visible by re-feeding into a fresh parser at
+        // the new dimensions. Holds the parser lock for the duration of the
+        // swap so the reader thread doesn't see a half-built state.
+        {
+            let mut p = match self.parser.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let fresh = reflow_parser(&mut p, rows, cols, DEFAULT_SCROLLBACK_LINES);
+            *p = fresh;
+        }
+
         self.master
             .resize(PtySize {
                 rows,
@@ -453,13 +851,6 @@ impl PtyPane {
                 pixel_height: 0,
             })
             .context("pty resize failed")?;
-        let mut p = match self.parser.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // vt100 0.16 moved set_size from Parser to Screen.
-        p.screen_mut().set_size(rows, cols);
-        drop(p);
         self.rows = rows;
         self.cols = cols;
         Ok(())
@@ -474,6 +865,16 @@ impl PtyPane {
             // don't tear down a working pane. If it's genuinely dead
             // the reader thread will hit EOF and close.
             Err(_) => true,
+        }
+    }
+
+    /// Non-blocking: if the child has exited, return a human-readable
+    /// description of the exit status ("exit code 1"). Returns `None`
+    /// when the child is still running or the status is unavailable.
+    pub fn try_exit_status_desc(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(format!("exit code {}", status.exit_code())),
+            _ => None,
         }
     }
 
@@ -497,8 +898,17 @@ impl PtyPane {
 
 impl Drop for PtyPane {
     fn drop(&mut self) {
-        // Ensure the child is gone; the reader thread will see EOF
-        // when the master drops after this Drop completes.
+        // Ensure the local PTY child is gone; the reader thread will
+        // see EOF when the master drops after this Drop completes.
+        //
+        // For tmux-wrapped panes the child IS the `tmux attach` client,
+        // not the underlying chat process. Killing the attach client
+        // detaches it cleanly; the tmux server keeps the chat session
+        // alive so a later `wg tui` reattaches to the same session and
+        // the user resumes their conversation. THIS IS THE PERSISTENCE
+        // INVARIANT — Drop must NOT call `kill_underlying_session`. To
+        // discard the chat, callers explicitly invoke that method
+        // (chat archive / delete paths in viz_viewer/state.rs).
         let _ = self.child.kill();
         // Don't join the reader here — `kill` may not have fully
         // flushed yet and we'd block the TUI shutdown. The thread is
@@ -508,23 +918,283 @@ impl Drop for PtyPane {
     }
 }
 
+/// Cached tmux-availability probe. Cheap (one `which` per process) and
+/// returns false if tmux is not installed; callers fall back to plain
+/// `spawn_in` + a one-time warning.
+pub fn tmux_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Returns true if a tmux session with the given name currently exists.
+/// Cheap shell-out — used during `spawn_via_tmux` to decide whether to
+/// create a fresh session or reattach to an existing one.
+pub fn tmux_has_session(name: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["has-session", "-t", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// List every tmux session whose name starts with `prefix`. Returns an
+/// empty vec if tmux isn't installed or `list-sessions` fails (e.g. no
+/// server running). Used by the chat orphan-sweep to find dangling
+/// `wg-chat-*` sessions whose backing task is gone.
+pub fn tmux_list_sessions_with_prefix(prefix: &str) -> Vec<String> {
+    let out = match std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#S"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with(prefix))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Tear down a tmux session by name. No-op when the session doesn't
+/// exist. Idempotent.
+pub fn tmux_kill_session(name: &str) {
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", name])
+        .status();
+}
+
+/// Apply wg's desired tmux session options to `session_name`. Idempotent
+/// and best-effort — failures here are cosmetic (a status bar visible
+/// when it shouldn't be), not fatal, so we silence them.
+///
+/// wg owns the state of every `wg-chat-*` tmux session. Anything wg cares
+/// about goes here, and both spawn-time application and the runtime sync
+/// sweep (`sync_chat_session_settings`) pick it up automatically. Adding
+/// a new tmux-relevant setting later is one line in this function — not
+/// a thread through every callsite.
+///
+/// Currently sets:
+/// - `status off` — wg's TUI provides the chrome the user actually
+///   interacts with; tmux's default green status bar is an
+///   implementation detail of the wrapper and visually out of place.
+/// - `mouse off` — wg owns scroll for chat sessions (fix-scroll-via).
+///   Tmux's default mouse-mode is off, but we explicitly disable it
+///   so any user `.tmux.conf` that flips it on can't accidentally
+///   re-enable autonomous copy-mode entry on the wheel — that path
+///   emits copy-mode escape sequences into our vt100 parser and the
+///   rendered output garbles after the first few lines.
+pub fn apply_session_options(session_name: &str) {
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", session_name, "status", "off"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("tmux")
+        .args(["set-option", "-t", session_name, "mouse", "off"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Re-assert wg's desired tmux session options across every existing
+/// session whose name starts with `prefix`. No-op when tmux isn't
+/// installed or no sessions match.
+///
+/// Self-healing: if a chat tmux session has drifted (user manually
+/// flipped `status on`, or wg's defaults changed since the session was
+/// created), the next call corrects it. Safe to call from any hook
+/// point — TUI startup, theme toggle, future settings changes.
+///
+/// `prefix` should be the project-namespaced `wg-chat-<project>-`
+/// prefix so unrelated tmux sessions on the same machine are untouched.
+pub fn sync_chat_session_settings(prefix: &str) {
+    if !tmux_available() {
+        return;
+    }
+    for session in tmux_list_sessions_with_prefix(prefix) {
+        apply_session_options(&session);
+    }
+}
+
+/// Query whether `session`'s active pane is currently in any tmux
+/// mode (copy-mode, view-mode, etc.). Returns `Some(true)` /
+/// `Some(false)`; `None` when tmux isn't installed or the session
+/// is gone. Used by tests + smoke scenarios.
+pub fn tmux_pane_in_mode(session: &str) -> Option<bool> {
+    let out = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", session, "#{pane_in_mode}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Some(s.trim() == "1")
+}
+
+/// Read a single row's content into a UTF-8 byte buffer plus its `wrapped`
+/// flag. Empty cells are emitted as ASCII spaces and trailing spaces are
+/// trimmed; wide-character continuation cells are skipped because their
+/// content is already encoded in the preceding cell.
+fn read_row_for_reflow(parser: &vt100::Parser, row: u16, cols: u16) -> (Vec<u8>, bool) {
+    let mut row_bytes: Vec<u8> = Vec::new();
+    for c in 0..cols {
+        if let Some(cell) = parser.screen().cell(row, c) {
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let s = cell.contents();
+            if s.is_empty() {
+                row_bytes.push(b' ');
+            } else {
+                row_bytes.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+    while row_bytes.last() == Some(&b' ') {
+        row_bytes.pop();
+    }
+    let wrapped = parser.screen().row_wrapped(row);
+    (row_bytes, wrapped)
+}
+
+/// Snapshot every logical line currently in the parser (scrollback oldest →
+/// newest, then visible top → bottom), optionally dropping the `drop_recent_k`
+/// most-recently-scrolled-into-scrollback rows. With `drop_recent_k = 0` this
+/// is the standard reflow snapshot; with `k > 0` it is the sync-mode-aware
+/// trim that drops scrollback rows codex pushed during a `\x1b[?2026h` ...
+/// `\x1b[?2026l` synchronized repaint (those rows are repaint echoes the user
+/// never wanted preserved — see `manage_sync_mode_scrollback`).
+///
+/// `trim_trailing_blank_rows` controls whether trailing fully-blank logical
+/// lines are popped before returning. The reflow-on-resize caller wants
+/// trimming so blank visible regions don't compound across resizes; the
+/// sync-mode trim caller wants trailing blanks PRESERVED so the row count of
+/// the re-fed parser matches the pre-trim row count exactly (popping a blank
+/// row would silently lose one row of REAL scrollback per sync block, which
+/// over many animation frames would erase legitimate chat history — see
+/// `sync_mode_block_trim_removes_scrolled_rows`).
+fn snapshot_logical_lines_skipping_recent_scrollback(
+    parser: &mut vt100::Parser,
+    drop_recent_k: usize,
+    trim_trailing_blank_rows: bool,
+) -> Vec<Vec<u8>> {
+    let saved_offset = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let max_offset = parser.screen().scrollback();
+    let (rows, cols) = parser.screen().size();
+
+    let mut rows_data: Vec<(Vec<u8>, bool)> = Vec::new();
+
+    // Skip the K most-recently-scrolled rows (offsets 1..=k) by starting the
+    // walk at offset k+1. When k >= max_offset, the loop body doesn't execute
+    // and we walk only the visible region.
+    let lower = drop_recent_k.saturating_add(1);
+    if lower <= max_offset {
+        for offset in (lower..=max_offset).rev() {
+            parser.screen_mut().set_scrollback(offset);
+            rows_data.push(read_row_for_reflow(parser, 0, cols));
+        }
+    }
+    parser.screen_mut().set_scrollback(0);
+    for r in 0..rows {
+        rows_data.push(read_row_for_reflow(parser, r, cols));
+    }
+    parser.screen_mut().set_scrollback(saved_offset);
+
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut prev_wrapped = false;
+    for (row_bytes, wrapped) in rows_data {
+        current.extend_from_slice(&row_bytes);
+        if !wrapped {
+            lines.push(std::mem::take(&mut current));
+        }
+        prev_wrapped = wrapped;
+    }
+    if !current.is_empty() || prev_wrapped {
+        lines.push(current);
+    }
+    if trim_trailing_blank_rows {
+        while lines.len() > 1 && lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+    }
+    lines
+}
+
+/// Snapshot every logical line currently in the parser (scrollback oldest →
+/// newest, then visible top → bottom). Joins rows whose preceding row carries
+/// `wrapped()=true` so the result is a list of logical lines independent of
+/// the original column width — feeding them into a fresh parser at a new
+/// column count rewraps cleanly.
+fn snapshot_logical_lines(parser: &mut vt100::Parser) -> Vec<Vec<u8>> {
+    snapshot_logical_lines_skipping_recent_scrollback(parser, 0, true)
+}
+
+/// Build a fresh `vt100::Parser` at the requested dimensions and re-feed the
+/// snapshot of `parser`'s scrollback + visible content into it. Content
+/// reflows naturally to the new column width because vt100 re-wraps at parse
+/// time.
+fn reflow_parser(
+    parser: &mut vt100::Parser,
+    new_rows: u16,
+    new_cols: u16,
+    scrollback_lines: usize,
+) -> vt100::Parser {
+    let logical_lines = snapshot_logical_lines(parser);
+    let mut fresh = vt100::Parser::new(new_rows, new_cols, scrollback_lines);
+    let n = logical_lines.len();
+    for (i, line) in logical_lines.iter().enumerate() {
+        fresh.process(line);
+        // Don't append \r\n after the final logical line — it would push the
+        // current visible row into scrollback and leave the cursor on a
+        // gratuitously blank row.
+        if i + 1 < n {
+            fresh.process(b"\r\n");
+        }
+    }
+    fresh
+}
+
 /// Convert a crossterm `KeyEvent` into the byte sequence a Unix PTY
 /// expects. Handles control characters, arrow keys (CSI sequences),
 /// function keys, and plain text. Not exhaustive — covers what a
 /// `wg nex` REPL user actually presses.
-/// Scan PTY output for terminal capability queries and write the
-/// conventional replies back through the shared writer. Minimal
-/// coverage — just the queries claude and codex send on startup that,
-/// if unanswered, make the CLI freeze post-splash.
+/// Scan PTY output for terminal capability queries and return the
+/// conventional reply bytes. Pure (no I/O) so it is unit-testable.
 ///
-/// This is standard terminal emulator behavior: xterm, gnome-terminal,
-/// alacritty etc. all respond to these. portable-pty is a raw pipe
-/// and vt100-the-parser doesn't generate replies, so we fill the gap.
-fn respond_to_queries(chunk: &[u8], writer: &std::sync::Arc<Mutex<Box<dyn Write + Send>>>) {
+/// `cursor_position` is the parser's current `(row, col)` (0-indexed)
+/// at the moment the query bytes arrived. CPR (`ESC [ 6 n`) replies
+/// with this position in 1-indexed form, matching xterm semantics.
+///
+/// Coverage targets the queries claude and codex actually send on
+/// startup; if any are unanswered, the vendor CLI blocks post-splash
+/// and the embedded TUI shows nothing usable. This is standard
+/// terminal emulator behavior — xterm, gnome-terminal, alacritty etc.
+/// all answer these — portable-pty is a raw pipe so vt100-the-parser
+/// doesn't generate replies and we fill the gap.
+fn compute_query_replies(chunk: &[u8], cursor_position: (u16, u16)) -> Vec<u8> {
     // Scan for well-known query sequences. Byte patterns:
     //   ESC [ c            — Primary Device Attributes (DA1)
     //   ESC [ > c          — Secondary Device Attributes (DA2)
-    //   ESC [ ? 6 n        — cursor position request (also common)
+    //   ESC [ 6 n          — Cursor Position Report (CPR)
+    //   ESC [ 5 n          — Device Status Report (DSR)
+    //   ESC [ ? u          — Kitty keyboard protocol query
+    //   ESC ] 10 ; ? ESC \ — OSC 10 (foreground color query)
+    //   ESC ] 11 ; ? ESC \ — OSC 11 (background color query)
     //   ESC [ > 0 q        — XTVERSION
     //   ESC [ ? 2026 $ p   — DECRQM for mode 2026 (synchronized output)
     //
@@ -582,8 +1252,234 @@ fn respond_to_queries(chunk: &[u8], writer: &std::sync::Arc<Mutex<Box<dyn Write 
             i += end + 1;
             continue;
         }
+        // ESC [ 6 n — Cursor Position Report (CPR). Reply with the
+        // parser's current cursor in 1-indexed form. Codex's interactive
+        // TUI sends this on startup and BLOCKS waiting for the reply —
+        // without it, the splash never advances and the chat tab shows
+        // nothing useful (root cause of the codex chat-tab regression).
+        if tail.starts_with(b"\x1b[6n") {
+            let (row, col) = cursor_position;
+            let resp = format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1));
+            reply.extend_from_slice(resp.as_bytes());
+            i += 4;
+            continue;
+        }
+        // ESC [ 5 n — Device Status Report. Reply 0 = "ready, no malfunction".
+        if tail.starts_with(b"\x1b[5n") {
+            reply.extend_from_slice(b"\x1b[0n");
+            i += 4;
+            continue;
+        }
+        // ESC [ ? u — Kitty keyboard protocol query. Reply 0 = legacy mode
+        // (no kitty progressive enhancement). Codex falls back to xterm
+        // sequences when this is the answer.
+        if tail.starts_with(b"\x1b[?u") {
+            reply.extend_from_slice(b"\x1b[?0u");
+            i += 4;
+            continue;
+        }
+        // ESC ] 10 ; ? ESC \ — OSC 10 (foreground color query). Reply with
+        // a typical dark-theme light-gray foreground. Codex uses this to
+        // pick a readable palette; an unanswered query leaves it stalled
+        // at startup. Also accept BEL terminator (ESC ] 10 ; ? BEL).
+        if tail.starts_with(b"\x1b]10;?\x1b\\") {
+            reply.extend_from_slice(b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\");
+            i += 8;
+            continue;
+        }
+        if tail.starts_with(b"\x1b]10;?\x07") {
+            reply.extend_from_slice(b"\x1b]10;rgb:cccc/cccc/cccc\x07");
+            i += 7;
+            continue;
+        }
+        // ESC ] 11 ; ? ESC \ — OSC 11 (background color query). Reply
+        // black (typical dark-theme bg). Same blocking behavior as OSC 10
+        // if unanswered.
+        if tail.starts_with(b"\x1b]11;?\x1b\\") {
+            reply.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+            i += 8;
+            continue;
+        }
+        if tail.starts_with(b"\x1b]11;?\x07") {
+            reply.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x07");
+            i += 7;
+            continue;
+        }
         i += 1;
     }
+    reply
+}
+
+/// Read the parser's current scrollback row count without disturbing the
+/// user's scrollback offset. Uses the standard `set_scrollback(MAX) →
+/// scrollback()` clamp trick.
+fn parser_scrollback_count(parser: &mut vt100::Parser) -> usize {
+    let saved = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let count = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(saved);
+    count
+}
+
+/// Build a fresh parser at the same dimensions, re-feeding logical lines
+/// from `parser` but dropping the `drop_recent_k` most-recently-scrolled
+/// scrollback rows. Used by `manage_sync_mode_scrollback` to remove the
+/// row(s) codex's full-screen sync repaint scrolled off the top during a
+/// `\x1b[?2026h ... \x1b[?2026l` block.
+///
+/// Trailing-blank trimming is DISABLED here so the re-fed parser's row
+/// count matches the original exactly: popping a blank visible-region row
+/// would silently scroll one extra row of REAL scrollback off the top per
+/// trim, and over many animation frames would erase legitimate chat
+/// history (`sync_mode_block_trim_removes_scrolled_rows` pins this).
+fn parser_after_dropping_recent_scrollback(
+    parser: &mut vt100::Parser,
+    drop_recent_k: usize,
+) -> vt100::Parser {
+    let (rows, cols) = parser.screen().size();
+    let lines = snapshot_logical_lines_skipping_recent_scrollback(parser, drop_recent_k, false);
+    let mut fresh = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK_LINES);
+    let n = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        fresh.process(line);
+        if i + 1 < n {
+            fresh.process(b"\r\n");
+        }
+    }
+    fresh
+}
+
+/// Whether `chunk` contains DEC mode 2026 (synchronized output) BSU
+/// (`\x1b[?2026h`) or ESU (`\x1b[?2026l`) markers. Cheap byte scan;
+/// `manage_sync_mode_scrollback` calls this first to skip the
+/// snapshot/trim work on the vast majority of reads that have no sync
+/// markers (raw text, key echo, prompts, etc.).
+fn chunk_contains_sync_markers(chunk: &[u8]) -> bool {
+    chunk
+        .windows(8)
+        .any(|w| w == b"\x1b[?2026h" || w == b"\x1b[?2026l")
+}
+
+/// Process DEC mode 2026 (synchronized output) tracking for one chunk.
+///
+/// Codex emits its TUI as `\x1b[?2026h` (BSU) ... full-screen repaint
+/// with `\r\n`-separated rows ... `\x1b[?2026l` (ESU) per animation
+/// frame. The repaint's trailing newline scrolls one row off the top
+/// per frame, and after enough frames the scrollback fills with stacked
+/// repaint-echoes the user perceives as "scrolling shows the spinner
+/// frames over and over." vt100 0.16 does not implement BSU/ESU itself,
+/// so we intercept the markers here and trim any scrollback the sync
+/// block produced — the visible region is whatever codex repainted, and
+/// the next sync block will repaint again, so we lose nothing the user
+/// wanted preserved.
+///
+/// Caller invariants:
+/// - `*in_sync` and `*sync_start_count` reflect state BEFORE this chunk's
+///   bytes have been processed by the parser.
+/// - `pre_chunk_scrollback_count` is the parser's scrollback row count
+///   captured BEFORE `parser.process(chunk)` ran.
+/// - Caller has already invoked `parser.process(chunk)` so the parser's
+///   visible state and scrollback count reflect post-chunk.
+///
+/// Updates `*in_sync` and `*sync_start_count` to reflect post-chunk
+/// state, and trims any rows scrolled into scrollback during a sync
+/// block that ENDED in this chunk.
+fn manage_sync_mode_scrollback(
+    chunk: &[u8],
+    parser: &Arc<Mutex<vt100::Parser>>,
+    in_sync: &mut bool,
+    sync_start_count: &mut usize,
+    pre_chunk_scrollback_count: usize,
+) {
+    if !chunk_contains_sync_markers(chunk) {
+        return;
+    }
+
+    // Walk the chunk byte-by-byte tracking sync transitions. We only need
+    // to know the FINAL state and whether a sync block ended within the
+    // chunk (so we can trim). When entering sync from outside, capture
+    // the seed scrollback count: pre_chunk_scrollback_count for the FIRST
+    // entry, post-chunk for subsequent entries (a sync block that started
+    // and ended earlier in the chunk is already trimmed by then).
+    let mut seed = if *in_sync {
+        *sync_start_count
+    } else {
+        pre_chunk_scrollback_count
+    };
+    let mut current_in_sync = *in_sync;
+    let mut total_drop = 0usize;
+
+    let mut i = 0;
+    while i < chunk.len() {
+        if chunk[i..].starts_with(b"\x1b[?2026h") {
+            if !current_in_sync {
+                // Entering sync: pick the right seed. For the first BSU
+                // in the chunk this is pre_chunk_scrollback_count (set
+                // above). For subsequent BSUs after an earlier ESU, the
+                // seed should be the post-trim count, which equals seed
+                // at this point because each ESU's trim brings the
+                // scrollback count back to seed.
+                current_in_sync = true;
+            }
+            i += 8;
+            continue;
+        }
+        if chunk[i..].starts_with(b"\x1b[?2026l") {
+            if current_in_sync {
+                // Sync ended. The bytes between the matching BSU and ESU
+                // pushed (post_count - seed) rows into scrollback, where
+                // post_count is the parser's count NOW (after the entire
+                // chunk has been processed — minus any trim we've already
+                // applied for earlier ESUs in this chunk). We accumulate
+                // `total_drop` and trim once at the end so the parser
+                // lock is held only briefly.
+                if let Ok(mut p) = parser.lock() {
+                    let now = parser_scrollback_count(&mut p);
+                    let after_prior_trims = now.saturating_sub(total_drop);
+                    if after_prior_trims > seed {
+                        total_drop += after_prior_trims - seed;
+                    }
+                    seed = seed.min(after_prior_trims);
+                }
+                current_in_sync = false;
+            }
+            i += 8;
+            continue;
+        }
+        i += 1;
+    }
+
+    if total_drop > 0
+        && let Ok(mut p) = parser.lock()
+    {
+        let fresh = parser_after_dropping_recent_scrollback(&mut p, total_drop);
+        *p = fresh;
+    }
+
+    // Update caller state for next chunk.
+    *in_sync = current_in_sync;
+    *sync_start_count = if current_in_sync {
+        seed
+    } else if let Ok(mut p) = parser.lock() {
+        parser_scrollback_count(&mut p)
+    } else {
+        seed
+    };
+}
+
+/// I/O wrapper: read the parser's current cursor position, compute
+/// replies for any queries in `chunk`, and write them back through
+/// the shared writer.
+fn respond_to_queries(
+    chunk: &[u8],
+    writer: &std::sync::Arc<Mutex<Box<dyn Write + Send>>>,
+    parser: &std::sync::Arc<Mutex<vt100::Parser>>,
+) {
+    let cursor_position = match parser.lock() {
+        Ok(p) => p.screen().cursor_position(),
+        Err(poisoned) => poisoned.into_inner().screen().cursor_position(),
+    };
+    let reply = compute_query_replies(chunk, cursor_position);
     if !reply.is_empty()
         && let Ok(mut w) = writer.lock()
     {
@@ -776,6 +1672,84 @@ mod tests {
         assert_eq!(key_event_to_bytes(&e), b"\x1b[Z");
     }
 
+    /// Pinning the reader-thread ordering invariant: when
+    /// `bytes_processed` advances, the vt100 parser MUST already
+    /// contain the bytes it just claimed credit for.
+    ///
+    /// fix-nex-tui regression: the original reader-thread loop did
+    /// `bytes_processed.fetch_add(n)` BEFORE `parser.process(buf)`.
+    /// The TUI's event loop reads `bytes_processed` to decide whether
+    /// fresh PTY bytes have arrived since the last frame
+    /// (`chat_pty_has_new_bytes()`), then snapshots the watermark
+    /// after a redraw (`update_task_pane_byte_watermarks()`). With
+    /// the old order, a watermark snapshot taken between the
+    /// counter advance and `parser.process` rendered the pre-chunk
+    /// screen and pinned the watermark to the new counter value —
+    /// every subsequent poll then saw `bytes_processed == watermark`
+    /// and skipped the redraw, so the model's reply lived in the
+    /// parser but never reached the user's screen.
+    ///
+    /// Symptom in the wild: `wg tui` -> nex chat against
+    /// lambda01/qwen3-coder, second message in a fresh chat (or any
+    /// message after a TUI restart) shows the user prompt but no
+    /// model response, despite the inner tmux session having the
+    /// reply (verified via `tmux capture-pane`).
+    ///
+    /// This test polls the counter on a tight loop and asserts the
+    /// parser screen is non-empty whenever the counter has advanced
+    /// past the prologue. With the regression, the test races with
+    /// the reader thread and catches the empty-screen-with-advanced-
+    /// counter window. With the fix in place, the counter never
+    /// outpaces the parser, so the assertion holds.
+    #[test]
+    fn bytes_processed_never_outpaces_parser() {
+        // `printf` per chunk + tiny sleeps maximize the chance of the
+        // test thread observing the counter mid-loop.
+        let pane = PtyPane::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "for m in alpha bravo charlie delta echo foxtrot golf hotel; do \
+                 printf '%s\\r\\n' \"$m\"; sleep 0.01; done; sleep 30",
+            ],
+            &[],
+            10,
+            60,
+        )
+        .expect("spawn /bin/sh");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_bytes = 0u64;
+        let mut violations: Vec<String> = Vec::new();
+        let mut advances = 0;
+        while std::time::Instant::now() < deadline {
+            let bytes = pane.bytes_processed();
+            if bytes > last_bytes && bytes >= 8 {
+                let p = pane.parser.lock().unwrap();
+                let contents = p.screen().contents();
+                if contents.trim().is_empty() {
+                    violations.push(format!(
+                        "bytes_processed={} but parser screen is empty",
+                        bytes
+                    ));
+                }
+                drop(p);
+                last_bytes = bytes;
+                advances += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(advances > 0, "reader thread never advanced bytes_processed");
+        assert!(
+            violations.is_empty(),
+            "byte-counter raced ahead of parser writes — \
+             reader thread must call `parser.process(buf)` BEFORE \
+             `reader_bytes.fetch_add(n)`:\n{}",
+            violations.join("\n"),
+        );
+    }
+
     #[test]
     fn spawn_echo_and_read_output() {
         let mut pane =
@@ -796,6 +1770,137 @@ mod tests {
             "did not see 'hello from pty' in PTY output; screen was:\n{}",
             p.screen().contents()
         );
+    }
+
+    /// End-to-end integration test for the codex chat-tab fix:
+    /// spawn a real PTY child that emits the codex startup query burst,
+    /// then reads the response wg writes back, then echoes it as a
+    /// marker so the test can observe via the parser screen.
+    ///
+    /// Without the CPR / kitty / OSC 10 handlers, the child reads
+    /// nothing for those queries and hangs at `read`, the test times
+    /// out, and the screen never shows the marker. With the handlers,
+    /// the child receives the responses through the PTY slave stdin,
+    /// echoes them, and the marker shows up — proving the full
+    /// reader-thread → respond_to_queries → writer → child stdin path
+    /// works end-to-end (not just the pure compute_query_replies fn).
+    #[test]
+    fn pty_pane_unblocks_codex_style_query_burst_end_to_end() {
+        // Bash script: emit the codex startup query burst, read up to
+        // 64 bytes (covers DA + CPR + kitty + OSC10 replies easily),
+        // base64 the bytes, then echo them with a unique marker.
+        // Using base64 keeps the response printable so the parser screen
+        // shows ASCII we can grep for; the raw response bytes contain
+        // ESC/CSI which would be re-interpreted by the parser.
+        //
+        // The query burst matches what codex 0.125.0 actually sent at
+        // 24×80 (verified via pty.fork()).
+        let script = r#"
+printf '\x1b[?2004h\x1b[>7u\x1b[?1004h\x1b[6n\x1b[?u\x1b[c\x1b]10;?\x1b\\'
+# Drain whatever the responder sends. -N 64 = up to 64 bytes;
+# -t 3 = 3-second timeout per read attempt. Loop a couple of times
+# in case the responses are delivered in chunks.
+got=""
+for _ in 1 2 3; do
+  IFS= read -r -t 1 -N 64 chunk || true
+  got="$got$chunk"
+done
+b64=$(printf %s "$got" | base64 | tr -d '\n')
+printf 'CODEX_RESP_MARKER:%s:END\n' "$b64"
+sleep 5
+"#;
+        let mut pane = PtyPane::spawn("/bin/bash", &["-c", script], &[], 24, 80)
+            .expect("spawn bash with codex burst");
+        // Give the script up to 5 s to emit queries, receive responses,
+        // and print the marker. 50 ms × 100 = 5 s.
+        let mut last_screen = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let p = pane.parser.lock().unwrap();
+            let contents = p.screen().contents();
+            if contents.contains("CODEX_RESP_MARKER:") && contents.contains(":END") {
+                // Decode the base64 between the markers.
+                let start =
+                    contents.find("CODEX_RESP_MARKER:").unwrap() + "CODEX_RESP_MARKER:".len();
+                let rest = &contents[start..];
+                let end = rest.find(":END").expect("END marker present");
+                // The base64 may have been wrapped across PTY rows by the
+                // emulator; strip whitespace before decoding.
+                let b64: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+                let decoded = base64_decode_lenient(&b64);
+                drop(p);
+
+                // The raw response bytes must contain the four key replies:
+                // DA1, CPR, kitty, and OSC 10. (DA1 was already supported
+                // pre-fix; the other three are the new handlers.)
+                assert!(
+                    decoded
+                        .windows(b"\x1b[?65;1;6c".len())
+                        .any(|w| w == b"\x1b[?65;1;6c"),
+                    "expected DA1 reply in PTY responses, got: {:?}",
+                    decoded
+                );
+                assert!(
+                    decoded
+                        .windows(b"\x1b[1;1R".len())
+                        .any(|w| w == b"\x1b[1;1R"),
+                    "expected CPR reply in PTY responses (the bytes wg writes back \
+                     to the child via the master writer must round-trip through the \
+                     PTY slave stdin), got: {:?}",
+                    decoded
+                );
+                assert!(
+                    decoded.windows(b"\x1b[?0u".len()).any(|w| w == b"\x1b[?0u"),
+                    "expected kitty keyboard reply in PTY responses, got: {:?}",
+                    decoded
+                );
+                assert!(
+                    decoded
+                        .windows(b"\x1b]10;rgb:".len())
+                        .any(|w| w == b"\x1b]10;rgb:"),
+                    "expected OSC 10 fg-color reply in PTY responses, got: {:?}",
+                    decoded
+                );
+                return;
+            }
+            last_screen = contents;
+        }
+        let _ = pane.kill();
+        panic!(
+            "PTY child never emitted the CODEX_RESP_MARKER within 5 s — \
+             responder likely failed to write CPR/kitty/OSC10 replies \
+             back through the PTY master writer. Last screen was:\n{}",
+            last_screen
+        );
+    }
+
+    /// Minimal RFC-4648 base64 decoder for test use only — the codex
+    /// integration test base64-encodes the bytes the bash child read
+    /// from stdin so they survive vt100 parser interpretation. We
+    /// don't pull in a base64 crate just for one test.
+    fn base64_decode_lenient(s: &str) -> Vec<u8> {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        let s = s.trim_end_matches('=');
+        let mut out = Vec::with_capacity(s.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for ch in s.bytes() {
+            let v = TABLE.iter().position(|&b| b == ch);
+            let v = match v {
+                Some(v) => v as u32,
+                None => continue,
+            };
+            buf = (buf << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+                buf &= (1u32 << bits) - 1;
+            }
+        }
+        out
     }
 
     #[test]
@@ -1348,5 +2453,1884 @@ mod tests {
             p.screen_mut().set_scrollback(0);
             assert_eq!(p.screen().scrollback(), 0);
         }
+    }
+
+    // ── helpers for the SIGWINCH dedup tests ──────────────────────────────
+
+    /// Read the actual number of entries in the vt100 scrollback buffer
+    /// without perturbing the user's scroll offset.
+    fn test_scrollback_count(parser: &Arc<Mutex<vt100::Parser>>) -> usize {
+        let mut p = parser.lock().unwrap();
+        let saved = p.screen().scrollback();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let count = p.screen().scrollback();
+        p.screen_mut().set_scrollback(saved);
+        count
+    }
+
+    /// Read all entries in the scrollback buffer exactly once, without
+    /// including the live screen.  Walks from max offset to offset=1;
+    /// at each step, row 0 of the visible window is a unique scrollback row
+    /// (oldest-first order).  Returns each row as a trimmed string line.
+    fn collect_scrollback_only_naive(parser: &Arc<Mutex<vt100::Parser>>, cols: u16) -> Vec<String> {
+        let max = test_scrollback_count(parser);
+        let mut rows_out = Vec::new();
+        for offset in (1..=max).rev() {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_scrollback(offset);
+            drop(p);
+            let p = parser.lock().unwrap();
+            let row: String = (0..cols)
+                .map(|c| {
+                    p.screen()
+                        .cell(0, c)
+                        .map(|cell| cell.contents().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            rows_out.push(row.trim_end().to_string());
+        }
+        {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_scrollback(0);
+        }
+        rows_out
+    }
+
+    /// Walk every row of the parser exactly once: scrollback oldest → newest,
+    /// then visible top → bottom. Unlike `collect_full_scrollback_and_screen`
+    /// (which renders the visible window at every scrollback offset and so
+    /// repeats most rows many times), this returns one entry per logical row,
+    /// suitable for "appears at most once" duplication checks.
+    fn collect_every_row_once(parser: &Arc<Mutex<vt100::Parser>>) -> Vec<String> {
+        let max = test_scrollback_count(parser);
+        let mut out: Vec<String> = Vec::new();
+        let cols = {
+            let p = parser.lock().unwrap();
+            p.screen().size().1
+        };
+        for offset in (1..=max).rev() {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_scrollback(offset);
+            drop(p);
+            let p = parser.lock().unwrap();
+            let row: String = (0..cols)
+                .map(|c| {
+                    p.screen()
+                        .cell(0, c)
+                        .map(|cell| cell.contents().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            out.push(row.trim_end().to_string());
+        }
+        {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_scrollback(0);
+        }
+        let p = parser.lock().unwrap();
+        let (rows, _) = p.screen().size();
+        for r in 0..rows {
+            let row: String = (0..cols)
+                .map(|c| {
+                    p.screen()
+                        .cell(r, c)
+                        .map(|cell| cell.contents().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            out.push(row.trim_end().to_string());
+        }
+        out
+    }
+
+    /// Pre-condition: vt100 0.16's `Screen::set_size` does NOT reflow scrollback.
+    /// After a width change, scrollback rows keep their pre-resize cell count
+    /// and wrap flags — and a child's SIGWINCH-driven clear+reprint pushes
+    /// already-seen content back into scrollback as duplicates.
+    /// (Diagnose: agent-1104 / diagnose-scrollback-corruption.)
+    ///
+    /// This test pins the bug shape for regression detection. The fix lives in
+    /// `reflow_parser`; see `refeed_reflow_eliminates_scrollback_duplicates`.
+    #[test]
+    fn naive_set_size_then_child_reprint_creates_scrollback_duplicates() {
+        let init_rows = 10u16;
+        let new_rows = 12u16;
+        let cols = 80u16;
+        let mut p = vt100::Parser::new(init_rows, cols, DEFAULT_SCROLLBACK_LINES);
+        for i in 0..30u32 {
+            p.process(format!("marker-{:04}\r\n", i).as_bytes());
+        }
+        // Simulate the buggy resize path: just set_size, no reflow.
+        p.screen_mut().set_size(new_rows, cols);
+        // Simulate the child's SIGWINCH-driven clear+repaint of the new visible
+        // window. marker-0018 was already in scrollback; reprinting it pushes
+        // a second copy in.
+        p.process(b"\x1b[2J\x1b[H");
+        for i in 18..30u32 {
+            p.process(format!("marker-{:04}\r\n", i).as_bytes());
+        }
+        let parser = Arc::new(Mutex::new(p));
+        let naive = collect_scrollback_only_naive(&parser, cols).join("\n");
+        let any_dup = (0..30u32).any(|i| naive.matches(&format!("marker-{:04}", i)).count() > 1);
+        assert!(
+            any_dup,
+            "naive set_size + child reprint must produce scrollback duplicates \
+             (this is the bug-shape pre-condition for the reflow fix); naive scrollback:\n{}",
+            naive
+        );
+    }
+
+    /// TDD assertion for the re-feed reflow fix: snapshotting the parser into
+    /// logical lines and re-feeding them into a freshly-sized parser produces
+    /// a scrollback in which every marker appears at most once. The bug
+    /// (scrollback duplicates after SIGWINCH reflow) is gone, even when the
+    /// child subsequently reprints — because the reprint hits a clean parser
+    /// where the "duplicates" are simply the next visible region, not pushed
+    /// into scrollback as wrap-mismatched echoes.
+    #[test]
+    fn refeed_reflow_eliminates_scrollback_duplicates() {
+        let init_rows = 10u16;
+        let new_rows = 12u16;
+        let cols = 80u16;
+        let mut p = vt100::Parser::new(init_rows, cols, DEFAULT_SCROLLBACK_LINES);
+        for i in 0..30u32 {
+            p.process(format!("marker-{:04}\r\n", i).as_bytes());
+        }
+        // Reflow via re-feed instead of bare set_size.
+        let reflowed = reflow_parser(&mut p, new_rows, cols, DEFAULT_SCROLLBACK_LINES);
+        let parser = Arc::new(Mutex::new(reflowed));
+
+        // After reflow, every marker appears exactly once across scrollback +
+        // visible. (Some markers may not appear at all if they wrapped off the
+        // top of the bounded scrollback — but none should appear twice.)
+        let rows = collect_every_row_once(&parser);
+        let full = rows.join("\n");
+        for i in 0..30u32 {
+            let marker = format!("marker-{:04}", i);
+            let n = full.matches(&marker).count();
+            assert!(
+                n <= 1,
+                "after re-feed reflow, marker {} appeared {} times \
+                 (expected ≤1). Rows:\n{}",
+                marker,
+                n,
+                full
+            );
+        }
+        // And the most recent markers are present at all.
+        for i in 18..30u32 {
+            let marker = format!("marker-{:04}", i);
+            assert!(
+                full.contains(&marker),
+                "marker {} should still be present after reflow. Rows:\n{}",
+                marker,
+                full
+            );
+        }
+    }
+
+    /// Reflow at a NARROWER width: rows that previously fit on a single line
+    /// now wrap. The user's logical content is preserved exactly once.
+    #[test]
+    fn refeed_reflow_rewraps_at_narrower_width() {
+        let init_rows = 30u16;
+        let init_cols = 120u16;
+        let new_rows = 30u16;
+        let new_cols = 40u16;
+        let mut p = vt100::Parser::new(init_rows, init_cols, DEFAULT_SCROLLBACK_LINES);
+        // 12 logical lines, each 100 chars — fit unwrapped at 120, wrap at 40.
+        let lines: Vec<String> = (0..12)
+            .map(|i| {
+                let body = "x".repeat(85);
+                format!("history-line-{:03}-{}", i, body)
+            })
+            .collect();
+        for line in &lines {
+            p.process(line.as_bytes());
+            p.process(b"\r\n");
+        }
+        let reflowed = reflow_parser(&mut p, new_rows, new_cols, DEFAULT_SCROLLBACK_LINES);
+        let parser = Arc::new(Mutex::new(reflowed));
+        let rows = collect_every_row_once(&parser);
+        let full = rows.join("\n");
+        for line in &lines {
+            let marker = &line[..16]; // "history-line-NNN"
+            let n = full.matches(marker).count();
+            assert_eq!(
+                n, 1,
+                "after reflow narrower, line marker {:?} appeared {} times \
+                 (expected exactly 1). Rows:\n{}",
+                marker, n, full
+            );
+        }
+    }
+
+    /// Reflow at a WIDER width: previously-wrapped logical lines unwrap into
+    /// single rows. Each logical line still appears exactly once.
+    #[test]
+    fn refeed_reflow_unwraps_at_wider_width() {
+        let init_rows = 24u16;
+        let init_cols = 80u16;
+        let new_rows = 24u16;
+        let new_cols = 200u16;
+        let mut p = vt100::Parser::new(init_rows, init_cols, DEFAULT_SCROLLBACK_LINES);
+        let lines: Vec<String> = (0..10)
+            .map(|i| {
+                let body = "y".repeat(95);
+                format!("entry-{:03}-{}", i, body)
+            })
+            .collect();
+        for line in &lines {
+            p.process(line.as_bytes());
+            p.process(b"\r\n");
+        }
+        let reflowed = reflow_parser(&mut p, new_rows, new_cols, DEFAULT_SCROLLBACK_LINES);
+        let parser = Arc::new(Mutex::new(reflowed));
+        let rows_out = collect_every_row_once(&parser);
+        let full = rows_out.join("\n");
+        for line in &lines {
+            let marker = &line[..9]; // "entry-NNN"
+            let n = full.matches(marker).count();
+            assert_eq!(
+                n, 1,
+                "after reflow wider, line marker {:?} appeared {} times \
+                 (expected exactly 1). Rows:\n{}",
+                marker, n, full
+            );
+        }
+    }
+
+    /// Simulate a TUI child's SIGWINCH-driven clear+repaint AFTER our
+    /// reflow has already swapped the parser. The child's reprint hits the
+    /// fresh, already-reflowed parser. The post-repaint scrollback may have
+    /// at most a tiny number of "echo" rows from the repaint's trailing
+    /// newlines (per diagnose: bounded ≤ 1 row per resize), but it must NOT
+    /// re-introduce the wrap-stale compounding duplicates the dedup
+    /// machinery used to paper over.
+    #[test]
+    fn refeed_reflow_then_child_repaint_keeps_scrollback_almost_clean() {
+        let cols = 80u16;
+        let mut p = vt100::Parser::new(10, cols, DEFAULT_SCROLLBACK_LINES);
+        for i in 0..30u32 {
+            p.process(format!("clean-{:04}\r\n", i).as_bytes());
+        }
+        // Reflow: shrink rows, keep cols. Equivalent to a typing-induced
+        // SIGWINCH from the host TUI changing the chat-pane height.
+        let mut p = reflow_parser(&mut p, 12, cols, DEFAULT_SCROLLBACK_LINES);
+        // Now simulate the TUI child's SIGWINCH response — clear + repaint
+        // the visible region with the most recent 12 markers.
+        p.process(b"\x1b[2J\x1b[H");
+        for i in 18..30u32 {
+            p.process(format!("clean-{:04}\r\n", i).as_bytes());
+        }
+        let parser = Arc::new(Mutex::new(p));
+        let rows = collect_every_row_once(&parser);
+        let full = rows.join("\n");
+        for i in 0..30u32 {
+            let marker = format!("clean-{:04}", i);
+            let n = full.matches(&marker).count();
+            // Bound: at most TWO copies of any one marker — one from the
+            // re-fed scrollback, one from the child's repaint. Without the
+            // re-feed fix, the wrap-stale compounding pushed many more.
+            assert!(
+                n <= 2,
+                "after reflow + child repaint, marker {} appeared {} times \
+                 (expected ≤2 — one re-fed copy, at most one repaint copy). Rows:\n{}",
+                marker,
+                n,
+                full
+            );
+        }
+    }
+
+    /// End-to-end: drive `PtyPane::resize` against a real spawned PTY and
+    /// confirm that no scrollback duplicates appear after multiple width
+    /// changes. Uses `printf` to emit a deterministic block of markers so the
+    /// child output is fully realized before we resize.
+    #[test]
+    fn pty_pane_resize_does_not_create_scrollback_duplicates() {
+        // 30 unique markers, then sleep so the child does not exit before we
+        // have a chance to drive the resize sequence.
+        let script = "for i in $(seq 0 29); do printf 'pane-marker-%04d\\n' $i; done; sleep 5";
+        let mut pane =
+            PtyPane::spawn("/bin/sh", &["-c", script], &[], 10, 80).expect("spawn /bin/sh script");
+
+        // Wait for the child output to land in the parser. /bin/sh emits the
+        // 30 lines synchronously; 200 ms is generous on any platform.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Three back-to-back resizes (the chat tab fires a burst per the
+        // diagnose). Each call goes through the new re-feed reflow path.
+        for &(rows, cols) in &[(12u16, 80u16), (8, 100), (14, 60), (12, 80)] {
+            pane.resize(rows, cols).expect("resize");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let parser_arc = Arc::clone(&pane.parser);
+        let rows = collect_every_row_once(&parser_arc);
+        let full = rows.join("\n");
+        for i in 0..30u32 {
+            let marker = format!("pane-marker-{:04}", i);
+            let n = full.matches(&marker).count();
+            assert!(
+                n <= 1,
+                "after PtyPane::resize burst, marker {} appeared {} times \
+                 (expected ≤1). Rows:\n{}",
+                marker,
+                n,
+                full
+            );
+        }
+        pane.kill();
+    }
+
+    /// Multiple consecutive resizes (a typing-induced burst of SIGWINCH events
+    /// per the diagnose) must NOT compound duplicates. Each reflow snapshot
+    /// → re-feed cycle keeps each logical line appearing at most once.
+    #[test]
+    fn refeed_reflow_handles_burst_of_resizes_without_compounding_duplicates() {
+        let cols = 80u16;
+        let mut p = vt100::Parser::new(10, cols, DEFAULT_SCROLLBACK_LINES);
+        for i in 0..40u32 {
+            p.process(format!("burst-{:03}\r\n", i).as_bytes());
+        }
+        // Three back-to-back resizes alternating between heights/widths.
+        for &(rows, cols) in &[(12u16, 80u16), (8, 100), (14, 60), (12, 80)] {
+            let reflowed = reflow_parser(&mut p, rows, cols, DEFAULT_SCROLLBACK_LINES);
+            p = reflowed;
+        }
+        let parser = Arc::new(Mutex::new(p));
+        let rows = collect_every_row_once(&parser);
+        let full = rows.join("\n");
+        for i in 0..40u32 {
+            let marker = format!("burst-{:03}", i);
+            let n = full.matches(&marker).count();
+            assert!(
+                n <= 1,
+                "after a burst of resizes, marker {} appeared {} times — \
+                 reflow must not compound duplicates across consecutive resizes. \
+                 Rows:\n{}",
+                marker,
+                n,
+                full
+            );
+        }
+    }
+
+    /// Reads every scrollback row plus the current visible screen by
+    /// rendering the parser into a TestBackend at offsets max..=0.
+    /// Returns the concatenated text, with each row trimmed and
+    /// joined by '\n'.
+    fn collect_full_scrollback_and_screen(
+        parser: &Arc<Mutex<vt100::Parser>>,
+        rows: u16,
+        cols: u16,
+    ) -> String {
+        let total = test_scrollback_count(parser);
+        let mut out = String::new();
+        for offset in (0..=total).rev() {
+            {
+                let mut p = parser.lock().unwrap();
+                p.screen_mut().set_scrollback(offset);
+            }
+            let frame = render_to_text(parser, rows, cols);
+            out.push_str(&frame);
+            out.push('\n');
+        }
+        {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_scrollback(0);
+        }
+        out
+    }
+
+    /// Repro for fix-pty-scrollback: the chat-tab PTY pane was spawned
+    /// at hardcoded 24×80 and then resized to the actual chat-message
+    /// area on the first frame. The vendor CLI (claude/codex/wg-nex)
+    /// dumps multi-screen history at the small size, then SIGWINCH
+    /// triggers a clear-screen + reprint at the larger size. The
+    /// scrollback ends up containing the same logical lines twice —
+    /// once wrapped at the small width and once unwrapped at the larger
+    /// width — which the user sees as "the chat scrollback loops a bit
+    /// and then settles".
+    ///
+    /// Without the fix: lines whose length straddles 80 cols (wrap)
+    /// but fit within 120 cols (no wrap) appear twice in the rendered
+    /// scrollback because the wrap-at-80 form is in the older rows and
+    /// the no-wrap form is in the SIGWINCH-echo rows + visible screen.
+    /// The existing `scrollback_hidden` dedup hides the K hot-end echo
+    /// rows but does NOT remove the older wrap-at-80 copies.
+    #[test]
+    fn initial_spawn_at_default_then_resize_doubles_long_lines_in_scrollback() {
+        let small_rows = 24u16;
+        let small_cols = 80u16;
+        let large_rows = 30u16;
+        let large_cols = 120u16;
+
+        // Lines longer than small_cols (wrap at 80) but fit in large_cols (no wrap).
+        // 12 lines × ~95 chars each.
+        let lines: Vec<String> = (0..12)
+            .map(|i| {
+                let body = "x".repeat(80);
+                format!("history-line-{:03}-{}", i, body)
+            })
+            .collect();
+        // Sanity: each line is longer than small_cols, shorter than large_cols.
+        for l in &lines {
+            assert!(
+                l.len() > small_cols as usize && l.len() <= large_cols as usize,
+                "test setup: line length {} not in ({}, {}]",
+                l.len(),
+                small_cols,
+                large_cols
+            );
+        }
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            small_rows,
+            small_cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        // Vendor CLI dumps history at small dims (lines wrap at 80 cols).
+        {
+            let mut p = parser.lock().unwrap();
+            for line in &lines {
+                p.process(line.as_bytes());
+                p.process(b"\r\n");
+            }
+        }
+        // First frame triggers resize → SIGWINCH → child reflows: clear + reprint.
+        // Most vendor CLIs reprint the visible region (their TUI), which pushes
+        // wrap-at-old-size content into scrollback and then prints unwrap-at-new-size
+        // content on the new screen.
+        {
+            let mut p = parser.lock().unwrap();
+            p.screen_mut().set_size(large_rows, large_cols);
+            p.process(b"\x1b[2J\x1b[H");
+            for line in &lines {
+                p.process(line.as_bytes());
+                p.process(b"\r\n");
+            }
+        }
+
+        let full = collect_full_scrollback_and_screen(&parser, large_rows, large_cols);
+        // The bug: at least one line appears more than once in the
+        // rendered scrollback because the wrap-at-80 copy survives
+        // alongside the unwrap-at-120 reprint.
+        let mut any_dup = false;
+        for line in &lines {
+            // Use a unique substring per line: the marker prefix.
+            let marker = &line[..16]; // "history-line-NNN"
+            let n = full.matches(marker).count();
+            if n > 1 {
+                any_dup = true;
+                break;
+            }
+        }
+        assert!(
+            any_dup,
+            "expected at least one logical line to appear twice in rendered \
+             scrollback after spawn-at-wrong-size + resize-on-first-frame; \
+             got each line once. Rendered:\n{}",
+            full
+        );
+    }
+
+    /// Fix: spawning the PTY at the actual chat-message area
+    /// dimensions from the start avoids the SIGWINCH reflow entirely.
+    /// Each logical line then appears in scrollback exactly once.
+    /// This is the post-fix-pty-scrollback contract — every chat-tab
+    /// PTY spawn must use the real `msg_area.height`/`msg_area.width`
+    /// (deferred via `consume_pending_chat_pty_spawn` if needed).
+    #[test]
+    fn spawn_at_correct_size_does_not_double_long_lines_in_scrollback() {
+        let large_rows = 30u16;
+        let large_cols = 120u16;
+
+        let lines: Vec<String> = (0..12)
+            .map(|i| {
+                let body = "x".repeat(80);
+                format!("history-line-{:03}-{}", i, body)
+            })
+            .collect();
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            large_rows,
+            large_cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        // Spawned at the right size — vendor CLI prints once, no SIGWINCH echo.
+        {
+            let mut p = parser.lock().unwrap();
+            for line in &lines {
+                p.process(line.as_bytes());
+                p.process(b"\r\n");
+            }
+        }
+
+        let full = collect_full_scrollback_and_screen(&parser, large_rows, large_cols);
+        for line in &lines {
+            let marker = &line[..16];
+            let n = full.matches(marker).count();
+            assert!(
+                n >= 1,
+                "line {:?} should appear at least once in rendered scrollback (got {})",
+                marker,
+                n
+            );
+            assert!(
+                n <= 1,
+                "line {:?} should appear at most once when spawn dims match render dims \
+                 (got {} occurrences). Rendered:\n{}",
+                marker,
+                n,
+                full
+            );
+        }
+    }
+
+    /// `PtyPane::dims()` reports the size the parser/master PTY were
+    /// opened with. The chat-tab spawn path must call
+    /// `consume_pending_chat_pty_spawn(rows, cols)` with the actual
+    /// `msg_area` height/width so the child process sees its initial
+    /// size as the layout area. If a regression slipped a hardcoded
+    /// 24×80 back into the spawn site, this would catch it via the
+    /// reported dims after a fresh spawn.
+    #[test]
+    fn pty_pane_dims_reports_spawn_size() {
+        let pane = PtyPane::spawn("/bin/sh", &["-c", "sleep 60"], &[], 30, 120)
+            .expect("spawn /bin/sh -c sleep");
+        assert_eq!(pane.dims(), (30, 120));
+        // Deliberately drop the pane (sleep gets killed by Drop).
+    }
+
+    // ─── Terminal-capability query responder tests ──────────────────────
+    //
+    // Codex's interactive CLI sends a burst of capability queries on
+    // startup (CPR / kitty keyboard / OSC 10 + 11 / DA / DECRQM) and
+    // BLOCKS waiting for replies — a real terminal answers them; the
+    // wg PTY pane has to fill that role. These tests cover each query
+    // we now answer; without the responses, codex's chat tab in the
+    // wg TUI shows only its query bytes and never advances past the
+    // splash. A live capture at 24×80 produced exactly 40 bytes (the
+    // query block) until the responder was added; with replies in
+    // place, codex emits its full TUI on the next read.
+
+    #[test]
+    fn cpr_query_replies_with_cursor_position() {
+        // ESC [ 6 n at cursor (0,0) → ESC [ 1 ; 1 R (1-indexed).
+        let reply = compute_query_replies(b"\x1b[6n", (0, 0));
+        assert_eq!(reply, b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn cpr_query_uses_real_cursor_position() {
+        // ESC [ 6 n at cursor (3, 9) → ESC [ 4 ; 10 R (row+1, col+1).
+        let reply = compute_query_replies(b"\x1b[6n", (3, 9));
+        assert_eq!(reply, b"\x1b[4;10R");
+    }
+
+    #[test]
+    fn dsr_query_replies_ok() {
+        // ESC [ 5 n → ESC [ 0 n (terminal ready, no malfunction).
+        let reply = compute_query_replies(b"\x1b[5n", (0, 0));
+        assert_eq!(reply, b"\x1b[0n");
+    }
+
+    #[test]
+    fn kitty_keyboard_query_replies_legacy_mode() {
+        // ESC [ ? u → ESC [ ? 0 u (no kitty progressive enhancement).
+        let reply = compute_query_replies(b"\x1b[?u", (0, 0));
+        assert_eq!(reply, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn osc10_foreground_query_replies_with_rgb() {
+        // ESC ] 10 ; ? ESC \ → ESC ] 10 ; rgb:cccc/cccc/cccc ESC \
+        let reply = compute_query_replies(b"\x1b]10;?\x1b\\", (0, 0));
+        assert_eq!(reply, b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\");
+    }
+
+    #[test]
+    fn osc10_foreground_query_with_bel_terminator() {
+        // BEL-terminated form: ESC ] 10 ; ? BEL.
+        let reply = compute_query_replies(b"\x1b]10;?\x07", (0, 0));
+        assert_eq!(reply, b"\x1b]10;rgb:cccc/cccc/cccc\x07");
+    }
+
+    #[test]
+    fn osc11_background_query_replies_with_rgb() {
+        // ESC ] 11 ; ? ESC \ → ESC ] 11 ; rgb:0000/0000/0000 ESC \
+        let reply = compute_query_replies(b"\x1b]11;?\x1b\\", (0, 0));
+        assert_eq!(reply, b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn osc11_background_query_with_bel_terminator() {
+        let reply = compute_query_replies(b"\x1b]11;?\x07", (0, 0));
+        assert_eq!(reply, b"\x1b]11;rgb:0000/0000/0000\x07");
+    }
+
+    /// Regression: the actual 40-byte query burst captured from a
+    /// fresh `codex` PTY at 24×80 must produce a non-empty reply
+    /// containing all four query answers (CPR, kitty, OSC 10, OSC 11)
+    /// PLUS Primary DA (already supported). Without these replies
+    /// codex never proceeds past its initial query block.
+    ///
+    /// Capture command:
+    ///   pty.fork() → execvp("codex") with TERM=xterm-256color, COLORTERM=truecolor
+    ///   read for 4 s, kill — output is the 40 bytes below verbatim.
+    #[test]
+    fn codex_startup_query_burst_unblocks() {
+        // Bytes captured from codex 0.125.0 startup at 24×80.
+        let burst: &[u8] = b"\x1b[?2004h\x1b[>7u\x1b[?1004h\x1b[6n\x1b[?u\x1b[c\x1b]10;?\x1b\\";
+        let reply = compute_query_replies(burst, (0, 0));
+        // Must contain a CPR reply.
+        assert!(
+            reply.windows(b"\x1b[1;1R".len()).any(|w| w == b"\x1b[1;1R"),
+            "codex CPR query (ESC [ 6 n) must be answered, got: {:?}",
+            reply
+        );
+        // Must contain a kitty keyboard reply.
+        assert!(
+            reply.windows(b"\x1b[?0u".len()).any(|w| w == b"\x1b[?0u"),
+            "codex kitty kbd query (ESC [ ? u) must be answered, got: {:?}",
+            reply
+        );
+        // Must contain Primary DA reply.
+        assert!(
+            reply
+                .windows(b"\x1b[?65;1;6c".len())
+                .any(|w| w == b"\x1b[?65;1;6c"),
+            "codex DA1 query must be answered, got: {:?}",
+            reply
+        );
+        // Must contain OSC 10 fg reply.
+        assert!(
+            reply
+                .windows(b"\x1b]10;rgb:".len())
+                .any(|w| w == b"\x1b]10;rgb:"),
+            "codex OSC 10 fg query must be answered, got: {:?}",
+            reply
+        );
+        // Mode-set bytes (\x1b[?2004h, \x1b[>7u, \x1b[?1004h) are not
+        // queries — they should not produce replies.
+        assert!(
+            !reply
+                .windows(b"\x1b[?2004".len())
+                .any(|w| w == b"\x1b[?2004"),
+            "mode-set bytes must not be echoed as replies, got: {:?}",
+            reply
+        );
+    }
+
+    /// CPR queries embedded in a stream of ordinary output should still
+    /// be answered without truncating surrounding bytes from the reply
+    /// scan (the function only writes responses; it doesn't gate
+    /// vt100 processing).
+    #[test]
+    fn cpr_query_in_mixed_stream() {
+        let chunk: &[u8] = b"hello\x1b[6nworld";
+        let reply = compute_query_replies(chunk, (5, 0));
+        assert_eq!(reply, b"\x1b[6;1R");
+    }
+
+    /// Multiple queries in a single chunk should each produce their
+    /// own reply, in stream order. Codex sends CPR + kitty + OSC10
+    /// + DA1 in one TCP-style flush.
+    #[test]
+    fn multiple_queries_yield_concatenated_replies() {
+        let chunk: &[u8] = b"\x1b[6n\x1b[?u\x1b[c";
+        let reply = compute_query_replies(chunk, (0, 0));
+        // Order matches input.
+        let cpr = b"\x1b[1;1R";
+        let kitty = b"\x1b[?0u";
+        let da = b"\x1b[?65;1;6c";
+        let cpr_pos = reply
+            .windows(cpr.len())
+            .position(|w| w == cpr)
+            .expect("CPR reply present");
+        let kitty_pos = reply
+            .windows(kitty.len())
+            .position(|w| w == kitty)
+            .expect("kitty reply present");
+        let da_pos = reply
+            .windows(da.len())
+            .position(|w| w == da)
+            .expect("DA reply present");
+        assert!(cpr_pos < kitty_pos, "CPR reply must come before kitty");
+        assert!(kitty_pos < da_pos, "kitty reply must come before DA");
+    }
+
+    /// A chunk with no recognized queries must return an empty reply
+    /// (no spurious bytes get written back to the PTY).
+    #[test]
+    fn no_query_yields_empty_reply() {
+        let reply = compute_query_replies(b"hello world\r\n", (0, 0));
+        assert!(reply.is_empty(), "non-query bytes must not produce replies");
+    }
+
+    // ─── DEC mode 2026 (synchronized output) scrollback management ──────
+    //
+    // Codex's interactive TUI emits each animation frame as a BSU
+    // (`\x1b[?2026h`) ... full-screen repaint with `\r\n`-separated rows
+    // ... ESU (`\x1b[?2026l`) block. The repaint's trailing newline scrolls
+    // one row off the top per frame, and after enough frames the user sees
+    // stacked spinner copies in scrollback (fix-codex-chat-3 user repro).
+    // vt100 0.16 doesn't implement BSU/ESU at all, so we intercept the
+    // markers in the PTY reader and trim sync-induced scrollback growth.
+
+    /// Pre-condition for the bug: a single codex-style sync-mode repaint
+    /// pushes one row into scrollback when the cursor sits at the bottom
+    /// of the visible region after the final `\r\n`. Pin this so that if
+    /// vt100 ever starts treating BSU/ESU as scrollback-suppressing on
+    /// its own, we know to remove the workaround.
+    #[test]
+    fn raw_sync_mode_repaint_scrolls_into_scrollback_without_intervention() {
+        let rows = 24u16;
+        let cols = 80u16;
+        let mut p = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK_LINES);
+
+        // One frame: BSU + 23 content rows + 1 spinner row + ESU. The
+        // last row's trailing `\r\n` lands the cursor below the bottom
+        // and scrolls the top row off into scrollback.
+        p.process(b"\x1b[?2026h");
+        p.process(b"\x1b[1;0r"); // scroll region = full screen
+        p.process(b"\x1b[1;1H"); // cursor home
+        for r in 0..23 {
+            p.process(format!("row {} content\r\n", r).as_bytes());
+        }
+        p.process(b"Loading X\r\n");
+        p.process(b"\x1b[r");
+        p.process(b"\x1b[?2026l");
+
+        let count = parser_scrollback_count(&mut p);
+        assert!(
+            count >= 1,
+            "raw sync repaint must push at least one row into scrollback \
+             (this is the bug-shape pre-condition for the trim fix); \
+             got count={}",
+            count
+        );
+    }
+
+    /// Fix: a single sync block whose repaint pushed K rows into
+    /// scrollback must result in K rows being trimmed when sync ends.
+    /// Drives `manage_sync_mode_scrollback` with a single BSU...ESU chunk
+    /// matching codex's repaint pattern and asserts scrollback grew zero
+    /// rows from before the chunk.
+    #[test]
+    fn sync_mode_block_trim_removes_scrolled_rows() {
+        let rows = 24u16;
+        let cols = 80u16;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+
+        // Pre-feed history that scrolls into scrollback BEFORE the sync
+        // block. (Real codex chats build scrollback as the user types
+        // messages and the agent replies — those rows are persisted in
+        // scrollback before any animation frame is emitted.)
+        {
+            let mut p = parser.lock().unwrap();
+            for i in 0..30u32 {
+                p.process(format!("real-history-{:02}\r\n", i).as_bytes());
+            }
+        }
+        let pre_count = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        assert!(
+            pre_count > 0,
+            "test setup: history feed should have pushed rows into scrollback"
+        );
+
+        // One sync-mode repaint frame whose final `\r\n` causes a scroll.
+        let mut chunk: Vec<u8> = Vec::new();
+        chunk.extend_from_slice(b"\x1b[?2026h");
+        chunk.extend_from_slice(b"\x1b[1;0r");
+        chunk.extend_from_slice(b"\x1b[1;1H");
+        for r in 0..23 {
+            chunk.extend_from_slice(format!("row {} content\r\n", r).as_bytes());
+        }
+        chunk.extend_from_slice(b"Loading X\r\n");
+        chunk.extend_from_slice(b"\x1b[r");
+        chunk.extend_from_slice(b"\x1b[?2026l");
+
+        let pre_chunk_scrollback = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(&chunk);
+        }
+
+        let mut in_sync = false;
+        let mut sync_start = 0usize;
+        manage_sync_mode_scrollback(
+            &chunk,
+            &parser,
+            &mut in_sync,
+            &mut sync_start,
+            pre_chunk_scrollback,
+        );
+
+        let post_count = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        assert_eq!(
+            post_count, pre_count,
+            "sync-mode repaint must NOT grow scrollback after manage_sync_mode_scrollback \
+             trims it (pre={}, post={}). Codex animations would otherwise stack frames in \
+             scrollback as the user described.",
+            pre_count, post_count
+        );
+
+        // The pre-existing real history must still be in scrollback —
+        // the trim only drops the K rows the sync block pushed, not
+        // rows that were already there. (The sync repaint overwrites
+        // the visible region; that's expected and codex repaints again.)
+        let lines = {
+            let mut p = parser.lock().unwrap();
+            snapshot_logical_lines(&mut p)
+        };
+        let joined: String = lines
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..pre_count.min(5) {
+            let needle = format!("real-history-{:02}", i);
+            assert!(
+                joined.contains(&needle),
+                "pre-sync real history line {} must survive the sync-mode trim \
+                 (the trim must drop ONLY rows scrolled during sync, not pre-existing \
+                 scrollback); got:\n{}",
+                needle,
+                joined
+            );
+        }
+    }
+
+    /// Five back-to-back sync-mode frames (one per animation tick) must
+    /// each have their scrollback growth trimmed independently — total
+    /// scrollback growth across N frames is zero, NOT N. This is the
+    /// "scroll up shows stacked spinner frames" bug.
+    #[test]
+    fn five_sync_mode_frames_each_trim_independently() {
+        let rows = 24u16;
+        let cols = 80u16;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+
+        {
+            let mut p = parser.lock().unwrap();
+            for i in 0..3u32 {
+                p.process(format!("history-{}\r\n", i).as_bytes());
+            }
+        }
+        let baseline = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+
+        let mut in_sync = false;
+        let mut sync_start = 0usize;
+        for frame in 0..5u32 {
+            let mut chunk: Vec<u8> = Vec::new();
+            chunk.extend_from_slice(b"\x1b[?2026h");
+            chunk.extend_from_slice(b"\x1b[1;0r");
+            chunk.extend_from_slice(b"\x1b[1;1H");
+            for r in 0..23 {
+                chunk.extend_from_slice(format!("row {} content\r\n", r).as_bytes());
+            }
+            chunk.extend_from_slice(format!("Loading frame-{}\r\n", frame).as_bytes());
+            chunk.extend_from_slice(b"\x1b[r");
+            chunk.extend_from_slice(b"\x1b[?2026l");
+
+            let pre = {
+                let mut p = parser.lock().unwrap();
+                parser_scrollback_count(&mut p)
+            };
+            {
+                let mut p = parser.lock().unwrap();
+                p.process(&chunk);
+            }
+            manage_sync_mode_scrollback(&chunk, &parser, &mut in_sync, &mut sync_start, pre);
+        }
+
+        let final_count = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        assert_eq!(
+            final_count, baseline,
+            "five sync-mode animation frames must each trim independently — \
+             total scrollback should equal pre-animation baseline ({}), got {}. \
+             Without the trim, scrollback would grow by ~5 rows (one per frame), \
+             which is exactly the user-visible \"scroll up shows stacked spinner frames\" \
+             regression.",
+            baseline, final_count
+        );
+    }
+
+    /// chunk_contains_sync_markers must NOT trigger the trim path on a
+    /// chunk that has no DEC 2026 markers — the cheap fast-path that
+    /// keeps the reader thread from snapshot/reflowing on every read.
+    #[test]
+    fn no_sync_markers_means_no_scrollback_trim() {
+        let rows = 24u16;
+        let cols = 80u16;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
+        // Push some content that scrolls into scrollback WITHOUT any sync
+        // markers — manage_sync_mode_scrollback must leave it alone.
+        let mut chunk: Vec<u8> = Vec::new();
+        for i in 0..30u32 {
+            chunk.extend_from_slice(format!("plain-{:02}\r\n", i).as_bytes());
+        }
+        let pre = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        {
+            let mut p = parser.lock().unwrap();
+            p.process(&chunk);
+        }
+        let mut in_sync = false;
+        let mut sync_start = 0usize;
+        manage_sync_mode_scrollback(&chunk, &parser, &mut in_sync, &mut sync_start, pre);
+
+        let post = {
+            let mut p = parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+        assert!(
+            post > pre,
+            "non-sync content scrolling off the top must accumulate normally in \
+             scrollback (the fast-path skips trim work); pre={}, post={}",
+            pre,
+            post
+        );
+
+        let joined: Vec<String> = {
+            let mut p = parser.lock().unwrap();
+            snapshot_logical_lines(&mut p)
+                .iter()
+                .map(|l| String::from_utf8_lossy(l).into_owned())
+                .collect()
+        };
+        let blob = joined.join("\n");
+        assert!(
+            blob.contains("plain-00") || blob.contains("plain-01"),
+            "early plain-NN history must remain in scrollback (no spurious trim). \
+             Got:\n{}",
+            blob
+        );
+    }
+
+    /// End-to-end: drive the full reader-thread + sync-mode-trim path
+    /// against a real PTY child emitting codex's actual repaint pattern.
+    /// Without the trim, scrollback grows by ~1 row per frame (the bug
+    /// the user reported). With the trim wired into the reader thread,
+    /// scrollback growth across N animation frames must stay bounded.
+    ///
+    /// The shell child here was the live confirmation that the fix
+    /// works end-to-end — at 10 frames the unmodified vt100 parser
+    /// stacked 10 rows in scrollback (verified separately); the wg
+    /// reader thread with `manage_sync_mode_scrollback` keeps it ≤2
+    /// (one possible off-by-one from each chunk's reflow plus the
+    /// occasional wide chunk that ends mid-sync).
+    #[test]
+    fn pty_pane_codex_sync_repaint_does_not_stack_scrollback_rows() {
+        // 5 frames × ~500 bytes each, 80 ms apart — well within
+        // codex's 10-20 fps cadence.
+        let script = r#"
+ROWS=24
+for frame in 1 2 3 4 5; do
+  printf '\x1b[?2026h'
+  printf '\x1b[1;0r'
+  printf '\x1b[1;1H'
+  for r in $(seq 1 23); do
+    printf '\x1b[Krow %d content\r\n' "$r"
+  done
+  printf '\x1b[KLoading frame-%d\r\n' "$frame"
+  printf '\x1b[r'
+  printf '\x1b[?2026l'
+  sleep 0.08
+done
+sleep 5
+"#;
+        let mut pane = PtyPane::spawn("/bin/bash", &["-c", script], &[], 24, 80)
+            .expect("spawn /bin/bash codex-shape repaint");
+
+        // Wait for all 5 frames to land (≥ 5 × 80 ms = 400 ms; pad for
+        // bash spawn + thread scheduling).
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let scrollback_growth = {
+            let mut p = pane.parser.lock().unwrap();
+            parser_scrollback_count(&mut p)
+        };
+
+        // Without the fix, scrollback_growth would be ~5 (one row per
+        // frame stacked). With the fix, it must be small — ideally 0,
+        // but reflow has occasional off-by-one slack we accept since
+        // it's bounded per-frame and doesn't compound across frames
+        // the way the unmodified parser would.
+        assert!(
+            scrollback_growth <= 2,
+            "5-frame codex-style sync repaint must NOT stack scrollback rows — \
+             got {} rows growth, expected ≤2 (the bug reported in fix-codex-chat-3 \
+             would produce 5+; user described it as 'scrolling up is repeating the \
+             animation text')",
+            scrollback_growth
+        );
+
+        pane.kill();
+    }
+
+    /// chunk_contains_sync_markers detects both BSU and ESU bytes and
+    /// rejects unrelated bytes that happen to share a prefix.
+    #[test]
+    fn chunk_contains_sync_markers_detection() {
+        assert!(chunk_contains_sync_markers(b"\x1b[?2026h"));
+        assert!(chunk_contains_sync_markers(b"\x1b[?2026l"));
+        assert!(chunk_contains_sync_markers(b"prefix\x1b[?2026hsuffix"));
+        assert!(chunk_contains_sync_markers(b"prefix\x1b[?2026lsuffix"));
+        assert!(!chunk_contains_sync_markers(b""));
+        assert!(!chunk_contains_sync_markers(b"\x1b[?2026"));
+        assert!(!chunk_contains_sync_markers(b"\x1b[?2025h"));
+        assert!(!chunk_contains_sync_markers(b"plain text only"));
+        assert!(!chunk_contains_sync_markers(b"\x1b[?2004h\x1b[H"));
+    }
+
+    /// snapshot_logical_lines_skipping_recent_scrollback drops the K most
+    /// recent scrollback rows and preserves the rest plus the visible
+    /// region. Pin the contract so future changes to reflow don't
+    /// accidentally invert the offset semantics (offset 1 is the
+    /// most-recently-scrolled, offset max is the oldest).
+    #[test]
+    fn snapshot_skip_recent_scrollback_drops_correct_rows() {
+        let rows = 5u16;
+        let cols = 40u16;
+        let mut p = vt100::Parser::new(rows, cols, DEFAULT_SCROLLBACK_LINES);
+        // Feed 8 lines into a 5-row screen. Each "line-N\r\n" advances
+        // the cursor one row; after 8 newlines the cursor is 8 rows
+        // below the start, so 4 lines have scrolled into scrollback
+        // (line-0..line-3 — newest at offset 1 = line-3, oldest at
+        // offset 4 = line-0). The visible region holds line-4..line-7
+        // plus one trailing blank row.
+        for i in 0..8u32 {
+            p.process(format!("line-{}\r\n", i).as_bytes());
+        }
+        let max_offset = parser_scrollback_count(&mut p);
+        assert_eq!(
+            max_offset, 4,
+            "test setup expectation: 8 lines into 5-row screen → 4 in scrollback, \
+             4 visible (+ 1 trailing blank)"
+        );
+
+        // drop_recent_k=0 keeps everything.
+        let all = snapshot_logical_lines_skipping_recent_scrollback(&mut p, 0, true);
+        let blob_all: String = all
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for i in 0..8u32 {
+            assert!(
+                blob_all.contains(&format!("line-{}", i)),
+                "all lines should be present in full snapshot, missing line-{}; got:\n{}",
+                i,
+                blob_all
+            );
+        }
+
+        // drop_recent_k=2 drops the two most-recently-scrolled rows:
+        // line-3 (offset 1) and line-2 (offset 2). The two OLDEST
+        // (line-0 at offset 4, line-1 at offset 3) survive in scrollback;
+        // the visible region (line-4..line-7) is unaffected.
+        let trimmed = snapshot_logical_lines_skipping_recent_scrollback(&mut p, 2, true);
+        let blob_trim: String = trimmed
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for surviving in ["line-0", "line-1", "line-4", "line-5", "line-6", "line-7"] {
+            assert!(
+                blob_trim.contains(surviving),
+                "drop_recent_k=2 must keep {}; got:\n{}",
+                surviving,
+                blob_trim
+            );
+        }
+        for dropped in ["line-2", "line-3"] {
+            assert!(
+                !blob_trim.contains(dropped),
+                "drop_recent_k=2 must drop {} (it was offset 1 or 2 in scrollback); got:\n{}",
+                dropped,
+                blob_trim
+            );
+        }
+    }
+
+    /// THE persistence invariant: dropping a tmux-wrapped PtyPane only
+    /// kills the attach client; the underlying tmux session keeps the
+    /// inner process alive. If this assertion ever flips, chat agents
+    /// will die on TUI exit and codex's mid-tool-call rollouts corrupt
+    /// (see docs/design/chat-agent-persistence.md Part A). Skip if tmux
+    /// isn't installed (CI may lack it).
+    #[test]
+    fn drop_does_not_kill_underlying_tmux_session() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping persistence invariant test");
+            return;
+        }
+        // Use a wg-chat-test-* prefix so we land in the same namespace
+        // the orphan sweep targets, and a unique pid+nanos suffix so
+        // parallel test runs don't collide.
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-drop-{}", suffix);
+
+        // Long-running command so the session would survive the TUI
+        // exit point we're modeling.
+        {
+            let pane = PtyPane::spawn_via_tmux(
+                &session,
+                "sh",
+                &["-c", "while true; do sleep 1; done"],
+                &[],
+                None,
+                24,
+                80,
+            )
+            .expect("spawn_via_tmux should succeed when tmux is available");
+            assert_eq!(pane.tmux_session(), Some(session.as_str()));
+            assert!(
+                tmux_has_session(&session),
+                "session should exist while pane is alive"
+            );
+            // pane drops here — equivalent to TUI exit on user quit.
+        }
+
+        // Give tmux a brief moment in case the attach client teardown
+        // is async on this platform; in practice the server keeps the
+        // session regardless.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            tmux_has_session(&session),
+            "tmux session must survive PtyPane Drop — this is the persistence invariant"
+        );
+
+        // Cleanup: explicitly kill so the test doesn't leak background
+        // sleep loops between runs.
+        tmux_kill_session(&session);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !tmux_has_session(&session),
+            "kill_session should remove the session"
+        );
+    }
+
+    /// Re-spawning into the same session reattaches rather than
+    /// starting a fresh process — that is the entry point for "user
+    /// closed wg tui, opens it again, gets their chat back".
+    #[test]
+    fn spawn_via_tmux_reattaches_existing_session() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping reattach test");
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-reattach-{}", suffix);
+
+        // First spawn writes a marker file inside the session shell.
+        // We assert the marker contents persist between attaches —
+        // proving we hit the same shell, not a fresh one.
+        let marker = std::env::temp_dir().join(format!("wg-tmux-test-{}", suffix));
+        let cmd = format!(
+            "echo first > {marker}; while true; do sleep 1; done",
+            marker = marker.display()
+        );
+        {
+            let _pane = PtyPane::spawn_via_tmux(&session, "sh", &["-c", &cmd], &[], None, 24, 80)
+                .expect("first spawn ok");
+        }
+        // Wait for the inner shell to write the marker.
+        let mut found = false;
+        for _ in 0..30 {
+            if marker.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            found,
+            "marker file {} should exist after first spawn",
+            marker.display()
+        );
+
+        // Second spawn must NOT re-run the command; if it did, it
+        // would overwrite our marker contents below.
+        std::fs::write(&marker, b"reattach").unwrap();
+        {
+            let _pane = PtyPane::spawn_via_tmux(&session, "sh", &["-c", &cmd], &[], None, 24, 80)
+                .expect("second spawn ok (reattach)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let after = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(
+            after.trim(),
+            "reattach",
+            "second spawn must reattach, NOT re-run the inner shell command"
+        );
+
+        tmux_kill_session(&session);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// Pins fix-mouse-wheel-3: a tmux-wrapped PtyPane (the real
+    /// chat-tab setup post `implement-tmux-wrapped`) MUST scroll its
+    /// inner tmux history when `scroll_up` is called, AND must do
+    /// so without writing any bytes to the PTY child's stdin
+    /// (preserves fix-mouse-wheel-2's invariant).
+    ///
+    /// Why this test exists separately from the
+    /// `mouse_wheel_in_vendor_pty_mode_scrolls_outer_not_inner` test:
+    /// that test uses `PtyPane::spawn_in("/bin/sh", ...)` — a primary
+    /// screen child with real vt100 scrollback. fix-mouse-wheel-2
+    /// passed there but failed in production because real chat panes
+    /// use `spawn_via_tmux`, and tmux paints the alt screen, leaving
+    /// the outer vt100 parser's scrollback empty. `set_scrollback(N)`
+    /// on the outer parser is a silent no-op for tmux-wrapped panes.
+    /// The user reported "scroll wheel does bupkis" — exactly this.
+    ///
+    /// The fix is to dispatch `scroll_up` on tmux-wrapped panes to
+    /// `tmux send-keys -t <session> -X scroll-up` (out-of-band IPC,
+    /// not a write to the attach client's stdin). Tmux redraws the
+    /// attached client to reflect the scrolled copy-mode view; our
+    /// vt100 reader thread pumps the redraw into the parser; the
+    /// user sees scrolled content.
+    #[test]
+    fn tmux_wrapped_scroll_up_advances_render_without_writing_to_child() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping tmux scroll test");
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-scroll-{}", suffix);
+        let mut pane = PtyPane::spawn_via_tmux(
+            &session,
+            "sh",
+            &[
+                "-c",
+                "for i in $(seq 1 80); do echo line $i; done; sleep 30",
+            ],
+            &[],
+            None,
+            24,
+            80,
+        )
+        .expect("spawn_via_tmux ok");
+        // Wait for tmux to draw the post-loop screen.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && pane.bytes_processed() < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let snapshot = |p: &PtyPane| -> String {
+            let parser = p.parser.lock().unwrap();
+            let s = parser.screen();
+            let (rows, cols) = s.size();
+            let mut acc = String::new();
+            for r in 0..rows {
+                for c in 0..cols {
+                    if let Some(cell) = s.cell(r, c) {
+                        acc.push_str(cell.contents());
+                    }
+                }
+                acc.push('\n');
+            }
+            acc
+        };
+
+        let before = snapshot(&pane);
+        let bytes_before = pane.child_input_bytes_written();
+        assert!(
+            !pane.is_scrolled_back(),
+            "pre-condition: pane should be at the live tail before scroll_up"
+        );
+
+        pane.scroll_up(30);
+        // Wait for tmux's redraw to propagate through the PTY into
+        // our vt100 parser. tmux processes copy-mode commands quickly
+        // but the IPC roundtrip + reader thread takes a few hundred
+        // ms in practice.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let after = snapshot(&pane);
+        let bytes_after = pane.child_input_bytes_written();
+
+        assert_eq!(
+            bytes_before, bytes_after,
+            "scroll_up MUST NOT write any bytes to the PTY child's stdin \
+             — this preserves fix-mouse-wheel-2's invariant. Tmux IPC is \
+             out-of-band."
+        );
+        assert!(
+            pane.is_scrolled_back(),
+            "post-condition: scroll_up should put the pane in scrolled-back state"
+        );
+        assert!(
+            pane.scrollback() >= 30,
+            "tmux_scroll_lines bookkeeping should reflect 30 lines scrolled, got {}",
+            pane.scrollback()
+        );
+        assert_ne!(
+            before, after,
+            "fix-mouse-wheel-3: scroll_up MUST change rendered content on a \
+             tmux-wrapped pane. If this regresses, check that:\n\
+             1. `tmux_session: Some(...)` is set after spawn_via_tmux\n\
+             2. scroll_up dispatches to tmux_scroll_up for tmux-wrapped panes\n\
+             3. tmux_scroll_up issues `tmux copy-mode` + `send-keys -X scroll-up`"
+        );
+
+        // Scroll back down to the live tail; the pane should exit
+        // copy mode and report not-scrolled-back again.
+        pane.scroll_down(30);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let bytes_after_down = pane.child_input_bytes_written();
+        assert_eq!(
+            bytes_before, bytes_after_down,
+            "scroll_down MUST also not write to PTY child stdin"
+        );
+        assert!(
+            !pane.is_scrolled_back(),
+            "scroll_down(30) should bring us back to live tail"
+        );
+        assert_eq!(
+            pane.scrollback(),
+            0,
+            "tmux_scroll_lines should be 0 after scroll_down brings us home"
+        );
+
+        pane.kill_underlying_session();
+    }
+
+    /// Status-bar suppression: a tmux session created via spawn_via_tmux
+    /// must have its status bar disabled — the wg TUI provides the
+    /// chrome the user actually interacts with, and tmux's default
+    /// green bar is visually out of place. Skip if tmux isn't
+    /// installed.
+    #[test]
+    fn spawn_via_tmux_disables_status_bar() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping status-bar test");
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-status-{}", suffix);
+
+        {
+            let _pane = PtyPane::spawn_via_tmux(
+                &session,
+                "sh",
+                &["-c", "while true; do sleep 1; done"],
+                &[],
+                None,
+                24,
+                80,
+            )
+            .expect("spawn_via_tmux should succeed when tmux is available");
+
+            let out = std::process::Command::new("tmux")
+                .args(["show-options", "-t", &session, "status"])
+                .output()
+                .expect("tmux show-options must run");
+            let s = String::from_utf8_lossy(&out.stdout);
+            // tmux prints either `status off` or `status on` (no quotes).
+            assert!(
+                s.contains("status off"),
+                "expected status bar to be off, got: {:?}",
+                s
+            );
+        }
+
+        tmux_kill_session(&session);
+    }
+
+    /// fix-scroll-via: typing a key while a tmux-wrapped pane is in
+    /// copy-mode (because the user scrolled up) MUST auto-cancel
+    /// copy-mode so the bytes land in the inner CLI, not in tmux's
+    /// copy-mode command interpreter. Pre-fix the user would scroll
+    /// up to inspect history, type something, and watch the keystroke
+    /// disappear into tmux's copy buffer.
+    #[test]
+    fn send_key_cancels_tmux_copy_mode() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping send_key-cancels-copy-mode test");
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-send-cancel-{}", suffix);
+
+        let mut pane = PtyPane::spawn_via_tmux(
+            &session,
+            "sh",
+            &["-c", "while true; do sleep 1; done"],
+            &[],
+            None,
+            24,
+            80,
+        )
+        .expect("spawn_via_tmux ok");
+
+        // Pre-scroll: not in copy mode.
+        assert_eq!(
+            tmux_pane_in_mode(&session),
+            Some(false),
+            "pane should not be in copy-mode before any scroll"
+        );
+
+        pane.scroll_up(5);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            pane.scrollback() > 0,
+            "scroll_up should bump tmux_scroll_lines"
+        );
+        assert_eq!(
+            tmux_pane_in_mode(&session),
+            Some(true),
+            "tmux session must be in copy-mode after scroll_up"
+        );
+
+        // Sending a key auto-cancels copy-mode AND forwards bytes to
+        // the inner stdin. Both halves matter: cancel without forward
+        // would lose the keystroke; forward without cancel would
+        // route the byte through tmux's copy-mode interpreter.
+        let bytes_before = pane.child_input_bytes_written();
+        pane.send_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .expect("send_key ok");
+        let bytes_after = pane.child_input_bytes_written();
+        assert!(
+            bytes_after > bytes_before,
+            "send_key MUST forward bytes to inner stdin after auto-cancel; \
+             pre={}, post={}",
+            bytes_before,
+            bytes_after
+        );
+        assert_eq!(
+            pane.scrollback(),
+            0,
+            "send_key MUST clear tmux_scroll_lines (copy-mode cancelled)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            tmux_pane_in_mode(&session),
+            Some(false),
+            "tmux session must have exited copy-mode after send_key"
+        );
+
+        tmux_kill_session(&session);
+    }
+
+    /// fix-scroll-via: tmux's autonomous mouse-mode is explicitly
+    /// disabled at session creation so wheel events on the host
+    /// terminal don't get re-interpreted by tmux into copy-mode
+    /// keystrokes that emit garbled escape sequences into our vt100.
+    /// wg owns scroll; tmux just executes our explicit copy-mode
+    /// commands.
+    #[test]
+    fn spawn_via_tmux_disables_mouse_mode() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping mouse-mode test");
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let session = format!("wg-chat-test-mouse-{}", suffix);
+
+        let _pane = PtyPane::spawn_via_tmux(
+            &session,
+            "sh",
+            &["-c", "while true; do sleep 1; done"],
+            &[],
+            None,
+            24,
+            80,
+        )
+        .expect("spawn_via_tmux ok");
+
+        let out = std::process::Command::new("tmux")
+            .args(["show-options", "-t", &session, "mouse"])
+            .output()
+            .expect("tmux show-options must run");
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains("mouse off"),
+            "expected mouse mode to be off, got: {:?}",
+            s
+        );
+
+        tmux_kill_session(&session);
+    }
+
+    #[test]
+    fn spawn_via_tmux_rejects_invalid_session_name() {
+        // Don't actually need tmux to test the validation guard.
+        let bad = ["", "with space", "has:colon", "has.dot"];
+        for name in bad {
+            let r = PtyPane::spawn_via_tmux(name, "sh", &["-c", "true"], &[], None, 24, 80);
+            assert!(
+                r.is_err(),
+                "spawn_via_tmux must reject invalid session name {:?}",
+                name
+            );
+        }
+    }
+
+    /// Helper: read tmux's current `status` option for `session`.
+    /// Returns `"off"` / `"on"` / something else; panics on tmux error.
+    fn read_tmux_status_option(session: &str) -> String {
+        let out = std::process::Command::new("tmux")
+            .args(["show-options", "-t", session, "status"])
+            .output()
+            .expect("tmux show-options must run");
+        let s = String::from_utf8_lossy(&out.stdout);
+        // tmux prints `status off` or `status on`. Extract the value.
+        s.lines()
+            .find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("status ").map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Helper: produce a unique suffix for parallel test isolation.
+    fn unique_suffix(label: &str) -> String {
+        format!(
+            "{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    /// Helper: produce an isolated tmux session prefix for sync tests.
+    ///
+    /// Rust runs tests in parallel by default. A shared prefix like
+    /// `wg-chat-test-` lets one test's sync sweep rewrite another test's
+    /// tmux session, which can make drift preconditions disappear before
+    /// they are asserted. Keep each sweep scoped to its own unique prefix.
+    fn unique_tmux_test_prefix(label: &str) -> String {
+        format!("wg-chat-test-{}-", unique_suffix(label))
+    }
+
+    fn tmux_session_in_prefix(prefix: &str, name: &str) -> String {
+        format!("{}{}", prefix, name)
+    }
+
+    fn set_tmux_status_option(session: &str, value: &str) {
+        let out = std::process::Command::new("tmux")
+            .args(["set-option", "-t", session, "status", value])
+            .output()
+            .expect("tmux set-option must run");
+        assert!(
+            out.status.success(),
+            "tmux set-option status {value} failed for {session}: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// THE re-assertion invariant: a wg-chat-* tmux session whose
+    /// `status` was manually flipped on (e.g. by a prior wg version, or
+    /// by a stray `tmux set status on`) gets corrected back to `off`
+    /// when wg next runs `sync_chat_session_settings`. This is the
+    /// retroactive cleanup path that subsumes fix-tmux-status-2.
+    #[test]
+    fn sync_chat_session_settings_reverts_drifted_status() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping drift-revert test");
+            return;
+        }
+        let prefix = unique_tmux_test_prefix("revert");
+        let session = tmux_session_in_prefix(&prefix, "owned");
+
+        // Create the session with a long-running command, then flip
+        // status ON manually to simulate a drifted / older-wg session.
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "--",
+                "sh",
+                "-c",
+                "while true; do sleep 1; done",
+            ])
+            .status()
+            .expect("tmux new-session must run");
+        set_tmux_status_option(&session, "on");
+        assert_eq!(
+            read_tmux_status_option(&session),
+            "on",
+            "precondition: status should be on before sync"
+        );
+
+        // Run the sync sweep with a prefix that matches only our test session.
+        sync_chat_session_settings(&prefix);
+
+        assert_eq!(
+            read_tmux_status_option(&session),
+            "off",
+            "sync_chat_session_settings must re-assert `status off` on drifted session"
+        );
+
+        tmux_kill_session(&session);
+    }
+
+    /// Idempotency invariant: running the sync twice produces no
+    /// observable change. (If we ever start setting options that have
+    /// side effects on the running session — e.g. visible flicker —
+    /// this is the test that should catch the regression.)
+    #[test]
+    fn sync_chat_session_settings_is_idempotent() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping idempotency test");
+            return;
+        }
+        let prefix = unique_tmux_test_prefix("idem");
+        let session = tmux_session_in_prefix(&prefix, "owned");
+
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "--",
+                "sh",
+                "-c",
+                "while true; do sleep 1; done",
+            ])
+            .status()
+            .expect("tmux new-session must run");
+
+        sync_chat_session_settings(&prefix);
+        let after_first = read_tmux_status_option(&session);
+        sync_chat_session_settings(&prefix);
+        let after_second = read_tmux_status_option(&session);
+
+        assert_eq!(after_first, "off", "first sync should produce status off");
+        assert_eq!(
+            after_first, after_second,
+            "second sync must produce identical observable state (idempotency)"
+        );
+
+        tmux_kill_session(&session);
+    }
+
+    /// Scope invariant: sync only touches sessions matching the given
+    /// prefix. A user's own tmux work in an unrelated session must not
+    /// have its status bar flipped. (Without this, a careless prefix
+    /// would silently rewrite the user's tmux config.)
+    #[test]
+    fn sync_chat_session_settings_skips_non_matching_sessions() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping scope test");
+            return;
+        }
+        let prefix = unique_tmux_test_prefix("scope");
+        let owned = tmux_session_in_prefix(&prefix, "owned");
+        let foreign = format!("user-work-{}", unique_suffix("scope"));
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &owned,
+                "--",
+                "sh",
+                "-c",
+                "while true; do sleep 1; done",
+            ])
+            .status()
+            .expect("tmux new-session must run");
+        let _ = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &foreign,
+                "--",
+                "sh",
+                "-c",
+                "while true; do sleep 1; done",
+            ])
+            .status()
+            .expect("tmux new-session must run");
+        // Force status ON on both sessions. The sync should correct only
+        // the owned prefix and leave the foreign session in this state.
+        set_tmux_status_option(&owned, "on");
+        set_tmux_status_option(&foreign, "on");
+        assert_eq!(
+            read_tmux_status_option(&owned),
+            "on",
+            "precondition: owned session has status on"
+        );
+        assert_eq!(
+            read_tmux_status_option(&foreign),
+            "on",
+            "precondition: foreign session has status on"
+        );
+
+        sync_chat_session_settings(&prefix);
+
+        assert_eq!(
+            read_tmux_status_option(&owned),
+            "off",
+            "sync must touch sessions inside its prefix"
+        );
+        assert_eq!(
+            read_tmux_status_option(&foreign),
+            "on",
+            "sync must NOT touch sessions outside its prefix"
+        );
+
+        tmux_kill_session(&owned);
+        tmux_kill_session(&foreign);
+    }
+
+    /// No-op safety: calling sync with a prefix that matches nothing
+    /// must not crash, even if tmux has zero sessions of that shape.
+    #[test]
+    fn sync_chat_session_settings_no_matching_sessions_is_noop() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping no-match test");
+            return;
+        }
+        // Prefix designed to match nothing real.
+        let prefix = unique_tmux_test_prefix("noop");
+        sync_chat_session_settings(&format!("{}missing-", prefix));
+        // If we got here without panic, the test passes.
+    }
+
+    /// Spawn-time re-assertion: spawn_via_tmux must apply wg's desired
+    /// options on EVERY spawn (both create and reattach), so a session
+    /// that drifted between TUI runs gets corrected on the next attach.
+    /// This is the "spawn path also self-heals" guarantee.
+    #[test]
+    fn spawn_via_tmux_reasserts_status_on_reattach() {
+        if !tmux_available() {
+            eprintln!("tmux not installed — skipping reattach-reassert test");
+            return;
+        }
+        let prefix = unique_tmux_test_prefix("reassert");
+        let session = tmux_session_in_prefix(&prefix, "owned");
+
+        // First spawn creates the session and applies options.
+        {
+            let _pane = PtyPane::spawn_via_tmux(
+                &session,
+                "sh",
+                &["-c", "while true; do sleep 1; done"],
+                &[],
+                None,
+                24,
+                80,
+            )
+            .expect("first spawn ok");
+        }
+        // Simulate drift between runs: flip status ON externally.
+        set_tmux_status_option(&session, "on");
+        assert_eq!(
+            read_tmux_status_option(&session),
+            "on",
+            "precondition: status drifted to on before reattach"
+        );
+
+        // Second spawn (reattach) must re-assert status off.
+        {
+            let _pane = PtyPane::spawn_via_tmux(
+                &session,
+                "sh",
+                &["-c", "while true; do sleep 1; done"],
+                &[],
+                None,
+                24,
+                80,
+            )
+            .expect("reattach ok");
+        }
+        assert_eq!(
+            read_tmux_status_option(&session),
+            "off",
+            "reattach must re-assert wg's desired status off"
+        );
+
+        tmux_kill_session(&session);
     }
 }

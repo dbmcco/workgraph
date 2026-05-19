@@ -1,9 +1,9 @@
-//! Matrix message listener for workgraph
+//! Matrix message listener for WG
 //!
 //! Background listener that processes commands from Matrix rooms:
 //! - Listens to configured room(s) for commands
 //! - Parses human responses: 'claim <task>', 'done <task>', 'input <task> <text>'
-//! - Updates workgraph accordingly
+//! - Updates WG accordingly
 //! - Sends confirmation back to room
 //!
 //! Command execution logic is shared via `matrix_commands`.
@@ -53,7 +53,7 @@ impl MatrixListener {
     /// Create a new Matrix listener
     ///
     /// # Arguments
-    /// * `workgraph_dir` - Path to the .workgraph directory
+    /// * `workgraph_dir` - Path to the .wg directory
     /// * `matrix_config` - Matrix credentials and settings
     /// * `listener_config` - Listener-specific configuration
     pub async fn new(

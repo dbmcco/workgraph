@@ -1,4 +1,4 @@
-# Workgraph Coordination Model — Design Document
+# wg Coordination Model — Design Document
 
 **Date:** 2026-03-10
 **Status:** Approved Design (from 10-agent deliberation consensus)
@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-Workgraph's coordination model will evolve from its current implicit conventions — where coordinators are special-cased tasks distinguished by string prefix heuristics and communication is split across ad hoc channels — into a **Layered Coordination Model** with three explicit architectural layers: (1) the task graph as a stigmergic medium (the primary coordination mechanism), (2) a typed node model with a minimal two-variant enum (`Task` | `Session`) replacing heuristic prefix matching, and (3) three formally declared interaction channels (stigmergic, message-queue, chat) with mandatory graph tracing. This design preserves workgraph's distinctive property — indirect coordination through traces in a shared graph — while resolving the fundamental tensions between persistent and ephemeral agents, fire-and-forget and conversational work, and human control versus system autonomy. The migration is incremental: each phase delivers value independently, the system remains backward-compatible at every step, and the most impactful changes (NodeKind enum, hard message gate, session renaming) ship first.
+wg's coordination model will evolve from its current implicit conventions — where coordinators are special-cased tasks distinguished by string prefix heuristics and communication is split across ad hoc channels — into a **Layered Coordination Model** with three explicit architectural layers: (1) the task graph as a stigmergic medium (the primary coordination mechanism), (2) a typed node model with a minimal two-variant enum (`Task` | `Session`) replacing heuristic prefix matching, and (3) three formally declared interaction channels (stigmergic, message-queue, chat) with mandatory graph tracing. This design preserves wg's distinctive property — indirect coordination through traces in a shared graph — while resolving the fundamental tensions between persistent and ephemeral agents, fire-and-forget and conversational work, and human control versus system autonomy. The migration is incremental: each phase delivers value independently, the system remains backward-compatible at every step, and the most impactful changes (NodeKind enum, hard message gate, session renaming) ship first.
 
 ---
 
@@ -17,9 +17,9 @@ Workgraph's coordination model will evolve from its current implicit conventions
 
 These principles emerged from unanimous consensus across all 10 research perspectives and are binding design commitments.
 
-1. **The graph is the system of record.** Every coordination event must leave a trace in the graph. The graph is workgraph's memory, identity, and single source of truth. No coordination channel may operate outside the graph.
+1. **The graph is the system of record.** Every coordination event must leave a trace in the graph. The graph is wg's memory, identity, and single source of truth. No coordination channel may operate outside the graph.
 
-2. **Stigmergy first, direct communication second.** Agents coordinate primarily through traces left in the shared graph — task states, artifacts, logs, dependency structures. Direct communication (chat, messages) is a supplement, not a replacement. This is workgraph's core competitive advantage over workflow-as-code systems (Temporal) and DAG-based systems (Airflow).
+2. **Stigmergy first, direct communication second.** Agents coordinate primarily through traces left in the shared graph — task states, artifacts, logs, dependency structures. Direct communication (chat, messages) is a supplement, not a replacement. This is wg's core competitive advantage over workflow-as-code systems (Temporal) and DAG-based systems (Airflow).
 
 3. **Minimal type taxonomy.** Two node kinds (`Task`, `Session`), not three or more. History shows that node-type taxonomies proliferate without bound (Airflow's operator taxonomy is the cautionary tale). The taxonomy is closed for now and opened through deliberate code changes, never through autonomous self-modification.
 
@@ -43,7 +43,7 @@ These principles emerged from unanimous consensus across all 10 research perspec
 
 ### 3.1 What Is the System Today?
 
-Before describing the target, we must be precise about the current state. Today's workgraph has:
+Before describing the target, we must be precise about the current state. Today's wg has:
 
 **A single `Task` struct** (`src/graph.rs:201-346`) with 40+ fields that serves all purposes — regular work items, coordinator processes, evaluation scaffolds, assignment decisions, and FLIP checks. There is no type discrimination in the data model; all nodes are `Task`.
 
@@ -59,7 +59,7 @@ Before describing the target, we must be precise about the current state. Today'
 
 ### 3.2 Layer 1: The Stigmergic Medium
 
-The task graph (`.workgraph/graph.jsonl`) is the primary coordination mechanism. This is already true today and is workgraph's most important design property. The deliberation confirmed this unanimously and elevated it from an implicit convention to a stated architectural principle.
+The task graph (`.wg/graph.jsonl`) is the primary coordination mechanism. This is already true today and is wg's most important design property. The deliberation confirmed this unanimously and elevated it from an implicit convention to a stated architectural principle.
 
 **What this means concretely:**
 
@@ -215,17 +215,17 @@ This is not a "channel" in the traditional sense — it IS the graph. Agents coo
 - Graph trace: IS the graph (tautologically complete)
 - Addressing: Broadcast (any agent with graph access can read)
 
-This channel is workgraph's default and most important coordination mechanism. The design must ensure it remains the path of least resistance — creating a task and writing artifacts should always be easier than sending a direct message.
+This channel is wg's default and most important coordination mechanism. The design must ensure it remains the path of least resistance — creating a task and writing artifacts should always be easier than sending a direct message.
 
 #### Channel 2: Message Queue (`wg msg`)
 
 Task-attached, JSONL-based mailbox messaging for cases where stigmergic coordination is insufficient — typically when an agent needs to communicate updated requirements, corrections, or context to a running task.
 
 **Properties:**
-- Medium: JSONL files in `.workgraph/messages/{task-id}.jsonl`
+- Medium: JSONL files in `.wg/messages/{task-id}.jsonl`
 - Parties: Task ↔ Task, User → Task
 - Synchronization: Semi-asynchronous (delivery via notification file, polling by agent)
-- Graph trace: Already in the graph (messages stored in `.workgraph/`)
+- Graph trace: Already in the graph (messages stored in `.wg/`)
 - Addressing: Point-to-point (task-bound)
 - Delivery guarantee: Best-effort (agent may not check)
 
@@ -386,7 +386,7 @@ The migration follows six phases, each delivering independent value. Phases can 
 
 **What stays the same:**
 - Chat mechanics unchanged
-- Raw chat history still stored in `.workgraph/chat/` files (not removed)
+- Raw chat history still stored in `.wg/chat/` files (not removed)
 - Message queue semantics unchanged
 
 **Why this is Phase 5 (not earlier):** Implementing decision-level tracing requires understanding what constitutes a "decision" in chat context. This needs the Session abstraction (Phase 3) to be in place. The tracing logic lives in the session agent, not in the chat transport.
@@ -394,7 +394,7 @@ The migration follows six phases, each delivering independent value. Phases can 
 ### Phase 6: Event-Sourced Operation Log
 
 **What changes:**
-- New file: `.workgraph/operations.jsonl` as an append-only event store
+- New file: `.wg/operations.jsonl` as an append-only event store
 - All graph mutations emit events to this log
 - Events include structural (task_created, status_changed) and decision (dispatch_decision, retry_decision with rationale)
 - Graph state files remain as materialized views

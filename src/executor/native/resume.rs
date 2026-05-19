@@ -4,7 +4,7 @@
 //! up from the conversation journal rather than starting from scratch.
 //!
 //! Protocol:
-//! 1. Check for existing journal at `.workgraph/output/<task-id>/conversation.jsonl`
+//! 1. Check for existing journal at `.wg/output/<task-id>/conversation.jsonl`
 //! 2. Load entries, reconstruct message history
 //! 3. If journal exceeds budget, compact older turns (summarize)
 //! 4. Detect stale tool results (files changed since journal was written)
@@ -228,29 +228,25 @@ fn truncate_to_fit(
     budget_tokens: usize,
     model: Option<&str>,
 ) -> Vec<Message> {
-    let preserve_resume_summary = messages.first().is_some_and(is_resume_summary_message);
-    while messages.len() > RESUME_TRUNCATE_FLOOR
-        && estimate_tokens_with_model(&messages, model) > budget_tokens
-    {
-        let remove_idx = if preserve_resume_summary && messages.len() > 1 {
-            1
-        } else {
-            0
-        };
-        messages.remove(remove_idx);
+    let preserve_summary = messages.first().is_some_and(is_resume_summary_message);
+    let min_len = RESUME_TRUNCATE_FLOOR + usize::from(preserve_summary);
+
+    while messages.len() > min_len && estimate_tokens_with_model(&messages, model) > budget_tokens {
+        let drop_index = if preserve_summary { 1 } else { 0 };
+        messages.remove(drop_index);
     }
     ensure_valid_alternation(&mut messages);
     messages
 }
 
 fn is_resume_summary_message(message: &Message) -> bool {
-    if message.role != Role::User {
-        return false;
-    }
-    message.content.first().is_some_and(|block| match block {
-        ContentBlock::Text { text } => text.contains("[Resume:") && text.contains("compacted"),
-        _ => false,
-    })
+    message.role == Role::User
+        && message.content.iter().any(|block| match block {
+            ContentBlock::Text { text } => {
+                text.starts_with("[Resume:") && text.contains("compacted")
+            }
+            _ => false,
+        })
 }
 
 /// Reconstruct `Vec<Message>` from journal entries.

@@ -1,3 +1,4 @@
+pub mod async_fs;
 pub mod chat_palette;
 pub mod chat_tab_state;
 pub mod event;
@@ -14,6 +15,9 @@ pub mod trace;
 mod config_tests;
 #[cfg(test)]
 mod editor_tests;
+
+#[cfg(test)]
+mod scroll_mode_tests;
 
 use std::io;
 use std::path::PathBuf;

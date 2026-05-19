@@ -445,7 +445,7 @@ async def run_trial(
         # Always stop the daemon before cleanup (handles both normal and error paths)
         daemon_registry.stop_one(wg_dir)
         result["elapsed_s"] = round(time.monotonic() - start, 2)
-        # Save workgraph state before cleanup
+        # Save WG state before cleanup
         state_dst = os.path.join(RESULTS_DIR, trial_id, "workgraph_state")
         try:
             os.makedirs(os.path.dirname(state_dst), exist_ok=True)
@@ -566,7 +566,7 @@ async def main(timeout: float, tasks: list[str] | None = None):
         "serving_engine": "SGLang",
         "gpu": "RTX 6000 Ada 48GB (lambda01)",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "condition": "A (agent-only, no workgraph decomposition)",
+        "condition": "A (agent-only, no WG task graph)",
         "task_selection": "All 18 available local TB tasks, ordered hardest-first",
         "total_trials": total_trials,
         "passed": passed,

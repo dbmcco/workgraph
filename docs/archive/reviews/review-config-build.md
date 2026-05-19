@@ -64,7 +64,7 @@ These tests fail on `cargo test --lib`, which means **CI is currently red** on t
 1. Line 28: unconditional `[dependencies]`
 2. Line 44-45: `[target.'cfg(unix)'.dependencies]`
 
-The unconditional entry supersedes the target-specific one. Since workgraph only targets Unix anyway (the daemon script, PID management, and `kill()` calls all assume Unix), the target-specific block on line 44-45 is redundant and should be removed.
+The unconditional entry supersedes the target-specific one. Since wg only targets Unix anyway (the daemon script, PID management, and `kill()` calls all assume Unix), the target-specific block on line 44-45 is redundant and should be removed.
 
 #### P2: `petgraph` Appears Unused
 
@@ -172,8 +172,8 @@ Not a workspace — single crate. Appropriate for the current codebase size (~53
 
 A shell-based daemon wrapper for the `wg agent` command. Features:
 - Start/stop/restart/status/logs subcommands
-- PID file management in `.workgraph/pids/`
-- Log rotation to `.workgraph/logs/`
+- PID file management in `.wg/pids/`
+- Log rotation to `.wg/logs/`
 - Automatic restart on non-zero exit with 5s backoff
 - Graceful shutdown (SIGTERM, 30s timeout, then SIGKILL)
 
@@ -185,20 +185,20 @@ A shell-based daemon wrapper for the `wg agent` command. Features:
 
 ```
 /target
-.workgraph/
+.wg/
 USER_FEEDBACK.md
 agency_session_id.txt
 ```
 
-Clean and appropriate. The `.workgraph/` exclusion prevents accidentally committing project state. `USER_FEEDBACK.md` and `agency_session_id.txt` are ephemeral session files.
+Clean and appropriate. The `.wg/` exclusion prevents accidentally committing project state. `USER_FEEDBACK.md` and `agency_session_id.txt` are ephemeral session files.
 
 ## 6. Configuration System (`src/config.rs` + `src/commands/config_cmd.rs`)
 
 ### Architecture
 
 Two config files with separate concerns:
-- **`.workgraph/config.toml`** (per-project): Agent, coordinator, project, help, and agency settings.
-- **`~/.config/workgraph/matrix.toml`** (per-user, global): Matrix credentials. Correctly separated to avoid committing secrets.
+- **`.wg/config.toml`** (per-project): Agent, coordinator, project, help, and agency settings.
+- **`~/.config/wg/matrix.toml`** (per-user, global): Matrix credentials. Correctly separated to avoid committing secrets.
 
 ### Config Sections
 

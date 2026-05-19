@@ -36,7 +36,7 @@ Nikete's veracity exchange concept (from the research-veracity-exchange task) pr
 ## What the Current System Provides
 
 ### Operation Log (fully implemented)
-- Append-only JSONL at `.workgraph/log/operations.jsonl`
+- Append-only JSONL at `.wg/log/operations.jsonl`
 - All 12 graph-mutating commands instrumented: add, edit, done, fail, abandon, retry, claim, unclaim, pause, resume, archive, gc
 - Each entry: `{timestamp, op, task_id, actor, detail}`
 - Actor convention: `"cli"`, `"agent:<id>"`, `"coordinator"`
@@ -45,13 +45,13 @@ Nikete's veracity exchange concept (from the research-veracity-exchange task) pr
 - Concurrent write safety via `O_APPEND` + single `write_all()` call
 
 ### Agent Conversation Archives (implemented)
-- On `wg done` or `wg fail`: agent's `prompt.txt` and `output.log` archived to `.workgraph/log/agents/<task-id>/<timestamp>/`
+- On `wg done` or `wg fail`: agent's `prompt.txt` and `output.log` archived to `.wg/log/agents/<task-id>/<timestamp>/`
 - Each retry attempt gets its own timestamped subdirectory
 - Full history of all attempts preserved permanently
 
 ### Agency Evaluation System (implemented)
 - 4-dimension scoring: correctness (40%), completeness (30%), efficiency (15%), style_adherence (15%)
-- Evaluations stored in `.workgraph/agency/evaluations/` as YAML
+- Evaluations stored in `.wg/agency/evaluations/` as YAML
 - Scores propagate to agent, role, and motivation performance records
 - Performance trends computed (up/down/flat)
 - Synergy matrix (role × motivation cross-performance)
@@ -157,7 +157,7 @@ This is the largest implementation gap after information boundary control. niket
 
 **What supports veracity exchange:**
 - **`wg log --operations --json`** provides machine-readable operation history. An external consumer could parse this.
-- **Evaluation scores exist in structured YAML.** A consumer could read `.workgraph/agency/evaluations/`.
+- **Evaluation scores exist in structured YAML.** A consumer could read `.wg/agency/evaluations/`.
 - **Artifact paths are declared per task.** A consumer knows what files a task produced.
 - **Content-hash IDs provide stable references.** Agents and tasks can be referenced unambiguously.
 
@@ -172,7 +172,7 @@ This is the largest implementation gap after information boundary control. niket
 **Gap to close:** The veracity exchange research recommended a 3-phase approach:
 1. **Phase 1 (CLI bridge)**: `wg exchange export <task-id>` generates a portable JSON bundle (task definition, evaluation scores, public artifacts). `wg exchange import` consumes bundles from peers. ~300-400 lines.
 2. **Phase 2 (Event hooks)**: Hook system that notifies external systems on task completion. Allows passive consumers to subscribe. ~200 lines.
-3. **Phase 3 (Native integration)**: Full exchange client with peer discovery, credibility tracking, and bidirectional communication. This is a separate tool, not core workgraph changes.
+3. **Phase 3 (Native integration)**: Full exchange client with peer discovery, credibility tracking, and bidirectional communication. This is a separate tool, not core wg changes.
 
 This is correctly deferred as the most speculative dimension. Phase 1 alone provides the minimum viable exchange interface.
 

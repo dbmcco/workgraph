@@ -38,7 +38,7 @@ fn make_task(id: &str, title: &str, status: Status) -> Task {
 }
 
 fn setup_workgraph(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     fs::create_dir_all(wg_dir.join("service")).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
@@ -67,6 +67,7 @@ fn make_evaluation(
         timestamp: format!("2025-06-01T12:00:{}Z", id.len() % 60),
         model: Some("test-model".to_string()),
         source: "llm".to_string(),
+        loop_iteration: 0,
     }
 }
 

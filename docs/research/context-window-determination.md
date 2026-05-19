@@ -24,7 +24,7 @@ This registry is used by `effective_registry()` → `registry_lookup()` for comp
 
 ### 1.2 Models YAML Registry (`models.yaml` / `ModelRegistry`)
 
-**Location:** `src/models.rs:46–72` (`ModelEntry` struct), loaded from `.workgraph/models.yaml`
+**Location:** `src/models.rs:46–72` (`ModelEntry` struct), loaded from `.wg/models.yaml`
 
 The `ModelRegistry` (separate from `Config::model_registry`) has `ModelEntry.context_window: u64` with hardcoded defaults for 13 models (`src/models.rs:123–273`):
 - Claude opus/sonnet: 1,000,000
@@ -213,7 +213,7 @@ These three defaults are inconsistent and none of them attempt to discover the a
 
 ### 4.3 No Runtime Discovery
 
-The OpenAI-compatible `/models` endpoint typically returns `context_length` per model. Workgraph fetches this for OpenRouter (via `fetch_openrouter_models`) but only feeds it to the benchmark system. The provider creation path and compaction threshold path do not query `/models` at runtime to discover context window sizes.
+The OpenAI-compatible `/models` endpoint typically returns `context_length` per model. wg fetches this for OpenRouter (via `fetch_openrouter_models`) but only feeds it to the benchmark system. The provider creation path and compaction threshold path do not query `/models` at runtime to discover context window sizes.
 
 ### 4.4 Endpoint Config `context_window` Never Set by CLI
 

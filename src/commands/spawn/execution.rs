@@ -88,7 +88,7 @@ pub(crate) fn spawn_agent_inner(
     let graph_path = graph_path(dir);
 
     if !graph_path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     // Load the graph and get task info
@@ -181,6 +181,12 @@ pub(crate) fn spawn_agent_inner(
         Status::PendingEval => {
             anyhow::bail!(
                 "Cannot spawn on task '{}': task is pending evaluation",
+                task_id
+            );
+        }
+        Status::FailedPendingEval => {
+            anyhow::bail!(
+                "Cannot spawn on task '{}': task is pending rescue evaluation",
                 task_id
             );
         }
@@ -438,7 +444,7 @@ pub(crate) fn spawn_agent_inner(
     let mut settings = executor_config.apply_templates(&vars);
 
     // Universal wg context injection for all executor types.
-    // Ensures all executors receive consistent workgraph context in their prompts,
+    // Ensures all executors receive consistent WG context in their prompts,
     // with model-appropriate knowledge tier based on context window and capabilities.
     let model_str = settings.model.as_deref().unwrap_or("");
     let model_tier = super::context::classify_model_tier(model_str);
@@ -453,11 +459,7 @@ pub(crate) fn spawn_agent_inner(
     // Scope-based prompt assembly for built-in executors.
     // When no custom prompt_template is defined (built-in defaults),
     // use build_prompt() to assemble the prompt based on context scope.
-    if settings.prompt_template.is_none()
-        && (settings.executor_type == "claude"
-            || settings.executor_type == "amplifier"
-            || settings.executor_type == "native")
-    {
+    if settings.prompt_template.is_none() && executor_uses_auto_prompt(&settings.executor_type) {
         let prompt = build_prompt(&vars, scope, &scope_ctx);
 
         // Debug logging: capture spawn metadata if WG_DEBUG_PROMPTS is set
@@ -501,7 +503,7 @@ pub(crate) fn spawn_agent_inner(
     let effective_provider: Option<String> = resolved.provider.or(registry_provider.clone());
 
     // Endpoint resolution: plan.endpoint is the single source of truth. For
-    // executors that don't need an endpoint (claude/codex/amplifier/shell),
+    // executors that don't need an endpoint (claude/codex/shell),
     // plan.endpoint is None and the argv builder skips --endpoint-* flags
     // entirely. For native, plan.endpoint carries the resolved EndpointConfig.
     // No ad-hoc cascade lookup happens here anymore — that decision lives in
@@ -945,6 +947,19 @@ pub(crate) fn should_create_worktree(
     true
 }
 
+/// Built-in executors that ship without a `prompt_template` and rely on
+/// `build_prompt()` to assemble the agent prompt at spawn time.
+///
+/// CLI handlers (claude, codex) and in-process handlers (native) all need
+/// the same WG-context preamble, so the spawn pipeline auto-builds a
+/// `PromptTemplate` for any of these when the user hasn't supplied one in
+/// their executor config. Adding a new built-in handler without listing it
+/// here means the spawn writes no prompt.txt and the resulting subprocess
+/// receives empty stdin — exactly the codex bug.
+fn executor_uses_auto_prompt(executor_type: &str) -> bool {
+    matches!(executor_type, "claude" | "codex" | "native")
+}
+
 /// Build the inner command string for the executor.
 ///
 /// Returns `(primary_command, Option<fallback_command>)`. The fallback is
@@ -1086,7 +1101,7 @@ fn build_inner_command(
             for arg in &settings.args {
                 cmd_parts.push(shell_escape(arg));
             }
-            // Prevent agents from spawning sub-agents outside workgraph
+            // Prevent agents from spawning sub-agents outside WG
             cmd_parts.push("--disallowedTools".to_string());
             cmd_parts.push(shell_escape("Agent,EnterWorktree,ExitWorktree"));
 
@@ -1129,38 +1144,6 @@ fn build_inner_command(
                 prompt_file_command(&prompt_file.to_string_lossy(), &codex_cmd)
             } else {
                 codex_cmd
-            }
-        }
-        "amplifier" => {
-            // Write prompt to file and pipe to amplifier - same pattern as claude
-            let mut cmd_parts = vec![shell_escape(&settings.command)];
-            for arg in &settings.args {
-                cmd_parts.push(shell_escape(arg));
-            }
-            // Add model flag if specified.
-            // Model can be "provider:model" (e.g., "provider-openai:minimax/minimax-m2.5")
-            // which splits into -p provider -m model, or just "model" which passes -m only.
-            // If no model is set, amplifier uses its settings.yaml default.
-            if let Some(m) = effective_model {
-                if let Some((provider, model)) = m.split_once(':') {
-                    cmd_parts.push("-p".to_string());
-                    cmd_parts.push(shell_escape(provider));
-                    cmd_parts.push("-m".to_string());
-                    cmd_parts.push(shell_escape(model));
-                } else {
-                    cmd_parts.push("-m".to_string());
-                    cmd_parts.push(shell_escape(m));
-                }
-            }
-            let amplifier_cmd = cmd_parts.join(" ");
-
-            if let Some(ref prompt_template) = settings.prompt_template {
-                let prompt_file = output_dir.join("prompt.txt");
-                fs::write(&prompt_file, &prompt_template.template)
-                    .with_context(|| format!("Failed to write prompt file: {:?}", prompt_file))?;
-                prompt_file_command(&prompt_file.to_string_lossy(), &amplifier_cmd)
-            } else {
-                amplifier_cmd
             }
         }
         "native" => {
@@ -1335,7 +1318,7 @@ fn write_wrapper_script(
     // For Claude executor: split stdout (JSONL) to raw_stream.jsonl, stderr to output.log.
     // Also tee stdout to output.log for backward compatibility.
     // For native: the agent loop writes stream.jsonl directly; wrapper just adds bookends.
-    // For amplifier/shell/other: wrapper emits Init+Result bookend events.
+    // For shell/other: wrapper emits Init+Result bookend events.
     let (run_command, fallback_run_command, stream_init, stream_result) = match executor_type {
         "claude" | "codex" => {
             let raw_stream_file = output_dir.join("raw_stream.jsonl");
@@ -1365,7 +1348,7 @@ fn write_wrapper_script(
             (cmd, None, String::new(), String::new())
         }
         _ => {
-            // Amplifier, shell, and custom executors: wrapper writes bookend events.
+            // Shell and custom executors: wrapper writes bookend events.
             let cmd = format!(
                 "{timed_command} >> \"$OUTPUT_FILE\" 2>&1",
                 timed_command = timed_command,
@@ -1396,6 +1379,18 @@ fn write_wrapper_script(
         }
     };
 
+    // Raw stream path for the failure classifier. Only claude/codex write this file.
+    let raw_stream_shell_var = match executor_type {
+        "claude" | "codex" => {
+            let raw_stream_file = output_dir.join("raw_stream.jsonl");
+            format!(
+                "RAW_STREAM={}",
+                shell_escape(&raw_stream_file.to_string_lossy())
+            )
+        }
+        _ => "RAW_STREAM=".to_string(),
+    };
+
     // Session resume fallback block: when the primary command tried to resume
     // a stale session (e.g., claude --resume <uuid>), detect the error and
     // retry with a fresh session.
@@ -1423,6 +1418,7 @@ fi
         r#"#!/bin/bash
 TASK_ID={escaped_task_id}
 OUTPUT_FILE={escaped_output_file}
+{raw_stream_shell_var}
 
 # Allow nested Claude Code sessions (spawned agents are independent)
 unset CLAUDECODE
@@ -1453,7 +1449,8 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
     if [ $EXIT_CODE -eq 124 ]; then
         echo "" >> "$OUTPUT_FILE"
         echo "[wrapper] Agent killed by hard timeout, marking task failed" >> "$OUTPUT_FILE"
-        wg fail "$TASK_ID" --reason "Agent exceeded hard timeout" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
+        FAIL_CLASS=$(wg classify-failure --exit-code $EXIT_CODE 2>/dev/null || echo "agent-hard-timeout")
+        wg fail "$TASK_ID" --class "$FAIL_CLASS" --reason "Agent exceeded hard timeout" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
     elif [ $EXIT_CODE -eq 0 ]; then
         echo "" >> "$OUTPUT_FILE"
         # Safety net: check for unread messages the agent may have missed
@@ -1462,12 +1459,28 @@ if [ "$TASK_STATUS" = "in-progress" ]; then
             echo "[wrapper] WARNING: Agent finished with unread messages:" >> "$OUTPUT_FILE"
             echo "$UNREAD" >> "$OUTPUT_FILE"
         fi
-        echo "{complete_msg}" >> "$OUTPUT_FILE"
-        {complete_cmd}
+
+        # Minimum-work gate: refuse to auto-mark done with no evidence of real work.
+        # Catches models that exit 0 with a prose summary and no tool use (e.g. gpt-5.x lazy-completion).
+        WG_GIT_DIR="$WG_WORKTREE_PATH"
+        if [ -z "$WG_GIT_DIR" ]; then WG_GIT_DIR="."; fi
+        LOG_COUNT=$(wg show "$TASK_ID" --json 2>/dev/null | grep -c '"event"' || echo 0)
+        ARTIFACT_COUNT=$(wg show "$TASK_ID" --json 2>/dev/null | grep -c '"artifact"' || echo 0)
+        DIFF_BYTES=$(git -C "$WG_GIT_DIR" diff HEAD --stat 2>/dev/null | wc -c || echo 0)
+        COMMITS_AHEAD=$(git -C "$WG_GIT_DIR" rev-list --count HEAD ^origin/HEAD 2>/dev/null || echo 0)
+
+        if [ "$LOG_COUNT" -lt 1 ] && [ "$ARTIFACT_COUNT" -lt 1 ] && [ "$DIFF_BYTES" -lt 50 ] && [ "$COMMITS_AHEAD" -lt 1 ]; then
+            echo "[wrapper] FAIL-GATE: agent exited 0 with no logs, no artifacts, no diff, no commits — refusing to auto-mark done" >> "$OUTPUT_FILE"
+            wg fail "$TASK_ID" --class "agent-no-work" --reason "Agent exited 0 without producing any work (no wg log, no artifacts, no diff, no commits)" 2>> "$OUTPUT_FILE" || true
+        else
+            echo "{complete_msg}" >> "$OUTPUT_FILE"
+            {complete_cmd}
+        fi
     else
         echo "" >> "$OUTPUT_FILE"
         echo "[wrapper] Agent exited with code $EXIT_CODE, marking task failed" >> "$OUTPUT_FILE"
-        wg fail "$TASK_ID" --reason "Agent exited with code $EXIT_CODE" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
+        FAIL_CLASS=$(wg classify-failure --raw-stream "$RAW_STREAM" --exit-code $EXIT_CODE 2>/dev/null || echo "agent-exit-nonzero")
+        wg fail "$TASK_ID" --class "$FAIL_CLASS" --reason "Agent exited with code $EXIT_CODE" 2>> "$OUTPUT_FILE" || echo "[wrapper] WARNING: 'wg fail' failed with exit code $?" >> "$OUTPUT_FILE"
     fi
 fi
 
@@ -1476,6 +1489,11 @@ fi
 # still alive, so it can react to conflicts. This wrapper only handles the
 # cleanup marker for the coordinator sweep.
 if [ -n "$WG_WORKTREE_PATH" ] && [ -n "$WG_BRANCH" ] && [ -n "$WG_PROJECT_ROOT" ]; then
+    CURRENT_DIR_REAL=$(pwd -P 2>/dev/null || pwd)
+    WORKTREE_PATH_REAL=$(cd "$WG_WORKTREE_PATH" 2>/dev/null && pwd -P || printf '%s' "$WG_WORKTREE_PATH")
+    if [ "$CURRENT_DIR_REAL" != "$WORKTREE_PATH_REAL" ]; then
+        echo "[wrapper] WARNING: Skipping worktree cleanup because current directory '$CURRENT_DIR_REAL' does not match WG_WORKTREE_PATH '$WORKTREE_PATH_REAL' — possible inherited parent agent environment" >> "$OUTPUT_FILE"
+    else
     if [ ! -e "$WG_WORKTREE_PATH/.git" ]; then
         echo "[wrapper] WARNING: Worktree .git pointer missing at $WG_WORKTREE_PATH — possible worktree escape detected" >> "$OUTPUT_FILE"
     fi
@@ -1498,12 +1516,14 @@ if [ -n "$WG_WORKTREE_PATH" ] && [ -n "$WG_BRANCH" ] && [ -n "$WG_PROJECT_ROOT" 
             && echo "[wrapper] Reaped target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE" \
             || echo "[wrapper] WARNING: failed to reap target/ from $WG_WORKTREE_PATH" >> "$OUTPUT_FILE"
     fi
+    fi
 fi
 
 exit $EXIT_CODE
 "#,
         escaped_task_id = shell_escape(task_id),
         escaped_output_file = shell_escape(output_file_str),
+        raw_stream_shell_var = raw_stream_shell_var,
         run_command = run_command,
         session_fallback_block = session_fallback_block,
         timeout_note = timeout_note,
@@ -1787,7 +1807,11 @@ fn check_openrouter_cost_caps(
         fetch_openrouter_key_status_blocking, resolve_openai_api_key_from_dir,
     };
 
-    let openrouter_config = &config.openrouter;
+    // No [openrouter] section → no caps to enforce. The section is
+    // emitted only on the openrouter route or when explicitly added.
+    let Some(openrouter_config) = config.openrouter.as_ref() else {
+        return Ok(());
+    };
 
     // Early exit if no cost caps are configured
     if openrouter_config.cost_cap_global_usd.is_none()
@@ -1806,7 +1830,7 @@ fn check_openrouter_cost_caps(
         }
     };
 
-    let service_dir = workgraph_dir.join(".workgraph/service");
+    let service_dir = workgraph_dir.join(".wg/service");
 
     // Load current coordinator state for session cost tracking
     let mut coordinator_state = CoordinatorState::load_for(&service_dir, 0).unwrap_or_default();
@@ -1921,6 +1945,38 @@ fn handle_cost_cap_violation(
 mod tests {
     use super::*;
     use workgraph::config::CLAUDE_OPUS_MODEL_ID;
+
+    // --- executor_uses_auto_prompt tests ---
+
+    // Regression for codex-handler-doesn: the spawn pipeline used to hard-code
+    // the auto-prompt list as `claude | native`, which silently dropped
+    // codex. Codex agents spawned with no prompt_template, fell through to
+    // the codex case in build_inner_command's `else { codex_cmd }` branch,
+    // and the resulting run.sh had no `cat prompt.txt | ...` prefix. Codex
+    // CLI sat reading stdin, got nothing, exited with 'No prompt provided
+    // via stdin'. Pin the three built-in handlers here.
+    #[test]
+    fn test_executor_uses_auto_prompt_includes_codex() {
+        assert!(executor_uses_auto_prompt("codex"));
+    }
+
+    #[test]
+    fn test_executor_uses_auto_prompt_includes_all_builtins() {
+        for kind in ["claude", "codex", "native"] {
+            assert!(
+                executor_uses_auto_prompt(kind),
+                "{} must auto-build prompt",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_executor_uses_auto_prompt_excludes_shell_and_unknown() {
+        assert!(!executor_uses_auto_prompt("shell"));
+        assert!(!executor_uses_auto_prompt(""));
+        assert!(!executor_uses_auto_prompt("custom"));
+    }
 
     // --- should_create_worktree tests ---
 
@@ -2251,6 +2307,7 @@ mod tests {
                     api_key_file: None,
                     api_key_env: None,
                     model: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -2262,6 +2319,7 @@ mod tests {
                     api_key_file: None,
                     api_key_env: None,
                     model: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },

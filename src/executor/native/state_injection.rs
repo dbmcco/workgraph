@@ -76,7 +76,7 @@ impl DependencySnapshot {
 
 /// Collects dynamic state changes and formats them as ephemeral injections.
 pub struct StateInjector {
-    /// Path to the `.workgraph/` directory.
+    /// Path to the `.wg/` directory.
     workgraph_dir: PathBuf,
     /// Task this agent is working on.
     task_id: String,
@@ -374,7 +374,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Create a minimal workgraph directory with a graph and a task.
+    /// Create a minimal WG directory with a graph and a task.
     fn setup_workgraph(dir: &Path, task_id: &str, deps: &[(&str, &str)]) {
         fs::create_dir_all(dir).unwrap();
 

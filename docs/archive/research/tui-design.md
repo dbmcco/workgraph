@@ -1,6 +1,6 @@
-# TUI Design for Workgraph
+# TUI Design for wg
 
-This document outlines the design for a terminal user interface (TUI) for workgraph using ratatui.
+This document outlines the design for a terminal user interface (TUI) for wg using ratatui.
 
 ## Table of Contents
 
@@ -20,7 +20,7 @@ This document outlines the design for a terminal user interface (TUI) for workgr
 
 ### Goals
 
-- Provide an interactive, real-time view of the workgraph
+- Provide an interactive, real-time view of the wg
 - Enable fast task management without leaving the terminal
 - Support both human operators and monitoring of agent activity
 - Maintain the principle of simplicity while adding power-user features
@@ -29,7 +29,7 @@ This document outlines the design for a terminal user interface (TUI) for workgr
 
 - Full graph editing (complex dependency modifications)
 - Multi-user collaboration features
-- Remote workgraph viewing
+- Remote wg viewing
 
 ---
 
@@ -277,7 +277,7 @@ tokio = { version = "1", features = ["full"] }
 notify = "6"
 notify-debouncer-mini = "0.4"
 
-# Existing workgraph dependencies
+# Existing wg dependencies
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -297,7 +297,7 @@ anyhow = "1.0"
 ┌──────────────────────────────────────────────────────────────┐
 │                          App                                 │
 │  - state: AppState                                           │
-│  - graph: WorkGraph                                          │
+│  - graph: wg                                          │
 │  - current_view: View                                        │
 │  - filter: FilterState                                       │
 │  - selection: SelectionState                                 │
@@ -358,10 +358,10 @@ async fn run_app(terminal: &mut Terminal, app: &mut App) -> Result<()> {
 
 ```rust
 struct App {
-    /// The workgraph data
-    graph: WorkGraph,
+    /// The wg data
+    graph: wg,
 
-    /// Path to .workgraph directory
+    /// Path to .wg directory
     workgraph_dir: PathBuf,
 
     /// Current view mode
@@ -409,7 +409,7 @@ struct Filter {
 
 ### 6.5 File Watching
 
-Watch `.workgraph/graph.jsonl` for external changes (from CLI or other agents).
+Watch `.wg/graph.jsonl` for external changes (from CLI or other agents).
 
 ```rust
 async fn start_file_watcher(
@@ -461,7 +461,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.1 Task List View
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │                                                                 │
 │  Tasks                                                   [?help]│
 │  ──────                                                         │
@@ -485,7 +485,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.2 Task Detail Modal
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │                                                                 │
 │  Tasks                                                          │
 │  ──────                                                         │
@@ -518,7 +518,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.3 Ready Queue View
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │                                                                 │
 │  Ready Queue                                             [?help]│
 │  ───────────                                                    │
@@ -547,7 +547,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.4 Graph View
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │                                                                 │
 │  Dependency Graph: api-impl                              [?help]│
 │  ──────────────────────────                                     │
@@ -577,7 +577,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.5 Add Task Modal
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │                                                                 │
 │  Tasks                                                          │
 │  ──────                                                         │
@@ -606,7 +606,7 @@ Recommendation: **Option A** - keeps everything in one binary, easier to install
 ### 7.6 Help Overlay
 
 ```
-┌─ Workgraph ─────────────────────────────────────────────────────┐
+┌─ wg ─────────────────────────────────────────────────────┐
 │ ┌─ Help ──────────────────────────────────────────────────────┐ │
 │ │                                                             │ │
 │ │  Navigation                    Actions                      │ │

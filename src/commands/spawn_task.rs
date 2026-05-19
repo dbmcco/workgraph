@@ -13,9 +13,9 @@
 //!
 //! Adapters live inline here (one match arm per executor). Native
 //! execs into `wg nex`; Claude execs into `wg claude-handler`
-//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex /
-//! Gemini / Amplifier are still stubs — they error cleanly with a
-//! "not yet implemented" message when selected.
+//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex / Gemini
+//! are still stubs — they error cleanly with a "not yet implemented"
+//! message when selected.
 //!
 //! ## Stdout-is-protocol contract
 //!
@@ -54,9 +54,6 @@ pub enum HandlerSpec {
         model: Option<String>,
     },
     Gemini {
-        chat_ref: String,
-    },
-    Amplifier {
         chat_ref: String,
     },
 }
@@ -102,9 +99,6 @@ impl HandlerSpec {
                 s
             }
             Self::Gemini { chat_ref } => format!("gemini [TODO: adapter for session={}]", chat_ref),
-            Self::Amplifier { chat_ref } => {
-                format!("wg amplifier-run {} [TODO]", chat_ref)
-            }
         }
     }
 }
@@ -175,14 +169,17 @@ pub fn resolve_handler(
     let config = workgraph::config::Config::load_or_default(workgraph_dir);
 
     // chat_ref convention: task id IS the chat alias, until Phase 5
-    // migration swaps to `.chat-<uuid>`. Exception: `.coordinator-N`
-    // task ids map to the existing `coordinator-N` chat alias the
-    // daemon registers via `register_coordinator_session` — so IPC
-    // writers (`wg chat --coordinator N`) and the handler land on
-    // the SAME underlying chat dir. Without this, the handler would
-    // use a fresh `chat/.coordinator-N/` dir that no other code
-    // writes to, and the coordinator's inbox would appear empty.
-    let chat_ref = if let Some(n) = task.id.strip_prefix(".coordinator-") {
+    // migration swaps to `.chat-<uuid>`. Exceptions: `.chat-N` and
+    // `.coordinator-N` task ids map to the registered `chat-N` /
+    // `coordinator-N` aliases (see `register_coordinator_session`,
+    // which installs both). Without these strips, the handler would
+    // resolve `.chat-N` / `.coordinator-N` literally, fall back to a
+    // fresh `chat/.chat-N/` dir that no IPC writer touches, and the
+    // chat's inbox would appear empty (split-brain with the UUID dir
+    // the registered alias resolves to).
+    let chat_ref = if let Some(n) = task.id.strip_prefix(".chat-") {
+        format!("chat-{}", n)
+    } else if let Some(n) = task.id.strip_prefix(".coordinator-") {
         format!("coordinator-{}", n)
     } else {
         task.id.clone()
@@ -200,12 +197,26 @@ pub fn resolve_handler(
     });
 
     // Single source of truth: ALL executor/model/endpoint decisions flow
-    // through `plan_spawn`. We only source `WG_EXECUTOR_TYPE` (which the
-    // daemon sets per-coordinator so a Claude coordinator in the same graph
-    // as a native one routes correctly even if the global default differs)
-    // and feed it as the `agent_executor` hint.
+    // through `plan_spawn`. We source TWO env vars set by the parent
+    // (typically the daemon supervisor):
+    //   - `WG_EXECUTOR_TYPE` — agency-derived executor for THIS chat/task,
+    //     so a codex chat in the same graph as a claude one routes
+    //     correctly even if the global `[dispatcher].executor` differs.
+    //   - `WG_MODEL` — agency-derived model for THIS chat/task, fed as
+    //     `default_model`. Without this, the per-chat model the daemon
+    //     resolved (from `CoordinatorState.model_override` etc.) silently
+    //     falls back to `[dispatcher].model` here — the chat-launched-with
+    //     bug where "create chat with codex:gpt-5" ran codex with
+    //     `-m claude:opus` because spawn-task only honored the executor
+    //     half of the per-chat plan.
     let env_executor = std::env::var("WG_EXECUTOR_TYPE").ok();
-    let plan = workgraph::dispatch::plan_spawn(task, &config, env_executor.as_deref(), None)?;
+    let env_model = std::env::var("WG_MODEL").ok();
+    let plan = workgraph::dispatch::plan_spawn(
+        task,
+        &config,
+        env_executor.as_deref(),
+        env_model.as_deref(),
+    )?;
 
     // Provenance: every spawn emits one line tracing each decision back to
     // the config knob that produced it. Eliminates silent-routing bugs.
@@ -234,7 +245,6 @@ pub fn resolve_handler(
         },
         workgraph::dispatch::ExecutorKind::Claude => HandlerSpec::Claude { chat_ref, model },
         workgraph::dispatch::ExecutorKind::Codex => HandlerSpec::Codex { chat_ref, model },
-        workgraph::dispatch::ExecutorKind::Amplifier => HandlerSpec::Amplifier { chat_ref },
         workgraph::dispatch::ExecutorKind::Shell => {
             return Err(anyhow!(
                 "shell executor is not supported by spawn-task; \
@@ -273,10 +283,6 @@ fn dispatch(spec: &HandlerSpec, _workgraph_dir: &Path) -> Result<()> {
         HandlerSpec::Codex { chat_ref, model } => dispatch_codex(chat_ref, model.as_deref()),
         HandlerSpec::Gemini { .. } => Err(anyhow!(
             "gemini adapter not yet implemented (Phase 7). Use --executor native for now."
-        )),
-        HandlerSpec::Amplifier { .. } => Err(anyhow!(
-            "amplifier adapter via spawn-task not yet implemented (Phase 7). \
-             Use the existing service-level amplifier dispatch for now."
         )),
     }
 }
@@ -384,101 +390,156 @@ mod tests {
         }
     }
 
-    // These tests expect Native handler; isolate from WG_EXECUTOR_TYPE env var
-    // which the coordinator daemon sets per-agent.
+    /// Save and restore WG_EXECUTOR_TYPE + WG_MODEL across a test body.
+    /// `set_exec` / `set_model` configure the env for the duration of `f`.
+    /// Env restoration runs even on panic via Drop, so failed assertions
+    /// don't leak into other tests.
+    fn with_env<R>(set_exec: Option<&str>, set_model: Option<&str>, f: impl FnOnce() -> R) -> R {
+        struct EnvGuard {
+            saved_exec: Option<String>,
+            saved_model: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.saved_exec.take() {
+                        Some(v) => std::env::set_var("WG_EXECUTOR_TYPE", v),
+                        None => std::env::remove_var("WG_EXECUTOR_TYPE"),
+                    }
+                    match self.saved_model.take() {
+                        Some(v) => std::env::set_var("WG_MODEL", v),
+                        None => std::env::remove_var("WG_MODEL"),
+                    }
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            saved_exec: std::env::var("WG_EXECUTOR_TYPE").ok(),
+            saved_model: std::env::var("WG_MODEL").ok(),
+        };
+        unsafe {
+            match set_exec {
+                Some(v) => std::env::set_var("WG_EXECUTOR_TYPE", v),
+                None => std::env::remove_var("WG_EXECUTOR_TYPE"),
+            }
+            match set_model {
+                Some(v) => std::env::set_var("WG_MODEL", v),
+                None => std::env::remove_var("WG_MODEL"),
+            }
+        }
+        f()
+    }
+
+    // These tests pin WG_EXECUTOR_TYPE=native because role/resume are
+    // Native-handler-specific concepts; the dispatcher default (Claude)
+    // would route to a Claude handler with no role/resume fields. We also
+    // scrub WG_MODEL because the agent harness running cargo test sets it
+    // to the agent's resolved model, which would otherwise leak in via
+    // dispatch::plan_spawn's `default_model` arg.
     #[test]
     #[serial]
     fn coordinator_task_gets_coordinator_role() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".workgraph")).unwrap();
-        let task = mktask(".coordinator-0");
-        let spec = resolve_handler(dir.path(), &task, None).unwrap();
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        }
-        match spec {
-            HandlerSpec::Native { role, .. } => {
-                assert_eq!(role, Some("coordinator".to_string()));
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".wg")).unwrap();
+            let task = mktask(".coordinator-0");
+            let spec = resolve_handler(dir.path(), &task, None).unwrap();
+            match spec {
+                HandlerSpec::Native { role, .. } => {
+                    assert_eq!(role, Some("coordinator".to_string()));
+                }
+                _ => panic!("expected Native handler"),
             }
-            _ => panic!("expected Native handler"),
-        }
+        });
     }
 
     #[test]
     #[serial]
     fn non_coordinator_task_gets_no_role() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        let dir = tempfile::tempdir().unwrap();
-        let task = mktask("my-task");
-        let spec = resolve_handler(dir.path(), &task, None).unwrap();
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        }
-        match spec {
-            HandlerSpec::Native { role, .. } => {
-                assert!(role.is_none(), "regular task should not have a role");
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let task = mktask("my-task");
+            let spec = resolve_handler(dir.path(), &task, None).unwrap();
+            match spec {
+                HandlerSpec::Native { role, .. } => {
+                    assert!(role.is_none(), "regular task should not have a role");
+                }
+                _ => panic!("expected Native handler"),
             }
-            _ => panic!("expected Native handler"),
-        }
+        });
     }
 
     #[test]
     #[serial]
     fn role_override_wins() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        let dir = tempfile::tempdir().unwrap();
-        let task = mktask(".coordinator-0");
-        let spec = resolve_handler(dir.path(), &task, Some("evaluator")).unwrap();
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        }
-        match spec {
-            HandlerSpec::Native { role, .. } => {
-                assert_eq!(role, Some("evaluator".to_string()));
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let task = mktask(".coordinator-0");
+            let spec = resolve_handler(dir.path(), &task, Some("evaluator")).unwrap();
+            match spec {
+                HandlerSpec::Native { role, .. } => {
+                    assert_eq!(role, Some("evaluator".to_string()));
+                }
+                _ => panic!("expected Native handler"),
             }
-            _ => panic!("expected Native handler"),
-        }
+        });
     }
 
     #[test]
     #[serial]
     fn resume_true_when_journal_exists() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        let dir = tempfile::tempdir().unwrap();
-        let task = mktask("have-journal");
-        let chat = dir.path().join("chat").join(&task.id);
-        std::fs::create_dir_all(&chat).unwrap();
-        std::fs::write(chat.join("conversation.jsonl"), b"").unwrap();
-        let spec = resolve_handler(dir.path(), &task, None).unwrap();
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        }
-        match spec {
-            HandlerSpec::Native { resume, .. } => assert!(resume),
-            _ => panic!(),
-        }
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let task = mktask("have-journal");
+            let chat = dir.path().join("chat").join(&task.id);
+            std::fs::create_dir_all(&chat).unwrap();
+            std::fs::write(chat.join("conversation.jsonl"), b"").unwrap();
+            let spec = resolve_handler(dir.path(), &task, None).unwrap();
+            match spec {
+                HandlerSpec::Native { resume, .. } => assert!(resume),
+                _ => panic!(),
+            }
+        });
     }
 
     #[test]
     #[serial]
     fn resume_false_when_fresh() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        let dir = tempfile::tempdir().unwrap();
-        let task = mktask("fresh-task");
-        let spec = resolve_handler(dir.path(), &task, None).unwrap();
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        }
-        match spec {
-            HandlerSpec::Native { resume, .. } => assert!(!resume),
-            _ => panic!(),
-        }
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let task = mktask("fresh-task");
+            let spec = resolve_handler(dir.path(), &task, None).unwrap();
+            match spec {
+                HandlerSpec::Native { resume, .. } => assert!(!resume),
+                _ => panic!(),
+            }
+        });
+    }
+
+    /// Composition glue regression: `.chat-N` task ids must resolve to
+    /// the registered `chat-N` alias, not the literal `.chat-N` directory.
+    /// Without this, `wg spawn-task .chat-N` → `wg nex --chat .chat-N`
+    /// → `chat_dir_for_ref(".chat-N")` falls back to `chat/.chat-N/`,
+    /// which no IPC writer touches — split-brain with the UUID dir the
+    /// registered alias resolves to. Surfaced by integrate-nex-chat-end-to-end.
+    #[test]
+    #[serial]
+    fn dot_chat_id_strips_leading_dot_for_chat_ref() {
+        with_env(Some("native"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".wg")).unwrap();
+            let task = mktask(".chat-7");
+            let spec = resolve_handler(dir.path(), &task, None).unwrap();
+            match spec {
+                HandlerSpec::Native { chat_ref, .. } => {
+                    assert_eq!(
+                        chat_ref, "chat-7",
+                        ".chat-N task id must map to the registered `chat-N` alias"
+                    );
+                }
+                _ => panic!("expected Native handler"),
+            }
+        });
     }
 
     #[test]
@@ -536,42 +597,49 @@ mod tests {
     #[test]
     #[serial]
     fn spawn_task_falls_back_to_config_model() {
-        let saved = std::env::var("WG_EXECUTOR_TYPE").ok();
-        unsafe { std::env::set_var("WG_EXECUTOR_TYPE", "claude") };
-        let dir = tempfile::tempdir().unwrap();
-        let wg_dir = dir.path();
-        std::fs::write(
-            wg_dir.join("config.toml"),
-            b"[coordinator]\nmodel = \"claude:opus\"\n",
-        )
-        .unwrap();
+        with_env(Some("claude"), None, || {
+            let dir = tempfile::tempdir().unwrap();
+            let wg_dir = dir.path();
+            std::fs::write(
+                wg_dir.join("config.toml"),
+                b"[coordinator]\nmodel = \"claude:opus\"\n",
+            )
+            .unwrap();
 
-        let task = mktask(".coordinator-0");
-        assert!(task.model.is_none(), "synthesized task has no model");
-        let spec = resolve_handler(wg_dir, &task, None).unwrap();
+            let task = mktask(".coordinator-0");
+            assert!(task.model.is_none(), "synthesized task has no model");
+            let config = workgraph::config::Config::load_or_default(wg_dir);
+            let expected_model = config
+                .coordinator
+                .model
+                .clone()
+                .unwrap_or_else(|| config.agent.model.clone());
+            let expected_executor = workgraph::dispatch::handler_for_model(&expected_model);
+            let spec = resolve_handler(wg_dir, &task, None).unwrap();
 
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("WG_EXECUTOR_TYPE", v) };
-        } else {
-            unsafe { std::env::remove_var("WG_EXECUTOR_TYPE") };
-        }
-
-        let preview = spec.command_preview();
-        match spec {
-            HandlerSpec::Claude { model, .. } => {
-                assert_eq!(
-                    model,
-                    Some("claude:opus".to_string()),
-                    "should fall back to config.coordinator.model when task.model is None"
-                );
-            }
-            _ => panic!("expected Claude handler"),
-        }
-        assert!(
-            preview.contains("-m claude:opus"),
-            "dry-run should include config model: {}",
-            preview
-        );
+            let preview = spec.command_preview();
+            let (actual_executor, actual_model) = match spec {
+                HandlerSpec::Claude { model, .. } => ("claude", model),
+                HandlerSpec::Codex { model, .. } => ("codex", model),
+                HandlerSpec::Native { model, .. } => ("native", model),
+                HandlerSpec::Gemini { .. } => ("gemini", None),
+            };
+            assert_eq!(
+                actual_executor,
+                expected_executor.as_str(),
+                "should use the handler implied by the effective config model"
+            );
+            assert_eq!(
+                actual_model,
+                Some(expected_model.clone()),
+                "should fall back to the effective config model when task.model is None"
+            );
+            assert!(
+                preview.contains(&format!("-m {}", expected_model)),
+                "dry-run should include config model: {}",
+                preview
+            );
+        });
     }
 
     #[test]
@@ -636,5 +704,129 @@ mod tests {
             }
             _ => panic!("expected Claude handler"),
         }
+    }
+
+    /// Regression test for chat-launched-with: when the daemon supervisor
+    /// spawns `wg spawn-task .chat-N`, it sets BOTH `WG_EXECUTOR_TYPE` and
+    /// `WG_MODEL` env vars carrying the per-chat overrides resolved from
+    /// `CoordinatorState`. spawn-task must honor BOTH — previously only
+    /// WG_EXECUTOR_TYPE was read, so the chat would dispatch to the right
+    /// executor binary but with the wrong model (the global
+    /// `[dispatcher].model` fallback, which is `claude:opus` in most
+    /// installs). The user-visible symptom: "I asked for codex and got
+    /// claude" — the codex-handler received `-m claude:opus` and either
+    /// errored out or fell through.
+    #[test]
+    #[serial]
+    fn spawn_task_propagates_wg_model_env_var() {
+        let saved_exec = std::env::var("WG_EXECUTOR_TYPE").ok();
+        let saved_model = std::env::var("WG_MODEL").ok();
+        unsafe {
+            std::env::set_var("WG_EXECUTOR_TYPE", "codex");
+            std::env::set_var("WG_MODEL", "codex:gpt-5");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path();
+        // Set a config.coordinator.model that differs from the env var so
+        // we can tell which one won.
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            b"[coordinator]\nmodel = \"claude:opus\"\n",
+        )
+        .unwrap();
+
+        // Synthesized chat task — no task.model field, mirroring what
+        // create_chat_in_graph writes today.
+        let task = mktask(".chat-7");
+        assert!(task.model.is_none(), "chat tasks have no task.model today");
+        let spec = resolve_handler(wg_dir, &task, None).unwrap();
+
+        // Restore env before assertions.
+        unsafe {
+            if let Some(v) = saved_exec {
+                std::env::set_var("WG_EXECUTOR_TYPE", v);
+            } else {
+                std::env::remove_var("WG_EXECUTOR_TYPE");
+            }
+            if let Some(v) = saved_model {
+                std::env::set_var("WG_MODEL", v);
+            } else {
+                std::env::remove_var("WG_MODEL");
+            }
+        }
+
+        match spec {
+            HandlerSpec::Codex { model, .. } => {
+                assert_eq!(
+                    model,
+                    Some("codex:gpt-5".to_string()),
+                    "WG_MODEL env var must take precedence over \
+                     config.coordinator.model. Got: {:?}",
+                    model,
+                );
+            }
+            other => panic!(
+                "expected Codex handler with codex:gpt-5 model, got {:?}",
+                match other {
+                    HandlerSpec::Claude { model, .. } => format!("Claude {{ model: {:?} }}", model),
+                    HandlerSpec::Native { model, .. } => format!("Native {{ model: {:?} }}", model),
+                    HandlerSpec::Codex { model, .. } => format!("Codex {{ model: {:?} }}", model),
+                    HandlerSpec::Gemini { .. } => "Gemini".to_string(),
+                }
+            ),
+        }
+    }
+
+    /// Fix C end-to-end (fix-nex-chat / diagnose-wg-nex root cause #2):
+    /// `wg spawn-task --dry-run` for a task with `task.endpoint` set to an
+    /// inline http(s)://URL must emit `wg nex --chat ... -e <url>` on
+    /// stdout. Before Fix C, the URL was silently dropped and the dry-run
+    /// emitted no `-e` flag — meaning even when the supervisor DID spawn,
+    /// nex would talk to the global default endpoint (or fall through
+    /// to provider heuristics) instead of the user's chosen URL.
+    ///
+    /// This is the exact reproduction scenario from `diagnose-wg-nex`:
+    ///   `WG_EXECUTOR_TYPE=native WG_MODEL=qwen3-coder \
+    ///    wg spawn-task --dry-run .chat-32`
+    #[test]
+    #[serial]
+    fn dry_run_includes_inline_url_endpoint_from_task() {
+        with_env(Some("native"), Some("nex:qwen3-coder"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let wg_dir = dir.path();
+
+            let mut task = mktask(".chat-32");
+            task.tags = vec![workgraph::chat_id::CHAT_LOOP_TAG.to_string()];
+            task.model = Some("nex:qwen3-coder".to_string());
+            task.endpoint = Some("https://lambda01.tail334fe6.ts.net:30000".to_string());
+
+            let spec = resolve_handler(wg_dir, &task, None).unwrap();
+            let preview = spec.command_preview();
+
+            match &spec {
+                HandlerSpec::Native {
+                    endpoint, model, ..
+                } => {
+                    assert_eq!(
+                        endpoint.as_deref(),
+                        Some("https://lambda01.tail334fe6.ts.net:30000"),
+                        "Native handler MUST carry task.endpoint URL — got endpoint={:?}, model={:?}, preview={}",
+                        endpoint,
+                        model,
+                        preview
+                    );
+                }
+                other => panic!(
+                    "expected Native handler with inline URL endpoint, got: {}",
+                    other.command_preview()
+                ),
+            }
+
+            assert!(
+                preview.contains("-e https://lambda01.tail334fe6.ts.net:30000"),
+                "dry-run preview MUST include -e <url>, got: {}",
+                preview
+            );
+        });
     }
 }

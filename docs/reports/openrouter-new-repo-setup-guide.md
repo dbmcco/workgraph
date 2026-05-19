@@ -1,4 +1,4 @@
-# How to Set Up a New Workgraph Repo with OpenRouter as the Default Executor
+# How to Set Up a New wg Repo with OpenRouter as the Default Executor
 
 **Task:** research-current-new
 **Date:** 2026-04-03
@@ -8,7 +8,7 @@
 ## TL;DR — The Happy Path
 
 ```bash
-# 1. One-time global setup (writes ~/.workgraph/config.toml)
+# 1. One-time global setup (writes ~/.wg/config.toml)
 export OPENROUTER_API_KEY="sk-or-v1-..."
 wg setup --provider openrouter --model anthropic/claude-sonnet-4
 
@@ -51,7 +51,7 @@ The wizard auto-detects your environment (installed CLIs, existing API keys, etc
 8. **Skill installation** → for `native` executor, skipped (wg skill is for Claude Code)
 9. **Notifications** → optional Matrix/Telegram/email/Slack/webhook setup
 
-Writes to: `~/.workgraph/config.toml`
+Writes to: `~/.wg/config.toml`
 
 ### Option B: Non-interactive one-liner
 
@@ -71,7 +71,7 @@ Additional flags:
 - `--url https://openrouter.ai/api/v1` — override endpoint URL (rarely needed)
 - `--skip-validation` — skip the API key connectivity check
 
-### What `wg setup` writes to `~/.workgraph/config.toml`
+### What `wg setup` writes to `~/.wg/config.toml`
 
 After running `wg setup --provider openrouter --model anthropic/claude-sonnet-4`, the global config looks like:
 
@@ -155,13 +155,13 @@ wg init
 ```
 
 This creates:
-- `.workgraph/` directory
-- `.workgraph/graph.jsonl` — empty task graph
-- `.workgraph/.gitignore` — excludes `agents/`, `service/`, credentials
-- `.workgraph/agency/` — seeded roles, tradeoffs, and default agents (unless `--no-agency`)
-- Adds `.workgraph` to the repo-level `.gitignore`
+- `.wg/` directory
+- `.wg/graph.jsonl` — empty task graph
+- `.wg/.gitignore` — excludes `agents/`, `service/`, credentials
+- `.wg/agency/` — seeded roles, tradeoffs, and default agents (unless `--no-agency`)
+- Adds `.wg` to the repo-level `.gitignore`
 
-**`wg init` does NOT create a local `config.toml`** — it inherits the global config from `~/.workgraph/config.toml`. This is intentional: global config sets the provider/executor/model, and projects inherit it.
+**`wg init` does NOT create a local `config.toml`** — it inherits the global config from `~/.wg/config.toml`. This is intentional: global config sets the provider/executor/model, and projects inherit it.
 
 If you need project-specific overrides:
 
@@ -169,7 +169,7 @@ If you need project-specific overrides:
 wg config --local --coordinator-model openrouter:minimax/minimax-m2.7
 ```
 
-This creates `.workgraph/config.toml` with only the overridden fields. The merged config (global + local) is what workgraph uses at runtime.
+This creates `.wg/config.toml` with only the overridden fields. The merged config (global + local) is what wg uses at runtime.
 
 ---
 
@@ -179,7 +179,7 @@ This creates `.workgraph/config.toml` with only the overridden fields. The merge
 
 OpenRouter uses `provider/model` naming: `anthropic/claude-sonnet-4`, `minimax/minimax-m2.7`, `deepseek/deepseek-chat-v3`, etc.
 
-In workgraph config/CLI, models are specified as `provider_prefix:model_id`:
+In wg config/CLI, models are specified as `provider_prefix:model_id`:
 
 ```
 openrouter:anthropic/claude-sonnet-4
@@ -187,7 +187,7 @@ openrouter:minimax/minimax-m2.7
 openrouter:deepseek/deepseek-chat-v3
 ```
 
-The `openrouter:` prefix tells workgraph to route through the OpenRouter endpoint.
+The `openrouter:` prefix tells wg to route through the OpenRouter endpoint.
 
 ### Known provider prefixes
 
@@ -216,7 +216,7 @@ wg add "My task" --model openrouter:minimax/minimax-m2.7
 
 ### Executor auto-detection
 
-When `coordinator.executor` is not explicitly set, workgraph infers it from the model:
+When `coordinator.executor` is not explicitly set, wg infers it from the model:
 - `openrouter:...` → `native` executor
 - `openai:...` → `native` executor
 - `claude:...` → `claude` executor
@@ -287,19 +287,19 @@ This is more steps but gives fine-grained control.
 ## Gaps and Pain Points
 
 ### 1. No unified `wg init --provider openrouter` flag
-**Issue:** `wg init` creates the `.workgraph/` directory but does NOT configure the provider/executor/model. Those must be set separately via `wg setup` (global) or `wg config` (local). A new user must know to run `wg setup` first, or manually edit config.toml.
+**Issue:** `wg init` creates the `.wg/` directory but does NOT configure the provider/executor/model. Those must be set separately via `wg setup` (global) or `wg config` (local). A new user must know to run `wg setup` first, or manually edit config.toml.
 
-**Ideal:** `wg init --provider openrouter --model minimax/minimax-m2.7` should do everything in one command: create `.workgraph/`, set up the endpoint, configure the executor, and save a local config.toml.
+**Ideal:** `wg init --provider openrouter --model minimax/minimax-m2.7` should do everything in one command: create `.wg/`, set up the endpoint, configure the executor, and save a local config.toml.
 
 ### 2. Two-config dance (global vs local)
-**Issue:** `wg setup` writes to `~/.workgraph/config.toml` (global). `wg init` doesn't create a local config. If a user wants per-project model defaults, they must separately run `wg config --local --coordinator-model ...`. This is non-obvious.
+**Issue:** `wg setup` writes to `~/.wg/config.toml` (global). `wg init` doesn't create a local config. If a user wants per-project model defaults, they must separately run `wg config --local --coordinator-model ...`. This is non-obvious.
 
-**Ideal:** `wg init` could optionally create a `.workgraph/config.toml` with the project's model/endpoint settings. Or `wg setup --local` could write to the current project's config.
+**Ideal:** `wg init` could optionally create a `.wg/config.toml` with the project's model/endpoint settings. Or `wg setup --local` could write to the current project's config.
 
 ### 3. provider:model format is confusing for OpenRouter models
-**Issue:** OpenRouter models already have a slash (`anthropic/claude-sonnet-4`). Adding the workgraph provider prefix creates `openrouter:anthropic/claude-sonnet-4`. This looks like three levels of nesting and is confusing. Users might try `minimax/minimax-m2.7` without the `openrouter:` prefix, which would be treated as a bare model name and default to the `claude` executor.
+**Issue:** OpenRouter models already have a slash (`anthropic/claude-sonnet-4`). Adding the wg provider prefix creates `openrouter:anthropic/claude-sonnet-4`. This looks like three levels of nesting and is confusing. Users might try `minimax/minimax-m2.7` without the `openrouter:` prefix, which would be treated as a bare model name and default to the `claude` executor.
 
-**Ideal:** Workgraph could auto-detect that a model containing `/` should be routed through OpenRouter (or the configured default endpoint) without requiring an explicit prefix.
+**Ideal:** wg could auto-detect that a model containing `/` should be routed through OpenRouter (or the configured default endpoint) without requiring an explicit prefix.
 
 ### 4. No `wg setup --local` for project-scoped config
 **Issue:** `wg setup` always writes to global config. There's no `--local` flag to run the wizard for a project-specific config.
@@ -325,7 +325,7 @@ This is more steps but gives fine-grained control.
 |---|---|---|
 | 1 | `export OPENROUTER_API_KEY="sk-or-v1-..."` | Set API key in environment |
 | 2 | `wg setup --provider openrouter --model openrouter:minimax/minimax-m2.7` | Write global config: native executor, OpenRouter endpoint, model |
-| 3 | `cd my-project && wg init` | Create `.workgraph/`, inherit global config |
+| 3 | `cd my-project && wg init` | Create `.wg/`, inherit global config |
 | 4 | `wg endpoints test openrouter` | Verify connectivity (optional but recommended) |
 | 5 | `wg add "First task" --verify "..."` | Create a task |
 | 6 | `wg service start` | Launch the coordinator |

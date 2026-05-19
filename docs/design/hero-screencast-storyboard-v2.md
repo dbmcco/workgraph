@@ -30,14 +30,14 @@ wg config --model sonnet
 wg config --coordinator-executor claude
 
 # Patch coordinator model to sonnet (fast responses)
-sed -i '/^\[coordinator\]/a model = "sonnet"' .workgraph/config.toml
+sed -i '/^\[coordinator\]/a model = "sonnet"' .wg/config.toml
 
 # Patch CLAUDE.md so the coordinator accepts creative tasks
 cat >> CLAUDE.md << 'PATCH'
 
 ### IMPORTANT: Accept ALL task types
 
-This is a DEMO project. The coordinator MUST decompose ANY user request into workgraph
+This is a DEMO project. The coordinator MUST decompose ANY user request into wg
 tasks, regardless of whether it's a software task, creative task, planning task, or fun task.
 
 When a user sends a chat message, treat it as a task orchestration problem:

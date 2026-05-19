@@ -39,6 +39,7 @@ fn integration_openrouter_resolve_inline_key() {
         api_key: Some("sk-or-inline-key-123".to_string()),
         api_key_file: None,
         api_key_env: None,
+        api_key_ref: None,
         is_default: true,
         context_window: None,
     };
@@ -61,6 +62,7 @@ fn integration_openrouter_resolve_key_file() {
         api_key: None,
         api_key_file: Some(key_path.to_string_lossy().to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -72,7 +74,7 @@ fn integration_openrouter_resolve_key_file() {
 #[test]
 fn integration_openrouter_resolve_key_file_relative() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let secrets_dir = wg_dir.join("secrets");
     fs::create_dir_all(&secrets_dir).unwrap();
@@ -86,6 +88,7 @@ fn integration_openrouter_resolve_key_file_relative() {
         api_key: None,
         api_key_file: Some("secrets/or.key".to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -108,6 +111,7 @@ fn integration_openrouter_inline_key_beats_key_file() {
         api_key: Some("inline-wins".to_string()),
         api_key_file: Some(key_path.to_string_lossy().to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -126,6 +130,7 @@ fn integration_openrouter_no_key_returns_none() {
         api_key: None,
         api_key_file: None,
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -151,6 +156,7 @@ fn integration_openrouter_find_for_provider() {
                 api_key: Some("sk-ant-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -162,6 +168,7 @@ fn integration_openrouter_find_for_provider() {
                 api_key: Some("sk-or-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: false,
                 context_window: None,
@@ -191,6 +198,7 @@ fn integration_openrouter_find_for_provider_prefers_default() {
                 api_key: Some("sk-staging".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: false,
                 context_window: None,
@@ -202,6 +210,7 @@ fn integration_openrouter_find_for_provider_prefers_default() {
                 api_key: Some("sk-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -274,6 +283,7 @@ mod provider_env_var_tests {
                 api_key: Some("sk-test".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -300,6 +310,7 @@ mod provider_env_var_tests {
                 api_key: Some("sk-or-test".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -529,6 +540,7 @@ mod agent_model_preference_tests {
                     api_key: Some("sk-or-test".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     model: None,
                     is_default: true,
                     context_window: None,
@@ -540,6 +552,7 @@ mod agent_model_preference_tests {
                     api_key: Some("sk-ant-test".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     model: None,
                     is_default: false,
                     context_window: None,
@@ -590,6 +603,7 @@ mod agent_model_preference_tests {
                     api_key: Some("sk-or".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     model: None,
                     is_default: true,
                     context_window: None,
@@ -601,6 +615,7 @@ mod agent_model_preference_tests {
                     api_key: Some("sk-ant".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     model: None,
                     is_default: false,
                     context_window: None,
@@ -650,6 +665,7 @@ mod agent_model_preference_tests {
                 api_key: Some("sk-or-eval".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -708,6 +724,7 @@ mod config_roundtrip_tests {
                     api_key: Some("sk-or-roundtrip-1".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -719,6 +736,7 @@ mod config_roundtrip_tests {
                     api_key: Some("sk-ant-roundtrip".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -779,6 +797,7 @@ mod config_roundtrip_tests {
                 api_key: Some("sk-or-prod-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -823,7 +842,7 @@ mod config_roundtrip_tests {
         let tmp = setup_workgraph_dir();
         let dir = tmp.path();
 
-        // Create a key file in the workgraph dir
+        // Create a key file in the WG dir
         let key_path = dir.join("secrets");
         fs::create_dir_all(&key_path).unwrap();
         fs::write(key_path.join("or.key"), "sk-or-from-file-roundtrip").unwrap();
@@ -839,6 +858,7 @@ mod config_roundtrip_tests {
                 api_key: None,
                 api_key_file: Some("secrets/or.key".to_string()),
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -873,6 +893,7 @@ mod config_roundtrip_tests {
                     api_key: Some("key-a".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -884,6 +905,7 @@ mod config_roundtrip_tests {
                     api_key: Some("key-b".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -938,6 +960,7 @@ mod error_case_tests {
             api_key: None,
             api_key_file: Some("/nonexistent/path/or.key".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -966,6 +989,7 @@ mod error_case_tests {
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -998,6 +1022,7 @@ mod error_case_tests {
                 api_key: Some("key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -1033,6 +1058,7 @@ mod error_case_tests {
             api_key: Some("sk-or-v1-abcdef123456".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -1050,6 +1076,7 @@ mod error_case_tests {
             api_key: Some("short".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -1064,6 +1091,7 @@ mod error_case_tests {
             api_key: None,
             api_key_file: Some("/some/path".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -1078,6 +1106,7 @@ mod error_case_tests {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };

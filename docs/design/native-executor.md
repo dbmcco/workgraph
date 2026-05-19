@@ -4,7 +4,7 @@
 
 ## Overview
 
-A `native` executor that calls the Anthropic Messages API directly from Rust, implementing a tool-use loop with both file tools and in-process workgraph tools. This eliminates the dependency on Claude CLI and Amplifier for agent execution, giving workgraph full control over the LLM interaction lifecycle.
+A `native` executor that calls the Anthropic Messages API directly from Rust, implementing a tool-use loop with both file tools and in-process wg tools. This eliminates the dependency on Claude CLI and Amplifier for agent execution, giving wg full control over the LLM interaction lifecycle.
 
 ## Motivation
 
@@ -34,7 +34,7 @@ src/executor/
     │   ├── mod.rs      # ToolRegistry, ToolDefinition, dispatch
     │   ├── file.rs     # read_file, write_file, edit_file, glob, grep
     │   ├── bash.rs     # Shell command execution
-    │   └── wg.rs       # In-process workgraph operations
+    │   └── wg.rs       # In-process wg operations
     └── bundle.rs       # Bundle loading and tool filtering
 ```
 
@@ -208,7 +208,7 @@ content-type: application/json
 
 **API key resolution** (priority order):
 1. `ANTHROPIC_API_KEY` environment variable
-2. `.workgraph/config.toml` field: `[native_executor] api_key = "..."`
+2. `.wg/config.toml` field: `[native_executor] api_key = "..."`
 3. `~/.config/anthropic/api_key` file (single line)
 
 **Model resolution**: Same hierarchy as existing executors — `task.model > executor.model > coordinator.model > "claude-sonnet-4-20250514"`
@@ -425,9 +425,9 @@ pub struct BashTool {
 Executes via `tokio::process::Command::new("bash").arg("-c").arg(command)`.
 Captures stdout + stderr. Kills on timeout via SIGTERM, then SIGKILL after 5s.
 
-### Workgraph Tools (`tools/wg.rs`)
+### wg Tools (`tools/wg.rs`)
 
-These call workgraph library functions directly — **no subprocess, no CLI parsing overhead**.
+These call wg library functions directly — **no subprocess, no CLI parsing overhead**.
 
 | Tool | Maps to | Description |
 |------|---------|-------------|
@@ -478,7 +478,7 @@ These call workgraph library functions directly — **no subprocess, no CLI pars
 }
 ```
 
-**Implementation approach**: Each wg tool function takes a `&Path` to the workgraph directory and calls the corresponding library function. The workgraph dir is captured in the tool closure at registration time:
+**Implementation approach**: Each wg tool function takes a `&Path` to the wg directory and calls the corresponding library function. The wg dir is captured in the tool closure at registration time:
 
 ```rust
 pub fn register_wg_tools(registry: &mut ToolRegistry, workgraph_dir: PathBuf) {
@@ -494,10 +494,10 @@ Currently, many `wg` commands in `src/commands/` are structured as CLI entry poi
 
 ### Bundle Configuration Format
 
-Bundles define tool allowlists and context for the native executor. Stored as TOML in `.workgraph/bundles/`:
+Bundles define tool allowlists and context for the native executor. Stored as TOML in `.wg/bundles/`:
 
 ```toml
-# .workgraph/bundles/research.toml
+# .wg/bundles/research.toml
 [bundle]
 name = "research"
 description = "Read-only research and analysis"
@@ -518,14 +518,14 @@ You are a research agent. Your job is to investigate, analyze, and report findin
 You cannot modify files or create tasks — only read and observe.
 """
 
-# .workgraph/bundles/implementer.toml
+# .wg/bundles/implementer.toml
 [bundle]
 name = "implementer"
 description = "Full implementation agent with all tools"
 tools = ["*"]    # wildcard: all registered tools
 context_scope = "full"
 
-# .workgraph/bundles/bare.toml
+# .wg/bundles/bare.toml
 [bundle]
 name = "bare"
 description = "Minimal agent with wg tools only"
@@ -542,7 +542,7 @@ tools = [
 ]
 context_scope = "task"
 
-# .workgraph/bundles/shell.toml
+# .wg/bundles/shell.toml
 [bundle]
 name = "shell"
 description = "Agent with bash access and wg tools"
@@ -616,7 +616,7 @@ This extends the existing `exec_mode` system without breaking it. The `exec_mode
 
 ## Configuration
 
-### Executor Registration (`.workgraph/executors/native.toml`)
+### Executor Registration (`.wg/executors/native.toml`)
 
 ```toml
 [executor]
@@ -723,14 +723,14 @@ New required dependencies: `regex` (for grep tool), `async-trait` (for Tool trai
 - `src/executor/native/tools/bash.rs` — Shell execution with timeout
 - Unit tests for each tool
 
-### Phase 4c: Workgraph Tools
+### Phase 4c: wg Tools
 - `src/executor/native/tools/wg.rs` — In-process wg operations
 - Extract library functions where commands currently do everything inline
 - Integration test: native agent creates a task, logs progress, marks done
 
 ### Phase 4d: Bundle System + Integration
 - `src/executor/native/bundle.rs` — Bundle loading, tool filtering
-- Default bundle configs in `.workgraph/bundles/`
+- Default bundle configs in `.wg/bundles/`
 - Native executor registration in `ExecutorRegistry`
 - Spawn path in `spawn_agent_inner`
 - End-to-end test: coordinator dispatches a task to native executor, agent completes it

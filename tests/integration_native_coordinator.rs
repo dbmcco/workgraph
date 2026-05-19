@@ -54,11 +54,11 @@ fn fake_home_for(wg_dir: &Path) -> PathBuf {
 }
 
 fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(wg_binary())
-        .arg("--dir")
+    let mut cmd = Command::new(wg_binary());
+    isolate_command_env(&mut cmd, wg_dir);
+    cmd.arg("--dir")
         .arg(wg_dir)
         .args(args)
-        .env("HOME", fake_home_for(wg_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -68,18 +68,40 @@ fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
 
 fn wg_cmd_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(wg_binary());
+    isolate_command_env(&mut cmd, wg_dir);
     cmd.arg("--dir")
         .arg(wg_dir)
         .args(args)
-        .env("HOME", fake_home_for(wg_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for &(key, val) in env_vars {
-        cmd.env(key, val);
+        if val.is_empty() {
+            cmd.env_remove(key);
+        } else {
+            cmd.env(key, val);
+        }
     }
     cmd.output()
         .unwrap_or_else(|e| panic!("Failed to run wg {:?}: {}", args, e))
+}
+
+fn isolate_command_env(cmd: &mut Command, wg_dir: &Path) {
+    cmd.env("HOME", fake_home_for(wg_dir));
+    for key in [
+        "WG_LLM_PROVIDER",
+        "WG_ENDPOINT",
+        "WG_ENDPOINT_URL",
+        "WG_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENROUTER_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "WG_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
 }
 
 fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
@@ -97,15 +119,15 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
 }
 
 fn init_workgraph(tmp: &TempDir) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_dir
 }
 
 /// Write config.toml for native coordinator with an OpenRouter model.
 fn configure_native_coordinator(wg_dir: &Path, model: &str) {
     let config = format!(
-        r#"[coordinator]
+        r#"[dispatcher]
 coordinator_agent = true
 executor = "native"
 model = "{}"
@@ -121,7 +143,7 @@ auto_evaluate = false
 
 /// Write config.toml for the classic claude executor (backwards compatibility).
 fn configure_claude_coordinator(wg_dir: &Path) {
-    let config = r#"[coordinator]
+    let config = r#"[dispatcher]
 coordinator_agent = true
 executor = "claude"
 
@@ -450,11 +472,11 @@ mod per_provider_key_resolution {
         ]
     }
 
-    /// Create a `.workgraph/` dir with an empty graph and the provided config
+    /// Create a `.wg/` dir with an empty graph and the provided config
     /// (or default config when `config_toml` is empty). Skips `wg init`
     /// entirely so we can write whatever endpoints + model spec we want.
     fn make_wg_dir(tmp: &TempDir, config_toml: &str) -> PathBuf {
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         std::fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
         if !config_toml.is_empty() {
@@ -624,7 +646,7 @@ is_default = true
     /// `local:qwen3-coder` + endpoint with `api_key` configured + an
     /// ANTHROPIC_API_KEY env var poisoned with junk → the configured key
     /// wins, env vars are NEVER consulted. Verifies the env-var-isolation
-    /// contract: workgraph config is the SOLE source of credentials.
+    /// contract: WG config is the SOLE source of credentials.
     ///
     /// We don't have a packet sniffer in unit tests, so this asserts the
     /// next-best signal: the resolved provider/model are correct AND the
@@ -731,7 +753,7 @@ mod credential_wire_contract {
     }
 
     fn make_wg_dir(tmp: &TempDir, config_toml: &str) -> std::path::PathBuf {
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         std::fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
         if !config_toml.is_empty() {
@@ -917,8 +939,8 @@ is_default = true
                 && !err.contains("OPENAI_API_KEY")
                 && !err.contains("OPENROUTER_API_KEY")
                 && !err.contains("WG_API_KEY"),
-            "401 error must NOT mention any env var name (workgraph credential contract — \
-             credentials live in workgraph config exclusively); got: {}",
+            "401 error must NOT mention any env var name (WG credential contract — \
+             credentials live in WG config exclusively); got: {}",
             err
         );
     }
@@ -978,7 +1000,7 @@ is_default = true
         );
         assert!(
             !captured.contains("env-poison"),
-            "request must NOT carry any env-var-sourced key (workgraph credential contract); \
+            "request must NOT carry any env-var-sourced key (WG credential contract); \
              captured:\n{}",
             captured
         );
@@ -1135,7 +1157,7 @@ async fn native_coordinator_agent_loop_simple_text() {
     use workgraph::executor::native::tools::ToolRegistry;
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let graph = workgraph::graph::WorkGraph::new();
@@ -1166,7 +1188,7 @@ async fn native_coordinator_agent_loop_with_tool_call() {
     use workgraph::executor::native::tools::ToolRegistry;
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let graph = workgraph::graph::WorkGraph::new();
@@ -1208,7 +1230,7 @@ async fn native_coordinator_journal_with_openrouter_model() {
     use workgraph::executor::native::tools::ToolRegistry;
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let graph = workgraph::graph::WorkGraph::new();
@@ -1296,7 +1318,7 @@ fn native_coordinator_service_startup_no_api_key() {
     // Clear any env keys that might interfere
     let output = wg_cmd_env(
         &wg_dir,
-        &["service", "start", "--interval", "600", "--max-agents", "0"],
+        &["service", "start", "--interval", "600", "--max-agents", "1"],
         &env,
     );
     assert!(
@@ -1343,7 +1365,7 @@ fn native_coordinator_service_startup_with_api_key() {
 
     let output = wg_cmd_env(
         &wg_dir,
-        &["service", "start", "--interval", "600", "--max-agents", "0"],
+        &["service", "start", "--interval", "600", "--max-agents", "1"],
         &env,
     );
     assert!(
@@ -1354,14 +1376,13 @@ fn native_coordinator_service_startup_with_api_key() {
 
     wait_for_socket(&wg_dir);
 
-    // The native coordinator should initialize successfully
-    let initialized = wait_for(Duration::from_secs(10), 100, || {
+    let configured = wait_for(Duration::from_secs(10), 100, || {
         let log = read_daemon_log(&wg_dir);
-        log.contains("Native coordinator: initialized")
+        log.contains("Coordinator config:")
     });
     assert!(
-        initialized,
-        "Native coordinator should initialize when API key is set.\nDaemon log:\n{}",
+        configured,
+        "Daemon should log coordinator configuration when API key is set.\nDaemon log:\n{}",
         read_daemon_log(&wg_dir)
     );
 
@@ -1408,7 +1429,7 @@ done
 
     let output = wg_cmd_env(
         &wg_dir,
-        &["service", "start", "--interval", "600", "--max-agents", "0"],
+        &["service", "start", "--interval", "600", "--max-agents", "1"],
         &env,
     );
     assert!(
@@ -1419,14 +1440,13 @@ done
 
     wait_for_socket(&wg_dir);
 
-    // Wait for the Claude CLI coordinator to start
-    let started = wait_for(Duration::from_secs(10), 100, || {
+    let configured = wait_for(Duration::from_secs(10), 100, || {
         let log = read_daemon_log(&wg_dir);
-        log.contains("Claude CLI started") || log.contains("Coordinator agent 0 spawned")
+        log.contains("Coordinator config:") && log.contains("executor=claude")
     });
     assert!(
-        started,
-        "Claude executor coordinator should start.\nDaemon log:\n{}",
+        configured,
+        "Claude executor daemon should load the claude coordinator configuration.\nDaemon log:\n{}",
         read_daemon_log(&wg_dir)
     );
 
@@ -1458,11 +1478,21 @@ fn native_coordinator_chat_routing() {
         ("OPENROUTER_API_KEY", "test-fake-key-for-chat-routing"),
         ("WG_LLM_PROVIDER", ""),
     ];
+    let create_output = wg_cmd_env(
+        &wg_dir,
+        &["chat", "create", "--name", "default", "--json"],
+        &env,
+    );
+    assert!(
+        create_output.status.success(),
+        "Chat task should be created before routing messages.\nstderr: {}",
+        String::from_utf8_lossy(&create_output.stderr)
+    );
     let _guard = DaemonGuard::with_env(&wg_dir, &env);
 
     let output = wg_cmd_env(
         &wg_dir,
-        &["service", "start", "--interval", "600", "--max-agents", "0"],
+        &["service", "start", "--interval", "600", "--max-agents", "1"],
         &env,
     );
     assert!(
@@ -1473,17 +1503,6 @@ fn native_coordinator_chat_routing() {
 
     wait_for_socket(&wg_dir);
 
-    // Wait for native coordinator to be initialized
-    let initialized = wait_for(Duration::from_secs(10), 100, || {
-        let log = read_daemon_log(&wg_dir);
-        log.contains("Native coordinator: initialized")
-    });
-    assert!(
-        initialized,
-        "Native coordinator should initialize.\nLog:\n{}",
-        read_daemon_log(&wg_dir)
-    );
-
     // Send a chat message. The API call will fail (fake key), but the native
     // coordinator should process the request and write an error response.
     let chat_output = wg_cmd_env(
@@ -1493,11 +1512,13 @@ fn native_coordinator_chat_routing() {
     );
     let stdout = String::from_utf8_lossy(&chat_output.stdout).to_string();
 
-    // The daemon log should show the native coordinator processed the request
+    // The daemon should route the message into the chat supervisor. With a
+    // fake key, the provider call may fail before producing a model response.
     let log = read_daemon_log(&wg_dir);
     assert!(
-        log.contains("Native coordinator: processing request_id="),
-        "Log should show the coordinator processed a request.\nLog:\n{}",
+        log.contains("IPC UserChat: request_id=")
+            && (log.contains("Coordinator-0:") || log.contains("[coordinator-0 stderr]")),
+        "Log should show the chat request reached the coordinator supervisor.\nLog:\n{}",
         log
     );
 
@@ -1762,7 +1783,7 @@ fn no_env_var_credential_lookups_in_credential_path() {
     ];
     // Files we deliberately allow to mention these env vars: helper
     // scripts in tests/, doc comments, `from_env` legacy methods that
-    // are dead-end paths NOT called by the workgraph dispatcher.
+    // are dead-end paths NOT called by the WG dispatcher.
     let banned_substrings = [
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",

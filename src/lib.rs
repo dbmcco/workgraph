@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 // Pre-existing clippy lints surfaced by rust 1.95 that weren't in
 // 1.93. Allowed crate-wide while we decide whether to refactor each
 // site individually. Not caused by the sessions-as-identity rollout
@@ -18,6 +19,7 @@ extern crate self as workgraph;
 
 pub mod agency;
 pub mod chat;
+pub mod chat_command;
 pub mod chat_id;
 pub mod chat_sessions;
 pub mod check;
@@ -33,9 +35,11 @@ pub mod federation;
 pub mod function;
 pub mod function_memory;
 pub mod graph;
+pub mod html;
 pub mod json_extract;
 pub mod launcher_history;
 pub mod lifecycle;
+pub mod lock;
 pub mod markdown;
 #[cfg(feature = "matrix")]
 pub mod matrix;
@@ -59,6 +63,7 @@ pub mod registry {
     pub use crate::service::registry::AgentStatus;
 }
 pub mod runs;
+pub mod secret;
 pub mod service;
 pub mod session_lock;
 pub mod smoke;

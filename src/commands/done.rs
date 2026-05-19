@@ -105,6 +105,12 @@ enum PushOutcome {
 enum WorktreeMergeResult {
     NotInWorktree,
     NoCommits,
+    /// Worktree branch has 0 commits ahead of main, but the working tree has
+    /// staged or modified tracked files — the agent prepared work but never
+    /// committed it. Treating this as NoCommits silently drops the work.
+    UncommittedChanges {
+        files: Vec<String>,
+    },
     Merged {
         commit_sha: String,
         push_outcome: PushOutcome,
@@ -252,11 +258,37 @@ fn is_no_changes_to_commit(stdout: &str, stderr: &str) -> bool {
         .any(|n| stdout.contains(n) || stderr.contains(n))
 }
 
-fn detect_worktree() -> Option<WorktreeInfo> {
+/// Detect whether we're running inside a WG-managed agent worktree
+/// for the project rooted at `wg_dir`'s parent.
+///
+/// Reads `WG_WORKTREE_PATH` / `WG_BRANCH` / `WG_PROJECT_ROOT` from the
+/// environment. Returns `None` (silently — env vars unset is the common
+/// case for a human running `wg done`) when any are missing OR when
+/// `WG_PROJECT_ROOT` does not match `wg_dir`'s parent. The mismatch case
+/// catches stale/leaked env vars: e.g. a user running `wg done --dir
+/// /other/project` from inside an agent shell, or a test harness running
+/// `wg done` against a temp `--dir` while the parent shell still has the
+/// agent's `WG_WORKTREE_PATH` exported. Acting on a worktree that doesn't
+/// belong to the project we're managing would mutate the wrong git tree.
+fn detect_worktree(wg_dir: &Path) -> Option<WorktreeInfo> {
     let wt_path = std::env::var("WG_WORKTREE_PATH").ok()?;
     let branch = std::env::var("WG_BRANCH").ok()?;
     let project_root = std::env::var("WG_PROJECT_ROOT").ok()?;
     let agent_id = std::env::var("WG_AGENT_ID").ok();
+
+    // Sanity-check: WG_PROJECT_ROOT must match the parent of the
+    // WG dir we're operating on. Use canonicalized paths so
+    // symlinks and `.`/`..` segments don't cause false negatives.
+    let expected_root = wg_dir.parent()?;
+    let env_root = Path::new(&project_root);
+    let same = match (env_root.canonicalize(), expected_root.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => env_root == expected_root,
+    };
+    if !same {
+        return None;
+    }
+
     Some(WorktreeInfo {
         worktree_path: wt_path,
         branch,
@@ -290,6 +322,34 @@ fn attempt_worktree_merge(wt: &WorktreeInfo, task_id: &str) -> Result<WorktreeMe
         .count();
 
     if commit_count == 0 {
+        // Before declaring NoCommits, make sure the agent didn't stage work and
+        // forget to commit. `git status --porcelain` runs in the worktree
+        // directory because the staging area is per-working-tree. Any entry
+        // that isn't `??` (untracked) represents work that would silently
+        // disappear when we mark the task done and clean up the worktree.
+        let porcelain = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt.worktree_path)
+            .output()
+            .context("Failed to check worktree status for uncommitted changes")?;
+
+        if porcelain.status.success() {
+            let dirty: Vec<String> = String::from_utf8_lossy(&porcelain.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .filter(|l| !l.starts_with("??"))
+                .map(|l| {
+                    // Porcelain format is "XY path" (X staged, Y unstaged).
+                    // Skip the 2-char status field and the separating space.
+                    l.get(3..).unwrap_or(l).to_string()
+                })
+                .collect();
+
+            if !dirty.is_empty() {
+                return Ok(WorktreeMergeResult::UncommittedChanges { files: dirty });
+            }
+        }
+
         return Ok(WorktreeMergeResult::NoCommits);
     }
 
@@ -837,11 +897,19 @@ fn run_llm_verify_evaluation(
         verify_cmd
     );
 
-    // Find the workgraph directory (where .workgraph folder is located)
+    // Find the WG directory (.wg/, or legacy .workgraph/)
     let workgraph_dir = project_root
         .ancestors()
-        .find(|p| p.join(".workgraph").exists())
-        .unwrap_or(project_root);
+        .find(|p| p.join(".wg").exists() || p.join(".wg").exists())
+        .map(|p| {
+            if p.join(".wg").exists() {
+                p.join(".wg")
+            } else {
+                p.join(".wg")
+            }
+        })
+        .unwrap_or_else(|| project_root.to_path_buf());
+    let workgraph_dir = workgraph_dir.as_path();
 
     // Run evaluation on the task
     match evaluate::run(workgraph_dir, &task.id, None, false, false) {
@@ -1062,19 +1130,21 @@ fn run_verify_command(
 }
 
 /// Returns `true` if the path emitted by `git status --porcelain` refers to a
-/// workgraph-internal directory that should never trigger a hygiene warning.
+/// WG-internal directory that should never trigger a hygiene warning.
 ///
-/// Matches `.wg/`, `.wg-worktrees/`, `.workgraph/`, and numbered worktree dirs
-/// like `.workgraph.1/`. These are workgraph's own data — agents should never
-/// commit them, but they are *expected* to sit untracked in the working tree
-/// (see project memory: "stale `.workgraph.N/` dirs + agency YAMLs sit
-/// untracked"), so flagging them in `wg done` only produces noise.
+/// Matches `.wg/`, `.wg-worktrees/`, legacy `.workgraph/`, and numbered
+/// worktree dirs like `.workgraph.1/` and `.wg.1/`. These are WG's
+/// own data — agents should never commit them, but they are *expected* to
+/// sit untracked in the working tree (see project memory: "stale
+/// `.workgraph.N/` dirs + agency YAMLs sit untracked"), so flagging them
+/// in `wg done` only produces noise.
 fn is_hygiene_ignored_path(path: &str) -> bool {
     let p = path.trim_start_matches("./");
     let head = p.split('/').next().unwrap_or(p);
     head == ".wg"
         || head == ".wg-worktrees"
         || head == ".workgraph"
+        || head.starts_with(".wg.")
         || head.starts_with(".workgraph.")
 }
 
@@ -1097,7 +1167,7 @@ fn porcelain_path(line: &str) -> Option<&str> {
 }
 
 /// Filter `git status --porcelain` output, dropping lines whose path is a
-/// workgraph-internal directory we don't want to warn about.
+/// WG-internal directory we don't want to warn about.
 fn filter_hygiene_porcelain(status: &str) -> Vec<&str> {
     status
         .lines()
@@ -1113,8 +1183,8 @@ fn filter_hygiene_porcelain(status: &str) -> Vec<&str> {
 ///
 /// Skipped entirely for chat-loop tasks — a chat agent is a conversation
 /// endpoint, not a code agent, and should never be lectured about
-/// uncommitted state (see chat-agent-loops bug B). Workgraph-internal
-/// paths (`.wg/`, `.workgraph.*/`, etc.) are filtered from the warning
+/// uncommitted state (see chat-agent-loops bug B). WG-internal
+/// paths (`.wg/`, `.wg.*/`, etc.) are filtered from the warning
 /// even when the check does run.
 fn check_agent_git_hygiene(dir: &Path, task_id: &str, tags: &[String]) {
     if tags.iter().any(|t| workgraph::chat_id::is_chat_loop_tag(t)) {
@@ -1341,6 +1411,15 @@ fn run_inner(
                 // `.evaluate-X` ARE the eval pipeline — they must run on a
                 // soft-done source. See pick_done_target_status.
                 if dependent_is_system && b.status == Status::PendingEval {
+                    return false;
+                }
+                // Terminal blockers (Failed / Abandoned) don't gate manual
+                // `wg done` on a downstream task. The operator is explicitly
+                // marking work complete; auto-spawn against broken artifacts
+                // is the concern `is_dep_satisfied` guards, not this path.
+                // (Done is already excluded by `query::after` via
+                // `is_dep_satisfied`.)
+                if matches!(b.status, Status::Failed | Status::Abandoned) {
                     return false;
                 }
                 true
@@ -2109,11 +2188,41 @@ fn run_inner(
     // If running inside an agent worktree, attempt to squash-merge the branch
     // back to main before marking the task done. On conflict, either refuse
     // (agent can fix it) or defer (--ignore-unmerged-worktree creates .merge-* task).
-    if let Some(wt) = detect_worktree() {
+    if let Some(wt) = detect_worktree(dir) {
         match attempt_worktree_merge(&wt, id)? {
-            WorktreeMergeResult::NotInWorktree | WorktreeMergeResult::NoCommits => {
+            WorktreeMergeResult::NotInWorktree => {
                 // Nothing to merge — proceed to mark done
                 mark_worktree_for_cleanup(&wt);
+            }
+            WorktreeMergeResult::NoCommits => {
+                // Surface the no-op so the agent (and human reading logs) sees
+                // what happened. Prior to this line, NoCommits was a silent
+                // pass-through and `wg show` lied about "Merged to main: true".
+                eprintln!(
+                    "[merge] No commits on branch {} — nothing to merge",
+                    wt.branch
+                );
+                mark_worktree_for_cleanup(&wt);
+            }
+            WorktreeMergeResult::UncommittedChanges { files } => {
+                // Loud refusal — prior behavior silently dropped this work and
+                // marked the task done. See docs/codex-handler-merge-bug.md.
+                let files_display = files
+                    .iter()
+                    .map(|f| format!("  - {}", f))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                anyhow::bail!(
+                    "Worktree has uncommitted changes — refusing to mark '{}' as done.\n\n\
+                     Uncommitted/staged tracked files in {}:\n{}\n\n\
+                     These changes would be silently dropped when the worktree is cleaned up.\n\
+                     Fix: run `git commit -m '...' && git push` in the worktree, then re-run `wg done {}`.\n\
+                     If you want to discard them, run `git reset --hard HEAD` in the worktree first.",
+                    id,
+                    wt.worktree_path,
+                    files_display,
+                    id,
+                );
             }
             WorktreeMergeResult::Merged {
                 commit_sha,
@@ -2621,7 +2730,7 @@ mod tests {
     fn test_done_uninitialized_workgraph_fails() {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
-        // Don't initialize workgraph
+        // Don't initialize WG
 
         let result = run(dir_path, "t1", false, false, false, false, false);
         assert!(result.is_err());
@@ -3531,7 +3640,7 @@ mod tests {
         task.verify = Some("exit 1".to_string());
         setup_workgraph(dir_path, vec![task]);
 
-        // Write config with lower threshold (dir_path is the .workgraph dir in tests)
+        // Write config with lower threshold (dir_path is the .wg dir in tests)
         let config_path = dir_path.join("config.toml");
         std::fs::write(&config_path, "[coordinator]\nmax_verify_failures = 2\n").unwrap();
 
@@ -4286,9 +4395,9 @@ mod tests {
 
         git(&["checkout", "main"]);
 
-        // Untracked file mimics stray .workgraph.* / .wg/ dirs that trigger the
+        // Untracked file mimics stray .wg.* / .wg/ dirs that trigger the
         // "nothing added to commit but untracked files present" wording.
-        std::fs::write(project_root.join(".workgraph.junk"), "junk\n").unwrap();
+        std::fs::write(project_root.join(".wg.junk"), "junk\n").unwrap();
 
         let wt = WorktreeInfo {
             worktree_path: project_root.to_string_lossy().to_string(),
@@ -4315,7 +4424,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // chat-agent-loops bug B: git hygiene must skip chat-loop tasks and
-    // filter workgraph-internal paths from the warning.
+    // filter WG-internal paths from the warning.
     // ------------------------------------------------------------------
 
     #[test]
@@ -4325,9 +4434,12 @@ mod tests {
         assert!(is_hygiene_ignored_path(".wg/lockfile"));
         assert!(is_hygiene_ignored_path(".wg-worktrees/"));
         assert!(is_hygiene_ignored_path(".wg-worktrees/agent-228/foo"));
+        // Legacy `.workgraph/` and numbered worktree dirs.
         assert!(is_hygiene_ignored_path(".workgraph/"));
         assert!(is_hygiene_ignored_path(".workgraph.1/"));
         assert!(is_hygiene_ignored_path(".workgraph.42/graph.jsonl"));
+        assert!(is_hygiene_ignored_path(".wg.1/"));
+        assert!(is_hygiene_ignored_path(".wg.42/graph.jsonl"));
         // Real source paths must NOT be treated as ignored.
         assert!(!is_hygiene_ignored_path("src/foo.rs"));
         assert!(!is_hygiene_ignored_path("README.md"));
@@ -4370,12 +4482,12 @@ mod tests {
 
     #[test]
     fn test_filter_hygiene_porcelain_returns_empty_when_only_ignored() {
-        // The user's repro: only the workgraph-internal noise is present.
-        let raw = "?? .wg/\n?? .workgraph.1/\n";
+        // The user's repro: only the WG-internal noise is present.
+        let raw = "?? .wg/\n?? .wg.1/\n";
         let kept = filter_hygiene_porcelain(raw);
         assert!(
             kept.is_empty(),
-            "filter should drop all workgraph-internal paths, got {:?}",
+            "filter should drop all WG-internal paths, got {:?}",
             kept,
         );
     }

@@ -6,11 +6,11 @@
 
 ## Context
 
-Workgraph originally had two overlapping identity systems:
+wg originally had two overlapping identity systems:
 
-1. **Actor** (graph.rs) — a node in the work graph representing a human or AI that can perform work. Had capabilities, rate, capacity, trust levels, heartbeats, and a Matrix binding. Stored in `graph.jsonl` as `kind: "actor"`.
+1. **Actor** (graph.rs) — a node in the wg representing a human or AI that can perform work. Had capabilities, rate, capacity, trust levels, heartbeats, and a Matrix binding. Stored in `graph.jsonl` as `kind: "actor"`.
 
-2. **Agent** (agency.rs) — a content-addressed pairing of a Role (what it does) and a Motivation (why/how it acts). Had performance tracking, lineage, and prompt rendering. Stored as YAML in `.workgraph/agency/agents/`.
+2. **Agent** (agency.rs) — a content-addressed pairing of a Role (what it does) and a Motivation (why/how it acts). Had performance tracking, lineage, and prompt rendering. Stored as YAML in `.wg/agency/agents/`.
 
 The two systems overlapped in confusing ways:
 - Both claimed to represent "an agent"
@@ -105,7 +105,7 @@ The following sections document the state of both systems before the merge, pres
 
 ### System 1: Actor (removed)
 
-An Actor was a node in the work graph stored in `graph.jsonl` alongside tasks and resources, representing a human or AI that can perform work. It tracked operational identity (capabilities, rate, capacity), availability (heartbeat, response times), trust levels, and human integration (Matrix binding).
+An Actor was a node in the wg stored in `graph.jsonl` alongside tasks and resources, representing a human or AI that can perform work. It tracked operational identity (capabilities, rate, capacity), availability (heartbeat, response times), trust levels, and human integration (Matrix binding).
 
 ### System 2: Agent (agency.rs)
 

@@ -82,7 +82,7 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
 }
 
 fn setup_workgraph(tmp: &TempDir, tasks: Vec<Task>) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let mut graph = WorkGraph::new();
@@ -1609,7 +1609,7 @@ fn test_completion_iteration_less_than_guard() {
 fn test_backward_compat_old_loops_to_loads() {
     // Old JSONL with loops_to field should still load correctly (silently ignored)
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
     // Write a JSONL file with the old loops_to field
@@ -1628,7 +1628,7 @@ fn test_backward_compat_old_loops_to_loads() {
 fn test_backward_compat_old_loops_to_cli_works() {
     // Old JSONL with loops_to should work with CLI commands
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
     let old_jsonl = r#"{"kind":"task","id":"t1","title":"Old task with loop","status":"open","after":[],"before":[],"requires":[],"tags":[],"skills":[],"inputs":[],"deliverables":[],"artifacts":[],"log":[],"retry_count":0,"loop_iteration":0,"paused":false,"visibility":"internal","loops_to":[{"target":"t1","max_iterations":5}]}"#;
@@ -6479,9 +6479,9 @@ fn test_shell_checker_cycle_failure_restarts() {
 #[test]
 fn test_cli_add_with_exec_flag() {
     let dir = TempDir::new().unwrap();
-    let wg_dir = dir.path().join(".workgraph");
+    let wg_dir = dir.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     let output = wg_ok(
         &wg_dir,
         &[
@@ -6518,9 +6518,9 @@ fn test_cli_add_with_exec_flag() {
 #[test]
 fn test_cli_add_with_exec_and_timeout() {
     let dir = TempDir::new().unwrap();
-    let wg_dir = dir.path().join(".workgraph");
+    let wg_dir = dir.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_ok(
         &wg_dir,
         &[
@@ -6550,7 +6550,7 @@ fn test_cli_add_with_exec_and_timeout() {
 // cycle) re-Opens the chat task in microseconds. The chat supervisor then
 // spawns another `wg spawn-task .chat-N`, which finds the task Open, claims
 // it, the new agent calls `wg done`, repeat. .chat-2 hit dispatch count 458
-// in the user's autohaiku/workgraph project before manual archive.
+// in the user's autohaiku/WG project before manual archive.
 //
 // The fix lives in graph.rs::reactivate_cycle (covers wg-done sync path)
 // AND graph.rs::evaluate_all_cycle_iterations (covers dispatcher safety net).

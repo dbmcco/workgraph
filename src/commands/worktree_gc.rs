@@ -88,7 +88,7 @@ pub fn plan(
 ) -> Result<Vec<Decision>> {
     let project_root = workgraph_dir
         .parent()
-        .context("Cannot determine project root from workgraph dir")?
+        .context("Cannot determine project root from WG dir")?
         .to_path_buf();
     let worktrees_dir = project_root.join(".wg-worktrees");
     if !worktrees_dir.exists() {
@@ -226,7 +226,7 @@ pub fn plan(
 pub fn run(workgraph_dir: &Path, apply: bool, force: bool) -> Result<()> {
     let project_root = workgraph_dir
         .parent()
-        .context("Cannot determine project root from workgraph dir")?
+        .context("Cannot determine project root from WG dir")?
         .to_path_buf();
     let worktrees_dir = project_root.join(".wg-worktrees");
     if !worktrees_dir.exists() {
@@ -398,11 +398,11 @@ mod tests {
     use workgraph::parser::save_graph;
     use workgraph::service::{AgentEntry, AgentRegistry, AgentStatus};
 
-    /// Build a fixture: project root with `.workgraph/` + `.wg-worktrees/`.
+    /// Build a fixture: project root with `.wg/` + `.wg-worktrees/`.
     /// Returns (workgraph_dir, project_root, worktrees_dir).
     fn fixture(tmp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
         let project_root = tmp.path().to_path_buf();
-        let wg_dir = project_root.join(".workgraph");
+        let wg_dir = project_root.join(".wg");
         let worktrees_dir = project_root.join(".wg-worktrees");
         std::fs::create_dir_all(&wg_dir).unwrap();
         std::fs::create_dir_all(&worktrees_dir).unwrap();
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn worktree_gc_no_worktrees_dir() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         write_registry(&wg_dir, vec![]);
         write_graph(&wg_dir, vec![]);

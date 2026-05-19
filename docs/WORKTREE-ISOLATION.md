@@ -60,7 +60,7 @@ Git worktrees allow multiple working trees to share the same `.git` repository. 
 
 1. **No two worktrees can have the same branch checked out.** Each worktree must be on a unique branch (or detached HEAD). This is enforced by git.
 2. **Creating a worktree is fast** — it's essentially `cp -r` of the working tree + index setup. No object copying.
-3. **Disk usage** — each worktree is a full copy of the working tree. For a Rust project like workgraph (~25MB source), this is negligible. For large repos, it can matter.
+3. **Disk usage** — each worktree is a full copy of the working tree. For a Rust project like wg (~25MB source), this is negligible. For large repos, it can matter.
 4. **Build artifacts are NOT shared.** Each worktree gets its own `target/` directory (assuming it's gitignored). This means each agent pays the full build cost. For Rust, this is significant (~2-5 min for initial build).
 
 ### 2.4 Concurrency Safety
@@ -82,8 +82,8 @@ Coordinator spawns Agent X for task-id "implement-foo"
   ├─ 1. Create worktree:
   │     git worktree add .wg-worktrees/agent-{id} -b wg/{agent-id}/{task-id}
   │
-  ├─ 2. Symlink .workgraph:
-  │     ln -s /absolute/path/to/.workgraph .wg-worktrees/agent-{id}/.workgraph
+  ├─ 2. Symlink .wg:
+  │     ln -s /absolute/path/to/.wg .wg-worktrees/agent-{id}/.wg
   │
   ├─ 3. Set working_dir to worktree path
   │     Agent runs inside .wg-worktrees/agent-{id}/
@@ -110,7 +110,7 @@ Examples:
 - `wg/agent-43/fix-build-warnings`
 
 Rationale:
-- `wg/` prefix makes workgraph branches instantly identifiable
+- `wg/` prefix makes wg branches instantly identifiable
 - Agent ID ensures uniqueness even if the same task is retried
 - Task ID provides human-readable context
 
@@ -148,8 +148,8 @@ Benefits:
 │                                                         │
 │  1. git worktree add .wg-worktrees/{agent-id}          │
 │     -b wg/{agent-id}/{task-id} HEAD                    │
-│  2. ln -s {abs}/.workgraph                             │
-│     .wg-worktrees/{agent-id}/.workgraph                │
+│  2. ln -s {abs}/.wg                                    │
+│     .wg-worktrees/{agent-id}/.wg                │
 │  3. Set working_dir = .wg-worktrees/{agent-id}         │
 │  4. Launch agent process in that directory              │
 └───────────────────────┬─────────────────────────────────┘
@@ -162,7 +162,7 @@ Benefits:
 │  - Edits files (no interference with other agents)      │
 │  - Runs cargo build (own target/ directory)             │
 │  - Can commit to its branch                             │
-│  - wg commands use symlinked .workgraph (shared state)  │
+│  - wg commands use symlinked .wg (shared state)  │
 └───────────────────────┬─────────────────────────────────┘
                         │
                         ▼
@@ -255,9 +255,9 @@ Key observation: Claude Code's worktree model is **manual and user-initiated**, 
 This repo already has a Claude Code worktree at `.claude/worktrees/agent-a4f43401`:
 - Full working tree copy
 - `.git` file pointing to `.git/worktrees/agent-a4f43401`
-- **No `.workgraph` directory** — this is the shared state problem in action
+- **No `.wg` directory** — this is the shared state problem in action
 
-## 5. Integration Points in Workgraph
+## 5. Integration Points in wg
 
 ### 5.1 Where Worktree Creation Happens
 
@@ -369,11 +369,11 @@ The wrapper script and agent need these additional env vars:
 | `WG_BRANCH` | `wg/agent-42/implement-foo` | Agent's branch name |
 | `WG_PROJECT_ROOT` | `/home/erik/workgraph` | Main repo root (for merge-back) |
 
-## 6. The `.workgraph` Shared State Problem
+## 6. The `.wg` Shared State Problem
 
 ### 6.1 The Problem
 
-`.workgraph/` contains:
+`.wg/` contains:
 - `graph.jsonl` — task state (shared between all agents)
 - `agents/` — agent registry and output
 - `agency/` — roles, motivations, agent configs
@@ -381,16 +381,16 @@ The wrapper script and agent need these additional env vars:
 - `config.toml` — project configuration
 - `output/` — captured task outputs
 
-All agents must read/write the same task state. If each worktree has its own `.workgraph/`, changes are invisible to other agents and the coordinator.
+All agents must read/write the same task state. If each worktree has its own `.wg/`, changes are invisible to other agents and the coordinator.
 
-### 6.2 Solution: Symlink `.workgraph`
+### 6.2 Solution: Symlink `.wg`
 
-**Recommended approach:** Symlink `.workgraph` in each worktree to the main repo's `.workgraph`:
+**Recommended approach:** Symlink `.wg` in each worktree to the main repo's `.wg/`:
 
 ```bash
 # During worktree creation:
-ln -s /home/erik/workgraph/.workgraph \
-      /home/erik/workgraph/.wg-worktrees/agent-42/.workgraph
+ln -s /home/erik/workgraph/.wg \
+      /home/erik/workgraph/.wg-worktrees/agent-42/.wg
 ```
 
 This means:
@@ -399,17 +399,17 @@ This means:
 - Config and executor settings are shared
 - Output capture goes to the shared location
 
-Since `.workgraph/` is already in `.gitignore`, it won't appear in any worktree's git status.
+Since `.wg/` is already in `.gitignore`, it won't appear in any worktree's git status.
 
 ### 6.3 Alternative: `WG_DIR` Environment Variable
 
 Instead of symlinks, set `WG_DIR` pointing to the absolute path:
 
 ```bash
-export WG_DIR=/home/erik/workgraph/.workgraph
+export WG_DIR=/home/erik/workgraph/.wg
 ```
 
-This requires the `wg` CLI to check `WG_DIR` before searching for `.workgraph` in the current directory. Minor code change in `src/main.rs` where `workgraph_dir` is resolved.
+This requires the `wg` CLI to check `WG_DIR` before searching for `.wg` in the current directory. Minor code change in `src/main.rs` where `workgraph_dir` is resolved.
 
 **Assessment:** The symlink approach is simpler and requires no code changes to `wg` itself. The `WG_DIR` approach is more explicit but requires a code change. **Recommend symlink for v1, add `WG_DIR` support as a follow-up.**
 
@@ -478,7 +478,7 @@ The most significant cost is build time. Each worktree gets its own `target/` di
 **Recommendation:** Make worktree isolation opt-in via config, defaulting to **off**. The coordinator enables it when `max_agents > 1` and the tasks being spawned are code-modifying tasks.
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 [coordinator]
 worktree_isolation = true    # false = shared working dir (current behavior)
 merge_strategy = "squash"    # "merge", "squash", "rebase"
@@ -496,7 +496,7 @@ isolation: false  # Don't create a worktree for this task
 ### 8.1 Configuration
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 [coordinator]
 worktree_isolation = false   # opt-in, default off
 merge_strategy = "squash"    # how to integrate agent branches
@@ -513,7 +513,7 @@ cleanup_on_fail = true       # remove worktree on task failure
    - `create_agent_worktree(dir, agent_id, task_id) -> Result<PathBuf>`
    - `cleanup_agent_worktree(dir, agent_id) -> Result<()>`
    - `merge_agent_worktree(dir, agent_id, task_id, strategy) -> Result<MergeResult>`
-   - Handles: git worktree add, .workgraph symlink, optional target/ copy
+   - Handles: git worktree add, .wg symlink, optional target/ copy
 
 2. **Modify `src/commands/spawn/execution.rs`**
    - In `spawn_agent_inner()`: call `create_agent_worktree()` when isolation enabled
@@ -569,7 +569,7 @@ cleanup_on_fail = true       # remove worktree on task failure
 | Git operations fail (corrupt repo) | High | Low | Git worktree is mature and well-tested; we only use basic operations |
 | Agent creates files outside worktree | Medium | Low | `wg artifact` paths are relative; agent runs in worktree dir |
 | Concurrent graph.jsonl writes | Medium | Medium | Existing problem; orthogonal fix (file locking) |
-| `.workgraph` symlink issues on some filesystems | Low | Low | Fall back to `WG_DIR` env var if symlink fails |
+| `.wg` symlink issues on some filesystems | Low | Low | Fall back to `WG_DIR` env var if symlink fails |
 
 ### 9.2 Rollback Plan
 
@@ -617,13 +617,13 @@ wg add "Update .gitignore and docs" --after all -d "Add .wg-worktrees/ to .gitig
 
 ## Appendix B: Comparison with Claude Code's Approach
 
-| Aspect | Claude Code | Workgraph (Proposed) |
+| Aspect | Claude Code | wg (Proposed) |
 |--------|-------------|---------------------|
 | Trigger | User-initiated (`EnterWorktree` tool) | Automatic (coordinator config) |
 | Location | `.claude/worktrees/<name>` | `.wg-worktrees/<agent-id>` |
 | Branch | `worktree-<name>` | `wg/<agent-id>/<task-id>` |
 | Merge-back | Manual (user decides) | Automatic (squash merge on completion) |
-| Shared state | None (independent session) | `.workgraph` symlinked |
+| Shared state | None (independent session) | `.wg` symlinked |
 | Cleanup | User prompted on exit | Automatic on task done/fail |
 | Conflict handling | None (no auto-merge) | Auto-retry on conflict |
 

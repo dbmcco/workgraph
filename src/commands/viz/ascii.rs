@@ -229,8 +229,15 @@ pub(crate) fn generate_ascii(
     // Task lookup
     let task_map: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), *t)).collect();
 
-    // Color helpers
-    let use_color = std::io::stdout().is_terminal();
+    // Color helpers — honour the standard CLICOLOR_FORCE / NO_COLOR
+    // overrides so callers can pipe to a file or test the ANSI output.
+    let use_color = if std::env::var_os("NO_COLOR").is_some() {
+        false
+    } else if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
+        true
+    } else {
+        std::io::stdout().is_terminal()
+    };
 
     let status_color = |status: &Status| -> &str {
         if !use_color {
@@ -245,9 +252,16 @@ pub(crate) fn generate_ascii(
             Status::Abandoned => "\x1b[90m",                           // gray
             Status::Waiting | Status::PendingValidation => "\x1b[33m", // yellow
             Status::PendingEval => "\x1b[38;5;154m",                   // chartreuse
+            Status::FailedPendingEval => "\x1b[38;5;208m",             // orange (warm coral)
             Status::Incomplete => "\x1b[38;5;208m",                    // orange
         }
     };
+    // Paused tasks render in a soft blue-gray distinguishable from open (white),
+    // abandoned (gray), and blocked (gray) — paired with a leading ‖ glyph for
+    // redundant signaling that survives NO_COLOR / dim terminals / colorblind viewers.
+    // U+2016 (DOUBLE VERTICAL LINE) is used instead of U+23F8 (PAUSE SYMBOL) to avoid
+    // emoji-presentation rendering on terminals with color-emoji fonts.
+    let paused_color = if use_color { "\x1b[38;5;110m" } else { "" }; // 256-color 110 = #87afd7 soft blue-gray
     let reset = if use_color { "\x1b[0m" } else { "" };
 
     let status_label = |status: &Status| -> &str {
@@ -260,6 +274,7 @@ pub(crate) fn generate_ascii(
             Status::Abandoned => "abandoned",
             Status::Waiting | Status::PendingValidation => "waiting",
             Status::PendingEval => "pending-eval",
+            Status::FailedPendingEval => "failed-pending-eval",
             Status::Incomplete => "incomplete",
         }
     };
@@ -292,8 +307,13 @@ pub(crate) fn generate_ascii(
             return format!("{}{}  ({}){}", dim, id, status, reset);
         }
 
-        // Chat agent tasks: cyan for current (.chat-N), dark gray for legacy (.coordinator-N)
-        let color = if is_chat_agent && use_color {
+        let is_paused = task.is_some_and(|t| t.paused);
+        // Chat agent tasks: cyan for current (.chat-N), dark gray for legacy (.coordinator-N).
+        // Paused tasks override the status color with a muted blue-gray so they read
+        // as "open but on hold" rather than as the underlying status's normal hue.
+        let color = if is_paused && use_color {
+            paused_color
+        } else if is_chat_agent && use_color {
             if is_legacy_coord {
                 "\x1b[90m" // dark gray — muted for legacy
             } else {
@@ -302,6 +322,8 @@ pub(crate) fn generate_ascii(
         } else {
             task.map(|t| status_color(&t.status)).unwrap_or("")
         };
+        // Pause glyph prefix for redundant (color + glyph) signaling.
+        let pause_glyph = if is_paused { "‖ " } else { "" };
         let loop_info = if is_chat_agent {
             task.map(|t| format!(" [turn {}]", t.loop_iteration))
                 .unwrap_or_default()
@@ -439,12 +461,25 @@ pub(crate) fn generate_ascii(
                 }
             })
             .unwrap_or_default();
+        // Parens decorator (status + tokens + priority) renders as white so
+        // it stands out from the timestamp suffix and reads as foreground info,
+        // while the trailing time suffix stays gray (already coloured below by
+        // `relative_ts`). Status-coloured task ids remain the most prominent
+        // element on the line.
+        let (paren_color, paren_reset) = if use_color {
+            ("\x1b[37m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
         format!(
-            "{}{}{}  ({}){}{}{}{}{}",
+            "{}{}{}{}  {}({}){}{}{}{}{}{}",
             color,
+            pause_glyph,
             id,
             reset,
+            paren_color,
             status_with_tokens,
+            paren_reset,
             delay_hint,
             relative_ts,
             msg_indicator,
@@ -1766,6 +1801,96 @@ mod tests {
 
         assert!(result.text.contains("(in-progress)"));
         assert!(result.text.contains("(blocked)"));
+    }
+
+    /// Serialise tests that mutate process-global colour env vars.
+    static COLOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_generate_ascii_paren_decorator_renders_white() {
+        // With colour forced on, the parenthetical decorator must be wrapped
+        // in `\x1b[37m`/`\x1b[0m` (white) so it reads as foreground info,
+        // distinct from the status-coloured task id.
+        let _guard = COLOR_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialised by COLOR_ENV_LOCK; no other thread reads env here.
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+            std::env::set_var("CLICOLOR_FORCE", "1");
+        }
+
+        let mut graph = WorkGraph::new();
+        let mut t = make_task("solo-task", "Solo");
+        t.status = Status::Done;
+        graph.add_node(Node::Task(t));
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // SAFETY: serialised by COLOR_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CLICOLOR_FORCE");
+        }
+
+        // The line should contain the white-wrapped parens block. The exact
+        // surrounding format is `…id\x1b[0m  \x1b[37m(done)\x1b[0m…`.
+        assert!(
+            result.text.contains("\x1b[37m(done)\x1b[0m"),
+            "parens should be wrapped in white ANSI codes; got: {:?}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn test_generate_ascii_no_color_strips_ansi() {
+        // With NO_COLOR set, no ANSI escapes should appear in the output.
+        let _guard = COLOR_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialised by COLOR_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CLICOLOR_FORCE");
+            std::env::set_var("NO_COLOR", "1");
+        }
+
+        let mut graph = WorkGraph::new();
+        let t = make_task("solo-task", "Solo");
+        graph.add_node(Node::Task(t));
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::default(),
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // SAFETY: serialised by COLOR_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("NO_COLOR");
+        }
+
+        assert!(
+            !result.text.contains('\x1b'),
+            "NO_COLOR should suppress ANSI escapes; got: {:?}",
+            result.text
+        );
     }
 
     #[test]

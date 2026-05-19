@@ -17,6 +17,127 @@
 # introduced the regression and the task that fixed it.
 
 [[scenario]]
+name = "agency_csv_roundtrip"
+script = "scenarios/agency_csv_roundtrip.sh"
+owners = [
+    "impl-agency-csv-roundtrip",
+    "fix-agency-csv",
+]
+description = "Pins Agency's 12-column starter CSV import/export contract: `wg agency import --format agency-csv` followed by `wg agency export --format agency-csv` must byte-equal the fixture, including CRLF terminators, multi-domain space-after-comma (`software, management`), parent_ids JSON arrays, and the empty-parent_ids-when-only-parent_content_hash-set roundtrip."
+timeout_seconds = 30
+
+[[scenario]]
+name = "agency_import_dedup_collision"
+script = "scenarios/agency_import_dedup_collision.sh"
+owners = [
+    "investigate-agency-import",
+]
+description = "Pins the dedup decision in docs/manual/03-agency.md: one row per content_hash = sha256(description). Default mode warns + skips on each collision (first-write-wins, two cases: per-scope variants and same-description name collisions); `--strict` errors on the first collision. Regression cover for the silent last-write-wins behavior that masked drift in agency federation imports."
+timeout_seconds = 30
+
+[[scenario]]
+name = "dev_check_branch_and_binary_freshness"
+script = "scenarios/dev_check_branch_and_binary_freshness.sh"
+owners = [
+    "fix-cargo-install",
+]
+description = "Pins fix-cargo-install: `wg dev-check` reports branch, main HEAD, and current wg binary mtime; clean main reports OK, while a non-main checkout with a binary older than main HEAD reports WARN for both branch and stale-binary drift."
+timeout_seconds = 30
+
+[[scenario]]
+name = "integrate_nex_chat_end_to_end"
+script = "scenarios/integrate_nex_chat_end_to_end.sh"
+owners = [
+    "integrate-nex-chat-end-to-end",
+    "fix-chat-dir-race",
+    "fix-tui-supervisor-coexistence",
+    "fix-supervisor-restart-backoff",
+    "re-implement-fix",
+    "fix-nex-cursor-corruption",
+    "smoke-gate-is",
+]
+description = "End-to-end live nex chat against lambda01 + composition glue: 2 messages, 2 replies, 1 supervisor spawn, no chat-dir split-brain. Pins the .chat-N → chat-N alias mapping in spawn_task that prevents the daemon supervisor and IPC writers from disagreeing on which chat dir to use. Also guards the supervisor restart-backoff: 3 normal handoff cycles in <1min must not trip the rate-limit pause."
+timeout_seconds = 300
+
+[[scenario]]
+name = "tui_nex_chat_end_to_end"
+script = "scenarios/tui_nex_chat_end_to_end.sh"
+owners = [
+    "fix-nex-cursor-corruption",
+    "fix-supervisor-restart-backoff",
+    "fix-tui-supervisor-coexistence",
+    "fix-chat-dir-race",
+    "integrate-nex-chat-end-to-end",
+    "smoke-tui-nex-end-to-end",
+    "design-nex-chat",
+]
+description = "Simulated-human end-to-end smoke: TUI new-chat dialog → nex chat against live endpoint → message+reply → close+reopen → resume."
+timeout_seconds = 240
+
+[[scenario]]
+name = "nex_chat_in_tui_via_tmux"
+script = "scenarios/nex_chat_in_tui_via_tmux.sh"
+owners = [
+    "implement-nex-chat",
+]
+description = "Pins implement-nex-chat path A: the TUI native/nex chat pane uses the tmux-wrapped PTY path while the inner argv mirrors the working CLI shape `wg nex -m <model> -e <endpoint>` and does not pass `--chat`, `--role`, or `--resume`."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_nex_chat_post_restart_response"
+script = "scenarios/tui_nex_chat_post_restart_response.sh"
+owners = [
+    "fix-nex-tui",
+]
+description = "Pins fix-nex-tui: the TUI's PTY reader thread must advance bytes_processed only AFTER the vt100 parser has processed the chunk, otherwise the event loop's chat_pty_has_new_bytes/update_task_pane_byte_watermarks pair can race the watermark past a stale screen. Drives the canonical 13-step user flow against lambda01/qwen3-coder: create nex chat, two messages with rendered replies, kill TUI, relaunch, send a NEW message, assert the post-restart reply renders in the TUI's chat pane (the regression that blocked implement-generalize-chat)."
+timeout_seconds = 360
+
+[[scenario]]
+name = "bash_chat"
+script = "scenarios/bash_chat.sh"
+owners = [
+    "implement-generalize-chat",
+]
+description = "Pins implement-generalize-chat: `wg chat new --command 'bash'` creates a generic command chat task with command_argv/working_dir metadata and no LLM preset."
+timeout_seconds = 30
+
+[[scenario]]
+name = "custom_command_chat"
+script = "scenarios/custom_command_chat.sh"
+owners = [
+    "implement-generalize-chat",
+]
+description = "Pins implement-generalize-chat: arbitrary command lines such as `tail -f /tmp/test.log` are stored as generic persistent chat pane commands."
+timeout_seconds = 30
+
+[[scenario]]
+name = "chat_last_interaction_sort"
+script = "scenarios/chat_last_interaction_sort.sh"
+owners = [
+    "fix-chat-tasks",
+]
+description = "Pins fix-chat-tasks: sending to an older .chat-N updates last_interaction_at, wg show displays it, and activity sorting puts the recently active chat first without live LLM credentials."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_chat_pty_last_interaction"
+script = "scenarios/tui_chat_pty_last_interaction.sh"
+owners = [
+    "fix-last-interaction",
+]
+description = "Pins fix-last-interaction: typing and sending in a real wg tui chat PTY tab bumps the backing .chat-N last_interaction_at within 5s and bubbles it above a previously newer chat, without LLM credentials."
+timeout_seconds = 45
+
+[[scenario]]
+name = "preset_shortcuts_still_work"
+script = "scenarios/preset_shortcuts_still_work.sh"
+owners = [
+    "implement-generalize-chat",
+]
+description = "Pins implement-generalize-chat: `--exec claude`, `--exec codex`, and `--exec nex` remain preset shortcuts while also writing command_argv/working_dir/executor_preset_name metadata."
+timeout_seconds = 30
+
+[[scenario]]
 name = "nex_two_message_against_lambda01"
 script = "scenarios/nex_two_message_against_lambda01.sh"
 owners = [
@@ -63,6 +184,16 @@ description = "graph.jsonl rows containing priority as either integer or string 
 timeout_seconds = 20
 
 [[scenario]]
+name = "wg_msg_send_shows_indicator_in_viz"
+script = "scenarios/wg_msg_send_shows_indicator_in_viz.sh"
+owners = [
+    "fix-tui-message",
+    "smoke-gate-is",
+]
+description = "After `wg msg send`, the per-task ✉ indicator must appear in `wg viz` (which shares the TUI task-list rendering path). Pre-fix the indicator stayed stale because the fs watcher only reloaded viz on graph.jsonl mtime changes, while `wg msg send` writes only to messages/<task>.jsonl."
+timeout_seconds = 20
+
+[[scenario]]
 name = "chat_create_via_ipc_works"
 script = "scenarios/chat_create_via_ipc_works.sh"
 owners = [
@@ -73,6 +204,70 @@ owners = [
     "smoke-gate-is",
 ]
 description = "Open a chat and send 'hi'; expect a non-error coordinator response within 30s of dispatcher boot."
+timeout_seconds = 90
+
+[[scenario]]
+name = "chat_create_endpoint_persists"
+script = "scenarios/chat_create_endpoint_persists.sh"
+owners = [
+    "fix-chat-creation",
+    "smoke-gate-is",
+]
+description = "`wg chat create -e <URL>` (and the legacy `wg service create-coordinator --endpoint <URL>` alias the TUI launcher invokes) must persist endpoint_override into CoordinatorState AND record `endpoint` on the .chat-N graph task. Pre-fix the launcher captured the endpoint into history but the chat used the daemon-default — exactly the gap the user reported with `wg nex -m qwen3-coder -e https://lambda01...`."
+timeout_seconds = 30
+
+[[scenario]]
+name = "launcher_custom_url_register_persists"
+script = "scenarios/launcher_custom_url_register_persists.sh"
+owners = [
+    "fix-new-chat",
+    "smoke-gate-is",
+]
+description = "fix-new-chat: the TUI new-chat dialog allows ad-hoc Custom URL entry plus optional 'register with name'. Filling the name persists the endpoint to GLOBAL config (~/.wg/config.toml) so it shows up in `wg endpoint list` afterward, while the chat itself still pins to that URL."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_launcher_modal_does_not_leak_keys"
+script = "scenarios/tui_launcher_modal_does_not_leak_keys.sh"
+owners = [
+    "fix-new-chat-2",
+    "redesign-new-chat",
+    "smoke-gate-is",
+]
+description = "fix-new-chat-2: while the new-chat launcher (or any non-Normal InputMode) is open, ZERO keystrokes may reach the underlying chat-pane PTY child's stdin. Pre-fix, opening the launcher via [+] left focused_panel = RightPanel so the vendor_pty_active branch ran before the launcher dispatch and forwarded typed characters (e.g. a custom URL) into the background chat tab. Same byte-level pattern as fix-mouse-wheel-2."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_launcher_modal_does_not_leak_paste"
+script = "scenarios/tui_launcher_modal_does_not_leak_paste.sh"
+owners = [
+    "fix-paste-events",
+    "fix-new-chat-2",
+    "redesign-new-chat",
+    "smoke-gate-is",
+]
+description = "fix-paste-events: while the new-chat launcher (or any non-Normal InputMode) is open, ZERO bytes of an Event::Paste may reach the underlying chat-pane PTY child's stdin. fix-new-chat-2 closed the keystroke path but missed paste events — crossterm delivers bracketed paste as a single Event::Paste(String) rather than a sequence of Event::Keys, so the keystroke-path guard never fired. User repro 2026-04-30: pasted a tailscale URL into the new-chat dialog → URL appeared in the background chat tab. Pins both halves: (a) byte-level child_input_bytes_written() stays at 0 across dispatch_event(Event::Paste) with launcher open, (b) the paste reaches the focused launcher section's text field (Name, Endpoint custom_text), (c) negative control — Normal-mode paste still forwards to the chat PTY (guard must not over-block). Third iteration of the new-chat input-leak bug class (fix-new-chat → fix-new-chat-2 → fix-paste-events)."
+timeout_seconds = 90
+
+[[scenario]]
+name = "launcher_redesign_default_and_addnew"
+script = "scenarios/launcher_redesign_default_and_addnew.sh"
+owners = [
+    "redesign-new-chat",
+    "smoke-gate-is",
+]
+description = "redesign-new-chat 2026-04-30: the TUI new-chat dialog opens in a minimal Default mode with exactly two preset radios (codex:gpt-5.5, claude:opus) plus a '+ Add new...' row, NOT a populated openrouter list or recent-history list. Picking '+ Add new...' flips into a small inline form with executor radio (claude/codex/nex), model field, and an endpoint field that is shown ONLY for executor=nex. Pins the entire redesign contract via the launcher_redesign_tests + launcher_open_tests modules."
+timeout_seconds = 90
+
+[[scenario]]
+name = "launcher_focus_new_chat_on_launch"
+script = "scenarios/launcher_focus_new_chat_on_launch.sh"
+owners = [
+    "fix-new-chat-4",
+    "redesign-new-chat",
+    "smoke-gate-is",
+]
+description = "fix-new-chat-4 2026-05-01: clicking Launch on the new-chat dialog must focus the freshly-created chat tab and show a 'Booting <executor>...' placeholder until the PTY emits its first byte. Pre-fix, the post-handler force_refresh's sync_active_tabs_from_graph saw the new cid missing from active_tabs (race with daemon's graph.jsonl write being re-read) and auto-switched focus back to active_tabs[0] — the previous chat. Pins: (a) IPC success → launcher dismissed + active_coordinator_id = new cid in the same drain step; (b) graph-lag race tolerated — focus sticks on new cid even when graph reload hasn't picked it up; (c) IPC failure leaves focus untouched (negative control); (d) booting placeholder renders the chat label + executor name instead of falling through to the generic 'Press c to type' empty state."
 timeout_seconds = 90
 
 [[scenario]]
@@ -146,6 +341,16 @@ owners = [
 ]
 description = "Dispatcher's explicit `-x codex` MUST win when the assigned agent has only the default claude executor and the task model is `local:qwen3-coder`. Regression for agency-still-picks: the previous fix (agency-picks-claude) put the model-compat override INSIDE the agency, where it fired BEFORE the dispatcher's executor floor in resolve_executor's precedence — silently rewriting `-x codex` to native. Asserts SpawnPlan executor=codex (never native, never claude) for the codex+local: combo."
 timeout_seconds = 30
+
+[[scenario]]
+name = "codex_handler_pipes_prompt_to_stdin"
+script = "scenarios/codex_handler_pipes_prompt_to_stdin.sh"
+owners = [
+    "codex-handler-doesn",
+    "smoke-gate-is",
+]
+description = "Dispatcher MUST write a non-empty prompt.txt and a run.sh that pipes it into `codex exec` via stdin. Regression for codex-handler-doesn: spawn_agent_inner's auto-prompt gate hard-coded `claude | native`, omitting codex, so every codex agent shipped with empty stdin and exited 1 reading 'No prompt provided via stdin'. Asserts cat <prompt.txt> | 'codex' 'exec' appears in the agent's run.sh and prompt.txt has content — no LLM call required."
+timeout_seconds = 60
 
 [[scenario]]
 name = "tui_new_chat_creates_fresh_ids"
@@ -266,6 +471,36 @@ description = "Inline spawn of an `.evaluate-*` task must register the agent wit
 timeout_seconds = 60
 
 [[scenario]]
+name = "agency_codex_override_routes_to_codex"
+script = "scenarios/agency_codex_override_routes_to_codex.sh"
+owners = [
+    "fix-agency-tasks",
+    "smoke-gate-is",
+]
+description = "Agency MUST honor explicit `[models.assigner]` / `[models.evaluator]` / `[models.flip_*]` overrides per CLAUDE.md 'explicit overrides win, cascade does not'. Regression for fix-agency-tasks: `wg init --route codex-cli` writes codex:* per-role overrides but the spawn site hard-coded executor=claude, model=claude:haiku — and `run_lightweight_llm_call` collapsed `codex:` → `oai-compat`, attempting an HTTP call with no key. Asserts `.assign-*` inline spawn registers with executor=codex + model=codex:* in both registry.json and metadata.json when the project config has the codex assigner override."
+timeout_seconds = 60
+
+[[scenario]]
+name = "evolve_fanout_codex_route_no_bare_aliases"
+script = "scenarios/evolve_fanout_codex_route_no_bare_aliases.sh"
+owners = [
+    "bug-evolve-run-bypasses-codex-route",
+    "smoke-gate-is",
+]
+description = "`wg evolve run --force-fanout` MUST honor the project's [tiers] and [models.evolver] config. Regression for bug-evolve-run-bypasses-codex-route: analyzer / synthesize / apply / evaluate tasks were hard-coded to bare anthropic aliases (`sonnet`/`haiku`/`opus`), so on a `wg init --route codex-cli` repo every fan-out task dispatched through the claude CLI handler regardless of `[models.evolver].model = codex:gpt-5.5`. Asserts every fan-out task model is codex-prefixed (no bare anthropic alias, no `claude:` slipping through) on a codex-routed graph."
+timeout_seconds = 60
+
+[[scenario]]
+name = "evaluator_claude_slash_model_bypasses_openrouter"
+script = "scenarios/evaluator_claude_slash_model_bypasses_openrouter.sh"
+owners = [
+    "fix-evaluator-role",
+    "smoke-gate-is",
+]
+description = "Evaluator one-shot roles configured with Claude registry/OpenRouter IDs such as `anthropic/claude-haiku-4-5` must call the Claude CLI directly as `--model haiku`, without first trying native OpenRouter and without passing the slash-form model to the CLI. Regression for fix-evaluator-role: no OpenRouter key caused a native OpenRouter failure, then the Claude CLI fallback failed because it received `anthropic/claude-haiku-4-5` instead of `haiku`."
+timeout_seconds = 60
+
+[[scenario]]
 name = "dispatcher_kick_bypasses_settling_delay"
 script = "scenarios/dispatcher_kick_bypasses_settling_delay.sh"
 owners = [
@@ -284,3 +519,588 @@ owners = [
 ]
 description = "`wg reset` must clear the `assigned` claim field so reset tasks are immediately ready for fresh dispatch. Regression: dead-agent claims survived reset; user had to `wg unclaim` each task by hand or it looked identical to the dispatcher-poll bug."
 timeout_seconds = 30
+
+[[scenario]]
+name = "wg_done_refuses_uncommitted_worktree"
+script = "scenarios/wg_done_refuses_uncommitted_worktree.sh"
+owners = [
+    "wg-done-silent",
+    "smoke-gate-is",
+]
+description = "Pins wg-done-silent: when an agent's worktree branch has 0 commits ahead of main but staged-but-uncommitted tracked files, `wg done` MUST refuse with non-zero exit + actionable error naming the file. Regression history: codex agent for create-agents-md ran `git add AGENTS.md && wg done`, saw zero error, AGENTS.md never landed on main; the work was silently dropped because attempt_worktree_merge's `commit_count == 0` short-circuit returned NoCommits without checking the porcelain. Drives a real git worktree + staged file, asserts (a) wg done exits non-zero, (b) error names the staged file, (c) the file is NOT on main, (d) the task is NOT marked done. No LLM credentials needed; pure git + graph assertions."
+timeout_seconds = 30
+
+[[scenario]]
+name = "chat_launched_with_codex_uses_codex"
+script = "scenarios/chat_launched_with_codex_uses_codex.sh"
+owners = [
+    "chat-launched-with",
+    "fix-tui-new",
+    "smoke-gate-is",
+]
+description = "Regression for chat-launched-with: launching a chat with --executor codex --model codex:gpt-5 against a project whose default is claude:opus must dispatch wg codex-handler with -m codex:gpt-5, NOT wg claude-handler with -m claude:opus. Locks both halves of the fix end-to-end: (1) wg chat create persists executor_override and model_override into CoordinatorState, (2) spawn-task with WG_EXECUTOR_TYPE=codex + WG_MODEL=codex:gpt-5 honors WG_MODEL alongside WG_EXECUTOR_TYPE in plan_spawn (pre-fix: WG_MODEL was dropped, the codex handler ran with claude:opus). The TUI auto-PTY half is locked by unit tests in chat_pty_executor_resolution_tests."
+timeout_seconds = 30
+
+[[scenario]]
+name = "codex_chat_pty_passes_bypass_approvals"
+script = "scenarios/codex_chat_pty_passes_bypass_approvals.sh"
+owners = [
+    "fix-codex-chat",
+    "fix-codex-chat-2",
+    "fix-pass-no",
+    "smoke-gate-is",
+]
+description = "Pins fix-codex-chat (bypass flag) AND fix-codex-chat-2 (correct cwd + chat_dir add-dir) AND fix-pass-no (--no-alt-screen). The codex chat agent in the wg TUI MUST be launched with --dangerously-bypass-approvals-and-sandbox AND with cwd = project root (NOT .wg/chat/chat-N/) AND with --add-dir <chat_dir> so per-chat scratch stays writable AND with --no-alt-screen so codex emits line-streamed output instead of alternate-screen TUI mode (which loses scrollback and stacks animation frames in the wg PTY emulator). Drives `wg tui` with a fake codex shim that captures argv + PWD; asserts all four. The previous behaviour (cwd = chat_dir) made the codex banner report 'directory: <proj>/.wg/chat/chat-0' and broke shell command discovery for the chat agent. Mirrors the claude path's --dangerously-skip-permissions + project-root cwd posture. No real codex CLI / LLM required."
+timeout_seconds = 60
+
+[[scenario]]
+name = "failed_upstream_blocks_downstream"
+script = "scenarios/failed_upstream_blocks_downstream.sh"
+owners = [
+    "fix-failed-upstream",
+]
+description = "Regression for fix-failed-upstream: a failed upstream task must NOT unblock downstream tasks. `wg ready` and `wg list` must NOT show downstream as ready when its upstream is failed; downstream must become ready only after upstream reaches done."
+timeout_seconds = 30
+
+[[scenario]]
+name = "wg_init_writes_lockstep_agent_guides"
+script = "scenarios/wg_init_writes_lockstep_agent_guides.sh"
+owners = [
+    "fix-wg-init-2",
+]
+description = "Pins fix-wg-init-2: every fresh `wg init` route must write both CLAUDE.md and AGENTS.md to the project root from the same layer-2 template, so Claude Code / Claude CLI and Codex sessions receive byte-identical project-specific context that delegates the universal role contract to `wg agent-guide`. No LLM endpoint needed."
+timeout_seconds = 30
+
+[[scenario]]
+name = "agent_guide_warns_off_wg_nex"
+script = "scenarios/agent_guide_warns_off_wg_nex.sh"
+owners = [
+    "fix-agent-prompting",
+]
+description = "Pins fix-agent-prompting: the bundled universal `wg agent-guide` must explicitly tell chat and worker agents that `wg nex` is an interactive REPL, hangs on stdin when invoked from bash, and that one-shot LLM work should be represented as `wg add` subtasks or batch-mode agency commands instead."
+timeout_seconds = 30
+
+[[scenario]]
+name = "codex_init_route_has_correct_defaults"
+script = "scenarios/codex_init_route_has_correct_defaults.sh"
+owners = [
+    "fix-codex-cli",
+    "bump-codex-defaults",
+]
+description = "Pins the codex-cli route defaults regression: `wg init --route codex-cli` must write gpt-5.5 (newest frontier; user-preferred default per bump-codex-defaults) as the agent/dispatcher model, full tier set (gpt-5.4-mini/gpt-5.4/gpt-5.5), [models.evaluator]/[models.assigner]/[models.flip_inference]/[models.flip_comparison] all pointing to gpt-5.4-mini — so agency meta-tasks AND FLIP scoring run on codex, not fall back to claude:haiku. Also verifies `wg config lint` flags the old codex:o1-pro string. No LLM endpoint needed."
+timeout_seconds = 30
+
+[[scenario]]
+name = "codex_cli_fresh_init_runtime"
+script = "scenarios/codex_cli_fresh_init_runtime.sh"
+owners = [
+    "fix-wg-init",
+    "bump-codex-defaults",
+]
+description = "Pins fix-wg-init: `wg init --route codex-cli` followed by `WG_DIR=<project_root> wg service start` (the user's natural mistake — pointing WG_DIR at the project root rather than the .wg subdir) must produce a fully working dispatcher that loads project codex:gpt-5.5 (not global claude:opus), writes service files under .wg/service/ (not sibling service/), watches .wg/graph.jsonl (not sibling graph.jsonl), logs no `Failed to load graph for task-aware reaping` tick errors, and propagates WG_EXECUTOR_TYPE=codex + WG_MODEL=codex:gpt-5.5 through the spawn-task → codex-handler chain. No LLM endpoint needed (spawn-task --dry-run prints the resolved invocation)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "config_one_line_codex_route"
+script = "scenarios/config_one_line_codex_route.sh"
+owners = [
+    "allow-one-line",
+    "fix-wg-config",
+]
+description = "Pins allow-one-line and fix-wg-config: the real terminal flow `wg config --local --model ... --coordinator-model ... --tier ... --tier ... --tier ... --set-model ... --set-model ... --flip-model ... --auto-assign true --auto-evaluate true` must succeed as one atomic invocation, must not emit Clap's repeated --tier error, must write canonical dispatcher.model plus all Codex tier/model-routing values to local config, must clear a stale deprecated dispatcher.executor=claude pin, must document repeatable flags clearly, and `wg service restart` must report executor=codex/model=codex:gpt-5.5. No LLM endpoint needed."
+timeout_seconds = 60
+
+[[scenario]]
+name = "purge_chats_skips_active_by_default"
+script = "scenarios/purge_chats_skips_active_by_default.sh"
+owners = [
+    "wg-service-purge",
+    "smoke-gate-is",
+]
+description = "Pins the `lol you archived _this_ chat too` regression: `wg service purge-chats` must skip chats with recent consumer-cursor activity (the user's actually-attached chat) by default; the legacy full-nuke is opt-in via --include-active. Builds a graph with three chat-loop tasks, marks one active by touching its .cursor file, runs purge-chats, asserts only the inactive ones get archived AND the output line surfaces the skipped count + override hint, then re-runs with --include-active to verify the override path also still works. No LLM credentials needed."
+timeout_seconds = 30
+
+[[scenario]]
+name = "failure_class_pdf_400"
+script = "scenarios/failure_class_pdf_400.sh"
+owners = [
+    "design-pdf-binary",
+    "fix-pdf-binary",
+    "verify-end-to",
+    "smoke-gate-is",
+]
+description = "Pins Option A of PDF/binary failure handling: api_error_status:400 stream produces failure_class=api-error-400-document, surfaced in wg show with operator hint. Runs offline using a synthetic raw_stream.jsonl; the fixture tests/smoke/fixtures/broken.pdf is a real malformed PDF verified to trigger Anthropic HTTP 400 in live tests."
+timeout_seconds = 30
+
+[[scenario]]
+name = "html_since_filter"
+script = "scenarios/html_since_filter.sh"
+owners = [
+    "wg-html-add",
+]
+description = "Regression for wg-html-add: `wg html --since <duration>` filters tasks by recency. Asserts: (1) --since 24h on a mixed-age graph produces fewer tasks than --all, (2) the rendered index.html footer mentions the active time window, (3) valid durations (1h, 24h, 7d, 30d) are accepted, (4) invalid durations (garbage, 0d, abc, 7x) are rejected with a non-zero exit code. No daemon, no LLM."
+timeout_seconds = 60
+
+[[scenario]]
+name = "retry_clears_downstream_stale_claims"
+script = "scenarios/retry_clears_downstream_stale_claims.sh"
+owners = [
+    "fix-claim-lifecycle",
+    "design-claim-lifecycle",
+    "smoke-gate-is",
+]
+description = "Pins bug-retry-doesnt-clear-stale-downstream-claims: `wg retry <upstream>` must walk the forward closure and clear `assigned` on any non-terminal downstream task whose claim references a Dead/missing agent. Pre-fix the dispatcher silently skipped stale-claimed downstream tasks forever; the user's fan-out workflow stalled with 'spawned=0' for hours. Builds upstream→downstream, claims downstream with an absent agent, fails+retries upstream, asserts (a) downstream.assigned cleared, (b) downstream.status==Open, (c) log records the cleanup cause."
+timeout_seconds = 30
+
+[[scenario]]
+name = "reconciler_clears_open_with_dead_agent"
+script = "scenarios/reconciler_clears_open_with_dead_agent.sh"
+owners = [
+    "fix-claim-lifecycle",
+    "design-claim-lifecycle",
+    "smoke-gate-is",
+]
+description = "Lazy / safety-net path from design-claim-lifecycle: a Status::Open task whose `assigned` references a missing agent must be unclaimed by the dispatcher's reconciler tick (proxied here via `wg sweep`, which shares the predicate). Catches kill -9, panic-on-startup, host-reboot failure modes that no eager path can cover. Pre-fix the reconciler filtered to `status==InProgress`, so Open+dead-claim sat forever."
+timeout_seconds = 30
+
+[[scenario]]
+name = "reset_clears_downstream_claims_too"
+script = "scenarios/reset_clears_downstream_claims_too.sh"
+owners = [
+    "fix-claim-lifecycle",
+    "design-claim-lifecycle",
+    "smoke-gate-is",
+]
+description = "Belt-and-suspenders for the closure walk: `wg reset upstream --yes` (default Forward direction) must clear claims on transitive downstream tasks too, not just the seed. The existing `reset_clears_claim` scenario uses --seeds with all IDs explicit and would not catch a regression that drops downstream from `compute_closure`."
+timeout_seconds = 30
+
+[[scenario]]
+name = "wg_html_ascii_viz"
+script = "scenarios/wg_html_ascii_viz.sh"
+owners = [
+    "wg-html-redesign",
+    "wg-html-v2",
+]
+description = "Regression for wg-html-redesign + wg-html-v2: `wg html` (no flags) emits ASCII viz in a viz-pre element with clickable task-link spans, side panel anchor, theme toggle, all three inline JSON globals (WG_TASKS / WG_EDGES / WG_CYCLES), the panel.js + style.css companion assets, and the ASCII layout matches `wg viz` output."
+timeout_seconds = 60
+
+[[scenario]]
+name = "wg_html_box_drawing_alignment"
+script = "scenarios/wg_html_box_drawing_alignment.sh"
+owners = [
+    "fix-wg-html-box-drawing-alignment",
+]
+description = "Regression for fix-wg-html-box-drawing-alignment: the `wg html` viz must preserve terminal-cell alignment for Unicode box-drawing connector glyphs (`─ │ ┐ ┘ ├ └ ←`). Pins (1) style.css declares typography-stabilizing rules on `.viz-pre`, `.viz-pre *`, and `.viz-pre .edge` (no ligatures, no kerning, no synthesis, zero-box edge spans), (2) long `─` runs survive HTML emission byte-for-byte after tag-stripping with the HTML parser, (3) every `─` cell on a connector line is wrapped in exactly one `<span class=\"edge\" data-edges=\"from>to\">─</span>` so the wg-html-v2 selection-highlight contract still works. Loud-SKIPs (exit 77) when the current graph has no long-edge cases (a freshly-cloned / minimal graph)."
+timeout_seconds = 30
+
+[[scenario]]
+name = "wg_html_font_bundle"
+script = "scenarios/wg_html_font_bundle.sh"
+owners = [
+    "fix-android-firefox-wg-html-font-fallback",
+]
+description = "Regression for fix-android-firefox-wg-html-font-fallback: `wg html` must bundle the JetBrains Mono Regular subset (~9KB WOFF2) and reference it via @font-face from the LOCAL file (not Google Fonts CDN), so the viz <pre> renders box-drawing glyphs (`─ │ ┐ ┘ ├ └ ┤ ┬ ┴ ┼`) with stable monospace metrics on every platform. Bug shape: Android Firefox's `monospace` generic resolves to Droid Sans Mono / Noto Sans Mono, which lacks complete box-drawing coverage — without a self-hosted webfont declaring `unicode-range: U+2500-257F`, Firefox does per-glyph fallback for `─`/`│`/`┐`/`┘` from a different (proportional-metrics) font and long connector runs visually drift out of column. Pins (1) WOFF2 binary emitted with intact wOF2 magic bytes and reasonable size (4KB-200KB), (2) SIL OFL 1.1 license file co-bundled, (3) @font-face references the local JetBrainsMono-viz.woff2 (offline-capable; rejects Google Fonts URLs), (4) unicode-range covers U+2500-257F, (5) .viz-pre font stack lists 'JetBrains Mono' first AND includes Android-friendly fallbacks ('Roboto Mono' / 'Noto Sans Mono') as a safety net, (6) text-size-adjust: 100% (with -webkit- prefix) disables Android mobile text-inflation. No daemon, no LLM."
+timeout_seconds = 30
+
+[[scenario]]
+name = "wg_html_chat"
+script = "scenarios/wg_html_chat.sh"
+owners = [
+    "wg-html-chat",
+]
+description = "Regression for wg-html-chat: `wg html --chat` renders chat transcripts with visibility-respecting defaults. Asserts default omits transcripts (chat task node still rendered); --chat includes only public transcripts and shows a 'transcript hidden' notice on internal chats; --chat --all includes non-public transcripts; --chat --public-only drops internal chat tasks entirely; the secret sanitizer redacts sk- api keys, OPENAI_API_KEY=... assignments, and ~/.wg/secrets paths in the rendered output."
+timeout_seconds = 60
+
+[[scenario]]
+name = "wg_html_v2_tui_parity"
+script = "scenarios/wg_html_v2_tui_parity.sh"
+owners = [
+    "wg-html-v2",
+    "fix-wg-html-2",
+]
+description = "TUI-parity contract for `wg html` (v2). Pins: (1) default = all tasks (no flags) — wg-html-redesign default was wrong for the read-only TUI-sibling use case. (2) Edge connector glyphs carry `data-edges=\"from>to\"` per character so JS can colorize upstream vs downstream on selection. (3) CSS holds the exact TUI RGB palette for status colors (state.rs:271) and edge highlights — magenta=upstream, cyan=downstream, yellow=cycle (render.rs:1500). (4) Both auto (prefers-color-scheme) and manual (data-theme) dark/light themes are wired, with localStorage bootstrap to avoid a flash on load. (5) panel.js applies is-upstream / is-downstream / is-cycle / is-selected classes and honors OS prefers-color-scheme; it does NOT call fetch/XHR (rsync-friendly static contract). (6) WG_EDGES['parent'].down includes the child id (the reachability set the JS uses for highlight decisions)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "wg_html_resizable_inspector"
+script = "scenarios/wg_html_resizable_inspector.sh"
+owners = [
+    "wg-html-resizable",
+]
+description = "Regression for wg-html-resizable: the inspector panel is drag-resizable and the chosen size persists. Pins: (1) panel-resize-handle element exists with role=separator. (2) CSS exposes both col-resize (wide layout) and row-resize (narrow layout) cursors so the handle reorients with the panel. (3) panel.js wires pointerdown/pointermove/pointerup so the drag is responsive. (4) The width is persisted to localStorage under wg-html-inspector-width-px and re-applied on reload. (5) The user-chosen size is propagated by setting --panel-width inline; the existing CSS rule width: var(--panel-width) consumes it. (6) panel.js remains vanilla — no fetch, no module imports, no framework — and passes node --check."
+timeout_seconds = 60
+
+[[scenario]]
+name = "wg_html_declutter"
+script = "scenarios/wg_html_declutter.sh"
+owners = [
+    "wg-html-declutter",
+]
+description = "Regression for wg-html-declutter: the page header is decluttered (source title + '<n> tasks shown' — no 'click a task id to inspect' subtitle, no 'Dependency graph (...)' parenthetical headline above the viz, no inline `<section class=\"legend-section\">`). A 'Legend' button in the header opens the side panel with a full legend covering edge colors, status colors, click behaviors, and CLI flags. The legend HTML lives inside a hidden `<template id=\"wg-legend-template\">`; panel.js binds the legend toggle and reuses the existing side-panel infrastructure, swatches reference the --edge-* CSS variables for theme-aware colors."
+timeout_seconds = 60
+
+[[scenario]]
+name = "profile_create_and_list"
+script = "scenarios/profile_create_and_list.sh"
+owners = [
+    "implement-named-profiles",
+]
+description = "Named profiles: create a profile, verify file written, wg profile list shows it as [user], wg profile show displays agent.model."
+timeout_seconds = 30
+
+[[scenario]]
+name = "profile_use_without_daemon"
+script = "scenarios/profile_use_without_daemon.sh"
+owners = [
+    "implement-named-profiles",
+]
+description = "Named profiles: wg profile use <name> writes active-pointer, wg config --merged reflects the profile's models, wg profile use --clear removes the pointer."
+timeout_seconds = 30
+
+[[scenario]]
+name = "profile_codex_service_start"
+script = "scenarios/profile_codex_service_start.sh"
+owners = [
+    "fix-profile-application",
+]
+description = "Regression for fix-profile-application: the live terminal flow `wg service stop; wg profile use codex; wg service start` must start the dispatcher with executor=codex/model=codex:gpt-5.5 even when local config pins claude:opus, and `wg config --models` must not render codex role settings as nex."
+timeout_seconds = 60
+
+[[scenario]]
+name = "profile_switch_authoritative_hot_reload"
+script = "scenarios/profile_switch_authoritative_hot_reload.sh"
+owners = [
+    "make-profile-switching",
+]
+description = "Regression for make-profile-switching: with a running daemon and stale repo-local Claude pins in [agent], [dispatcher], [tiers], and [models.*], `wg profile use codex` alone clears local routing pins, preserves unrelated local settings, makes profile show/config --merged/service status agree on codex, and `wg profile use claude` hot-reloads back to Claude."
+timeout_seconds = 60
+
+[[scenario]]
+name = "profile_diff"
+script = "scenarios/profile_diff.sh"
+owners = [
+    "implement-named-profiles",
+]
+description = "Named profiles: wg profile diff claude codex shows both model strings in output."
+timeout_seconds = 30
+
+[[scenario]]
+name = "profile_allowlist_rejects_tui"
+script = "scenarios/profile_allowlist_rejects_tui.sh"
+owners = [
+    "implement-named-profiles",
+]
+description = "Named profiles: a profile file with unknown field [tui] is rejected at parse time with a clear error naming the field."
+timeout_seconds = 30
+
+[[scenario]]
+name = "profile_nex_canonical_name"
+script = "scenarios/profile_nex_canonical_name.sh"
+owners = [
+    "rename-wgnext-profile",
+]
+description = "The in-process LLM handler starter profile is named `nex` (matches `wg nex`), not the legacy `wgnext` / `wg-next`. Pins rename-wgnext-profile: (1) fresh init-starters writes nex.toml only, (2) the rendered template/description say `wg nex`, (3) wg profile list shows `[user] nex   wg nex: ...`, (4) an existing `wgnext.toml` on disk is auto-migrated to `nex.toml` preserving user edits, (5) loading the legacy `wgnext` name still works but emits a deprecation hint."
+timeout_seconds = 30
+
+[[scenario]]
+name = "nex_canonical_prefix"
+script = "scenarios/nex_canonical_prefix.sh"
+owners = [
+    "fix-model-prefix",
+    "smoke-gate-is",
+]
+description = "`nex:<model>` is the canonical model-prefix for the in-process nex handler (matches `wg nex`); the previous `local:` and `oai-compat:` prefixes are deprecated. Pins fix-model-prefix: (1) `wg init -m nex:<model> -e <URL>` writes a clean config that round-trips with no warnings, (2) legacy `local:` / `oai-compat:` configs still load but emit a stderr deprecation warning naming `nex:` as the replacement, (3) `wg migrate config` rewrites the deprecated prefixes to `nex:`, writes a `.pre-migrate.<ts>` backup, and is idempotent (second run is a no-op), (4) the dispatcher routes `nex:<model>` to the in-process native handler (visible via spawn-task --dry-run with WG_EXECUTOR_TYPE=native + WG_MODEL=nex:*)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "pty_resize_dedup_no_scrollback_echo"
+script = "scenarios/pty_resize_dedup_no_scrollback_echo.sh"
+owners = [
+    "fix-tui-pty",
+    "diagnose-tui-pty",
+    "fix-scrollback-reflow",
+    "diagnose-scrollback-corruption",
+]
+description = "PTY scrollback duplication after SIGWINCH reflow. Originally landed as a navigation-time dedup heuristic (fix-tui-pty); replaced with true re-feed reflow in fix-scrollback-reflow (PtyPane::resize snapshots scrollback+visible into logical lines, re-feeds into a fresh vt100::Parser at the new dimensions). Pins the bug-shape pre-condition (naive set_size + reprint creates duplicates), the primary fix (re-feed eliminates duplicates), narrower/wider rewrap semantics, multi-resize burst stress, and end-to-end PtyPane::resize integration."
+timeout_seconds = 240
+
+[[scenario]]
+name = "pty_initial_spawn_no_scrollback_doubling"
+script = "scenarios/pty_initial_spawn_no_scrollback_doubling.sh"
+owners = [
+    "fix-pty-scrollback",
+]
+description = "PTY initial-render scrollback dedup (no resize required): the chat-tab PtyPane was previously spawned at hardcoded 24x80, and the first frame's resize() to the actual msg_area fired SIGWINCH. Vendor CLIs (claude / codex / wg nex) reflowed by clear-screen + reprint, pushing wrap-at-80-cols copies into scrollback alongside the unwrap-at-actual-cols reprint — the user saw 'chat scrollback loops a bit and then settles'. Fix defers the spawn into the render path so the child opens at the real dimensions from the start. Runs unit tests for both the parser-level bug pattern and the deferred-spawn semantics in maybe_auto_enable_chat_pty / consume_pending_chat_pty_spawn."
+timeout_seconds = 180
+
+[[scenario]]
+name = "secret_keyring_round_trip"
+script = "scenarios/secret_keyring_round_trip.sh"
+owners = [
+    "implement-wg-secret",
+    "fix-wg-secret",
+]
+description = "Keyring backend round-trip: set / get / list / rm / check. Pins the fix-wg-secret regressions: --from-stdin reads piped input, --yes makes rm non-interactive, list never reveals values, and `wg secret backend show` no longer claims the keyring backend is itself a file at ~/.wg/keystore (the misnomer)."
+timeout_seconds = 30
+
+[[scenario]]
+name = "secret_plaintext_round_trip"
+script = "scenarios/secret_plaintext_round_trip.sh"
+owners = [
+    "implement-wg-secret",
+    "fix-wg-secret",
+]
+description = "Plaintext backend round-trip with allow_plaintext=true: set / get / list / rm via --from-stdin and --yes. Verifies file is created with 0600 perms at ~/.wg/secrets/."
+timeout_seconds = 30
+
+[[scenario]]
+name = "secret_api_key_ref_resolve"
+script = "scenarios/secret_api_key_ref_resolve.sh"
+owners = [
+    "implement-wg-secret",
+    "fix-wg-secret",
+]
+description = "api_key_ref resolution in endpoint config: store a secret via --from-stdin, configure endpoint with api_key_ref = 'keyring:<name>', verify wg endpoints list shows key present (✓)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "secret_keystore_explicit"
+script = "scenarios/secret_keystore_explicit.sh"
+owners = [
+    "fix-wg-secret",
+]
+description = "Explicit `keystore` backend round-trip: --backend keystore + --from-stdin lands at ~/.wg/keystore/<name> with 0600 perms; `keystore:<name>` URI resolves; list reports it under the new `keystore:` prefix (not the legacy `keyring:` misnomer); --yes deletes. Pins the fix-wg-secret naming-honesty contract."
+timeout_seconds = 30
+
+[[scenario]]
+name = "secret_os_keyring_when_available"
+script = "scenarios/secret_os_keyring_when_available.sh"
+owners = [
+    "fix-wg-secret",
+]
+description = "OS-native keyring round-trip when the platform has one (macOS Keychain or Linux secret-service). On headless / unsupported environments, loud-SKIPs (exit 77) so the gate doesn't block CI. When reachable, verifies `wg secret set --from-stdin` actually lands in OS storage (looked up via `security find-generic-password` / `secret-tool lookup`), get --reveal round-trips, backend show reports OS keyring reachable, and rm --yes removes from OS storage."
+timeout_seconds = 30
+
+[[scenario]]
+name = "pty_codex_query_responses"
+script = "scenarios/pty_codex_query_responses.sh"
+owners = [
+    "fix-codex-agent",
+]
+description = "Pins the codex chat-tab rendering fix. Codex's interactive CLI sends CPR (ESC [ 6 n), kitty keyboard query (ESC [ ? u) and OSC 10/11 fg/bg queries on startup and BLOCKS waiting for replies — without responses the chat tab shows only 40 bytes of query output (no UI). Re-runs the unit tests for each new query response handler in compute_query_replies, plus a regression test that feeds the actual 40-byte burst captured from codex 0.125.0 at 24x80 and asserts CPR + kitty + Primary DA + OSC 10 replies are all generated."
+timeout_seconds = 120
+
+[[scenario]]
+name = "pty_codex_sync_repaint_no_scrollback_stacking"
+script = "scenarios/pty_codex_sync_repaint_no_scrollback_stacking.sh"
+owners = [
+    "fix-codex-chat-3",
+]
+description = "Pins fix-codex-chat-3: codex chat in wg TUI must (1) render real-time animation frames between user keypresses and (2) NOT stack spinner copies in scrollback as the user scrolls back. Bug 1 = event loop's idle-poll branch never redrew on PTY byte arrivals (refresh interval 1 Hz against codex's 10-20 Hz frames); fix wires per-pane bytes_processed watermark into has_timed_ui_elements. Bug 2 = codex emits each frame as a DEC mode 2026 (BSU/ESU) sync block whose trailing \\r\\n scrolls one row off the top per frame, accumulating in scrollback (vt100 0.16 doesn't implement BSU/ESU); fix intercepts the markers in the reader thread and trims sync-induced scrollback growth via reflow. Runs unit tests for both halves; no live LLM/codex endpoint required (synthesized byte streams matching codex 0.125.0's actual pattern)."
+timeout_seconds = 180
+
+[[scenario]]
+name = "tui_scroll_mode_toggle"
+script = "scenarios/tui_scroll_mode.sh"
+owners = [
+    "implement-tui-scroll",
+]
+description = "Pins the Ctrl+] scroll mode implementation. Runs cargo test for all scroll_mode_tests unit tests which cover: entering scroll mode, all exit keys (Esc/q/Ctrl+]), key-swallowing (letter keys not forwarded to PTY in scroll mode), scroll navigation (PageUp/End), and automatic exit on pane-switch. No live LLM endpoint required."
+timeout_seconds = 120
+
+[[scenario]]
+name = "viz_tui_preserve_top_anchor"
+script = "scenarios/viz_tui_preserve_top_anchor.sh"
+owners = [
+    "preserve-top-anchor",
+]
+description = "Live `wg viz --tui` regression for preserve-top-anchor: start at graph top, insert tasks above the selected anchor task from another shell with `wg insert before`, and assert the newly inserted top rows remain visible. Pre-fix, the selected-task relative anchor pulled the viewport down to the old task and hid the graph top."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_mouse_wheel_does_not_send_arrows"
+script = "scenarios/tui_mouse_wheel_does_not_send_arrows.sh"
+owners = [
+    "fix-mouse-wheel",
+    "fix-mouse-wheel-2",
+    "implement-tui-scroll",
+    "smoke-gate-is",
+]
+description = "Pins fix-mouse-wheel-2: mouse-wheel ScrollUp/ScrollDown over the chat tab MUST scroll the outer wg vt100 pane and MUST NOT translate to Up/Down arrow-key bytes forwarded to the embedded child's stdin. Pre-fix, claude code emitted 'Scroll wheel is sending arrow keys · use PgUp/PgDn to scroll in claude code' because fix-mouse-wheel's vendor-PTY heuristic translated wheel notches to arrow keys. Asserts (a) is_scrolled_back() is true after a wheel event (outer scrollback advanced), and (b) child_input_bytes_written() is unchanged (zero bytes to PTY child stdin) — the byte-level guard is the real gate. Also covers the observer-mode path so fix-mouse-wheel's original scroll-the-vt100 contract doesn't regress."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_mouse_wheel_tmux_wrapped_advances_scroll"
+script = "scenarios/tui_mouse_wheel_tmux_wrapped_advances_scroll.sh"
+owners = [
+    "fix-mouse-wheel-3",
+]
+description = "Pins fix-mouse-wheel-3: mouse-wheel scroll on a TMUX-WRAPPED chat pane (the real chat-tab setup post implement-tmux-wrapped) MUST advance the user-visible rendered content AND MUST NOT write any bytes to the PTY child's stdin. fix-mouse-wheel-2 asserted scroll on a raw /bin/sh primary-screen child and shipped — but real chat panes use spawn_via_tmux, and tmux paints the alt screen, so the outer vt100 parser had no scrollback to advance. The wheel-event handler stole tmux's native mouse handling without doing anything useful with it (user: 'i rebuilt now and the scroll wheel does bupkis'). The fix dispatches scroll_up/down on tmux-wrapped panes to `tmux send-keys -X scroll-up`/-X scroll-down (out-of-band IPC, not a write to the attach client's stdin). This scenario pins both halves of the new contract: rendered content changes AND zero bytes to PTY child stdin. Strengthens the existing fix-mouse-wheel-2 test's scrollback() assertion so a future is_scrolled_back-only no-op can't slip through."
+timeout_seconds = 120
+
+[[scenario]]
+name = "failed_pending_eval_state_machine"
+script = "scenarios/failed_pending_eval_state_machine.sh"
+owners = [
+    "design-failed-pending",
+    "implement-failed-pending",
+]
+description = "Validates the FailedPendingEval state machine: agent-exit-nonzero + auto_evaluate=true → failed-pending-eval; other failure classes go directly to terminal failed; operator wg fail on FailedPendingEval forces terminal; downstream blocked on failed-pending-eval; .evaluate-X system task bypasses the block. No daemon, no LLM."
+timeout_seconds = 60
+
+[[scenario]]
+name = "chat_archive_kills_tmux_session"
+script = "scenarios/chat_archive_kills_tmux_session.sh"
+owners = [
+    "design-chat-agent",
+    "implement-tmux-wrapped",
+]
+description = "Pins the chat-archive -> kill_underlying_session contract from the tmux-persistence design. Manually starts a wg-chat-* tmux session matching the canonical schema, runs wg chat archive, asserts the session is killed within 2 seconds. Skips when tmux is missing."
+timeout_seconds = 60
+
+[[scenario]]
+name = "chat_scroll_via_drives_tmux_copy_mode"
+script = "scenarios/chat_scroll_via_drives_tmux_copy_mode.sh"
+owners = [
+    "fix-scroll-via",
+]
+description = "fix-scroll-via: scrolling a tmux-wrapped chat must drive tmux's own copy-mode (so tmux re-emits a clean post-scroll view), not walk the outer vt100 parser's scrollback. Drives copy-mode + cursor-up + cancel via the same tmux send-keys -X commands wg's PtyPane issues, asserts pane_in_mode toggles 0->1->0 and that mouse mode is off. Skips when tmux is missing."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_chat_ctrl_c_interrupts_hung_subprocess"
+script = "scenarios/tui_chat_ctrl_c_interrupts_hung_subprocess.sh"
+owners = [
+    "fix-tui-chat-2",
+]
+description = "Pins fix-tui-chat-2: a real wg tui chat tab running inside tmux starts a custom bash chat, launches a hanging foreground subprocess, enters chat scroll mode via Ctrl+], then presses Ctrl+C. Ctrl+C must still reach the focused tmux-wrapped chat pane, interrupt the hung subprocess, and leave bash usable for the next command. Skips when tmux is missing."
+timeout_seconds = 45
+
+[[scenario]]
+name = "wg_html_chat_color_and_markdown"
+script = "scenarios/wg_html_chat_color_and_markdown.sh"
+owners = [
+    "polish-wg-html",
+]
+description = "Pins polish-wg-html: (1) chat task nodes in the viz must carry the 'chat-agent' CSS class (so --chat-task blue overrides open/yellow status color); (2) description JSON must include description_html (markdown rendered to HTML); (3) panel.js must have the desc-toggle wiring for raw/pretty toggle; (4) CSS must declare --chat-task color (TUI Color::Blue = rgb(36,114,200))."
+timeout_seconds = 60
+
+[[scenario]]
+name = "publish_run_against_local_rsync_target"
+script = "scenarios/publish_run_against_local_rsync_target.sh"
+owners = [
+    "wg-publish-easy",
+    "wg-html-publish",
+]
+description = "Pins wg-publish-easy: end-to-end add/list/show/run/remove against a local rsync target, plus scheduled-deployment lifecycle (creates a `.publish-<name>` cron task on add, abandons it on remove). Verifies html builds, files are mirrored to the destination, and last_status=ok is recorded. Also pins wg-html-publish: the default rsync flags stay '-avz --delete' (NO silent --mkpath upgrade — older rsync still works); opt-in --mkpath appends one flag and a `run` against a NON-EXISTENT remote subdir succeeds (creates the path) instead of hitting rsync exit 11; opt-in --rsync-flags fully replaces the default and is not silently augmented; --mkpath + --rsync-flags together is rejected with a non-zero exit naming both flags; --help advertises both flags. Skips when rsync is missing."
+timeout_seconds = 120
+
+[[scenario]]
+name = "publish_project_metadata_renders"
+script = "scenarios/publish_project_metadata_renders.sh"
+owners = [
+    "wg-html-publish-2",
+    "show-host-and",
+]
+description = "Pins wg-html-publish-2 and show-host-and: project metadata (title / byline / abstract markdown) at the top of `wg html publish`-rendered pages, and empty-metadata publish output uses `hostname:/repo/path` in the browser title and minimal visible header instead of generic `workgraph`. Walks the cascade: per-deployment --title/--byline/--abstract on `add` wins over project-level [project] config, which wins over the auto-discovered <wg_dir>/about.md, and when nothing is set anywhere the project-header block is OMITTED while the source title/header remain specific. Verifies the abstract is rendered as markdown (h2/ul/li from a markdown source). Skips when rsync is missing."
+timeout_seconds = 120
+
+[[scenario]]
+name = "wg_html_msg_indicator"
+script = "scenarios/wg_html_msg_indicator.sh"
+owners = [
+    "wg-html-surface",
+]
+description = "Pins wg-html-surface: HTML export shows a message indicator on tasks with messages (parity with TUI envelope glyph). Verifies (1) .msg-indicator span on task-list rows that have messages, none on rows without; (2) status-class breakdown (msg-none/msg-unseen/msg-seen/msg-replied) maps to the same CoordinatorMessageStatus the TUI uses; (3) per-task page renders #messages-section with escaped bodies; (4) WG_TASKS JSON exposes msg bundle for messaged tasks only; (5) CSS provides theme-aware status colors + has-unread-msg row highlight; (6) panel.js gained renderMessagesPanelHtml + scrollPanelToMessages helpers + a data-msg-action click handler; (7) panel.js stays vanilla (no fetch / imports)."
+timeout_seconds = 60
+
+[[scenario]]
+name = "chat_native_endpoint_full_pipeline"
+script = "scenarios/chat_native_endpoint_full_pipeline.sh"
+owners = [
+    "fix-nex-chat",
+    "diagnose-wg-nex",
+]
+description = "Pins fix-nex-chat: the four stacked fixes from diagnose-wg-nex. Creates a native chat with --endpoint <URL> and asserts (A) wg sweep --dry-run does not flag the chat-loop task as orphaned (sweep.rs Fix A), (C) `wg spawn-task --dry-run .chat-0` includes `-e <URL>` and the provenance line records `task.endpoint` as the source (plan.rs Fix C), and CoordinatorState persists endpoint_override for TUI-reattach. Pure graph-state + dry-run check; no live LLM call required. Pre-fix the chat-loop task got reset to Open by sweep within ~2s and the dry-run silently dropped the endpoint URL."
+timeout_seconds = 30
+
+[[scenario]]
+name = "chat_died_panel_keys_reach_handler"
+script = "scenarios/chat_died_panel_keys_reach_handler.sh"
+owners = [
+    "fix-chat-died",
+    "fix-chat-tab",
+]
+description = "Pins fix-chat-died: when the embedded chat agent's PTY child exits (codex/claude/nex), the 'Chat agent died' panel offers R (retry) / E (edit config) / X (dismiss). Pre-fix, vendor_pty_active in handle_key was true even after the pane died because chat_pty_mode stays set so the render path knows to draw the panel; the keystroke fell through to a missing pane and was silently consumed. Asserts R/E/X (and Shift+R) reach the death-panel recovery branch when chat_pty_mode + RightPanel focus are still set, and that a live chat (no death info) still receives keystrokes."
+timeout_seconds = 60
+
+[[scenario]]
+name = "last_interaction_at_bumps_on_mutation"
+script = "scenarios/last_interaction_at_bumps_on_mutation.sh"
+owners = [
+    "revert-redo-fix",
+    "fix-tui-graph",
+    "smoke-gate-is",
+]
+description = "Pins the data-side contract behind the TUI activity sort introduced in revert-redo-fix (the redo of the reverted fix-tui-graph). Every task carries `last_interaction_at`; `modify_graph` auto-bumps it on substantive mutations (status, log, edits) and leaves untouched siblings alone. Tasks predating the field default to `created_at` on read so the TUI sort never sees a None. Heartbeats live in `service/registry.json` and never reach `modify_graph`, so they are naturally excluded — the cure for the prior 'every event yanks the viewport' regression. No daemon, no LLM."
+timeout_seconds = 30
+
+[[scenario]]
+name = "tui_perf_message_stats_pair_folds"
+script = "scenarios/tui_perf_message_stats_pair_folds.sh"
+owners = [
+    "fix-tui-perf",
+    "fix-tui-perf-2",
+    "diagnose-tui-scales",
+]
+description = "Pins fix-tui-perf-2 fix 1 (bench E from diagnose-tui-scales): `message_stats_pair_cached` over a 1000-task fixture must outperform the standalone `message_stats` + `coordinator_message_status` baseline by at least 1.5× and re-scans of unmodified files must be cache hits. A regression here would re-introduce the diagnose hot path #1 (each fs-change tick double-reading every messages/<task>.jsonl)."
+timeout_seconds = 180
+
+[[scenario]]
+name = "tui_perf_token_usage_cached"
+script = "scenarios/tui_perf_token_usage_cached.sh"
+owners = [
+    "fix-tui-perf",
+    "fix-tui-perf-2",
+    "diagnose-tui-scales",
+]
+description = "Pins fix-tui-perf-2 fix 2: `parse_token_usage_live_cached` must hit the (path, mtime) cache on unchanged files, turning a no-op refresh into a metadata syscall instead of a full JSONL re-parse. Regression would re-introduce the per-fs-event walk of every active agent's output.log identified as the second half of diagnose hot path #1."
+timeout_seconds = 180
+
+[[scenario]]
+name = "tui_responsive_under_500ms_latency"
+script = "scenarios/tui_responsive_under_500ms_latency.sh"
+owners = [
+    "fix-tui-must",
+    "fix-tui-perf",
+    "fix-tui-perf-2",
+]
+description = "Pins fix-tui-must: under simulated 500ms-latency filesystem (WG_ASYNC_FS_TEST_LATENCY_MS=500), the TUI's main-thread API on `AsyncFs` stays non-blocking — every request_*/cached_*/drain_responses/bump_chat_interaction call returns in < 50ms p99 even while the worker is stuck on a slow disk read. Regression here would re-expose the high-latency-FS freeze the user reported on 2026-05-04 ('TUI basically gets stuck')."
+timeout_seconds = 600
+
+[[scenario]]
+name = "publish_wcc_releases_paused_subgraph"
+script = "scenarios/publish_wcc_releases_paused_subgraph.sh"
+owners = [
+    "wg-publish-wcc",
+]
+description = "Pins wg-publish-wcc: `wg publish <task> --wcc` releases every task in the weakly-connected component of <task> in topological order (deps first). Asserts (1) leaf-publish on a 5-node paused linear chain unpauses every node, (2) diamond A→B; A→C; B→D; C→D — `publish d --wcc` releases all four, (3) `--wcc` and `--only` are mutually exclusive at parse time, and (4) per-task 'Task published' log timestamps are monotonically non-decreasing in dep→dependent order. Pre-task this required N invocations of `wg publish` for an N-task batch and agents were writing for-loops; the release shape addresses that ergonomic gap."
+timeout_seconds = 30
+
+[[scenario]]
+name = "codex_token_usage_capture"
+script = "scenarios/codex_token_usage_capture.sh"
+owners = [
+    "fix-codex-agent-2",
+]
+description = "Pins fix-codex-agent-2: Codex `exec --json` `turn.completed` usage events with input_tokens/cached_input_tokens/output_tokens/reasoning_output_tokens must populate WG token usage and estimated cost, while Claude assistant-message and native turn parsing still regressions-test cleanly. No live LLM call required."
+timeout_seconds = 180
+
+[[scenario]]
+name = "nex_current_data_prompt"
+script = "scenarios/nex_current_data_prompt.sh"
+owners = [
+    "fix-nex-agent",
+]
+description = "Pins fix-nex-agent: real `wg nex --eval-mode` CLI invocations against a local OAI-compatible endpoint must send current-data prompt guidance, expose web_fetch/web_search/bash in the default tool surface, accept a non-coder model spec, and make --minimal-tools explicitly fall back to bash without web_fetch/web_search."
+timeout_seconds = 60

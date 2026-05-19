@@ -1,7 +1,7 @@
 //! Conversation journal for the native executor.
 //!
 //! Persists every message exchange to a structured, provider-agnostic JSONL file
-//! at `.workgraph/output/<task-id>/conversation.jsonl`. Enables resume, debugging,
+//! at `.wg/output/<task-id>/conversation.jsonl`. Enables resume, debugging,
 //! evaluation, and audit.
 //!
 //! See docs/research/unified-conversation-layer-design.md §3 for the specification.
@@ -41,7 +41,7 @@ pub enum JournalEntryKind {
         system_prompt: String,
         /// Tool definitions available in this conversation.
         tools: Vec<ToolDefinition>,
-        /// Task ID if running within workgraph.
+        /// Task ID if running within WG.
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
     },
@@ -595,11 +595,11 @@ mod tests {
 
     #[test]
     fn test_journal_path_construction() {
-        let dir = Path::new("/tmp/.workgraph");
+        let dir = Path::new("/tmp/.wg");
         let path = journal_path(dir, "my-task-id");
         assert_eq!(
             path,
-            Path::new("/tmp/.workgraph/output/my-task-id/conversation.jsonl")
+            Path::new("/tmp/.wg/output/my-task-id/conversation.jsonl")
         );
     }
 

@@ -213,11 +213,11 @@ present for >=30% of models, Phase 3 weights activate.
 
 ### 3.5 Tier Assignment
 
-Models are assigned to workgraph tiers based on **output pricing** relative to
+Models are assigned to wg tiers based on **output pricing** relative to
 the median, mapping the benchmark registry's three-tier classification
-(frontier/mid/budget) to workgraph's three tiers (premium/standard/fast):
+(frontier/mid/budget) to wg's three tiers (premium/standard/fast):
 
-| Benchmark Tier | Workgraph Tier | Pricing Range (current) |
+| Benchmark Tier | wg Tier | Pricing Range (current) |
 |---------------|----------------|------------------------|
 | `budget` | `fast` | $0.02 – $0.95/Mtok output |
 | `mid` | `standard` | $0.97 – $3.40/Mtok output |
@@ -237,7 +237,7 @@ The profile resolves `tiers.fast` to `fast_candidates[0]`, etc.
 ### 3.6 Hard Filters (applied before ranking)
 
 1. **Tool support required** — models without `supports_tools: true` are excluded
-   (workgraph agents need function calling)
+   (wg agents need function calling)
 2. **Minimum context window** — exclude models with `context_window < 32_000`
 3. **Minimum output tokens** — exclude models with `max_output_tokens < 4_000`
 4. **Non-zero pricing** — exclude models with $0 pricing (typically deprecated)
@@ -340,7 +340,7 @@ individual tiers: `tiers.premium = "openrouter:anthropic/claude-opus-4"`.
 ### 5.1 Stored in config.toml
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 
 # Provider profile: "anthropic" (default), "openrouter", "openai"
 profile = "openrouter"
@@ -364,7 +364,7 @@ Dynamic profiles cache their resolved tier mappings to avoid re-computing on
 every model resolution call:
 
 ```
-.workgraph/service/profile_cache.json
+.wg/service/profile_cache.json
 ```
 
 ```json

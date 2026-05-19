@@ -32,7 +32,7 @@ pub struct AgentStats {
     pub idle_iterations: u32,
 }
 
-/// Persistent agent state - saved to .workgraph/agents/<actor-id>.json
+/// Persistent agent state - saved to .wg/agents/<actor-id>.json
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentState {
     /// Actor ID this state belongs to
@@ -201,7 +201,7 @@ pub fn run(
     let path = graph_path(dir);
 
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     // Load config and apply defaults

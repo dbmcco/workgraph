@@ -14,7 +14,7 @@
 
 ### Session TTL
 - Claude session persistence is server-side. Exact TTL is not publicly documented but empirical evidence suggests sessions survive for **hours to days** (not weeks).
-- **Current blocker**: Workgraph spawns agents with `--no-session-persistence` (see `src/commands/spawn/execution.rs:401,437,466`). This flag **must be removed** (or made configurable) to enable `--resume` for resurrection.
+- **Current blocker**: wg spawns agents with `--no-session-persistence` (see `src/commands/spawn/execution.rs:401,437,466`). This flag **must be removed** (or made configurable) to enable `--resume` for resurrection.
 - Sessions created with `--no-session-persistence` are ephemeral and **cannot** be resumed.
 
 ### Context preservation
@@ -25,7 +25,7 @@
 ## 2. Detection Flow: How the Coordinator Detects Unread Messages on Completed Tasks
 
 ### Current message system
-Messages are stored in `.workgraph/messages/{task-id}.jsonl`. Each message has a monotonic ID, timestamp, sender, body, and delivery status (Sent → Delivered → Read → Acknowledged). Read cursors per agent are in `.workgraph/messages/.cursors/{agent-id}.{task-id}`.
+Messages are stored in `.wg/messages/{task-id}.jsonl`. Each message has a monotonic ID, timestamp, sender, body, and delivery status (Sent → Delivered → Read → Acknowledged). Read cursors per agent are in `.wg/messages/.cursors/{agent-id}.{task-id}`.
 
 ### Proposed detection mechanism
 The coordinator poll loop (`src/commands/service/coordinator.rs`) already runs on each tick. Add a check:
@@ -53,7 +53,7 @@ Done → [message arrives] → InProgress → Done (again)
 **Detailed sequence:**
 
 1. Task is `Done`. Agent exited. `session_id` stored in stream.jsonl Init event (or agent registry).
-2. New message arrives at `.workgraph/messages/{task-id}.jsonl`.
+2. New message arrives at `.wg/messages/{task-id}.jsonl`.
 3. Coordinator detects unread message on Done task (next poll tick).
 4. Coordinator sets task status to `InProgress`, sets `assigned` to new agent ID.
 5. Coordinator spawns agent with `claude --resume <session-id> -p "New message: <body>"`.
@@ -168,7 +168,7 @@ Any message to a completed task triggers resurrection, which spawns an agent wit
 
 **Tier 4 — Message content scanning (future):**
 - Scan resurrection-triggering messages for prompt injection patterns.
-- This is orthogonal to workgraph and belongs in the executor layer.
+- This is orthogonal to wg and belongs in the executor layer.
 
 ### Recommendation
 Implement Tier 1 + Tier 2 for v1. Tier 3 is a config option for sensitive workflows. Tier 4 is out of scope.

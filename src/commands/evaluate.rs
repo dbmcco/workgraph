@@ -7,7 +7,7 @@ use workgraph::agency::{
     self, Evaluation, EvaluatorInput, FlipComparisonInput, FlipInferenceInput, eval_source,
     load_all_evaluations_or_warn, load_role, load_tradeoff, record_evaluation,
     record_evaluation_with_inference, render_evaluator_prompt, render_flip_comparison_prompt,
-    render_flip_inference_prompt, render_identity_prompt_rich, resolve_all_components,
+    render_flip_inference_prompt, render_identity_prompt_rich, resolve_all_components_for_scope,
     resolve_outcome,
 };
 use workgraph::config::Config;
@@ -178,7 +178,7 @@ pub fn run(
 ) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        bail!("Workgraph not initialized. Run `wg init` first.");
+        bail!("WG not initialized. Run `wg init` first.");
     }
 
     let graph = load_graph(&path)?;
@@ -285,7 +285,17 @@ pub fn run(
             let eval_tradeoff_path = tradeoffs_dir.join(format!("{}.yaml", eval_agent.tradeoff_id));
             let eval_tradeoff = load_tradeoff(&eval_tradeoff_path).ok()?;
             let workgraph_root = dir;
-            let resolved_skills = resolve_all_components(&eval_role, workgraph_root, &agency_dir);
+            // Bias composer toward `meta:evaluator`-scoped components when
+            // composing the evaluator's own identity. Untagged components
+            // still flow through (backward-compat); off-scope ones are
+            // dropped so a bundled role doesn't pull in assigner/evolver
+            // skills it shouldn't show as evaluator capabilities.
+            let resolved_skills = resolve_all_components_for_scope(
+                &eval_role,
+                workgraph_root,
+                &agency_dir,
+                Some("meta:evaluator"),
+            );
             let outcome = resolve_outcome(&eval_role.outcome_id, &agency_dir);
             Some(render_identity_prompt_rich(
                 &eval_role,
@@ -525,6 +535,7 @@ pub fn run(
         timestamp,
         model: task_model.clone(),
         source: "llm".to_string(),
+        loop_iteration: task.loop_iteration,
     };
 
     // Step 8: Save evaluation, update performance records, and trigger retrospective inference
@@ -738,6 +749,7 @@ pub fn run(
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 model: None,
                 source: eval_source::LLM.to_string(),
+                loop_iteration: task.loop_iteration,
             };
 
             if let Err(e) = record_evaluation(&eval_of_evaluator, &agency_dir) {
@@ -763,7 +775,7 @@ pub fn run_flip(
 ) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        bail!("Workgraph not initialized. Run `wg init` first.");
+        bail!("WG not initialized. Run `wg init` first.");
     }
 
     let graph = load_graph(&path)?;
@@ -1049,6 +1061,7 @@ pub fn run_flip(
         timestamp,
         model: task_model.clone(),
         source: eval_source::FLIP.to_string(),
+        loop_iteration: task.loop_iteration,
     };
 
     // Save evaluation
@@ -1210,7 +1223,7 @@ pub fn run_record(
 
     let path = super::graph_path(dir);
     if !path.exists() {
-        bail!("Workgraph not initialized. Run `wg init` first.");
+        bail!("WG not initialized. Run `wg init` first.");
     }
 
     let graph = load_graph(&path)?;
@@ -1265,6 +1278,7 @@ pub fn run_record(
         timestamp,
         model: None,
         source: source.to_string(),
+        loop_iteration: task.loop_iteration,
     };
 
     // Save evaluation and trigger retrospective inference for learning assignments
@@ -1796,7 +1810,7 @@ pub fn apply_gate_decision(
 ) -> Result<GateAction> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        bail!("Workgraph not initialized. Run `wg init` first.");
+        bail!("WG not initialized. Run `wg init` first.");
     }
 
     // Snapshot prerequisites and always bump gate_attempts so the caller
@@ -2186,6 +2200,7 @@ mod tests {
             timestamp: String::new(),
             model: None,
             source: String::new(),
+            loop_iteration: 0,
         };
         assert_eq!(
             GateDecision::from_evaluation(&mk_eval(0.9), &config).decision,
@@ -2244,6 +2259,7 @@ mod tests {
             timestamp: String::new(),
             model: None,
             source: "llm".to_string(),
+            loop_iteration: 0,
         }
     }
 
@@ -2343,7 +2359,7 @@ mod tests {
         // After an in-place rescue, the spawn helper should inject the
         // evaluator's notes into the next agent's previous_attempt_context.
         // We exercise this end-to-end by:
-        //   1. Writing an evaluation JSON to .workgraph/agency/evaluations/
+        //   1. Writing an evaluation JSON to .wg/agency/evaluations/
         //   2. Running check_eval_gate (which transitions task to Open and
         //      bumps rescue_count).
         //   3. Calling build_previous_attempt_context() and asserting the

@@ -309,7 +309,7 @@ mod tests {
     use workgraph::graph::{Status, Task, WorkGraph};
 
     fn write_graph(dir: &Path, tasks: Vec<Task>) {
-        let workgraph_dir = dir.join(".workgraph");
+        let workgraph_dir = dir.join(".wg");
         std::fs::create_dir_all(&workgraph_dir).unwrap();
         let graph_path = workgraph_dir.join("graph.jsonl");
         let mut graph = WorkGraph::new();
@@ -339,10 +339,9 @@ mod tests {
         };
         write_graph(dir, vec![coord, dependent]);
 
-        run_chat_rename(&dir.join(".workgraph"), false, true).unwrap();
+        run_chat_rename(&dir.join(".wg"), false, true).unwrap();
 
-        let graph =
-            workgraph::parser::load_graph(&dir.join(".workgraph").join("graph.jsonl")).unwrap();
+        let graph = workgraph::parser::load_graph(&dir.join(".wg").join("graph.jsonl")).unwrap();
 
         // .chat-3 exists with renamed title and tag
         let migrated = graph.get_task(".chat-3").expect("chat-3 should exist");
@@ -372,11 +371,10 @@ mod tests {
         };
         write_graph(dir, vec![coord]);
 
-        run_chat_rename(&dir.join(".workgraph"), false, true).unwrap();
-        run_chat_rename(&dir.join(".workgraph"), false, true).unwrap();
+        run_chat_rename(&dir.join(".wg"), false, true).unwrap();
+        run_chat_rename(&dir.join(".wg"), false, true).unwrap();
 
-        let graph =
-            workgraph::parser::load_graph(&dir.join(".workgraph").join("graph.jsonl")).unwrap();
+        let graph = workgraph::parser::load_graph(&dir.join(".wg").join("graph.jsonl")).unwrap();
         assert!(graph.get_task(".chat-0").is_some());
         assert!(graph.get_task(".coordinator-0").is_none());
     }
@@ -412,10 +410,9 @@ mod tests {
         };
         write_graph(dir, vec![chat, compact, archive, blocked]);
 
-        run_retire_compact_archive(&dir.join(".workgraph"), false, true).unwrap();
+        run_retire_compact_archive(&dir.join(".wg"), false, true).unwrap();
 
-        let graph =
-            workgraph::parser::load_graph(&dir.join(".workgraph").join("graph.jsonl")).unwrap();
+        let graph = workgraph::parser::load_graph(&dir.join(".wg").join("graph.jsonl")).unwrap();
         assert_eq!(
             graph.get_task(".compact-0").unwrap().status,
             Status::Abandoned
@@ -444,11 +441,10 @@ mod tests {
         };
         write_graph(dir, vec![compact]);
 
-        run_retire_compact_archive(&dir.join(".workgraph"), false, true).unwrap();
-        run_retire_compact_archive(&dir.join(".workgraph"), false, true).unwrap();
+        run_retire_compact_archive(&dir.join(".wg"), false, true).unwrap();
+        run_retire_compact_archive(&dir.join(".wg"), false, true).unwrap();
 
-        let graph =
-            workgraph::parser::load_graph(&dir.join(".workgraph").join("graph.jsonl")).unwrap();
+        let graph = workgraph::parser::load_graph(&dir.join(".wg").join("graph.jsonl")).unwrap();
         assert_eq!(
             graph.get_task(".compact-0").unwrap().status,
             Status::Abandoned
@@ -468,10 +464,9 @@ mod tests {
         };
         write_graph(dir, vec![coord]);
 
-        run_chat_rename(&dir.join(".workgraph"), true, true).unwrap();
+        run_chat_rename(&dir.join(".wg"), true, true).unwrap();
 
-        let graph =
-            workgraph::parser::load_graph(&dir.join(".workgraph").join("graph.jsonl")).unwrap();
+        let graph = workgraph::parser::load_graph(&dir.join(".wg").join("graph.jsonl")).unwrap();
         // Legacy id still present, no chat- yet
         assert!(graph.get_task(".coordinator-1").is_some());
         assert!(graph.get_task(".chat-1").is_none());
@@ -642,6 +637,14 @@ pub(crate) fn migrate_one(path: &Path, dry_run: bool) -> Result<ConfigMigrateRes
     // 3. Fix known stale model strings (claude-sonnet-4 → -4-6, etc).
     fix_stale_model_strings(&mut doc, &mut rewritten);
 
+    // 4. Strip orphaned [openrouter] section when the project has no
+    //    openrouter usage. Default-only [openrouter] is just log spam:
+    //    the registry-refresh job will probe OpenRouter every poll if a
+    //    section is present, even on claude-cli / codex-cli projects
+    //    that have no API key. Idempotent — running again on a config
+    //    where it was already removed is a no-op.
+    drop_orphaned_openrouter(&mut doc, &mut removed);
+
     result.removed_keys = removed;
     result.renamed_keys = renamed;
     result.rewritten_values = rewritten;
@@ -720,6 +723,60 @@ fn drop_deprecated(doc: &mut toml::Value, removed: &mut Vec<String>) {
     }
 }
 
+/// Remove the `[openrouter]` section when nothing in the config actually
+/// uses OpenRouter. "Uses" means: a top-level model spec / tier / endpoint
+/// references the `openrouter:` provider prefix. If anything points at
+/// openrouter we leave the section alone — the cost-cap settings inside
+/// might be intentional.
+///
+/// This catches the common case where an old `wg init` (before the
+/// fix-remove-openrouter change) wrote a default `[openrouter]` block
+/// into a claude-cli or codex-cli project. The default block has no
+/// API key, so the daemon's registry-refresh job spins on auth errors.
+fn drop_orphaned_openrouter(doc: &mut toml::Value, removed: &mut Vec<String>) {
+    let table = match doc.as_table_mut() {
+        Some(t) => t,
+        None => return,
+    };
+    if !table.contains_key("openrouter") {
+        return;
+    }
+
+    // Scan for any string in the doc that mentions "openrouter" — model
+    // specs, tier values, endpoint provider/url, etc. The check has to
+    // skip the [openrouter] section itself, otherwise a default section
+    // would always look "in use".
+    let mut uses_openrouter = false;
+    for (k, v) in table.iter() {
+        if k == "openrouter" {
+            continue;
+        }
+        if value_mentions_openrouter(v) {
+            uses_openrouter = true;
+            break;
+        }
+    }
+    if uses_openrouter {
+        return;
+    }
+
+    table.remove("openrouter");
+    removed.push("openrouter (orphaned section — no openrouter usage in config)".to_string());
+}
+
+/// Recursive predicate: returns true if any string-leaf inside `v`
+/// mentions "openrouter" — model specs, endpoint provider names, URLs,
+/// etc. Used by [`drop_orphaned_openrouter`] to decide whether the
+/// section is still load-bearing.
+fn value_mentions_openrouter(v: &toml::Value) -> bool {
+    match v {
+        toml::Value::String(s) => s.contains("openrouter"),
+        toml::Value::Array(arr) => arr.iter().any(value_mentions_openrouter),
+        toml::Value::Table(t) => t.values().any(value_mentions_openrouter),
+        _ => false,
+    }
+}
+
 fn rename_legacy_fields(doc: &mut toml::Value, renamed: &mut Vec<(String, String)>) {
     let table = match doc.as_table_mut() {
         Some(t) => t,
@@ -772,6 +829,16 @@ const STALE_MODEL_REWRITES: &[(&str, &str)] = &[
     ("anthropic/claude-sonnet-4", "anthropic/claude-sonnet-4-6"),
     ("anthropic/claude-haiku-4", "anthropic/claude-haiku-4-5"),
     ("anthropic/claude-opus-4", "anthropic/claude-opus-4-7"),
+    // Codex / OpenAI model rewrites (2026-04-28):
+    // o1-pro deprecated 2026-10-23; gpt-5.4 is the new balanced default.
+    ("codex:o1-pro", "codex:gpt-5.4"),
+    // Old tier names predating the gpt-5.4 generation.
+    ("codex:gpt-5-mini", "codex:gpt-5.4-mini"),
+    ("codex:gpt-5", "codex:gpt-5.4"),
+    // gpt-5-codex sunsets 2026-07-23; gpt-5.4 is the direct replacement.
+    ("codex:gpt-5-codex", "codex:gpt-5.4"),
+    // gpt-5.4-pro superseded by gpt-5.5 (newer, cheaper at $5/$30 vs $30/$180).
+    ("codex:gpt-5.4-pro", "codex:gpt-5.5"),
 ];
 
 fn fix_stale_model_strings(doc: &mut toml::Value, rewritten: &mut Vec<(String, String, String)>) {
@@ -786,6 +853,18 @@ fn fix_stale_model_strings(doc: &mut toml::Value, rewritten: &mut Vec<(String, S
                 rewritten.push((path.to_string(), s.clone(), new_str.clone()));
                 return Some(new_str);
             }
+        }
+        // Generic rewrite for the deprecated `local:` / `oai-compat:` prefixes
+        // — replace with the canonical `nex:` (matches `wg nex`).
+        // Only fires on values that match `<deprecated>:<rest>` where
+        // <deprecated> is in `deprecated_provider_prefix_replacement`.
+        if let Some((prefix, rest)) = s.split_once(':')
+            && let Some(replacement) =
+                workgraph::config::deprecated_provider_prefix_replacement(prefix)
+        {
+            let new_str = format!("{}:{}", replacement, rest);
+            rewritten.push((path.to_string(), s.clone(), new_str.clone()));
+            return Some(new_str);
         }
         None
     });
@@ -954,6 +1033,251 @@ premium = "claude:opus"
             "canonical config should be a no-op; got {:?}",
             r
         );
+    }
+
+    #[test]
+    fn fixes_stale_codex_o1_pro_to_gpt54() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "codex:o1-pro"
+
+[tiers]
+fast = "codex:gpt-5-mini"
+standard = "codex:gpt-5"
+premium = "codex:o1-pro"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            r.rewritten_values
+                .iter()
+                .any(|(_, old, new)| old == "codex:o1-pro" && new == "codex:gpt-5.4"),
+            "should rewrite codex:o1-pro to codex:gpt-5.4; got {:?}",
+            r.rewritten_values,
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            migrated.contains("codex:gpt-5.4"),
+            "migrated should contain codex:gpt-5.4"
+        );
+        assert!(
+            !migrated.contains("\"codex:o1-pro\""),
+            "migrated should not contain codex:o1-pro"
+        );
+        assert!(
+            !migrated.contains("\"codex:gpt-5-mini\""),
+            "migrated should not contain codex:gpt-5-mini"
+        );
+        assert!(
+            !migrated.contains("\"codex:gpt-5\""),
+            "migrated should not contain bare codex:gpt-5"
+        );
+    }
+
+    #[test]
+    fn fixes_stale_codex_gpt5_codex_to_gpt54() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[tiers]
+standard = "codex:gpt-5-codex"
+premium = "codex:gpt-5.4-pro"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            r.rewritten_values
+                .iter()
+                .any(|(_, old, new)| old == "codex:gpt-5-codex" && new == "codex:gpt-5.4"),
+            "should rewrite codex:gpt-5-codex to codex:gpt-5.4; got {:?}",
+            r.rewritten_values,
+        );
+        assert!(
+            r.rewritten_values
+                .iter()
+                .any(|(_, old, new)| old == "codex:gpt-5.4-pro" && new == "codex:gpt-5.5"),
+            "should rewrite codex:gpt-5.4-pro to codex:gpt-5.5; got {:?}",
+            r.rewritten_values,
+        );
+    }
+
+    #[test]
+    fn rewrites_deprecated_local_prefix_to_nex() {
+        // `local:` is the deprecated alias for `nex:` (canonical, matches
+        // the `wg nex` subcommand). `wg migrate config` rewrites it.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "local:qwen3-coder-30b"
+
+[tiers]
+fast = "local:qwen3-coder-30b"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            r.rewritten_values
+                .iter()
+                .any(|(_, old, new)| old == "local:qwen3-coder-30b"
+                    && new == "nex:qwen3-coder-30b"),
+            "should rewrite local:qwen3-coder-30b to nex:qwen3-coder-30b; got {:?}",
+            r.rewritten_values,
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("\"nex:qwen3-coder-30b\""));
+        assert!(!migrated.contains("\"local:qwen3-coder-30b\""));
+    }
+
+    #[test]
+    fn rewrites_deprecated_oai_compat_prefix_to_nex() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "oai-compat:gpt-5"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            r.rewritten_values
+                .iter()
+                .any(|(_, old, new)| old == "oai-compat:gpt-5" && new == "nex:gpt-5"),
+            "should rewrite oai-compat:gpt-5 to nex:gpt-5; got {:?}",
+            r.rewritten_values,
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("\"nex:gpt-5\""));
+        assert!(!migrated.contains("\"oai-compat:gpt-5\""));
+    }
+
+    #[test]
+    fn migrate_writes_pre_migrate_backup() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "local:qwen3-coder"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(r.wrote);
+        let backup = r.backup_path.expect("backup path must be set on a write");
+        assert!(backup.exists(), "backup file must exist on disk");
+        let backup_body = std::fs::read_to_string(&backup).unwrap();
+        // Backup is the pre-migration content — still the deprecated prefix.
+        assert!(backup_body.contains("local:qwen3-coder"));
+    }
+
+    #[test]
+    fn drops_orphaned_openrouter_section_on_claude_cli_project() {
+        // A claude-cli project should never carry a default [openrouter]
+        // section. The registry-refresh job would otherwise probe
+        // OpenRouter every poll and fill the daemon log with auth errors.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "claude:opus"
+
+[tiers]
+fast = "claude:haiku"
+standard = "claude:sonnet"
+premium = "claude:opus"
+
+[openrouter]
+cap_behavior = "escalate"
+key_status_check_interval_minutes = 5
+warn_at_usage_percent = 80
+cost_estimation_buffer = 1.2
+enable_cache_tracking = true
+track_session_costs = true
+persist_cost_history = false
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            r.removed_keys.iter().any(|k| k.starts_with("openrouter")),
+            "should remove orphaned [openrouter] section; got {:?}",
+            r.removed_keys,
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !migrated.lines().any(|l| l.trim() == "[openrouter]"),
+            "migrated config must not contain [openrouter]; got:\n{}",
+            migrated,
+        );
+        // claude config remains intact
+        assert!(migrated.contains("claude:opus"));
+    }
+
+    #[test]
+    fn keeps_openrouter_section_when_used() {
+        // If the project has an openrouter:* model anywhere, the
+        // [openrouter] section is load-bearing — leave it alone.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "openrouter:anthropic/claude-opus-4-7"
+
+[tiers]
+premium = "openrouter:anthropic/claude-opus-4-7"
+
+[openrouter]
+cost_cap_global_usd = 5.0
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            !r.removed_keys.iter().any(|k| k.starts_with("openrouter")),
+            "must not remove [openrouter] when a model spec uses it; got {:?}",
+            r.removed_keys,
+        );
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            migrated.lines().any(|l| l.trim() == "[openrouter]"),
+            "migrated config must keep [openrouter]; got:\n{}",
+            migrated,
+        );
+        assert!(migrated.contains("cost_cap_global_usd"));
+    }
+
+    #[test]
+    fn drop_orphaned_openrouter_is_idempotent() {
+        // Running migrate twice on a config that's already had its
+        // orphan section removed must be a no-op for the openrouter check.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            tmp.path(),
+            r#"
+[agent]
+model = "claude:opus"
+
+[tiers]
+fast = "claude:haiku"
+standard = "claude:sonnet"
+premium = "claude:opus"
+"#,
+        );
+        let r = migrate_one(&path, false).unwrap();
+        assert!(
+            !r.removed_keys.iter().any(|k| k.starts_with("openrouter")),
+            "first pass on a config without [openrouter] should not report removing it; got {:?}",
+            r.removed_keys,
+        );
+        // Second pass is also a no-op
+        let r2 = migrate_one(&path, false).unwrap();
+        assert!(r2.is_noop(), "second pass should be a no-op; got {:?}", r2);
     }
 
     #[test]

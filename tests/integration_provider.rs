@@ -266,6 +266,10 @@ is_default = true
     std::fs::write(tmp.path().join("config.toml"), config_content).unwrap();
 
     let provider = create_provider(tmp.path(), "deepseek/deepseek-chat").unwrap();
+    // [native_executor].provider is preserved verbatim; the user wrote
+    // "openai" so that's what `provider.name()` reports. Routing still
+    // takes the OAI-compat path — the match arm in create_provider_ext
+    // treats "openai" and "oai-compat" identically.
     assert_eq!(provider.name(), "openai");
     assert_eq!(provider.model(), "deepseek/deepseek-chat");
 }
@@ -311,6 +315,7 @@ fn test_endpoint_api_key_resolution() {
                 api_key: Some("sk-ant-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -322,6 +327,7 @@ fn test_endpoint_api_key_resolution() {
                 api_key: Some("sk-oai-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: false,
                 context_window: None,
@@ -333,6 +339,7 @@ fn test_endpoint_api_key_resolution() {
                 api_key: Some("sk-or-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: false,
                 context_window: None,
@@ -366,6 +373,7 @@ fn test_endpoint_default_selection() {
                 api_key: Some("sk-staging".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: false,
                 context_window: None,
@@ -377,6 +385,7 @@ fn test_endpoint_default_selection() {
                 api_key: Some("sk-prod".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 model: None,
                 is_default: true,
                 context_window: None,
@@ -601,12 +610,12 @@ fn test_fallback_tier_defaults() {
         CLAUDE_HAIKU_MODEL_ID
     );
 
-    // Verification → Standard tier → sonnet
+    // Verification → Premium tier → opus
     assert_eq!(
         config
             .resolve_model_for_role(DispatchRole::Verification)
             .model,
-        CLAUDE_SONNET_MODEL_ID
+        CLAUDE_OPUS_MODEL_ID
     );
 
     // Evaluator → Fast tier → haiku
@@ -635,11 +644,7 @@ fn test_model_registry_default_models() {
     let registry = ModelRegistry::with_defaults();
 
     // Should contain models from multiple providers
-    assert!(
-        registry
-            .get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
-            .is_some()
-    );
+    assert!(registry.get("anthropic/claude-opus-4-6").is_some());
     assert!(registry.get("openai/gpt-4o").is_some());
     assert!(registry.get("deepseek/deepseek-chat").is_some());
     assert!(registry.get("google/gemini-2.5-pro").is_some());
@@ -649,9 +654,7 @@ fn test_model_registry_default_models() {
 fn test_model_registry_tier_classification() {
     let registry = ModelRegistry::with_defaults();
 
-    let opus = registry
-        .get(&format!("anthropic/{CLAUDE_OPUS_MODEL_ID}"))
-        .unwrap();
+    let opus = registry.get("anthropic/claude-opus-4-6").unwrap();
     assert_eq!(opus.tier, ModelTier::Frontier);
 
     let haiku = registry.get("anthropic/claude-haiku-4-5").unwrap();

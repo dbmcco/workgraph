@@ -7,9 +7,9 @@
 
 | File | Path | Purpose |
 |------|------|---------|
-| Global config | `~/.workgraph/config.toml` | User-wide defaults |
-| Local config | `.workgraph/config.toml` | Project-specific overrides |
-| Matrix credentials | `~/.config/workgraph/matrix.toml` | Sensitive Matrix login (separate to avoid committing secrets) |
+| Global config | `~/.wg/config.toml` | User-wide defaults |
+| Local config | `.wg/config.toml` | Project-specific overrides |
+| Matrix credentials | `~/.config/wg/matrix.toml` | Sensitive Matrix login (separate to avoid committing secrets) |
 
 **Merge rule:** `Config::load_merged()` deep-merges global + local, with local values winning. `ConfigSource` tracks provenance (Global/Local/Default) for `wg config --list`.
 
@@ -45,7 +45,7 @@
 | `compaction_threshold_ratio` | f64 | `0.8` | No | Context window fraction for compaction |
 | `eval_frequency` | string | `"every_5"` | No | How often to evaluate coordinator turns |
 | `worktree_isolation` | bool | `false` | No | Use git worktrees for isolation |
-| `max_coordinators` | usize | `4` | No | Max simultaneous coordinators |
+| `max_coordinators` | usize | `16` | No | Max simultaneous coordinators |
 | `archive_retention_days` | u64 | `7` | No | Days to keep archived coordinators |
 | `registry_refresh_interval` | u64 | `86400` | No | Model registry refresh interval (seconds) |
 | `max_verify_failures` | u32 | `3` | No | Max verify failures before giving up |
@@ -236,8 +236,8 @@ Already exists at `src/commands/setup.rs`. Interactive wizard that:
 5. Offers to auto-discover and register models from API response
 6. Asks about agency (auto_assign, auto_evaluate)
 7. Asks about max_agents
-8. Writes to global config (`~/.workgraph/config.toml`)
-9. Configures `~/.claude/CLAUDE.md` with workgraph directives
+8. Writes to global config (`~/.wg/config.toml`)
+9. Configures `~/.claude/CLAUDE.md` with wg directives
 10. Also configures project-level `CLAUDE.md`
 
 Non-interactive mode via `--provider` flag with `--api-key-file`, `--api-key-env`, `--url`, `--model`, `--skip-validation`.
@@ -276,7 +276,7 @@ Non-interactive mode via `--provider` flag with `--api-key-file`, `--api-key-env
 | `git` installed | `which git` | Required for worktree isolation |
 | `tmux` installed | `which tmux` | Required for `wg server` |
 | Local inference server | HTTP check `localhost:11434/8000/8080` | Required if executor=local |
-| `.workgraph/` initialized | `dir.exists()` | Required for most operations |
+| `.wg/` initialized | `dir.exists()` | Required for most operations |
 
 ## 8. Config Health Check / Validation
 

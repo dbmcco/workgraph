@@ -34,7 +34,7 @@ doesn't belong.
 
 The coordinator is best modeled as a *sidecar entity* -- not a graph node, but a
 first-class object with its own state file that the TUI and CLI can query. This
-follows the same pattern as `AgentRegistry` (`.workgraph/service/agents.json`):
+follows the same pattern as `AgentRegistry` (`.wg/service/agents.json`):
 operational metadata stored alongside the graph, not in it.
 
 ### 3. How would coordinator activities show up?
@@ -65,7 +65,7 @@ machine-readable events while keeping daemon.log for low-level debugging.
 
 ### 4. What about multiple coordinators or restarts?
 
-The coordinator entity is **singleton per workgraph** and persists across restarts:
+The coordinator entity is **singleton per wg** and persists across restarts:
 
 - `coordinator-state.json` already persists tick count, config, last tick time
 - The new `coordinator-activity.jsonl` appends across sessions (rotated by size)
@@ -178,7 +178,7 @@ pub enum ActivityEvent {
 
 ### Storage
 
-File: `.workgraph/service/coordinator-activity.jsonl`
+File: `.wg/service/coordinator-activity.jsonl`
 
 - Append-only JSONL (one `ActivityEntry` per line)
 - Rotated when > 1MB (keep one backup: `coordinator-activity.jsonl.1`)

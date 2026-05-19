@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::config::MatrixConfig;
 
-/// State directory name within .workgraph
+/// State directory name within .wg
 const MATRIX_STATE_DIR: &str = "matrix";
 
 /// Incoming Matrix message from a room
@@ -142,7 +142,7 @@ impl MatrixClient {
                 "user": localpart
             },
             "password": password,
-            "initial_device_display_name": "workgraph"
+            "initial_device_display_name": "WG"
         });
 
         let resp = http
@@ -558,7 +558,7 @@ pub enum VerificationEvent {
 /// and disconnects.
 ///
 /// # Arguments
-/// * `workgraph_dir` - Path to the .workgraph directory
+/// * `workgraph_dir` - Path to the .wg directory
 /// * `message` - The notification message to send
 pub async fn send_notification(workgraph_dir: &Path, message: &str) -> Result<()> {
     let config = MatrixConfig::load()?;

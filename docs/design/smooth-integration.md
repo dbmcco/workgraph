@@ -10,9 +10,9 @@
 
 The question is not "how do we merge nikete's code" but **"what abstractions and interfaces make integration frictionless?"**
 
-We want to make it as easy as possible for nikete — and any future VX system — to work with workgraph without requiring deep coupling, invasive merges, or synchronized releases. The ideal outcome: nikete can build his VX exchange client as an independent tool that talks to `wg` through stable, documented interfaces, while we continue evolving core features without breaking his tooling.
+We want to make it as easy as possible for nikete — and any future VX system — to work with wg without requiring deep coupling, invasive merges, or synchronized releases. The ideal outcome: nikete can build his VX exchange client as an independent tool that talks to `wg` through stable, documented interfaces, while we continue evolving core features without breaking his tooling.
 
-This means designing workgraph as a **platform** rather than a **monolith**. External systems should be able to observe, react to, and extend workgraph behavior through well-defined surfaces — not by forking and modifying internals.
+This means designing wg as a **platform** rather than a **monolith**. External systems should be able to observe, react to, and extend wg behavior through well-defined surfaces — not by forking and modifying internals.
 
 ---
 
@@ -52,7 +52,7 @@ These don't exist yet but are needed for VX integration:
 | `wg veracity scores --json` | Query per-task veracity scores | Aggregation view. |
 | `wg veracity sensitivity <task-id> <level>` | Set task sensitivity | Requires new `sensitivity` field on Task. |
 | `wg veracity check --json` | Validate sensitivity constraints | Graph constraint checker. |
-| `wg capabilities --json` | Advertise what this workgraph instance can do | See §3.4 below. |
+| `wg capabilities --json` | Advertise what this WG instance can do | See §3.4 below. |
 
 **Design principle:** Every `wg veracity` command should have `--json` from day one. These are integration-facing by nature.
 
@@ -62,17 +62,17 @@ External systems touch these file formats directly or indirectly:
 
 | Format | Location | Consumers | Stability |
 |--------|----------|-----------|-----------|
-| Graph JSONL | `.workgraph/graph.jsonl` | Federation peers, backup tools | **High** — append-only, line-per-task |
-| Operations log | `.workgraph/log/operations.jsonl` | Audit tools, VX data flow events | **High** — append-only |
-| Evaluation JSON | `.workgraph/agency/evaluations/*.json` | VX reward mapping | **Medium** — add fields with `serde(default)` |
-| Agent YAML | `.workgraph/agency/agents/*.yaml` | Federation, peer identity | **Medium** |
-| Federation config | `.workgraph/federation.yaml` | Cross-repo tools | **Low** — internal |
+| Graph JSONL | `.wg/graph.jsonl` | Federation peers, backup tools | **High** — append-only, line-per-task |
+| Operations log | `.wg/log/operations.jsonl` | Audit tools, VX data flow events | **High** — append-only |
+| Evaluation JSON | `.wg/agency/evaluations/*.json` | VX reward mapping | **Medium** — add fields with `serde(default)` |
+| Agent YAML | `.wg/agency/agents/*.yaml` | Federation, peer identity | **Medium** |
+| Federation config | `.wg/federation.yaml` | Cross-repo tools | **Low** — internal |
 
 **Rule:** Never remove or rename fields in stable formats. New fields use `#[serde(default)]` or `#[serde(skip_serializing_if)]`. Old field names get `#[serde(alias)]` when renamed.
 
 ### 1.5 Events and Hooks
 
-Currently workgraph has one event mechanism: the `IpcRequest::GraphChanged` notification sent over the Unix socket at `.workgraph/service.socket`. The coordinator uses this for fast scheduling after graph mutations.
+Currently wg has one event mechanism: the `IpcRequest::GraphChanged` notification sent over the Unix socket at `.wg/service.socket`. The coordinator uses this for fast scheduling after graph mutations.
 
 For external integration, we need a richer event surface:
 
@@ -91,7 +91,7 @@ This is trivially implementable — it's `tail -f` on `operations.jsonl` with op
 **Option B: Webhook callbacks (Phase 2, if needed)**
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 [hooks]
 on_task_done = "curl -X POST http://localhost:8080/wg/task-done -d @-"
 on_evaluation = "curl -X POST http://localhost:8080/wg/evaluation -d @-"
@@ -118,7 +118,7 @@ A formal plugin system (dynamic loading, trait objects, etc.) would add complexi
 
 ### 2.1 The Problem
 
-When workgraph instances want to share knowledge across organizational boundaries, what's the envelope? You can't send raw graph state (contains internal prompts, credentials, agent IDs). You can't send just task titles (too lossy). You need a **sanitized, structured view** of what was done, how it worked, and what was learned.
+When WG instances want to share knowledge across organizational boundaries, what's the envelope? You can't send raw graph state (contains internal prompts, credentials, agent IDs). You can't send just task titles (too lossy). You need a **sanitized, structured view** of what was done, how it worked, and what was learned.
 
 nikete's `Canon` concept is exactly this: a materialized view of work product, designed for sharing.
 
@@ -210,7 +210,7 @@ wg canon export portfolio-root --zone public
 # → Strips internal task IDs, agent IDs, raw prompts
 # → Hashes data references instead of including data
 
-# Import a canon (from a peer suggestion, or from another workgraph)
+# Import a canon (from a peer suggestion, or from another wg)
 wg canon import suggestion-from-peer7f3a.canon.yaml
 # → Creates a task (or task subgraph) pre-populated with canon context
 # → Sets source: "canon:peer7f3a:sha256:def456"
@@ -257,7 +257,7 @@ wg veracity score suggestion-abc123                # compare against baseline
 
 ### 3.1 Design Philosophy: Thin Adapter, Fat CLI
 
-The VX exchange client should be a **thin adapter** that translates between VX protocol concepts and `wg` CLI calls. It should NOT duplicate workgraph logic. The adapter's job:
+The VX exchange client should be a **thin adapter** that translates between VX protocol concepts and `wg` CLI calls. It should NOT duplicate wg logic. The adapter's job:
 
 1. **Translate**: VX protocol messages ↔ `wg` CLI invocations
 2. **Filter**: Apply sensitivity rules before data leaves the node
@@ -279,7 +279,7 @@ The VX exchange client should be a **thin adapter** that translates between VX p
                         │  calls wg CLI with --json
                         ▼
 ┌───────────────────────────────────────────────────┐
-│                   workgraph (wg)                   │
+│                   wg (wg)                   │
 │                                                    │
 │  graph · agency · provenance · federation · runs   │
 └────────────────────────────────────────────────────┘
@@ -323,7 +323,7 @@ The adapter needs these `wg` commands. All exist or are planned:
 
 ### 3.3 Event Stream: `wg watch --json`
 
-The adapter needs to react to workgraph events without polling. `wg watch` tails the operations log:
+The adapter needs to react to wg events without polling. `wg watch` tails the operations log:
 
 ```bash
 # Stream all events
@@ -347,7 +347,7 @@ The `--since` flag enables reconnection after adapter restart — no lost events
 
 ### 3.4 Capability Discovery: `wg capabilities --json`
 
-An external tool (VX adapter, federation peer, or any integration) can ask "what can this workgraph do?"
+An external tool (VX adapter, federation peer, or any integration) can ask "what can this wg do?"
 
 ```json
 {
@@ -431,12 +431,12 @@ This keeps the internal/external distinction clear: `wg evaluate` = internal LLM
 
 | Extension Point | Mechanism | How External Systems Use It |
 |----------------|-----------|---------------------------|
-| **Custom executors** | `.workgraph/executors/{name}.toml` — process-based, template variables (`{{task_id}}`, `{{task_identity}}`, etc.) | VX could define a `vx-executor.toml` that wraps the default executor with outcome reporting |
+| **Custom executors** | `.wg/executors/{name}.toml` — process-based, template variables (`{{task_id}}`, `{{task_identity}}`, etc.) | VX could define a `vx-executor.toml` that wraps the default executor with outcome reporting |
 | **Custom evaluator agents** | `agency.evaluator_agent` in config — an agent that produces evaluations | VX could plug in an evaluator that queries real-world outcome data instead of (or alongside) LLM judgment |
 | **Custom assigner agents** | `agency.assigner_agent` in config | VX could factor in peer credibility when assigning agents to tasks |
 | **Custom evolver agents** | `agency.evolver_agent` in config | VX could use GEPA-based evolution with outcome data as the fitness function |
 | **Federation remotes** | `AgencyStore` trait in `federation.rs` | New backend implementations (HTTP, git-hosted) for remote agency stores |
-| **CLI as API** | `wg <cmd> --json` | Any external tool can read/write workgraph state |
+| **CLI as API** | `wg <cmd> --json` | Any external tool can read/write wg state |
 
 ### 5.2 New Extension Points Needed
 
@@ -503,15 +503,15 @@ This entire namespace can be feature-gated (`#[cfg(feature = "veracity")]`) so i
 ```bash
 # From nikete's fork directory
 wg list --json > /tmp/nikete-tasks.json
-ls .workgraph/agency/  # Check for identity/ vs agency/ directory naming
+ls .wg/agency/  # Check for identity/ vs agency/ directory naming
 ```
 
 **Step 2: Graph migration (zero data loss)**
 
-The graph format (`.workgraph/graph.jsonl`) is compatible between forks. Both use the same `Task` struct with the same core fields. Copy it directly:
+The graph format (`.wg/graph.jsonl`) is compatible between forks. Both use the same `Task` struct with the same core fields. Copy it directly:
 
 ```bash
-cp -r .workgraph/graph.jsonl /path/to/upstream-workgraph/.workgraph/
+cp -r .wg/graph.jsonl /path/to/upstream-wg/.wg/
 ```
 
 **Step 3: Agency migration**
@@ -520,9 +520,9 @@ If running `nikete/vx-adapter` (which renamed `agency/` → `identity/`):
 
 ```bash
 # The directory structure is the same, just renamed
-cp -r .workgraph/identity/roles/ /path/to/upstream/.workgraph/agency/roles/
-cp -r .workgraph/identity/objectives/ /path/to/upstream/.workgraph/agency/motivations/
-cp -r .workgraph/identity/agents/ /path/to/upstream/.workgraph/agency/agents/
+cp -r .wg/identity/roles/ /path/to/upstream/.wg/agency/roles/
+cp -r .wg/identity/objectives/ /path/to/upstream/.wg/agency/motivations/
+cp -r .wg/identity/agents/ /path/to/upstream/.wg/agency/agents/
 ```
 
 Agent YAML files use `#[serde(alias)]`, so `objective_id` deserializes as `motivation_id`, and `reward` records deserialize as `evaluation` records. **No file editing required.**
@@ -533,18 +533,18 @@ If running `nikete/main` (same directory names as upstream): direct copy, no tra
 
 ```bash
 # Copy evaluation files — serde aliases handle field name differences
-cp -r .workgraph/identity/evaluations/ /path/to/upstream/.workgraph/agency/evaluations/
+cp -r .wg/identity/evaluations/ /path/to/upstream/.wg/agency/evaluations/
 # Or from nikete/main:
-cp -r .workgraph/agency/evaluations/ /path/to/upstream/.workgraph/agency/evaluations/
+cp -r .wg/agency/evaluations/ /path/to/upstream/.wg/agency/evaluations/
 ```
 
 Fields like `value` → `score` and `source` (new) are handled by `#[serde(alias)]` and `#[serde(default)]`.
 
 **Step 5: Trace/Canon migration**
 
-- nikete/main traces (`.workgraph/traces/`): These are conversation-level traces in a format we don't consume yet. Preserve them — once we port `parse_stream_json()`, they'll be readable.
-- nikete/main canons (`.workgraph/canons/`): Preserve. When we implement `wg canon import`, these become usable.
-- vx-adapter provenance (`.workgraph/log/operations.jsonl`): Same format as ours. Direct copy.
+- nikete/main traces (`.wg/traces/`): These are conversation-level traces in a format we don't consume yet. Preserve them — once we port `parse_stream_json()`, they'll be readable.
+- nikete/main canons (`.wg/canons/`): Preserve. When we implement `wg canon import`, these become usable.
+- vx-adapter provenance (`.wg/log/operations.jsonl`): Same format as ours. Direct copy.
 
 **Step 6: Config migration**
 
@@ -552,7 +552,7 @@ nikete's config has `[distill]` and `[replay]` sections we don't recognize. Our 
 
 ```bash
 # Merge configs — unknown sections are silently ignored by both sides
-cat nikete/.workgraph/config.toml upstream/.workgraph/config.toml > merged-config.toml
+cat nikete/.wg/config.toml upstream/.wg/config.toml > merged-config.toml
 # Review and deduplicate
 ```
 
@@ -561,7 +561,7 @@ cat nikete/.workgraph/config.toml upstream/.workgraph/config.toml > merged-confi
 ```bash
 # The VX adapter is a separate tool, not a wg fork
 cargo install wg-vx-adapter  # hypothetical
-wg-vx config set workgraph_dir /path/to/upstream/.workgraph
+wg-vx config set workgraph_dir /path/to/upstream/.wg
 ```
 
 ### 6.2 Migration Guarantees
@@ -648,11 +648,11 @@ This is a **collaboration through interfaces**, not a merge. Both codebases cont
 
 ### Why Not: Native Rust Integration (Shared Crate)
 
-A `workgraph-core` crate with shared types sounds clean but creates tight coupling. Both sides would need to coordinate releases, agree on type definitions, and handle version skew. The CLI-as-API approach gives the same integration surface with zero coordination overhead. If convergent evolution continues (provenance, models, GC), a shared crate becomes more natural — but don't force it.
+A `wg-core` crate with shared types sounds clean but creates tight coupling. Both sides would need to coordinate releases, agree on type definitions, and handle version skew. The CLI-as-API approach gives the same integration surface with zero coordination overhead. If convergent evolution continues (provenance, models, GC), a shared crate becomes more natural — but don't force it.
 
 ### Why Not: gRPC/REST API Server
 
-Adds deployment complexity (running a server), authentication concerns, and network latency for local operations. The CLI does everything a local API server would do, with better composability (pipes, scripts) and zero infrastructure. If workgraph eventually needs remote access (multi-machine deployment), a server makes sense — but that's a different problem from VX integration.
+Adds deployment complexity (running a server), authentication concerns, and network latency for local operations. The CLI does everything a local API server would do, with better composability (pipes, scripts) and zero infrastructure. If wg eventually needs remote access (multi-machine deployment), a server makes sense — but that's a different problem from VX integration.
 
 ### Why Not: Full Plugin System
 

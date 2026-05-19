@@ -9,12 +9,12 @@
 
 ## 1. Problem Statement
 
-The current TB adapter (`terminal-bench/wg/adapter.py`, 1730 lines) reimplements workgraph's entire agent execution loop using litellm. This means TB benchmarks measure the adapter's custom loop, not workgraph's actual execution machinery. Specifically:
+The current TB adapter (`terminal-bench/wg/adapter.py`, 1730 lines) reimplements WG's entire agent execution loop using litellm. This means TB benchmarks measure the adapter's custom loop, not WG's actual execution machinery. Specifically:
 
-1. **Agent loop** is a hand-rolled `for turn in range(max_turns)` loop with `litellm.acompletion()` — native wg uses coordinator → executor dispatch
-2. **Tool schemas** are reimplemented as OpenAI function-call JSON — native wg provides tools via Claude Code / amplifier bundles
-3. **Prompts** are six hand-crafted functions — native wg uses `src/agency/prompt.rs` composition
-4. **Graph state** lives in `/tmp/tb-wg-XXXX/` and is destroyed — native wg uses persistent `.workgraph/`
+1. **Agent loop** is a hand-rolled `for turn in range(max_turns)` loop with `litellm.acompletion()` — native WG uses coordinator → executor dispatch
+2. **Tool schemas** are reimplemented as OpenAI function-call JSON — native WG provides tools via Claude Code / amplifier bundles
+3. **Prompts** are six hand-crafted functions — native WG uses `src/agency/prompt.rs` composition
+4. **Graph state** lives in `/tmp/tb-wg-XXXX/` and is destroyed — native WG uses persistent `.wg/`
 5. **`wg service start`** is never called — the adapter *is* the agent loop
 
 ## 2. Decision: Host-with-Bridge Architecture
@@ -24,15 +24,15 @@ The current TB adapter (`terminal-bench/wg/adapter.py`, 1730 lines) reimplements
 | Option | Description | Pros | Cons |
 |--------|-------------|------|------|
 | **A: WG inside container** | Install `wg` binary + run service inside Harbor Docker containers | Full isolation per trial | Requires wg binary injection into Docker; breaks Harbor verifier; complex networking; service/coordinator doesn't work without git repo |
-| **B: Host-with-bridge** | Run `wg service` on host; bridge Harbor's `env.exec()` to wg agents | Tests real wg execution; minimal Harbor changes; reuses existing wg infrastructure | Less isolation; need trial namespace; adapter becomes thinner shim |
-| **C: Replace Harbor entirely** | Run TB tasks through `wg service` directly, skip Harbor | Tests exactly what ships; simplest wg integration | Loses Harbor's verification, scoring, container isolation; can't compare with non-wg agents |
+| **B: Host-with-bridge** | Run `wg service` on host; bridge Harbor's `env.exec()` to WG agents | Tests real WG execution; minimal Harbor changes; reuses existing WG infrastructure | Less isolation; need trial namespace; adapter becomes thinner shim |
+| **C: Replace Harbor entirely** | Run TB tasks through `wg service` directly, skip Harbor | Tests exactly what ships; simplest WG integration | Loses Harbor's verification, scoring, container isolation; can't compare with non-WG agents |
 
 **Decision: Option B — Host-with-Bridge**
 
 Reasoning:
 - Harbor provides irreplaceable value: container isolation for task work, automated verification/scoring, reproducible environments, comparison framework
 - Running wg on host is what users actually do — wg manages worktrees, not containers
-- The bridge is thin: Harbor only needs to call `wg` CLI commands; wg agents do the actual work
+- The bridge is thin: Harbor only needs to call `wg` CLI commands; WG agents do the actual work
 - The current adapter already runs wg commands on the host (`_exec_wg_cmd_host()`); we're extending this pattern rather than fighting it
 
 ## 3. Architecture
@@ -117,11 +117,11 @@ Harbor Runner
 
 The `native` executor (`wg native-exec`) is the right choice because:
 
-1. **Model flexibility**: It uses the OpenAI-compatible API path, so it can target `openrouter:minimax/minimax-m2.7` (BENCHMARK_MODEL) directly via wg's endpoint/provider system. The `claude` executor is hardwired to Claude Code CLI which only supports Anthropic models.
+1. **Model flexibility**: It uses the OpenAI-compatible API path, so it can target `openrouter:minimax/minimax-m2.7` (BENCHMARK_MODEL) directly via WG's endpoint/provider system. The `claude` executor is hardwired to Claude Code CLI which only supports Anthropic models.
 
-2. **Benchmark model requirement**: TB requires all conditions use the same model for fair comparison. The native executor respects wg's model resolution hierarchy (`task.model > executor.model > coordinator.model`) and works with any OpenAI-compatible provider.
+2. **Benchmark model requirement**: TB requires all conditions use the same model for fair comparison. The native executor respects WG's model resolution hierarchy (`task.model > executor.model > coordinator.model`) and works with any OpenAI-compatible provider.
 
-3. **Prompt composition**: The native executor receives prompts via `build_prompt()` in `src/service/executor.rs`, which already handles scope-based context assembly. The TB conditions' prompt variations map to wg's existing mechanisms:
+3. **Prompt composition**: The native executor receives prompts via `build_prompt()` in `src/service/executor.rs`, which already handles scope-based context assembly. The TB conditions' prompt variations map to WG's existing mechanisms:
    - Condition A: `context_scope=clean`, no agency, bare exec_mode
    - Condition B: `context_scope=task`, standard prompt
    - Condition C: `context_scope=task`, skill injection via role
@@ -140,9 +140,9 @@ For a separate "production parity" benchmark track, use the `claude` executor (C
 **Decision: Tasks execute on the host filesystem, not inside Harbor containers.**
 
 Rationale:
-- Native wg agents work on the host (or in git worktrees). This is the production execution model.
+- Native WG agents work on the host (or in git worktrees). This is the production execution model.
 - Harbor's `env.exec()` container routing exists to isolate agents from each other. WG already provides this via worktree isolation (`config.coordinator.worktree_isolation = true`).
-- Trying to bridge native executor tools → Harbor container adds complexity with no benchmark benefit. We'd be measuring the bridge latency, not wg's actual tool performance.
+- Trying to bridge native executor tools → Harbor container adds complexity with no benchmark benefit. We'd be measuring the bridge latency, not WG's actual tool performance.
 - Harbor's *verification* (scoring the result) can still run in a container — only the agent's work happens on the host.
 
 **Implication for task definitions:**
@@ -157,7 +157,7 @@ Each trial gets an isolated graph + working directory:
 ```
 /tmp/tb-trials/<run-id>/
 ├── <condition>-<task>-r<replica>/
-│   ├── .workgraph/           # Trial-specific graph
+│   ├── .wg/           # Trial-specific graph
 │   │   ├── graph.jsonl
 │   │   ├── config.toml       # Pre-configured executor + model
 │   │   ├── executors/
@@ -167,7 +167,7 @@ Each trial gets an isolated graph + working directory:
 │   │   └── (task files created here)
 │   └── logs/                  # Trial logs for analysis
 │       ├── agent-output/
-│       └── workgraph_state/   # Copied from .workgraph/ after trial
+│       └── workgraph_state/   # Copied from .wg/ after trial
 ```
 
 This preserves per-trial isolation without Docker containers for the wg layer.
@@ -180,7 +180,7 @@ The adapter shrinks from ~1730 lines to ~300 lines. It becomes a thin orchestrat
 
 ```python
 class WorkgraphAgent(BaseAgent):
-    """Harbor adapter — delegates execution to native wg service."""
+    """Harbor adapter — delegates execution to native WG service."""
 
     async def setup(self, environment):
         # 1. Create trial directory
@@ -226,12 +226,12 @@ class WorkgraphAgent(BaseAgent):
 
 ```python
 async def _write_trial_executor_config(trial_dir, model, condition):
-    """Write .workgraph/executors/native.toml for this trial."""
+    """Write .wg/executors/native.toml for this trial."""
     # Configures native executor with BENCHMARK_MODEL
     # Sets exec_mode based on condition (bare/light/full)
 
 async def _write_trial_wg_config(trial_dir, condition):
-    """Write .workgraph/config.toml for this trial."""
+    """Write .wg/config.toml for this trial."""
     # Sets context_scope, model, disable auto_assign for A
     # Configures endpoint for OpenRouter
 
@@ -278,23 +278,23 @@ The native executor (`wg native-exec`) can be configured to exclude wg tools fro
 
 ```
 1. Create temp directory: /tmp/tb-trials/<run-id>/<condition>-<task>-r<replica>/
-2. Initialize: wg init --dir <trial-dir>/.workgraph
-3. Write executor config: <trial-dir>/.workgraph/executors/native.toml
+2. Initialize: wg init --dir <trial-dir>/.wg
+3. Write executor config: <trial-dir>/.wg/executors/native.toml
    - type = "native"
    - model = BENCHMARK_MODEL
    - endpoint/provider for OpenRouter
-4. Write wg config: <trial-dir>/.workgraph/config.toml
+4. Write wg config: <trial-dir>/.wg/config.toml
    - coordinator.model = BENCHMARK_MODEL
    - coordinator.max_agents = 1
    - coordinator.worktree_isolation = false  (trial is already isolated)
    - coordinator.auto_test_discovery = (true for F, false otherwise)
    - coordinator.context_scope = (per condition)
 5. Bootstrap agency (conditions D, E):
-   - wg agency init --dir <trial-dir>/.workgraph
+   - wg agency init --dir <trial-dir>/.wg
    - wg agent create <name> --role <role> --tradeoff <tradeoff>
 6. Create root task:
-   - wg add "<title>" --id <root-task-id> --dir <trial-dir>/.workgraph
-   - (D, E) wg assign <root-task-id> <agent-name>
+   - wg add "<title>" --id <root-task-id> --dir <trial-dir>/.wg
+   - (D, E) `wg assign <root-task-id> <agent-name>`
    - (F) wg add with --verify
 ```
 
@@ -302,15 +302,15 @@ The native executor (`wg native-exec`) can be configured to exclude wg tools fro
 
 ```
 1. Start service:
-   wg service start --dir <trial-dir>/.workgraph --max-agents 1
+   wg service start --dir <trial-dir>/.wg --max-agents 1
 
 2. Poll for completion:
    loop every 2s for up to <timeout>:
-     status = wg show <root-task-id> --dir <trial-dir>/.workgraph --json
+     status = wg show <root-task-id> --dir <trial-dir>/.wg --json
      if status in (done, failed, abandoned): break
 
 3. Stop service:
-   wg service stop --dir <trial-dir>/.workgraph
+   wg service stop --dir <trial-dir>/.wg
 ```
 
 ### 6.3 Teardown Phase (in adapter `run()`, after execution)
@@ -330,7 +330,7 @@ The native executor (`wg native-exec`) can be configured to exclude wg tools fro
 3. Write structured trial log (TrialLogger)
 
 4. Archive:
-   shutil.copytree(<trial-dir>/.workgraph, <logs-dir>/workgraph_state)
+   shutil.copytree(<trial-dir>/.wg, <logs-dir>/workgraph_state)
 
 5. Cleanup:
    shutil.rmtree(<trial-dir>)
@@ -363,7 +363,7 @@ The `TrialLogger` class (`tb_logging.py`) needs adaptation to parse these events
 4. **Adapt TrialLogger** — parse stream.jsonl instead of litellm responses
 
 ### Phase 3: Condition Parity
-1. **Map each condition** to native wg config (exec_mode, context_scope, agency)
+1. **Map each condition** to native WG config (exec_mode, context_scope, agency)
 2. **Create role/tradeoff definitions** matching adapter's condition prompts
 3. **Validate** — run each condition on a calibration task, compare with adapter results
 

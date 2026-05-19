@@ -24,6 +24,10 @@ pub struct ImportCounts {
 pub struct ImportManifest {
     pub source: String,
     pub version: String,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub agency_compat_version: Option<String>,
     pub imported_at: String,
     pub counts: ManifestCounts,
     pub content_hash: String,
@@ -36,7 +40,7 @@ pub struct ManifestCounts {
     pub trade_off_configs: u32,
 }
 
-/// Path to the import manifest within the workgraph agency directory.
+/// Path to the import manifest within the WG agency directory.
 pub fn manifest_path(workgraph_dir: &Path) -> std::path::PathBuf {
     workgraph_dir.join("agency/import-manifest.yaml")
 }
@@ -58,6 +62,8 @@ pub fn write_manifest(
     let manifest = ImportManifest {
         source: source.to_string(),
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
+        schema: Some("agency-12col-v1.2.4".to_string()),
+        agency_compat_version: Some(agency::WG_AGENCY_COMPAT_VERSION.to_string()),
         imported_at: chrono::Utc::now().to_rfc3339(),
         counts: ManifestCounts {
             role_components: counts.role_components,
@@ -77,10 +83,48 @@ pub struct ImportOptions {
     pub csv_path: Option<String>,
     pub url: Option<String>,
     pub upstream: bool,
+    pub format: Option<String>,
     pub dry_run: bool,
     pub tag: Option<String>,
     pub force: bool,
     pub check: bool,
+    /// Error on the first dedup collision rather than warn-and-skip.
+    pub strict: bool,
+}
+
+/// One detected dedup collision during import. See docs/manual/03-agency.md
+/// "Import Dedup Rule" for the rule rationale.
+#[derive(Debug, Clone)]
+pub struct ImportCollision {
+    pub kind: &'static str,
+    pub row: usize,
+    pub hash: String,
+    pub kept_name: String,
+    pub kept_scope: Option<String>,
+    pub dropped_name: String,
+    pub dropped_scope: Option<String>,
+    /// Where the collision happened: against another CSV row, or against an
+    /// existing on-disk file.
+    pub origin: CollisionOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollisionOrigin {
+    /// Collided with a previous row in this same import.
+    SameImport,
+    /// Collided with a primitive file already present on disk (seed, prior
+    /// import, or another remote).
+    Existing,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCsvColumns {
+    quality_score: Option<f64>,
+    domain_tags: Vec<String>,
+    metadata: HashMap<String, String>,
+    parent_ids: Vec<String>,
+    generation: u32,
+    created_by: Option<String>,
 }
 
 /// Fetch CSV content from a remote URL.
@@ -126,6 +170,20 @@ pub fn run_from_bytes(
     dry_run: bool,
     tag: Option<&str>,
 ) -> Result<ImportCounts> {
+    run_from_bytes_with(workgraph_dir, source_label, csv_bytes, dry_run, tag, false).map(|(c, _)| c)
+}
+
+/// Like `run_from_bytes` but accepts a `strict` flag and returns the detected
+/// collision list alongside the counts. See docs/manual/03-agency.md
+/// "Import Dedup Rule" for semantics.
+pub fn run_from_bytes_with(
+    workgraph_dir: &Path,
+    source_label: &str,
+    csv_bytes: &[u8],
+    dry_run: bool,
+    tag: Option<&str>,
+    strict: bool,
+) -> Result<(ImportCounts, Vec<ImportCollision>)> {
     let provenance_tag = tag.unwrap_or("agency-import");
     let agency_dir = workgraph_dir.join("agency");
 
@@ -137,6 +195,13 @@ pub fn run_from_bytes(
     let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
 
     let format = detect_format(reader.headers().context("Failed to read CSV headers")?);
+
+    // Per-type seen-hash trackers and pre-existing-name lookup. Keys are
+    // content_hash; values are (name, scope) of the row that owns the file.
+    let mut seen_components: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut seen_outcomes: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut seen_tradeoffs: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut collisions: Vec<ImportCollision> = Vec::new();
 
     let mut components_count = 0u32;
     let mut outcomes_count = 0u32;
@@ -150,23 +215,41 @@ pub fn run_from_bytes(
         let name = record.get(1).unwrap_or("").trim().to_string();
         let description = record.get(2).unwrap_or("").trim().to_string();
 
-        let (quality_score, domain_tags, metadata, parent_content_hash) = match format {
+        let ParsedCsvColumns {
+            quality_score,
+            domain_tags,
+            mut metadata,
+            parent_ids,
+            generation,
+            created_by,
+        } = match format {
             CsvFormat::Agency => parse_agency_columns(&record),
             CsvFormat::Legacy => parse_legacy_columns(&record),
         };
-
-        let mut parent_ids = vec![];
-        if let Some(ref pch) = parent_content_hash
-            && !pch.is_empty()
-        {
-            parent_ids.push(pch.clone());
-        }
+        // Track original CSV row position so re-export can emit rows in
+        // input order (required for byte-exact roundtrip with upstream
+        // starter.csv, which is not in alphabetical order).
+        metadata.insert("agency_csv_row_idx".to_string(), row_idx.to_string());
+        let quality = quality_score
+            .map(|score| (score * 100.0).round().clamp(0.0, 100.0) as u8)
+            .unwrap_or(100);
+        let domain_specificity = metadata
+            .get("domain_specificity")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0);
+        let domain = domain_tags.clone();
+        let scope = metadata.get("scope").cloned();
+        let origin_instance_id = metadata.get("origin_instance_id").cloned();
+        let parent_content_hash = metadata.get("parent_content_hash").cloned();
 
         let lineage = Lineage {
             parent_ids,
-            generation: 0,
-            created_by: format!("{}-v{}", provenance_tag, env!("CARGO_PKG_VERSION")),
+            generation,
+            created_by: created_by
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("{}-v{}", provenance_tag, env!("CARGO_PKG_VERSION"))),
             created_at: chrono::Utc::now(),
+            reframing_potential: None,
         };
 
         let access_control = AccessControl {
@@ -192,6 +275,27 @@ pub fn run_from_bytes(
                 let content = ContentRef::Inline(description.clone());
                 let category = ComponentCategory::Translated;
                 let id = agency::content_hash_component(&description, &category, &content);
+                let row_num = row_idx + 1;
+                let scope_for_check = scope.clone();
+                let collision = check_collision(
+                    "component",
+                    &id,
+                    &name,
+                    scope_for_check.as_deref(),
+                    row_num,
+                    &mut seen_components,
+                    &agency_dir.join("primitives/components"),
+                    dry_run,
+                );
+                if let Some(coll) = collision {
+                    if strict {
+                        anyhow::bail!(format_strict_error(&coll));
+                    }
+                    eprintln!("{}", format_collision_warning(&coll));
+                    collisions.push(coll);
+                    skipped += 1;
+                    continue;
+                }
 
                 if dry_run {
                     println!("  [component] {} ({})", name, agency::short_hash(&id));
@@ -200,6 +304,12 @@ pub fn run_from_bytes(
                         id: id.clone(),
                         name,
                         description,
+                        quality,
+                        domain_specificity,
+                        domain,
+                        scope,
+                        origin_instance_id,
+                        parent_content_hash,
                         category,
                         content,
                         performance,
@@ -229,6 +339,27 @@ pub fn run_from_bytes(
                     CsvFormat::Agency => vec![],
                 };
                 let id = agency::content_hash_outcome(&description, &success_criteria);
+                let row_num = row_idx + 1;
+                let scope_for_check = scope.clone();
+                let collision = check_collision(
+                    "outcome",
+                    &id,
+                    &name,
+                    scope_for_check.as_deref(),
+                    row_num,
+                    &mut seen_outcomes,
+                    &agency_dir.join("primitives/outcomes"),
+                    dry_run,
+                );
+                if let Some(coll) = collision {
+                    if strict {
+                        anyhow::bail!(format_strict_error(&coll));
+                    }
+                    eprintln!("{}", format_collision_warning(&coll));
+                    collisions.push(coll);
+                    skipped += 1;
+                    continue;
+                }
 
                 if dry_run {
                     println!("  [outcome] {} ({})", name, agency::short_hash(&id));
@@ -237,6 +368,12 @@ pub fn run_from_bytes(
                         id: id.clone(),
                         name,
                         description,
+                        quality,
+                        domain_specificity,
+                        domain,
+                        scope,
+                        origin_instance_id,
+                        parent_content_hash,
                         success_criteria,
                         performance,
                         lineage,
@@ -274,6 +411,27 @@ pub fn run_from_bytes(
                     CsvFormat::Agency => (vec![], vec![]),
                 };
                 let id = agency::content_hash_tradeoff(&acceptable, &unacceptable, &description);
+                let row_num = row_idx + 1;
+                let scope_for_check = scope.clone();
+                let collision = check_collision(
+                    "tradeoff",
+                    &id,
+                    &name,
+                    scope_for_check.as_deref(),
+                    row_num,
+                    &mut seen_tradeoffs,
+                    &agency_dir.join("primitives/tradeoffs"),
+                    dry_run,
+                );
+                if let Some(coll) = collision {
+                    if strict {
+                        anyhow::bail!(format_strict_error(&coll));
+                    }
+                    eprintln!("{}", format_collision_warning(&coll));
+                    collisions.push(coll);
+                    skipped += 1;
+                    continue;
+                }
 
                 if dry_run {
                     println!("  [tradeoff] {} ({})", name, agency::short_hash(&id));
@@ -282,6 +440,12 @@ pub fn run_from_bytes(
                         id: id.clone(),
                         name,
                         description,
+                        quality,
+                        domain_specificity,
+                        domain,
+                        scope,
+                        origin_instance_id,
+                        parent_content_hash,
                         acceptable_tradeoffs: acceptable,
                         unacceptable_tradeoffs: unacceptable,
                         performance,
@@ -328,16 +492,148 @@ pub fn run_from_bytes(
     if skipped > 0 {
         println!("  Skipped:    {}", skipped);
     }
+    if !collisions.is_empty() {
+        println!(
+            "  Collisions: {} (description-hash dedup; rerun with --strict to fail)",
+            collisions.len()
+        );
+    }
 
     if !dry_run {
         write_manifest(workgraph_dir, source_label, csv_bytes, &counts)?;
     }
 
-    Ok(counts)
+    Ok((counts, collisions))
+}
+
+fn check_collision(
+    kind: &'static str,
+    id: &str,
+    name: &str,
+    scope: Option<&str>,
+    row: usize,
+    seen: &mut HashMap<String, (String, Option<String>)>,
+    on_disk_dir: &Path,
+    dry_run: bool,
+) -> Option<ImportCollision> {
+    if let Some((kept_name, kept_scope)) = seen.get(id) {
+        let kept_name = kept_name.clone();
+        let kept_scope = kept_scope.clone();
+        if kept_name != name || kept_scope.as_deref() != scope {
+            return Some(ImportCollision {
+                kind,
+                row,
+                hash: id.to_string(),
+                kept_name,
+                kept_scope,
+                dropped_name: name.to_string(),
+                dropped_scope: scope.map(str::to_string),
+                origin: CollisionOrigin::SameImport,
+            });
+        }
+        return None;
+    }
+    if !dry_run {
+        let on_disk = on_disk_dir.join(format!("{}.yaml", id));
+        if on_disk.exists() {
+            let (existing_name, existing_scope) = read_existing_name_scope(kind, &on_disk);
+            if existing_name.as_deref() != Some(name) || existing_scope.as_deref() != scope {
+                let collision = ImportCollision {
+                    kind,
+                    row,
+                    hash: id.to_string(),
+                    kept_name: existing_name.unwrap_or_else(|| "<unknown>".to_string()),
+                    kept_scope: existing_scope,
+                    dropped_name: name.to_string(),
+                    dropped_scope: scope.map(str::to_string),
+                    origin: CollisionOrigin::Existing,
+                };
+                seen.insert(
+                    id.to_string(),
+                    (collision.kept_name.clone(), collision.kept_scope.clone()),
+                );
+                return Some(collision);
+            }
+        }
+    }
+    seen.insert(
+        id.to_string(),
+        (name.to_string(), scope.map(str::to_string)),
+    );
+    None
+}
+
+fn read_existing_name_scope(kind: &str, path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    match kind {
+        "component" => {
+            if let Ok(c) = serde_yaml::from_str::<workgraph::agency::RoleComponent>(&text) {
+                return (Some(c.name), c.scope);
+            }
+        }
+        "outcome" => {
+            if let Ok(o) = serde_yaml::from_str::<workgraph::agency::DesiredOutcome>(&text) {
+                return (Some(o.name), o.scope);
+            }
+        }
+        "tradeoff" => {
+            if let Ok(t) = serde_yaml::from_str::<workgraph::agency::TradeoffConfig>(&text) {
+                return (Some(t.name), t.scope);
+            }
+        }
+        _ => {}
+    }
+    (None, None)
+}
+
+fn format_collision_warning(c: &ImportCollision) -> String {
+    let kept_scope = c.kept_scope.as_deref().unwrap_or("<none>");
+    let dropped_scope = c.dropped_scope.as_deref().unwrap_or("<none>");
+    let origin = match c.origin {
+        CollisionOrigin::SameImport => "earlier row in this import",
+        CollisionOrigin::Existing => "existing on-disk primitive",
+    };
+    format!(
+        "Warning: agency import collision (row {}): {} '{}' (scope={}) shares description-hash {} with {} '{}' (scope={}); skipping",
+        c.row,
+        c.kind,
+        c.dropped_name,
+        dropped_scope,
+        agency::short_hash(&c.hash),
+        origin,
+        c.kept_name,
+        kept_scope,
+    )
+}
+
+fn format_strict_error(c: &ImportCollision) -> String {
+    let kept_scope = c.kept_scope.as_deref().unwrap_or("<none>");
+    let dropped_scope = c.dropped_scope.as_deref().unwrap_or("<none>");
+    format!(
+        "agency import --strict: row {} {} '{}' (scope={}) collides on description-hash {} with '{}' (scope={})",
+        c.row,
+        c.kind,
+        c.dropped_name,
+        dropped_scope,
+        agency::short_hash(&c.hash),
+        c.kept_name,
+        kept_scope,
+    )
 }
 
 /// Unified entry point for `wg agency import` supporting local file, URL, and upstream modes.
 pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCounts> {
+    if let Some(format) = opts.format.as_deref()
+        && !matches!(format, "agency-csv" | "auto")
+    {
+        anyhow::bail!(
+            "Unsupported agency import format '{}'. Use: agency-csv",
+            format
+        );
+    }
+
     // Determine the CSV source
     let source_count =
         opts.csv_path.is_some() as u8 + opts.url.is_some() as u8 + opts.upstream as u8;
@@ -347,7 +643,17 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
 
     if let Some(ref csv_path) = opts.csv_path {
         // Local file path — existing behavior
-        return run(workgraph_dir, csv_path, opts.dry_run, opts.tag.as_deref());
+        let csv_bytes =
+            std::fs::read(csv_path).with_context(|| format!("Failed to read '{}'", csv_path))?;
+        return run_from_bytes_with(
+            workgraph_dir,
+            csv_path,
+            &csv_bytes,
+            opts.dry_run,
+            opts.tag.as_deref(),
+            opts.strict,
+        )
+        .map(|(c, _)| c);
     }
 
     // Resolve the URL (either explicit --url or --upstream from config)
@@ -401,13 +707,15 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
         }
 
         // Hash differs — import
-        return run_from_bytes(
+        return run_from_bytes_with(
             workgraph_dir,
             &url,
             &csv_bytes,
             opts.dry_run,
             opts.tag.as_deref(),
-        );
+            opts.strict,
+        )
+        .map(|(c, _)| c);
     }
 
     // No existing manifest or --force: fetch and import
@@ -428,13 +736,15 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
         std::process::exit(0);
     }
 
-    run_from_bytes(
+    run_from_bytes_with(
         workgraph_dir,
         &url,
         &csv_bytes,
         opts.dry_run,
         opts.tag.as_deref(),
+        opts.strict,
     )
+    .map(|(c, _)| c)
 }
 
 /// Detected CSV format based on header or column count.
@@ -442,7 +752,8 @@ pub fn run_import(workgraph_dir: &Path, opts: ImportOptions) -> Result<ImportCou
 enum CsvFormat {
     /// Old 7-column format: type,name,description,col4,col5,domain_tags,quality_score
     Legacy,
-    /// Agency 9-column format: type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope
+    /// Agency CSV format: the 9-column starter subset or the 12-column upstream
+    /// starter schema ending in parent_ids,generation,created_by.
     Agency,
 }
 
@@ -462,14 +773,14 @@ fn detect_format(headers: &csv::StringRecord) -> CsvFormat {
     CsvFormat::Legacy
 }
 
-/// `wg agency import <csv-path>` -- import Agency's starter.csv primitives into WorkGraph.
+/// `wg agency import <csv-path>` -- import Agency's starter.csv primitives into WG.
 ///
 /// Supports two CSV formats:
 ///
 /// **Legacy (7 columns):** type,name,description,col4,col5,domain_tags,quality_score
 ///   - type: skill | outcome | tradeoff
 ///
-/// **Agency (9 columns):** type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope
+/// **Agency CSV (9 or 12 columns):** type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope[,parent_ids,generation,created_by]
 ///   - type: role_component | desired_outcome | trade_off_config
 ///
 /// Both formats are auto-detected. Legacy type names (skill/outcome/tradeoff) are also
@@ -485,23 +796,15 @@ pub fn run(
     run_from_bytes(workgraph_dir, csv_path, &csv_bytes, dry_run, tag)
 }
 
-/// Parse columns from Agency's 9-column CSV format.
+/// Parse columns from Agency's 9- or 12-column CSV format.
 ///
 /// Columns: type(0), name(1), description(2), quality(3), domain_specificity(4),
-///          domain(5), origin_instance_id(6), parent_content_hash(7), scope(8)
-fn parse_agency_columns(
-    record: &csv::StringRecord,
-) -> (
-    Option<f64>,
-    Vec<String>,
-    HashMap<String, String>,
-    Option<String>,
-) {
+///          domain(5), origin_instance_id(6), parent_content_hash(7), scope(8),
+///          parent_ids(9), generation(10), created_by(11)
+fn parse_agency_columns(record: &csv::StringRecord) -> ParsedCsvColumns {
     // quality (col3): integer 0-100, map to avg_score as 0.0-1.0
-    let quality_score: Option<f64> = record.get(3).and_then(|s| {
-        let s = s.trim();
-        s.parse::<f64>().ok().map(|v| v / 100.0)
-    });
+    let quality_raw = record.get(3).map(|s| s.trim()).unwrap_or("");
+    let quality_score: Option<f64> = quality_raw.parse::<f64>().ok().map(|v| v / 100.0);
 
     // domain_specificity (col4): store as metadata
     let domain_specificity = record
@@ -509,7 +812,10 @@ fn parse_agency_columns(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    // domain (col5): comma-separated tags
+    // domain (col5): comma-separated tags. Preserve raw text for byte-exact CSV
+    // roundtrip — upstream emits e.g. "software, management" with a space, while
+    // a re-join of the parsed tags would emit "software,management".
+    let domain_raw = record.get(5).map(str::to_string);
     let domain_tags: Vec<String> = record
         .get(5)
         .map(|s| {
@@ -535,7 +841,32 @@ fn parse_agency_columns(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
+    let parent_ids_raw = record.get(9).map(|s| s.trim()).unwrap_or("");
+    let mut parent_ids = Vec::new();
+    if let Some(ref pch) = parent_content_hash
+        && !pch.is_empty()
+    {
+        parent_ids.push(pch.clone());
+    }
+    for parent_id in parse_parent_ids_column(parent_ids_raw) {
+        if !parent_ids.contains(&parent_id) {
+            parent_ids.push(parent_id);
+        }
+    }
+
+    let generation = record
+        .get(10)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let created_by = record
+        .get(11)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut metadata = HashMap::new();
+    if !quality_raw.is_empty() {
+        metadata.insert("agency_quality".to_string(), quality_raw.to_string());
+    }
     if !scope.is_empty() {
         metadata.insert("scope".to_string(), scope);
     }
@@ -550,21 +881,47 @@ fn parse_agency_columns(
     {
         metadata.insert("parent_content_hash".to_string(), pch.clone());
     }
+    // Always insert parent_ids (even empty string) so re-export can emit the
+    // exact original text rather than synthesising a JSON array from
+    // lineage.parent_ids (which the importer fills from parent_content_hash).
+    metadata.insert("parent_ids".to_string(), parent_ids_raw.to_string());
+    // Preserve raw domain text so re-export can emit "software, management"
+    // verbatim instead of `domain_tags.join(",")` flattening to "software,management".
+    if let Some(raw) = domain_raw {
+        metadata.insert("domain_raw".to_string(), raw);
+    }
 
-    (quality_score, domain_tags, metadata, parent_content_hash)
+    ParsedCsvColumns {
+        quality_score,
+        domain_tags,
+        metadata,
+        parent_ids,
+        generation,
+        created_by,
+    }
+}
+
+fn parse_parent_ids_column(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(ids) = serde_json::from_str::<Vec<String>>(raw) {
+        return ids
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Parse columns from the legacy 7-column CSV format.
 ///
 /// Columns: type(0), name(1), description(2), col4(3), col5(4), domain_tags(5), quality_score(6)
-fn parse_legacy_columns(
-    record: &csv::StringRecord,
-) -> (
-    Option<f64>,
-    Vec<String>,
-    HashMap<String, String>,
-    Option<String>,
-) {
+fn parse_legacy_columns(record: &csv::StringRecord) -> ParsedCsvColumns {
     let quality_score: Option<f64> = record.get(6).and_then(|s| s.trim().parse().ok());
 
     let domain_tags: Vec<String> = record
@@ -577,7 +934,14 @@ fn parse_legacy_columns(
         })
         .unwrap_or_default();
 
-    (quality_score, domain_tags, HashMap::new(), None)
+    ParsedCsvColumns {
+        quality_score,
+        domain_tags,
+        metadata: HashMap::new(),
+        parent_ids: Vec::new(),
+        generation: 0,
+        created_by: None,
+    }
 }
 
 #[cfg(test)]
@@ -647,7 +1011,7 @@ mod tests {
     #[test]
     fn test_agency_import_parses_csv() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_fixture_csv(tmp.path());
@@ -670,7 +1034,7 @@ mod tests {
     #[test]
     fn test_agency_import_dry_run_no_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_fixture_csv(tmp.path());
@@ -687,7 +1051,7 @@ mod tests {
     #[test]
     fn test_agency_import_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_fixture_csv(tmp.path());
@@ -706,7 +1070,7 @@ mod tests {
     #[test]
     fn test_agency_import_content_hash_stability() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_fixture_csv(tmp.path());
@@ -721,7 +1085,7 @@ mod tests {
 
         // Import again into a fresh dir
         let tmp2 = tempfile::tempdir().unwrap();
-        let wg_dir2 = tmp2.path().join(".workgraph");
+        let wg_dir2 = tmp2.path().join(".wg");
         std::fs::create_dir_all(&wg_dir2).unwrap();
         run(&wg_dir2, csv_path.to_str().unwrap(), false, None).unwrap();
 
@@ -740,7 +1104,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_format() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -766,7 +1130,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_metadata_preserved() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -816,7 +1180,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_quality_maps_to_score() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -834,7 +1198,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_domain_maps_to_tags() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -861,7 +1225,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_tradeoff_uses_description() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -890,7 +1254,7 @@ mod tests {
     #[test]
     fn test_agency_import_9col_parent_content_hash_in_lineage() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -946,7 +1310,7 @@ mod tests {
     #[test]
     fn test_import_writes_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -971,7 +1335,7 @@ mod tests {
     #[test]
     fn test_import_dry_run_no_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -984,7 +1348,7 @@ mod tests {
     #[test]
     fn test_reimport_updates_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -1012,7 +1376,7 @@ mod tests {
     #[test]
     fn test_agency_pull_run_from_bytes() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1032,7 +1396,7 @@ mod tests {
     #[test]
     fn test_agency_pull_read_manifest_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let result = read_manifest(&wg_dir).unwrap();
@@ -1042,7 +1406,7 @@ mod tests {
     #[test]
     fn test_agency_pull_read_manifest_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -1056,7 +1420,7 @@ mod tests {
     #[test]
     fn test_agency_pull_change_detection_same_hash() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1074,7 +1438,7 @@ mod tests {
     #[test]
     fn test_agency_pull_change_detection_different_hash() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv1 = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1096,7 +1460,7 @@ mod tests {
     #[test]
     fn test_agency_pull_import_from_local_via_run_import() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv_path = write_agency_format_csv(tmp.path());
@@ -1105,10 +1469,12 @@ mod tests {
             csv_path: Some(csv_path.to_str().unwrap().to_string()),
             url: None,
             upstream: false,
+            format: None,
             dry_run: false,
             tag: None,
             force: false,
             check: false,
+            strict: false,
         };
         let counts = run_import(&wg_dir, opts).unwrap();
         assert_eq!(counts.role_components, 2);
@@ -1119,17 +1485,19 @@ mod tests {
     #[test]
     fn test_agency_pull_error_multiple_sources() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let opts = ImportOptions {
             csv_path: Some("file.csv".to_string()),
             url: Some("http://example.com/file.csv".to_string()),
             upstream: false,
+            format: None,
             dry_run: false,
             tag: None,
             force: false,
             check: false,
+            strict: false,
         };
         let result = run_import(&wg_dir, opts);
         assert!(result.is_err());
@@ -1139,17 +1507,19 @@ mod tests {
     #[test]
     fn test_agency_pull_error_no_source() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let opts = ImportOptions {
             csv_path: None,
             url: None,
             upstream: false,
+            format: None,
             dry_run: false,
             tag: None,
             force: false,
             check: false,
+            strict: false,
         };
         let result = run_import(&wg_dir, opts);
         assert!(result.is_err());
@@ -1159,17 +1529,19 @@ mod tests {
     #[test]
     fn test_agency_pull_upstream_no_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let opts = ImportOptions {
             csv_path: None,
             url: None,
             upstream: true,
+            format: None,
             dry_run: false,
             tag: None,
             force: false,
             check: false,
+            strict: false,
         };
         let result = run_import(&wg_dir, opts);
         assert!(result.is_err());
@@ -1184,7 +1556,7 @@ mod tests {
     #[test]
     fn test_agency_pull_url_network_error_graceful() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         // Use a URL that will fail to connect (invalid host)
@@ -1192,10 +1564,12 @@ mod tests {
             csv_path: None,
             url: Some("http://192.0.2.1:1/nonexistent.csv".to_string()),
             upstream: false,
+            format: None,
             dry_run: false,
             tag: None,
             force: false,
             check: false,
+            strict: false,
         };
         let result = run_import(&wg_dir, opts);
         assert!(result.is_err());
@@ -1210,7 +1584,7 @@ mod tests {
     #[test]
     fn test_agency_pull_run_from_bytes_dry_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1228,7 +1602,7 @@ mod tests {
     #[test]
     fn test_agency_pull_run_from_bytes_with_tag() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1236,19 +1610,20 @@ mod tests {
 
         run_from_bytes(&wg_dir, "test://tagged.csv", csv, false, Some("custom-tag")).unwrap();
 
-        // Verify component was saved with custom tag provenance
+        // Verify component was saved with agency-compatible import provenance.
         let components_dir = wg_dir.join("agency/primitives/components");
         let entries: Vec<_> = std::fs::read_dir(&components_dir).unwrap().collect();
         assert_eq!(entries.len(), 1);
         let component: RoleComponent =
             agency::load_component(&entries[0].as_ref().unwrap().path()).unwrap();
-        assert!(component.lineage.created_by.starts_with("custom-tag"));
+        assert_eq!(component.lineage.created_by, "import");
+        assert_eq!(component.access_control.owner, "custom-tag");
     }
 
     #[test]
     fn test_agency_pull_additive_merge() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let csv1 = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
@@ -1268,5 +1643,112 @@ mod tests {
             .count();
         // Second import should ADD the new component, not remove the first
         assert_eq!(count2, 2);
+    }
+
+    /// Per-scope variant: upstream uses the same description+name with two
+    /// different scopes ("task" vs "meta:assigner"). Default behavior keeps
+    /// the first row, warns, and records a same-import collision.
+    #[test]
+    fn test_agency_import_per_scope_variant_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        // Two rows: same (type, name, description), different scope.
+        let csv = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
+                     role_component,forward-compatible-deferral-spec,Deferral spec contents,80,high,management,inst-001,,task\n\
+                     role_component,forward-compatible-deferral-spec,Deferral spec contents,80,high,management,inst-001,,meta:assigner\n";
+
+        let (counts, collisions) =
+            run_from_bytes_with(&wg_dir, "test://scope-variant.csv", csv, false, None, false)
+                .unwrap();
+
+        // Exactly one row saved; the duplicate-by-hash row is dropped + recorded.
+        assert_eq!(counts.role_components, 1);
+        assert_eq!(collisions.len(), 1);
+        let coll = &collisions[0];
+        assert_eq!(coll.kind, "component");
+        assert_eq!(coll.kept_name, "forward-compatible-deferral-spec");
+        assert_eq!(coll.dropped_name, "forward-compatible-deferral-spec");
+        assert_eq!(coll.kept_scope.as_deref(), Some("task"));
+        assert_eq!(coll.dropped_scope.as_deref(), Some("meta:assigner"));
+        assert_eq!(coll.origin, CollisionOrigin::SameImport);
+
+        // Strict mode errors on the same input.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let wg_dir2 = tmp2.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir2).unwrap();
+        let err = run_from_bytes_with(&wg_dir2, "test://scope-variant.csv", csv, false, None, true)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--strict"),
+            "strict error should mention --strict, got: {}",
+            msg
+        );
+        assert!(msg.contains("forward-compatible-deferral-spec"));
+    }
+
+    /// Same-description name collision: an upstream row whose description
+    /// matches a primitive already on disk (a locally-seeded one) gets
+    /// detected as an Existing-origin collision and skipped.
+    #[test]
+    fn test_agency_import_same_description_name_collision_with_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+
+        // First import: seed a primitive with one name.
+        let seed = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
+                      role_component,adapt-research-synthesis-for-non-domain-audience,Identical description text,90,high,research,inst-seed,,task\n";
+        let (seed_counts, seed_coll) =
+            run_from_bytes_with(&wg_dir, "test://seed.csv", seed, false, None, false).unwrap();
+        assert_eq!(seed_counts.role_components, 1);
+        assert!(seed_coll.is_empty());
+
+        // Second import: an upstream row with a different name but identical
+        // description. Default behavior should warn + skip (preserving the
+        // locally-seeded row).
+        let upstream = b"type,name,description,quality,domain_specificity,domain,origin_instance_id,parent_content_hash,scope\n\
+                          role_component,identify-write-up-audience-and-adapt,Identical description text,80,medium,writing,inst-up,,task\n";
+        let (upstream_counts, upstream_coll) =
+            run_from_bytes_with(&wg_dir, "test://upstream.csv", upstream, false, None, false)
+                .unwrap();
+        assert_eq!(
+            upstream_counts.role_components, 0,
+            "upstream row should be skipped, not saved"
+        );
+        assert_eq!(upstream_coll.len(), 1);
+        let coll = &upstream_coll[0];
+        assert_eq!(coll.origin, CollisionOrigin::Existing);
+        assert_eq!(
+            coll.kept_name, "adapt-research-synthesis-for-non-domain-audience",
+            "first-write-wins: locally-seeded primitive must not be silently overwritten"
+        );
+        assert_eq!(coll.dropped_name, "identify-write-up-audience-and-adapt");
+
+        // Verify on-disk state preserves the seeded name.
+        let comp_dir = wg_dir.join("agency/primitives/components");
+        let entries: Vec<_> = std::fs::read_dir(&comp_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        let comp: RoleComponent =
+            agency::load_component(&entries[0].as_ref().unwrap().path()).unwrap();
+        assert_eq!(
+            comp.name,
+            "adapt-research-synthesis-for-non-domain-audience"
+        );
+
+        // Strict mode errors on the same upstream import against a seeded file.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let wg_dir2 = tmp2.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir2).unwrap();
+        run_from_bytes_with(&wg_dir2, "test://seed.csv", seed, false, None, false).unwrap();
+        let err = run_from_bytes_with(&wg_dir2, "test://upstream.csv", upstream, false, None, true)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--strict"),
+            "strict error should mention --strict, got: {}",
+            err
+        );
     }
 }

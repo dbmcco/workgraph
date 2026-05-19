@@ -7,7 +7,7 @@
 
 ## 1. Event Sourcing Analogy
 
-Workgraph's `stream.jsonl` is already an event log. Every tool call produces `ToolStart`/`ToolEnd` events, every LLM turn produces `Turn` events with token usage. The agent's observable state is the reduction of all stream events.
+wg's `stream.jsonl` is already an event log. Every tool call produces `ToolStart`/`ToolEnd` events, every LLM turn produces `Turn` events with token usage. The agent's observable state is the reduction of all stream events.
 
 **Can we replay events to restore state?**
 
@@ -48,7 +48,7 @@ The LLM's "state" lives in two places:
 
 ### Summary of stolen ideas
 
-| Pattern | Source | Application to workgraph |
+| Pattern | Source | Application to wg |
 |---------|--------|------------------------|
 | Continue-as-new | Temporal | Handoff document → new agent with summary |
 | AOF compaction | Redis | Summarize stream.jsonl into checkpoint |
@@ -124,7 +124,7 @@ This IS a checkpoint, just triggered by death rather than proactively. The quest
 
 **Key insight: file changes persist regardless of agent death.**
 
-When an LLM agent runs `cargo build`, edits files, writes tests — all of that survives agent death. The agent's working directory in `.workgraph/agents/<agent-id>/` contains its output log, and the project repo contains all file changes.
+When an LLM agent runs `cargo build`, edits files, writes tests — all of that survives agent death. The agent's working directory in `.wg/agents/<agent-id>/` contains its output log, and the project repo contains all file changes.
 
 **What's actually lost when an agent dies:**
 1. The LLM's context window (conversation history, reasoning chain)
@@ -158,7 +158,7 @@ Agent writes a structured progress summary before dying (or periodically). Succe
 
 ### Is it sufficient?
 
-**For most workgraph tasks: yes.** Here's why:
+**For most wg tasks: yes.** Here's why:
 
 1. Tasks are typically scoped (20-60 min of work)
 2. The task description provides goal and validation criteria

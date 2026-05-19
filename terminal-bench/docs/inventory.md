@@ -181,14 +181,14 @@ Located in `tasks/hard-benchmarks/`. These are project-authored multi-step tasks
 | Script | Purpose | Execution Mode | Tasks | Conditions |
 |--------|---------|---------------|-------|------------|
 | `reproduce.sh` | Full reproduction of paper experiment | Harbor framework (Docker containers) | All 89 TB 2.0 | A, B, C |
-| `run_condition_a.py` | Isolated wg service per problem, 8 parallel agents | Native wg executor (host-side) | 8 calibration | A |
-| `run_pilot_f_89.py` | 18-task pilot with surveillance loops | Native wg executor (temp dirs) | 18 (8 cal + 10 hard) | F |
-| `run_pilot_f_5x1.py` | 5-task pilot for condition F surveillance | Native wg executor | 5 calibration subset | F |
-| `run_pilot_condition_f.py` | 14-trial condition F lifecycle pilot (no LLM) | Native wg executor + federation | 7 calibration | F |
-| `run_pilot_a_prime.py` | A' pilot (bare agent, no turn cap) | Native wg executor + federation | 7 calibration | A' |
-| `run_full_a_prime_vs_f.py` | Full A' vs F benchmark | Native wg executor + federation | 7 calibration | A', F |
-| `run_hard_benchmarks.py` | Hard benchmark A' vs F comparison | Native wg executor + federation | 10 hard benchmarks | A', F |
-| `rerun_pilot_f_89_dns.py` | Re-run 29 DNS-failed trials from pilot-f-89 | Native wg executor | Failed subset of 18 | F |
+| `run_condition_a.py` | Isolated wg service per problem, 8 parallel agents | Native WG executor (host-side) | 8 calibration | A |
+| `run_pilot_f_89.py` | 18-task pilot with surveillance loops | Native WG executor (temp dirs) | 18 (8 cal + 10 hard) | F |
+| `run_pilot_f_5x1.py` | 5-task pilot for condition F surveillance | Native WG executor | 5 calibration subset | F |
+| `run_pilot_condition_f.py` | 14-trial condition F lifecycle pilot (no LLM) | Native WG executor + federation | 7 calibration | F |
+| `run_pilot_a_prime.py` | A' pilot (bare agent, no turn cap) | Native WG executor + federation | 7 calibration | A' |
+| `run_full_a_prime_vs_f.py` | Full A' vs F benchmark | Native WG executor + federation | 7 calibration | A', F |
+| `run_hard_benchmarks.py` | Hard benchmark A' vs F comparison | Native WG executor + federation | 10 hard benchmarks | A', F |
+| `rerun_pilot_f_89_dns.py` | Re-run 29 DNS-failed trials from pilot-f-89 | Native WG executor | Failed subset of 18 | F |
 
 ### Support Scripts
 
@@ -203,9 +203,9 @@ Located in `tasks/hard-benchmarks/`. These are project-authored multi-step tasks
 
 ### Adapter (`wg/adapter.py`)
 
-The core adapter bridges Harbor's agent protocol to workgraph's native executor. Supports two execution modes:
+The core adapter bridges Harbor's agent protocol to WG's native executor. Supports two execution modes:
 1. **Docker-aware** (Harbor path): LLM agent loop in Python, routes commands through Harbor's `environment.exec()` into Docker containers. Uses LiteLLM for API calls.
-2. **Host-native** (standalone runner path): Delegates to `wg service start` + `wg native-exec`. Uses wg's built-in Rust OpenAI-compatible client directly.
+2. **Host-native** (standalone runner path): Delegates to `wg service start` + `wg native-exec`. Uses WG's built-in Rust OpenAI-compatible client directly.
 
 Supports **6 conditions** (A through F) with varying tool access, context scope, and agency configuration.
 
@@ -226,7 +226,7 @@ Supports **6 conditions** (A through F) with varying tool access, context scope,
 |-----------|---------|-------|
 | **Docker** | Container isolation for TB tasks | `docker.io` + `docker-compose-v2` |
 | **Harbor** | Benchmark framework (task download, orchestration, verification) | `pip install harbor-bench` (>= 0.3.0) |
-| **Workgraph (`wg`)** | Task graph executor, agent spawning | `cargo install --path .` (Rust binary) |
+| **wg (`wg`)** | Task graph executor, agent spawning | `cargo install --path .` (Rust binary) |
 | **Python 3.10+** | Runner scripts, adapter | System or venv |
 | **LiteLLM** | OpenRouter API proxy (Harbor path only) | `pip install litellm` |
 | **OpenRouter API** | LLM API gateway | Requires `OPENROUTER_API_KEY` env var |
@@ -353,7 +353,7 @@ Results directories in `terminal-bench/results/` document completed experiments:
 
 1. **Two execution paths exist**: Harbor (Docker containers, LiteLLM) and host-native (wg service, Rust client). The host-native path is used by all `run_*.py` scripts and provides per-trial isolation via temp directories.
 
-2. **Trial isolation**: Each trial gets its own temp directory with an independent `.workgraph/`, config, and service socket. Trials cannot interfere with each other.
+2. **Trial isolation**: Each trial gets its own temp directory with an independent `.wg/`, config, and service socket. Trials cannot interfere with each other.
 
 3. **Concurrency is semaphore-gated**: `asyncio.Semaphore(MAX_CONCURRENT_TRIALS)` limits parallel trials. The limiting factor is API rate limits, not local compute for most tasks.
 

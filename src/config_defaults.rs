@@ -11,7 +11,7 @@
 
 use crate::config::{
     Config, EndpointConfig, EndpointsConfig, ModelRegistryEntry, ModelRoutingConfig,
-    RoleModelConfig, Tier, TierConfig,
+    OpenRouterConfig, RoleModelConfig, Tier, TierConfig,
 };
 use crate::model_routes::{
     WORKGRAPH_CLAUDE_CLI_FAST_ROUTE, WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE,
@@ -110,9 +110,9 @@ impl SetupRoute {
 
     /// Conservative version of [`SetupRoute::from_executor`]: returns
     /// `None` for executors that don't map to any of the 5 routes
-    /// (e.g. `shell`, `amplifier`, custom executor names). Callers
-    /// should fall back to the legacy path when this returns `None`
-    /// rather than substituting a default route.
+    /// (e.g. `shell`, custom executor names). Callers should fall back
+    /// to the legacy path when this returns `None` rather than
+    /// substituting a default route.
     pub fn try_from_executor(executor: &str) -> Option<Self> {
         match executor {
             "claude" => Some(Self::ClaudeCli),
@@ -193,6 +193,7 @@ fn openrouter_config(params: &RouteParams) -> Config {
             api_key: None,
             api_key_file: params.api_key_file.clone(),
             api_key_env,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -200,6 +201,12 @@ fn openrouter_config(params: &RouteParams) -> Config {
 
     // Model registry: 3 standard Claude models via OpenRouter.
     config.model_registry = openrouter_default_registry();
+
+    // Cost-cap / monitoring section. Only the openrouter route emits
+    // [openrouter] — claude-cli / codex-cli / local / nex-custom leave
+    // it None so the section never appears in their config.toml.
+    // Defaults are unchanged; the user can edit afterwards.
+    config.openrouter = Some(OpenRouterConfig::default());
 
     // Tiers fully populated. Stored in provider:model format so the
     // strict model-spec validator accepts them on reload.
@@ -288,8 +295,18 @@ fn codex_cli_config(params: &RouteParams) -> Config {
     config.agent.model = agent_model.clone();
     config.coordinator.model = Some(agent_model.clone());
 
-    // Eval / assign default to the cheap tier from the central registry.
+    // Eval / assign / flip default to the cheap tier from the central registry.
+    // Pin flip_inference + flip_comparison so FLIP scoring doesn't fall through
+    // to the built-in claude:haiku default on a codex-only project.
     config.models = split_role_models_routing(&agent_model, &codex_fast, &codex_fast);
+    let flip_role = RoleModelConfig {
+        provider: None,
+        model: Some(codex_fast.clone()),
+        tier: None,
+        endpoint: None,
+    };
+    config.models.flip_inference = Some(flip_role.clone());
+    config.models.flip_comparison = Some(flip_role);
 
     config
 }
@@ -315,6 +332,7 @@ fn local_config(params: &RouteParams) -> Config {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -336,12 +354,13 @@ fn local_config(params: &RouteParams) -> Config {
         ..Default::default()
     }];
 
-    let default_model = format!("local:{}", model_id);
+    let default_model = format!("nex:{}", model_id);
 
     // Single local model fills all tiers — user should adjust as they
     // load more models. This is honest about the local single-model
     // reality, not pretending haiku/sonnet/opus exist locally. Stored in
-    // provider:model format to satisfy the strict validator.
+    // provider:model format (canonical `nex:` prefix matching `wg nex`)
+    // so the strict validator accepts on reload.
     config.tiers = TierConfig {
         fast: Some(default_model.clone()),
         standard: Some(default_model.clone()),
@@ -380,6 +399,7 @@ fn nex_custom_config(params: &RouteParams) -> Config {
             api_key: None,
             api_key_file: params.api_key_file.clone(),
             api_key_env: params.api_key_env.clone(),
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -393,7 +413,7 @@ fn nex_custom_config(params: &RouteParams) -> Config {
         ..Default::default()
     }];
 
-    let default_model = format!("oai-compat:{}", model_id);
+    let default_model = format!("nex:{}", model_id);
 
     // Single custom model — same single-model treatment as local.
     // provider:model format to satisfy the strict validator.
@@ -453,6 +473,8 @@ fn codex_default_registry() -> Vec<ModelRegistryEntry> {
             provider: "codex".to_string(),
             model: model_for_route(WORKGRAPH_CODEX_CLI_FAST_ROUTE),
             tier: Tier::Fast,
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
             ..Default::default()
         },
         ModelRegistryEntry {
@@ -460,6 +482,10 @@ fn codex_default_registry() -> Vec<ModelRegistryEntry> {
             provider: "codex".to_string(),
             model: model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
             tier: Tier::Standard,
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            cost_per_input_mtok: 2.5,
+            cost_per_output_mtok: 15.0,
             ..Default::default()
         },
         ModelRegistryEntry {
@@ -467,6 +493,10 @@ fn codex_default_registry() -> Vec<ModelRegistryEntry> {
             provider: "codex".to_string(),
             model: model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
             tier: Tier::Premium,
+            context_window: 1_000_000,
+            max_output_tokens: 128_000,
+            cost_per_input_mtok: 5.0,
+            cost_per_output_mtok: 30.0,
             ..Default::default()
         },
     ]
@@ -714,20 +744,32 @@ mod tests {
     fn test_route_codex_cli_role_split() {
         let config = config_for_route(SetupRoute::CodexCli, RouteParams::default());
         assert_eq!(
-            config.agent.model, "codex:o1-pro",
-            "codex-cli agent should default to o1-pro (premium)"
+            config.agent.model, "codex:gpt-5.5",
+            "codex-cli agent should default to gpt-5.5 (premium tier — newest frontier)"
         );
         let evaluator = config.models.evaluator.as_ref().unwrap();
         assert_eq!(
             evaluator.model.as_deref(),
-            Some("codex:gpt-5-mini"),
-            "codex-cli evaluator should default to gpt-5-mini (cheap)"
+            Some("codex:gpt-5.4-mini"),
+            "codex-cli evaluator should default to gpt-5.4-mini (cheap/haiku-equivalent)"
         );
         let assigner = config.models.assigner.as_ref().unwrap();
         assert_eq!(
             assigner.model.as_deref(),
-            Some("codex:gpt-5-mini"),
-            "codex-cli assigner should default to gpt-5-mini (cheap)"
+            Some("codex:gpt-5.4-mini"),
+            "codex-cli assigner should default to gpt-5.4-mini (cheap/haiku-equivalent)"
+        );
+        let flip_inference = config.models.flip_inference.as_ref().unwrap();
+        assert_eq!(
+            flip_inference.model.as_deref(),
+            Some("codex:gpt-5.4-mini"),
+            "codex-cli flip_inference should be pinned to gpt-5.4-mini (no silent claude:haiku fallback)"
+        );
+        let flip_comparison = config.models.flip_comparison.as_ref().unwrap();
+        assert_eq!(
+            flip_comparison.model.as_deref(),
+            Some("codex:gpt-5.4-mini"),
+            "codex-cli flip_comparison should be pinned to gpt-5.4-mini (no silent claude:haiku fallback)"
         );
     }
 
@@ -741,7 +783,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let expected = "local:qwen3-coder";
+        let expected = "nex:qwen3-coder";
         assert_eq!(config.agent.model, expected);
         assert_eq!(config.coordinator.model.as_deref(), Some(expected));
         assert_eq!(config.tiers.fast.as_deref(), Some(expected));
@@ -774,7 +816,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let expected = "oai-compat:my-model";
+        let expected = "nex:my-model";
         assert_eq!(
             config.models.evaluator.as_ref().unwrap().model.as_deref(),
             Some(expected),
@@ -802,9 +844,9 @@ mod tests {
 
         assert_tiers_filled(&config);
 
-        // Default = premium tier model = codex:o1-pro (worker runs premium for real implementation).
-        assert_eq!(config.agent.model, "codex:o1-pro");
-        assert_eq!(config.coordinator.model.as_deref(), Some("codex:o1-pro"));
+        // Default = premium tier model = codex:gpt-5.5 (newest frontier).
+        assert_eq!(config.agent.model, "codex:gpt-5.5");
+        assert_eq!(config.coordinator.model.as_deref(), Some("codex:gpt-5.5"));
 
         assert_models_evaluator_and_assigner_pinned(&config);
 
@@ -839,12 +881,13 @@ mod tests {
         assert!(ep.api_key_file.is_none());
 
         assert_tiers_filled(&config);
-        // Single local model fills all tiers (provider:model format)
-        assert_eq!(config.tiers.fast.as_deref(), Some("local:qwen3:4b"));
-        assert_eq!(config.tiers.standard.as_deref(), Some("local:qwen3:4b"));
-        assert_eq!(config.tiers.premium.as_deref(), Some("local:qwen3:4b"));
+        // Single local model fills all tiers (provider:model format,
+        // canonical `nex:` prefix).
+        assert_eq!(config.tiers.fast.as_deref(), Some("nex:qwen3:4b"));
+        assert_eq!(config.tiers.standard.as_deref(), Some("nex:qwen3:4b"));
+        assert_eq!(config.tiers.premium.as_deref(), Some("nex:qwen3:4b"));
 
-        assert_eq!(config.agent.model, "local:qwen3:4b");
+        assert_eq!(config.agent.model, "nex:qwen3:4b");
 
         assert_models_evaluator_and_assigner_pinned(&config);
 
@@ -885,20 +928,17 @@ mod tests {
         assert!(ep.is_default);
 
         assert_tiers_filled(&config);
-        assert_eq!(
-            config.tiers.fast.as_deref(),
-            Some("oai-compat:my-special-model")
-        );
+        assert_eq!(config.tiers.fast.as_deref(), Some("nex:my-special-model"));
         assert_eq!(
             config.tiers.standard.as_deref(),
-            Some("oai-compat:my-special-model")
+            Some("nex:my-special-model")
         );
         assert_eq!(
             config.tiers.premium.as_deref(),
-            Some("oai-compat:my-special-model")
+            Some("nex:my-special-model")
         );
 
-        assert_eq!(config.agent.model, "oai-compat:my-special-model");
+        assert_eq!(config.agent.model, "nex:my-special-model");
 
         assert_models_evaluator_and_assigner_pinned(&config);
 
@@ -953,6 +993,74 @@ mod tests {
         assert_eq!(SetupRoute::from_executor("unknown"), SetupRoute::ClaudeCli);
     }
 
+    // ── [openrouter] section presence per route ─────────────────────
+
+    /// Serialize `config` to TOML and return true if `[openrouter]`
+    /// appears as a top-level section header.
+    fn toml_has_openrouter_section(config: &Config) -> bool {
+        let toml_str = toml::to_string_pretty(config).expect("serialize");
+        toml_str.lines().any(|l| l.trim() == "[openrouter]")
+    }
+
+    #[test]
+    fn test_route_openrouter_emits_openrouter_section() {
+        let config = config_for_route(SetupRoute::Openrouter, RouteParams::default());
+        assert!(
+            toml_has_openrouter_section(&config),
+            "openrouter route must emit [openrouter] so the cost-cap config is visible to the user"
+        );
+    }
+
+    #[test]
+    fn test_route_claude_cli_omits_openrouter_section() {
+        let config = config_for_route(SetupRoute::ClaudeCli, RouteParams::default());
+        assert!(
+            !toml_has_openrouter_section(&config),
+            "claude-cli route must NOT emit [openrouter] — no openrouter usage means no log spam"
+        );
+    }
+
+    #[test]
+    fn test_route_codex_cli_omits_openrouter_section() {
+        let config = config_for_route(SetupRoute::CodexCli, RouteParams::default());
+        assert!(
+            !toml_has_openrouter_section(&config),
+            "codex-cli route must NOT emit [openrouter]"
+        );
+    }
+
+    #[test]
+    fn test_route_local_omits_openrouter_section() {
+        let config = config_for_route(
+            SetupRoute::Local,
+            RouteParams {
+                model: Some("qwen3-coder".to_string()),
+                url: Some("http://localhost:11434/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !toml_has_openrouter_section(&config),
+            "local route must NOT emit [openrouter]"
+        );
+    }
+
+    #[test]
+    fn test_route_nex_custom_omits_openrouter_section() {
+        let config = config_for_route(
+            SetupRoute::NexCustom,
+            RouteParams {
+                url: Some("https://my.endpoint.example/v1".to_string()),
+                model: Some("my-model".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !toml_has_openrouter_section(&config),
+            "nex-custom route must NOT emit [openrouter]"
+        );
+    }
+
     #[test]
     fn test_ensure_provider_prefix_idempotent() {
         assert_eq!(
@@ -969,8 +1077,8 @@ mod tests {
     fn test_ensure_provider_prefix_adds_prefix() {
         assert_eq!(ensure_provider_prefix("opus", "claude"), "claude:opus");
         assert_eq!(
-            ensure_provider_prefix("qwen3:4b", "local"),
-            "local:qwen3:4b",
+            ensure_provider_prefix("qwen3:4b", "nex"),
+            "nex:qwen3:4b",
             "ollama-style tag (model:tag) without a known provider prefix should still get prefixed"
         );
     }

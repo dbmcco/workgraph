@@ -47,6 +47,12 @@ fn make_motivation(id: &str, name: &str) -> TradeoffConfig {
         id: id.to_string(),
         name: name.to_string(),
         description: format!("{} description", name),
+        quality: 100,
+        domain_specificity: 0,
+        domain: vec![],
+        scope: None,
+        origin_instance_id: None,
+        parent_content_hash: None,
         acceptable_tradeoffs: Vec::new(),
         unacceptable_tradeoffs: Vec::new(),
         performance: PerformanceRecord::default(),
@@ -102,6 +108,7 @@ fn make_evaluation(
         timestamp: "2026-01-15T12:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     }
 }
 
@@ -137,7 +144,7 @@ fn create_bare_store_dirs(dir: &Path) {
 }
 
 fn create_project_store_dirs(dir: &Path) {
-    let agency = dir.join(".workgraph").join("agency");
+    let agency = dir.join(".wg").join("agency");
     std::fs::create_dir_all(agency.join("cache/roles")).unwrap();
     std::fs::create_dir_all(agency.join("primitives/tradeoffs")).unwrap();
     std::fs::create_dir_all(agency.join("cache/agents")).unwrap();
@@ -152,7 +159,7 @@ fn write_federation_config(wg_dir: &Path, config: &FederationConfig) {
 // 1. SCAN TESTS
 // ===========================================================================
 
-/// Scanning should find project stores with .workgraph/agency/roles/.
+/// Scanning should find project stores with .wg/agency/roles/.
 #[test]
 fn scan_finds_project_stores() {
     let tmp = TempDir::new().unwrap();
@@ -163,13 +170,13 @@ fn scan_finds_project_stores() {
     create_project_store_dirs(&proj_b);
 
     // Verify both project stores are individually valid
-    let store_a = LocalStore::new(proj_a.join(".workgraph").join("agency"));
-    let store_b = LocalStore::new(proj_b.join(".workgraph").join("agency"));
+    let store_a = LocalStore::new(proj_a.join(".wg").join("agency"));
+    let store_b = LocalStore::new(proj_b.join(".wg").join("agency"));
     assert!(store_a.is_valid());
     assert!(store_b.is_valid());
 }
 
-/// Scanning should find bare stores (agency/roles/ without .workgraph parent).
+/// Scanning should find bare stores (agency/roles/ without .wg parent).
 #[test]
 fn scan_finds_bare_stores() {
     let tmp = TempDir::new().unwrap();
@@ -196,10 +203,7 @@ fn resolve_store_finds_project() {
     create_project_store_dirs(tmp.path());
 
     let store = federation::resolve_store(tmp.path().to_str().unwrap()).unwrap();
-    assert_eq!(
-        store.store_path(),
-        tmp.path().join(".workgraph").join("agency")
-    );
+    assert_eq!(store.store_path(), tmp.path().join(".wg").join("agency"));
     assert!(store.is_valid());
 }
 
@@ -617,7 +621,7 @@ fn push_never_deletes_from_target() {
 #[test]
 fn remote_add_list_remove_lifecycle() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     // Add
@@ -654,7 +658,7 @@ fn remote_add_list_remove_lifecycle() {
 #[test]
 fn remote_name_resolves_for_pull_push() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join("project").join(".workgraph");
+    let wg_dir = tmp.path().join("project").join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let remote_store = setup_store(&tmp, "remote");
@@ -709,7 +713,7 @@ fn remote_show_entity_summary() {
 #[test]
 fn touch_remote_sync_updates_timestamp() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let mut config = FederationConfig::default();
@@ -1101,7 +1105,7 @@ fn transfer_from_empty_source_gives_empty_results() {
 #[test]
 fn federation_config_yaml_roundtrip() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let mut config = FederationConfig::default();
@@ -1144,7 +1148,7 @@ fn federation_config_yaml_roundtrip() {
 #[test]
 fn federation_config_missing_file_returns_default() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let config = federation::load_federation_config(&wg_dir).unwrap();
@@ -1228,6 +1232,7 @@ fn lineage_merge_prefers_richer() {
         generation: 2,
         created_by: "evolver".to_string(),
         created_at: chrono::Utc::now(),
+        reframing_potential: None,
     };
     // Give source a unique eval so the merge triggers an update
     source_role.performance = make_perf(vec![(0.9, "task-src", "2026-02-01T00:00:00Z")]);
@@ -1239,6 +1244,7 @@ fn lineage_merge_prefers_richer() {
         generation: 1,
         created_by: "human".to_string(),
         created_at: chrono::Utc::now(),
+        reframing_potential: None,
     };
     target_role.performance = make_perf(vec![(0.8, "task-tgt", "2026-01-01T00:00:00Z")]);
     target.save_role(&target_role).unwrap();
@@ -1372,27 +1378,27 @@ fn multiple_agents_shared_deps_added_once() {
 fn scan_max_depth_limits_discovery() {
     let tmp = TempDir::new().unwrap();
 
-    // Store at depth 1: root/shallow/.workgraph/agency/
+    // Store at depth 1: root/shallow/.wg/agency/
     let shallow = tmp.path().join("shallow");
     create_project_store_dirs(&shallow);
     // Add a role so it's not empty
-    let shallow_store = LocalStore::new(shallow.join(".workgraph").join("agency"));
+    let shallow_store = LocalStore::new(shallow.join(".wg").join("agency"));
     agency::init(shallow_store.store_path()).unwrap();
     shallow_store
         .save_role(&make_role("r-shallow", "shallow-role"))
         .unwrap();
 
-    // Store at depth 3: root/a/b/deep/.workgraph/agency/
+    // Store at depth 3: root/a/b/deep/.wg/agency/
     let deep = tmp.path().join("a").join("b").join("deep");
     create_project_store_dirs(&deep);
-    let deep_store = LocalStore::new(deep.join(".workgraph").join("agency"));
+    let deep_store = LocalStore::new(deep.join(".wg").join("agency"));
     agency::init(deep_store.store_path()).unwrap();
     deep_store
         .save_role(&make_role("r-deep", "deep-role"))
         .unwrap();
 
-    // With max_depth=3 (root/shallow/.workgraph = 2 levels), shallow is found
-    // but deep (root/a/b/deep/.workgraph = 4 levels) is not
+    // With max_depth=3 (root/shallow/.wg = 2 levels), shallow is found
+    // but deep (root/a/b/deep/.wg = 4 levels) is not
     // Verify via resolve: shallow store should be valid, deep should exist
     assert!(shallow_store.is_valid());
     assert!(deep_store.is_valid());
@@ -1561,7 +1567,7 @@ fn force_with_no_performance_keeps_target_perf() {
 #[test]
 fn multiple_remotes_coexist() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join("project").join(".workgraph");
+    let wg_dir = tmp.path().join("project").join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let store_a = setup_store(&tmp, "team-a");
@@ -1605,7 +1611,7 @@ fn multiple_remotes_coexist() {
 #[test]
 fn remote_removal_isolates_others() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let mut config = FederationConfig::default();
@@ -1728,7 +1734,7 @@ fn transfer_preserves_all_agent_fields() {
 
     let mut agent = make_agent("a1", "full-agent", "r1", "m1");
     agent.capabilities = vec!["rust".to_string(), "testing".to_string()];
-    agent.executor = "amplifier".to_string();
+    agent.executor = "codex".to_string();
     source.save_agent(&agent).unwrap();
 
     federation::transfer(&source, &target, &TransferOptions::default()).unwrap();
@@ -1739,7 +1745,7 @@ fn transfer_preserves_all_agent_fields() {
     assert_eq!(transferred.role_id, "r1");
     assert_eq!(transferred.tradeoff_id, "m1");
     assert_eq!(transferred.capabilities, vec!["rust", "testing"]);
-    assert_eq!(transferred.executor, "amplifier");
+    assert_eq!(transferred.executor, "codex");
 }
 
 /// Evaluation relevance filtering: only evals for transferred entities are copied.
@@ -1832,13 +1838,13 @@ fn scan_cli_finds_multiple_stores_json() {
     // Create two project stores with entities
     let proj_a = tmp.path().join("alpha");
     create_project_store_dirs(&proj_a);
-    let store_a = LocalStore::new(proj_a.join(".workgraph").join("agency"));
+    let store_a = LocalStore::new(proj_a.join(".wg").join("agency"));
     agency::init(store_a.store_path()).unwrap();
     store_a.save_role(&make_role("r1", "role-alpha")).unwrap();
 
     let proj_b = tmp.path().join("beta");
     create_project_store_dirs(&proj_b);
-    let store_b = LocalStore::new(proj_b.join(".workgraph").join("agency"));
+    let store_b = LocalStore::new(proj_b.join(".wg").join("agency"));
     agency::init(store_b.store_path()).unwrap();
     store_b.save_role(&make_role("r2", "role-beta")).unwrap();
     store_b
@@ -1864,7 +1870,7 @@ fn scan_mixed_bare_and_project_stores() {
     // Project store
     let proj = tmp.path().join("project");
     create_project_store_dirs(&proj);
-    let store_proj = LocalStore::new(proj.join(".workgraph").join("agency"));
+    let store_proj = LocalStore::new(proj.join(".wg").join("agency"));
     agency::init(store_proj.store_path()).unwrap();
     store_proj.save_role(&make_role("r1", "proj-role")).unwrap();
 
@@ -1962,7 +1968,7 @@ fn transfer_preserves_all_optional_agent_fields() {
     agent.capacity = Some(3.0);
     agent.trust_level = TrustLevel::Verified;
     agent.contact = Some("agent@example.com".to_string());
-    agent.executor = "amplifier".to_string();
+    agent.executor = "codex".to_string();
     source.save_agent(&agent).unwrap();
 
     federation::transfer(&source, &target, &TransferOptions::default()).unwrap();
@@ -1973,7 +1979,7 @@ fn transfer_preserves_all_optional_agent_fields() {
     assert_eq!(transferred.capacity, Some(3.0));
     assert_eq!(transferred.trust_level, TrustLevel::Verified);
     assert_eq!(transferred.contact.as_deref(), Some("agent@example.com"));
-    assert_eq!(transferred.executor, "amplifier");
+    assert_eq!(transferred.executor, "codex");
     assert_eq!(transferred.capabilities.len(), 3);
 }
 
@@ -2119,7 +2125,7 @@ fn force_flag_overwrites_agent() {
         .unwrap();
 
     let mut source_agent = make_agent("a1", "source-agent", "r1", "m1");
-    source_agent.executor = "amplifier".to_string();
+    source_agent.executor = "codex".to_string();
     source.save_agent(&source_agent).unwrap();
 
     let mut target_agent = make_agent("a1", "target-agent", "r1", "m1");
@@ -2136,7 +2142,7 @@ fn force_flag_overwrites_agent() {
     let agents = target.load_agents().unwrap();
     let merged = agents.iter().find(|a| a.id == "a1").unwrap();
     assert_eq!(merged.name, "source-agent");
-    assert_eq!(merged.executor, "amplifier");
+    assert_eq!(merged.executor, "codex");
 }
 
 /// No_evaluations + force: overwrites metadata, keeps evaluations out.
@@ -2498,6 +2504,7 @@ fn lineage_merge_higher_generation_wins_on_equal_parents() {
         generation: 5,
         created_by: "evolver".to_string(),
         created_at: chrono::Utc::now(),
+        reframing_potential: None,
     };
     source_role.performance = make_perf(vec![(0.9, "task-src", "2026-02-01T00:00:00Z")]);
     source.save_role(&source_role).unwrap();
@@ -2508,6 +2515,7 @@ fn lineage_merge_higher_generation_wins_on_equal_parents() {
         generation: 3,
         created_by: "human".to_string(),
         created_at: chrono::Utc::now(),
+        reframing_potential: None,
     };
     target_role.performance = make_perf(vec![(0.8, "task-tgt", "2026-01-01T00:00:00Z")]);
     target.save_role(&target_role).unwrap();

@@ -2,31 +2,28 @@ use anyhow::Result;
 
 const QUICKSTART_TEXT: &str = r###"
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                         WORKGRAPH AGENT QUICKSTART                           ║
+║                            WG AGENT QUICKSTART                               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 GETTING STARTED
 ─────────────────────────────────────────
-  wg init                     # Create a .workgraph directory
-  wg setup                    # Interactive config wizard (executor, model, agency)
+  wg init                     # Create a .wg directory
+  wg setup                    # Interactive config wizard (5 routes: claude-cli, openrouter, codex-cli, local, nex-custom)
+  wg setup --route claude-cli --yes   # Non-interactive: pick a route and accept defaults
   wg agency init              # Bootstrap roles, tradeoffs, and a default agent
-  wg service start            # Start the coordinator
+  wg service start            # Start the dispatcher daemon
   wg add "My first task"      # Add work — the service dispatches automatically
   wg status                   # Quick one-screen overview of your project
+  wg dev-check                # Check branch and installed wg binary freshness
 
 SKILL & BUNDLE SETUP (required for agents to use wg)
 ─────────────────────────────────────────
-  Spawned agents need to know how to use workgraph. Without the right
-  skill or bundle installed, agents won't know wg commands exist.
+  Spawned agents need to know how to use the `wg` CLI. Without the right
+  skill or bundle installed, agents won't know that command surface exists.
 
   Claude Code executor:
     wg skill install             # Installs ~/.claude/skills/wg/SKILL.md
                                  # This is injected into every Claude Code session
-
-  Amplifier executor:
-    cd ~/amplifier-bundle-workgraph && ./setup.sh
-                                 # Installs the workgraph bundle and executor
-                                 # Then use: amplifier run -B workgraph
 
   Custom executor:
     Ensure your executor's agent prompt includes wg CLI instructions.
@@ -65,32 +62,33 @@ AGENCY SETUP
     wg agent create "Name" --role <hash> --tradeoff <hash>
     wg config --auto-assign true --auto-evaluate true
 
-⚠ COORDINATOR SERVICE REMINDER ⚠
+⚠ DISPATCHER SERVICE REMINDER ⚠
 ─────────────────────────────────────────
-  Check if the coordinator is running:  wg service status
+  Check if the dispatcher is running:  wg service status
 
   If it IS running, your job is to DEFINE work, not DISPATCH it.
-  Add tasks and dependencies — the coordinator handles the rest.
+  Add tasks and dependencies — the dispatcher handles the rest.
   Never manually 'wg spawn' or 'wg claim' while the service is running;
-  you'll collide with the coordinator and get 'already claimed' errors.
+  you'll collide with the dispatcher and get 'already claimed' errors.
 
   If it is NOT running, choose a mode below.
 
 SERVICE MODE (recommended for parallel work)
 ─────────────────────────────────────────
-  wg service start --max-agents 5  # Start coordinator with parallelism limit
+  wg service start --max-agents 5  # Start dispatcher with parallelism limit
+  wg service install               # Generate a systemd user service file
 
-  The coordinator automatically spawns agents on ready tasks. Just add tasks:
+  The dispatcher automatically spawns worker agents on ready tasks. Just add tasks:
 
   wg add "Do the thing" --after prerequisite-task
 
   Monitor with wg agents and wg list. Do NOT manually wg spawn or wg claim —
-  the coordinator handles this.
+  the dispatcher handles this.
 
   wg service status           # Check if running, see last tick
   wg service restart          # Graceful stop then start
-  wg service pause            # Pause coordinator (no new spawns, running agents continue)
-  wg service resume           # Resume coordinator
+  wg service pause            # Pause dispatcher (no new spawns, running agents continue)
+  wg service resume           # Resume dispatcher
   wg service freeze           # SIGSTOP all agents and pause service
   wg service thaw             # SIGCONT agents and resume service
   wg agents                   # Who's working on what
@@ -98,16 +96,23 @@ SERVICE MODE (recommended for parallel work)
   wg agents kill <agent-id> --force   # SIGKILL immediately
   wg kill <agent-id>          # Kill agent + pause its task (prevents re-dispatch)
   wg kill <agent-id> --redispatch  # Kill agent, leave task open for re-dispatch
+  wg kill --tree <agent-id>   # Kill agent + cascade-abandon all downstream tasks
   wg kill --all               # Kill all agents + pause their tasks
   wg list                     # What's done, what's pending
   wg tui                      # Interactive dashboard
+  wg reap                     # Garbage-collect dead/done/failed agents from the registry
 
-  Multi-chat sessions:
+  Multi-chat sessions (the canonical surface is `wg chat`; `wg service` aliases below
+  preserve back-compat with the old coordinator-named subcommands):
 
-  wg service create-chat          # Create a new chat session
-  wg service stop-chat <n>        # Stop a chat session
-  wg service archive-chat <n>     # Archive a chat session
-  wg service delete-chat <n>      # Delete a chat session
+  wg service create-chat          # Create a new chat agent (alias: create-coordinator)
+  wg service stop-chat <n>        # Stop a chat agent (alias: stop-coordinator)
+  wg service archive-chat <n>     # Archive a chat agent (alias: archive-coordinator)
+  wg service delete-chat <n>      # Delete a chat agent (alias: delete-coordinator)
+  wg service interrupt-chat <n>   # SIGINT the chat's current generation (preserves context)
+  wg service set-executor <id>    # Hot-swap a chat agent's executor and/or model
+                                  # (SIGTERM + respawn; conversation history preserved)
+  wg service purge-chats          # Bulk-purge all chat agents (archive all, kill all)
 
   Chat with the chat agent:
 
@@ -162,9 +167,9 @@ DISCOVERING & ADDING WORK
   wg add "X" --exec-mode full    # Default: full agent with all tools
   wg add "X" --exec-mode light   # Read-only tools (research/review tasks)
   wg add "X" --exec-mode bare    # Only wg CLI (coordination-only tasks)
-  wg add "X" --exec-mode shell   # Shell command, no LLM (use with wg exec --set)
+  wg add "X" --exec-mode shell   # Shell command, no LLM (exit 0 = done, non-zero = failed; no eval rescue)
 
-  Context scopes control how much context the coordinator injects into the
+  Context scopes control how much context the dispatcher injects into the
   agent's prompt when dispatching a task:
 
   wg add "X" --context-scope clean  # Minimal: just the task description
@@ -190,12 +195,32 @@ TASK STATE COMMANDS
   wg fail <task-id> --reason  # Mark failed (can be retried)
   wg retry <task-id>          # Retry a failed/incomplete task (resets to open)
   wg abandon <task-id>        # Give up permanently
-  wg pause <task-id>          # Pause task (coordinator skips it until resumed)
+  wg pause <task-id>          # Pause task (dispatcher skips it until resumed)
   wg wait <task-id> --until "condition"  # Park task until condition is met
   wg resume <task-id>         # Resume a paused/waiting task
   wg unclaim <task-id>        # Release a claimed task (back to open)
   wg incomplete <task-id> --reason "..." # Mark incomplete (retryable — needs another pass)
   wg requeue <task-id> --reason "..."  # Requeue in-progress task for triage
+  wg reprioritize <task-id> <level>    # Change priority (critical, high, normal, low, idle)
+
+  failed-pending-eval is an intermediate status that applies ONLY to LLM
+  agent tasks (full / light / bare exec modes): the agent exited non-zero
+  with auto_evaluate=true, awaiting an `.evaluate-X` verdict before becoming
+  terminal failed. 'wg fail <id>' on a failed-pending-eval task forces
+  the terminal status.
+
+  Shell tasks (--exec-mode shell or --exec '<cmd>') do NOT participate in
+  this rescue path: failure semantics are 'exit code 0 = done, non-zero =
+  failed (terminal)'. They are exempt from the agency pipeline so no
+  .assign-*, .flip-*, or .evaluate-* lifecycle tasks are scaffolded for
+  them. Cron / recurring shell tasks follow the same rule: each invocation
+  succeeds or fails terminally, with no rescue attempt.
+
+  KNOWN GAP (2026-05-01): coordinator-dispatched shell tasks that fail via
+  the agent wrapper (which calls 'wg fail --class agent-exit-nonzero') can
+  currently land in failed-pending-eval and stay there because no
+  .evaluate-X exists to resolve the rescue. 'wg exec --shell' is the
+  recommended path for now; tracked under 'fix-shell-pending-eval'.
 
   Wait conditions:
     --until "task:dep-a=done"   # Wait for another task to reach a status
@@ -266,7 +291,7 @@ CONTEXT & ARTIFACTS
 
 CYCLES (repeating workflows)
 ─────────────────────────────────────────
-  Workgraph is a directed graph, NOT a DAG. It supports cycles natively.
+  The WG task graph is a directed graph, NOT a DAG. It supports cycles natively.
   Use cycles instead of duplicating tasks (e.g., don't create "pass 1",
   "pass 2", "pass 3" — create one cycle that iterates).
 
@@ -339,6 +364,11 @@ SHELL EXECUTION
   wg exec --clear build-task                         # Remove the shell command
 
   Use with --exec-mode shell on task creation for fully automated steps.
+  Shell tasks are exempt from the agency pipeline (no .assign-*, .flip-*,
+  or .evaluate-* siblings) and from LLM evaluation. Failure is terminal:
+  exit 0 → done, non-zero → failed. 'wg exec --shell <task>' is the
+  preferred entrypoint — it transitions directly to failed without going
+  through failed-pending-eval.
 
 COMPACT, SWEEP & CHECKPOINT
 ─────────────────────────────────────────
@@ -399,6 +429,10 @@ DISCOVERY & PUBLISHING
   wg publish <task-id>              # Publish a draft task (validates deps, resumes subgraph)
   wg publish <task-id> --only       # Publish just this task (skip subgraph propagation)
 
+  wg html publish add <name> --rsync user@host:/path/  # Register an html rsync deployment
+  wg html publish run <name>        # Run the html rsync deployment now
+  wg html publish list              # List configured rsync deployments
+
   wg reclaim <task-id> --from <actor> --to <actor>  # Reclaim task from dead agent
 
 GROWING THE GRAPH
@@ -423,30 +457,43 @@ GROWING THE GRAPH
   You may be any node. Use 'wg context' to see what came before.
   Use 'wg add' to create what comes next.
 
-  The coordinator dispatches anything you add. You don't need permission.
+  The dispatcher dispatches anything you add. You don't need permission.
   Use judgment on size — if a fix takes 5 minutes, just do it inline.
   Create tasks for work that benefits from separate focus.
 
 TIPS
 ─────────────────────────────────────────
-• If the coordinator is running: add tasks → it dispatches automatically
-• If no coordinator: ready → claim → work → done
+• If the dispatcher is running: add tasks → it dispatches automatically
+• If no dispatcher: ready → claim → work → done
 • Run 'wg log' BEFORE starting work to track progress
 • Use 'wg context' to understand what dependencies produced
 • Check 'wg blocked <task-id>' if a task isn't appearing in ready list
 • Use 'wg why-blocked <task-id>' for the full transitive blocking chain
+• Confused which graph wg is talking to? Run 'wg which' (prints resolved dir + resolver step)
 
 EXECUTORS & MODELS
 ─────────────────────────────────────────
-  The coordinator spawns agents using an executor (default: claude).
-  Switch to amplifier for OpenRouter-backed models:
+  wg derives the handler from the model spec's provider prefix. The CLI
+  flag (--executor / --coordinator-executor) is a deprecated legacy alias.
+  Pick a (model, endpoint) pair instead:
 
-  wg config --coordinator-executor amplifier
+  wg config -m claude:opus                                  # claude CLI handler
+  wg config -m codex:gpt-5.5                                # codex CLI handler
+  wg config -m nex:qwen3-coder -e http://127.0.0.1:8088     # in-process nex handler
+  wg config -m openrouter:anthropic/claude-opus-4-7         # in-process nex handler
+
+  Or pick a named profile (writes ~/.wg/active-profile, hot-reloads daemon):
+
+  wg profile use claude         # Starter profile: claude:opus worker
+  wg profile use codex          # Starter profile: codex:gpt-5.5
+  wg profile use nex            # Starter profile: in-process nex endpoint
+  wg profile show               # Inspect active profile
+  wg profile init-starters      # Re-write the three starter profiles
 
   Set a default model for all agents:
 
-  wg service start --model anthropic:claude-sonnet-4-6   # CLI override
-  # Or in .workgraph/config.toml under [coordinator]: model = "anthropic:claude-sonnet-4-6"
+  wg service start --model claude:sonnet-4-6                # CLI override
+  # Or in .wg/config.toml under [dispatcher]: model = "claude:sonnet-4-6"
 
   Per-task model selection (overrides the default):
 
@@ -456,7 +503,10 @@ EXECUTORS & MODELS
   Model format: use provider:model (e.g., openrouter:deepseek/deepseek-v3.2).
   Short names (opus, sonnet, haiku) are also accepted.
 
-  Model hierarchy: task --model > executor model > coordinator model > 'default'
+  Model hierarchy: task --model > executor model > dispatcher model > 'default'
+
+  wg executors                  # List which handler binaries are installed/usable
+  wg config lint                # Read-only check for deprecated/stale config keys
 
 MODEL REGISTRY & API KEYS
 ─────────────────────────────────────────
@@ -517,16 +567,38 @@ CONFIGURATION
 ─────────────────────────────────────────
   wg config --show                    # Show current configuration
   wg config --list                    # Show merged config with source annotations
-  wg config --merged                  # Show effective merged config
+  wg config --merged                  # Show effective merged config (debug routing)
   wg config init --global             # Write minimal canonical ~/.wg/config.toml
   wg config init --local --bare       # Write minimal canonical .wg/config.toml
   wg config init --route openrouter --global   # Write openrouter-route config
-  wg config --global --model opus     # Update key in global ~/.wg/config.toml
-  wg config --local --model sonnet    # Update key in local .wg/config.toml
+                                                # Routes: claude-cli, codex-cli, openrouter, local, nex-custom
+  wg config --global --model opus     # Update key in global ~/.wg/config.toml (auto-reloads daemon)
+  wg config --local --model sonnet    # Update key in local .wg/config.toml (auto-reloads daemon)
+  wg config -m opus --no-reload       # Skip the auto-reload IPC; just write the file
+  wg config lint                      # Read-only audit: report deprecated keys, stale model strings
   wg config --creator-agent <hash>    # Set agent used for task creation
   wg config --creator-model <model>   # Set model used for task creation
   wg migrate config --dry-run         # Preview what `wg migrate config` would change
   wg migrate config --all             # Rewrite stale global+local configs to canonical
+  wg migrate secrets --dry-run        # Preview migration of api_key_env → keyring:<name>
+  wg migrate secrets                  # Migrate api_key_env → keyring:<name> (prompts each)
+
+API KEYS & SECRETS
+─────────────────────────────────────────
+  Manage credentials in a backend (keyring | keystore | plaintext) plus
+  passthrough URI schemes (op:// pass: env: literal:):
+
+  wg secret set <name>                # Store a secret in the credential store
+  wg secret get <name>                # Show a secret (redacted by default)
+  wg secret list                      # List stored secret names (never values)
+  wg secret rm <name>                 # Delete a stored secret
+  wg secret check <ref>               # Pre-flight: is this ref reachable?
+  wg secret backend show              # Which backends are active and reachable
+  wg secret backend set <kind>        # Set the default backend for new `wg secret set`
+
+  Reference secrets from endpoint config via `api_key_ref = "keyring:<name>"`
+  (preferred). The older `api_key_env = "VAR"` is still accepted; run
+  `wg migrate secrets` to rewrite existing configs.
 
 TRACE, RUNS & REPLAY
 ─────────────────────────────────────────
@@ -568,20 +640,20 @@ DEAD AGENT DETECTION
   wg dead-agents --purge --delete-dirs  # Also delete agent work directories
   wg dead-agents --threshold 30       # Override heartbeat timeout (minutes)
 
-PEER WORKGRAPHS
+PEER WG PROJECTS
 ─────────────────────────────────────────
-  Cross-repo communication between workgraph instances:
+  Cross-repo communication between WG instances:
 
-  wg peer add <name> <path>           # Register a peer workgraph
+  wg peer add <name> <path>           # Register a peer WG project
   wg peer list                        # List all peers with service status
   wg peer status                      # Quick health check of all peers
-  wg add "Task" --repo <peer>         # Create a task in a peer workgraph
+  wg add "Task" --repo <peer>         # Create a task in a peer WG project
 
 EVALUATION & MONITORING
 ─────────────────────────────────────────
   wg evaluate run <task-id>           # Trigger LLM evaluation of a completed task
   wg evaluate show                    # View evaluation history
-  wg watch                            # Stream workgraph events as JSON lines
+  wg watch                            # Stream WG events as JSON lines
   wg watch --task <id>                # Stream events for a specific task
 
 NOTIFICATION & COMMUNICATION
@@ -641,11 +713,6 @@ fn json_output() -> serde_json::Value {
                 "location": "~/.claude/skills/wg/SKILL.md",
                 "note": "Injected into every Claude Code session automatically"
             },
-            "amplifier": {
-                "install": "cd ~/amplifier-bundle-workgraph && ./setup.sh",
-                "alternative": "amplifier bundle add git+https://github.com/graphwork/amplifier-bundle-workgraph",
-                "usage": "amplifier run -B workgraph"
-            },
             "custom": "Ensure your executor's agent prompt includes wg CLI instructions"
         },
         "agency": {
@@ -667,7 +734,7 @@ fn json_output() -> serde_json::Value {
                 "enable": "wg config --auto-place true"
             },
             "auto_create": {
-                "description": "When auto_create is enabled, the coordinator invokes the creator agent to discover and add new primitives when the store needs expansion.",
+                "description": "When auto_create is enabled, the dispatcher invokes the creator agent to discover and add new primitives when the store needs expansion.",
                 "enable": "wg config --auto-create true"
             },
             "model_registry": {
@@ -679,9 +746,10 @@ fn json_output() -> serde_json::Value {
         },
         "modes": {
             "service": {
-                "description": "Recommended for parallel work. Coordinator dispatches automatically.",
+                "description": "Recommended for parallel work. Dispatcher daemon spawns worker agents automatically.",
                 "start": "wg service start --max-agents 5",
-                "workflow": "Add tasks with dependencies → coordinator spawns agents on ready tasks",
+                "install_systemd": "wg service install (generate systemd user service file)",
+                "workflow": "Add tasks with dependencies → dispatcher spawns worker agents on ready tasks",
                 "warning": "Do NOT manually wg spawn or wg claim while the service is running",
                 "monitor": ["wg service status", "wg agents", "wg list", "wg tui"],
                 "control": {
@@ -692,7 +760,9 @@ fn json_output() -> serde_json::Value {
                 },
                 "kill_agent": "wg kill <agent-id> (pauses task by default)",
                 "kill_agent_redispatch": "wg kill <agent-id> --redispatch (leave task open)",
-                "kill_all": "wg kill --all (pauses all tasks)"
+                "kill_tree": "wg kill --tree <agent-id> (cascade-abandon all downstream tasks)",
+                "kill_all": "wg kill --all (pauses all tasks)",
+                "reap": "wg reap (garbage-collect dead/done/failed agents from registry)"
             },
             "manual": {
                 "description": "For when no service is running. You claim and work tasks yourself.",
@@ -720,7 +790,7 @@ fn json_output() -> serde_json::Value {
                 "fail": "Mark failed (can be retried)",
                 "retry": "Retry a failed task (resets to open)",
                 "abandon": "Give up permanently",
-                "pause": "Pause task (coordinator skips it until resumed)",
+                "pause": "Pause task (dispatcher skips it until resumed)",
                 "wait": "Park task until condition met (wg wait <id> --until \"condition\")",
                 "resume": "Resume a paused/waiting task",
                 "reschedule": "Set not_before timestamp (wg reschedule <id> --after 24)",
@@ -759,6 +829,9 @@ fn json_output() -> serde_json::Value {
             "discover_artifacts": "wg discover --with-artifacts",
             "publish": "wg publish <task-id>",
             "publish_only": "wg publish <task-id> --only",
+            "html_publish_add": "wg html publish add <name> --rsync user@host:/path/",
+            "html_publish_run": "wg html publish run <name>",
+            "html_publish_list": "wg html publish list",
             "reclaim": "wg reclaim <task-id> --from <actor> --to <actor>"
         },
         "exec_modes": {
@@ -802,23 +875,53 @@ fn json_output() -> serde_json::Value {
                 "docs_wrong": "wg add \"Fix docs for X\" -d \"Spotted while reading ...\"",
                 "followup": "wg add \"Verify: ...\" --after <task-id>"
             },
-            "guidance": "The coordinator dispatches anything you add. If a fix takes 5 minutes, do it inline. Create tasks for work that benefits from separate focus."
+            "guidance": "The dispatcher dispatches anything you add. If a fix takes 5 minutes, do it inline. Create tasks for work that benefits from separate focus."
         },
         "tips": [
-            "If the coordinator is running: add tasks with dependencies, it dispatches automatically",
-            "If no coordinator: ready → claim → work → done",
+            "If the dispatcher is running: add tasks with dependencies, it dispatches automatically",
+            "If no dispatcher: ready → claim → work → done",
             "Run 'wg log' BEFORE starting work to track progress",
             "Use 'wg context' to understand what dependencies produced",
             "Check 'wg blocked <task-id>' if a task isn't appearing in ready list",
-            "Use 'wg why-blocked <task-id>' for the full transitive blocking chain"
+            "Use 'wg why-blocked <task-id>' for the full transitive blocking chain",
+            "Confused which graph wg is talking to? Run 'wg which'"
         ],
         "executors_and_models": {
-            "switch_executor": "wg config --coordinator-executor amplifier",
-            "set_model_cli": "wg service start --model anthropic:claude-sonnet-4-6",
-            "set_model_config": "[coordinator] model = \"anthropic:claude-sonnet-4-6\"",
+            "model_spec_routing": "wg derives the handler from the model spec's provider prefix; --executor / --coordinator-executor is a deprecated legacy alias.",
+            "claude": "wg config -m claude:opus (claude CLI handler)",
+            "codex": "wg config -m codex:gpt-5.5 (codex CLI handler)",
+            "nex_local": "wg config -m nex:qwen3-coder -e http://127.0.0.1:8088 (in-process nex handler)",
+            "openrouter": "wg config -m openrouter:anthropic/claude-opus-4-7 (in-process nex handler)",
+            "set_model_cli": "wg service start --model claude:sonnet-4-6",
+            "set_model_config": "[dispatcher] model = \"claude:sonnet-4-6\"",
             "per_task_model": "wg add \"task\" --model openrouter:google/gemini-2.5-flash",
             "model_format": "provider:model (e.g., openrouter:deepseek/deepseek-v3.2). Short names (opus, sonnet, haiku) also accepted.",
-            "hierarchy": "task --model > executor model > coordinator model > 'default'"
+            "hierarchy": "task --model > executor model > dispatcher model > 'default'",
+            "executors_cmd": "wg executors (list which handlers are installed/usable on this system)",
+            "config_lint": "wg config lint (read-only audit for deprecated keys / stale model strings)"
+        },
+        "named_profiles": {
+            "description": "Named profiles bundle (model, endpoint, secret refs) into a presetting that can be activated atomically.",
+            "use": "wg profile use <name> (writes ~/.wg/active-profile, hot-reloads daemon)",
+            "show": "wg profile show",
+            "list": "wg profile list",
+            "create": "wg profile create <name>",
+            "edit": "wg profile edit <name>",
+            "diff": "wg profile diff <a> <b>",
+            "init_starters": "wg profile init-starters (writes built-in starters: claude, codex, nex)",
+            "starters": ["claude (opus worker)", "codex (gpt-5.5)", "nex (in-process endpoint)"]
+        },
+        "secrets": {
+            "description": "Manage credentials in a backend (keyring | keystore | plaintext) plus passthrough URI schemes (op:// pass: env: literal:).",
+            "set": "wg secret set <name>",
+            "get": "wg secret get <name>",
+            "list": "wg secret list",
+            "rm": "wg secret rm <name>",
+            "check": "wg secret check <ref>",
+            "backend_show": "wg secret backend show",
+            "backend_set": "wg secret backend set <kind>",
+            "endpoint_ref": "Reference secrets via api_key_ref = \"keyring:<name>\" in [[llm_endpoints.endpoints]]; the older api_key_env still works.",
+            "migrate": "wg migrate secrets (rewrite api_key_env → keyring:<name>, prompts each)"
         },
         "model_registry": {
             "model": {
@@ -864,17 +967,32 @@ fn json_output() -> serde_json::Value {
             "checkpoint_list": "wg checkpoint <task> --list",
             "stats": "wg stats"
         },
-        "multi_coordinator": {
-            "create": "wg service create-coordinator",
-            "stop": "wg service stop-coordinator <n>",
-            "archive": "wg service archive-coordinator <n>",
-            "delete": "wg service delete-coordinator <n>"
+        "multi_chat": {
+            "description": "Each chat agent is a graph entity (.chat-N). The canonical command surface is `wg chat <subcommand>`; wg service aliases below preserve back-compat with the old coordinator-named subcommands.",
+            "create": "wg chat create (or: wg service create-chat)",
+            "stop": "wg chat stop <id> (or: wg service stop-chat <n>)",
+            "archive": "wg chat archive <id> (or: wg service archive-chat <n>)",
+            "delete": "wg chat delete <id> (or: wg service delete-chat <n>)",
+            "interrupt": "wg service interrupt-chat <n>",
+            "set_executor": "wg service set-executor <id> --executor <kind> -m <model> (hot-swap; respawn preserves history)",
+            "purge": "wg service purge-chats (bulk-purge all chat agents; reversible via wg chat create)"
         },
         "chat": {
-            "send": "wg chat \"message\"",
+            "subcommands": {
+                "create": "wg chat create",
+                "list": "wg chat list",
+                "show": "wg chat show <id>",
+                "attach": "wg chat attach <id>",
+                "send": "wg chat send <id> \"message\"",
+                "stop": "wg chat stop <id>",
+                "resume": "wg chat resume <id>",
+                "archive": "wg chat archive <id>",
+                "delete": "wg chat delete <id>"
+            },
+            "default_form": "wg chat \"message\" (one-shot send to default chat)",
             "interactive": "wg chat -i",
             "attachment": "wg chat --attachment file.txt",
-            "coordinator": "wg chat --coordinator 1",
+            "coordinator_legacy": "wg chat --coordinator 1 (legacy flag for targeting a specific chat)",
             "history": "wg chat --history",
             "clear": "wg chat --clear"
         },
@@ -914,12 +1032,12 @@ fn json_output() -> serde_json::Value {
         "configuration": {
             "show": "wg config --show",
             "list": "wg config --list (merged config with source annotations)",
-            "global": "wg config --global (target ~/.workgraph/config.toml)",
-            "local": "wg config --local (target .workgraph/config.toml)",
+            "global": "wg config --global (target ~/.wg/config.toml)",
+            "local": "wg config --local (target .wg/config.toml)",
             "creator_agent": "wg config --creator-agent <hash>"
         },
         "context_scopes": {
-            "description": "Control how much context the coordinator injects into agent prompts.",
+            "description": "Control how much context the dispatcher injects into agent prompts.",
             "levels": {
                 "clean": "Minimal: just the task description",
                 "task": "Standard default: task + predecessor context",
@@ -1070,8 +1188,8 @@ mod tests {
     }
 
     #[test]
-    fn test_quickstart_text_contains_coordinator_reminder() {
-        assert!(QUICKSTART_TEXT.contains("COORDINATOR SERVICE REMINDER"));
+    fn test_quickstart_text_contains_dispatcher_reminder() {
+        assert!(QUICKSTART_TEXT.contains("DISPATCHER SERVICE REMINDER"));
     }
 
     #[test]
@@ -1148,7 +1266,7 @@ mod tests {
 
         // Check executors_and_models section
         let em = output.get("executors_and_models").unwrap();
-        assert!(em.get("switch_executor").is_some());
+        assert!(em.get("model_spec_routing").is_some());
         assert!(em.get("per_task_model").is_some());
         assert!(em.get("hierarchy").is_some());
 
@@ -1170,7 +1288,7 @@ mod tests {
     #[test]
     fn test_quickstart_text_contains_executors_and_models() {
         assert!(QUICKSTART_TEXT.contains("EXECUTORS & MODELS"));
-        assert!(QUICKSTART_TEXT.contains("--coordinator-executor amplifier"));
+        assert!(QUICKSTART_TEXT.contains("wg config -m claude:opus"));
         assert!(QUICKSTART_TEXT.contains("--model"));
     }
 
@@ -1199,7 +1317,6 @@ mod tests {
     fn test_quickstart_text_contains_skill_bundle_setup() {
         assert!(QUICKSTART_TEXT.contains("SKILL & BUNDLE SETUP"));
         assert!(QUICKSTART_TEXT.contains("wg skill install"));
-        assert!(QUICKSTART_TEXT.contains("amplifier run -B workgraph"));
     }
 
     #[test]
@@ -1209,7 +1326,6 @@ mod tests {
             .get("skill_bundle_setup")
             .expect("missing skill_bundle_setup");
         assert!(sbs.get("claude").is_some());
-        assert!(sbs.get("amplifier").is_some());
         assert!(sbs.get("custom").is_some());
         assert!(
             sbs["claude"]["install"]
@@ -1282,8 +1398,8 @@ mod tests {
     }
 
     #[test]
-    fn test_quickstart_text_contains_peer_workgraphs() {
-        assert!(QUICKSTART_TEXT.contains("PEER WORKGRAPHS"));
+    fn test_quickstart_text_contains_peer_wg_projects() {
+        assert!(QUICKSTART_TEXT.contains("PEER WG PROJECTS"));
         assert!(QUICKSTART_TEXT.contains("wg peer add"));
         assert!(QUICKSTART_TEXT.contains("--repo"));
     }
@@ -1329,11 +1445,11 @@ mod tests {
     fn test_quickstart_text_all_sections_present() {
         let text = QUICKSTART_TEXT.trim();
         let required_sections = [
-            "WORKGRAPH AGENT QUICKSTART",
+            "WG AGENT QUICKSTART",
             "GETTING STARTED",
             "SKILL & BUNDLE SETUP",
             "AGENCY SETUP",
-            "COORDINATOR SERVICE REMINDER",
+            "DISPATCHER SERVICE REMINDER",
             "SERVICE MODE",
             "MANUAL MODE",
             "DISCOVERING & ADDING WORK",
@@ -1353,7 +1469,7 @@ mod tests {
             "TRACE, RUNS & REPLAY",
             "ANALYSIS",
             "DEAD AGENT DETECTION",
-            "PEER WORKGRAPHS",
+            "PEER WG PROJECTS",
             "EVALUATION & MONITORING",
             "NOTIFICATION & COMMUNICATION",
             "RESOURCE MANAGEMENT",
@@ -1426,7 +1542,6 @@ mod tests {
     fn test_quickstart_text_contains_profiles() {
         assert!(QUICKSTART_TEXT.contains("PROVIDER PROFILES"));
         assert!(QUICKSTART_TEXT.contains("wg profile list"));
-        assert!(QUICKSTART_TEXT.contains("wg profile set"));
     }
 
     #[test]

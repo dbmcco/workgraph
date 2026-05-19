@@ -1,4 +1,4 @@
-//! Usage statistics tracking for workgraph commands
+//! Usage statistics tracking for WG commands
 //!
 //! This module implements a hybrid approach for tracking command usage:
 //! - Write path: Append-only log file (O(1) writes, no locking via O_APPEND)
@@ -6,8 +6,8 @@
 //! - Read path: Fast reads from pre-aggregated stats.json
 //!
 //! File layout:
-//! - `.workgraph/usage.log` - Append-only log of command invocations
-//! - `.workgraph/stats.json` - Aggregated command counts
+//! - `.wg/usage.log` - Append-only log of command invocations
+//! - `.wg/stats.json` - Aggregated command counts
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ pub fn stats_path(dir: &Path) -> std::path::PathBuf {
 /// This is fire-and-forget: errors are silently ignored to avoid
 /// impacting command execution. Uses O_APPEND for atomic writes.
 pub fn append_usage_log(dir: &Path, command: &str) {
-    // Skip if .workgraph doesn't exist (not initialized)
+    // Skip if .wg doesn't exist (not initialized)
     if !dir.exists() {
         return;
     }

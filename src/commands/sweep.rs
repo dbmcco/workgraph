@@ -44,10 +44,16 @@ pub struct SweepResult {
     pub bytes_freed: u64,
 }
 
-/// Detect orphaned in-progress tasks whose agents are dead or missing.
+/// Detect orphaned tasks whose agents are dead, missing, or unreachable.
 ///
-/// This is the reconciliation safety net that catches tasks missed by the
-/// split-save race in cleanup_dead_agents().
+/// Covers two shapes of orphaning:
+/// - `Status::InProgress` with a dead/missing agent (the original
+///   split-save race in `cleanup_dead_agents()`).
+/// - `Status::Open` with a dead/missing-agent claim — see
+///   `bug-retry-doesnt-clear-stale-downstream-claims`. These tasks are
+///   never going to be picked up by the dispatcher because its "ready"
+///   check excludes assigned tasks. Surfacing them in `wg sweep` lets
+///   users diagnose why the dispatcher silently stalled on a fan-out.
 pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
     let gpath = graph_path(dir);
     let graph = load_graph(&gpath).context("Failed to load graph")?;
@@ -56,24 +62,36 @@ pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
     let mut orphaned = Vec::new();
 
     for task in graph.tasks() {
-        if task.status != Status::InProgress {
+        let is_inprogress = task.status == Status::InProgress;
+        let is_open_with_claim = task.status == Status::Open && task.assigned.is_some();
+        if !is_inprogress && !is_open_with_claim {
             continue;
         }
 
         let agent_id = match &task.assigned {
             Some(id) => id,
             None => {
-                // InProgress but no agent assigned — orphaned
-                orphaned.push(OrphanedTask {
-                    task_id: task.id.clone(),
-                    task_title: task.title.clone(),
-                    assigned_agent: "(none)".to_string(),
-                    reason: "InProgress with no assigned agent".to_string(),
-                });
+                // InProgress but no agent assigned — orphaned (split-save).
+                // Skip long-lived loop tasks (chat/compact) that intentionally
+                // sit InProgress between user messages or compaction cycles
+                // without an inline agent.
+                let is_loop_task = task
+                    .tags
+                    .iter()
+                    .any(|t| workgraph::chat_id::is_chat_loop_tag(t) || t == "compact-loop");
+                if !is_loop_task {
+                    orphaned.push(OrphanedTask {
+                        task_id: task.id.clone(),
+                        task_title: task.title.clone(),
+                        assigned_agent: "(none)".to_string(),
+                        reason: "InProgress with no assigned agent".to_string(),
+                    });
+                }
                 continue;
             }
         };
 
+        let status_label = if is_inprogress { "InProgress" } else { "Open" };
         match registry.get_agent(agent_id) {
             Some(agent) => {
                 if agent.status == AgentStatus::Dead {
@@ -81,7 +99,10 @@ pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
                         task_id: task.id.clone(),
                         task_title: task.title.clone(),
                         assigned_agent: agent_id.clone(),
-                        reason: format!("Agent '{}' is marked Dead in registry", agent_id),
+                        reason: format!(
+                            "{} task; agent '{}' is marked Dead in registry",
+                            status_label, agent_id
+                        ),
                     });
                 } else if agent.is_alive() && !is_process_alive(agent.pid) {
                     orphaned.push(OrphanedTask {
@@ -89,8 +110,8 @@ pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
                         task_title: task.title.clone(),
                         assigned_agent: agent_id.clone(),
                         reason: format!(
-                            "Agent '{}' (PID {}) process is not running",
-                            agent_id, agent.pid
+                            "{} task; agent '{}' (PID {}) process is not running",
+                            status_label, agent_id, agent.pid
                         ),
                     });
                 }
@@ -101,7 +122,10 @@ pub fn find_orphaned_tasks(dir: &Path) -> Result<Vec<OrphanedTask>> {
                     task_id: task.id.clone(),
                     task_title: task.title.clone(),
                     assigned_agent: agent_id.clone(),
-                    reason: format!("Agent '{}' not found in registry", agent_id),
+                    reason: format!(
+                        "{} task; agent '{}' not found in registry",
+                        status_label, agent_id
+                    ),
                 });
             }
         }
@@ -198,7 +222,7 @@ pub fn run(dir: &Path, dry_run: bool, reap_targets: bool, json: bool) -> Result<
     }
 
     // Archive each orphaned agent's output BEFORE unclaiming the task, so
-    // the attempt is preserved in `.workgraph/log/agents/<task-id>/<timestamp>/`
+    // the attempt is preserved in `.wg/log/agents/<task-id>/<timestamp>/`
     // and visible in the TUI iteration switcher. Without this, an in-progress
     // task that gets respawned via sweep loses prior attempts from the
     // iteration history. Best-effort — failures are non-fatal. Skip the
@@ -224,10 +248,27 @@ pub fn run(dir: &Path, dry_run: bool, reap_targets: bool, json: bool) -> Result<
         let mut modified = false;
         for o in &orphaned_clone {
             if let Some(task) = graph.get_task_mut(&o.task_id)
-                && task.status == Status::InProgress
+                && matches!(task.status, Status::InProgress | Status::Open)
+                && task.assigned.is_some()
             {
                 task.status = Status::Open;
                 task.assigned = None;
+                task.started_at = None;
+                task.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: Some("sweep".to_string()),
+                    user: Some(workgraph::current_user()),
+                    message: format!("Sweep: task unclaimed — {}", o.reason),
+                });
+                fixed.push(o.task_id.clone());
+                modified = true;
+            } else if let Some(task) = graph.get_task_mut(&o.task_id)
+                && task.status == Status::InProgress
+                && task.assigned.is_none()
+            {
+                // The "(none)" sentinel branch: InProgress with no assigned.
+                // Just transition to Open; nothing to clear.
+                task.status = Status::Open;
                 task.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("sweep".to_string()),
@@ -296,20 +337,32 @@ pub fn run(dir: &Path, dry_run: bool, reap_targets: bool, json: bool) -> Result<
 }
 
 /// Reconciliation function for use inside the coordinator tick.
-/// Scans for InProgress tasks whose assigned agent is Dead in the registry
-/// and resets them to Open. Returns the number of tasks recovered.
+/// Scans for tasks in `InProgress` OR `Open` whose assigned agent is Dead
+/// (or unreachable, or absent from the registry) and clears the stale
+/// claim. `InProgress` tasks transition to Open; `Open` tasks just have
+/// their claim wiped — both end up dispatchable on the next tick.
+/// Returns the number of tasks recovered.
 ///
-/// This is the safety net for Bug 1 (split-save ordering) described in the
-/// root cause analysis.
+/// This is the safety net the eager paths (`wg reset`, `wg retry`) cannot
+/// cover: kill -9, OOM, panic-before-cleanup, host reboot. The eager
+/// paths handle user-initiated transitions with low latency; this lazy
+/// path catches everything else once per dispatcher tick (poll_interval).
+///
+/// Originally only handled `Status::InProgress`. The `Open + assigned-but-
+/// dead` predicate was added to fix `bug-retry-doesnt-clear-stale-
+/// downstream-claims`: synthesis tasks that were never claimed by a live
+/// agent (the agency assigner stamped an `assigned` value, then the
+/// upstream agent died before reaching them) used to sit there forever
+/// because the previous filter `status == InProgress` skipped them.
 pub fn reconcile_orphaned_tasks(dir: &Path, graph_path: &Path) -> Result<usize> {
     let registry = AgentRegistry::load(dir).unwrap_or_else(|_| AgentRegistry::new());
 
     let mut count = 0usize;
     modify_graph(graph_path, |graph| {
-        // First pass: collect IDs of orphaned tasks
-        let orphaned_ids: Vec<(String, String)> = graph
+        // First pass: collect IDs of orphaned tasks (status + reason).
+        let orphaned_ids: Vec<(String, Status, String)> = graph
             .tasks()
-            .filter(|task| task.status == Status::InProgress)
+            .filter(|task| matches!(task.status, Status::InProgress | Status::Open))
             .filter_map(|task| {
                 let dominated = match &task.assigned {
                     Some(agent_id) => match registry.get_agent(agent_id) {
@@ -318,7 +371,17 @@ pub fn reconcile_orphaned_tasks(dir: &Path, graph_path: &Path) -> Result<usize> 
                                 || (agent.is_alive() && !is_process_alive(agent.pid))
                         }
                         None => {
-                            if let Some(ref started) = task.started_at {
+                            // Agent absent from registry. For InProgress we
+                            // require >5min since started_at to avoid races
+                            // with a freshly-spawned agent that hasn't
+                            // written its registry entry yet. For Open we
+                            // can act immediately — `started_at` is None
+                            // for an Open task that was never picked up,
+                            // and a missing-agent claim means whatever
+                            // process owned it is unrecoverable.
+                            if task.status == Status::Open {
+                                true
+                            } else if let Some(ref started) = task.started_at {
                                 if let Ok(started_dt) =
                                     started.parse::<chrono::DateTime<chrono::Utc>>()
                                 {
@@ -331,34 +394,53 @@ pub fn reconcile_orphaned_tasks(dir: &Path, graph_path: &Path) -> Result<usize> 
                             }
                         }
                     },
-                    None => !task
-                        .tags
-                        .iter()
-                        .any(|t| t == "coordinator-loop" || t == "compact-loop"),
+                    None => {
+                        // Status=Open with no assigned is normal — skip.
+                        // Status=InProgress with no assigned IS orphaned
+                        // (split-save race), unless this is a long-lived
+                        // loop task without an agent (chat/compact). Chat-loop
+                        // tasks are kept InProgress between user messages by
+                        // design — orphan-recovery would race the supervisor
+                        // and reset newly-created chats to Open before the
+                        // first user message arrives.
+                        task.status == Status::InProgress
+                            && !task.tags.iter().any(|t| {
+                                workgraph::chat_id::is_chat_loop_tag(t) || t == "compact-loop"
+                            })
+                    }
                 };
 
                 if dominated {
                     let agent_desc = task.assigned.as_deref().unwrap_or("(none)").to_string();
-                    Some((task.id.clone(), agent_desc))
+                    Some((task.id.clone(), task.status, agent_desc))
                 } else {
                     None
                 }
             })
             .collect();
 
-        // Second pass: mutate the orphaned tasks
+        // Second pass: mutate the orphaned tasks.
         count = orphaned_ids.len();
-        for (task_id, agent_desc) in &orphaned_ids {
+        for (task_id, prev_status, agent_desc) in &orphaned_ids {
             if let Some(task) = graph.get_task_mut(task_id) {
+                let was_open = *prev_status == Status::Open;
                 task.status = Status::Open;
                 task.assigned = None;
+                // started_at only matters for InProgress; clearing it on
+                // an Open task is a no-op, but explicit is fine.
+                task.started_at = None;
+                let kind = if was_open {
+                    "stale-claim cleared"
+                } else {
+                    "task recovered from orphaned state"
+                };
                 task.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("reconcile".to_string()),
                     user: Some(workgraph::current_user()),
                     message: format!(
-                        "Reconciliation: task recovered from orphaned state (agent: {})",
-                        agent_desc
+                        "Reconciliation: {} (was {:?}, agent: {})",
+                        kind, prev_status, agent_desc
                     ),
                 });
             }
@@ -646,7 +728,7 @@ mod tests {
 
     /// Regression test for tui-cannot-view: when sweep unclaims an orphaned
     /// task, the now-dead agent's output.log must be archived to
-    /// `.workgraph/log/agents/<task-id>/<timestamp>/` so the TUI iteration
+    /// `.wg/log/agents/<task-id>/<timestamp>/` so the TUI iteration
     /// switcher can show that attempt.
     #[test]
     fn test_sweep_archives_orphaned_agent_for_iteration_history() {
@@ -684,6 +766,108 @@ mod tests {
         assert!(archived.contains("stream hung"));
     }
 
+    /// TDD for the lazy reconciler path described in design-claim-lifecycle:
+    /// a task in `Status::Open` (not InProgress!) whose `assigned` references
+    /// a Dead agent must be unclaimed by the next dispatcher tick. This is
+    /// the safety net that catches what `wg reset`/`wg retry` eager paths
+    /// miss (kill -9, panic, host reboot).
+    #[test]
+    fn test_dispatcher_heartbeat_unclaims_dead_agents() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gpath = dir.join("graph.jsonl");
+
+        // Open task assigned to a dead agent — would have been silently
+        // skipped by the dispatcher pre-fix (status==InProgress filter).
+        let mut t = make_task("ready-task", "Ready Task", Status::Open);
+        t.assigned = Some("agent-zombie-1".to_string());
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(t));
+        save_graph(&graph, &gpath).unwrap();
+
+        // Registry: dead agent.
+        use workgraph::service::registry::AgentEntry;
+        let mut reg = AgentRegistry::new();
+        reg.agents.insert(
+            "agent-zombie-1".to_string(),
+            AgentEntry {
+                id: "agent-zombie-1".to_string(),
+                pid: 99999,
+                task_id: "ready-task".to_string(),
+                executor: "claude".to_string(),
+                status: AgentStatus::Dead,
+                started_at: Utc::now().to_rfc3339(),
+                last_heartbeat: "2020-01-01T00:00:00Z".to_string(),
+                completed_at: Some(Utc::now().to_rfc3339()),
+                output_file: "/tmp/output.log".to_string(),
+                model: None,
+                worktree_path: None,
+            },
+        );
+        reg.save(dir).unwrap();
+
+        // Simulate one dispatcher tick.
+        let count = reconcile_orphaned_tasks(dir, &gpath).unwrap();
+        assert!(count >= 1, "reconciler must cover Open + dead-agent claims");
+
+        let graph = load_graph(&gpath).unwrap();
+        let task = graph.get_task("ready-task").unwrap();
+        assert_eq!(task.status, Status::Open);
+        assert!(
+            task.assigned.is_none(),
+            "lazy reconciler must wipe the stale claim so dispatcher can pick it up"
+        );
+        assert!(
+            task.log
+                .iter()
+                .any(|e| e.message.contains("Reconciliation")),
+            "log entry should record reconciler action: {:?}",
+            task.log.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Reconciler must NOT touch an Open task with a still-alive agent
+    /// claim. (Possible if assignment was made but the agent hasn't yet
+    /// flipped the task to InProgress.)
+    #[test]
+    fn test_reconciler_preserves_open_tasks_with_live_claims() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let gpath = dir.join("graph.jsonl");
+
+        let mut t = make_task("warming-up", "Warming up", Status::Open);
+        t.assigned = Some("agent-alive-1".to_string());
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(t));
+        save_graph(&graph, &gpath).unwrap();
+
+        use workgraph::service::registry::AgentEntry;
+        let mut reg = AgentRegistry::new();
+        reg.agents.insert(
+            "agent-alive-1".to_string(),
+            AgentEntry {
+                id: "agent-alive-1".to_string(),
+                pid: std::process::id(),
+                task_id: "warming-up".to_string(),
+                executor: "claude".to_string(),
+                status: AgentStatus::Working,
+                started_at: Utc::now().to_rfc3339(),
+                last_heartbeat: Utc::now().to_rfc3339(),
+                completed_at: None,
+                output_file: "/tmp/output.log".to_string(),
+                model: None,
+                worktree_path: None,
+            },
+        );
+        reg.save(dir).unwrap();
+
+        let _ = reconcile_orphaned_tasks(dir, &gpath).unwrap();
+
+        let graph = load_graph(&gpath).unwrap();
+        let task = graph.get_task("warming-up").unwrap();
+        assert_eq!(task.assigned, Some("agent-alive-1".to_string()));
+    }
+
     /// Regression test for tui-cannot-view: orphaned tasks where assigned was
     /// already None (sentinel "(none)") should not crash sweep when archiving
     /// — there is no agent dir to archive, so the call must be skipped.
@@ -709,6 +893,115 @@ mod tests {
         assert!(
             !archive_base.exists(),
             "No archive for sentinel-only orphan"
+        );
+    }
+
+    /// Fix A regression-guard (fix-nex-chat / diagnose-wg-nex root cause #1):
+    /// chat-loop and legacy coordinator-loop tagged tasks must NOT be
+    /// reset to Open by orphan-recovery just because they're InProgress
+    /// without an inline `assigned` value. Newly-created chats via the
+    /// `CreateChat` IPC sit InProgress with `assigned=None` until the
+    /// supervisor process spawns; if reconciliation flips them to Open
+    /// in that ~2s window, the supervisor's pre-flight invariant breaks
+    /// and the chat dies silently.
+    #[test]
+    fn test_reconcile_skips_chat_loop_tagged_tasks() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        std::fs::create_dir_all(dir).unwrap();
+        let gpath = dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        // chat-loop (new tag): must be skipped
+        let mut chat_new = make_task(".chat-7", "Chat 7", Status::InProgress);
+        chat_new.tags = vec![workgraph::chat_id::CHAT_LOOP_TAG.to_string()];
+        graph.add_node(Node::Task(chat_new));
+        // coordinator-loop (legacy tag): must be skipped via is_chat_loop_tag
+        let mut chat_legacy = make_task(".coordinator-3", "Coordinator 3", Status::InProgress);
+        chat_legacy.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(chat_legacy));
+        // compact-loop: must be skipped
+        let mut compact = make_task(".compact-0", "Compact 0", Status::InProgress);
+        compact.tags = vec!["compact-loop".to_string()];
+        graph.add_node(Node::Task(compact));
+        // Untagged InProgress with no assigned: SHOULD be flipped (control)
+        let plain = make_task("plain-stuck", "Plain Stuck", Status::InProgress);
+        graph.add_node(Node::Task(plain));
+        save_graph(&graph, &gpath).unwrap();
+
+        // Empty registry — every InProgress-with-no-assigned would normally
+        // qualify as orphaned.
+        AgentRegistry::new().save(dir).unwrap();
+
+        let recovered = reconcile_orphaned_tasks(dir, &gpath).unwrap();
+        assert_eq!(
+            recovered, 1,
+            "only the untagged plain task should be recovered"
+        );
+
+        let g2 = workgraph::parser::load_graph(&gpath).unwrap();
+        assert_eq!(
+            g2.get_task(".chat-7").unwrap().status,
+            Status::InProgress,
+            "chat-loop task must remain InProgress"
+        );
+        assert_eq!(
+            g2.get_task(".coordinator-3").unwrap().status,
+            Status::InProgress,
+            "legacy coordinator-loop task must remain InProgress"
+        );
+        assert_eq!(
+            g2.get_task(".compact-0").unwrap().status,
+            Status::InProgress,
+            "compact-loop task must remain InProgress"
+        );
+        assert_eq!(
+            g2.get_task("plain-stuck").unwrap().status,
+            Status::Open,
+            "untagged plain orphan should be flipped to Open"
+        );
+    }
+
+    /// Fix A regression-guard for the user-facing `wg sweep` command:
+    /// `find_orphaned_tasks` must skip chat-loop and compact-loop tagged
+    /// tasks. Without this, running `wg sweep` between chat creation and
+    /// supervisor spawn would reset the chat to Open just like the
+    /// dispatcher's reconciliation tick did.
+    #[test]
+    fn test_find_orphaned_skips_chat_loop_tagged_tasks() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        std::fs::create_dir_all(dir).unwrap();
+        let gpath = dir.join("graph.jsonl");
+
+        let mut graph = WorkGraph::new();
+        let mut chat_new = make_task(".chat-9", "Chat 9", Status::InProgress);
+        chat_new.tags = vec![workgraph::chat_id::CHAT_LOOP_TAG.to_string()];
+        graph.add_node(Node::Task(chat_new));
+        let mut compact = make_task(".compact-0", "Compact", Status::InProgress);
+        compact.tags = vec!["compact-loop".to_string()];
+        graph.add_node(Node::Task(compact));
+        let plain = make_task("plain-orphan", "Plain", Status::InProgress);
+        graph.add_node(Node::Task(plain));
+        save_graph(&graph, &gpath).unwrap();
+        AgentRegistry::new().save(dir).unwrap();
+
+        let orphaned = find_orphaned_tasks(dir).unwrap();
+        let ids: Vec<&str> = orphaned.iter().map(|o| o.task_id.as_str()).collect();
+        assert!(
+            !ids.contains(&".chat-9"),
+            "chat-loop task must NOT appear in find_orphaned_tasks: {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&".compact-0"),
+            "compact-loop task must NOT appear in find_orphaned_tasks: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"plain-orphan"),
+            "untagged orphan should still be reported: {:?}",
+            ids
         );
     }
 }

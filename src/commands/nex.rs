@@ -100,14 +100,6 @@ pub fn run(
             &working_dir,
             &config.native_executor,
         );
-        if is_coordinator {
-            // Coordinator mode: keep ALL wg tools — the agent manages
-            // the workgraph (add tasks, mark done, log, etc.).
-        } else {
-            // Interactive/skill mode: strip wg mutation tools — there's
-            // no task context. wg_show/wg_list kept for browsing.
-            reg.remove_tools(&["wg_done", "wg_add", "wg_fail", "wg_rescue", "wg_artifact"]);
-        }
         if minimal_tools {
             // Minimal tool surface: keep only the canonical local-dev set.
             // Dramatically reduces prefill cost for small local models.
@@ -177,9 +169,8 @@ pub fn run(
     };
 
     // Load role/skill content from the agency primitives directory.
-    // "coordinator" is a special-case role handled above (restores
-    // wg tools). Other role names are looked up by fuzzy match
-    // against component names in .workgraph/agency/primitives/components/.
+    // "coordinator" is a special-case role handled below. Other role names are looked up by fuzzy match
+    // against component names in .wg/agency/primitives/components/.
     let role_prompt_addendum = if let Some(role_name) = role {
         if is_coordinator {
             // Full coordinator prompt (~290 lines) — matches what the
@@ -207,20 +198,7 @@ pub fn run(
     };
 
     let now = chrono::Local::now();
-    let default_system = format!(
-        "You are an AI assistant in an interactive terminal session. You have tools for \
-         reading and writing files, running shell commands, searching and fetching from \
-         the web, and summarizing or delegating work.\n\
-         \n\
-         Working directory: {}\n\
-         Current date: {} ({})\n\
-         \n\
-         Note: workgraph mutation tools (wg_done, wg_add, wg_log, wg_fail) are not for \
-         this session — they belong to task-agent runs, not interactive conversations.",
-        working_dir.display(),
-        now.format("%Y-%m-%d %H:%M %Z"),
-        now.format("%A"),
-    );
+    let default_system = build_default_system_prompt(&working_dir, now, minimal_tools);
     let system_with_role = if let Some(ref addendum) = role_prompt_addendum {
         format!("{}\n\n## Role\n\n{}", default_system, addendum)
     } else {
@@ -229,7 +207,7 @@ pub fn run(
     let system = system_prompt.unwrap_or(&system_with_role);
 
     // Every nex session — CLI, coordinator, task-agent — lives under
-    // `<workgraph>/chat/<ref>/`. Pick the reference:
+    // `<wg-dir>/chat/<ref>/`. Pick the reference:
     //   1. `--chat <ref>`  — explicit, wins over everything else.
     //   2. `--chat-id N`   — legacy numeric id, same effect.
     //   3. `--resume`      — interactive picker (no arg) or pattern
@@ -379,7 +357,7 @@ pub fn run(
     // `chat/<ref>/conversation.jsonl` for persistence + auto-resume.
     // Eval mode skips the chat surface even though it's autonomous:
     // the benchmarked repo shouldn't get inbox.jsonl/outbox.jsonl/
-    // .streaming files written into its `.workgraph/chat/<alias>/`
+    // .streaming files written into its `.wg/chat/<alias>/`
     // directory (no attacher will ever read them, and some graders
     // diff the working tree). Explicit chat bindings still win.
     let mount_chat_surface = chat_ref.is_some() || chat_id.is_some() || (autonomous && !eval_mode);
@@ -654,8 +632,46 @@ fn record_nex_invocation(effective_model: &str, endpoint: Option<&str>, eval_mod
         ));
 }
 
+fn build_default_system_prompt(
+    working_dir: &Path,
+    now: chrono::DateTime<chrono::Local>,
+    minimal_tools: bool,
+) -> String {
+    let tool_summary = if minimal_tools {
+        "You have a minimal local-development tool set for reading and writing files, \
+         running shell commands, and searching local files. In this mode, web_search and \
+         web_fetch are not available; use bash with curl or wget for HTTP requests."
+    } else {
+        "You have tools for reading and writing files, running shell commands, searching \
+         and fetching from the web, and summarizing or delegating work."
+    };
+
+    format!(
+        "You are an AI assistant in an interactive terminal session. {tool_summary}\n\
+         \n\
+         Working directory: {}\n\
+         Current date: {} ({})\n\
+         \n\
+         Use bash to run `wg` CLI commands when you need WG task management.\n\
+         \n\
+         When asked to produce content that requires current real-world data \
+         (weather, news, prices, dates beyond your training cutoff, schedules, laws, \
+         company facts, etc.):\n\
+         - If a web search or web fetch tool is available, use it.\n\
+         - If bash is available, use curl or wget for known data endpoints; for weather, \
+         `curl https://wttr.in/<location>` is often a useful first check.\n\
+         - If you cannot fetch live data with the available tools, state that limitation \
+         explicitly and ask the user to provide the data or confirm they want a code \
+         skeleton or placeholder.\n\
+         - Do not write code or prose that fabricates current data.",
+        working_dir.display(),
+        now.format("%Y-%m-%d %H:%M %Z"),
+        now.format("%A"),
+    )
+}
+
 /// Load an agency role/skill component by name. Scans all YAML files
-/// in `.workgraph/agency/primitives/components/` for one whose `name`
+/// in `.wg/agency/primitives/components/` for one whose `name`
 /// field matches (case-insensitive substring match). Returns the
 /// `content` field as a string, or None if no match found.
 fn load_agency_role(workgraph_dir: &Path, role_name: &str) -> Option<String> {
@@ -751,5 +767,71 @@ mod tests {
                 "eval mode should not write to history"
             );
         });
+    }
+
+    #[test]
+    fn test_default_prompt_directs_current_data_to_fetch_before_code() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-04T12:00:00-05:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let prompt = build_default_system_prompt(Path::new("/tmp/work"), now, false);
+
+        assert!(prompt.contains("requires current real-world data"));
+        assert!(prompt.contains("If a web search or web fetch tool is available, use it"));
+        assert!(prompt.contains("curl https://wttr.in/<location>"));
+        assert!(prompt.contains("Do not write code or prose that fabricates current data"));
+        assert!(prompt.contains("Current date: 2026-05-04"));
+    }
+
+    #[test]
+    fn test_minimal_prompt_names_bash_http_fallback_without_web_tools() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-04T12:00:00-05:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let prompt = build_default_system_prompt(Path::new("/tmp/work"), now, true);
+
+        assert!(prompt.contains("minimal local-development tool set"));
+        assert!(prompt.contains("web_search and web_fetch are not available"));
+        assert!(prompt.contains("use bash with curl or wget for HTTP requests"));
+        assert!(prompt.contains("If you cannot fetch live data with the available tools"));
+    }
+
+    #[test]
+    fn test_nex_default_tool_surface_has_web_fetch_and_bash() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ToolRegistry::default_all(tmp.path(), tmp.path());
+        let names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        assert!(names.contains(&"web_fetch".to_string()));
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"bash".to_string()));
+    }
+
+    #[test]
+    fn test_nex_minimal_tool_surface_keeps_bash_without_web_fetch() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = ToolRegistry::default_all(tmp.path(), tmp.path());
+        registry.keep_only_tools(&[
+            "read_file",
+            "edit_file",
+            "write_file",
+            "bash",
+            "grep",
+            "glob",
+            "todo_write",
+        ]);
+        let names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        assert!(names.contains(&"bash".to_string()));
+        assert!(!names.contains(&"web_fetch".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
     }
 }

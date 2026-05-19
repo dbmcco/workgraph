@@ -1,14 +1,14 @@
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "wg")]
-#[command(about = "Workgraph - A lightweight work coordination graph")]
+#[command(about = "WG - A lightweight work coordination graph")]
 #[command(version)]
 #[command(disable_help_flag = true)]
 #[command(disable_help_subcommand = true)]
 pub struct Cli {
-    /// Path to the workgraph directory (default: .workgraph in current dir)
+    /// Path to the WG directory (default: .wg in current dir; legacy .workgraph accepted)
     #[arg(long, global = true)]
     pub dir: Option<PathBuf>,
 
@@ -35,23 +35,23 @@ pub struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
-    /// Initialize a new workgraph in the current directory
+    /// Initialize a new WG project in the current directory
     Init {
         /// Skip agency initialization (roles, agents, auto-assign config)
         #[arg(long)]
         no_agency: bool,
 
-        /// Initialize the GLOBAL workgraph at `~/.wg` instead of
+        /// Initialize the GLOBAL WG directory at `~/.wg` instead of
         /// the current directory. Useful for `wg nex`-style interactive
-        /// usage from arbitrary directories without littering workgraph
+        /// usage from arbitrary directories without littering WG
         /// dirs everywhere. Resolver precedence: --dir > $WG_DIR >
         /// project discovery (`.wg` preferred, legacy `.workgraph` accepted) >
-        /// global (`~/.wg` preferred) > ./.wg
+        /// global (`~/.wg` preferred, legacy `~/.workgraph` accepted) > ./.wg
         #[arg(long)]
         global: bool,
 
         /// [DEPRECATED] Agent executor (`claude`, `codex`, `nex`/`native`,
-        /// `amplifier`, `shell`). The executor is now derived from the
+        /// `shell`). The executor is now derived from the
         /// model spec's provider prefix — you should not need this flag.
         /// Kept for one release with a deprecation warning so existing
         /// scripts keep working. Migrate to `-m <provider>:<model>`.
@@ -59,20 +59,22 @@ pub enum Commands {
         executor: Option<String>,
 
         /// Model spec for this project. Use `provider:model` form
-        /// (e.g. `claude:opus`, `local:qwen3-coder`,
-        /// `openrouter:anthropic/claude-opus-4-6`, `oai-compat:gpt-5`).
+        /// (e.g. `claude:opus`, `nex:qwen3-coder`,
+        /// `openrouter:anthropic/claude-opus-4-6`).
         /// The provider prefix tells wg which handler to spawn — claude
         /// CLI for `claude:*`, codex CLI for `codex:*`, in-process nex
-        /// for `local:*` / `openrouter:*` / `oai-compat:*` / etc.
+        /// for `nex:*` / `openrouter:*` / etc.
         /// Bare aliases (`opus`, `sonnet`, `haiku`) default to claude.
+        /// (Legacy: `local:` and `oai-compat:` are deprecated aliases for
+        /// `nex:` and emit a warning; `wg migrate config` rewrites them.)
         #[arg(short = 'm', long)]
         model: Option<String>,
 
-        /// Inline LLM endpoint URL. Required for `local:*` models and
+        /// Inline LLM endpoint URL. Required for `nex:*` models and
         /// any other model whose handler needs an explicit URL (nex /
         /// native). Ignored for handlers that auth themselves
         /// (claude / codex CLIs).
-        /// Example: `wg init -m local:qwen3-coder -e http://127.0.0.1:8088`
+        /// Example: `wg init -m nex:qwen3-coder -e http://127.0.0.1:8088`
         #[arg(short = 'e', long)]
         endpoint: Option<String>,
 
@@ -84,7 +86,7 @@ pub enum Commands {
         route: Option<String>,
 
         /// Print the config that would be written but don't actually create
-        /// the workgraph directory or files.
+        /// the WG directory or files.
         #[arg(long)]
         dry_run: bool,
     },
@@ -204,7 +206,7 @@ pub enum Commands {
         #[arg(long, short = 'd', alias = "desc")]
         description: Option<String>,
 
-        /// Create the task in a peer workgraph (by name or path)
+        /// Create the task in a peer WG project (by name or path)
         #[arg(long)]
         repo: Option<String>,
 
@@ -531,12 +533,33 @@ pub enum Commands {
         #[arg(long)]
         reason: Option<String>,
 
+        /// Machine-readable failure class (set by wrapper; pairs with --reason).
+        /// One of: api-error-400-document, api-error-429-rate-limit,
+        ///         api-error-5xx-transient, agent-hard-timeout,
+        ///         agent-exit-nonzero, wrapper-internal.
+        #[arg(long, value_name = "CLASS")]
+        class: Option<String>,
+
         /// Reject a done task via evaluation gate. Allows failing a task that
         /// is already Done because the evaluator determined the work is
         /// unacceptable. The task transitions to Failed and its dependents
         /// become blocked.
         #[arg(long)]
         eval_reject: bool,
+    },
+
+    /// [Internal] Classify an agent failure from raw_stream.jsonl and exit code.
+    /// Prints the kebab failure-class string to stdout. Used by the wrapper
+    /// script before calling `wg fail --class <CLASS>`.
+    #[command(hide = true)]
+    ClassifyFailure {
+        /// Path to the raw_stream.jsonl written by the executor wrapper
+        #[arg(long, value_name = "PATH")]
+        raw_stream: Option<String>,
+
+        /// Shell exit code of the agent process (124 = hard timeout)
+        #[arg(long, value_name = "N")]
+        exit_code: i32,
     },
 
     /// Mark a task as incomplete (retryable — needs another pass)
@@ -705,8 +728,14 @@ pub enum Commands {
         #[arg(value_name = "TASK")]
         id: String,
         /// Only publish this single task (skip subgraph propagation)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wcc")]
         only: bool,
+        /// Publish every task in the weakly-connected component of TASK
+        /// (treats the dependency graph as undirected and unpauses the
+        /// whole component in topological order). Use this to release a
+        /// fan-out + synthesis batch with one command.
+        #[arg(long)]
+        wcc: bool,
     },
 
     /// Park a task and exit — sets status to Waiting until condition is met
@@ -1281,7 +1310,7 @@ pub enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Attach a file (copied to .workgraph/attachments/)
+        /// Attach a file (copied to .wg/attachments/)
         #[arg(long)]
         attachment: Vec<String>,
 
@@ -1347,7 +1376,7 @@ pub enum Commands {
         command: AgencyCommands,
     },
 
-    /// Manage peer workgraph instances for cross-repo communication
+    /// Manage peer WG projects for cross-repo communication
     Peer {
         #[command(subcommand)]
         command: PeerCommands,
@@ -1484,7 +1513,7 @@ pub enum Commands {
 
     /// Manage agent definitions (identity: role + tradeoff pairings)
     #[command(
-        after_help = "This command manages agent identity entities stored in .workgraph/agency/.\nEach agent definition pairs a role with a tradeoff profile.\n\nSee also: 'wg agents' to list running agent processes (service workers)."
+        after_help = "This command manages agent identity entities stored in .wg/agency/.\nEach agent definition pairs a role with a tradeoff profile.\n\nSee also: 'wg agents' to list running agent processes (service workers)."
     )]
     Agent {
         #[command(subcommand)]
@@ -1496,7 +1525,7 @@ pub enum Commands {
         /// Task ID to spawn an agent for
         task: String,
 
-        /// Executor to use (claude, amplifier, shell, or custom config name)
+        /// Executor to use (claude, codex, native, shell, or custom config name)
         #[arg(long)]
         executor: String,
 
@@ -1550,7 +1579,7 @@ pub enum Commands {
         #[arg(long)]
         init: bool,
 
-        /// Target global config (~/.workgraph/config.toml) instead of local
+        /// Target global config (~/.wg/config.toml) instead of local
         #[arg(long, conflicts_with = "local")]
         global: bool,
 
@@ -1562,13 +1591,13 @@ pub enum Commands {
         #[arg(long)]
         list: bool,
 
-        /// Set executor (claude, amplifier, shell, or custom config name)
+        /// Set executor (claude, codex, native, shell, or custom config name)
         #[arg(long)]
         executor: Option<String>,
 
         /// Set model. Accepts `provider:model` (e.g. `claude:opus`) or
-        /// a bare name when combined with `-e URL` (implies oai-compat).
-        /// Updates `agent.model` and `coordinator.model`.
+        /// a bare name when combined with `-e URL` (implies nex).
+        /// Updates `agent.model` and `dispatcher.model`.
         #[arg(short = 'm', long)]
         model: Option<String>,
 
@@ -1594,7 +1623,7 @@ pub enum Commands {
         #[arg(long)]
         max_agents: Option<usize>,
 
-        /// Set max concurrent coordinator agents (LLM sessions). Default: 4.
+        /// Set max concurrent coordinator agents (LLM sessions). Default: 16.
         #[arg(long)]
         max_coordinators: Option<usize>,
 
@@ -1610,11 +1639,15 @@ pub enum Commands {
         #[arg(long, alias = "coordinator-executor")]
         dispatcher_executor: Option<String>,
 
-        /// Set dispatcher model (e.g., opus, sonnet, haiku); legacy alias: --coordinator-model
-        #[arg(long, alias = "coordinator-model")]
+        /// Set dispatcher model (e.g., claude:opus or codex:gpt-5.5); legacy alias: --coordinator-model
+        #[arg(
+            long = "dispatcher-model",
+            alias = "coordinator-model",
+            value_name = "MODEL"
+        )]
         coordinator_model: Option<String>,
 
-        /// [DEPRECATED] Set coordinator provider — use provider:model in --coordinator-model instead
+        /// [DEPRECATED] Set coordinator provider — use provider:model in --dispatcher-model instead
         #[arg(long)]
         coordinator_provider: Option<String>,
 
@@ -1760,9 +1793,9 @@ pub enum Commands {
         #[arg(long = "tiers")]
         show_tiers: bool,
 
-        /// Set which model a tier uses (e.g., --tier standard=gpt-4o)
-        #[arg(long = "tier", value_name = "TIER=MODEL_ID")]
-        set_tier: Option<String>,
+        /// Set which model a tier uses; repeat for multiple tiers (e.g., --tier fast=claude:haiku --tier standard=claude:sonnet)
+        #[arg(long = "tier", value_name = "TIER=MODEL_ID", action = ArgAction::Append)]
+        set_tier: Vec<String>,
 
         /// Registry entry short ID (for --registry-add)
         #[arg(long = "id", requires = "registry_add")]
@@ -1800,30 +1833,30 @@ pub enum Commands {
         #[arg(long = "models")]
         show_models: bool,
 
-        /// Set model for a dispatch role: --set-model <role> <model>
+        /// Set model for a dispatch role; repeat for multiple roles: --set-model <role> <model>
         /// Roles: default, task_agent, evaluator, flip_inference, flip_comparison,
         /// assigner, evolver, verification, triage, creator
-        #[arg(long = "set-model", num_args = 2, value_names = ["ROLE", "MODEL"])]
-        set_model: Option<Vec<String>>,
+        #[arg(long = "set-model", num_args = 2, value_names = ["ROLE", "MODEL"], action = ArgAction::Append)]
+        set_model: Vec<String>,
 
-        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
-        #[arg(long = "set-provider", num_args = 2, value_names = ["ROLE", "PROVIDER"])]
-        set_provider: Option<Vec<String>>,
+        /// [DEPRECATED] Set provider for a dispatch role; repeat for multiple roles — use provider:model in --set-model instead
+        #[arg(long = "set-provider", num_args = 2, value_names = ["ROLE", "PROVIDER"], action = ArgAction::Append)]
+        set_provider: Vec<String>,
 
-        /// Set endpoint for a dispatch role: --set-endpoint <role> <endpoint-name>
+        /// Set endpoint for a dispatch role; repeat for multiple roles: --set-endpoint <role> <endpoint-name>
         /// Binds a named endpoint (from `wg endpoints list`) to a dispatch role.
-        #[arg(long = "set-endpoint", num_args = 2, value_names = ["ROLE", "ENDPOINT"])]
-        set_endpoint: Option<Vec<String>>,
+        #[arg(long = "set-endpoint", num_args = 2, value_names = ["ROLE", "ENDPOINT"], action = ArgAction::Append)]
+        set_endpoint: Vec<String>,
 
-        /// Set model for a dispatch role: --role-model <role>=<model>
+        /// Set model for a dispatch role; repeat for multiple roles: --role-model <role>=<model>
         /// Equivalent to --set-model but uses key=value syntax.
-        #[arg(long = "role-model", value_name = "ROLE=MODEL")]
-        role_model: Option<String>,
+        #[arg(long = "role-model", value_name = "ROLE=MODEL", action = ArgAction::Append)]
+        role_model: Vec<String>,
 
-        /// [DEPRECATED] Set provider for a dispatch role — use provider:model in --set-model instead
+        /// [DEPRECATED] Set provider for a dispatch role; repeat for multiple roles — use provider:model in --set-model instead
         /// Equivalent to --set-provider but uses key=value syntax.
-        #[arg(long = "role-provider", value_name = "ROLE=PROVIDER")]
-        role_provider: Option<String>,
+        #[arg(long = "role-provider", value_name = "ROLE=PROVIDER", action = ArgAction::Append)]
+        role_provider: Vec<String>,
 
         /// Max tokens of previous-attempt context to inject on retry (default: 2000, 0 = disabled)
         #[arg(long, name = "retry-context-tokens")]
@@ -1841,7 +1874,7 @@ pub enum Commands {
         #[arg(long, name = "check-key")]
         check_key: bool,
 
-        /// Install project config as global default (~/.workgraph/config.toml)
+        /// Install project config as global default (~/.wg/config.toml)
         #[arg(long, name = "install-global")]
         install_global: bool,
 
@@ -1892,13 +1925,50 @@ pub enum Commands {
         #[arg(long)]
         purge: bool,
 
-        /// Also delete agent work directories (.workgraph/agents/<id>/) when purging
+        /// Also delete agent work directories (.wg/agents/<id>/) when purging
         #[arg(long, requires = "purge")]
         delete_dirs: bool,
 
         /// Override heartbeat timeout threshold (minutes)
         #[arg(long)]
         threshold: Option<u64>,
+    },
+
+    /// Render the WG task graph as a static, clickable HTML viewer (TUI-parity).
+    #[command(
+        after_help = "Generates a directory of static HTML/CSS/JS files mirroring the\nWG task graph. The page is a read-only sibling of the TUI viewer:\nthe ASCII viz from `wg viz --all` is rendered with clickable task ids\nand status indicators that open a detail overlay matching `wg show`.\nClick a task to highlight its before/after edges in the TUI palette\n(magenta = upstream deps, cyan = downstream consumers).\n\nDefaults: ALL tasks are shown, NO chat transcripts are rendered\n(chat task nodes still appear in the viz, but the conversation is\nomitted). Pass `--chat` to render transcripts; `--chat --all` to\ninclude non-public transcripts; `--public-only` to mirror only\n`visibility = public` tasks AND public chats.\n\nA best-effort sanitizer redacts api-key-shaped strings, env-var\nassignments (OPENAI_API_KEY=..., GITHUB_TOKEN=..., etc.), and\npaths under `~/.wg/secrets`. Review transcripts manually before\npublishing — sanitization is NOT a security guarantee.\n\nThe output is rsync-friendly — no JavaScript framework, no server,\nno backend. Open `<out>/index.html` in any browser (file:// works).\n\nExamples:\n  wg html                       # All tasks, no chat transcripts\n  wg html --chat                # All tasks + public chats' transcripts\n  wg html --chat --all          # All tasks + every transcript\n  wg html --chat --public-only  # Public tasks + public chats only\n  wg html --since 24h           # Only tasks touched in the last 24h"
+    )]
+    Html {
+        /// Optional subcommand. Without one, runs the default render.
+        ///   wg html publish add <name> --rsync <target> [--schedule <cron>] ...
+        ///   wg html publish list / show / run / remove / edit
+        #[command(subcommand)]
+        command: Option<HtmlCommands>,
+
+        /// Output directory (will be created if missing)
+        #[arg(long, default_value = "./public")]
+        out: std::path::PathBuf,
+
+        /// Restrict to tasks with `visibility = public`. Default: include all
+        /// tasks (matches the TUI viewer). When combined with `--chat`,
+        /// also restricts transcripts to public chats only.
+        #[arg(long, alias = "public", conflicts_with = "all")]
+        public_only: bool,
+
+        /// When combined with `--chat`, include transcripts for ALL chats —
+        /// public and non-public. Without `--chat`, this flag is a no-op.
+        #[arg(long)]
+        all: bool,
+
+        /// Render chat transcripts on chat task pages. By default only
+        /// transcripts of `visibility = public` chats are included; pass
+        /// `--all` to include non-public transcripts as well.
+        #[arg(long)]
+        chat: bool,
+
+        /// Only include tasks active within this time window (e.g. 1h, 24h, 7d, 30d)
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Detect and recover orphaned in-progress tasks with dead agents
@@ -2085,6 +2155,12 @@ pub enum Commands {
     /// Print a concise cheat sheet for agent onboarding
     Quickstart,
 
+    /// Check local development checkout and installed wg binary freshness
+    DevCheck,
+
+    /// Print the universal agent / chat-agent role contract bundled with this binary
+    AgentGuide,
+
     /// Quick one-screen status overview
     Status {
         /// Include dot-prefixed system tasks in counts (hidden by default)
@@ -2117,7 +2193,7 @@ pub enum Commands {
         message: Option<String>,
     },
 
-    /// Stream workgraph events as JSON lines
+    /// Stream WG events as JSON lines
     Watch {
         /// Filter events by type (repeatable). Types: task_state, evaluation, agent, all.
         #[arg(long = "event", default_value = "all")]
@@ -2172,6 +2248,23 @@ pub enum Commands {
     Key {
         #[command(subcommand)]
         command: KeyCommands,
+    },
+
+    /// Manage secrets (API keys) in the credential store
+    ///
+    /// Secrets are stored outside env vars, config files, and shell history.
+    /// Default backend: keyring (secure file store at ~/.wg/keystore/).
+    /// Plaintext backend: enabled via `secrets.allow_plaintext = true` in config.
+    ///
+    /// Quick start:
+    ///   wg secret set openrouter        # store key (prompts for value)
+    ///   wg secret list                  # show stored names only
+    ///   wg secret get openrouter        # show redacted; --reveal for full value
+    ///   wg secret rm openrouter         # delete
+    ///   wg secret backend show          # show active backend(s)
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommands,
     },
 
     /// Interactive agentic REPL — coding assistant powered by any model
@@ -2244,26 +2337,26 @@ pub enum Commands {
         resume: Option<String>,
 
         /// Load an agency role/skill by name to augment the session.
-        /// Searches `.workgraph/agency/primitives/components/` for a
+        /// Searches `.wg/agency/primitives/components/` for a
         /// matching component and appends its content to the system
-        /// prompt. Use "coordinator" to enable workgraph management
-        /// tools (wg_add, wg_done) which are otherwise stripped in
-        /// interactive mode.
+        /// prompt. Use "coordinator" to load the coordinator prompt;
+        /// WG task management still happens through `wg` CLI
+        /// commands run with bash.
         #[arg(long)]
         role: Option<String>,
 
         /// Run as a chat-tethered agent: read user turns from
-        /// `<workgraph>/chat/<id>/inbox.jsonl`, write streaming tokens
-        /// to `<workgraph>/chat/<id>/streaming`, append finalized
-        /// assistant turns to `<workgraph>/chat/<id>/outbox.jsonl`.
+        /// `<wg-dir>/chat/<id>/inbox.jsonl`, write streaming tokens
+        /// to `<wg-dir>/chat/<id>/streaming`, append finalized
+        /// assistant turns to `<wg-dir>/chat/<id>/outbox.jsonl`.
         /// Bypasses stdin/stderr. When set, the journal is stored at
-        /// `<workgraph>/chat/<id>/conversation.jsonl` so `--resume`
+        /// `<wg-dir>/chat/<id>/conversation.jsonl` so `--resume`
         /// picks up the right session automatically.
         ///
         /// Primary use case: this is how `wg nex` serves as the
         /// coordinator (spawned by the service / a graph task with a
         /// chat tether to the TUI). Pair with `--role coordinator`
-        /// for the wg_* mutation tools.
+        /// for the coordinator prompt.
         #[arg(long = "chat-id")]
         chat_id: Option<u32>,
 
@@ -2439,7 +2532,7 @@ pub enum Commands {
         model: Option<String>,
     },
 
-    /// Print the workgraph directory that `wg` would use from here,
+    /// Print the WG directory that `wg` would use from here,
     /// and show which resolver step won (CLI flag / env / walk-up /
     /// home / default). Useful when you're confused about which graph
     /// `wg add` is talking to.
@@ -2550,6 +2643,116 @@ pub enum WorktreeCommand {
 }
 
 #[derive(Subcommand)]
+pub enum HtmlCommands {
+    /// Manage rsync deployments for `wg html` output
+    Publish {
+        #[command(subcommand)]
+        command: HtmlPublishCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HtmlPublishCommands {
+    /// Register a new rsync deployment for `wg html` output
+    Add {
+        /// Deployment name (used in `wg html publish run <name>`)
+        name: String,
+
+        /// rsync target (e.g. user@host:/var/www/wg/)
+        #[arg(long)]
+        rsync: String,
+
+        /// Cron expression (5- or 6-field) — runs the deployment on a schedule.
+        /// Without this flag, the deployment is manual-only.
+        #[arg(long)]
+        schedule: Option<String>,
+
+        /// `--since` flag passed to `wg html` (e.g. 7d, 24h)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Pass `--public-only` to `wg html`
+        #[arg(long = "public-only")]
+        public_only: bool,
+
+        /// Include chat transcripts in the html output (off by default)
+        #[arg(long = "chat")]
+        include_chat: bool,
+
+        /// Staging dir for the html output (default: $TMPDIR/wg-html-publish-<name>)
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Path to an SSH private key to use for rsync
+        #[arg(long = "ssh-key")]
+        ssh_key: Option<String>,
+
+        /// ~/.ssh/config Host alias
+        #[arg(long = "ssh-config-host")]
+        ssh_config_host: Option<String>,
+
+        /// Append `--mkpath` to the default rsync flags so a fresh remote
+        /// path is auto-created on first run (avoids rsync exit 11 when the
+        /// destination directory doesn't exist yet). Requires rsync >= 3.2.3.
+        /// Mutually exclusive with --rsync-flags.
+        #[arg(long = "mkpath", conflicts_with = "rsync_flags")]
+        mkpath: bool,
+
+        /// Override the rsync flags entirely as a single whitespace-separated
+        /// string (default when omitted: "-avz --delete"). Replaces the
+        /// default — use e.g. --rsync-flags='-avz --delete --mkpath -P' to
+        /// keep the defaults plus extras. Mutually exclusive with --mkpath.
+        #[arg(long = "rsync-flags", conflicts_with = "mkpath")]
+        rsync_flags: Option<String>,
+
+        /// Title shown at the top of the rendered page. Wins over
+        /// `[project].title` / `[project].name` in `<workgraph_dir>/config.toml`
+        /// and overrides the default `hostname:/repo/path` source label for
+        /// portable public exports.
+        #[arg(long = "title")]
+        title: Option<String>,
+
+        /// One-line byline / tagline shown under the title. Wins over
+        /// `[project].byline` in `<workgraph_dir>/config.toml`.
+        #[arg(long = "byline")]
+        byline: Option<String>,
+
+        /// Path to a markdown file rendered as the page abstract (relative
+        /// to `<workgraph_dir>` if not absolute). When unset, the renderer
+        /// falls back to `<workgraph_dir>/about.md`.
+        #[arg(long = "abstract")]
+        abstract_path: Option<String>,
+    },
+
+    /// List registered deployments
+    List,
+
+    /// Show details for one deployment
+    Show {
+        /// Deployment name
+        name: String,
+    },
+
+    /// Run a deployment immediately (build html, rsync to target)
+    Run {
+        /// Deployment name
+        name: String,
+        /// Print rsync's planned changes without modifying the target
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+
+    /// Remove a deployment (also abandons its scheduling task if any)
+    Remove {
+        /// Deployment name
+        name: String,
+    },
+
+    /// Edit html-publish.toml in $EDITOR (validates after save)
+    Edit,
+}
+
+#[derive(Subcommand)]
 pub enum EndpointsCommands {
     /// List all configured endpoints
     List,
@@ -2587,7 +2790,7 @@ pub enum EndpointsCommands {
         #[arg(long)]
         default: bool,
 
-        /// Target global config (~/.workgraph/config.toml)
+        /// Target global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -2625,7 +2828,7 @@ pub enum EndpointsCommands {
         #[arg(long)]
         default: bool,
 
-        /// Target global config (~/.workgraph/config.toml)
+        /// Target global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -2635,7 +2838,7 @@ pub enum EndpointsCommands {
         /// Endpoint name to remove
         name: String,
 
-        /// Target global config (~/.workgraph/config.toml)
+        /// Target global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -2645,7 +2848,7 @@ pub enum EndpointsCommands {
         /// Endpoint name to set as default
         name: String,
 
-        /// Target global config (~/.workgraph/config.toml)
+        /// Target global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -2799,7 +3002,7 @@ pub enum ModelCommands {
         #[arg(long)]
         cost_out: Option<f64>,
 
-        /// Write to global config (~/.workgraph/config.toml)
+        /// Write to global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -2858,6 +3061,91 @@ pub enum ModelCommands {
 }
 
 #[derive(Subcommand)]
+pub enum SecretCommands {
+    /// Store a secret (API key) in the credential store.
+    ///
+    /// Default: prompts interactively (echo off). Use --from-stdin in scripts
+    /// to read one line from stdin (no prompt). --value still works but the
+    /// value may appear in shell history.
+    Set {
+        /// Secret name (e.g., openrouter, anthropic)
+        name: String,
+
+        /// Secret value (visible in argv / shell history — prefer --from-stdin)
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Read the secret value from stdin (one line). Mutually exclusive
+        /// with --value. Use this for scripted setup and CI provisioning.
+        #[arg(long)]
+        from_stdin: bool,
+
+        /// Backend to use: keyring (default), keystore, or plaintext
+        #[arg(long)]
+        backend: Option<String>,
+    },
+
+    /// Show a secret (redacted by default).
+    ///
+    /// Without --reveal, prints only a masked preview: "sk-ab****...ef12".
+    /// With --reveal, prints the full value and warns you it's visible.
+    Get {
+        /// Secret name
+        name: String,
+
+        /// Print the full value (with warning)
+        #[arg(long)]
+        reveal: bool,
+
+        /// Backend to use: keyring (default), keystore, or plaintext
+        #[arg(long)]
+        backend: Option<String>,
+    },
+
+    /// List stored secret names (never values).
+    List,
+
+    /// Delete a stored secret.
+    Rm {
+        /// Secret name
+        name: String,
+
+        /// Backend to use: keyring (default), keystore, or plaintext
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Skip confirmation prompt. Required when stdin is not a terminal
+        /// (CI / scripts).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Check whether a secret ref is reachable (for pre-flight validation).
+    Check {
+        /// Secret ref URI: keyring:<name>, plain:<name>, env:<VAR>, op://<path>, pass:<path>
+        api_key_ref: String,
+    },
+
+    /// Backend management subcommands.
+    Backend {
+        #[command(subcommand)]
+        command: SecretBackendCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretBackendCommands {
+    /// Show which backend(s) are active and reachable.
+    Show,
+
+    /// Set the default backend for new `wg secret set` calls.
+    Set {
+        /// Backend name: keyring, keystore, or plaintext
+        backend: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum KeyCommands {
     /// Configure an API key for a provider
     Set {
@@ -2872,11 +3160,11 @@ pub enum KeyCommands {
         #[arg(long)]
         file: Option<String>,
 
-        /// Store key value directly (written to ~/.workgraph/keys/<provider>.key, NOT to config)
+        /// Store key value directly (written to ~/.wg/keys/<provider>.key, NOT to config)
         #[arg(long)]
         value: Option<String>,
 
-        /// Apply to global config (~/.workgraph/config.toml)
+        /// Apply to global config (~/.wg/config.toml)
         #[arg(long)]
         global: bool,
     },
@@ -3037,7 +3325,7 @@ pub enum EvaluateCommands {
 
 #[derive(Subcommand)]
 pub enum ProfileCommands {
-    /// Set the active provider profile
+    /// Set the active provider profile (deprecated alias for `use`)
     Set {
         /// Profile name (e.g., anthropic, openrouter, openai)
         name: String,
@@ -3054,14 +3342,95 @@ pub enum ProfileCommands {
         #[arg(long)]
         premium: Option<String>,
     },
+    /// Activate a named profile (clears local routing pins, hot-reloads daemon)
+    Use {
+        /// Profile name to activate, or omit with --clear to deactivate
+        name: Option<String>,
+
+        /// Skip sending IPC reload to daemon (still writes profile config and clears local routing pins)
+        #[arg(long)]
+        no_reload: bool,
+
+        /// Clear the active profile (revert to base config)
+        #[arg(long)]
+        clear: bool,
+    },
     /// Show current profile and resolved model mappings
     Show {
+        /// Profile name to show (defaults to active profile)
+        profile_name: Option<String>,
+
         /// Show raw metrics (pricing, context length, benchmark scores) per model
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Also show what this profile changes vs base config
+        #[arg(long)]
+        diff_base: bool,
     },
-    /// List available profiles
-    List,
+    /// List available profiles (installed + built-in starters)
+    List {
+        /// Show only installed profiles (skip built-in starters)
+        #[arg(long)]
+        installed: bool,
+    },
+    /// Create a new named profile
+    Create {
+        /// Profile name
+        name: String,
+
+        /// Primary model for this profile (e.g., claude:opus, codex:gpt-5.5)
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+
+        /// Endpoint URL (e.g., http://127.0.0.1:8088)
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+
+        /// Copy an existing profile as the starting point
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Human-readable description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Overwrite if profile already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Open a profile file in $EDITOR
+    Edit {
+        /// Profile name
+        name: String,
+
+        /// Skip sending IPC reload after save
+        #[arg(long)]
+        no_reload: bool,
+    },
+    /// Delete a named profile
+    Delete {
+        /// Profile name
+        name: String,
+
+        /// Force deletion even if this is the active profile
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show diff between two profiles (or base config vs a profile)
+    Diff {
+        /// First profile name (or base config when only one arg given)
+        a: String,
+
+        /// Second profile name (optional; if omitted, diff is base vs a)
+        b: Option<String>,
+    },
+    /// Write the three starter profiles (claude, codex, nex) to ~/.wg/profiles/
+    InitStarters {
+        /// Overwrite existing starter files
+        #[arg(long)]
+        force: bool,
+    },
     /// Refresh model data from OpenRouter and recompute rankings
     Refresh,
 }
@@ -3340,7 +3709,7 @@ pub enum FuncCommands {
         #[arg(long)]
         verbose: bool,
 
-        /// Include functions from federated peer workgraphs
+        /// Include functions from federated peer WG projects
         #[arg(long)]
         include_peers: bool,
 
@@ -3381,7 +3750,7 @@ pub enum FuncCommands {
         #[arg(long)]
         generative: bool,
 
-        /// Write to specific path instead of .workgraph/functions/<name>.yaml
+        /// Write to specific path instead of .wg/functions/<name>.yaml
         #[arg(long)]
         output: Option<String>,
 
@@ -3400,7 +3769,7 @@ pub enum FuncCommands {
         /// Function ID (prefix match supported)
         function_id: String,
 
-        /// Load function from a peer workgraph (peer:function-id) or file path
+        /// Load function from a peer WG project (peer:function-id) or file path
         #[arg(long)]
         from: Option<String>,
 
@@ -3608,7 +3977,7 @@ pub enum AgencyCommands {
         #[arg(long)]
         force: bool,
 
-        /// Pull into ~/.workgraph/agency/ instead of local project
+        /// Pull into ~/.wg/agency/ instead of local project
         #[arg(long)]
         global: bool,
     },
@@ -3667,10 +4036,14 @@ pub enum AgencyCommands {
         dry_run: bool,
     },
 
-    /// Import Agency's starter.csv primitives into WorkGraph
+    /// Import Agency's starter.csv primitives into WG
     Import {
         /// Path to the CSV file to import (omit when using --url or --upstream)
         csv_path: Option<String>,
+
+        /// Import format (agency-csv; default auto-detects compatible CSV files)
+        #[arg(long)]
+        format: Option<String>,
 
         /// Fetch CSV from a remote URL instead of local file
         #[arg(long)]
@@ -3695,6 +4068,29 @@ pub enum AgencyCommands {
         /// Only check if upstream has changed (exit 0 = changed, exit 1 = same)
         #[arg(long)]
         check: bool,
+
+        /// Error on the first description-hash dedup collision (default warns and skips).
+        /// See docs/manual/03-agency.md "Import Dedup Rule".
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Export local primitives as Agency CSV
+    Export {
+        /// Output CSV path, or '-' for stdout
+        output: String,
+
+        /// Export format (agency-csv)
+        #[arg(long, default_value = "agency-csv")]
+        format: String,
+
+        /// Filter rows, currently origin_instance_id=<value>
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Export from ~/.wg/agency/ instead of local project
+        #[arg(long)]
+        global: bool,
     },
 
     /// Push local entities to another agency store
@@ -3726,7 +4122,7 @@ pub enum AgencyCommands {
         #[arg(long)]
         force: bool,
 
-        /// Push from ~/.workgraph/agency/ instead of local project
+        /// Push from ~/.wg/agency/ instead of local project
         #[arg(long)]
         global: bool,
     },
@@ -3774,19 +4170,31 @@ pub enum ChatCommands {
     /// Create a new chat agent task in the graph.
     /// Works with the service running or stopped — the supervisor picks
     /// up the new chat on next start.
+    #[command(alias = "new")]
     Create {
         /// Optional human-readable name (becomes part of the task title
         /// and addressable as a chat reference).
         #[arg(long)]
         name: Option<String>,
 
-        /// Per-chat executor override (e.g. "claude", "amplifier", "native").
-        #[arg(long)]
+        /// Preset executor shortcut (e.g. "claude", "codex", "nex").
+        #[arg(long = "exec", alias = "executor")]
         executor: Option<String>,
 
         /// Per-chat model override (e.g. "claude:opus", "openai:qwen3-coder-30b").
         #[arg(long, short = 'm')]
         model: Option<String>,
+
+        /// Per-chat LLM endpoint URL (e.g.
+        /// "https://lambda01.tail334fe6.ts.net:30000"). Mirrors
+        /// `wg nex -e <URL>` and pins this single chat to a specific
+        /// server. Persists across daemon / TUI restarts.
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+
+        /// Arbitrary command line to run in a persistent chat pane.
+        #[arg(long, conflicts_with_all = ["executor", "model", "endpoint"])]
+        command: Option<String>,
     },
 
     /// List all chat agents with their runtime status.
@@ -3855,7 +4263,7 @@ pub enum ChatCommands {
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
-    /// List every nex session in this workgraph.
+    /// List every nex session in this WG project.
     List {
         /// Print UUIDs + aliases as JSON instead of a table.
         #[arg(long)]
@@ -3965,12 +4373,12 @@ pub enum SessionAliasCommands {
 
 #[derive(Subcommand)]
 pub enum PeerCommands {
-    /// Register a peer workgraph instance
+    /// Register a peer WG project
     Add {
         /// Peer name (used as shorthand reference)
         name: String,
 
-        /// Path to the peer project (containing .workgraph/)
+        /// Path to the peer project (containing .wg/)
         path: String,
 
         /// Description of this peer
@@ -4331,6 +4739,33 @@ pub enum MigrateCommands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Walk existing configs that use `api_key_env` and migrate them to
+    /// `api_key_ref = "keyring:<name>"`, prompting before each change.
+    ///
+    /// For each endpoint with `api_key_env`, the command:
+    /// 1. Reads the env var value (if set)
+    /// 2. Offers to store it in the keyring
+    /// 3. Rewrites the config entry to use `api_key_ref`
+    ///
+    /// Safe to run multiple times — idempotent.
+    Secrets {
+        /// Only report what would change, don't write.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Migrate the global config (~/.wg/config.toml). Default if neither flag given.
+        #[arg(long, conflicts_with = "local")]
+        global: bool,
+
+        /// Migrate the local project config (.wg/config.toml).
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+
+        /// Don't copy env var values into keyring — just rewrite config refs.
+        #[arg(long)]
+        no_copy: bool,
+    },
 }
 
 /// Subcommand variants for `wg config`.
@@ -4407,7 +4842,7 @@ pub enum ServiceCommands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// Unix socket path (default: .workgraph/service/daemon.sock)
+        /// Unix socket path (default: .wg/service/daemon.sock)
         #[arg(long)]
         socket: Option<String>,
 
@@ -4423,7 +4858,7 @@ pub enum ServiceCommands {
         #[arg(long)]
         interval: Option<u64>,
 
-        /// Model to use for spawned agents (overrides config.toml coordinator.model)
+        /// Model to use for spawned agents (overrides config.toml dispatcher.model)
         #[arg(long)]
         model: Option<String>,
 
@@ -4528,8 +4963,14 @@ pub enum ServiceCommands {
         #[arg(long)]
         model: Option<String>,
         /// Executor for this chat agent (e.g., "native", "claude")
-        #[arg(long)]
+        #[arg(long = "exec", alias = "executor")]
         executor: Option<String>,
+        /// LLM endpoint URL for this chat (mirrors `wg nex -e <URL>`).
+        #[arg(long, short = 'e')]
+        endpoint: Option<String>,
+        /// Arbitrary command line to run in a persistent chat pane.
+        #[arg(long, conflicts_with_all = ["executor", "model", "endpoint"])]
+        command: Option<String>,
     },
 
     /// Hot-swap a chat agent's executor and/or model.
@@ -4582,7 +5023,20 @@ pub enum ServiceCommands {
     /// Bulk-purge all chat agents: archive every chat-loop task, kill all live
     /// chat handler processes, prevent respawn on daemon restart. Preserves
     /// chat task nodes + history. Idempotent. Reversible via `wg chat new`.
-    PurgeChats,
+    ///
+    /// By default, chats considered "active" — the chat the calling shell is
+    /// inside (via `WG_CHAT_REF`), or any chat with recent consumer-cursor
+    /// activity (TUI attached, recent `wg chat read`) — are SKIPPED so you
+    /// don't accidentally archive the chat you're sitting in. Pass
+    /// `--include-active` to nuke everything regardless.
+    PurgeChats {
+        /// Archive every chat-loop task even if it looks active. Required to
+        /// reach the pre-2026-04 full-nuke behavior; otherwise the calling
+        /// chat (via `WG_CHAT_REF`) and any chat with recent consumer
+        /// activity are skipped.
+        #[arg(long, visible_alias = "force", visible_alias = "all")]
+        include_active: bool,
+    },
 
     /// Run the daemon (internal, called by start)
     #[command(hide = true)]
@@ -4603,7 +5057,7 @@ pub enum ServiceCommands {
         #[arg(long)]
         interval: Option<u64>,
 
-        /// Model to use for spawned agents (overrides config.toml coordinator.model)
+        /// Model to use for spawned agents (overrides config.toml dispatcher.model)
         #[arg(long)]
         model: Option<String>,
 
@@ -4653,7 +5107,7 @@ pub enum MatrixCommands {
 pub enum TelegramCommands {
     /// Start the Telegram bot listener
     ///
-    /// Polls the Telegram Bot API for messages and dispatches workgraph
+    /// Polls the Telegram Bot API for messages and dispatches WG
     /// commands like: claim, done, fail, input, status, ready, help
     Listen {
         /// Telegram chat ID to listen in (uses configured chat_id if not specified)
@@ -4725,6 +5179,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Edit { .. } => "edit",
         Commands::Done { .. } => "done",
         Commands::Fail { .. } => "fail",
+        Commands::ClassifyFailure { .. } => "classify-failure",
         Commands::Incomplete { .. } => "incomplete",
         Commands::Abandon { .. } => "abandon",
         Commands::Retry { .. } => "retry",
@@ -4802,6 +5257,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Profile { .. } => "profile",
         Commands::Config { .. } => "config",
         Commands::DeadAgents { .. } => "dead-agents",
+        Commands::Html { .. } => "html",
         Commands::Sweep { .. } => "sweep",
         Commands::Migrate { .. } => "migrate",
         Commands::Agents { .. } => "agents",
@@ -4814,6 +5270,8 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::TuiDump { .. } => "tui-dump",
         Commands::Setup { .. } => "setup",
         Commands::Quickstart => "quickstart",
+        Commands::DevCheck => "dev-check",
+        Commands::AgentGuide => "agent-guide",
         Commands::Status { .. } => "status",
         Commands::Stats => "stats",
         Commands::Metrics { .. } => "metrics",
@@ -4827,6 +5285,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::Models { .. } => "models",
         Commands::Model { .. } => "model",
         Commands::Key { .. } => "key",
+        Commands::Secret { .. } => "secret",
         Commands::Nex { .. } => "nex",
         Commands::TuiNex { .. } => "tui-nex",
         Commands::TuiPty { .. } => "tui-pty",
@@ -4905,6 +5364,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Profile { .. }
             | Commands::Config { .. }
             | Commands::DeadAgents { .. }
+            | Commands::Html { .. }
             | Commands::Sweep { .. }
             | Commands::Agents { .. }
             | Commands::Kill { .. }
@@ -4915,7 +5375,9 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Check
             | Commands::Cleanup { .. }
             | Commands::Cycles
+            | Commands::Viz { .. }
             | Commands::Quickstart
+            | Commands::DevCheck
             | Commands::Status { .. }
             | Commands::Stats
             | Commands::Metrics { .. }
@@ -4926,6 +5388,7 @@ pub fn supports_json(cmd: &Commands) -> bool {
             | Commands::Models { .. }
             | Commands::Model { .. }
             | Commands::Key { .. }
+            | Commands::Secret { .. }
             | Commands::TuiDump { .. }
     ) || {
         #[cfg(any(feature = "matrix", feature = "matrix-lite"))]

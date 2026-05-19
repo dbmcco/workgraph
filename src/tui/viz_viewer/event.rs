@@ -16,6 +16,13 @@ use super::render;
 /// keyboard shortcuts (`=`, `\`).
 const MIN_DRAG_PERCENT: i32 = 10;
 
+fn is_safe_launcher_field_char(c: char) -> bool {
+    !(c.is_control()
+        || ('\u{2580}'..='\u{259F}').contains(&c)
+        || c == '\u{2028}'
+        || c == '\u{2029}')
+}
+
 use super::state::{
     ChoiceDialogAction, ChoiceDialogState, CommandEffect, ConfigEditKind, ConfirmAction,
     ControlPanelFocus, FocusedPanel, InputMode, InspectorSubFocus, NavEntry, ResponsiveBreakpoint,
@@ -266,9 +273,19 @@ fn run_event_loop_inner(
         let takeover_redraw = poll_chat_pty_takeover(app);
 
         if needs_redraw || refreshed || drained || takeover_redraw {
+            if app.chat_pty_mode && app.chat_pty_has_new_bytes() {
+                app.bump_active_chat_pty_interaction(false);
+            }
             let completed = terminal.draw(|frame| render::draw(frame, app))?;
             // Update the shared screen snapshot for IPC dump clients.
             update_shared_screen(completed.buffer, app, shared_screen);
+            // Mark every embedded chat PTY's current bytes_processed as
+            // "rendered" so the next idle-poll tick only redraws when
+            // genuinely new bytes have landed. Without this watermark,
+            // `chat_pty_has_new_bytes()` would return true on every poll
+            // and pin the loop to 60 fps even when the PTY child is
+            // silent.
+            app.update_task_pane_byte_watermarks();
             needs_redraw = false;
         }
 
@@ -307,6 +324,24 @@ fn run_event_loop_inner(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("terminal event reader thread exited unexpectedly");
+            }
+        }
+
+        // Chat-exit prompt intercept. When the user presses q / Esc /
+        // Ctrl+C and there are live chat tmux sessions, ask first
+        // whether to leave them running (default — resume next time)
+        // or close them (kill the chat process, no resume). See
+        // docs/design/chat-agent-persistence.md.
+        if app.should_quit
+            && !app.exit_prompt_resolved
+            && !matches!(app.input_mode, InputMode::ExitPrompt(_))
+        {
+            let chats = app.live_chat_tmux_ids();
+            if !chats.is_empty() {
+                app.open_exit_prompt(chats);
+                app.should_quit = false;
+                needs_redraw = true;
+                continue;
             }
         }
 
@@ -467,6 +502,63 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         return;
     }
 
+    // Scroll mode: intercept all keys when the user has entered Ctrl+]
+    // scroll mode on the active chat PTY pane. The inner PTY must NOT
+    // receive any keys while scroll mode is active.
+    if let InputMode::ScrollMode { task_id } = &app.input_mode.clone() {
+        let task_id = task_id.clone();
+        // Auto-exit if PTY pane focus has shifted away (e.g. mouse click on graph).
+        let still_valid = app.chat_pty_mode
+            && app.chat_pty_forwards_stdin
+            && app.right_panel_tab == RightPanelTab::Chat
+            && app.focused_panel == FocusedPanel::RightPanel
+            && !app.chat_pty_observer;
+        if !still_valid {
+            app.input_mode = InputMode::Normal;
+            // fall through to normal key handling below
+        } else {
+            let is_exit = matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                || (matches!(code, KeyCode::Char(']'))
+                    && modifiers.contains(KeyModifiers::CONTROL));
+            if is_exit {
+                app.input_mode = InputMode::Normal;
+            } else if matches!(code, KeyCode::Char('c'))
+                && modifiers.contains(KeyModifiers::CONTROL)
+            {
+                if let Some(pane) = app.task_panes.get_mut(&task_id) {
+                    let _ = pane.interrupt_foreground();
+                    app.bump_active_chat_pty_interaction(false);
+                }
+                app.input_mode = InputMode::Normal;
+            } else {
+                let page = (app.last_right_content_area.height as usize).max(10);
+                let half = (page / 2).max(5);
+                if let Some(pane) = app.task_panes.get_mut(&task_id) {
+                    match code {
+                        KeyCode::PageUp if modifiers.is_empty() => pane.scroll_up(page),
+                        KeyCode::PageDown if modifiers.is_empty() => pane.scroll_down(page),
+                        KeyCode::Up if modifiers.is_empty() => pane.scroll_up(1),
+                        KeyCode::Down if modifiers.is_empty() => pane.scroll_down(1),
+                        KeyCode::Char('k') if modifiers.is_empty() => pane.scroll_up(1),
+                        KeyCode::Char('j') if modifiers.is_empty() => pane.scroll_down(1),
+                        KeyCode::Home if modifiers.is_empty() => pane.scroll_to_top(),
+                        KeyCode::Char('g') if modifiers.is_empty() => pane.scroll_to_top(),
+                        KeyCode::End if modifiers.is_empty() => pane.scroll_to_bottom(),
+                        KeyCode::Char('G') if modifiers.is_empty() => pane.scroll_to_bottom(),
+                        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            pane.scroll_up(half)
+                        }
+                        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            pane.scroll_down(half)
+                        }
+                        _ => {} // swallow — do NOT forward to PTY
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     // Vendor-CLI PTY: forward every keystroke to the embedded child's
     // stdin. Vendor CLIs (native wg nex REPL, claude, codex) read
     // stdin directly. Without this branch keys flow into our own
@@ -487,11 +579,33 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
     // without needing Ctrl-T — matches pane-focus behavior users
     // expect from tmux/vim splits. Ctrl-T still works as the
     // keyboard escape hatch (handled below).
+    //
+    // Modal gating (fix-new-chat-2): when ANY non-Normal input mode
+    // is active (Launcher, Confirm, ChoiceDialog, TextPrompt, etc.),
+    // the user is interacting with a modal overlay and keystrokes
+    // belong to it — never the underlying PTY. Without this guard,
+    // opening the launcher via the [+] button (which leaves
+    // focused_panel = RightPanel) would silently leak typed
+    // characters into the chat-pane child's stdin while the modal
+    // appears to "swallow" them.
+    //
+    // Death-panel gating (fix-chat-died): when the embedded child has
+    // exited and the death panel is showing, `chat_pty_mode` stays true
+    // (so render still goes through the PTY path) but the pane has
+    // been removed from `task_panes`. Without this guard the keystroke
+    // would be "forwarded" to a missing pane and silently dropped via
+    // the unconditional `return`, leaving R/E/X unreachable. Letting
+    // keys fall through here lets `handle_normal_key` route them to
+    // the death-panel recovery branch.
     let vendor_pty_active = app.chat_pty_mode
         && app.chat_pty_forwards_stdin
         && app.right_panel_tab == RightPanelTab::Chat
         && app.focused_panel == FocusedPanel::RightPanel
-        && !app.chat_pty_observer;
+        && !app.chat_pty_observer
+        && matches!(app.input_mode, InputMode::Normal)
+        && !app
+            .chat_agent_death
+            .contains_key(&app.active_coordinator_id);
     if vendor_pty_active {
         // Modal contract (implement-tui-modal): when chat PTY has focus, the
         // ONLY key allowed to break out is Ctrl+T. Every other keystroke —
@@ -503,6 +617,13 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         // implement-tui-command).
         let is_toggle =
             matches!(code, KeyCode::Char('t')) && modifiers.contains(KeyModifiers::CONTROL);
+        let is_scroll_toggle =
+            matches!(code, KeyCode::Char(']')) && modifiers.contains(KeyModifiers::CONTROL);
+        if is_scroll_toggle {
+            let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+            app.input_mode = InputMode::ScrollMode { task_id };
+            return;
+        }
         let is_scroll = matches!(
             code,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
@@ -524,9 +645,14 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         if !is_toggle {
             let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
             if let Some(pane) = app.task_panes.get_mut(&task_id) {
-                let key_event = crossterm::event::KeyEvent::new(code, modifiers);
-                let _ = pane.send_key(key_event);
+                if matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL) {
+                    let _ = pane.interrupt_foreground();
+                } else {
+                    let key_event = crossterm::event::KeyEvent::new(code, modifiers);
+                    let _ = pane.send_key(key_event);
+                }
             }
+            app.bump_active_chat_pty_interaction(matches!(code, KeyCode::Enter));
             // Always consume the key — we are nominally in PTY focus, so
             // letting it fall through to global handlers below would
             // re-introduce the old escape-hatch behavior the modal contract
@@ -588,11 +714,16 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         InputMode::TextPrompt(_) => handle_text_prompt_input(app, code, modifiers),
         InputMode::ChoiceDialog(_) => handle_choice_dialog_input(app, code),
         InputMode::CoordinatorPicker => handle_coordinator_picker_input(app, code),
+        InputMode::ChatManager => handle_chat_manager_input(app, code, modifiers),
         InputMode::ChatInput => handle_chat_input(app, code, modifiers),
         InputMode::MessageInput => handle_message_input(app, code, modifiers),
         InputMode::ConfigEdit => handle_config_edit_input(app, code, modifiers),
         InputMode::SettingsEdit => handle_settings_edit_input(app, code, modifiers),
         InputMode::Launcher => handle_launcher_input(app, code, modifiers),
+        // ScrollMode is handled before this dispatch (early return above).
+        // If we reach here, still_valid was false and input_mode was reset to Normal.
+        InputMode::ScrollMode { .. } => handle_normal_key(app, code, modifiers),
+        InputMode::ExitPrompt(_) => handle_exit_prompt_input(app, code),
         InputMode::Normal => {
             // Also check legacy search_active flag for backward compat
             if app.search_active {
@@ -605,11 +736,25 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
 }
 
 fn handle_paste(app: &mut VizApp, text: &str) {
+    // Modal gating (fix-paste-events): symmetric to the input_mode guard
+    // on `vendor_pty_active` in `handle_key`. fix-new-chat-2 closed the
+    // keystroke-leak path but missed paste events, which crossterm
+    // delivers as a separate `Event::Paste(String)` rather than a
+    // sequence of `Event::Key`s. Result: with the new-chat launcher
+    // open, Cmd-V / middle-click of bracketed paste content was still
+    // forwarded into the underlying chat-pane child's stdin (the user
+    // pasted a URL into the dialog, the URL appeared in the background
+    // chat tab). When ANY non-Normal input mode is active, paste belongs
+    // to the focused dialog widget — never the underlying PTY.
     let vendor_pty_active = app.chat_pty_mode
         && app.chat_pty_forwards_stdin
         && app.right_panel_tab == RightPanelTab::Chat
         && app.focused_panel == FocusedPanel::RightPanel
-        && !app.chat_pty_observer;
+        && !app.chat_pty_observer
+        && matches!(app.input_mode, InputMode::Normal)
+        && !app
+            .chat_agent_death
+            .contains_key(&app.active_coordinator_id);
     if vendor_pty_active {
         let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
         if let Some(pane) = app.task_panes.get_mut(&task_id) {
@@ -673,6 +818,39 @@ fn handle_paste(app: &mut VizApp, text: &str) {
         InputMode::SettingsEdit => {
             let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
             app.settings_panel.edit_buffer.push_str(&clean);
+        }
+        InputMode::Launcher => {
+            // Route pasted text to the focused launcher text field.
+            // URLs / model strings are single-line, so newlines and
+            // carriage returns are stripped first. Default mode's
+            // preset radio has no text field — drop pastes there
+            // (the leak fix above is the real PTY guard; this is just
+            // UX so the paste lands somewhere visible to the user).
+            use super::state::{AddNewField, LauncherSection};
+            let clean: String = text
+                .chars()
+                .filter(|c| is_safe_launcher_field_char(*c))
+                .collect();
+            if let Some(launcher) = app.launcher.as_mut() {
+                match launcher.active_section {
+                    LauncherSection::Name => {
+                        launcher.name.push_str(&clean);
+                    }
+                    LauncherSection::AddNew(AddNewField::Model) => {
+                        launcher.add_model.push_str(&clean);
+                    }
+                    LauncherSection::AddNew(AddNewField::Endpoint) => {
+                        launcher.add_endpoint.push_str(&clean);
+                    }
+                    LauncherSection::AddNew(AddNewField::Name) => {
+                        launcher.name.push_str(&clean);
+                    }
+                    // Defaults radio + AddNew Executor radio have no
+                    // text field; drop the paste rather than silently
+                    // mangle the selection.
+                    LauncherSection::Defaults | LauncherSection::AddNew(AddNewField::Executor) => {}
+                }
+            }
         }
         _ => {} // Normal/Confirm modes: ignore paste
     }
@@ -806,6 +984,109 @@ fn handle_confirm_input(app: &mut VizApp, code: KeyCode) {
             app.input_mode = InputMode::Normal;
         }
         _ => {}
+    }
+}
+
+/// Handle key input while the chat-exit prompt is open. Two phases:
+///   - Top-level (per_chat_idx is None): a/c/s/Esc/Enter shortcuts
+///     that resolve the whole exit at once or descend to per-chat.
+///   - Per-chat (per_chat_idx is Some(i)): l/c/b/Esc shortcuts that
+///     record a decision for chats[i] and advance.
+fn handle_exit_prompt_input(app: &mut VizApp, code: KeyCode) {
+    let (per_chat_idx, total_chats) = match &app.input_mode {
+        InputMode::ExitPrompt(s) => (s.per_chat_idx, s.chats.len()),
+        _ => return,
+    };
+
+    if per_chat_idx.is_none() {
+        // Main prompt.
+        match code {
+            // Default action: leave running.
+            KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.resolve_exit_prompt_leave_all();
+            }
+            // Close all.
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.resolve_exit_prompt_close_all();
+            }
+            // Per-chat selection.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                app.enter_exit_prompt_per_chat();
+            }
+            // Cancel exit.
+            KeyCode::Esc => {
+                app.cancel_exit_prompt();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Per-chat granular flow.
+    let i = per_chat_idx.unwrap();
+    match code {
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            // Leave this chat (default), advance.
+            if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+                if i < s.per_chat_close.len() {
+                    s.per_chat_close[i] = false;
+                }
+                advance_per_chat_or_finish(s, total_chats);
+            }
+            // If we just finished, apply now.
+            if matches!(app.input_mode, InputMode::ExitPrompt(_)) {
+                let done = matches!(
+                    &app.input_mode,
+                    InputMode::ExitPrompt(s) if s.per_chat_idx.is_none()
+                );
+                if done {
+                    app.resolve_exit_prompt_per_chat();
+                }
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            // Close this chat, advance.
+            if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+                if i < s.per_chat_close.len() {
+                    s.per_chat_close[i] = true;
+                }
+                advance_per_chat_or_finish(s, total_chats);
+            }
+            if matches!(app.input_mode, InputMode::ExitPrompt(_)) {
+                let done = matches!(
+                    &app.input_mode,
+                    InputMode::ExitPrompt(s) if s.per_chat_idx.is_none()
+                );
+                if done {
+                    app.resolve_exit_prompt_per_chat();
+                }
+            }
+        }
+        // Back to main prompt.
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+                s.per_chat_idx = None;
+            }
+        }
+        // Cancel exit entirely.
+        KeyCode::Esc => {
+            app.cancel_exit_prompt();
+        }
+        _ => {}
+    }
+}
+
+/// Advance per-chat index; if the user has decided about every chat,
+/// reset `per_chat_idx` to `None` to signal "ready to apply".
+fn advance_per_chat_or_finish(
+    s: &mut crate::tui::viz_viewer::state::ExitPromptState,
+    total: usize,
+) {
+    let next = s.per_chat_idx.map(|i| i + 1).unwrap_or(0);
+    if next >= total {
+        s.per_chat_idx = None;
+    } else {
+        s.per_chat_idx = Some(next);
     }
 }
 
@@ -973,6 +1254,46 @@ fn handle_coordinator_picker_input(app: &mut VizApp, code: KeyCode) {
     }
 }
 
+/// Key handler for the chat manager pane (`InputMode::ChatManager`).
+///
+/// Bindings:
+///   - Up/Down or j/k: navigate visible rows
+///   - Space:          toggle multi-select on highlighted row
+///   - 'a':            select-all-visible
+///   - 'c':            clear multi-select
+///   - 'f':            cycle filter (all → non-empty → empty → alive)
+///   - 'd' or Enter:   abandon selected (or highlighted if no multi-select)
+///   - Esc or 'q':     close without action
+fn handle_chat_manager_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
+    if app.chat_manager.is_none() {
+        app.input_mode = InputMode::Normal;
+        return;
+    }
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => app.chat_manager_navigate(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.chat_manager_navigate(1),
+        KeyCode::PageUp => app.chat_manager_navigate(-10),
+        KeyCode::PageDown => app.chat_manager_navigate(10),
+        KeyCode::Char(' ') => app.chat_manager_toggle_select(),
+        KeyCode::Char('a') if modifiers.is_empty() => {
+            app.chat_manager_select_all_visible();
+        }
+        KeyCode::Char('c') if modifiers.is_empty() => {
+            app.chat_manager_clear_selection();
+        }
+        KeyCode::Char('f') if modifiers.is_empty() => {
+            app.chat_manager_cycle_filter();
+        }
+        KeyCode::Char('d') | KeyCode::Enter => {
+            app.chat_manager_abandon_selected();
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.close_chat_manager();
+        }
+        _ => {}
+    }
+}
+
 /// Handle keyboard input when the service control panel is open.
 fn handle_service_control_panel_key(app: &mut VizApp, code: KeyCode) {
     let stuck_count = app.service_health.stuck_tasks.len();
@@ -1058,20 +1379,19 @@ fn handle_service_control_panel_key(app: &mut VizApp, code: KeyCode) {
 /// - Recent row         → populate executor/model/endpoint from history entry, launch.
 /// - Click outside any row → no-op (modal stays open; Esc or tab-click dismisses).
 pub(super) fn handle_launcher_mouse_click(app: &mut VizApp, row: u16, column: u16) {
-    use super::state::{LauncherListHit, LauncherSection};
+    use super::state::{AddNewField, LauncherSection};
     let pos = Position::new(column, row);
 
     // Take ownership of hit lists to avoid borrow conflicts when mutating launcher.
     let name_hit = app.launcher_name_hit;
-    let exec_hits = app.launcher_executor_hits.clone();
-    let model_hits = app.launcher_model_hits.clone();
-    let ep_hits = app.launcher_endpoint_hits.clone();
-    let recent_hits = app.launcher_recent_hits.clone();
+    let default_hits = app.launcher_default_hits.clone();
+    let exec_hits = app.launcher_add_executor_hits.clone();
+    let model_hit = app.launcher_add_model_hit;
+    let endpoint_hit = app.launcher_add_endpoint_hit;
     let launch_btn = app.launcher_launch_btn_hit;
     let cancel_btn = app.launcher_cancel_btn_hit;
 
-    // Action buttons take priority over field rows (they're in the footer below
-    // everything else, but a click on either should commit the dialog state).
+    // Action buttons take priority over field rows.
     if launch_btn.height > 0 && launch_btn.contains(pos) {
         app.launch_from_launcher();
         return;
@@ -1090,81 +1410,48 @@ pub(super) fn handle_launcher_mouse_click(app: &mut VizApp, row: u16, column: u1
         launcher.active_section = LauncherSection::Name;
         return;
     }
+    // Default-mode preset / Add-new rows.
+    for (idx, rect) in &default_hits {
+        if rect.contains(pos) {
+            launcher.active_section = LauncherSection::Defaults;
+            launcher.default_selected = *idx;
+            return;
+        }
+    }
+    // Add-new-mode executor radio (claude / codex / nex).
     for (idx, rect) in &exec_hits {
         if rect.contains(pos) {
-            launcher.active_section = LauncherSection::Executor;
-            launcher.select_executor(*idx);
+            launcher.active_section = LauncherSection::AddNew(AddNewField::Executor);
+            launcher.add_executor_idx = *idx;
             return;
         }
     }
-    for (hit, rect) in &model_hits {
-        if rect.contains(pos) {
-            launcher.active_section = LauncherSection::Model;
-            match hit {
-                LauncherListHit::Item(filtered_idx) => {
-                    launcher.model_picker.custom_active = false;
-                    launcher.model_picker.selected = *filtered_idx;
-                }
-                LauncherListHit::Custom => {
-                    launcher.model_picker.selected = launcher.model_picker.filtered_indices.len();
-                    launcher.model_picker.enter_custom();
-                }
-            }
-            return;
-        }
+    if model_hit.height > 0 && model_hit.contains(pos) {
+        launcher.active_section = LauncherSection::AddNew(AddNewField::Model);
+        return;
     }
-    for (hit, rect) in &ep_hits {
-        if rect.contains(pos) {
-            launcher.active_section = LauncherSection::Endpoint;
-            match hit {
-                LauncherListHit::Item(filtered_idx) => {
-                    launcher.endpoint_picker.custom_active = false;
-                    launcher.endpoint_picker.selected = *filtered_idx;
-                }
-                LauncherListHit::Custom => {
-                    launcher.endpoint_picker.selected =
-                        launcher.endpoint_picker.filtered_indices.len();
-                    launcher.endpoint_picker.enter_custom();
-                }
-            }
-            return;
-        }
-    }
-    for (idx, rect) in &recent_hits {
-        if rect.contains(pos) {
-            launcher.active_section = LauncherSection::Recent;
-            launcher.recent_selected = *idx;
-            if let Some(entry) = launcher.recent_list.get(*idx).cloned() {
-                if let Some(pos_e) = launcher
-                    .executor_list
-                    .iter()
-                    .position(|(name, _, _)| name == &entry.executor)
-                {
-                    launcher.select_executor(pos_e);
-                }
-                if let Some(ref model) = entry.model {
-                    launcher.select_model_by_id(model);
-                }
-                if let Some(ref endpoint) = entry.endpoint {
-                    launcher.select_endpoint_by_value(endpoint);
-                }
-            }
-            // Single-click on a recent entry launches immediately, matching
-            // the keyboard "1..9" quick-select behavior.
-            app.launch_from_launcher();
-            return;
-        }
+    if endpoint_hit.height > 0 && endpoint_hit.contains(pos) {
+        launcher.active_section = LauncherSection::AddNew(AddNewField::Endpoint);
+        return;
     }
     // Click in launcher area but no row matched: just no-op.
 }
 
 fn handle_launcher_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
-    use super::state::LauncherSection;
+    use super::state::{ADD_NEW_EXECUTOR_CHOICES, AddNewField, LauncherMode, LauncherSection};
+
+    // While a previous Enter is still in-flight (waiting for `wg
+    // service create-coordinator` IPC to return), swallow keys so the
+    // user can't double-submit, Esc-cancel a half-created chat, or
+    // mutate fields whose values were already shipped. The pane is
+    // visible during this window — see fix-tui-new symptom 2.
+    if app.launcher.as_ref().is_some_and(|l| l.creating) {
+        return;
+    }
 
     // Universal submit: Ctrl+Enter from any section/state. Bypasses the
-    // section-specific handlers (which can swallow Enter — e.g. Name section
-    // moves to next field, Custom row enters edit mode). Without this safety
-    // valve, users have reported getting "stuck" in the dialog.
+    // section-specific handlers that swallow Enter (e.g. Add-new model
+    // text field where Enter consumes the keypress to launch).
     if matches!(code, KeyCode::Enter) && modifiers.contains(KeyModifiers::CONTROL) {
         app.launch_from_launcher();
         return;
@@ -1178,283 +1465,144 @@ fn handle_launcher_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         }
     };
 
-    // Name section: route character input to the name field
-    if launcher.active_section == LauncherSection::Name {
-        match code {
-            KeyCode::Esc => {
-                app.close_launcher();
-                return;
+    // Esc/Ctrl+C: in Add-new mode goes back to Default. In Default mode
+    // closes the launcher entirely.
+    if matches!(code, KeyCode::Esc)
+        || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
+    {
+        match launcher.mode {
+            LauncherMode::AddNew => {
+                launcher.mode = LauncherMode::Default;
+                launcher.active_section = LauncherSection::Defaults;
+                launcher.last_error = None;
             }
-            KeyCode::Tab => {
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    launcher.prev_section();
-                } else {
-                    launcher.next_section();
+            LauncherMode::Default => {
+                app.close_launcher();
+            }
+        }
+        return;
+    }
+
+    // Tab / Shift+Tab cycles between fields in both modes.
+    if matches!(code, KeyCode::Tab) {
+        if modifiers.contains(KeyModifiers::SHIFT) {
+            launcher.prev_section();
+        } else {
+            launcher.next_section();
+        }
+        return;
+    }
+    if matches!(code, KeyCode::BackTab) {
+        launcher.prev_section();
+        return;
+    }
+
+    // Section-specific dispatch. Each branch returns at the end so the
+    // generic fallthrough at the bottom handles only un-claimed keys.
+    match launcher.active_section.clone() {
+        LauncherSection::Defaults => match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if launcher.default_selected > 0 {
+                    launcher.default_selected -= 1;
                 }
-                return;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = launcher.presets.len(); // last index is "+ Add new"
+                if launcher.default_selected < max {
+                    launcher.default_selected += 1;
+                }
             }
             KeyCode::Enter => {
-                // Submit immediately — Name is optional, no need to step through
-                // the rest of the form. Users have reported getting "stuck" in
-                // the selector when Enter just navigated to the next section
-                // (no clear indication it was a Tab-style move, not a submit).
+                // Either launches a preset OR flips into Add-new mode.
+                // launch_from_launcher handles both branches.
                 app.launch_from_launcher();
-                return;
+            }
+            _ => {}
+        },
+        LauncherSection::Name => match code {
+            KeyCode::Enter => {
+                app.launch_from_launcher();
             }
             KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
                 launcher.name.push(c);
-                return;
             }
             KeyCode::Backspace => {
                 launcher.name.pop();
-                return;
             }
-            _ => return,
-        }
-    }
-
-    // Custom model input mode (via FilterPicker)
-    if launcher.active_section == LauncherSection::Model && launcher.model_picker.custom_active {
-        match code {
-            KeyCode::Esc => {
-                launcher.model_picker.exit_custom();
-                return;
+            _ => {}
+        },
+        LauncherSection::AddNew(AddNewField::Executor) => match code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if launcher.add_executor_idx > 0 {
+                    launcher.add_executor_idx -= 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let max = ADD_NEW_EXECUTOR_CHOICES.len().saturating_sub(1);
+                if launcher.add_executor_idx < max {
+                    launcher.add_executor_idx += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if launcher.add_executor_idx > 0 {
+                    launcher.add_executor_idx -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = ADD_NEW_EXECUTOR_CHOICES.len().saturating_sub(1);
+                if launcher.add_executor_idx < max {
+                    launcher.add_executor_idx += 1;
+                }
             }
             KeyCode::Enter => {
-                if !launcher.model_picker.custom_text.is_empty() {
-                    app.launch_from_launcher();
-                } else {
-                    launcher.model_picker.exit_custom();
-                }
-                return;
-            }
-            KeyCode::Tab => {
-                launcher.model_picker.exit_custom();
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    launcher.prev_section();
-                } else {
-                    launcher.next_section();
-                }
-                return;
-            }
-            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                launcher.model_picker.custom_text.push(c);
-                return;
-            }
-            KeyCode::Backspace => {
-                launcher.model_picker.custom_text.pop();
-                return;
-            }
-            _ => return,
-        }
-    }
-
-    // Custom endpoint input mode (via FilterPicker)
-    if launcher.active_section == LauncherSection::Endpoint
-        && launcher.endpoint_picker.custom_active
-    {
-        match code {
-            KeyCode::Esc => {
-                launcher.endpoint_picker.exit_custom();
-                return;
-            }
-            KeyCode::Enter => {
-                if !launcher.endpoint_picker.custom_text.is_empty() {
-                    app.launch_from_launcher();
-                } else {
-                    launcher.endpoint_picker.exit_custom();
-                }
-                return;
-            }
-            KeyCode::Tab => {
-                launcher.endpoint_picker.exit_custom();
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    launcher.prev_section();
-                } else {
-                    launcher.next_section();
-                }
-                return;
-            }
-            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                launcher.endpoint_picker.custom_text.push(c);
-                return;
-            }
-            KeyCode::Backspace => {
-                launcher.endpoint_picker.custom_text.pop();
-                return;
-            }
-            _ => return,
-        }
-    }
-
-    // Model section with filter: typing filters the list
-    if launcher.active_section == LauncherSection::Model {
-        match code {
-            KeyCode::Esc => {
-                if !launcher.model_picker.filter.is_empty() {
-                    launcher.model_picker.filter.clear();
-                    launcher.model_picker.apply_filter();
-                } else {
-                    app.close_launcher();
-                }
-                return;
-            }
-            KeyCode::Char(c)
-                if !modifiers.contains(KeyModifiers::CONTROL) && c != 'j' && c != 'k' =>
-            {
-                launcher.model_picker.type_char(c);
-                return;
-            }
-            KeyCode::Backspace => {
-                launcher.model_picker.backspace();
-                return;
-            }
-            _ => {} // fall through to generic key handling
-        }
-    }
-
-    // Endpoint section with filter: typing filters the list
-    if launcher.active_section == LauncherSection::Endpoint {
-        match code {
-            KeyCode::Esc => {
-                if !launcher.endpoint_picker.filter.is_empty() {
-                    launcher.endpoint_picker.filter.clear();
-                    launcher.endpoint_picker.apply_filter();
-                } else {
-                    app.close_launcher();
-                }
-                return;
-            }
-            KeyCode::Char(c)
-                if !modifiers.contains(KeyModifiers::CONTROL) && c != 'j' && c != 'k' =>
-            {
-                launcher.endpoint_picker.type_char(c);
-                return;
-            }
-            KeyCode::Backspace => {
-                launcher.endpoint_picker.backspace();
-                return;
-            }
-            _ => {} // fall through
-        }
-    }
-
-    match code {
-        KeyCode::Esc => {
-            app.close_launcher();
-        }
-        KeyCode::Tab => {
-            if modifiers.contains(KeyModifiers::SHIFT) {
-                launcher.prev_section();
-            } else {
+                // Move to model field rather than submitting — the user
+                // hasn't filled out the form yet.
                 launcher.next_section();
             }
-        }
-        KeyCode::Up | KeyCode::Char('k') => match launcher.active_section {
-            LauncherSection::Executor => {
-                if launcher.executor_selected > 0 {
-                    let new_idx = launcher.executor_selected - 1;
-                    launcher.select_executor(new_idx);
-                }
-            }
-            LauncherSection::Model => {
-                launcher.model_picker.prev();
-            }
-            LauncherSection::Endpoint => {
-                launcher.endpoint_picker.prev();
-            }
-            LauncherSection::Recent => {
-                if launcher.recent_selected > 0 {
-                    launcher.recent_selected -= 1;
-                }
-            }
             _ => {}
         },
-        KeyCode::Down | KeyCode::Char('j') => match launcher.active_section {
-            LauncherSection::Executor => {
-                let max = launcher.executor_list.len().saturating_sub(1);
-                if launcher.executor_selected < max {
-                    let new_idx = launcher.executor_selected + 1;
-                    launcher.select_executor(new_idx);
-                }
-            }
-            LauncherSection::Model => {
-                launcher.model_picker.next();
-            }
-            LauncherSection::Endpoint => {
-                launcher.endpoint_picker.next();
-            }
-            LauncherSection::Recent => {
-                let max = launcher.recent_list.len().saturating_sub(1);
-                if launcher.recent_selected < max {
-                    launcher.recent_selected += 1;
-                }
-            }
-            _ => {}
-        },
-        KeyCode::Enter => {
-            match launcher.active_section {
-                LauncherSection::Model => {
-                    if launcher.model_picker.is_custom_selected() {
-                        launcher.model_picker.enter_custom();
-                        return;
-                    }
-                }
-                LauncherSection::Endpoint => {
-                    if launcher.endpoint_picker.is_custom_selected() {
-                        launcher.endpoint_picker.enter_custom();
-                        return;
-                    }
-                }
-                LauncherSection::Recent => {
-                    if let Some(entry) = launcher.recent_list.get(launcher.recent_selected).cloned()
-                    {
-                        if let Some(pos) = launcher
-                            .executor_list
-                            .iter()
-                            .position(|(name, _, _)| name == &entry.executor)
-                        {
-                            launcher.executor_selected = pos;
-                        }
-                        if let Some(ref model) = entry.model {
-                            launcher.select_model_by_id(model);
-                        }
-                        if let Some(ref endpoint) = entry.endpoint {
-                            launcher.select_endpoint_by_value(endpoint);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            app.launch_from_launcher();
-        }
-        // Quick-select recent entries by number
-        KeyCode::Char(c @ '1'..='9') if launcher.active_section == LauncherSection::Recent => {
-            let idx = (c as usize) - ('1' as usize);
-            if idx < launcher.recent_list.len() {
-                launcher.recent_selected = idx;
-                if let Some(entry) = launcher.recent_list.get(idx).cloned() {
-                    if let Some(pos) = launcher
-                        .executor_list
-                        .iter()
-                        .position(|(name, _, _)| name == &entry.executor)
-                    {
-                        launcher.executor_selected = pos;
-                    }
-                    if let Some(ref model) = entry.model {
-                        launcher.select_model_by_id(model);
-                    }
-                    if let Some(ref endpoint) = entry.endpoint {
-                        launcher.select_endpoint_by_value(endpoint);
-                    }
-                }
+        LauncherSection::AddNew(AddNewField::Model) => match code {
+            KeyCode::Enter => {
                 app.launch_from_launcher();
             }
-        }
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            app.close_launcher();
-        }
-        _ => {}
+            KeyCode::Char(c)
+                if !modifiers.contains(KeyModifiers::CONTROL) && is_safe_launcher_field_char(c) =>
+            {
+                launcher.add_model.push(c);
+            }
+            KeyCode::Backspace => {
+                launcher.add_model.pop();
+            }
+            _ => {}
+        },
+        LauncherSection::AddNew(AddNewField::Endpoint) => match code {
+            KeyCode::Enter => {
+                app.launch_from_launcher();
+            }
+            KeyCode::Char(c)
+                if !modifiers.contains(KeyModifiers::CONTROL) && is_safe_launcher_field_char(c) =>
+            {
+                launcher.add_endpoint.push(c);
+            }
+            KeyCode::Backspace => {
+                launcher.add_endpoint.pop();
+            }
+            _ => {}
+        },
+        LauncherSection::AddNew(AddNewField::Name) => match code {
+            KeyCode::Enter => {
+                app.launch_from_launcher();
+            }
+            KeyCode::Char(c)
+                if !modifiers.contains(KeyModifiers::CONTROL) && is_safe_launcher_field_char(c) =>
+            {
+                launcher.name.push(c);
+            }
+            KeyCode::Backspace => {
+                launcher.name.pop();
+            }
+            _ => {}
+        },
     }
 }
 
@@ -1837,6 +1985,40 @@ fn handle_normal_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     // If consumed, return — don't fall through to digit→panel-tab nav.
     if try_chat_tab_navigation(app, code, modifiers) {
         return;
+    }
+    // Death-panel recovery: when the chat agent died and the death panel is
+    // showing, intercept R/E/X before they reach any other handler so the
+    // user can act on the panel regardless of which panel has focus.
+    // Accept the key regardless of SHIFT — the panel's labels say
+    // "Press R/E/X" (uppercase), so users naturally try shift+letter,
+    // which crossterm delivers as `Char('R')` + SHIFT. Reject CONTROL /
+    // ALT / META so we don't shadow other bindings (Ctrl+R, Alt+E, etc.).
+    let death_panel_modifier_ok =
+        !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+    if app.right_panel_tab == RightPanelTab::Chat
+        && app
+            .chat_agent_death
+            .contains_key(&app.active_coordinator_id)
+        && death_panel_modifier_ok
+    {
+        match code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                app.chat_agent_death.remove(&app.active_coordinator_id);
+                app.maybe_auto_enable_chat_pty();
+                return;
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                app.chat_agent_death.remove(&app.active_coordinator_id);
+                app.chat_pty_mode = false;
+                return;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                app.chat_agent_death.remove(&app.active_coordinator_id);
+                app.open_launcher();
+                return;
+            }
+            _ => {}
+        }
     }
     match app.focused_panel {
         FocusedPanel::Graph => handle_graph_key(app, code, modifiers),
@@ -2239,7 +2421,13 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
             }
         }
 
-        // M: send message to selected task's agent
+        // M on Chat tab: open the chat manager pane for bulk-cleanup
+        // (fix-tui-chat). Takes precedence over the bare-graph "send
+        // message" binding so chat-tab users get the cleanup UX.
+        KeyCode::Char('M') if app.right_panel_tab == RightPanelTab::Chat => {
+            app.open_chat_manager();
+        }
+        // M (graph context): send message to selected task's agent.
         KeyCode::Char('M') => {
             if let Some(task_id) = app.selected_task_id().map(|s| s.to_string()) {
                 super::state::editor_clear(&mut app.text_prompt.editor);
@@ -2864,6 +3052,12 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
         // Settings tab: 's' toggles edit scope (global ↔ local)
         KeyCode::Char('s') if app.right_panel_tab == RightPanelTab::Settings => {
             app.toggle_settings_scope();
+        }
+        // Log tab: 's' toggles head/tail summary mode (RawPretty view).
+        // Long tool/command outputs collapse to first 5 + last 5 lines
+        // with a `… N lines elided …` marker between them.
+        KeyCode::Char('s') if app.right_panel_tab == RightPanelTab::Log => {
+            app.toggle_log_summary();
         }
         // Settings tab: 'r' reloads from disk
         KeyCode::Char('r') if app.right_panel_tab == RightPanelTab::Settings => {
@@ -3519,6 +3713,30 @@ fn right_panel_scroll_to_bottom(app: &mut VizApp) {
     }
 }
 
+/// Route a mouse-wheel `ScrollUp` / `ScrollDown` event over the chat tab
+/// to the wg vt100 pane's own scrollback — never to the inner child's
+/// stdin.
+///
+/// Earlier versions (`fix-mouse-wheel`) translated wheel events into
+/// Up/Down arrow keys when the chat PTY was focused, with the goal of
+/// making touch and wheel feel identical for vendor CLIs. claude code
+/// detects this and emits a "Scroll wheel is sending arrow keys" warning;
+/// codex shows similar oddness. The right contract is: wheel ALWAYS
+/// scrolls the outer scrollback (the wg vt100 buffer), inner app sees
+/// nothing. Keyboard scrolling lives behind Ctrl+] scroll mode (see
+/// `implement-tui-scroll`). — fix-mouse-wheel-2.
+fn forward_chat_wheel(app: &mut VizApp, kind: MouseEventKind) {
+    let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+    let Some(pane) = app.task_panes.get_mut(&task_id) else {
+        return;
+    };
+    match kind {
+        MouseEventKind::ScrollUp => pane.scroll_up(3),
+        MouseEventKind::ScrollDown => pane.scroll_down(3),
+        _ => {}
+    }
+}
+
 fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     use super::state::ScrollbarDragTarget;
 
@@ -3565,53 +3783,14 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
     app.fullscreen_top_hover = in_fullscreen_top;
     app.fullscreen_bottom_hover = in_fullscreen_bottom;
 
-    // Launcher modal: route scroll wheel to whichever picker the cursor is
-    // over. Done before the generic match so scroll events don't fall through
-    // to the graph/chat handlers behind the modal.
+    // Launcher modal: redesigned dialog has no scrollable picker
+    // (Default mode is a 3-row radio, Add-new mode is a fixed-height
+    // form). Swallow scroll events so they don't reach the graph/chat
+    // handlers behind the modal but otherwise no-op.
     if matches!(app.input_mode, InputMode::Launcher)
         && (matches!(kind, MouseEventKind::ScrollUp) || matches!(kind, MouseEventKind::ScrollDown))
     {
-        let in_model_list =
-            app.launcher_model_list_area.height > 0 && app.launcher_model_list_area.contains(pos);
-        let in_endpoint_list = app.launcher_endpoint_list_area.height > 0
-            && app.launcher_endpoint_list_area.contains(pos);
-        if let Some(launcher) = app.launcher.as_mut() {
-            let delta = 3usize;
-            match kind {
-                MouseEventKind::ScrollUp => {
-                    if in_model_list {
-                        launcher.model_picker.scroll_up(delta);
-                    } else if in_endpoint_list {
-                        launcher.endpoint_picker.scroll_up(delta);
-                    } else {
-                        // Scroll over launcher but not over a list:
-                        // default to the active section's picker.
-                        match launcher.active_section {
-                            super::state::LauncherSection::Endpoint => {
-                                launcher.endpoint_picker.scroll_up(delta)
-                            }
-                            _ => launcher.model_picker.scroll_up(delta),
-                        }
-                    }
-                }
-                MouseEventKind::ScrollDown => {
-                    if in_model_list {
-                        launcher.model_picker.scroll_down(delta);
-                    } else if in_endpoint_list {
-                        launcher.endpoint_picker.scroll_down(delta);
-                    } else {
-                        match launcher.active_section {
-                            super::state::LauncherSection::Endpoint => {
-                                launcher.endpoint_picker.scroll_down(delta)
-                            }
-                            _ => launcher.model_picker.scroll_down(delta),
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
+        return;
     }
 
     match kind {
@@ -3622,10 +3801,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 && app.chat_pty_mode
                 && app.right_panel_tab == RightPanelTab::Chat
             {
-                let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
-                if let Some(pane) = app.task_panes.get_mut(&task_id) {
-                    pane.scroll_up(3);
-                }
+                forward_chat_wheel(app, MouseEventKind::ScrollUp);
             } else if in_graph && app.scroll_axis_swapped {
                 app.record_graph_hscroll_activity();
                 app.scroll.scroll_left(3);
@@ -3658,10 +3834,7 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 && app.chat_pty_mode
                 && app.right_panel_tab == RightPanelTab::Chat
             {
-                let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
-                if let Some(pane) = app.task_panes.get_mut(&task_id) {
-                    pane.scroll_down(3);
-                }
+                forward_chat_wheel(app, MouseEventKind::ScrollDown);
             } else if in_graph && app.scroll_axis_swapped {
                 app.record_graph_hscroll_activity();
                 app.scroll.scroll_right(3);
@@ -3708,9 +3881,11 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
             match &app.input_mode {
                 InputMode::ChoiceDialog(_)
                 | InputMode::Confirm(_)
-                | InputMode::CoordinatorPicker => {
+                | InputMode::CoordinatorPicker
+                | InputMode::ChatManager => {
                     if !in_dialog {
                         app.coordinator_picker = None;
+                        app.chat_manager = None;
                         app.input_mode = InputMode::Normal;
                         return;
                     }
@@ -3750,6 +3925,19 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 // Click on coordinator/user-board tab bar.
                 app.focused_panel = FocusedPanel::RightPanel;
 
+                // Check scroll arrows first — they take precedence over the
+                // "click anywhere on the bar" handlers below.
+                let left = &app.coordinator_left_arrow_hit;
+                if left.start != left.end && column >= left.start && column < left.end {
+                    app.scroll_chat_tabs(-1);
+                    return;
+                }
+                let right = &app.coordinator_right_arrow_hit;
+                if right.start != right.end && column >= right.start && column < right.end {
+                    app.scroll_chat_tabs(1);
+                    return;
+                }
+
                 // Check [+] button first
                 let plus = &app.coordinator_plus_hit;
                 if column >= plus.start && column < plus.end {
@@ -3766,13 +3954,15 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                         match &hit.kind {
                             TabBarEntryKind::Coordinator(cid) => {
                                 app.right_panel_tab = RightPanelTab::Chat;
-                                // Close button: remove tab from view (no graph change)
+                                // Close button: abandon underlying chat task
+                                // AND hide tab immediately. Per user mental
+                                // model "X = gone for good" (fix-tui-chat).
                                 if hit.close_start != hit.close_end
                                     && column >= hit.close_start
                                     && column < hit.close_end
                                 {
                                     let cid = *cid;
-                                    app.close_tab(cid);
+                                    app.click_close_button(cid);
                                 } else {
                                     app.switch_coordinator(*cid);
                                 }
@@ -4030,41 +4220,31 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
                 && app.last_iter_nav_area.contains(pos)
                 && app.right_panel_tab == RightPanelTab::Detail
             {
-                // Click on ◀ ▶ iteration navigation in Detail tab header.
-                // Layout (left-aligned): ◀ | padding | " iter X/Y " | padding | ▶
+                // Click on the Detail tab iteration nav bar. The bar is
+                // split into three zones — prev segment (clickable as ◀),
+                // center label (no click action), next segment (clickable
+                // as ▶). Each clickable segment is at least 3 cells wide
+                // so mouse precision isn't required.
                 app.focused_panel = FocusedPanel::RightPanel;
-                let col = column.saturating_sub(app.last_iter_nav_area.x) as usize;
                 let total = app.iteration_archives.len() + 1;
-                let usable_width = app.last_iter_nav_area.width.saturating_sub(2) as usize;
-                let center_len = format!(" iter {}/{} ", total, total).len();
-                let arrow_width = 2;
-                let gap = 2;
-                let side_width =
-                    (usable_width.saturating_sub(center_len + arrow_width * 2 + gap * 2)) / 2;
-                let pad = side_width.max(1);
-
-                // ◀ at 0, padding 1..pad, middle (pad+1)..(pad+center_len), padding, ▶
-                let left_zone_end = pad;
-                let right_zone_start = 1 + pad + center_len;
-
-                if col <= left_zone_end {
-                    if app.iteration_prev() {
-                        handle_iteration_change(app);
-                        let msg = match app.viewing_iteration {
-                            Some(idx) => format!("Viewing iteration {}/{}", idx + 1, total),
-                            None => format!("Viewing current ({}/{})", total, total),
-                        };
-                        app.push_toast(msg, super::state::ToastSeverity::Info);
-                    }
-                } else if col >= right_zone_start {
-                    if app.iteration_next() {
-                        handle_iteration_change(app);
-                        let msg = match app.viewing_iteration {
-                            Some(idx) => format!("Viewing iteration {}/{}", idx + 1, total),
-                            None => format!("Viewing current ({}/{})", total, total),
-                        };
-                        app.push_toast(msg, super::state::ToastSeverity::Info);
-                    }
+                let prev_hit =
+                    app.iter_nav_prev_zone.width > 0 && app.iter_nav_prev_zone.contains(pos);
+                let next_hit =
+                    app.iter_nav_next_zone.width > 0 && app.iter_nav_next_zone.contains(pos);
+                if prev_hit && app.iter_can_go_prev() && app.iteration_prev() {
+                    handle_iteration_change(app);
+                    let msg = match app.viewing_iteration {
+                        Some(idx) => format!("Viewing iteration {}/{}", idx + 1, total),
+                        None => format!("Viewing current ({}/{})", total, total),
+                    };
+                    app.push_toast(msg, super::state::ToastSeverity::Info);
+                } else if next_hit && app.iter_can_go_next() && app.iteration_next() {
+                    handle_iteration_change(app);
+                    let msg = match app.viewing_iteration {
+                        Some(idx) => format!("Viewing iteration {}/{}", idx + 1, total),
+                        None => format!("Viewing current ({}/{})", total, total),
+                    };
+                    app.push_toast(msg, super::state::ToastSeverity::Info);
                 }
             } else if in_right_content && app.right_panel_tab == RightPanelTab::Detail {
                 // Click in Detail tab: toggle section collapse if clicking a header.
@@ -4119,9 +4299,23 @@ fn handle_mouse(app: &mut VizApp, kind: MouseEventKind, row: u16, column: u16) {
 
                         if let Some(region) = clicked_annotation {
                             // Select the parent task (keeps graph node highlighted).
+                            // `select_task_at_line` clears any prior `hud_pin`; we
+                            // re-set it below so the inspector keeps showing the
+                            // meta-task across graph-refresh ticks.
                             app.select_task_at_line(orig_line);
-                            // Show the dot-task detail in the inspector.
+                            // Show the dot-task detail in the inspector and pin
+                            // it so the periodic invalidate_hud + load_hud_detail
+                            // refresh path doesn't reset the inspector to the
+                            // parent task.
                             if let Some(dot_id) = region.dot_task_ids.first() {
+                                if let Some(parent_id) =
+                                    app.selected_task_id().map(|s| s.to_string())
+                                {
+                                    app.hud_pin = Some(super::state::HudPin {
+                                        dot_task_id: dot_id.clone(),
+                                        anchor_parent_id: parent_id,
+                                    });
+                                }
                                 app.load_hud_detail_for_task(dot_id);
                             }
                             app.right_panel_visible = true;
@@ -7505,584 +7699,6 @@ mod scrollbar_tests {
             "Clicking on the chat input area with text should enter ChatInput mode"
         );
     }
-
-    // ──────────────────────────────────────────────────────────────────────
-    // Launcher (new-chat dialog) mouse + scroll tests
-    // ──────────────────────────────────────────────────────────────────────
-
-    use crate::tui::viz_viewer::state::{
-        FilterPicker, LauncherListHit, LauncherSection, LauncherState, filter_models_for_executor,
-    };
-
-    fn make_launcher(
-        executors: Vec<(&str, &str, bool)>,
-        models: Vec<(&str, &str)>,
-    ) -> LauncherState {
-        let executor_list: Vec<(String, String, bool)> = executors
-            .into_iter()
-            .map(|(n, d, a)| (n.to_string(), d.to_string(), a))
-            .collect();
-        let all_models: Vec<(String, String)> = models
-            .into_iter()
-            .map(|(n, d)| (n.to_string(), d.to_string()))
-            .collect();
-        let initial_executor = executor_list
-            .first()
-            .map(|(n, _, _)| n.clone())
-            .unwrap_or_else(|| "claude".to_string());
-        let initial_models = filter_models_for_executor(&all_models, &initial_executor);
-        let model_picker = FilterPicker::new(initial_models, true);
-        let endpoint_picker = FilterPicker::new(vec![], true);
-        LauncherState {
-            active_section: LauncherSection::Executor,
-            name: String::new(),
-            executor_list,
-            executor_selected: 0,
-            model_picker,
-            endpoint_picker,
-            recent_list: vec![],
-            recent_selected: 0,
-            all_models,
-        }
-    }
-
-    /// Test: clicking on an executor row in the launcher selects it AND
-    /// re-filters the model list to compatible models only.
-    #[test]
-    fn test_dialog_handles_mouse_click_on_executor_selector() {
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![
-                ("claude", "claude CLI", true),
-                ("native", "in-process loop", true),
-            ],
-            vec![
-                ("claude:opus", ""),
-                ("openai:gpt-4o", ""),
-                ("google:gemini-2.5-pro", ""),
-            ],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 30,
-        };
-        app.launcher_executor_hits = vec![
-            (
-                0,
-                Rect {
-                    x: 0,
-                    y: 5,
-                    width: 80,
-                    height: 1,
-                },
-            ),
-            (
-                1,
-                Rect {
-                    x: 0,
-                    y: 6,
-                    width: 80,
-                    height: 1,
-                },
-            ),
-        ];
-        // Click on the second executor row (native).
-        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 6, 10);
-        let l = app.launcher.as_ref().unwrap();
-        assert_eq!(l.executor_selected, 1, "click should select native");
-        assert_eq!(
-            l.active_section,
-            LauncherSection::Executor,
-            "section should be Executor"
-        );
-        // native shows endpoint section
-        assert!(l.show_endpoint(), "native should reveal endpoint");
-        // model list always shows all models — filter never strips
-        assert_eq!(l.model_picker.items.len(), 3);
-    }
-
-    /// Test: scroll-wheel events over the model list area scroll the picker.
-    #[test]
-    fn test_dialog_handles_scroll_wheel_in_model_list() {
-        let (mut app, _tmp) = build_test_app();
-        let many_models: Vec<(&str, &str)> = (0..20)
-            .map(|i| {
-                let s: &'static str = Box::leak(format!("claude:model-{}", i).into_boxed_str());
-                (s, "")
-            })
-            .collect();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            many_models,
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 30,
-        };
-        app.launcher_model_list_area = Rect {
-            x: 0,
-            y: 8,
-            width: 80,
-            height: 6,
-        };
-        let initial = app.launcher.as_ref().unwrap().model_picker.scroll_offset;
-        assert_eq!(initial, 0);
-        handle_mouse(&mut app, MouseEventKind::ScrollDown, 10, 10);
-        let after_down = app.launcher.as_ref().unwrap().model_picker.scroll_offset;
-        assert!(after_down > 0, "scroll down should move offset forward");
-        handle_mouse(&mut app, MouseEventKind::ScrollUp, 10, 10);
-        let after_up = app.launcher.as_ref().unwrap().model_picker.scroll_offset;
-        assert!(after_up < after_down, "scroll up should move offset back");
-    }
-
-    /// Test: clicking another coordinator tab while the launcher is open
-    /// dismisses the launcher AND switches to that tab in one action.
-    #[test]
-    fn test_dialog_click_on_other_tab_dismisses_and_switches() {
-        let (mut app, _tmp) = build_test_app();
-        // Add two coordinators so we have a second tab to click.
-        app.coordinator_chats.insert(0, Default::default());
-        app.coordinator_chats.insert(1, Default::default());
-        app.active_coordinator_id = 0;
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 1,
-            width: 80,
-            height: 29,
-        };
-        app.last_coordinator_bar_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 1,
-        };
-        app.coordinator_tab_hits = vec![crate::tui::viz_viewer::state::CoordinatorTabHit {
-            tab_start: 5,
-            tab_end: 15,
-            close_start: 0,
-            close_end: 0,
-            kind: crate::tui::viz_viewer::state::TabBarEntryKind::Coordinator(1),
-        }];
-        // Click on the tab (column 10, row 0).
-        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 10);
-        assert!(app.launcher.is_none(), "launcher should be dismissed");
-        assert_eq!(
-            app.input_mode,
-            InputMode::Normal,
-            "input mode should be Normal"
-        );
-        assert_eq!(
-            app.active_coordinator_id, 1,
-            "should switch to clicked coordinator"
-        );
-    }
-
-    /// Test: selecting the native executor reveals the endpoint section
-    /// (which would not be present for claude). Sanity check on
-    /// `LauncherState::show_endpoint`, which the renderer keys off of.
-    #[test]
-    fn test_dialog_native_executor_reveals_endpoint_input() {
-        let mut launcher = make_launcher(
-            vec![
-                ("claude", "claude CLI", true),
-                ("native", "in-process loop", true),
-            ],
-            vec![("claude:opus", ""), ("openai:gpt-4o", "")],
-        );
-        // Default executor (claude) — endpoint hidden.
-        assert!(!launcher.show_endpoint());
-        launcher.select_executor(1);
-        assert!(launcher.show_endpoint(), "native should reveal endpoint");
-    }
-
-    /// Test: model list reorders by executor (compatible first), but ALWAYS
-    /// returns all models — never strips them. A strict filter would trap
-    /// users whose registry uses unconventional naming on the Custom row.
-    #[test]
-    fn test_filter_models_for_executor_reorders_compatible_first() {
-        let all = vec![
-            ("openrouter:claude-opus-4-6".to_string(), "".to_string()),
-            ("openrouter:gpt-4o".to_string(), "".to_string()),
-            ("openrouter:gemini-2.5-pro".to_string(), "".to_string()),
-            ("claude:opus".to_string(), "".to_string()),
-            ("openai:gpt-4o-mini".to_string(), "".to_string()),
-        ];
-        // claude executor: all 5 returned, claude/anthropic ones first
-        let claude_models = filter_models_for_executor(&all, "claude");
-        assert_eq!(claude_models.len(), 5, "should never strip models");
-        assert!(
-            claude_models[0].0.contains("claude"),
-            "claude-compatible model should come first, got {:?}",
-            claude_models[0].0
-        );
-        // codex executor: openai first
-        let codex_models = filter_models_for_executor(&all, "codex");
-        assert_eq!(codex_models.len(), 5);
-        assert!(codex_models[0].0.contains("openai") || codex_models[0].0.contains("gpt"));
-        // gemini executor: google first
-        let gemini_models = filter_models_for_executor(&all, "gemini");
-        assert_eq!(gemini_models.len(), 5);
-        assert!(gemini_models[0].0.contains("google") || gemini_models[0].0.contains("gemini"));
-        // native executor: all models, original order
-        let native_models = filter_models_for_executor(&all, "native");
-        assert_eq!(native_models.len(), 5);
-        assert_eq!(native_models, all);
-    }
-
-    /// Test: Ctrl+Enter from any section submits the launcher.
-    /// Regression guard for "stuck in selector" — users couldn't always find
-    /// the submit path because Enter is overloaded across sections.
-    #[test]
-    fn test_dialog_ctrl_enter_submits_from_any_section() {
-        use super::handle_launcher_input;
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        // Park in Name section — the section that historically did NOT submit
-        // on Enter (it just stepped to the next field).
-        app.launcher.as_mut().unwrap().active_section = LauncherSection::Name;
-        // Ctrl+Enter should submit (close launcher) regardless of section.
-        handle_launcher_input(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
-        assert!(
-            app.launcher.is_none(),
-            "Ctrl+Enter on Name section should submit + close launcher"
-        );
-    }
-
-    /// Test: plain Enter on Name section now submits too (was: navigated).
-    /// The old "Enter in Name moves to next section" behavior was the most
-    /// common reason users got stuck — they typed a name, hit Enter, nothing
-    /// visible happened.
-    #[test]
-    fn test_dialog_enter_on_name_section_submits() {
-        use super::handle_launcher_input;
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.launcher.as_mut().unwrap().active_section = LauncherSection::Name;
-        handle_launcher_input(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        assert!(
-            app.launcher.is_none(),
-            "Enter on Name section should submit + close launcher"
-        );
-    }
-
-    /// Test: clicking [Launch] button submits the launcher.
-    #[test]
-    fn test_dialog_click_launch_button_submits() {
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 30,
-        };
-        app.launcher_launch_btn_hit = Rect {
-            x: 2,
-            y: 28,
-            width: 8,
-            height: 1,
-        };
-        // Click on the Launch button.
-        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 28, 5);
-        assert!(
-            app.launcher.is_none(),
-            "[Launch] click should submit + close launcher"
-        );
-        assert_eq!(app.input_mode, InputMode::Normal);
-    }
-
-    /// Test: clicking [Cancel] button dismisses without submitting.
-    #[test]
-    fn test_dialog_click_cancel_button_dismisses() {
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 30,
-        };
-        app.launcher_cancel_btn_hit = Rect {
-            x: 13,
-            y: 28,
-            width: 8,
-            height: 1,
-        };
-        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 28, 16);
-        assert!(
-            app.launcher.is_none(),
-            "[Cancel] click should close launcher"
-        );
-        assert_eq!(app.input_mode, InputMode::Normal);
-    }
-
-    /// Test: in command mode (PTY not focused / focused_panel = Graph),
-    /// the legacy global Ctrl+N alias still opens the launcher. The
-    /// modal contract only swallows keys when the chat PTY has focus.
-    #[test]
-    fn test_command_mode_ctrl_n_opens_launcher() {
-        let (mut app, tmp) = build_test_app();
-        app.right_panel_tab = RightPanelTab::Chat;
-        // Command mode: focused_panel = Graph (Ctrl+T'd out of PTY).
-        app.focused_panel = FocusedPanel::Graph;
-        app.chat_pty_mode = true;
-        app.chat_pty_forwards_stdin = true;
-        app.workgraph_dir = tmp.path().to_path_buf();
-        std::fs::write(tmp.path().join("config.toml"), "").ok();
-        super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-        assert!(
-            app.launcher.is_some(),
-            "Ctrl+N in command mode must open the launcher"
-        );
-        assert_eq!(app.input_mode, InputMode::Launcher);
-    }
-
-    /// Test: when chat PTY has focus (modal "PTY mode"), Ctrl+N is forwarded
-    /// to the embedded editor rather than escaping to open the launcher.
-    /// Only Ctrl+T is allowed to break out of PTY focus — see implement-tui-modal.
-    #[test]
-    fn test_pty_mode_passes_ctrl_n_to_editor() {
-        let (mut app, tmp) = build_test_app();
-        // Simulate vendor PTY active and forwarding stdin.
-        app.right_panel_tab = RightPanelTab::Chat;
-        app.focused_panel = FocusedPanel::RightPanel;
-        app.chat_pty_mode = true;
-        app.chat_pty_forwards_stdin = true;
-        app.workgraph_dir = tmp.path().to_path_buf();
-        std::fs::write(tmp.path().join("config.toml"), "").ok();
-        // Simulate Ctrl+N keystroke.
-        super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-        assert!(
-            app.launcher.is_none(),
-            "Ctrl+N in PTY mode must NOT open the launcher (must pass through to editor)"
-        );
-        assert_eq!(
-            app.input_mode,
-            InputMode::Normal,
-            "input_mode must remain Normal — only Ctrl+T should escape PTY mode"
-        );
-    }
-
-    /// Test: full submit flow — open launcher, press Enter, dialog dismisses
-    /// and exec_command was scheduled (we can't intercept the wg subprocess
-    /// here, but the launcher being None + InputMode back to Normal means
-    /// `launch_from_launcher` ran end-to-end).
-    #[test]
-    fn test_dialog_enter_submits_end_to_end() {
-        use super::handle_launcher_input;
-        let (mut app, _tmp) = build_test_app();
-        // Build a launcher with a real model, on Executor section (default).
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "Most capable")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        // Default: active_section = Executor, model_picker.selected = 0.
-        // Plain Enter should submit.
-        handle_launcher_input(&mut app, KeyCode::Enter, KeyModifiers::empty());
-        assert!(
-            app.launcher.is_none(),
-            "Enter on Executor section should submit + close launcher"
-        );
-        assert_eq!(
-            app.input_mode,
-            InputMode::Normal,
-            "input_mode should be Normal after submit"
-        );
-    }
-
-    /// Test: clicking a model row selects it and switches focus to Model section.
-    #[test]
-    fn test_launcher_click_on_model_row_selects_model() {
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", ""), ("claude:sonnet", "")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        app.last_launcher_area = Rect {
-            x: 0,
-            y: 0,
-            width: 80,
-            height: 30,
-        };
-        app.launcher_model_hits = vec![
-            (
-                LauncherListHit::Item(0),
-                Rect {
-                    x: 0,
-                    y: 8,
-                    width: 80,
-                    height: 1,
-                },
-            ),
-            (
-                LauncherListHit::Item(1),
-                Rect {
-                    x: 0,
-                    y: 9,
-                    width: 80,
-                    height: 1,
-                },
-            ),
-        ];
-        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 9, 10);
-        let l = app.launcher.as_ref().unwrap();
-        assert_eq!(l.active_section, LauncherSection::Model);
-        assert_eq!(l.model_picker.selected, 1);
-    }
-
-    /// Test: Shift+Enter on Model section also submits, mirroring the
-    /// common chat-input convention where Shift+Enter is a "send"
-    /// affordance. Plain Enter has always submitted; this guards against
-    /// regressions if Shift gets accidentally captured elsewhere.
-    #[test]
-    fn test_dialog_shift_enter_also_submits() {
-        use super::handle_launcher_input;
-        let (mut app, _tmp) = build_test_app();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            vec![("claude:opus", "Most capable")],
-        ));
-        app.input_mode = InputMode::Launcher;
-        // Move to Model section so Enter is unambiguously a submit action.
-        app.launcher.as_mut().unwrap().active_section = LauncherSection::Model;
-        handle_launcher_input(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
-        assert!(
-            app.launcher.is_none(),
-            "Shift+Enter should submit + close launcher (mirror of plain Enter)"
-        );
-        assert_eq!(app.input_mode, InputMode::Normal);
-    }
-
-    /// Test: keyboard ↑/↓ moves the model list selection. Regression guard
-    /// for "we still cant scroll the coordinator config" — selection-by-
-    /// keyboard is the primary navigation path when the list overflows.
-    #[test]
-    fn test_dialog_scroll_with_keyboard() {
-        use super::handle_launcher_input;
-        let (mut app, _tmp) = build_test_app();
-        let many_models: Vec<(&str, &str)> = (0..20)
-            .map(|i| {
-                let s: &'static str = Box::leak(format!("claude:model-{}", i).into_boxed_str());
-                (s, "")
-            })
-            .collect();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            many_models,
-        ));
-        app.input_mode = InputMode::Launcher;
-        // Park focus on the Model section so up/down navigates the picker.
-        app.launcher.as_mut().unwrap().active_section = LauncherSection::Model;
-        let initial = app.launcher.as_ref().unwrap().model_picker.selected;
-        assert_eq!(initial, 0);
-        handle_launcher_input(&mut app, KeyCode::Down, KeyModifiers::empty());
-        let after_down = app.launcher.as_ref().unwrap().model_picker.selected;
-        assert!(
-            after_down > initial,
-            "keyboard down should advance the model selection"
-        );
-        handle_launcher_input(&mut app, KeyCode::Down, KeyModifiers::empty());
-        handle_launcher_input(&mut app, KeyCode::Down, KeyModifiers::empty());
-        let after_more = app.launcher.as_ref().unwrap().model_picker.selected;
-        assert!(after_more > after_down, "more downs should keep advancing");
-        handle_launcher_input(&mut app, KeyCode::Up, KeyModifiers::empty());
-        let after_up = app.launcher.as_ref().unwrap().model_picker.selected;
-        assert!(
-            after_up < after_more,
-            "keyboard up should move selection back"
-        );
-    }
-
-    /// Test: after rendering the launcher, the [Launch] button hit area
-    /// is positioned ABOVE the model list. This pins the user-requested
-    /// layout — "launch at top of view so its clear why we are doing the
-    /// list below". Without this assertion the renderer is free to put
-    /// Launch at the bottom (the old layout) and users keep getting lost.
-    #[test]
-    fn test_dialog_launch_at_top_of_layout() {
-        use crate::tui::viz_viewer::render::draw_launcher_pane;
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let (mut app, _tmp) = build_test_app();
-        let many_models: Vec<(&str, &str)> = (0..30)
-            .map(|i| {
-                let s: &'static str = Box::leak(format!("claude:model-{}", i).into_boxed_str());
-                (s, "")
-            })
-            .collect();
-        app.launcher = Some(make_launcher(
-            vec![("claude", "claude CLI", true)],
-            many_models,
-        ));
-        app.input_mode = InputMode::Launcher;
-
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let launcher_area = Rect {
-            x: 0,
-            y: 1,
-            width: 120,
-            height: 38,
-        };
-        terminal
-            .draw(|frame| draw_launcher_pane(frame, &mut app, launcher_area))
-            .unwrap();
-
-        let launch_y = app.launcher_launch_btn_hit.y;
-        let model_list_y = app.launcher_model_list_area.y;
-        let model_list_h = app.launcher_model_list_area.height;
-        assert!(
-            launch_y > 0 && model_list_y > 0,
-            "render should populate hit areas for both launch and model list (got launch={}, model={})",
-            launch_y,
-            model_list_y,
-        );
-        assert!(
-            launch_y < model_list_y,
-            "[Launch] button must render ABOVE the model list — \
-             launch_y={}, model_list_y={}",
-            launch_y,
-            model_list_y,
-        );
-        // Also assert the model list is given enough vertical real estate
-        // to actually scroll. With 30 models and a 40-row terminal, we
-        // expect at least 10 rows of list visible.
-        assert!(
-            model_list_h >= 10,
-            "model list should dominate vertical space — got height={}, expected >=10",
-            model_list_h,
-        );
-    }
 }
 
 #[cfg(test)]
@@ -8410,9 +8026,10 @@ mod chat_tab_navigation_tests {
     use super::*;
     use crate::commands::viz::LayoutMode as VizLayoutMode;
     use crate::commands::viz::ascii::generate_ascii;
+    use ratatui::layout::Rect;
     use std::collections::{HashMap, HashSet};
     use workgraph::graph::{Node, Status, WorkGraph};
-    use workgraph::parser::save_graph;
+    use workgraph::parser::{load_graph, save_graph};
     use workgraph::test_helpers::make_task_with_status;
 
     /// Build a VizApp whose graph contains chat-loop tasks for each
@@ -8436,7 +8053,7 @@ mod chat_tab_navigation_tests {
         graph.add_node(Node::Task(regular));
 
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&graph, &graph_path).unwrap();
@@ -8771,6 +8388,172 @@ mod chat_tab_navigation_tests {
         );
     }
 
+    /// Per fix-tui-chat: clicking the ✕ close button on a chat tab must
+    /// route through `delete_coordinator` (which marks the task abandoned
+    /// + kills the agent), NOT just `close_tab` (which only hides). The
+    /// hide-only behavior was the user-reported bug: closed tabs reappear
+    /// every TUI restart because the underlying chat task is still in the
+    /// graph.
+    #[test]
+    fn click_close_button_enqueues_delete_coordinator_ipc() {
+        use crate::tui::viz_viewer::state::CommandEffect;
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4, 7]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        // Wire cmd_tx + cmd_rx to a single connected channel — the
+        // default test scaffold uses disjoint channels, so any IPC
+        // result sent by the spawned thread is dropped on the floor.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        switch_chat_tab_to_index(&mut app, 1); // active = cid 4
+
+        app.click_close_button(4);
+
+        // Tab is hidden immediately for snappy UX.
+        assert!(
+            !app.active_tabs.contains(&4),
+            "click_close_button must hide the tab from active_tabs"
+        );
+        // The IPC subprocess was enqueued. Even if the daemon is dead and
+        // the subprocess fails, exec_command always sends a CommandResult
+        // with the requested effect — verifies routing through
+        // delete_coordinator (NOT plain close_tab, which never spawns).
+        let result = app
+            .cmd_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("click_close_button must enqueue an IPC subprocess");
+        assert!(
+            matches!(result.effect, CommandEffect::DeleteCoordinator(4)),
+            "click_close_button must enqueue DeleteCoordinator(4)"
+        );
+    }
+
+    /// Per fix-tui-chat: 'M' (uppercase) on the Chat tab opens the chat
+    /// manager pane for bulk-cleanup of accumulated chat tasks. The pane
+    /// must enumerate every chat-loop task, support multi-select, and
+    /// invoke `delete_coordinator` per selected entry on abandon.
+    #[test]
+    fn chat_manager_opens_and_lists_all_chat_tasks() {
+        use crate::tui::viz_viewer::state::InputMode;
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4, 7]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::Graph;
+        app.input_mode = InputMode::Normal;
+
+        super::handle_key(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+
+        assert_eq!(app.input_mode, InputMode::ChatManager);
+        let mgr = app.chat_manager.as_ref().expect("manager must be open");
+        assert_eq!(mgr.entries.len(), 3, "manager must list all 3 chat tasks");
+        let cids: Vec<u32> = mgr.entries.iter().map(|e| e.cid).collect();
+        assert!(cids.contains(&0) && cids.contains(&4) && cids.contains(&7));
+    }
+
+    /// Multi-select then bulk-abandon enqueues a delete-coordinator IPC
+    /// per selected cid.
+    #[test]
+    fn chat_manager_bulk_abandon_enqueues_per_selected() {
+        use crate::tui::viz_viewer::state::{CommandEffect, InputMode};
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4, 7]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.input_mode = InputMode::Normal;
+
+        super::handle_key(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+        // Select all visible.
+        super::handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        // Verify all 3 entries got selected.
+        assert_eq!(
+            app.chat_manager
+                .as_ref()
+                .map(|m| m.multi_selected.len())
+                .unwrap_or(0),
+            3,
+            "select-all must mark every visible entry"
+        );
+        // Trigger bulk abandon.
+        super::handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        // Manager closes.
+        assert!(
+            app.chat_manager.is_none(),
+            "manager must close after abandon"
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+
+        // Expect 3 DeleteCoordinator IPC subprocess results in any order.
+        let mut received: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let r = app
+                .cmd_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("each abandon must enqueue a CommandResult");
+            if let CommandEffect::DeleteCoordinator(cid) = r.effect {
+                received.insert(cid);
+            }
+        }
+        assert!(received.contains(&0));
+        assert!(received.contains(&4));
+        assert!(received.contains(&7));
+    }
+
+    /// Filter cycling: `f` advances all → non-empty → empty → alive → all.
+    #[test]
+    fn chat_manager_filter_cycle() {
+        use crate::tui::viz_viewer::state::{ChatManagerFilter, InputMode};
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.input_mode = InputMode::Normal;
+        super::handle_key(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.chat_manager.as_ref().unwrap().filter,
+            ChatManagerFilter::All
+        );
+        super::handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(
+            app.chat_manager.as_ref().unwrap().filter,
+            ChatManagerFilter::NonEmpty
+        );
+        super::handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(
+            app.chat_manager.as_ref().unwrap().filter,
+            ChatManagerFilter::EmptyOnly
+        );
+        super::handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(
+            app.chat_manager.as_ref().unwrap().filter,
+            ChatManagerFilter::AliveOnly
+        );
+        super::handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(
+            app.chat_manager.as_ref().unwrap().filter,
+            ChatManagerFilter::All
+        );
+    }
+
+    /// Esc closes the chat manager without enqueuing any IPC.
+    #[test]
+    fn chat_manager_esc_closes_without_action() {
+        use crate::tui::viz_viewer::state::InputMode;
+        let (mut app, _tmp) = build_app_with_chats(&[0, 4]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.input_mode = InputMode::Normal;
+
+        super::handle_key(&mut app, KeyCode::Char('M'), KeyModifiers::SHIFT);
+        super::handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.chat_manager.is_none());
+        assert_eq!(app.input_mode, InputMode::Normal);
+        // No IPC enqueued.
+        assert!(
+            app.cmd_rx.try_recv().is_err(),
+            "Esc must NOT enqueue any IPC"
+        );
+    }
+
     /// Pressing `-` on the Chat tab closes the current tab without opening a
     /// dialog. No Archive/Stop/Abandon prompt — just removes from the view.
     #[test]
@@ -8896,6 +8679,191 @@ mod chat_tab_navigation_tests {
             app.focused_panel,
             FocusedPanel::RightPanel,
             "Ctrl+T from command mode must return focus to chat PTY"
+        );
+    }
+
+    /// Pins fix-mouse-wheel-2: in the chat tab, mouse-wheel
+    /// `ScrollUp`/`ScrollDown` MUST scroll the outer wg vt100 pane
+    /// (the scrollback the user is viewing in wg) — NEVER forward
+    /// translated arrow-key bytes to the inner PTY child's stdin.
+    ///
+    /// History:
+    /// * `fix-mouse-wheel` (8ddeb9e42) shipped a heuristic that, in
+    ///   vendor-PTY focus mode, translated wheel events into Up/Down
+    ///   arrow keys forwarded through the PTY master writer. The goal
+    ///   was to make wheel feel like touch scroll (which sends arrows).
+    /// * That heuristic was visible to the embedded vendor CLI: claude
+    ///   code emits `'Scroll wheel is sending arrow keys · use PgUp/PgDn
+    ///   to scroll in claude code'` whenever it sees the pattern. Codex
+    ///   shows similar oddness. Tmux + double-translation made it worse.
+    /// * `fix-mouse-wheel-2` (this test) reverts to: wheel always scrolls
+    ///   the outer scrollback. Keyboard-driven scroll is the Ctrl+] scroll
+    ///   mode added by `implement-tui-scroll`.
+    ///
+    /// Three assertions guard the contract (fix-mouse-wheel-2 +
+    /// fix-mouse-wheel-3):
+    /// 1. `is_scrolled_back()` is true after a wheel event — the outer
+    ///    pane's auto-follow flag flipped off.
+    /// 2. `scrollback()` advanced to a non-zero offset — the user-
+    ///    visible scroll position actually moved (fix-mouse-wheel-3:
+    ///    the original test only asserted (1), and (1) is true even
+    ///    when (2) didn't happen, so a regression where scroll
+    ///    silently no-ops would have slipped through).
+    /// 3. `child_input_bytes_written()` is unchanged — zero bytes were
+    ///    written to the child's stdin via the wheel path.
+    ///
+    /// This test uses a raw `/bin/sh` PTY child (primary screen, real
+    /// vt100 scrollback). The tmux-wrapped path — which is what real
+    /// chat tabs use post `implement-tmux-wrapped` — is covered by
+    /// `tmux_wrapped_scroll_up_advances_render_without_writing_to_child`
+    /// in `pty_pane.rs`.
+    #[test]
+    fn mouse_wheel_in_vendor_pty_mode_scrolls_outer_not_inner() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.mouse_enabled = true;
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &[
+                "-c",
+                "for i in $(seq 1 60); do echo line $i; done; sleep 60",
+            ],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            return;
+        };
+        // Wait for output to reach the parser so scrollback has rows.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if pane.bytes_processed() > 200 {
+                break;
+            }
+        }
+        let bytes_before = pane.child_input_bytes_written();
+        assert!(
+            !pane.is_scrolled_back(),
+            "pre-condition: pane should be at the live tail before the wheel event"
+        );
+        app.task_panes.insert(task_id.clone(), pane);
+
+        app.last_tab_bar_area = Rect {
+            x: 60,
+            y: 1,
+            width: 60,
+            height: 1,
+        };
+        app.last_right_content_area = Rect {
+            x: 60,
+            y: 2,
+            width: 60,
+            height: 24,
+        };
+
+        handle_mouse(&mut app, MouseEventKind::ScrollUp, 12, 80);
+
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert!(
+            pane_after.is_scrolled_back(),
+            "ScrollUp in vendor-PTY mode must scroll the OUTER vt100 pane \
+             (regression: fix-mouse-wheel-2)."
+        );
+        assert!(
+            pane_after.scrollback() > 0,
+            "ScrollUp must advance the user-visible scroll offset (got {}). \
+             Without this, scroll wheel silently no-ops on tmux-wrapped panes — \
+             the half-passing-test pattern fix-mouse-wheel-3 was created to \
+             catch.",
+            pane_after.scrollback()
+        );
+        assert_eq!(
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+            "ScrollUp must NOT write any bytes to the embedded child's stdin \
+             — claude code warns 'Scroll wheel is sending arrow keys' when it does \
+             (regression: fix-mouse-wheel-2)."
+        );
+    }
+
+    /// Counterpart to the vendor-PTY case: when chat is rendered in
+    /// observer mode (no stdin forwarding), the wheel must still produce
+    /// a useful scroll — namely, navigate the vt100 pane's scrollback
+    /// so the user can review rendered output. Same contract as the
+    /// vendor-PTY case post-fix-mouse-wheel-2: outer scrollback only,
+    /// zero bytes to child stdin.
+    #[test]
+    fn mouse_wheel_in_chat_observer_mode_scrolls_vt100_pane() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = false; // observer mode: no stdin forwarding
+        app.chat_pty_observer = true;
+        app.mouse_enabled = true;
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &[
+                "-c",
+                "for i in $(seq 1 60); do echo line $i; done; sleep 60",
+            ],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            return;
+        };
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if pane.bytes_processed() > 200 {
+                break;
+            }
+        }
+        let bytes_before = pane.child_input_bytes_written();
+        app.task_panes.insert(task_id.clone(), pane);
+
+        app.last_tab_bar_area = Rect {
+            x: 60,
+            y: 1,
+            width: 60,
+            height: 1,
+        };
+        app.last_right_content_area = Rect {
+            x: 60,
+            y: 2,
+            width: 60,
+            height: 24,
+        };
+
+        assert!(
+            !app.task_panes.get_mut(&task_id).unwrap().is_scrolled_back(),
+            "pre-condition: pane should be at the live tail"
+        );
+        handle_mouse(&mut app, MouseEventKind::ScrollUp, 12, 80);
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert!(
+            pane_after.is_scrolled_back(),
+            "ScrollUp in observer mode must scroll the vt100 pane back"
+        );
+        assert!(
+            pane_after.scrollback() > 0,
+            "ScrollUp must advance the user-visible scroll offset (got {})",
+            pane_after.scrollback()
+        );
+        assert_eq!(
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+            "ScrollUp in observer mode must not write to child stdin"
         );
     }
 
@@ -9085,6 +9053,625 @@ mod chat_tab_navigation_tests {
             "'n' in PTY mode must NOT open the launcher"
         );
     }
+
+    /// fix-new-chat-2 regression lock: while the new-chat launcher (or
+    /// any non-Normal `InputMode`) is open, ZERO keystrokes may reach
+    /// the underlying chat-pane PTY child's stdin. The pre-fix bug:
+    /// when the launcher was opened via the [+] button click,
+    /// `focused_panel` stayed `RightPanel` and `chat_pty_mode` stayed
+    /// true, so the `vendor_pty_active` branch in `handle_key` ran
+    /// BEFORE the `InputMode::Launcher` dispatch and forwarded every
+    /// typed character into the PTY child — visible in the user's
+    /// chat-tab conversation as a URL appearing where it had no
+    /// business being.
+    ///
+    /// Byte-level assertion (per task validation): the PtyPane's
+    /// `child_input_bytes_written()` counter must be unchanged after
+    /// sending a string of arbitrary keys.
+    #[test]
+    fn launcher_open_does_not_leak_keys_to_underlying_pty() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+
+        // Spawn a real PTY child (cat blocks on stdin so it stays alive)
+        // so we can read `child_input_bytes_written()` on it.
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "exec cat"],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            // CI without /bin/sh or no PTY support: skip silently — the
+            // unit-level guard (matches!(app.input_mode, InputMode::Normal)
+            // in vendor_pty_active) is also covered by the assertion in
+            // launcher_open_clears_pty_input_routing below.
+            return;
+        };
+        let bytes_before = pane.child_input_bytes_written();
+        app.task_panes.insert(task_id.clone(), pane);
+
+        // Open the launcher (modal). Mirrors the [+] click path: focus
+        // is NOT switched away from RightPanel.
+        app.open_launcher();
+        assert!(
+            matches!(app.input_mode, super::InputMode::Launcher),
+            "open_launcher must transition input_mode to Launcher"
+        );
+        // open_launcher rate-limits double-opens and bails (push_toast)
+        // when the chat cap is reached. If for any reason the launcher
+        // didn't initialize, the rest of the test is meaningless.
+        if app.launcher.is_none() {
+            return;
+        }
+
+        // Type a string of arbitrary keys — exactly the user's reported
+        // scenario: typing a custom URL into a section that has no input
+        // field.
+        let keys = "http://127.0.0.1:8088";
+        for c in keys.chars() {
+            super::handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        // Plus a few non-character keys that have no obvious binding in
+        // the dialog and historically would have leaked through.
+        super::handle_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Insert, KeyModifiers::NONE);
+
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert_eq!(
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+            "While Launcher modal is open, ZERO bytes may reach the \
+             chat-pane PTY child's stdin (fix-new-chat-2). Got {} bytes \
+             written; expected unchanged from {}.",
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+        );
+    }
+
+    /// Companion to `launcher_open_does_not_leak_keys_to_underlying_pty`
+    /// that does NOT require a real PTY child — exercises the
+    /// `vendor_pty_active` guard purely at the input-mode level. This
+    /// test is the canary that catches the regression even on CI hosts
+    /// where PtyPane::spawn_in fails (no /bin/sh, no PTY).
+    ///
+    /// The contract: with chat_pty_mode + forwards_stdin + RightPanel
+    /// focus all true, opening the launcher must change input_mode to
+    /// `Launcher`, and a subsequent `handle_key` must NOT reach the
+    /// vendor_pty_active branch — it must reach the launcher handler,
+    /// which mutates launcher state instead.
+    #[test]
+    fn launcher_open_clears_pty_input_routing() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        // Skip if launcher couldn't open (e.g. coordinator cap).
+        app.open_launcher();
+        if app.launcher.is_none() {
+            return;
+        }
+        // Move to the Name section so typed characters land in
+        // `launcher.name` — a field whose content we can inspect.
+        app.launcher.as_mut().unwrap().active_section = super::super::state::LauncherSection::Name;
+
+        super::handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("launcher should still be open after typing");
+        assert_eq!(
+            launcher.name, "xyz",
+            "Keys must reach the launcher's Name field even when \
+             chat_pty_mode + forwards_stdin + RightPanel focus would \
+             otherwise route to the PTY (fix-new-chat-2)."
+        );
+    }
+
+    /// fix-paste-events regression lock (PTY-required variant): while
+    /// the new-chat launcher (or any non-Normal `InputMode`) is open,
+    /// ZERO bytes of a bracketed-paste event may reach the underlying
+    /// chat-pane PTY child's stdin. fix-new-chat-2 closed the keystroke
+    /// path but missed `Event::Paste`, which crossterm delivers as a
+    /// single `Event::Paste(String)` rather than a sequence of `Key`s
+    /// — the user's reported repro 2026-04-30 was Cmd-V'ing a URL into
+    /// the new-chat dialog and watching the URL appear in the
+    /// background chat tab.
+    ///
+    /// Byte-level assertion: PtyPane's `child_input_bytes_written()`
+    /// counter must be unchanged after `dispatch_event(Event::Paste)`.
+    #[test]
+    fn launcher_open_does_not_leak_paste_to_underlying_pty() {
+        use crossterm::event::Event;
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "exec cat"],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            // CI without /bin/sh or no PTY support: skip silently —
+            // `launcher_open_clears_paste_routing_to_launcher_field`
+            // covers the routing contract without a real PTY child.
+            return;
+        };
+        let bytes_before = pane.child_input_bytes_written();
+        app.task_panes.insert(task_id.clone(), pane);
+
+        // Open the launcher (mirrors the [+] click path: focus stays
+        // on RightPanel, chat_pty_mode stays true).
+        app.open_launcher();
+        assert!(
+            matches!(app.input_mode, super::InputMode::Launcher),
+            "open_launcher must transition input_mode to Launcher"
+        );
+        if app.launcher.is_none() {
+            return;
+        }
+
+        // The exact user-reported payload — a tailscale URL pasted into
+        // the new-chat dialog while the dialog was open.
+        let pasted = "https://lambda01.tail334fe6.ts.net:30000".to_string();
+        super::dispatch_event(&mut app, Event::Paste(pasted));
+
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert_eq!(
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+            "While Launcher modal is open, ZERO bytes of a paste event \
+             may reach the chat-pane PTY child's stdin (fix-paste-events). \
+             Got {} bytes written; expected unchanged from {}.",
+            pane_after.child_input_bytes_written(),
+            bytes_before,
+        );
+    }
+
+    /// Companion to `launcher_open_does_not_leak_paste_to_underlying_pty`
+    /// that does NOT require a real PTY child — exercises both halves of
+    /// the fix in isolation: (a) the paste does not enter the
+    /// vendor_pty_active branch, and (b) the paste reaches the focused
+    /// launcher section's text field.
+    ///
+    /// Specifically, with the launcher's active_section set to Name,
+    /// `dispatch_event(Event::Paste)` must mutate `launcher.name` —
+    /// matching the validation contract "URL appears in the dialog field
+    /// (not the background chat)".
+    #[test]
+    fn launcher_open_clears_paste_routing_to_launcher_field() {
+        use crossterm::event::Event;
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+
+        app.open_launcher();
+        if app.launcher.is_none() {
+            return;
+        }
+        // Move to Name so the paste lands somewhere we can inspect.
+        app.launcher.as_mut().unwrap().active_section = super::super::state::LauncherSection::Name;
+
+        super::dispatch_event(&mut app, Event::Paste("my-chat".to_string()));
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("launcher should still be open after paste");
+        assert_eq!(
+            launcher.name, "my-chat",
+            "Paste must reach the launcher's Name field even when \
+             chat_pty_mode + forwards_stdin + RightPanel focus would \
+             otherwise route to the PTY (fix-paste-events)."
+        );
+    }
+
+    /// fix-paste-events: the user's exact repro flow — paste a custom
+    /// URL into the Add-new Endpoint field. This pins the "URL appears
+    /// in the dialog field" half of the validation: the launcher's
+    /// `add_endpoint` field must hold the pasted URL after
+    /// `dispatch_event(Event::Paste)`.
+    #[test]
+    fn launcher_paste_reaches_custom_endpoint_text() {
+        use crossterm::event::Event;
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+
+        app.open_launcher();
+        if app.launcher.is_none() {
+            return;
+        }
+        // Switch into Add-new mode + nex executor + Endpoint field —
+        // the state the user is in when they Cmd-V a URL into the
+        // redesigned dialog (post-2026-04-30).
+        {
+            let launcher = app.launcher.as_mut().unwrap();
+            launcher.enter_add_new();
+            launcher.add_executor_idx = 2; // nex
+            launcher.active_section = super::super::state::LauncherSection::AddNew(
+                super::super::state::AddNewField::Endpoint,
+            );
+        }
+
+        let url = "https://lambda01.tail334fe6.ts.net:30000";
+        super::dispatch_event(&mut app, Event::Paste(url.to_string()));
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("launcher should still be open after paste");
+        assert_eq!(
+            launcher.add_endpoint, url,
+            "Paste while in Add-new Endpoint field must populate \
+             add_endpoint (fix-paste-events)."
+        );
+    }
+
+    #[test]
+    fn launcher_paste_filters_rendered_cursor_glyph_from_endpoint() {
+        use crossterm::event::Event;
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+
+        app.open_launcher();
+        if app.launcher.is_none() {
+            return;
+        }
+        {
+            let launcher = app.launcher.as_mut().unwrap();
+            launcher.enter_add_new();
+            launcher.active_section = super::super::state::LauncherSection::AddNew(
+                super::super::state::AddNewField::Endpoint,
+            );
+        }
+
+        let url = "https://lambda01.tail334fe6.ts.net:30000";
+        super::dispatch_event(&mut app, Event::Paste(format!("{url}\u{2588}")));
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("launcher should still be open after paste");
+        assert_eq!(
+            launcher.add_endpoint, url,
+            "Launcher paste must reject the rendered cursor block before it \
+             can corrupt add_endpoint."
+        );
+    }
+
+    #[test]
+    fn launcher_char_input_filters_block_elements_from_add_new_fields() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+
+        app.open_launcher();
+        if app.launcher.is_none() {
+            return;
+        }
+        {
+            let launcher = app.launcher.as_mut().unwrap();
+            launcher.enter_add_new();
+            launcher.active_section = super::super::state::LauncherSection::AddNew(
+                super::super::state::AddNewField::Endpoint,
+            );
+        }
+
+        for c in "https://example.com:30000\u{2588}".chars() {
+            super::handle_key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+
+        {
+            let launcher = app.launcher.as_mut().unwrap();
+            assert_eq!(launcher.add_endpoint, "https://example.com:30000");
+            launcher.active_section = super::super::state::LauncherSection::AddNew(
+                super::super::state::AddNewField::Model,
+            );
+        }
+        super::handle_key(&mut app, KeyCode::Char('\u{2596}'), KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        {
+            let launcher = app.launcher.as_mut().unwrap();
+            assert_eq!(launcher.add_model, "m");
+            launcher.active_section = super::super::state::LauncherSection::AddNew(
+                super::super::state::AddNewField::Name,
+            );
+        }
+        super::handle_key(&mut app, KeyCode::Char('\u{259f}'), KeyModifiers::NONE);
+        super::handle_key(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+
+        let launcher = app
+            .launcher
+            .as_ref()
+            .expect("launcher should still be open after typing");
+        assert_eq!(launcher.name, "n");
+    }
+
+    /// Negative control for `fix-paste-events`: when input_mode IS
+    /// Normal and the chat PTY is the active surface, the paste path
+    /// must STILL forward to the PTY child. Without this assertion, an
+    /// over-eager guard could silently break Cmd-V into the chat tab
+    /// itself — a regression in the OPPOSITE direction.
+    #[test]
+    fn paste_in_normal_mode_still_reaches_chat_pty() {
+        use crossterm::event::Event;
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "exec cat"],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            return;
+        };
+        let bytes_before = pane.child_input_bytes_written();
+        app.task_panes.insert(task_id.clone(), pane);
+
+        let payload = "hello pty";
+        super::dispatch_event(&mut app, Event::Paste(payload.to_string()));
+
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert_eq!(
+            pane_after.child_input_bytes_written(),
+            bytes_before + payload.len() as u64,
+            "In Normal mode with chat PTY active, paste must forward \
+             every byte to the child's stdin (fix-paste-events guard \
+             must not over-block)."
+        );
+    }
+
+    #[test]
+    fn enter_in_chat_pty_mode_bumps_chat_last_interaction_at() {
+        let (mut app, _tmp) = build_app_with_chats(&[1]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+
+        let graph_path = app.workgraph_dir.join("graph.jsonl");
+        workgraph::parser::modify_graph(&graph_path, |graph| {
+            let task = graph.get_task_mut(".coordinator-1").unwrap();
+            task.last_interaction_at = Some("2026-04-30T00:00:00+00:00".to_string());
+            true
+        })
+        .unwrap();
+        let before = load_graph(&graph_path)
+            .unwrap()
+            .get_task(".coordinator-1")
+            .unwrap()
+            .last_interaction_at
+            .clone();
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "exec cat"],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            return;
+        };
+        app.task_panes.insert(task_id, pane);
+
+        handle_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        // The bump runs on the async-fs worker thread (so it can't block
+        // keystroke echo on a slow filesystem). Poll briefly until the
+        // worker has applied the write — fail the assertion if it never
+        // does within a reasonable window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut after = before.clone();
+        while std::time::Instant::now() < deadline {
+            after = load_graph(&graph_path)
+                .unwrap()
+                .get_task(".coordinator-1")
+                .unwrap()
+                .last_interaction_at
+                .clone();
+            if after != before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_ne!(
+            after, before,
+            "TUI chat PTY Enter must bump last_interaction_at for the active chat task"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // fix-chat-died: when the embedded chat agent's PTY child has exited,
+    // `chat_pty_mode` stays true (so the render path knows to show the death
+    // panel instead of falling back to the file-tailing renderer) but the
+    // pane is removed from `task_panes`. Without the death-panel guard in
+    // `vendor_pty_active`, R/E/X keystrokes were "forwarded" to the missing
+    // pane and silently dropped — leaving the user staring at the panel
+    // with no way to act on it.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn make_death_info() -> super::super::state::ChatAgentDeathInfo {
+        super::super::state::ChatAgentDeathInfo {
+            exit_status: "exit code 1".to_string(),
+            executor: "codex".to_string(),
+            spawn_cmd: "codex --resume chat-0".to_string(),
+        }
+    }
+
+    /// Simulate the user-reported scenario: codex died, panel is showing,
+    /// chat_pty_mode is still true with PTY focus. Pressing R must clear
+    /// the death info (so the render path will respawn) — not be silently
+    /// swallowed by the vendor-PTY forwarder.
+    #[test]
+    fn r_key_clears_death_info_when_chat_pty_focused() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        // Simulate post-death state: PTY mode flags still set, pane removed,
+        // death info populated.
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+        app.chat_agent_death.insert(0, make_death_info());
+
+        super::handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "R must clear death info so the render path can respawn the PTY \
+             (vendor_pty_active forwarder was swallowing R)"
+        );
+    }
+
+    /// X dismisses the panel and exits PTY mode — must reach the death-panel
+    /// recovery handler even with full PTY focus state.
+    #[test]
+    fn x_key_dismisses_death_panel_when_chat_pty_focused() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+        app.chat_agent_death.insert(0, make_death_info());
+
+        super::handle_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "X must clear death info"
+        );
+        assert!(
+            !app.chat_pty_mode,
+            "X must turn off chat_pty_mode so the file-tailing fallback renders"
+        );
+    }
+
+    /// E opens the launcher dialog — must reach the death-panel recovery
+    /// handler even with full PTY focus state.
+    #[test]
+    fn e_key_opens_launcher_when_chat_pty_focused() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+        app.chat_agent_death.insert(0, make_death_info());
+
+        super::handle_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "E must clear death info"
+        );
+        assert!(
+            matches!(app.input_mode, super::InputMode::Launcher),
+            "E must open the launcher (got {:?})",
+            app.input_mode
+        );
+    }
+
+    /// Shift+R (uppercase 'R' with SHIFT modifier — the form most terminal
+    /// emulators emit when the user reads "Press R" and types capital R)
+    /// must also reach the death-panel handler. The original handler used
+    /// `modifiers.is_empty()` which rejected SHIFT.
+    #[test]
+    fn shift_r_clears_death_info_when_chat_pty_focused() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+        app.chat_agent_death.insert(0, make_death_info());
+
+        super::handle_key(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT);
+
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "Shift+R (uppercase R) must clear death info"
+        );
+    }
+
+    /// Negative control: when there is NO death panel showing, vendor-PTY
+    /// forwarding must still work normally — the death-panel guard must
+    /// not over-block. This pins us against an opposite-direction
+    /// regression where the guard accidentally disables PTY forwarding.
+    #[test]
+    fn key_still_reaches_pty_when_no_death_info() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+        app.chat_pty_observer = false;
+        app.input_mode = super::InputMode::Normal;
+        // No death info — normal PTY operation.
+
+        let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
+        let Ok(pane) = crate::tui::pty_pane::PtyPane::spawn_in(
+            "/bin/sh",
+            &["-c", "exec cat"],
+            &[],
+            None,
+            24,
+            80,
+        ) else {
+            return;
+        };
+        let bytes_before = pane.child_input_bytes_written();
+        app.task_panes.insert(task_id.clone(), pane);
+
+        super::handle_key(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+
+        let pane_after = app.task_panes.get(&task_id).unwrap();
+        assert!(
+            pane_after.child_input_bytes_written() > bytes_before,
+            "Without death info, 'r' must reach the PTY child's stdin \
+             (death-panel guard must not over-block)"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -9112,7 +9699,7 @@ mod chat_open_tests {
         graph.add_node(Node::Task(regular));
 
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&graph, &graph_path).unwrap();

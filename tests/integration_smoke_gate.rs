@@ -41,6 +41,15 @@ fn wg_cmd_with_env(wg_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::p
     cmd.env_remove("WG_AGENT_ID");
     cmd.env_remove("WG_SMOKE_AGENT_OVERRIDE");
     cmd.env_remove("WG_SMOKE_MANIFEST");
+    // Also strip any inherited worktree context — when this suite runs from
+    // inside an agent's worktree, WG_WORKTREE_PATH/BRANCH/PROJECT_ROOT point
+    // at the *agent's* worktree, and `wg done`'s worktree-merge codepath
+    // would look at that worktree's git status (not the temp-dir fixture).
+    cmd.env_remove("WG_WORKTREE_PATH");
+    cmd.env_remove("WG_BRANCH");
+    cmd.env_remove("WG_PROJECT_ROOT");
+    cmd.env_remove("WG_WORKTREE_ACTIVE");
+    cmd.env_remove("WG_TASK_ID");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -85,7 +94,7 @@ fn make_skip_script(dir: &Path, name: &str, reason: &str) -> PathBuf {
 }
 
 fn init_with_task(tmp: &Path, task_id: &str) -> PathBuf {
-    let wg_dir = tmp.join(".workgraph");
+    let wg_dir = tmp.join(".wg");
     let init = wg_cmd_with_env(&wg_dir, &["init", "--executor", "shell"], &[]);
     assert!(
         init.status.success(),

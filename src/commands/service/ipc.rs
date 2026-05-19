@@ -83,8 +83,12 @@ pub enum IpcRequest {
         poll_interval: Option<u64>,
         #[serde(default)]
         model: Option<String>,
+        /// Active profile name — for audit logging only.
+        /// The actual config is applied by re-reading from disk (when other fields are None).
+        #[serde(default)]
+        profile: Option<String>,
     },
-    /// Create a task in this workgraph (cross-repo dispatch)
+    /// Create a task in this WG project (cross-repo dispatch)
     AddTask {
         title: String,
         #[serde(default)]
@@ -150,6 +154,14 @@ pub enum IpcRequest {
         /// Per-chat executor override (e.g., "native").
         #[serde(default)]
         executor: Option<String>,
+        /// Per-chat LLM endpoint URL (e.g., "https://lambda01.example/30000").
+        /// Mirrors the CLI's `wg nex -e <URL>` form so the TUI launcher can
+        /// pin a single chat to a specific server without touching global config.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Arbitrary command line for a generic persistent chat pane.
+        #[serde(default)]
+        command: Option<String>,
     },
     /// Hot-swap a chat agent's executor and/or model. Persists
     /// the override in CoordinatorState, SIGTERMs the current
@@ -203,7 +215,25 @@ pub enum IpcRequest {
     /// the user can later restart fresh via `wg chat new` or restore from
     /// history. The graph is left intact — only the supervisor lifecycle and
     /// `chat-loop` tags are removed.
-    PurgeChats,
+    ///
+    /// By default, chats considered "active" (recent consumer cursor activity
+    /// or pending inbox traffic, plus the optional `caller_chat_id` self-protect
+    /// hint passed by the CLI) are SKIPPED — the user's currently-attached chat
+    /// must not get nuked silently. `include_active=true` overrides and archives
+    /// every chat-loop task regardless of activity (the pre-2026-04 behavior).
+    PurgeChats {
+        /// When true, archive every chat-loop task even if it looks active.
+        /// Default false: protect the user's currently-attached chat.
+        #[serde(default)]
+        include_active: bool,
+        /// Chat ID the calling `wg` invocation thinks it is running inside
+        /// (derived from `WG_CHAT_REF` / `WG_CHAT_ID` env on the CLI side).
+        /// Always treated as active when `include_active` is false. Optional —
+        /// the daemon also infers active status from on-disk state, so a
+        /// missing hint just means no env-based self-protection.
+        #[serde(default)]
+        caller_chat_id: Option<u32>,
+    },
 }
 
 /// IPC Response types
@@ -444,10 +474,11 @@ fn handle_request(
             executor,
             poll_interval,
             model,
+            profile,
         } => {
             logger.info(&format!(
-                "IPC Reconfigure: max_agents={:?}, executor={:?}, poll_interval={:?}, model={:?}",
-                max_agents, executor, poll_interval, model
+                "IPC Reconfigure: max_agents={:?}, executor={:?}, poll_interval={:?}, model={:?}, profile={:?}",
+                max_agents, executor, poll_interval, model, profile
             ));
             handle_reconfigure(
                 dir,
@@ -546,12 +577,33 @@ fn handle_request(
             name,
             model,
             executor,
+            endpoint,
+            command,
         } => {
             logger.info(&format!(
-                "IPC CreateChat: name={:?}, model={:?}, executor={:?}",
-                name, model, executor
+                "IPC CreateChat: name={:?}, model={:?}, executor={:?}, endpoint={:?}, command={:?}",
+                name, model, executor, endpoint, command
             ));
-            handle_create_coordinator(dir, name.as_deref(), model.as_deref(), executor.as_deref())
+            let (resp, new_chat_id) = handle_create_coordinator(
+                dir,
+                name.as_deref(),
+                model.as_deref(),
+                executor.as_deref(),
+                endpoint.as_deref(),
+                command.as_deref(),
+            );
+            // Fix B (fix-nex-chat): eagerly enqueue the new chat for
+            // supervisor spawn AND signal urgent_wake so the daemon's main
+            // loop fires the lazy-spawn block within ~100ms instead of
+            // waiting for the user's first UserChat IPC. Without this,
+            // newly-created chats sit with no supervisor process between
+            // creation and first message; if the user opens a TUI tab in
+            // that window, the chat appears to die silently.
+            if let Some(cid) = new_chat_id {
+                pending_coordinator_ids.push(cid);
+                *urgent_wake = true;
+            }
+            resp
         }
         IpcRequest::SetChatExecutor {
             chat_id,
@@ -603,9 +655,15 @@ fn handle_request(
             logger.info("IPC ListChats");
             handle_list_coordinators(dir)
         }
-        IpcRequest::PurgeChats => {
-            logger.info("IPC PurgeChats");
-            let resp = handle_purge_chats(dir);
+        IpcRequest::PurgeChats {
+            include_active,
+            caller_chat_id,
+        } => {
+            logger.info(&format!(
+                "IPC PurgeChats include_active={} caller_chat_id={:?}",
+                include_active, caller_chat_id
+            ));
+            let resp = handle_purge_chats(dir, include_active, caller_chat_id);
             // Every successfully-purged chat needs its supervisor agent
             // shut down — same as a single ArchiveChat. The IPC dispatch
             // loop drains delete_coordinator_ids after we return.
@@ -1101,7 +1159,7 @@ fn handle_reconfigure(
     }))
 }
 
-/// Handle AddTask IPC request — create a task in this workgraph from a remote peer.
+/// Handle AddTask IPC request — create a task in this WG project from a remote peer.
 #[allow(clippy::too_many_arguments)]
 fn handle_add_task(
     dir: &Path,
@@ -1216,13 +1274,18 @@ fn handle_add_task(
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         started_at: None,
         completed_at: None,
+        last_interaction_at: None,
         log: vec![],
         retry_count: 0,
         max_retries: None,
         failure_reason: None,
+        failure_class: None,
         model: model.map(String::from),
         provider: None,
         endpoint: None,
+        command_argv: vec![],
+        working_dir: None,
+        executor_preset_name: None,
         verify: verify.map(String::from),
         verify_timeout: verify_timeout.map(String::from),
         agent: None,
@@ -1252,6 +1315,8 @@ fn handle_add_task(
         exec_mode: None,
         verify_failures: 0,
         rescue_count: 0,
+        rescued: false,
+        meta_eval_attempts: 0,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -1360,6 +1425,7 @@ fn handle_query_task(dir: &Path, task_id: &str) -> IpcResponse {
             "started_at": task.started_at,
             "completed_at": task.completed_at,
             "failure_reason": task.failure_reason,
+            "failure_class": task.failure_class.map(|c| c.to_string()),
         })),
         None => IpcResponse::error(&format!("Task '{}' not found", task_id)),
     }
@@ -1452,23 +1518,22 @@ pub fn create_chat_in_graph(
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
+    endpoint: Option<&str>,
+    command: Option<&str>,
 ) -> Result<u32> {
+    if command.is_some() && (model.is_some() || executor.is_some() || endpoint.is_some()) {
+        anyhow::bail!(
+            "--command cannot be combined with --exec/--executor, --model, or --endpoint"
+        );
+    }
     let graph_path = crate::commands::graph_path(dir);
     let mut graph =
         workgraph::parser::load_graph(&graph_path).with_context(|| "Failed to load graph")?;
 
     let config = workgraph::config::Config::load_or_default(dir);
     let max = config.coordinator.max_coordinators;
-    let alive = graph
-        .tasks()
-        .filter(|t| {
-            t.tags
-                .iter()
-                .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
-        })
-        .filter(|t| !matches!(t.status, workgraph::graph::Status::Abandoned))
-        .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
-        .count();
+    let alive =
+        workgraph::chat::count_live_chats(dir, &graph, workgraph::chat::CHAT_CAP_IDLE_THRESHOLD);
     if alive >= max {
         anyhow::bail!("Chat cap reached ({}/{})", alive, max);
     }
@@ -1479,6 +1544,22 @@ pub fn create_chat_in_graph(
     let title = name
         .map(|n| format!("Chat: {}", n))
         .unwrap_or_else(|| format!("Chat {}", next_id));
+
+    let project_root = workgraph::chat_command::project_root_for_workgraph_dir(dir);
+    let (command_argv, working_dir, executor_preset_name) = if let Some(command) = command {
+        (
+            workgraph::chat_command::argv_for_command_line(command),
+            Some(project_root.display().to_string()),
+            None,
+        )
+    } else {
+        let preset = workgraph::chat_command::preset_name_for_executor(executor, model);
+        (
+            workgraph::chat_command::argv_for_preset(&preset, model, endpoint, "wg"),
+            Some(project_root.display().to_string()),
+            Some(preset),
+        )
+    };
 
     let task = workgraph::graph::Task {
         id: workgraph::chat_id::format_chat_task_id(next_id),
@@ -1495,6 +1576,15 @@ pub fn create_chat_in_graph(
             restart_on_failure: true,
             max_failure_restarts: None,
         }),
+        // Per-task overrides — `plan_spawn` reads these directly off the
+        // chat task on every supervisor iteration. Setting them here means
+        // the supervisor honors the user's launcher choices on first spawn
+        // AND on respawn after handler crash.
+        model: model.map(String::from),
+        endpoint: endpoint.map(String::from),
+        command_argv,
+        working_dir,
+        executor_preset_name,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         started_at: Some(chrono::Utc::now().to_rfc3339()),
         log: vec![workgraph::graph::LogEntry {
@@ -1527,19 +1617,20 @@ pub fn create_chat_in_graph(
     })
     .with_context(|| "Failed to save graph")?;
 
-    // Record executor/model combo in launcher history
+    // Record executor/model/endpoint combo in launcher history
     {
         let exec = executor.unwrap_or("claude");
         let _ = workgraph::launcher_history::record_use(
-            &workgraph::launcher_history::HistoryEntry::new(exec, model, None, "tui"),
+            &workgraph::launcher_history::HistoryEntry::new(exec, model, endpoint, "tui"),
         );
     }
 
-    // Write per-coordinator state file with model/executor overrides if specified.
-    if model.is_some() || executor.is_some() {
+    // Write per-coordinator state file with model/executor/endpoint overrides if specified.
+    if model.is_some() || executor.is_some() || endpoint.is_some() {
         let mut state = super::CoordinatorState::load_or_default_for(dir, next_id);
         state.model_override = model.map(String::from);
         state.executor_override = executor.map(String::from);
+        state.endpoint_override = endpoint.map(String::from);
         state.save_for(dir, next_id);
     }
 
@@ -1547,31 +1638,74 @@ pub fn create_chat_in_graph(
 }
 
 /// Handle CreateCoordinator IPC request — wraps `create_chat_in_graph`.
+/// Returns `(IpcResponse, Option<u32>)` where the second element is the
+/// newly-created chat_id on success, so the caller can plumb it into
+/// `pending_coordinator_ids` for eager supervisor spawn (Fix B —
+/// `fix-nex-chat`). Without this, the supervisor for a new chat does not
+/// spawn until the user sends the first `UserChat` IPC, leaving a
+/// user-visible gap between create and first message during which no
+/// process exists.
 fn handle_create_coordinator(
     dir: &Path,
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
-) -> IpcResponse {
-    match create_chat_in_graph(dir, name, model, executor) {
-        Ok(next_id) => IpcResponse::success(serde_json::json!({
-            "coordinator_id": next_id,
-            "chat_id": next_id,
-            "task_id": workgraph::chat_id::format_chat_task_id(next_id),
-            "name": name,
-        })),
-        Err(e) => IpcResponse::error(&e.to_string()),
+    endpoint: Option<&str>,
+    command: Option<&str>,
+) -> (IpcResponse, Option<u32>) {
+    match create_chat_in_graph(dir, name, model, executor, endpoint, command) {
+        Ok(next_id) => (
+            IpcResponse::success(serde_json::json!({
+                "coordinator_id": next_id,
+                "chat_id": next_id,
+                "task_id": workgraph::chat_id::format_chat_task_id(next_id),
+                "name": name,
+            })),
+            Some(next_id),
+        ),
+        Err(e) => (IpcResponse::error(&e.to_string()), None),
     }
 }
 
 /// Handle DeleteCoordinator IPC request.
+///
+/// Per fix-tui-chat validation: `the abandon path kills the agent cleanly
+/// first`. Mirrors `handle_stop_coordinator`'s kill-agent block so a chat
+/// with a live worker is not silently orphaned when the user clicks ✕.
 fn handle_delete_coordinator(dir: &Path, coordinator_id: u32) -> IpcResponse {
     let graph_path = crate::commands::graph_path(dir);
     let task_id = workgraph::chat_id::format_chat_task_id(coordinator_id);
     let legacy_task_id = format!(".coordinator-{}", coordinator_id);
+
+    let resolved_task_id = if let Ok(graph) = workgraph::parser::load_graph(&graph_path) {
+        if graph.get_task(&task_id).is_some() {
+            task_id.clone()
+        } else if graph.get_task(&legacy_task_id).is_some() {
+            legacy_task_id.clone()
+        } else if coordinator_id == 0 && graph.get_task(".coordinator").is_some() {
+            ".coordinator".to_string()
+        } else {
+            task_id.clone()
+        }
+    } else {
+        task_id.clone()
+    };
+
+    if let Ok(graph) = workgraph::parser::load_graph(&graph_path)
+        && let Some(task) = graph.get_task(&resolved_task_id)
+        && task.agent.is_some()
+        && let Ok(registry) = AgentRegistry::load(dir)
+    {
+        for agent in registry.list_agents() {
+            if agent.task_id == resolved_task_id {
+                let _ = crate::commands::kill::run(dir, &agent.id, false, true, true);
+                break;
+            }
+        }
+    }
+
     let mut result_msg: Option<String> = None;
     match workgraph::parser::modify_graph(&graph_path, |graph| {
-        // Try .chat-N (new), then .coordinator-N (legacy), then .coordinator (very-legacy ID 0)
         let resolved_id = if graph.get_task(&task_id).is_some() {
             task_id.as_str()
         } else if graph.get_task(&legacy_task_id).is_some() {
@@ -1612,8 +1746,20 @@ fn handle_delete_coordinator(dir: &Path, coordinator_id: u32) -> IpcResponse {
 /// Bulk-archive every chat-loop task in the graph.
 ///
 /// Idempotent: tasks already tagged `archived` are skipped, not errored.
-/// Returns `{purged: [{chat_id, task_id}], skipped: [{chat_id, reason}]}`.
-fn handle_purge_chats(dir: &Path) -> IpcResponse {
+///
+/// Active chats — those with recent consumer cursor activity, pending inbox
+/// traffic, or matching the caller's own `WG_CHAT_REF` hint — are skipped
+/// when `include_active == false`. Pass `include_active = true` to nuke
+/// everything regardless of activity.
+///
+/// Returns `{purged: [{chat_id, task_id}], skipped: [{chat_id, reason}]}`
+/// where `reason` is one of `"already archived"`, `"active"`, or
+/// `"caller chat"` (the env-hint match).
+fn handle_purge_chats(
+    dir: &Path,
+    include_active: bool,
+    caller_chat_id: Option<u32>,
+) -> IpcResponse {
     let graph_path = crate::commands::graph_path(dir);
     let graph = match workgraph::parser::load_graph(&graph_path) {
         Ok(g) => g,
@@ -1642,9 +1788,26 @@ fn handle_purge_chats(dir: &Path) -> IpcResponse {
         }
     }
 
+    // Decide which chats are "active" (skipped unless --include-active).
+    let mut active_skips: Vec<(u32, &'static str)> = Vec::new();
+    let mut to_purge: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for id in &chat_ids {
+        if !include_active {
+            if Some(*id) == caller_chat_id {
+                active_skips.push((*id, "caller chat"));
+                continue;
+            }
+            if super::is_chat_active_on_disk(dir, *id) {
+                active_skips.push((*id, "active"));
+                continue;
+            }
+        }
+        to_purge.insert(*id);
+    }
+
     let mut purged = Vec::new();
     let mut errors = Vec::new();
-    for id in &chat_ids {
+    for id in &to_purge {
         let r = handle_archive_coordinator(dir, *id);
         if r.ok {
             let task_id = workgraph::chat_id::format_chat_task_id(*id);
@@ -1660,7 +1823,7 @@ fn handle_purge_chats(dir: &Path) -> IpcResponse {
         }
     }
 
-    let skipped: Vec<serde_json::Value> = already_archived
+    let mut skipped: Vec<serde_json::Value> = already_archived
         .iter()
         .map(|id| {
             serde_json::json!({
@@ -1669,6 +1832,13 @@ fn handle_purge_chats(dir: &Path) -> IpcResponse {
             })
         })
         .collect();
+    for (id, reason) in &active_skips {
+        skipped.push(serde_json::json!({
+            "chat_id": *id,
+            "task_id": workgraph::chat_id::format_chat_task_id(*id),
+            "reason": *reason,
+        }));
+    }
 
     IpcResponse::success(serde_json::json!({
         "purged": purged,
@@ -1996,6 +2166,7 @@ mod tests {
             executor: Some("opencode".to_string()),
             poll_interval: Some(120),
             model: Some("sonnet".to_string()),
+            profile: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"reconfigure\""));
@@ -2011,6 +2182,7 @@ mod tests {
                 executor,
                 poll_interval,
                 model,
+                profile: _,
             } => {
                 assert_eq!(max_agents, Some(8));
                 assert_eq!(executor, Some("opencode".to_string()));
@@ -2029,6 +2201,7 @@ mod tests {
             executor: None,
             poll_interval: None,
             model: None,
+            profile: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"reconfigure\""));
@@ -2040,6 +2213,7 @@ mod tests {
                 executor,
                 poll_interval,
                 model,
+                profile: _,
             } => {
                 assert!(max_agents.is_none());
                 assert!(executor.is_none());
@@ -2220,6 +2394,8 @@ poll_interval = 120
             name: Some("Feature Work".to_string()),
             model: None,
             executor: None,
+            endpoint: None,
+            command: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         // New canonical command name
@@ -2231,10 +2407,14 @@ poll_interval = 120
                 name,
                 model,
                 executor,
+                endpoint,
+                command,
             } => {
                 assert_eq!(name, Some("Feature Work".to_string()));
                 assert_eq!(model, None);
                 assert_eq!(executor, None);
+                assert_eq!(endpoint, None);
+                assert_eq!(command, None);
             }
             _ => panic!("Wrong request type"),
         }
@@ -2244,6 +2424,8 @@ poll_interval = 120
             name: Some("Local Model".to_string()),
             model: Some("openai:qwen3-coder-30b".to_string()),
             executor: Some("native".to_string()),
+            endpoint: None,
+            command: None,
         };
         let json2 = serde_json::to_string(&req2).unwrap();
         let parsed2: IpcRequest = serde_json::from_str(&json2).unwrap();
@@ -2252,12 +2434,68 @@ poll_interval = 120
                 name,
                 model,
                 executor,
+                endpoint,
+                command,
             } => {
                 assert_eq!(name, Some("Local Model".to_string()));
                 assert_eq!(model, Some("openai:qwen3-coder-30b".to_string()));
                 assert_eq!(executor, Some("native".to_string()));
+                assert_eq!(endpoint, None);
+                assert_eq!(command, None);
+                assert_eq!(endpoint, None);
             }
             _ => panic!("Wrong request type"),
+        }
+    }
+
+    /// Endpoint must round-trip through IPC serialization. This is the
+    /// over-the-wire shape that lets the TUI launcher's
+    /// `wg nex -m qwen3-coder -e https://...` form reach the daemon.
+    #[test]
+    fn test_ipc_create_chat_endpoint_round_trips() {
+        let req = IpcRequest::CreateChat {
+            name: Some("Lambda Box".to_string()),
+            model: Some("qwen3-coder".to_string()),
+            executor: Some("native".to_string()),
+            endpoint: Some("https://lambda01.tail334fe6.ts.net:30000".to_string()),
+            command: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"endpoint\":\"https://lambda01.tail334fe6.ts.net:30000\""),
+            "endpoint must be present in the on-the-wire JSON. Got: {}",
+            json
+        );
+
+        let parsed: IpcRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcRequest::CreateChat {
+                endpoint, command, ..
+            } => {
+                assert_eq!(
+                    endpoint,
+                    Some("https://lambda01.tail334fe6.ts.net:30000".to_string())
+                );
+                assert_eq!(command, None);
+            }
+            _ => panic!("Wrong request type"),
+        }
+    }
+
+    /// Legacy CreateChat IPC payloads (pre-endpoint) MUST still parse: the
+    /// daemon may be old when the CLI sends the new form, or vice versa.
+    /// `endpoint` is `Option<String>` with `#[serde(default)]` so omission
+    /// resolves to `None`.
+    #[test]
+    fn test_ipc_create_chat_endpoint_omitted_parses_as_none() {
+        let raw = r#"{"cmd":"create_chat","name":"Old Client","model":"opus","executor":"claude"}"#;
+        let parsed: IpcRequest = serde_json::from_str(raw).unwrap();
+        match parsed {
+            IpcRequest::CreateChat { endpoint, name, .. } => {
+                assert_eq!(name, Some("Old Client".to_string()));
+                assert_eq!(endpoint, None);
+            }
+            _ => panic!("Pre-endpoint create_chat must still parse"),
         }
     }
 
@@ -2359,6 +2597,145 @@ poll_interval = 120
             }
             _ => panic!("Wrong request type"),
         }
+    }
+
+    /// Fix B regression-guard (fix-nex-chat / diagnose-wg-nex root cause #1
+    /// follow-up): the IPC `CreateChat` handler must enqueue the new chat_id
+    /// into `pending_coordinator_ids` AND set `urgent_wake = true` so the
+    /// daemon's main loop spawns a supervisor for the new chat eagerly,
+    /// instead of waiting for the user's first `UserChat` IPC. Before this
+    /// fix, the supervisor only spawned on first message — opening the TUI
+    /// chat tab in the gap saw no live agent and silently fell back to
+    /// chat-0.
+    #[test]
+    fn test_handle_create_chat_signals_eager_spawn() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let mut running = true;
+        let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
+        let mut urgent_wake = false;
+        let mut pending_coordinator_ids: Vec<u32> = Vec::new();
+        let mut delete_coordinator_ids: Vec<u32> = Vec::new();
+        let mut interrupt_coordinator_ids: Vec<u32> = Vec::new();
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(60),
+            model: None,
+            provider: None,
+            paused: false,
+            settling_delay: Duration::from_millis(2000),
+        };
+        let logger = DaemonLogger::open(dir).unwrap();
+
+        let resp = handle_request(
+            dir,
+            IpcRequest::CreateChat {
+                name: Some("alice".to_string()),
+                model: Some("nex:qwen3-coder".to_string()),
+                executor: Some("native".to_string()),
+                endpoint: Some("https://lambda01.example:30000".to_string()),
+                command: None,
+            },
+            &mut running,
+            &mut wake_coordinator,
+            &mut kick_dispatcher,
+            &mut urgent_wake,
+            &mut pending_coordinator_ids,
+            &mut delete_coordinator_ids,
+            &mut interrupt_coordinator_ids,
+            &mut cfg,
+            &logger,
+        );
+
+        assert!(resp.ok, "create_chat should succeed: {:?}", resp.error);
+        let data = resp.data.expect("response should carry data");
+        let new_id = data
+            .get("chat_id")
+            .and_then(|v| v.as_u64())
+            .expect("chat_id must be present in response") as u32;
+
+        assert!(
+            urgent_wake,
+            "urgent_wake must be set so daemon's lazy-spawn block fires within ~100ms"
+        );
+        assert_eq!(
+            pending_coordinator_ids,
+            vec![new_id],
+            "pending_coordinator_ids must contain the newly-created chat_id ({}) for eager supervisor spawn",
+            new_id
+        );
+        assert!(
+            delete_coordinator_ids.is_empty(),
+            "create must not enqueue into delete_coordinator_ids"
+        );
+    }
+
+    /// Negative case: a CreateChat that fails (e.g., chat cap reached) must
+    /// NOT signal urgent_wake or push into pending_coordinator_ids.
+    /// Otherwise the daemon would be told to spawn a supervisor for an
+    /// id that doesn't exist.
+    #[test]
+    fn test_handle_create_chat_failure_does_not_signal() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        fs::create_dir_all(dir.join("service")).unwrap();
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // Force chat-cap-reached by writing a config with max_coordinators=0.
+        let toml = "[coordinator]\nmax_coordinators = 0\n";
+        std::fs::write(dir.join("config.toml"), toml).unwrap();
+
+        let mut running = true;
+        let mut wake_coordinator = false;
+        let mut kick_dispatcher = false;
+        let mut urgent_wake = false;
+        let mut pending_coordinator_ids: Vec<u32> = Vec::new();
+        let mut delete_coordinator_ids: Vec<u32> = Vec::new();
+        let mut interrupt_coordinator_ids: Vec<u32> = Vec::new();
+        let mut cfg = DaemonConfig {
+            max_agents: 4,
+            executor: "claude".to_string(),
+            poll_interval: Duration::from_secs(60),
+            model: None,
+            provider: None,
+            paused: false,
+            settling_delay: Duration::from_millis(2000),
+        };
+        let logger = DaemonLogger::open(dir).unwrap();
+
+        let resp = handle_request(
+            dir,
+            IpcRequest::CreateChat {
+                name: Some("over-cap".to_string()),
+                model: None,
+                executor: None,
+                endpoint: None,
+                command: None,
+            },
+            &mut running,
+            &mut wake_coordinator,
+            &mut kick_dispatcher,
+            &mut urgent_wake,
+            &mut pending_coordinator_ids,
+            &mut delete_coordinator_ids,
+            &mut interrupt_coordinator_ids,
+            &mut cfg,
+            &logger,
+        );
+
+        assert!(!resp.ok, "create_chat must fail when cap is 0");
+        assert!(!urgent_wake, "urgent_wake must NOT be set on failed create");
+        assert!(
+            pending_coordinator_ids.is_empty(),
+            "pending_coordinator_ids must be empty on failed create"
+        );
     }
 
     #[test]
@@ -2833,8 +3210,9 @@ poll_interval = 120
         workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
 
         // Create chat agent labeled "alice"
-        let resp = handle_create_coordinator(dir, Some("alice"), None, None);
+        let (resp, new_id) = handle_create_coordinator(dir, Some("alice"), None, None, None, None);
         assert!(resp.ok, "create_chat should succeed");
+        assert_eq!(new_id, Some(0), "first chat should be chat 0");
 
         // Verify the chat task was created with correct label and new prefix
         let graph = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
@@ -2845,8 +3223,9 @@ poll_interval = 120
         assert!(coord.tags.contains(&"chat-loop".to_string()));
 
         // Create chat labeled "bob"
-        let resp = handle_create_coordinator(dir, Some("bob"), None, None);
+        let (resp, new_id) = handle_create_coordinator(dir, Some("bob"), None, None, None, None);
         assert!(resp.ok, "create_chat for bob should succeed");
+        assert_eq!(new_id, Some(1), "second chat should be chat 1");
 
         let graph = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
         let coord = graph.get_task(".chat-1").expect("second chat should exist");
@@ -2867,8 +3246,8 @@ poll_interval = 120
         let graph = workgraph::graph::WorkGraph::new();
         workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
 
-        handle_create_coordinator(dir, Some("alice"), None, None);
-        handle_create_coordinator(dir, Some("bob"), None, None);
+        let _ = handle_create_coordinator(dir, Some("alice"), None, None, None, None);
+        let _ = handle_create_coordinator(dir, Some("bob"), None, None, None, None);
 
         // Write per-coordinator state files
         let alice_state = CoordinatorState {
@@ -3017,7 +3396,11 @@ poll_interval = 120
         }));
         workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
 
-        let resp = handle_purge_chats(dir);
+        // include_active=true preserves the original full-nuke semantics this
+        // test was written against (no on-disk activity exists for these in-
+        // memory test chats anyway, but we want this assertion to hold even
+        // if a future change makes "no inbox" briefly look active).
+        let resp = handle_purge_chats(dir, true, None);
         assert!(resp.ok, "PurgeChats should succeed: {:?}", resp.error);
         let data = resp.data.unwrap();
         let purged = data["purged"].as_array().unwrap();
@@ -3056,7 +3439,7 @@ poll_interval = 120
         // so the second purge produces zero new archives. Skipped includes
         // only chats that still carry a chat-loop tag (chat-2 in this graph;
         // the other two had their loop tags removed during the first purge).
-        let resp2 = handle_purge_chats(dir);
+        let resp2 = handle_purge_chats(dir, true, None);
         assert!(resp2.ok);
         let data2 = resp2.data.unwrap();
         let purged2 = data2["purged"].as_array().unwrap();
@@ -3073,11 +3456,181 @@ poll_interval = 120
         let dir = temp_dir.path();
         let graph = workgraph::graph::WorkGraph::new();
         workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
-        let resp = handle_purge_chats(dir);
+        let resp = handle_purge_chats(dir, false, None);
         assert!(resp.ok, "empty-graph purge should succeed");
         let data = resp.data.unwrap();
         assert!(data["purged"].as_array().unwrap().is_empty());
         assert!(data["skipped"].as_array().unwrap().is_empty());
+    }
+
+    /// Per-chat config persistence (fix-chat-creation): when a TUI
+    /// launcher creates a chat with `wg nex -m qwen3-coder -e https://X`,
+    /// all three (executor, model, endpoint) must land in the per-chat
+    /// CoordinatorState file so the supervisor reads them on respawn /
+    /// reattach. Without this, restarting the TUI silently drops the
+    /// endpoint override and the chat hits the default endpoint instead.
+    #[test]
+    fn test_create_chat_persists_endpoint_override() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("service")).unwrap();
+
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let (resp, new_id) = handle_create_coordinator(
+            dir,
+            Some("Lambda Box"),
+            Some("nex:qwen3-coder"),
+            Some("native"),
+            Some("https://lambda01.tail334fe6.ts.net:30000"),
+            None,
+        );
+        assert!(
+            resp.ok,
+            "create_chat with endpoint should succeed: {:?}",
+            resp.error
+        );
+        assert!(
+            new_id.is_some(),
+            "new chat_id should be returned for eager-spawn (Fix B)"
+        );
+
+        let chat_id = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("chat_id"))
+            .and_then(|v| v.as_u64())
+            .expect("response should include chat_id") as u32;
+
+        let state = super::CoordinatorState::load_for(dir, chat_id)
+            .expect("CoordinatorState file must exist after IPC create");
+        assert_eq!(
+            state.executor_override.as_deref(),
+            Some("native"),
+            "executor_override must persist"
+        );
+        assert_eq!(
+            state.model_override.as_deref(),
+            Some("nex:qwen3-coder"),
+            "model_override must persist"
+        );
+        assert_eq!(
+            state.endpoint_override.as_deref(),
+            Some("https://lambda01.tail334fe6.ts.net:30000"),
+            "endpoint_override must persist (TUI restart reuses this on reattach)"
+        );
+    }
+
+    /// CoordinatorState must round-trip endpoint_override through JSON
+    /// serialization — this is what TUI reattach reads on restart.
+    #[test]
+    fn test_coordinator_state_endpoint_override_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("service")).unwrap();
+
+        let original = super::CoordinatorState {
+            enabled: true,
+            max_agents: 1,
+            executor: "native".to_string(),
+            executor_override: Some("native".to_string()),
+            model_override: Some("qwen3-coder".to_string()),
+            endpoint_override: Some("https://lambda01.example/30000".to_string()),
+            ..Default::default()
+        };
+        original.save_for(dir, 7);
+
+        let loaded = super::CoordinatorState::load_for(dir, 7).expect("state file must exist");
+        assert_eq!(
+            loaded.endpoint_override.as_deref(),
+            Some("https://lambda01.example/30000"),
+            "endpoint_override must survive a save/load round-trip"
+        );
+    }
+
+    /// Cap regression (parent task fix-chat-cap): `create_chat_in_graph`
+    /// must use `count_live_chats`, not raw chat-loop count. With 4 chats
+    /// of which 2 are archived, the cap reads 2/4 — and the user can
+    /// still create a 3rd chat. Before the fix, archived-but-not-Done
+    /// chats inflated the count and the user saw "4/4 with only 2
+    /// visible tabs".
+    #[test]
+    fn test_create_chat_in_graph_excludes_archived_from_cap() {
+        use workgraph::chat_id::CHAT_LOOP_TAG;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Pre-load graph with 2 active chats and 2 archived chats —
+        // total 4 chat-loop-tagged tasks, but only 2 occupy slots.
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for (i, archived) in [(0u32, false), (1, false), (2, true), (3, true)] {
+            let mut tags = vec![CHAT_LOOP_TAG.to_string()];
+            if archived {
+                tags.push("archived".to_string());
+            }
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(i),
+                title: format!("Chat {}", i),
+                status: workgraph::graph::Status::InProgress,
+                tags,
+                created_at: Some(now.clone()),
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // Default max_coordinators is 4. We have 2 live + 2 archived =
+        // 2/4 — creation must succeed (fresh chat 4 lands).
+        let new_id = create_chat_in_graph(dir, Some("New One"), None, None, None, None)
+            .expect("cap not reached");
+        assert!(
+            new_id >= 4,
+            "new chat id should be at least 4 (after .chat-3), got {}",
+            new_id
+        );
+    }
+
+    /// Cap regression (parent task fix-chat-cap): a `.chat-N` task whose
+    /// supervisor is dead and whose consumer cursor has gone away (the
+    /// "zombie" case from the bug report) must not block new chats. The
+    /// freshness window in `count_live_chats` excludes old chats with no
+    /// cursor and no inbox traffic — supervisor's no-respawn rule and
+    /// the cap counter agree on what's live.
+    #[test]
+    fn test_create_chat_in_graph_zombie_supervisors_do_not_block() {
+        use workgraph::chat_id::CHAT_LOOP_TAG;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // 4 chat-loop-tagged InProgress tasks, all created an hour ago,
+        // none archived, no cursor files, no inbox traffic. Supervisor
+        // would treat them all as idle and exit. Cap counter should
+        // therefore see 0 live, allowing a new chat to land.
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(3600)).to_rfc3339();
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for i in 0u32..4 {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(i),
+                title: format!("Chat {}", i),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec![CHAT_LOOP_TAG.to_string()],
+                created_at: Some(stale.clone()),
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // 4 zombies + cap of 4 = pre-fix would bail with "Chat cap
+        // reached (4/4)". Post-fix the zombies don't count and creation
+        // succeeds.
+        let result = create_chat_in_graph(dir, None, None, None, None, None);
+        assert!(
+            result.is_ok(),
+            "zombie supervisors must not block new chats; got: {:?}",
+            result.err()
+        );
     }
 
     /// PurgeChats marks chats with the `archived` tag, which means
@@ -3110,8 +3663,10 @@ poll_interval = 120
         let pre_ids: Vec<u32> = pre.iter().map(|s| s.chat_id).collect();
         assert_eq!(pre_ids, vec![0, 3]);
 
-        // Purge.
-        let resp = handle_purge_chats(dir);
+        // Purge. include_active=true to keep the test independent of on-disk
+        // activity heuristics — this test is asserting the boot-enumeration
+        // post-condition, not the active-skip rule.
+        let resp = handle_purge_chats(dir, true, None);
         assert!(resp.ok);
 
         // Post-purge: zero supervisors enumerated → daemon restart spawns nothing.
@@ -3121,5 +3676,286 @@ poll_interval = 120
             "after purge, boot enumerator must yield no supervisors, got {:?}",
             post
         );
+    }
+
+    /// Active-skip rule (default `include_active=false`): a chat with a
+    /// freshly-touched consumer cursor is reported in `skipped` with
+    /// `reason=active` and stays chat-loop-tagged in the graph. The other
+    /// idle chats are archived. This is the regression guard for the
+    /// "lol you archived _this_ chat too" footgun.
+    #[test]
+    fn test_handle_purge_chats_skips_active_chat_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [5u32, 6, 7] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // Mark .chat-5 as active (freshly-touched consumer cursor).
+        workgraph::chat::write_cursor_for(dir, 5, 0).unwrap();
+
+        let resp = handle_purge_chats(dir, false, None);
+        assert!(resp.ok, "purge should succeed: {:?}", resp.error);
+        let data = resp.data.unwrap();
+
+        let purged = data["purged"].as_array().unwrap();
+        let purged_ids: Vec<u64> = purged
+            .iter()
+            .map(|v| v["chat_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(purged_ids, vec![6, 7]);
+
+        let skipped = data["skipped"].as_array().unwrap();
+        let active_skips: Vec<u64> = skipped
+            .iter()
+            .filter(|v| v["reason"].as_str() == Some("active"))
+            .map(|v| v["chat_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            active_skips,
+            vec![5],
+            "active chat .chat-5 must surface in skipped[].reason=active"
+        );
+
+        // Verify graph: .chat-5 keeps chat-loop tag; others archived.
+        let g = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        let t5 = g.get_task(".chat-5").unwrap();
+        assert!(
+            t5.tags.iter().any(|t| t == "chat-loop"),
+            "active chat keeps its chat-loop tag"
+        );
+        assert!(!t5.tags.iter().any(|t| t == "archived"));
+    }
+
+    /// `include_active=true` opts back into pre-2026-04 full-nuke behavior:
+    /// every chat-loop task gets archived regardless of activity.
+    #[test]
+    fn test_handle_purge_chats_include_active_archives_everything() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [5u32, 6] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+        // Active chat cursor — should be ignored under include_active=true.
+        workgraph::chat::write_cursor_for(dir, 5, 0).unwrap();
+
+        let resp = handle_purge_chats(dir, true, None);
+        assert!(resp.ok);
+        let data = resp.data.unwrap();
+        let purged = data["purged"].as_array().unwrap();
+        assert_eq!(
+            purged.len(),
+            2,
+            "include_active=true archives all chat-loop tasks"
+        );
+        // No "active"-reason skips under include_active=true.
+        let skipped = data["skipped"].as_array().unwrap();
+        let active_skips = skipped
+            .iter()
+            .filter(|v| v["reason"].as_str() == Some("active"))
+            .count();
+        assert_eq!(active_skips, 0);
+    }
+
+    /// `caller_chat_id` is treated as active: protects a chat-handler-spawned
+    /// `wg` invocation from archiving the very session it's running inside.
+    #[test]
+    fn test_handle_purge_chats_skips_caller_chat_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [3u32, 4] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // No on-disk activity — only the caller hint differentiates.
+        let resp = handle_purge_chats(dir, false, Some(3));
+        assert!(resp.ok);
+        let data = resp.data.unwrap();
+
+        let purged_ids: Vec<u64> = data["purged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["chat_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(purged_ids, vec![4]);
+
+        let caller_skips: Vec<u64> = data["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["reason"].as_str() == Some("caller chat"))
+            .map(|v| v["chat_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(caller_skips, vec![3]);
+    }
+
+    /// Zero-active-chats default behavior matches today: with no consumer
+    /// cursors and no caller hint, every chat-loop task gets archived.
+    #[test]
+    fn test_handle_purge_chats_no_active_chats_archives_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [10u32, 11, 12] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let resp = handle_purge_chats(dir, false, None);
+        assert!(resp.ok);
+        let data = resp.data.unwrap();
+        let purged_ids: Vec<u64> = data["purged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["chat_id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(purged_ids, vec![10, 11, 12]);
+
+        // No "active" reasons in skipped (all idle, no caller hint).
+        let skipped = data["skipped"].as_array().unwrap();
+        let active_count = skipped
+            .iter()
+            .filter(|v| {
+                let r = v["reason"].as_str();
+                r == Some("active") || r == Some("caller chat")
+            })
+            .count();
+        assert_eq!(active_count, 0);
+    }
+
+    /// Backward-compat: the IPC `PurgeChats` variant defaults
+    /// `include_active=false` and `caller_chat_id=None` when those fields
+    /// are absent from the wire JSON. The enum is internally tagged with
+    /// `cmd`, so old clients sending `{"cmd":"purge_chats"}` (the previous
+    /// unit-variant form) still deserialize cleanly into the new struct
+    /// variant with safe-by-default semantics.
+    #[test]
+    fn test_purge_chats_ipc_defaults_to_safe_mode() {
+        let req: IpcRequest = serde_json::from_str(r#"{"cmd":"purge_chats"}"#).unwrap();
+        match req {
+            IpcRequest::PurgeChats {
+                include_active,
+                caller_chat_id,
+            } => {
+                assert!(!include_active, "default must be include_active=false");
+                assert!(caller_chat_id.is_none());
+            }
+            _ => panic!("expected PurgeChats variant"),
+        }
+
+        // New clients sending the full payload are honored.
+        let req2: IpcRequest = serde_json::from_str(
+            r#"{"cmd":"purge_chats","include_active":true,"caller_chat_id":7}"#,
+        )
+        .unwrap();
+        match req2 {
+            IpcRequest::PurgeChats {
+                include_active,
+                caller_chat_id,
+            } => {
+                assert!(include_active);
+                assert_eq!(caller_chat_id, Some(7));
+            }
+            _ => panic!("expected PurgeChats variant"),
+        }
+    }
+
+    /// Per fix-tui-chat: `handle_delete_coordinator` must mark the chat
+    /// task `Abandoned` AND log an entry. The agent-kill block runs first
+    /// when an agent is bound to the task, but a chat with no live agent
+    /// (the typical "empty chat" cleanup target) must still abandon
+    /// cleanly without erroring.
+    #[test]
+    fn test_handle_delete_coordinator_marks_abandoned() {
+        use workgraph::graph::{Node, Status, WorkGraph};
+        use workgraph::test_helpers::make_task_with_status;
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        // Build a graph with a chat task at cid=4 (no agent bound — the
+        // common case for empty chats the user wants to bulk-clean).
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status(".chat-4", "Chat 4", Status::InProgress);
+        task.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(task));
+        let graph_path = dir.join("graph.jsonl");
+        workgraph::parser::save_graph(&graph, &graph_path).unwrap();
+
+        let resp = handle_delete_coordinator(dir, 4);
+        assert!(resp.ok, "delete must succeed; error = {:?}", resp.error);
+
+        let graph2 = workgraph::parser::load_graph(&graph_path).unwrap();
+        let task = graph2.get_task(".chat-4").expect("task must still exist");
+        assert_eq!(
+            task.status,
+            Status::Abandoned,
+            "delete-coordinator must mark task Abandoned"
+        );
+        assert!(
+            task.log
+                .iter()
+                .any(|l| l.message.contains("deleted via IPC")),
+            "delete-coordinator must append a log entry"
+        );
+    }
+
+    /// Legacy `.coordinator-N` and bare `.coordinator` task ids must
+    /// resolve identically. Regression lock for the chat_id::format vs.
+    /// legacy fallback ladder in `handle_delete_coordinator`.
+    #[test]
+    fn test_handle_delete_coordinator_legacy_id_resolves() {
+        use workgraph::graph::{Node, Status, WorkGraph};
+        use workgraph::test_helpers::make_task_with_status;
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status(".coordinator-7", "Legacy Chat 7", Status::InProgress);
+        task.tags = vec!["coordinator-loop".to_string()];
+        graph.add_node(Node::Task(task));
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let resp = handle_delete_coordinator(dir, 7);
+        assert!(resp.ok);
+
+        let graph2 = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        let task = graph2.get_task(".coordinator-7").unwrap();
+        assert_eq!(task.status, Status::Abandoned);
     }
 }
