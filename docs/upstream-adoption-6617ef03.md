@@ -24,11 +24,9 @@ Date: 2026-05-20
 - Broad upstream whitespace/doc churn is adopted as-is. `git diff --check` still reports upstream trailing whitespace in archived docs and CSV fixtures; these are not runtime blockers and should be cleaned in a separate formatting pass if desired.
 - `wg setup` still preserves an existing explicit route and OpenRouter key detection. Only the no-config/no-route fallback is Codex-first.
 
-## Conflicts Or Gaps
+## Follow-Up Compatibility Work
 
-- OpenCode is not a real Workgraph handler yet. The code accepts `"opencode"` in some config/IPC tests, but `ExecutorKind`, `handler_for_model`, `spawn-task`, and `provider_to_executor` do not define an OpenCode executor path.
-- Z.AI GLM is present in the central registry for other PAIA surfaces, but Workgraph has no `zai:`/`z-ai:` provider prefix, no route IDs for Workgraph GLM usage, and no OpenCode-backed execution adapter.
+- OpenCode now has a Workgraph executor path: `opencode`, `zai`, and `z-ai` model prefixes resolve to the `opencode` handler, and `spawn-task` can dispatch `wg opencode-handler`.
+- Workgraph now has central Z.AI GLM route IDs for fast/standard/premium usage; the runtime path converts `zai:glm-5.1` and `z-ai:glm-5.1` into the `opencode` CLI's `zai/glm-5.1` model form.
 - If Speedrift wants Codexd as a distinct daemonized surface rather than the current Codex CLI handler, Workgraph also needs an explicit `codexd` provider/executor mapping and spawn adapter.
-- Therefore OpenCode + Z.AI GLM support needs both sides:
-  - Workgraph upstream/local handler support: provider prefix, executor kind or adapter mapping, spawn dispatch, config/profile templates, tests.
-  - Speedrift/driftdriver wrapper support: central route IDs, credential assignment, and runtime wiring for any `opencode`/Z.AI invocation policy.
+- Remaining OpenCode/Z.AI work is integration polish: setup/profile templates and Speedrift/driftdriver policy for when to select the Z.AI route.

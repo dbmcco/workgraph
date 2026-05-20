@@ -53,6 +53,8 @@ pub enum ExecutorKind {
     Shell,
     /// Codex CLI (`codex exec …`). Handles its own auth.
     Codex,
+    /// OpenCode CLI (`opencode run …`). Handles its own provider auth.
+    OpenCode,
 }
 
 impl ExecutorKind {
@@ -62,6 +64,7 @@ impl ExecutorKind {
             ExecutorKind::Native => "native",
             ExecutorKind::Shell => "shell",
             ExecutorKind::Codex => "codex",
+            ExecutorKind::OpenCode => "opencode",
         }
     }
 
@@ -71,6 +74,7 @@ impl ExecutorKind {
             "native" => Some(ExecutorKind::Native),
             "shell" => Some(ExecutorKind::Shell),
             "codex" => Some(ExecutorKind::Codex),
+            "opencode" => Some(ExecutorKind::OpenCode),
             _ => None,
         }
     }

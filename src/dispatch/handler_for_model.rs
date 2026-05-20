@@ -29,6 +29,8 @@
 //! |---------------------------|----------------|-------------|-------------------|
 //! | `claude:*` (and bare)     | `claude` CLI   | Anthropic   | no (CLI auths)    |
 //! | `codex:*`                 | `codex` CLI    | OAI-compat  | no (CLI auths)    |
+//! | `opencode:*`              | `opencode` CLI | provider CLI config | no (CLI auths) |
+//! | `zai:*` / `z-ai:*`        | `opencode` CLI | provider CLI config | no (CLI auths) |
 //! | `nex:*` (canonical)       | `native` (nex) | OAI-compat  | yes               |
 //! | `openrouter:*`            | `native` (nex) | OAI-compat  | optional          |
 //! | `local:*` (deprecated)    | `native` (nex) | OAI-compat  | yes               |
@@ -135,6 +137,16 @@ mod tests {
     #[test]
     fn test_codex_prefix_routes_to_codex() {
         assert_eq!(handler_for_model("codex:gpt-5"), ExecutorKind::Codex);
+    }
+
+    #[test]
+    fn test_opencode_and_zai_prefixes_route_to_opencode() {
+        assert_eq!(
+            handler_for_model("opencode:zai/glm-5.1"),
+            ExecutorKind::OpenCode
+        );
+        assert_eq!(handler_for_model("zai:glm-5.1"), ExecutorKind::OpenCode);
+        assert_eq!(handler_for_model("z-ai:glm-5.1"), ExecutorKind::OpenCode);
     }
 
     #[test]

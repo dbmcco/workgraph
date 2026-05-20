@@ -83,6 +83,7 @@ pub mod nex;
 pub mod next;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod notify;
+pub mod opencode_handler;
 pub mod openrouter;
 pub mod pause;
 pub mod peer;

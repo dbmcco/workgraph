@@ -1693,6 +1693,9 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "oai-compat", // deprecated — use "nex"
     "openai",     // legacy alias for "oai-compat" — kept for backwards compatibility
     "codex",
+    "opencode",
+    "zai",
+    "z-ai",
     "gemini",
     "ollama",
     "llamacpp",
@@ -1870,6 +1873,7 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
 ///
 /// - `claude` → `"claude"` (Claude CLI)
 /// - `codex` → `"codex"` (Codex CLI)
+/// - `opencode` / `zai` / `z-ai` → `"opencode"` (OpenCode CLI)
 /// - `nex` (canonical) / `local` / `oai-compat` / `openrouter` / etc. → `"native"`
 ///   (the in-process nex handler — name kept as `"native"` for the legacy
 ///   ExecutorKind variant, but the user-facing prefix is `nex:`)
@@ -1877,6 +1881,7 @@ pub fn provider_to_executor(provider: &str) -> &'static str {
     match provider {
         "claude" => "claude",
         "codex" => "codex",
+        "opencode" | "zai" | "z-ai" => "opencode",
         _ => "native",
     }
 }
@@ -7055,6 +7060,9 @@ provider = "openrouter"
     fn test_provider_to_executor_mapping() {
         assert_eq!(provider_to_executor("claude"), "claude");
         assert_eq!(provider_to_executor("codex"), "codex");
+        assert_eq!(provider_to_executor("opencode"), "opencode");
+        assert_eq!(provider_to_executor("zai"), "opencode");
+        assert_eq!(provider_to_executor("z-ai"), "opencode");
         assert_eq!(provider_to_executor("openrouter"), "native");
         assert_eq!(provider_to_executor("openai"), "native");
         assert_eq!(provider_to_executor("gemini"), "native");

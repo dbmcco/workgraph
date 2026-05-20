@@ -13,9 +13,9 @@
 //!
 //! Adapters live inline here (one match arm per executor). Native
 //! execs into `wg nex`; Claude execs into `wg claude-handler`
-//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex / Gemini
-//! are still stubs — they error cleanly with a "not yet implemented"
-//! message when selected.
+//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex and
+//! OpenCode use single-shot CLI handlers. Gemini is still a stub — it
+//! errors cleanly with a "not yet implemented" message when selected.
 //!
 //! ## Stdout-is-protocol contract
 //!
@@ -50,6 +50,10 @@ pub enum HandlerSpec {
         model: Option<String>,
     },
     Codex {
+        chat_ref: String,
+        model: Option<String>,
+    },
+    OpenCode {
         chat_ref: String,
         model: Option<String>,
     },
@@ -93,6 +97,13 @@ impl HandlerSpec {
             }
             Self::Codex { chat_ref, model } => {
                 let mut s = format!("wg codex-handler --chat {}", chat_ref);
+                if let Some(m) = model {
+                    s.push_str(&format!(" -m {}", m));
+                }
+                s
+            }
+            Self::OpenCode { chat_ref, model } => {
+                let mut s = format!("wg opencode-handler --chat {}", chat_ref);
                 if let Some(m) = model {
                     s.push_str(&format!(" -m {}", m));
                 }
@@ -245,6 +256,7 @@ pub fn resolve_handler(
         },
         workgraph::dispatch::ExecutorKind::Claude => HandlerSpec::Claude { chat_ref, model },
         workgraph::dispatch::ExecutorKind::Codex => HandlerSpec::Codex { chat_ref, model },
+        workgraph::dispatch::ExecutorKind::OpenCode => HandlerSpec::OpenCode { chat_ref, model },
         workgraph::dispatch::ExecutorKind::Shell => {
             return Err(anyhow!(
                 "shell executor is not supported by spawn-task; \
@@ -281,9 +293,33 @@ fn dispatch(spec: &HandlerSpec, _workgraph_dir: &Path) -> Result<()> {
         ),
         HandlerSpec::Claude { chat_ref, model } => dispatch_claude(chat_ref, model.as_deref()),
         HandlerSpec::Codex { chat_ref, model } => dispatch_codex(chat_ref, model.as_deref()),
+        HandlerSpec::OpenCode { chat_ref, model } => dispatch_opencode(chat_ref, model.as_deref()),
         HandlerSpec::Gemini { .. } => Err(anyhow!(
             "gemini adapter not yet implemented (Phase 7). Use --executor native for now."
         )),
+    }
+}
+
+fn dispatch_opencode(chat_ref: &str, model: Option<&str>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let self_exe =
+            std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.arg("opencode-handler").arg("--chat").arg(chat_ref);
+        if let Some(m) = model {
+            cmd.arg("-m").arg(m);
+        }
+        let err = cmd.exec();
+        Err(anyhow!("exec wg opencode-handler failed: {}", err))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (chat_ref, model);
+        Err(anyhow!(
+            "spawn-task dispatch not yet supported on this platform"
+        ))
     }
 }
 
@@ -621,6 +657,7 @@ mod tests {
             let (actual_executor, actual_model) = match spec {
                 HandlerSpec::Claude { model, .. } => ("claude", model),
                 HandlerSpec::Codex { model, .. } => ("codex", model),
+                HandlerSpec::OpenCode { model, .. } => ("opencode", model),
                 HandlerSpec::Native { model, .. } => ("native", model),
                 HandlerSpec::Gemini { .. } => ("gemini", None),
             };
@@ -771,10 +808,42 @@ mod tests {
                     HandlerSpec::Claude { model, .. } => format!("Claude {{ model: {:?} }}", model),
                     HandlerSpec::Native { model, .. } => format!("Native {{ model: {:?} }}", model),
                     HandlerSpec::Codex { model, .. } => format!("Codex {{ model: {:?} }}", model),
+                    HandlerSpec::OpenCode { model, .. } => {
+                        format!("OpenCode {{ model: {:?} }}", model)
+                    }
                     HandlerSpec::Gemini { .. } => "Gemini".to_string(),
                 }
             ),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn spawn_task_routes_zai_model_to_opencode_handler() {
+        with_env(Some("opencode"), Some("zai:glm-5.1"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let wg_dir = dir.path();
+            let task = mktask(".chat-9");
+            let spec = resolve_handler(wg_dir, &task, None).unwrap();
+            let preview = spec.command_preview();
+
+            match spec {
+                HandlerSpec::OpenCode { model, .. } => {
+                    assert_eq!(model, Some("zai:glm-5.1".to_string()));
+                }
+                other => panic!("expected OpenCode handler, got {}", other.command_preview()),
+            }
+            assert!(
+                preview.contains("wg opencode-handler --chat chat-9"),
+                "dry-run should route to opencode-handler: {}",
+                preview
+            );
+            assert!(
+                preview.contains("-m zai:glm-5.1"),
+                "dry-run should preserve Workgraph model spec: {}",
+                preview
+            );
+        });
     }
 
     /// Fix C end-to-end (fix-nex-chat / diagnose-wg-nex root cause #2):

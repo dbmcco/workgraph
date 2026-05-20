@@ -12,6 +12,9 @@ pub const WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE: &str = "workgraph.claude_cli_premi
 pub const WORKGRAPH_CODEX_CLI_FAST_ROUTE: &str = "workgraph.codex_cli_fast";
 pub const WORKGRAPH_CODEX_CLI_STANDARD_ROUTE: &str = "workgraph.codex_cli_standard";
 pub const WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE: &str = "workgraph.codex_cli_premium";
+pub const WORKGRAPH_ZAI_GLM_FAST_ROUTE: &str = "workgraph.zai_glm_fast";
+pub const WORKGRAPH_ZAI_GLM_STANDARD_ROUTE: &str = "workgraph.zai_glm_standard";
+pub const WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE: &str = "workgraph.zai_glm_premium";
 pub const WORKGRAPH_LOCAL_DEFAULT_ROUTE: &str = "workgraph.local_default";
 pub const WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE: &str = "workgraph.custom_placeholder";
 
@@ -120,6 +123,9 @@ mod tests {
             model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
             "gpt-5.5"
         );
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_FAST_ROUTE), "glm-5.1");
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_STANDARD_ROUTE), "glm-5.1");
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE), "glm-5.1");
         assert_eq!(
             model_for_route(WORKGRAPH_LOCAL_DEFAULT_ROUTE),
             "qwen2.5-coder:7b"
@@ -139,6 +145,10 @@ mod tests {
         assert_eq!(
             spec_for_route("codex", WORKGRAPH_CODEX_CLI_FAST_ROUTE),
             "codex:gpt-5.4-mini"
+        );
+        assert_eq!(
+            spec_for_route("zai", WORKGRAPH_ZAI_GLM_STANDARD_ROUTE),
+            "zai:glm-5.1"
         );
     }
 }

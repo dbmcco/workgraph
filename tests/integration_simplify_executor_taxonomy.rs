@@ -237,6 +237,14 @@ fn test_handler_for_model_is_single_source_of_truth() {
 
     // codex → codex handler.
     assert_eq!(handler_for_model("codex:gpt-5"), ExecutorKind::Codex);
+
+    // opencode / Z.AI GLM → opencode handler.
+    assert_eq!(
+        handler_for_model("opencode:zai/glm-5.1"),
+        ExecutorKind::OpenCode
+    );
+    assert_eq!(handler_for_model("zai:glm-5.1"), ExecutorKind::OpenCode);
+    assert_eq!(handler_for_model("z-ai:glm-5.1"), ExecutorKind::OpenCode);
 }
 
 // --------------------------------------------------------------------

@@ -170,6 +170,9 @@ pub fn run_lightweight_llm_call(
             ExecutorKind::Codex => {
                 return call_codex_cli(&dispatch.model_id, prompt, timeout_secs);
             }
+            ExecutorKind::OpenCode => {
+                return call_opencode_cli(&dispatch.raw_spec, prompt, timeout_secs);
+            }
             ExecutorKind::Native => {
                 // Fall through to the native HTTP path below — openrouter,
                 // local, oai-compat, etc. are real HTTP providers that the
@@ -435,6 +438,47 @@ fn call_codex_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCal
         anyhow::bail!("Empty response from codex CLI");
     }
     Ok(LlmCallResult { text, token_usage })
+}
+
+fn call_opencode_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
+    let output = process::Command::new("timeout")
+        .arg(format!("{}s", timeout_secs))
+        .arg("opencode")
+        .arg("run")
+        .arg("--model")
+        .arg(opencode_model_arg(model))
+        .arg(prompt)
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .output()
+        .context("Failed to run opencode CLI for lightweight LLM call")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "OpenCode CLI call failed (exit {:?}): {}",
+            output.status.code(),
+            stderr.chars().take(500).collect::<String>()
+        );
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        anyhow::bail!("Empty response from opencode CLI");
+    }
+    Ok(LlmCallResult {
+        text,
+        token_usage: None,
+    })
+}
+
+fn opencode_model_arg(model: &str) -> String {
+    let spec = parse_model_spec(model);
+    match spec.provider.as_deref() {
+        Some("opencode") => spec.model_id,
+        Some("zai") | Some("z-ai") => format!("zai/{}", spec.model_id),
+        Some(_) | None => spec.model_id,
+    }
 }
 
 /// Parse stream-json output from Claude CLI to extract text content and token usage.
@@ -873,6 +917,20 @@ mod tests {
             );
             assert_eq!(dispatch.model_id, "gpt-5.4-mini", "role {:?}", role);
         }
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_zai_override_routes_to_opencode_cli() {
+        let mut config = Config::default();
+        config
+            .models
+            .set_model(DispatchRole::Assigner, "zai:glm-5.1");
+
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Assigner);
+        assert_eq!(dispatch.handler, ExecutorKind::OpenCode);
+        assert_eq!(dispatch.raw_spec, "zai:glm-5.1");
+        assert_eq!(dispatch.model_id, "glm-5.1");
+        assert_eq!(opencode_model_arg(&dispatch.raw_spec), "zai/glm-5.1");
     }
 
     #[test]

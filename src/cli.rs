@@ -2532,6 +2532,25 @@ pub enum Commands {
         model: Option<String>,
     },
 
+    /// Bridge OpenCode CLI output ↔ chat/<ref>/*.jsonl.
+    ///
+    /// Peer of `wg codex-handler` for the OpenCode executor. OpenCode is
+    /// invoked one turn at a time with `opencode run`.
+    #[command(name = "opencode-handler")]
+    OpenCodeHandler {
+        #[arg(long = "chat")]
+        chat: String,
+
+        #[arg(long)]
+        resume: bool,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
     /// Print the WG directory that `wg` would use from here,
     /// and show which resolver step won (CLI flag / env / walk-up /
     /// home / default). Useful when you're confused about which graph
@@ -5292,6 +5311,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::SpawnTask { .. } => "spawn-task",
         Commands::ClaudeHandler { .. } => "claude-handler",
         Commands::CodexHandler { .. } => "codex-handler",
+        Commands::OpenCodeHandler { .. } => "opencode-handler",
         Commands::NativeExec { .. } => "native-exec",
         Commands::Which { .. } => "which",
         Commands::Executors { .. } => "executors",
@@ -5306,7 +5326,9 @@ pub fn command_name(cmd: &Commands) -> &'static str {
 pub fn is_internal_command(cmd: &Commands) -> bool {
     matches!(
         cmd,
-        Commands::SpawnTask { .. } | Commands::ClaudeHandler { .. }
+        Commands::SpawnTask { .. }
+            | Commands::ClaudeHandler { .. }
+            | Commands::OpenCodeHandler { .. }
     )
 }
 
