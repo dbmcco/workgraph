@@ -39,6 +39,16 @@ pub enum Position {
     Parallel,
 }
 
+impl Position {
+    fn as_str(self) -> &'static str {
+        match self {
+            Position::Before => "before",
+            Position::After => "after",
+            Position::Parallel => "parallel",
+        }
+    }
+}
+
 impl std::str::FromStr for Position {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
@@ -242,6 +252,19 @@ pub fn run(
         .lock()
         .map(|s| s.clone())
         .unwrap_or_else(|_| derived_id.clone());
+    let _ = workgraph::provenance::record(
+        dir,
+        "insert",
+        Some(&assigned_id),
+        Some("insert"),
+        serde_json::json!({
+            "target": target_id,
+            "position": position.as_str(),
+            "replace_edges": opts.replace_edges,
+            "splice": opts.splice,
+        }),
+        workgraph::provenance::DEFAULT_ROTATION_THRESHOLD,
+    );
     Ok(assigned_id)
 }
 

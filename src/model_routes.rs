@@ -54,12 +54,22 @@ fn registry_path() -> Option<PathBuf> {
         }
     }
 
-    let cwd = env::current_dir().ok()?;
-    for ancestor in cwd.ancestors() {
-        if let Some(path) = sibling_registry_path(ancestor) {
-            return Some(path);
+    if let Ok(cwd) = env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            if let Some(path) = sibling_registry_path(ancestor) {
+                return Some(path);
+            }
         }
     }
+
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        for ancestor in Path::new(manifest_dir).ancestors() {
+            if let Some(path) = sibling_registry_path(ancestor) {
+                return Some(path);
+            }
+        }
+    }
+
     None
 }
 
@@ -100,10 +110,16 @@ mod tests {
         assert_eq!(model_for_route(WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE), "opus");
         assert_eq!(
             model_for_route(WORKGRAPH_CODEX_CLI_FAST_ROUTE),
-            "gpt-5-mini"
+            "gpt-5.4-mini"
         );
-        assert_eq!(model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE), "gpt-5");
-        assert_eq!(model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE), "o1-pro");
+        assert_eq!(
+            model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
+            "gpt-5.4"
+        );
+        assert_eq!(
+            model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
+            "gpt-5.5"
+        );
         assert_eq!(
             model_for_route(WORKGRAPH_LOCAL_DEFAULT_ROUTE),
             "qwen2.5-coder:7b"
@@ -122,7 +138,7 @@ mod tests {
         );
         assert_eq!(
             spec_for_route("codex", WORKGRAPH_CODEX_CLI_FAST_ROUTE),
-            "codex:gpt-5-mini"
+            "codex:gpt-5.4-mini"
         );
     }
 }

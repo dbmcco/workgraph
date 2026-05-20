@@ -128,10 +128,13 @@ fn init_workgraph(tmp: &TempDir) -> PathBuf {
     wg_dir
 }
 
-/// Write config.toml to enable the coordinator agent.
+/// Write config.toml to enable the coordinator agent on the Claude handler.
+///
+/// These tests use a mock `claude` binary, so they opt into Claude explicitly
+/// instead of relying on the production default executor.
 fn enable_coordinator_agent(wg_dir: &Path) {
     let config_path = wg_dir.join("config.toml");
-    let config = "[dispatcher]\ncoordinator_agent = true\nregistry_refresh_interval = 0\n";
+    let config = "[dispatcher]\ncoordinator_agent = true\nregistry_refresh_interval = 0\nexecutor = \"claude\"\nmodel = \"claude:haiku\"\n";
     fs::write(&config_path, config).unwrap();
     wg_ok(wg_dir, &["chat", "create", "--name", "default", "--json"]);
 }
@@ -488,6 +491,7 @@ impl Drop for CoordinatorDaemonGuard<'_> {
 fn coordinator_spawn_task_dry_run_primary() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
+    enable_coordinator_agent(&wg_dir);
 
     let stdout = wg_ok(
         &wg_dir,
@@ -550,6 +554,7 @@ fn coordinator_spawn_task_routes_native_executor() {
 fn coordinator_spawn_task_role_override_routes_to_handler() {
     let tmp = TempDir::new().unwrap();
     let wg_dir = init_workgraph(&tmp);
+    enable_coordinator_agent(&wg_dir);
 
     let output = wg_cmd(
         &wg_dir,

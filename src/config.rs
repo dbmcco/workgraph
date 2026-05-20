@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::model_routes::{WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE, spec_for_route};
+
 /// Bare Claude tier aliases passed to the claude CLI.
 /// The CLI resolves these to the current production model — we do not track dated IDs.
 pub const CLAUDE_HAIKU_MODEL_ID: &str = "haiku";
@@ -3384,15 +3386,12 @@ fn default_agent_timeout() -> String {
     "30m".to_string()
 }
 
-/// Providers that are not Anthropic-native and should default to the "native" executor.
-const NON_ANTHROPIC_PROVIDERS: &[&str] = &["openrouter", "oai-compat", "openai", "local"];
-
 impl CoordinatorConfig {
     /// Return the effective executor, considering provider-based auto-detection.
     ///
     /// If executor is explicitly set in config, that value is used unconditionally.
-    /// Otherwise, if provider is openrouter/openai/local, returns "native" (since
-    /// the claude executor only works with Anthropic's API). Falls back to "claude".
+    /// Otherwise, provider/model prefixes choose their handler. Falls back to
+    /// the Codex CLI default route.
     pub fn effective_executor(&self) -> String {
         if let Some(ref executor) = self.executor {
             // Explicitly set in config — honour it
@@ -3407,13 +3406,13 @@ impl CoordinatorConfig {
             }
         } else if let Some(ref provider) = self.provider {
             // Deprecated: separate provider field fallback
-            if NON_ANTHROPIC_PROVIDERS.contains(&provider.as_str()) {
-                "native".to_string()
-            } else {
-                "claude".to_string()
+            match provider.as_str() {
+                "claude" | "anthropic" => "claude".to_string(),
+                "codex" => "codex".to_string(),
+                _ => "native".to_string(),
             }
         } else {
-            "claude".to_string()
+            "codex".to_string()
         }
     }
 }
@@ -3531,7 +3530,7 @@ pub struct ProjectConfig {
 }
 
 fn default_executor() -> String {
-    "claude".to_string()
+    "codex".to_string()
 }
 
 fn is_default_executor(s: &str) -> bool {
@@ -3539,7 +3538,7 @@ fn is_default_executor(s: &str) -> bool {
 }
 
 fn default_model() -> String {
-    "claude:opus".to_string()
+    spec_for_route("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE)
 }
 
 fn default_interval() -> u64 {
@@ -4873,8 +4872,12 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.agent.executor, "claude");
-        assert_eq!(config.agent.model, "claude:opus");
+        assert_eq!(config.agent.executor, "codex");
+        assert!(
+            config.agent.model.starts_with("codex:"),
+            "default model should be codex-prefixed, got {}",
+            config.agent.model
+        );
         assert_eq!(config.agent.interval, 10);
     }
 
@@ -4882,7 +4885,7 @@ mod tests {
     fn test_load_missing_config() {
         let temp_dir = TempDir::new().unwrap();
         let config = Config::load(temp_dir.path()).unwrap();
-        assert_eq!(config.agent.executor, "claude");
+        assert_eq!(config.agent.executor, "codex");
     }
 
     #[test]
@@ -6507,10 +6510,11 @@ model = "claude:haiku"
     fn test_effective_compaction_threshold_fallback_no_model() {
         // No coordinator model → falls back to agent.model
         let config = Config::default();
-        // agent.model defaults to "claude:opus" → registry lookup "opus" (200_000 context window)
-        // 200_000 * 0.8 = 160_000
+        // agent.model defaults to the central codex premium route. It is not
+        // part of the legacy in-process Anthropic registry, so threshold falls
+        // back to compaction_token_threshold.
         let threshold = config.effective_compaction_threshold();
-        assert_eq!(threshold, 160_000); // uses agent.model "claude:opus" fallback
+        assert_eq!(threshold, 100_000);
     }
 
     #[test]
@@ -6885,7 +6889,7 @@ model = "claude:haiku"
     #[test]
     fn test_effective_executor_default_no_provider() {
         let config = Config::default();
-        assert_eq!(config.coordinator.effective_executor(), "claude");
+        assert_eq!(config.coordinator.effective_executor(), "codex");
     }
 
     #[test]
@@ -8199,7 +8203,7 @@ max_agents = 8
         // Should produce valid default config
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.coordinator.max_agents, 8); // default
-        assert_eq!(config.coordinator.effective_executor(), "claude"); // default
+        assert_eq!(config.coordinator.effective_executor(), "codex"); // default
     }
 
     #[test]

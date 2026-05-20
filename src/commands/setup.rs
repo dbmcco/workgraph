@@ -1342,15 +1342,13 @@ pub fn run() -> Result<()> {
         .collect();
 
     // Smart default: derive from existing executor, falling back to detected
-    // API keys, falling back to claude-cli (the most common starting point).
+    // API keys, falling back to codex-cli.
     let current_route = if let Some(ref exec) = existing.coordinator.executor {
         SetupRoute::from_executor(exec)
     } else if detection.openrouter_key {
         SetupRoute::Openrouter
-    } else if detection.claude_cli {
-        SetupRoute::ClaudeCli
     } else {
-        SetupRoute::ClaudeCli
+        SetupRoute::CodexCli
     };
     let current_route_idx = route_choices
         .iter()

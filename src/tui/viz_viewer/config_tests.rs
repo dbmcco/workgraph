@@ -835,6 +835,7 @@ new_setting = "hello"
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             });
@@ -871,6 +872,7 @@ new_setting = "hello"
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             });
@@ -885,6 +887,7 @@ new_setting = "hello"
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             });

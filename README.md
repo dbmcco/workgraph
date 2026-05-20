@@ -99,8 +99,8 @@ wg tui
 ### Pick your executor
 
 ```bash
-wg init --route claude-cli                                  # Claude (default)
-wg init --route codex-cli                                   # Codex
+wg init --route codex-cli                                   # Codex (default)
+wg init --route claude-cli                                  # Claude
 wg init -m nex:qwen3-coder -e https://your-endpoint:8080    # any OpenAI-compatible
 ```
 

@@ -64,7 +64,7 @@ fn assert_lockstep_agent_guides(project_dir: &Path) {
 // test_init_without_flags_uses_default_route
 // ---------------------------------------------------------------------------
 
-/// `wg init` with no flags uses the built-in default claude-cli route.
+/// `wg init` with no flags uses the built-in default codex-cli route.
 #[test]
 fn test_init_without_flags_uses_default_route() {
     let tmp = TempDir::new().unwrap();
@@ -85,8 +85,8 @@ fn test_init_without_flags_uses_default_route() {
 
     let config = workgraph::config::Config::load(&wg_dir).expect("config.toml should be loadable");
     assert!(
-        config.agent.model.starts_with("claude:"),
-        "default route should write a claude agent model, got {:?}",
+        config.agent.model.starts_with("codex:"),
+        "default route should write a codex agent model, got {:?}",
         config.agent.model
     );
 }

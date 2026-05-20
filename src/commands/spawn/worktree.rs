@@ -62,13 +62,22 @@ pub fn create_worktree(
         anyhow::bail!("git worktree add failed: {}", stderr.trim());
     }
 
-    // Symlink .wg so wg CLI works from the worktree
+    // Symlink the active state dir into the worktree so wg CLI works from
+    // both modern `.wg` and legacy `.workgraph` project layouts.
     let symlink_target = workgraph_dir
         .canonicalize()
         .context("Failed to canonicalize .wg path")?;
-    let symlink_path = worktree_dir.join(".wg");
-    std::os::unix::fs::symlink(&symlink_target, &symlink_path)
-        .context("Failed to symlink .wg into worktree")?;
+    let active_name = workgraph_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".wg");
+    for link_name in [active_name, ".wg"] {
+        let symlink_path = worktree_dir.join(link_name);
+        if !symlink_path.exists() {
+            std::os::unix::fs::symlink(&symlink_target, &symlink_path)
+                .with_context(|| format!("Failed to symlink {link_name} into worktree"))?;
+        }
+    }
 
     // Run worktree-setup.sh if it exists
     let setup_script = workgraph_dir.join("worktree-setup.sh");

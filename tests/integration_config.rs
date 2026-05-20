@@ -179,7 +179,7 @@ fn init_with_endpoint_and_model() {
             "http://lambda01:8089",
         ],
     );
-    assert!(output.contains("Initialized workgraph"));
+    assert!(output.contains("Initialized WG"));
 
     let config_text = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
     assert!(config_text.contains("local:qwen3-coder"));
@@ -276,14 +276,14 @@ fn config_set_endpoint_url_with_model() {
         ],
     );
     assert!(output.contains("http://lambda01:8089"));
-    assert!(output.contains("local:qwen3-coder"));
+    assert!(output.contains("nex:qwen3-coder"));
 
     let config_text = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
     assert!(config_text.contains("[[llm_endpoints.endpoints]]"));
     assert!(config_text.contains("provider = \"local\""));
     assert!(config_text.contains("url = \"http://lambda01:8089\""));
     assert!(config_text.contains("model = \"qwen3-coder\""));
-    assert!(config_text.contains("local:qwen3-coder"));
+    assert!(config_text.contains("nex:qwen3-coder"));
 }
 
 #[test]

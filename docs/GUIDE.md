@@ -15,13 +15,14 @@ command reference, see [COMMANDS.md](COMMANDS.md).
 
 ### Global config (once, after install)
 
-A fresh install with no `~/.wg/config.toml` already runs `claude:opus` via the
-`claude` CLI handler — built-in defaults cover the common case. The first time
-you want to commit choices to disk you have three options:
+A fresh install with no `~/.wg/config.toml` already runs the central
+`workgraph.codex_cli_premium` route via the `codex` CLI handler — built-in
+defaults cover the common case. The first time you want to commit choices to
+disk you have three options:
 
 ```bash
 wg setup                            # interactive wizard — pick one of 5 named routes
-wg config init --global             # non-interactive: minimal canonical claude-cli config
+wg config init --global             # non-interactive: minimal canonical codex-cli config
 wg config init --global --route openrouter   # non-interactive: openrouter route
 ```
 
@@ -30,8 +31,8 @@ complete, working config (model + tiers + endpoint when applicable):
 
 | Route | Default model spec | Use case |
 |-------|--------------------|----------|
+| `codex-cli` | `codex:gpt-5.5` | Local `codex` CLI login |
 | `claude-cli` | `claude:opus` | Local `claude` CLI login (no API key in config) |
-| `codex-cli` | `codex:gpt-5` | Local `codex` CLI login |
 | `openrouter` | `openrouter:<model>` | One API key, every major provider |
 | `local` | `nex:<model>` | Ollama / vLLM / llama.cpp on `localhost` (via nex) |
 | `nex-custom` | `nex:<model>` | Bring your own OAI-compatible URL + key + model |

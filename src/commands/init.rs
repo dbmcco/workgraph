@@ -79,14 +79,14 @@ pub fn run_with_route(
     // config remains a thin overlay rather than overwriting global with claude
     // defaults. This is what makes `wg profile use codex && cd proj && wg
     // init` work end-to-end: the local config inherits codex rather than
-    // silently restating claude:opus.
+    // silently restating another route.
     let resolved_route = if resolved_route.is_none()
         && executor.is_none()
         && route.is_none()
         && model.is_none()
         && endpoint.is_none()
     {
-        Some(default_route_from_global_or_claude())
+        Some(default_route_from_global_or_codex())
     } else {
         resolved_route
     };
@@ -226,23 +226,23 @@ pub fn run_with_route(
 
 /// Default route for a no-arg `wg init`. Reads `~/.wg/config.toml` and picks
 /// the route whose primary model provider matches the global `[agent].model`
-/// prefix. Falls back to `ClaudeCli` if no global exists or the provider is
+/// prefix. Falls back to `CodexCli` if no global exists or the provider is
 /// unrecognized.
 ///
 /// This is the glue that makes `wg profile use <provider> && wg init` produce
 /// a project config consistent with the active profile. Without it, the
-/// previous default (always ClaudeCli) overwrote codex/nex globals with
-/// claude:opus the moment a user ran `wg init`.
-fn default_route_from_global_or_claude() -> SetupRoute {
+/// previous default (always one route) overwrote codex/nex globals the moment
+/// a user ran `wg init`.
+fn default_route_from_global_or_codex() -> SetupRoute {
     let Ok(Some(global)) = workgraph::config::Config::load_global() else {
-        return SetupRoute::ClaudeCli;
+        return SetupRoute::CodexCli;
     };
     let spec = workgraph::config::parse_model_spec(&global.agent.model);
     spec.provider
         .as_deref()
         .map(workgraph::config::provider_to_executor)
         .and_then(SetupRoute::try_from_executor)
-        .unwrap_or(SetupRoute::ClaudeCli)
+        .unwrap_or(SetupRoute::CodexCli)
 }
 
 /// Map a model spec (e.g. `claude:opus`, `local:qwen3-coder`) to the
@@ -277,7 +277,7 @@ fn emit_executor_deprecation_warning(executor: &str) {
 fn suggested_model_for_executor(executor: &str) -> &'static str {
     match executor {
         "claude" => "claude:opus",
-        "codex" => "codex:gpt-5",
+        "codex" => "codex:gpt-5.5",
         "nex" | "native" => "nex:qwen3-coder -e <ENDPOINT>",
         "shell" => "shell  # exec_mode, not a model — keep the route",
         _ => "<provider>:<model>",

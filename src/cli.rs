@@ -4792,9 +4792,9 @@ pub enum ConfigSubcommand {
         #[arg(long, conflicts_with = "global")]
         local: bool,
 
-        /// Setup route. One of: `claude-cli` (default), `codex-cli`,
+        /// Setup route. One of: `codex-cli` (default), `claude-cli`,
         /// `openrouter`, `local`, `nex-custom`.
-        #[arg(long, default_value = "claude-cli")]
+        #[arg(long, default_value = "codex-cli")]
         route: String,
 
         /// Write only the absolute minimum (`[project]` for local,

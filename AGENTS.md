@@ -61,11 +61,12 @@ The model prefix matches the handler / subcommand name (`claude` / `codex` / `ne
 
 The legacy `--executor` / `-x` flag and `[agent].executor` / `[dispatcher].executor` config keys are deprecated; they still work for one release with a deprecation warning, but the model spec is the single source of truth for which handler runs. Spawned agents continue to receive `WG_EXECUTOR_TYPE` and `WG_MODEL` env vars (handler kind + resolved model). See `src/dispatch/handler_for_model.rs` for the full mapping.
 
-A fresh install with no `~/.wg/config.toml` already runs `claude:opus` via the
-claude CLI handler — built-in defaults cover the common case. To commit choices
-to disk run `wg config init --global` (minimal canonical claude-cli config; pass
-`--route claude-cli` / `codex-cli` / `openrouter` / `local` / `nex-custom` for
-non-default routes) or `wg setup` (interactive wizard). To inspect a config
+A fresh install with no `~/.wg/config.toml` already runs the central
+`workgraph.codex_cli_premium` route via the codex CLI handler — built-in
+defaults cover the common case. To commit choices to disk run `wg config init
+--global` (minimal canonical codex-cli config; pass `--route claude-cli` /
+`codex-cli` / `openrouter` / `local` / `nex-custom` for non-default routes) or
+`wg setup` (interactive wizard). To inspect a config
 without rewriting, run `wg config lint` (read-only companion to `wg migrate
 config`). To clean up an old config with deprecated keys or stale model strings,
 run `wg migrate config --dry-run` then `wg migrate config --all`. `wg config
@@ -94,8 +95,8 @@ storing the secret in `wg`.
 
 `.evaluate-*`, `.flip-*`, and `.assign-*` tasks are short one-shot LLM
 calls (scoring + assignment verdicts), not full worker agents. They are
-pinned to `claude:haiku` running on the claude CLI — the same handler
-worker agents use — and ignore project-level provider cascade from
+pinned to `claude:haiku` running on the claude CLI — still available as an
+explicit worker route — and ignore project-level provider cascade from
 `coordinator.model`. This keeps agency cheap and immune to "openrouter
 configured but no key" silent failures. Power users who *want* a
 non-Anthropic provider for these roles can override per-role via

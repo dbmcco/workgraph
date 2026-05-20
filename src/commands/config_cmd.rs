@@ -559,8 +559,6 @@ pub fn render_minimal_config(
             premium = route_spec("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
         ),
 
-
-
         (R::NexCustom, ConfigScope::Global) => format!(
             "{header}\
              # Edit endpoint url + api_key_env to match your provider.\n\

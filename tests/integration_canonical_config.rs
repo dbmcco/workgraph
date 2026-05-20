@@ -66,9 +66,9 @@ fn fresh_workgraph(tmp: &TempDir) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn defaults_no_user_config_run_claude_opus() {
+fn defaults_no_user_config_run_codex() {
     // With NO ~/.wg/config.toml at all, `wg config --merged` must show
-    // claude executor + opus model. Otherwise the binary's defaults are
+    // codex executor + the central codex premium route. Otherwise the binary's defaults are
     // not the canonical ones the design picked.
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("fakehome");
@@ -82,13 +82,13 @@ fn defaults_no_user_config_run_claude_opus() {
 
     let out = wg_ok(&wg_dir, &home, &["config", "--merged"]);
     assert!(
-        out.contains("claude:opus"),
-        "default agent.model should be claude:opus; got:\n{}",
+        out.contains("codex:"),
+        "default agent.model should be codex-prefixed; got:\n{}",
         out,
     );
     assert!(
-        out.contains("\"claude\""),
-        "default executor should be claude; got:\n{}",
+        out.contains("\"codex\""),
+        "default executor should be codex; got:\n{}",
         out,
     );
 }
@@ -120,21 +120,21 @@ fn config_init_global_writes_minimal_canonical() {
     let body = fs::read_to_string(&path).unwrap();
 
     // After the 2026-05 profile-as-snapshot pivot, `wg config init --global`
-    // for a default route (claude-cli) writes the *claude profile* verbatim.
+    // for the default route (codex-cli) writes the *codex profile* verbatim.
     // The profile is a complete, working config — not a stripped-down
     // "minimal" shell — so it includes [agent], [dispatcher], [tiers],
     // [models.*] sections. This is the single source of truth: profile file
     // = config file.
     assert!(body.contains("[agent]"), "missing [agent]; got:\n{}", body);
     assert!(
-        body.contains("model = \"claude:opus\""),
-        "missing claude:opus; got:\n{}",
+        body.contains("model = \"codex:gpt-5.5\""),
+        "missing codex:gpt-5.5; got:\n{}",
         body
     );
     assert!(body.contains("[tiers]"));
-    assert!(body.contains("fast = \"claude:haiku\""));
-    assert!(body.contains("standard = \"claude:sonnet\""));
-    assert!(body.contains("premium = \"claude:opus\""));
+    assert!(body.contains("fast = \"codex:gpt-5.4-mini\""));
+    assert!(body.contains("standard = \"codex:gpt-5.4\""));
+    assert!(body.contains("premium = \"codex:gpt-5.5\""));
     assert!(body.contains("[models.evaluator]"));
     assert!(body.contains("[models.assigner]"));
 

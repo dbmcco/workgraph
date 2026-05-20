@@ -7,7 +7,7 @@
 
 ## TL;DR
 
-1. **Built-in defaults Just Work**: a fresh install with no `~/.wg/config.toml` runs `claude:opus` via the claude CLI handler, `max_agents=8`, `coordinator_agent=true`. No user file is required for the common case (audit §2 covers every key — built-ins are already mostly correct; this doc just commits to *not writing them out*).
+1. **Built-in defaults Just Work**: a fresh install with no `~/.wg/config.toml` runs the central `workgraph.codex_cli_premium` route via the codex CLI handler, `max_agents=8`, `coordinator_agent=true`. No user file is required for the common case (audit §2 covers every key — built-ins are already mostly correct; this doc just commits to *not writing them out*).
 2. **`wg config init` becomes a real subcommand** (`wg config init --global|--local`). It writes the **minimum** delta vs built-ins: 6 lines for the typical claude-CLI user. Existing `wg config --init` flag stays as a one-release alias.
 3. **`wg setup` is route-driven** (already true) — keep the 5 named routes; add an explicit `--scope global|local|both` flag, and a final summary screen showing exactly which keys will be written and why each was picked. Surface `launcher_history` as the picker default for the model/endpoint prompts.
 4. **Migration: BOTH A and B**. Keep auto-detect-and-warn (B, current), and ship `wg migrate config` (A) as the opt-in command. The warn-only path stays — `wg migrate config` is the "fix it for me" button users can run when they're ready. No major-version break.
@@ -44,7 +44,7 @@ The audit (§2 "Full key inventory") already maps every key to G / P / B / N. Th
 
 ## 2. Built-in defaults policy (no user file needed)
 
-Goal from task description: *"a fresh install with no `~/.wg/config.toml` should Just Work for the most common case (claude CLI executor, opus model, sensible parallelism)."*
+Goal from task description, updated for Speedrift defaults: *"a fresh install with no `~/.wg/config.toml` should Just Work for the common Speedrift path (codex CLI executor, central codex premium route, sensible parallelism)."*
 
 The audit (§4 "Minimal global config") shows the built-ins already cover this — `agent.model = "claude:opus"` (audit §2 `[agent]`), `dispatcher.max_agents = 8` (audit §2 `[dispatcher]`), `coordinator_agent = true` (audit §2 `[dispatcher]` `coordinator_agent`). **Decision: do not change any built-in default values.** They are correct. What changes:
 

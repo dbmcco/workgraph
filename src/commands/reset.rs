@@ -203,6 +203,7 @@ pub fn run(dir: &Path, seeds: &[String], opts: ResetOptions) -> Result<ResetRepo
                 task.completed_at = None;
                 task.failure_reason = None;
                 task.retry_count = 0;
+                task.paused = false;
                 // Mirror `wg unclaim`: a reset task should be ready for a
                 // fresh dispatcher pickup, so clear claim fields too.
                 // Without this, dead-agent claims survive `wg reset` and
