@@ -39,7 +39,7 @@ struct MyClient;
 impl ClientHandler for MyClient {
     fn get_info(&self) -> ClientInfo {
         ClientInfo {
-            name: "workgraph-agent".into(),
+            name: "wg-agent".into(),
             version: "0.1.0".into(),
         }
     }
@@ -215,7 +215,7 @@ Currently, the native executor has a static `ToolRegistry` built at startup (`To
 
 ### Key Components
 
-#### 1. MCP Server Configuration (`~/.workgraph/mcp_servers.toml` or per-project)
+#### 1. MCP Server Configuration (`~/.wg/mcp_servers.toml` or per-project)
 
 ```toml
 [servers.filesystem]
@@ -352,7 +352,7 @@ struct WgClient;
 impl ClientHandler for WgClient {
     fn get_info(&self) -> ClientInfo {
         ClientInfo {
-            name: "workgraph-poc".into(),
+            name: "wg-poc".into(),
             version: "0.1.0".into(),
         }
     }
@@ -381,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
     // Call a tool
     let result = peer.call_tool(CallToolRequestParam {
         name: "echo".into(),
-        arguments: serde_json::json!({"message": "hello from workgraph"})
+        arguments: serde_json::json!({"message": "hello from wg"})
             .as_object().cloned(),
     }).await?;
 

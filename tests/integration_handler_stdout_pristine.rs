@@ -12,7 +12,7 @@
 //! the json-line stream.
 //!
 //! Strategy:
-//! 1. Initialise a workgraph in a tempdir.
+//! 1. Initialise WG in a tempdir.
 //! 2. Write a `config.toml` containing the deprecated `[coordinator]`
 //!    section (canonical form is `[dispatcher]`). Loading this config
 //!    must emit a deprecation warning.
@@ -70,7 +70,7 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
 }
 
 fn init_workgraph(tmp: &TempDir) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     wg_ok(&wg_dir, &["init", "--executor", "shell"]);
     wg_dir
 }

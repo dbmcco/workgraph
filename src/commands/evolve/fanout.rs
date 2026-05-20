@@ -3,13 +3,62 @@ use std::fs;
 use std::path::Path;
 
 use workgraph::agency::{Evaluation, Role, TradeoffConfig};
-use workgraph::config::Config;
+use workgraph::config::{Config, DispatchRole, Tier};
 use workgraph::graph::{CycleConfig, Node, Status, Task};
 use workgraph::parser::{load_graph, modify_graph};
 
 use super::partition::{self, AnalyzerSlice};
 use super::prompt::{build_analyzer_prompt, load_evolver_skills};
 use super::strategy::Strategy;
+
+/// Resolve a quality tier to a fully-qualified model spec via the project's
+/// `[tiers]` config (preserves the user's provider prefix, e.g. `codex:gpt-5.4`).
+fn tier_to_model_spec(config: &Config, tier: Tier) -> String {
+    let tiers = config.effective_tiers_public();
+    match tier {
+        Tier::Fast => tiers.fast,
+        Tier::Standard => tiers.standard,
+        Tier::Premium => tiers.premium,
+    }
+    .unwrap_or_else(|| format!("claude:{}", tier.default_alias()))
+}
+
+/// Resolve the model spec for evolver-coordination tasks (synthesize / apply /
+/// evaluate). Honors, in order:
+///
+///   1. CLI `--model` override (applies to every task in the run).
+///   2. `[models.evolver].model` (explicit per-role override; preserves the
+///      user-written prefix as-is so a `codex:gpt-5.5` config produces a
+///      `codex:gpt-5.5` task and routes to the codex CLI).
+///   3. `[models.evolver].tier` resolved through `[tiers]`.
+///   4. `DispatchRole::Evolver`'s default tier (Premium) resolved through `[tiers]`.
+fn evolver_model_spec(config: &Config, override_model: Option<&str>) -> String {
+    if let Some(m) = override_model {
+        return m.to_string();
+    }
+    if let Some(role_cfg) = config.models.get_role(DispatchRole::Evolver) {
+        if let Some(model) = &role_cfg.model {
+            return model.clone();
+        }
+        if let Some(tier) = role_cfg.tier {
+            return tier_to_model_spec(config, tier);
+        }
+    }
+    tier_to_model_spec(config, DispatchRole::Evolver.default_tier())
+}
+
+/// Resolve the model spec for an analyzer task. Honors `--model` override,
+/// otherwise resolves the slice's quality tier through `[tiers]`.
+fn analyzer_model_spec(
+    config: &Config,
+    override_model: Option<&str>,
+    slice: &AnalyzerSlice,
+) -> String {
+    if let Some(m) = override_model {
+        return m.to_string();
+    }
+    slice.model_tier.resolve_model(config)
+}
 
 /// Fan-out threshold: below this eval count, use single-shot mode.
 pub const FANOUT_THRESHOLD: usize = 50;
@@ -25,7 +74,7 @@ pub fn run_fanout(
     dry_run: bool,
     strategy: Option<&str>,
     budget: Option<u32>,
-    _model: Option<&str>,
+    model: Option<&str>,
     json: bool,
     autopoietic: bool,
     max_iterations: Option<u32>,
@@ -33,7 +82,7 @@ pub fn run_fanout(
     roles: &[Role],
     tradeoffs: &[TradeoffConfig],
     evaluations: &[Evaluation],
-    _config: &Config,
+    config: &Config,
 ) -> Result<()> {
     let run_id = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
 
@@ -43,7 +92,7 @@ pub fn run_fanout(
         None => Strategy::all_individual(),
     };
 
-    // Create run directory under .workgraph/evolve-runs/
+    // Create run directory under .wg/evolve-runs/
     let run_dir = dir.join(format!("evolve-runs/{}", run_id));
     fs::create_dir_all(&run_dir)
         .with_context(|| format!("Failed to create run directory: {}", run_dir.display()))?;
@@ -102,6 +151,8 @@ pub fn run_fanout(
             cycle_delay,
             json,
             evaluations.len(),
+            config,
+            model,
         );
         // Clean up run dir since this is dry run
         let _ = fs::remove_dir_all(&run_dir);
@@ -119,23 +170,23 @@ pub fn run_fanout(
             "## Evolver Partition ({run_id})\n\n\
              ### Iteration 0 (Pre-completed)\n\
              Partitioned {n_evals} evaluations into {n_slices} strategy slices.\n\
-             Pre-evolution snapshot: `.workgraph/evolve-runs/{run_id}/snapshot-iter-0.json`\n\n\
+             Pre-evolution snapshot: `.wg/evolve-runs/{run_id}/snapshot-iter-0.json`\n\n\
              ### On Re-Iteration\n\
              When this task re-opens after a cycle reset:\n\
-             1. Read self-assessment from `.workgraph/evolve-runs/{run_id}/self-assessment-latest.json`\n\
-             2. Load current agency data (roles, tradeoffs, evaluations from `.workgraph/agency/`)\n\
+             1. Read self-assessment from `.wg/evolve-runs/{run_id}/self-assessment-latest.json`\n\
+             2. Load current agency data (roles, tradeoffs, evaluations from `.wg/agency/`)\n\
              3. Re-partition evaluations, prioritizing strategies the self-assessment identified as high-impact\n\
-             4. Update slice files in `.workgraph/evolve-runs/{run_id}/` (`<strategy>-slice.json`)\n\
-             5. Save new snapshot: `.workgraph/evolve-runs/{run_id}/snapshot-iter-<N>.json` (N = loop_iteration)\n\
+             4. Update slice files in `.wg/evolve-runs/{run_id}/` (`<strategy>-slice.json`)\n\
+             5. Save new snapshot: `.wg/evolve-runs/{run_id}/snapshot-iter-<N>.json` (N = loop_iteration)\n\
              6. If the self-assessment recommends new strategies, create additional analyzer tasks with `wg add`\n\n\
-             Run dir: .workgraph/evolve-runs/{run_id}",
+             Run dir: .wg/evolve-runs/{run_id}",
             run_id = run_id,
             n_evals = evaluations.len(),
             n_slices = slices.len(),
         )
     } else {
         format!(
-            "Partitioned {} evaluations into {} strategy slices.\nRun dir: .workgraph/evolve-runs/{}",
+            "Partitioned {} evaluations into {} strategy slices.\nRun dir: .wg/evolve-runs/{}",
             evaluations.len(),
             slices.len(),
             run_id
@@ -170,7 +221,7 @@ pub fn run_fanout(
             _ => "No skill document available for this strategy.".to_string(),
         };
 
-        let model = slice.model_tier.label();
+        let analyzer_model = analyzer_model_spec(config, model, slice);
 
         let description =
             build_analyzer_prompt(*strategy, &run_id, &skill_doc, &slice.summary, &agency_dir);
@@ -182,7 +233,7 @@ pub fn run_fanout(
             status: Status::Open,
             after: vec![partition_task_id.clone()],
             tags: vec!["evolution".into(), "analyzer".into()],
-            model: Some(model.to_string()),
+            model: Some(analyzer_model),
             ..Task::default()
         };
         graph.add_node(Node::Task(analyzer_task));
@@ -202,7 +253,7 @@ pub fn run_fanout(
     let synthesize_description = format!(
         r#"## Evolver Synthesizer
 
-Read all analyzer proposals from `.workgraph/evolve-runs/{run_id}/` and produce a unified operation set.
+Read all analyzer proposals from `.wg/evolve-runs/{run_id}/` and produce a unified operation set.
 
 ### Input Files
 {input_files}
@@ -216,7 +267,7 @@ Read all analyzer proposals from `.workgraph/evolve-runs/{run_id}/` and produce 
 6. Write unified result
 
 ### Output
-Write to `.workgraph/evolve-runs/{run_id}/synthesis-result.json`:
+Write to `.wg/evolve-runs/{run_id}/synthesis-result.json`:
 
 ```json
 {{
@@ -250,6 +301,8 @@ Write to `.workgraph/evolve-runs/{run_id}/synthesis-result.json`:
         budget = budget.map_or("unlimited".to_string(), |b| b.to_string()),
     );
 
+    let coord_model = evolver_model_spec(config, model);
+
     let synthesize_task = Task {
         id: synthesize_task_id.clone(),
         title: format!("Evolve synthesizer ({})", run_id),
@@ -257,7 +310,7 @@ Write to `.workgraph/evolve-runs/{run_id}/synthesis-result.json`:
         status: Status::Open,
         after: analyzer_task_ids.clone(),
         tags: vec!["evolution".into(), "synthesizer".into()],
-        model: Some("sonnet".to_string()),
+        model: Some(coord_model.clone()),
         ..Task::default()
     };
     graph.add_node(Node::Task(synthesize_task));
@@ -279,13 +332,13 @@ Write to `.workgraph/evolve-runs/{run_id}/synthesis-result.json`:
 Apply the synthesized evolution operations.
 
 ### Input
-Read from: `.workgraph/evolve-runs/{run_id}/synthesis-result.json`
+Read from: `.wg/evolve-runs/{run_id}/synthesis-result.json`
 
 ### Instructions
 1. Read the synthesis result
 2. For each operation, call the appropriate apply function
 3. Handle deferred operations (self-mutation safety)
-4. Write results to `.workgraph/evolve-runs/{run_id}/apply-results.json`
+4. Write results to `.wg/evolve-runs/{run_id}/apply-results.json`
 
 ## Validation
 - All accepted operations are attempted
@@ -301,7 +354,7 @@ Read from: `.workgraph/evolve-runs/{run_id}/synthesis-result.json`
         status: Status::Open,
         after: vec![synthesize_task_id.clone()],
         tags: vec!["evolution".into(), "apply".into()],
-        model: Some("sonnet".to_string()),
+        model: Some(coord_model.clone()),
         ..Task::default()
     };
     graph.add_node(Node::Task(apply_task));
@@ -319,9 +372,9 @@ Read from: `.workgraph/evolve-runs/{run_id}/synthesis-result.json`
             "## Evolver Evaluate ({run_id})\n\n\
              Evaluate the impact of this evolution iteration and determine convergence.\n\n\
              ### Input\n\
-             - Pre-evolution snapshot: `.workgraph/evolve-runs/{run_id}/snapshot-iter-<N>.json` (N = loop_iteration)\n\
-             - Apply results: `.workgraph/evolve-runs/{run_id}/apply-results.json`\n\
-             - Current agency data: `.workgraph/agency/`\n\n\
+             - Pre-evolution snapshot: `.wg/evolve-runs/{run_id}/snapshot-iter-<N>.json` (N = loop_iteration)\n\
+             - Apply results: `.wg/evolve-runs/{run_id}/apply-results.json`\n\
+             - Current agency data: `.wg/agency/`\n\n\
              ### Instructions\n\
              1. Determine current iteration from `wg show {evaluate_id}` → `loop_iteration`\n\
              2. Load pre-iteration snapshot (`snapshot-iter-<loop_iteration>.json`)\n\
@@ -330,7 +383,7 @@ Read from: `.workgraph/evolve-runs/{run_id}/synthesis-result.json`
                 - Compare pre/post evaluation scores\n\
                 - Classify as improved, degraded, or neutral\n\
              5. Compute overall score delta (average absolute change across all modified entities)\n\
-             6. Write self-assessment to `.workgraph/evolve-runs/{run_id}/self-assessment-latest.json`:\n\
+             6. Write self-assessment to `.wg/evolve-runs/{run_id}/self-assessment-latest.json`:\n\
                 ```json\n\
                 {{\n\
                   \"iteration\": <N>,\n\
@@ -369,14 +422,14 @@ Read from: `.workgraph/evolve-runs/{run_id}/synthesis-result.json`
 Evaluate the results of the evolution run.
 
 ### Input
-- Pre-evolution snapshot: `.workgraph/evolve-runs/{run_id}/snapshot-iter-0.json`
-- Apply results: `.workgraph/evolve-runs/{run_id}/apply-results.json`
+- Pre-evolution snapshot: `.wg/evolve-runs/{run_id}/snapshot-iter-0.json`
+- Apply results: `.wg/evolve-runs/{run_id}/apply-results.json`
 
 ### Instructions
 1. Compare pre-evolution performance snapshot with current state
 2. Document which operations were applied vs skipped
 3. Assess overall impact
-4. Write evolution report to `.workgraph/evolve-runs/{run_id}/evolution-report.json`
+4. Write evolution report to `.wg/evolve-runs/{run_id}/evolution-report.json`
 
 ## Validation
 - Report covers all applied operations
@@ -392,7 +445,7 @@ Evaluate the results of the evolution run.
         status: Status::Open,
         after: vec![apply_task_id.clone()],
         tags: vec!["evolution".into(), "evaluate".into()],
-        model: Some("sonnet".to_string()),
+        model: Some(coord_model.clone()),
         ..Task::default()
     };
     graph.add_node(Node::Task(evaluate_task));
@@ -468,9 +521,11 @@ Evaluate the results of the evolution run.
                     "strategy": s.label(),
                     "evaluations": sl.stats.evaluations_in_slice,
                     "roles": sl.stats.roles_in_slice,
-                    "model": sl.model_tier.label(),
+                    "tier": sl.model_tier.label(),
+                    "model": analyzer_model_spec(config, model, sl),
                 })
             }).collect::<Vec<_>>(),
+            "coord_model": coord_model,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
@@ -482,12 +537,15 @@ Evaluate the results of the evolution run.
                 strategy.label(),
                 slice.stats.evaluations_in_slice,
                 slice.stats.roles_in_slice,
-                slice.model_tier.label(),
+                analyzer_model_spec(config, model, slice),
             );
         }
-        println!("  Synthesizer: {}", synthesize_task_id);
-        println!("  Apply: {}", apply_task_id);
-        println!("  Evaluate: {}", evaluate_task_id);
+        println!(
+            "  Synthesizer: {} (model: {})",
+            synthesize_task_id, coord_model
+        );
+        println!("  Apply: {} (model: {})", apply_task_id, coord_model);
+        println!("  Evaluate: {} (model: {})", evaluate_task_id, coord_model);
         if autopoietic {
             println!(
                 "  Cycle: {} iterations, {} second delay",
@@ -563,7 +621,10 @@ fn print_dry_run(
     cycle_delay: Option<u64>,
     json: bool,
     total_evals: usize,
+    config: &Config,
+    model_override: Option<&str>,
 ) {
+    let coord_model = evolver_model_spec(config, model_override);
     if json {
         let slice_json: Vec<serde_json::Value> = slices
             .iter()
@@ -572,7 +633,8 @@ fn print_dry_run(
                     "strategy": s.label(),
                     "evaluations": sl.stats.evaluations_in_slice,
                     "roles": sl.stats.roles_in_slice,
-                    "model": sl.model_tier.label(),
+                    "tier": sl.model_tier.label(),
+                    "model": analyzer_model_spec(config, model_override, sl),
                     "truncated": sl.stats.truncated,
                 })
             })
@@ -597,6 +659,7 @@ fn print_dry_run(
             "budget": budget,
             "slices": slice_json,
             "task_graph": task_graph,
+            "coord_model": coord_model,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return;
@@ -644,10 +707,11 @@ fn print_dry_run(
             "  {:<22} {:>30}   (model: {})",
             format!("{}:", strategy.label()),
             eval_info,
-            slice.model_tier.label(),
+            analyzer_model_spec(config, model_override, slice),
         );
     }
 
+    println!("\nCoord model:     {}", coord_model);
     println!("\nTask graph:");
     let partition = format!(".evolve-partition-{}", run_id);
     println!("  {}", partition);
@@ -683,7 +747,7 @@ mod tests {
 
     fn setup_test_env() -> (TempDir, std::path::PathBuf) {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         let graph = WorkGraph::new();
@@ -714,6 +778,12 @@ mod tests {
             id: id.to_string(),
             name: format!("Tradeoff {}", id),
             description: "test tradeoff".to_string(),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             acceptable_tradeoffs: vec![],
             unacceptable_tradeoffs: vec![],
             performance: PerformanceRecord {
@@ -744,6 +814,7 @@ mod tests {
             timestamp: "2026-03-13T12:00:00Z".to_string(),
             model: None,
             source: "llm".to_string(),
+            loop_iteration: 0,
         }
     }
 

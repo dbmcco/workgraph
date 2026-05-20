@@ -12,6 +12,7 @@ pub mod agency_scan;
 pub mod agency_stats;
 pub mod agent;
 pub mod agent_crud;
+pub mod agent_guide;
 pub mod agents;
 pub mod aging;
 pub mod analyze;
@@ -27,6 +28,8 @@ pub mod chat_session;
 pub mod check;
 pub mod checkpoint;
 pub mod claim;
+pub mod claim_lifecycle;
+pub mod classify_failure;
 pub mod claude_handler;
 pub mod cleanup;
 pub mod codex_handler;
@@ -39,6 +42,7 @@ pub mod cost;
 pub mod critical_path;
 pub mod cycles;
 pub mod dead_agents;
+pub mod dev_check;
 pub mod discover;
 pub mod done;
 pub mod edit;
@@ -85,6 +89,7 @@ pub mod peer;
 pub mod placement;
 pub mod plan;
 pub mod profile_cmd;
+pub mod publish;
 pub mod quickstart;
 pub mod ready;
 pub mod reap;
@@ -105,6 +110,7 @@ pub mod role;
 pub mod runs_cmd;
 pub mod screencast_autopilot;
 pub mod screencast_render;
+pub mod secret_cmd;
 pub mod server;
 pub mod service;
 pub mod setup;
@@ -143,18 +149,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use workgraph::parser::load_graph;
 
-/// Load the workgraph (immutable) from the given directory.
+/// Load the WG task graph (immutable) from the given directory.
 /// Returns the graph and the path to the graph file (needed for save_graph).
 pub fn load_workgraph(dir: &Path) -> Result<(workgraph::graph::WorkGraph, PathBuf)> {
     let path = graph_path(dir);
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
     let graph = load_graph(&path).context("Failed to load graph")?;
     Ok((graph, path))
 }
 
-/// Load the workgraph (mutable) from the given directory.
+/// Load the WG task graph (mutable) from the given directory.
 /// Returns the graph and the path to the graph file (needed for save_graph).
 pub fn load_workgraph_mut(dir: &Path) -> Result<(workgraph::graph::WorkGraph, PathBuf)> {
     load_workgraph(dir)
@@ -592,7 +598,7 @@ mod provenance_coverage_tests {
         )
         .unwrap();
 
-        super::fail::run(dir, "prov-fail", Some("timeout")).unwrap();
+        super::fail::run(dir, "prov-fail", Some("timeout"), None).unwrap();
         let entries = ops_with_type(dir, "fail");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].detail["reason"], "timeout");
@@ -708,7 +714,7 @@ mod provenance_coverage_tests {
         )
         .unwrap();
 
-        super::fail::run(dir, "prov-retry", Some("compile error")).unwrap();
+        super::fail::run(dir, "prov-retry", Some("compile error"), None).unwrap();
         super::retry::run(dir, "prov-retry", false, false, None).unwrap();
 
         let entries = ops_with_type(dir, "retry");
@@ -954,7 +960,7 @@ mod provenance_coverage_tests {
             false, // subtask
         )
         .unwrap();
-        super::fail::run(dir, "prov-gc", Some("oops")).unwrap();
+        super::fail::run(dir, "prov-gc", Some("oops"), None).unwrap();
         super::abandon::run(dir, "prov-gc", Some("giving up"), &[]).unwrap();
 
         super::gc::run(dir, false, false, None).unwrap();
@@ -968,6 +974,16 @@ mod provenance_coverage_tests {
     fn provenance_full_lifecycle_all_ops_recorded() {
         let tmp = setup_dir();
         let dir = tmp.path();
+
+        // Disable agency scaffolding so resume() doesn't create
+        // .assign-lifecycle / .flip-lifecycle / .evaluate-lifecycle blockers
+        // that would prevent the final done() call. The test cares about
+        // provenance ops, not the eval pipeline.
+        std::fs::write(
+            dir.join("config.toml"),
+            b"[agency]\nauto_assign = false\nauto_evaluate = false\n",
+        )
+        .unwrap();
 
         // add
         super::add::run(
@@ -1059,7 +1075,7 @@ mod provenance_coverage_tests {
         // unclaim
         super::claim::unclaim(dir, "lifecycle").unwrap();
         // fail
-        super::fail::run(dir, "lifecycle", Some("timeout")).unwrap();
+        super::fail::run(dir, "lifecycle", Some("timeout"), None).unwrap();
         // retry
         super::retry::run(dir, "lifecycle", false, false, None).unwrap();
         // done

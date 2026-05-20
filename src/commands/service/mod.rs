@@ -9,7 +9,7 @@
 //!   wg service stop [--force]                                        # Stop the service daemon
 //!   wg service status                                                # Show service + coordinator state
 //!
-//! The daemon respects coordinator config from .workgraph/config.toml:
+//! The daemon respects coordinator config from .wg/config.toml:
 //!   [coordinator]
 //!   max_agents = 4       # Maximum parallel agents
 //!   poll_interval = 5    # Background safety-net poll interval (seconds)
@@ -48,6 +48,47 @@ use workgraph::parser::load_graph;
 use workgraph::service::registry::AgentRegistry;
 
 use super::{graph_path, is_process_alive, kill_process_force, kill_process_graceful};
+
+/// Threshold for "recent" consumer activity when deciding whether a chat is
+/// active. A chat counts as active if any consumer touched its cursor file or
+/// pushed an inbox message within this many seconds. Matches the chat
+/// supervisor's idle threshold so the cap counter, supervisor respawn rule,
+/// and purge-skip rule all agree on what "live" means.
+pub(crate) const PURGE_ACTIVE_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// True when chat `chat_id` looks active on disk: either its inbox has unread
+/// messages or its consumer cursor file (`.cursor`) was modified within
+/// `PURGE_ACTIVE_THRESHOLD`. This is the "consumer ping" signal — a TUI or
+/// CLI that's reading the chat keeps the cursor fresh.
+///
+/// Does NOT consider `WG_CHAT_REF` or any env-based hint (callers wire that
+/// in separately as the higher-priority self-protection check).
+pub(crate) fn is_chat_active_on_disk(dir: &Path, chat_id: u32) -> bool {
+    !workgraph::chat::chat_session_is_idle(dir, chat_id, PURGE_ACTIVE_THRESHOLD)
+}
+
+/// Best-effort: parse the chat ID the calling `wg` invocation thinks it is
+/// running inside, by reading `WG_CHAT_REF` / `WG_CHAT_ID` from env. Accepts:
+///   - `.chat-N` / `.coordinator-N` task ids (parse_chat_task_id)
+///   - `coordinator-N` aliases
+///   - bare numeric `N`
+/// Returns `None` if no env var is set or the value is unparseable.
+/// CLI-side helper — the daemon itself never has these env vars set so it
+/// receives the parsed ID via IPC instead.
+pub(crate) fn detect_caller_chat_id_from_env() -> Option<u32> {
+    let raw = std::env::var("WG_CHAT_REF")
+        .ok()
+        .or_else(|| std::env::var("WG_CHAT_ID").ok())?;
+    if let Some(id) = workgraph::chat_id::parse_chat_task_id(&raw) {
+        return Some(id);
+    }
+    if let Some(rest) = raw.strip_prefix("coordinator-")
+        && let Ok(id) = rest.parse::<u32>()
+    {
+        return Some(id);
+    }
+    raw.parse::<u32>().ok()
+}
 
 fn resolve_service_coordinator_settings(
     dir: &Path,
@@ -209,7 +250,7 @@ struct DaemonLoggerInner {
 }
 
 impl DaemonLogger {
-    /// Open (or create) the log file at `.workgraph/service/daemon.log`.
+    /// Open (or create) the log file at `.wg/service/daemon.log`.
     pub fn open(dir: &Path) -> Result<Self> {
         let service_dir = dir.join("service");
         if !service_dir.exists() {
@@ -376,7 +417,7 @@ fn short_hash(hash: &[u8; 32]) -> String {
     hex::encode(&hash[..6])
 }
 
-/// Default socket path (project-specific, inside .workgraph dir)
+/// Default socket path (project-specific, inside .wg dir)
 pub fn default_socket_path(dir: &Path) -> PathBuf {
     dir.join("service").join("daemon.sock")
 }
@@ -503,12 +544,6 @@ pub struct CoordinatorState {
     /// Effective config: model for spawned agents
     #[serde(default)]
     pub model: Option<String>,
-    /// Persisted executor override from runtime reconfigure operations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executor_override: Option<String>,
-    /// Persisted model override from runtime reconfigure operations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<String>,
     /// Total coordinator ticks completed
     pub ticks: u64,
     /// ISO 8601 timestamp of the last tick
@@ -536,6 +571,20 @@ pub struct CoordinatorState {
     /// Session cost tracking for OpenRouter cost caps
     #[serde(default)]
     pub cost_tracking: SessionCostTracking,
+    /// Per-coordinator model override. When set, the coordinator agent uses this
+    /// model instead of the daemon-wide default. Persists across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Per-coordinator executor override. When set, the coordinator agent uses this
+    /// executor instead of the daemon-wide default. Persists across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_override: Option<String>,
+    /// Per-coordinator endpoint override. When set, the chat handler uses this
+    /// LLM endpoint URL instead of the daemon-wide default. Lets a single chat
+    /// hit a specific server (e.g. `wg nex -m qwen3-coder -e https://...`)
+    /// without rewriting global config. Persists across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 impl CoordinatorState {
@@ -779,7 +828,7 @@ pub fn generate_systemd_service(dir: &Path) -> Result<()> {
     // ExecStart uses `wg service start` - the service daemon includes the coordinator
     let service_content = format!(
         r#"[Unit]
-Description=Workgraph Service ({project_name})
+Description=WG Service ({project_name})
 After=network.target
 
 [Service]
@@ -816,7 +865,7 @@ WantedBy=default.target
 
     println!("Created systemd user service: {}", service_path.display());
     println!();
-    println!("Settings are read from .workgraph/config.toml");
+    println!("Settings are read from .wg/config.toml");
     println!("To change settings: wg config --max-agents N --interval N");
     println!();
     println!("To enable and start:");
@@ -895,7 +944,7 @@ pub fn run_tick(
 
     let graph_path = graph_path(dir);
     if !graph_path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let model = model
@@ -1071,7 +1120,7 @@ pub fn run_start(
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!(
-                    "Found orphan daemon process(es) for this workgraph: PID {}",
+                    "Found orphan daemon process(es) for this WG project: PID {}",
                     pids.join(", ")
                 );
                 println!("Use 'wg service start --force' to kill them and start fresh.");
@@ -1825,16 +1874,51 @@ fn run_automatic_archival(dir: &Path, archival_error_count: &mut u64, logger: &D
     }
 }
 
+/// Daemon-side state for the model-registry refresh job: failure count
+/// and an optional cooldown window. After
+/// `REGISTRY_REFRESH_FAILURE_THRESHOLD` consecutive failures the daemon
+/// stops trying for `REGISTRY_REFRESH_COOLDOWN` so a missing API key
+/// doesn't pile 25+ identical errors into the daemon log per hour.
+#[derive(Default)]
+pub(crate) struct RegistryRefreshState {
+    /// Consecutive failure count. Resets on success.
+    pub error_count: u64,
+    /// When set, skip refresh attempts until this instant.
+    pub cooldown_until: Option<std::time::Instant>,
+}
+
+/// Number of consecutive failures that trips the circuit breaker.
+const REGISTRY_REFRESH_FAILURE_THRESHOLD: u64 = 5;
+/// How long the breaker stays open once tripped.
+const REGISTRY_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Run model registry refresh directly from the daemon without graph control tasks.
 ///
 /// Time-gated: only fires when at least `registry_refresh_interval` seconds
 /// have elapsed since the last successful refresh (stored in
 /// `model_benchmarks.json`'s `fetched_at` field). Set interval to 0 to disable.
-fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &DaemonLogger) {
+///
+/// Circuit-breaker: after 5 consecutive failures the breaker opens for 1
+/// hour. Manual `wg config reload` or `wg openrouter status` (i.e. any
+/// path that re-resolves the API key successfully) implicitly clears the
+/// breaker on the next daemon restart; we deliberately keep the breaker
+/// state in-memory so a fresh daemon process always retries once before
+/// re-tripping.
+fn run_registry_refresh(dir: &Path, state: &mut RegistryRefreshState, logger: &DaemonLogger) {
     let config = workgraph::config::Config::load_or_default(dir);
     let interval = config.coordinator.registry_refresh_interval;
     if interval == 0 {
         return; // Disabled
+    }
+
+    // Circuit breaker: after a recent burst of failures, hold off and
+    // don't even attempt the fetch. The instant the cooldown expires we
+    // try once more — success clears the breaker, another failure
+    // starts a fresh cooldown.
+    if let Some(until) = state.cooldown_until
+        && std::time::Instant::now() < until
+    {
+        return;
     }
 
     // Time gate: check if enough time has elapsed since the last fetch.
@@ -1851,23 +1935,48 @@ fn run_registry_refresh(dir: &Path, refresh_error_count: &mut u64, logger: &Daem
     }
 
     // Run the actual refresh
-    match do_registry_refresh(dir) {
+    let outcome = do_registry_refresh(dir);
+    record_registry_refresh_outcome(state, outcome, logger);
+}
+
+/// Update circuit-breaker state from a refresh outcome and log
+/// transitions. Extracted so unit tests can drive the state machine
+/// without any IO or daemon plumbing.
+pub(crate) fn record_registry_refresh_outcome(
+    state: &mut RegistryRefreshState,
+    outcome: Result<String>,
+    logger: &DaemonLogger,
+) {
+    match outcome {
         Ok(summary) => {
-            if *refresh_error_count > 0 {
+            if state.error_count > 0 {
                 logger.info(&format!(
                     "Registry refresh recovered after {} consecutive error(s)",
-                    *refresh_error_count
+                    state.error_count
                 ));
             }
-            *refresh_error_count = 0;
+            state.error_count = 0;
+            state.cooldown_until = None;
             logger.info(&format!("Registry refresh complete: {}", summary));
         }
         Err(e) => {
-            *refresh_error_count += 1;
-            if *refresh_error_count == 1 || (*refresh_error_count).is_multiple_of(5) {
+            state.error_count += 1;
+            // Log the first error verbatim, then go quiet — we only
+            // surface the *threshold* event after that. This is the
+            // anti-spam guarantee the user asked for.
+            if state.error_count == 1 {
                 logger.error(&format!(
                     "Registry refresh error (#{} consecutive): {:#}",
-                    *refresh_error_count, e
+                    state.error_count, e
+                ));
+            } else if state.error_count == REGISTRY_REFRESH_FAILURE_THRESHOLD {
+                state.cooldown_until = Some(std::time::Instant::now() + REGISTRY_REFRESH_COOLDOWN);
+                logger.error(&format!(
+                    "Registry refresh: {} consecutive failures — cooling down for {} minutes. \
+                     Last error: {:#}",
+                    state.error_count,
+                    REGISTRY_REFRESH_COOLDOWN.as_secs() / 60,
+                    e
                 ));
             }
         }
@@ -2122,6 +2231,7 @@ pub fn run_daemon(
         cost_tracking: SessionCostTracking::default(),
         model_override: None,
         executor_override: None,
+        endpoint_override: None,
     };
     coord_state.save(&dir);
 
@@ -2356,7 +2466,7 @@ pub fn run_daemon(
 
     // Restore error counts from persisted state so they survive daemon restarts
     let mut archival_error_count: u64 = 0;
-    let mut refresh_error_count: u64 = 0;
+    let mut registry_refresh_state = RegistryRefreshState::default();
 
     // Obtain the raw fd for poll()-based waiting. This lets the daemon
     // sleep until an IPC connection arrives OR a timeout expires, instead
@@ -2738,7 +2848,7 @@ pub fn run_daemon(
                     run_automatic_archival(&dir, &mut archival_error_count, &logger);
 
                     // Registry refresh runs directly in the daemon and is time-gated.
-                    run_registry_refresh(&dir, &mut refresh_error_count, &logger);
+                    run_registry_refresh(&dir, &mut registry_refresh_state, &logger);
 
                     // Re-arm the self-write quiet window after the tick: the
                     // archival / registry-refresh phases above can also write
@@ -3159,7 +3269,7 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
             && coord.tasks_ready > 0
         {
             output["agents"]["note"] = serde_json::json!(
-                "tasks are ready but no agents have been spawned — check agent configuration"
+                "tasks are ready but no agents have been spawned — possible causes: (a) agent configuration; (b) stale `assigned` claims from dead agents (run `wg list --status open` to inspect; `wg unclaim <task>` clears one claim, `wg reset <task> --yes` clears + reopens)"
             );
         }
         if !recent_errors.is_empty() || !recent_fatals.is_empty() {
@@ -3187,7 +3297,7 @@ pub fn run_status(dir: &Path, json: bool) -> Result<()> {
                 && coord.tasks_ready > 0
             {
                 println!(
-                    "  Note: tasks are ready but no agents have been spawned — check agent configuration"
+                    "  Note: tasks are ready but no agents have been spawned — possible causes: (a) agent configuration; (b) stale `assigned` claims from dead agents (run `wg list --status open` to inspect; `wg unclaim <task>` clears one claim, `wg reset <task> --yes` clears + reopens)"
                 );
             }
         }
@@ -3254,6 +3364,7 @@ pub fn run_reload(
         executor: executor.map(std::string::ToString::to_string),
         poll_interval: interval,
         model: model.map(std::string::ToString::to_string),
+        profile: None,
     };
 
     let response = send_request(dir, &request)?;
@@ -3579,6 +3690,8 @@ pub fn run_create_coordinator(
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
+    endpoint: Option<&str>,
+    command: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let response = send_request(
@@ -3587,6 +3700,8 @@ pub fn run_create_coordinator(
             name: name.map(|s| s.to_string()),
             model: model.map(|s| s.to_string()),
             executor: executor.map(|s| s.to_string()),
+            endpoint: endpoint.map(|s| s.to_string()),
+            command: command.map(|s| s.to_string()),
         },
     )?;
 
@@ -3616,6 +3731,8 @@ pub fn run_create_coordinator(
     _name: Option<&str>,
     _model: Option<&str>,
     _executor: Option<&str>,
+    _endpoint: Option<&str>,
+    _command: Option<&str>,
     _json: bool,
 ) -> Result<()> {
     anyhow::bail!("Service daemon is only supported on Unix systems")
@@ -3793,16 +3910,28 @@ pub fn run_stop_coordinator(_dir: &Path, _coordinator_id: u32, _json: bool) -> R
 /// processes, and prevents respawn on daemon restart. Idempotent — re-running
 /// when no chats exist (or all are already purged) is a no-op.
 ///
+/// Active chats — the calling shell's own `WG_CHAT_REF` chat, plus any chat
+/// with recent consumer-cursor activity (TUI attached, recent `wg chat read`,
+/// pending inbox traffic) — are SKIPPED unless `include_active=true`. The
+/// "lol you archived _this_ chat" footgun isn't a feature.
+///
 /// Preserves chat task nodes + history. Reversible via `wg chat new`.
 #[cfg(unix)]
-pub fn run_purge_chats(dir: &Path, json: bool) -> Result<()> {
+pub fn run_purge_chats(dir: &Path, json: bool, include_active: bool) -> Result<()> {
+    let caller_chat_id = detect_caller_chat_id_from_env();
     // If the daemon isn't running, fall back to direct graph mutation so the
     // user can clean up post-crash without needing to restart the daemon
     // first. This keeps the command useful when the supervisor itself is
     // wedged.
     let socket_path = default_socket_path(dir);
     if socket_accepting(&socket_path) {
-        let response = send_request(dir, &IpcRequest::PurgeChats)?;
+        let response = send_request(
+            dir,
+            &IpcRequest::PurgeChats {
+                include_active,
+                caller_chat_id,
+            },
+        )?;
         if !response.ok {
             let msg = response
                 .error
@@ -3819,20 +3948,7 @@ pub fn run_purge_chats(dir: &Path, json: bool) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(data)?);
             } else {
-                let purged = data
-                    .get("purged")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let skipped = data
-                    .get("skipped")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                println!(
-                    "Purged {} chat agent(s), skipped {} already-archived",
-                    purged, skipped
-                );
+                print_purge_summary(data, include_active);
             }
         }
         Ok(())
@@ -3840,37 +3956,113 @@ pub fn run_purge_chats(dir: &Path, json: bool) -> Result<()> {
         // Daemon not running: do the same archive operation directly via the
         // graph, then clean up coordinator-state files so a future daemon
         // start does not see stale state.
-        let purged = direct_purge_chats(dir)?;
+        let result = direct_purge_chats(dir, include_active, caller_chat_id)?;
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "purged": purged,
+                    "purged": result.purged,
+                    "skipped_active": result.skipped_active,
                     "daemon_running": false,
                 }))?
             );
         } else {
-            println!(
+            let purged_n = result.purged.len();
+            let skipped = &result.skipped_active;
+            print!(
                 "Daemon not running — purged {} chat agent(s) directly via graph",
-                purged.len()
+                purged_n
             );
+            if !skipped.is_empty() {
+                let formatted: Vec<String> = skipped
+                    .iter()
+                    .map(|id| workgraph::chat_id::format_chat_task_id(*id))
+                    .collect();
+                print!(
+                    ", skipped {} active chat(s) ({})",
+                    skipped.len(),
+                    formatted.join(", ")
+                );
+                if !include_active {
+                    print!(". Pass --include-active to override.");
+                }
+            }
+            println!();
         }
         Ok(())
     }
 }
 
 #[cfg(not(unix))]
-pub fn run_purge_chats(_dir: &Path, _json: bool) -> Result<()> {
+pub fn run_purge_chats(_dir: &Path, _json: bool, _include_active: bool) -> Result<()> {
     anyhow::bail!("Service daemon is only supported on Unix systems")
+}
+
+/// Render the human-readable summary line from an IPC PurgeChats response.
+/// Splits skipped entries into "active" (skipped because of activity / caller)
+/// vs "already archived" so the user sees the actionable count clearly.
+#[cfg(unix)]
+fn print_purge_summary(data: &serde_json::Value, include_active: bool) {
+    let purged_n = data
+        .get("purged")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let mut skipped_active: Vec<String> = Vec::new();
+    let mut skipped_already: usize = 0;
+    if let Some(arr) = data.get("skipped").and_then(|v| v.as_array()) {
+        for entry in arr {
+            let reason = entry.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+            if reason == "active" || reason == "caller chat" {
+                if let Some(id) = entry.get("chat_id").and_then(|v| v.as_u64()) {
+                    skipped_active.push(workgraph::chat_id::format_chat_task_id(id as u32));
+                }
+            } else {
+                skipped_already += 1;
+            }
+        }
+    }
+    print!("Purged {} chat(s)", purged_n);
+    if !skipped_active.is_empty() {
+        print!(
+            ", skipped {} active chat(s) ({})",
+            skipped_active.len(),
+            skipped_active.join(", ")
+        );
+        if !include_active {
+            print!(". Pass --include-active to override.");
+        }
+    }
+    if skipped_already > 0 {
+        print!(", skipped {} already-archived", skipped_already);
+    }
+    println!();
+}
+
+/// Result of a `direct_purge_chats` invocation.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct DirectPurgeResult {
+    pub purged: Vec<u32>,
+    /// Chat IDs we skipped because they looked active (cursor recent, inbox
+    /// pending, or caller-chat hint). Empty when `include_active=true`.
+    pub skipped_active: Vec<u32>,
 }
 
 /// Direct graph-mutation purge used when the daemon is not running.
 /// Archives every chat-loop task and removes per-coordinator state files so
 /// the next daemon boot does not resurrect them.
+///
+/// When `include_active=false`, skips chats matching `caller_chat_id` or
+/// looking active on disk (recent consumer cursor / pending inbox).
 #[cfg(unix)]
-fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
+fn direct_purge_chats(
+    dir: &Path,
+    include_active: bool,
+    caller_chat_id: Option<u32>,
+) -> Result<DirectPurgeResult> {
     let graph_path = crate::commands::graph_path(dir);
-    let mut purged: Vec<u32> = Vec::new();
+    let mut result = DirectPurgeResult::default();
     workgraph::parser::modify_graph(&graph_path, |graph| {
         let mut chat_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         for task in graph.tasks() {
@@ -3890,6 +4082,20 @@ fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
         }
         let mut changed = false;
         for id in &chat_ids {
+            // Active-skip gate: protect the caller's own chat plus anything
+            // showing a recent consumer ping. Mutate-graph closure can't
+            // bail with a Result, so we just push to skipped_active and
+            // continue — caller reads `result.skipped_active` after.
+            if !include_active {
+                if Some(*id) == caller_chat_id {
+                    result.skipped_active.push(*id);
+                    continue;
+                }
+                if is_chat_active_on_disk(dir, *id) {
+                    result.skipped_active.push(*id);
+                    continue;
+                }
+            }
             let new_id = workgraph::chat_id::format_chat_task_id(*id);
             let legacy_id = format!(".coordinator-{}", id);
             let resolved = if graph.get_task(&new_id).is_some() {
@@ -3913,17 +4119,17 @@ fn direct_purge_chats(dir: &Path) -> Result<Vec<u32>> {
                 user: Some(workgraph::current_user()),
                 message: format!("Chat {} purged (daemon offline)", id),
             });
-            purged.push(*id);
+            result.purged.push(*id);
             changed = true;
         }
         changed
     })?;
     // Best-effort: remove per-coordinator state files so a daemon restart
     // does not see stale executor/model overrides for purged chats.
-    for id in &purged {
+    for id in &result.purged {
         CoordinatorState::remove_for(dir, *id);
     }
-    Ok(purged)
+    Ok(result)
 }
 
 /// Interrupt a coordinator's current generation via IPC (sends SIGINT, does NOT kill).
@@ -4074,6 +4280,56 @@ pub fn send_request(_dir: &Path, _request: &IpcRequest) -> Result<IpcResponse> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// 5 consecutive failures must trip the circuit breaker (sets
+    /// `cooldown_until`) so the daemon stops re-attempting the registry
+    /// refresh until the cooldown expires. Without this, a missing
+    /// OpenRouter API key fills the daemon log with 25+ identical errors.
+    #[test]
+    fn test_registry_refresh_breaker_trips_after_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let logger = DaemonLogger::open(tmp.path()).unwrap();
+        let mut state = RegistryRefreshState::default();
+        for _ in 0..(REGISTRY_REFRESH_FAILURE_THRESHOLD - 1) {
+            record_registry_refresh_outcome(
+                &mut state,
+                Err(anyhow::anyhow!("no api key")),
+                &logger,
+            );
+        }
+        assert!(
+            state.cooldown_until.is_none(),
+            "breaker must not trip below threshold"
+        );
+        record_registry_refresh_outcome(&mut state, Err(anyhow::anyhow!("no api key")), &logger);
+        assert_eq!(state.error_count, REGISTRY_REFRESH_FAILURE_THRESHOLD);
+        assert!(
+            state.cooldown_until.is_some(),
+            "breaker must trip at threshold"
+        );
+    }
+
+    /// A successful refresh after a streak of failures clears the
+    /// breaker — error count resets, cooldown is removed.
+    #[test]
+    fn test_registry_refresh_breaker_clears_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let logger = DaemonLogger::open(tmp.path()).unwrap();
+        let mut state = RegistryRefreshState {
+            error_count: REGISTRY_REFRESH_FAILURE_THRESHOLD,
+            cooldown_until: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        };
+        record_registry_refresh_outcome(
+            &mut state,
+            Ok("models: 1234 -> 1235".to_string()),
+            &logger,
+        );
+        assert_eq!(state.error_count, 0);
+        assert!(
+            state.cooldown_until.is_none(),
+            "breaker must clear on a successful refresh"
+        );
+    }
 
     #[test]
     fn test_default_socket_path() {
@@ -5151,8 +5407,9 @@ poll_interval = 60
         assert!(CoordinatorState::load_for(dir, 0).is_some());
         assert!(CoordinatorState::load_for(dir, 1).is_some());
 
-        let purged = direct_purge_chats(dir).expect("direct_purge_chats");
-        assert_eq!(purged.len(), 2);
+        let result = direct_purge_chats(dir, true, None).expect("direct_purge_chats");
+        assert_eq!(result.purged.len(), 2);
+        assert!(result.skipped_active.is_empty());
 
         // Graph: both chats archived.
         let g = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
@@ -5169,7 +5426,195 @@ poll_interval = 60
 
         // Idempotent: re-running on already-archived graph yields zero new
         // archives, and does not error.
-        let purged2 = direct_purge_chats(dir).expect("idempotent re-purge");
-        assert!(purged2.is_empty());
+        let result2 = direct_purge_chats(dir, true, None).expect("idempotent re-purge");
+        assert!(result2.purged.is_empty());
+    }
+
+    /// Active-skip rule: a chat with a recently-touched consumer cursor
+    /// (`.cursor` mtime fresh) must be skipped under the default
+    /// `include_active=false`. Other chats with no consumer activity are
+    /// archived. Mirrors the user's `lol you archived _this_ chat` scenario:
+    /// 1 active chat (.chat-5) survives, 2 idle test-chats die.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_purge_chats_skips_active_chat_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [5u32, 6, 7] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // Mark .chat-5 as active by writing a fresh consumer cursor.
+        // .chat-6 and .chat-7 stay idle (no cursor file, no inbox traffic).
+        workgraph::chat::write_cursor_for(dir, 5, 0).expect("write cursor");
+
+        let result = direct_purge_chats(dir, false, None).expect("direct_purge_chats");
+        assert_eq!(
+            result.purged.iter().copied().collect::<Vec<_>>(),
+            vec![6, 7],
+            "idle chats archived; active chat skipped"
+        );
+        assert_eq!(
+            result.skipped_active,
+            vec![5],
+            "active chat .chat-5 must be skipped under default"
+        );
+
+        // Verify graph state: .chat-5 still chat-loop tagged, others archived.
+        let g = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        let t5 = g.get_task(".chat-5").unwrap();
+        assert!(
+            t5.tags.iter().any(|t| t == "chat-loop"),
+            "active chat keeps chat-loop tag"
+        );
+        assert!(!t5.tags.iter().any(|t| t == "archived"));
+        let t6 = g.get_task(".chat-6").unwrap();
+        assert!(t6.tags.iter().any(|t| t == "archived"));
+        let t7 = g.get_task(".chat-7").unwrap();
+        assert!(t7.tags.iter().any(|t| t == "archived"));
+    }
+
+    /// `--include-active` opts back into the original full-nuke behavior:
+    /// every chat-loop task is archived regardless of activity. Used for
+    /// post-crash recovery where the user explicitly wants to wipe
+    /// everything.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_purge_chats_include_active_archives_everything() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [5u32, 6] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // .chat-5 is active (fresh cursor); --include-active overrides.
+        workgraph::chat::write_cursor_for(dir, 5, 0).expect("write cursor");
+
+        let result = direct_purge_chats(dir, true, None).expect("direct_purge_chats");
+        assert_eq!(
+            result.purged.iter().copied().collect::<Vec<_>>(),
+            vec![5, 6],
+            "include_active=true archives every chat regardless of activity"
+        );
+        assert!(result.skipped_active.is_empty());
+    }
+
+    /// `caller_chat_id` is treated as active even if the chat itself is
+    /// otherwise idle on disk. Protects a chat-handler-spawned `wg`
+    /// invocation from archiving its own session.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_purge_chats_skips_caller_chat_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [3u32, 4] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // No on-disk activity for either chat; pass caller_chat_id=3 via env hint.
+        let result = direct_purge_chats(dir, false, Some(3)).expect("direct_purge_chats");
+        assert_eq!(result.purged, vec![4]);
+        assert_eq!(result.skipped_active, vec![3]);
+    }
+
+    /// Zero-active-chats case: default behavior matches today (no false
+    /// positives blocking cleanup). All idle chats get archived.
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_purge_chats_no_active_chats_archives_all() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+
+        let mut graph = workgraph::graph::WorkGraph::new();
+        for id in [10u32, 11, 12] {
+            graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+                id: workgraph::chat_id::format_chat_task_id(id),
+                title: format!("Chat {}", id),
+                status: workgraph::graph::Status::InProgress,
+                tags: vec!["chat-loop".to_string()],
+                ..Default::default()
+            }));
+        }
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // No cursor files, no inbox messages — all idle.
+        let result = direct_purge_chats(dir, false, None).expect("direct_purge_chats");
+        assert_eq!(
+            result.purged.iter().copied().collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert!(result.skipped_active.is_empty());
+    }
+
+    /// `detect_caller_chat_id_from_env` parses each accepted form and falls
+    /// back to None when the env var is missing or unparseable.
+    #[test]
+    fn test_detect_caller_chat_id_from_env_forms() {
+        // Use a mutex to guard the global env across parallel tests.
+        // Rust's test runner threads share env state; we set/unset within
+        // one test and then leave it clean.
+        // SAFETY: tests run with a shared env; we restore on exit.
+        let original_ref = std::env::var("WG_CHAT_REF").ok();
+        let original_id = std::env::var("WG_CHAT_ID").ok();
+
+        unsafe {
+            std::env::remove_var("WG_CHAT_REF");
+            std::env::remove_var("WG_CHAT_ID");
+        }
+        assert_eq!(detect_caller_chat_id_from_env(), None, "no env");
+
+        unsafe { std::env::set_var("WG_CHAT_REF", ".chat-5") };
+        assert_eq!(detect_caller_chat_id_from_env(), Some(5));
+
+        unsafe { std::env::set_var("WG_CHAT_REF", ".coordinator-3") };
+        assert_eq!(detect_caller_chat_id_from_env(), Some(3));
+
+        unsafe { std::env::set_var("WG_CHAT_REF", "coordinator-7") };
+        assert_eq!(detect_caller_chat_id_from_env(), Some(7));
+
+        unsafe { std::env::set_var("WG_CHAT_REF", "9") };
+        assert_eq!(detect_caller_chat_id_from_env(), Some(9));
+
+        unsafe { std::env::set_var("WG_CHAT_REF", "garbage-not-numeric") };
+        assert_eq!(detect_caller_chat_id_from_env(), None);
+
+        unsafe {
+            std::env::remove_var("WG_CHAT_REF");
+            match original_ref {
+                Some(v) => std::env::set_var("WG_CHAT_REF", v),
+                None => std::env::remove_var("WG_CHAT_REF"),
+            }
+            match original_id {
+                Some(v) => std::env::set_var("WG_CHAT_ID", v),
+                None => std::env::remove_var("WG_CHAT_ID"),
+            }
+        }
     }
 }

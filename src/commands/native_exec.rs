@@ -126,7 +126,7 @@ pub fn run(
                 .unwrap_or_else(|| "sonnet".to_string())
         });
 
-    // Resolve the working directory (parent of .workgraph/)
+    // Resolve the working directory (parent of .wg/)
     let working_dir = workgraph_dir
         .canonicalize()
         .ok()
@@ -205,7 +205,7 @@ pub fn run(
     // Create and run the agent loop
     let journal_path = journal::journal_path(workgraph_dir, task_id);
 
-    // Resolve session summary path: .workgraph/agents/<agent-id>/session-summary.md
+    // Resolve session summary path: .wg/agents/<agent-id>/session-summary.md
     let session_summary_path = std::env::var("WG_AGENT_ID").ok().map(|agent_id| {
         workgraph_dir
             .join("agents")
@@ -233,7 +233,7 @@ pub fn run(
         }
     }
     // Register by task-id — task-ids are already unique within a
-    // workgraph, so we use them as the session key directly instead
+    // WG, so we use them as the session key directly instead
     // of a fresh UUID.
     let mut reg = workgraph::chat_sessions::load(workgraph_dir).unwrap_or_default();
     reg.sessions.entry(task_id.to_string()).or_insert_with(|| {
@@ -290,9 +290,9 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
     let result = rt.block_on(agent.run(&format!(
         "You are working on task '{}'. Complete the task as described in your system prompt. \
-         When done, call wg_done with task_id '{}'. If you genuinely cannot complete the \
-         task, call wg_fail with what you tried and what blocked you.",
-        task_id, task_id
+         When done, run `wg done {}` with the bash tool. If you genuinely cannot complete the \
+         task, run `wg fail {} --reason <what you tried and what blocked you>` with bash.",
+        task_id, task_id, task_id
     )))?;
 
     eprintln!(

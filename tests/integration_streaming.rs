@@ -401,7 +401,7 @@ fn streaming_flag_openrouter_enables_by_default() {
 #[test]
 fn streaming_flag_default_disabled() {
     let client = OpenAiClient::new("test-key".into(), "model", None).unwrap();
-    assert_eq!(client.name(), "openai"); // default name
+    assert_eq!(client.name(), "oai-compat"); // default OpenAI-compatible provider name
 }
 
 #[test]
@@ -558,6 +558,7 @@ fn from_endpoint_sets_streaming_for_openrouter() {
         api_key: Some("sk-or-key".to_string()),
         api_key_file: None,
         api_key_env: None,
+        api_key_ref: None,
         is_default: true,
         context_window: None,
     };

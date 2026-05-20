@@ -1,10 +1,10 @@
 #!/bin/bash
-# Nightly cleanup script for workgraph
+# Nightly cleanup script for WG
 # This script performs comprehensive nightly maintenance tasks
 
 set -e
 
-echo "=== Workgraph Nightly Cleanup $(date) ==="
+echo "=== wg Nightly Cleanup $(date) ==="
 
 # Configuration
 DRY_RUN=${DRY_RUN:-true}

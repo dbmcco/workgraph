@@ -157,7 +157,7 @@ pub struct FunctionOutput {
 #[derive(Default)]
 pub enum FunctionVisibility {
     #[default]
-    Internal, // only within this workgraph
+    Internal, // only within this WG project
     Peer,   // discoverable by federated peers, redaction applies
     Public, // fully portable, provenance stripped
 }
@@ -338,7 +338,7 @@ pub struct InterventionSummary {
 // Storage: load / save / list / find
 // ---------------------------------------------------------------------------
 
-/// Directory name under .workgraph/ for trace functions.
+/// Directory name under .wg/ for trace functions.
 pub const FUNCTIONS_DIR: &str = "functions";
 
 /// Load a single trace function from a YAML file.
@@ -399,7 +399,7 @@ pub fn find_function_by_prefix(
     }
 }
 
-/// Return the functions directory for a workgraph directory.
+/// Return the functions directory for a WG directory.
 pub fn functions_dir(workgraph_dir: &Path) -> PathBuf {
     workgraph_dir.join(FUNCTIONS_DIR)
 }
@@ -1802,7 +1802,7 @@ planner_template:
                 retries: false,
                 artifacts: false,
             },
-            storage_path: Some("/home/user/.workgraph/memory".to_string()),
+            storage_path: Some("/home/user/.wg/memory".to_string()),
         });
         func.inputs[0].default = Some(serde_yaml::Value::String("/home/user/project".to_string()));
         func.inputs[0].example = Some(serde_yaml::Value::String("src/lib.rs".to_string()));

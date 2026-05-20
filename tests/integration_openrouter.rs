@@ -87,11 +87,11 @@ fn test_openrouter_minimax_tool_loop() {
     let _api_key = std::env::var("OPENROUTER_API_KEY")
         .expect("OPENROUTER_API_KEY must be set for this integration test");
 
-    // ── 1. Set up temp workgraph ─────────────────────────────────────────
+    // ── 1. Set up temp WG graph ─────────────────────────────────────────
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_ok(&wg_dir, &["agency", "init"]);
 
     // ── 2. Configure OpenRouter endpoint ─────────────────────────────────
@@ -420,9 +420,9 @@ fn test_openrouter_bash_tool_execution() {
         .expect("OPENROUTER_API_KEY must be set for this integration test");
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_ok(&wg_dir, &["agency", "init"]);
 
     // Configure endpoint
@@ -512,9 +512,9 @@ fn test_openrouter_journal_completeness() {
         .expect("OPENROUTER_API_KEY must be set for this integration test");
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_ok(&wg_dir, &["agency", "init"]);
 
     // Configure endpoint
@@ -656,9 +656,9 @@ fn test_openrouter_file_read_write_tools() {
         .expect("OPENROUTER_API_KEY must be set for this integration test");
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
 
-    wg_ok(&wg_dir, &["init"]);
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
     wg_ok(&wg_dir, &["agency", "init"]);
 
     // Configure endpoint

@@ -1,4 +1,4 @@
-//! `wg stats` — display time investment statistics for the workgraph.
+//! `wg stats` — display time investment statistics for the WG task graph.
 
 use anyhow::Result;
 use std::path::Path;
@@ -88,7 +88,7 @@ pub fn run(dir: &Path, json: bool) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("Workgraph Time Statistics");
+        println!("WG Time Statistics");
         println!("=========================");
         println!();
 
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn test_run_empty_dir() {
         let temp = tempfile::TempDir::new().unwrap();
-        let wg_dir = temp.path().join(".workgraph");
+        let wg_dir = temp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         // Should not error even with no data
         let result = run(&wg_dir, false);
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_run_json() {
         let temp = tempfile::TempDir::new().unwrap();
-        let wg_dir = temp.path().join(".workgraph");
+        let wg_dir = temp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let result = run(&wg_dir, true);
         assert!(result.is_ok());

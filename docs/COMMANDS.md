@@ -1,6 +1,6 @@
-# Workgraph Command Reference
+# WG Command Reference
 
-Complete reference for all `wg` commands. Most query commands support `--json` for machine-readable output. All commands support `--dir <path>` to specify a custom workgraph directory.
+Complete reference for all `wg` commands. Most query commands support `--json` for machine-readable output. All commands support `--dir <path>` to specify a custom WG directory.
 
 ## Table of Contents
 
@@ -41,7 +41,7 @@ wg add <TITLE> [OPTIONS]
 | `--id <ID>` | Custom task ID (auto-generated from title if not provided) |
 | `-d, --description <TEXT>` | Detailed description, acceptance criteria |
 | `--after <ID>` | This task comes after another task (repeatable) |
-| `--repo <REPO>` | Create the task in a peer workgraph (by name or path) |
+| `--repo <REPO>` | Create the task in a peer wg (by name or path) |
 | `--assign <AGENT>` | Assign to an agent |
 | `--hours <N>` | Estimated hours |
 | `--cost <N>` | Estimated cost |
@@ -52,7 +52,6 @@ wg add <TITLE> [OPTIONS]
 | `--max-retries <N>` | Maximum retry attempts |
 | `--visibility <LEVEL>` | Task visibility zone for trace exports: `internal` (default), `peer`, `public` |
 | `--model <MODEL>` | Preferred model for this task (haiku, sonnet, opus) |
-| `--verify <CRITERIA>` | Verification criteria — task requires review before done |
 | `--max-iterations <N>` | Maximum cycle iterations — sets `CycleConfig` on this task, making it a cycle header |
 | `--cycle-guard <EXPR>` | Guard condition for cycle iteration: `task:<id>=<status>` or `always` |
 | `--cycle-delay <DUR>` | Delay between cycle iterations (e.g., `30s`, `5m`, `1h`) |
@@ -60,7 +59,6 @@ wg add <TITLE> [OPTIONS]
 | `--exec <CMD>` | Shell command to execute for this task (auto-sets exec_mode=shell) |
 | `--timeout <DUR>` | Per-task timeout (e.g., `30s`, `5m`, `1h`, `4h`, `1d`) |
 | `--provider <PROVIDER>` | **[DEPRECATED]** Provider — use `provider:model` format in `--model` instead |
-| `--verify-timeout <DUR>` | Verification timeout (e.g., `15m`, `900s`). Overrides global `WG_VERIFY_TIMEOUT` |
 | `--allow-phantom` | Allow phantom (forward-reference) dependencies without error |
 | `--independent` | Suppress implicit `--after` dependency on the creating task (alias: `--no-after`) |
 | `--propagation <POLICY>` | Retry propagation policy: `conservative`, `aggressive`, or `conditional:<float>` |
@@ -104,8 +102,8 @@ wg add "Implement user auth" \
 # Task with model override
 wg add "Quick formatting fix" --model haiku
 
-# Task requiring review
-wg add "Security audit" --verify "All findings documented with severity ratings"
+# Task requiring acceptance criteria — put criteria in description under `## Validation`
+wg add "Security audit" -d $'## Description\nReview surface for vulns.\n\n## Validation\n- [ ] All findings documented with severity ratings'
 
 # Cycle header — creates a structural cycle with review
 wg add "Write draft" --id write --after review --max-iterations 3
@@ -151,7 +149,6 @@ wg edit <ID> [OPTIONS]
 | `--context-scope <SCOPE>` | Set context scope for prompt assembly: `clean`, `task`, `graph`, `full` |
 | `--exec-mode <MODE>` | Set execution weight: `full` (default), `light` (read-only tools), `bare` (wg CLI only), `shell` (no LLM) |
 | `--provider <PROVIDER>` | **[DEPRECATED]** Update provider — use `provider:model` format in `--model` instead |
-| `--verify <CRITERIA>` | Set or update verification criteria (shell command that must pass before done) |
 | `--delay <DUR>` | Delay before task becomes ready (e.g., `30s`, `5m`, `1h`, `1d`) |
 | `--not-before <TIMESTAMP>` | Absolute timestamp before which task won't be dispatched (ISO 8601) |
 | `--no-converge` | Force all cycle iterations to run (agents cannot signal convergence) |
@@ -187,9 +184,6 @@ wg edit my-task --context-scope clean
 
 # Use bare execution mode (wg CLI only)
 wg edit my-task --exec-mode bare
-
-# Set or update verification criteria
-wg edit my-task --verify "cargo test test_feature passes"
 
 # Set a provider (use provider:model format — --provider is deprecated)
 wg edit my-task --model openai:gpt-4o
@@ -558,6 +552,58 @@ wg publish my-draft-task
 wg publish my-draft-task --only
 # Publish just this task without propagating to the subgraph
 ```
+
+For rsync-based deployment of `wg html` output, see [`wg html publish`](#wg-html-publish).
+
+---
+
+### `wg html publish`
+
+Manage rsync deployments for `wg html` output. Subcommands:
+
+| Subcommand | Purpose |
+|------------|---------|
+| `add <name> --rsync <target>` | Register a new rsync deployment |
+| `list` | List registered deployments |
+| `show <name>` | Show details (rsync target, schedule, last run) |
+| `run <name>` | Run a deployment now (build html + rsync) |
+| `remove <name>` | Remove a deployment (abandons its scheduling task) |
+| `edit` | Edit the html-publish.toml in `$EDITOR` |
+
+**`wg html publish add` options:**
+| Option | Description |
+|--------|-------------|
+| `--rsync <target>` | rsync destination (e.g. `user@host:/var/www/wg/`) — required |
+| `--schedule <expr>` | Cron expression — runs the deployment on a schedule |
+| `--since <duration>` | `--since` flag passed to `wg html` (e.g. `7d`, `24h`) |
+| `--public-only` | Pass `--public-only` to `wg html` |
+| `--chat` | Include chat transcripts in the html output |
+| `--out <path>` | Staging dir (default: `$TMPDIR/wg-html-publish-<name>`) |
+| `--ssh-key <path>` | Use a specific SSH private key for rsync |
+| `--ssh-config-host <name>` | `~/.ssh/config` Host alias |
+
+**Examples:**
+```bash
+# Register a manual deployment
+wg html publish add my-blog --rsync user@host:/var/www/blog/
+
+# Register a scheduled deployment (runs every 15 minutes via wg cron)
+wg html publish add my-blog --rsync user@host:/var/www/blog/ \
+    --schedule '*/15 * * * *' --since 7d --public-only
+
+# Run it now (build html + rsync)
+wg html publish run my-blog
+
+# Inspect details (last run timestamp, status, etc.)
+wg html publish show my-blog
+```
+
+Deployments are persisted to the resolved WG graph directory at
+`<graph_dir>/html-publish.toml`. Scheduling
+uses wg's own cron mechanism: `--schedule` registers a `.html-publish-<name>`
+task with `exec_mode = shell`, fired by `wg service` on the cron schedule.
+Failures are logged to `~/.wg/html-publish.log` and recorded on the
+deployment as `last_status` / `last_error`.
 
 ---
 
@@ -1044,7 +1090,7 @@ wg func list [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--verbose` | Show input parameters and task templates |
-| `--include-peers` | Include functions from federated peer workgraphs |
+| `--include-peers` | Include functions from federated peer WG instances |
 | `--visibility <LEVEL>` | Filter by visibility level: `internal`, `peer`, `public` |
 
 **Examples:**
@@ -1096,7 +1142,7 @@ Supports two modes:
 | `--recursive` | Alias for `--subgraph` |
 | `--generalize` | Use LLM to generalize descriptions (calls executor) |
 | `--generative` | Multi-trace mode: compare multiple traces to produce a version 2 (generative) function |
-| `--output <PATH>` | Write to specific path instead of `.workgraph/functions/` |
+| `--output <PATH>` | Write to specific path instead of `.wg/functions/` |
 | `--force` | Overwrite existing function with same name |
 | `--include-evaluations` | Include coordinator-generated evaluation and assignment tasks (`evaluate-*`, `assign-*`) that are normally filtered out |
 
@@ -1161,13 +1207,13 @@ wg func apply impl-feature --input feature_name=auth --dry-run
 
 ### `wg func bootstrap`
 
-Bootstrap the `extract-function` meta-function — a built-in version 2 (generative) function that describes the trace extraction process itself as a workgraph workflow.
+Bootstrap the `extract-function` meta-function — a built-in version 2 (generative) function that describes the trace extraction process itself as a WG workflow.
 
 ```bash
 wg func bootstrap [OPTIONS]
 ```
 
-Creates `.workgraph/functions/extract-function.yaml` with a planning node, structural constraints, and a static fallback (analyze → draft → validate → export).
+Creates `.wg/functions/extract-function.yaml` with a planning node, structural constraints, and a static fallback (analyze → draft → validate → export).
 
 **Options:**
 | Option | Description |
@@ -1386,7 +1432,7 @@ List and find skills across tasks.
 wg skill list           # list all skills in use
 wg skill task <ID>      # show skills for a specific task
 wg skill find <SKILL>   # find tasks requiring a specific skill
-wg skill install        # install the wg Claude Code skill to ~/.claude/skills/wg/
+wg skill install        # install the WG Claude Code skill to ~/.claude/skills/wg/
 ```
 
 **Examples:**
@@ -1401,7 +1447,7 @@ wg skill task implement-api
 # Shows which skills implement-api requires
 
 wg skill install
-# Installs the wg skill for Claude Code into ~/.claude/skills/wg/
+# Installs the WG skill for Claude Code into ~/.claude/skills/wg/
 ```
 
 ---
@@ -1532,7 +1578,7 @@ wg agency pull <SOURCE> [OPTIONS]
 | `--no-performance` | Skip merging performance data (copy definitions only) |
 | `--no-evaluations` | Skip copying evaluation JSON files |
 | `--force` | Overwrite local metadata instead of merging |
-| `--global` | Pull into `~/.workgraph/agency/` instead of local project |
+| `--global` | Pull into `~/.wg/agency/` instead of local project |
 
 **Example:**
 ```bash
@@ -1565,7 +1611,7 @@ wg agency push <TARGET> [OPTIONS]
 | `--no-performance` | Skip merging performance data (copy definitions only) |
 | `--no-evaluations` | Skip copying evaluation JSON files |
 | `--force` | Overwrite target metadata instead of merging |
-| `--global` | Push from `~/.workgraph/agency/` instead of local project |
+| `--global` | Push from `~/.wg/agency/` instead of local project |
 
 **Example:**
 ```bash
@@ -1701,7 +1747,7 @@ wg agency create --dry-run
 
 ### `wg agency import`
 
-Import Agency's starter.csv primitives into WorkGraph.
+Import Agency's starter.csv primitives into wg.
 
 ```bash
 wg agency import <CSV_PATH> [OPTIONS]
@@ -2002,7 +2048,7 @@ wg evolve apply <SYNTHESIS_FILE> [OPTIONS]
 
 **Example:**
 ```bash
-wg evolve apply .workgraph/agency/synthesis-result.json
+wg evolve apply .wg/agency/synthesis-result.json
 # Apply the synthesized evolution operations
 
 wg evolve apply synthesis-result.json -o results.json
@@ -2131,6 +2177,14 @@ wg exec run-tests --actor claude
 wg exec run-tests --dry-run
 ```
 
+**Failure semantics:** `wg exec --shell` runs the task command and
+transitions `open → in-progress → done` (exit 0) or `→ failed` (non-zero).
+Shell tasks are exempt from the agency pipeline (no `.assign-*`, `.flip-*`,
+or `.evaluate-*` siblings) and from LLM evaluation. They never enter
+`failed-pending-eval` — that intermediate state applies only to LLM agent
+tasks (`full` / `light` / `bare` exec modes) where an evaluator can score
+the output and rescue the task.
+
 ---
 
 ### `wg trajectory`
@@ -2258,7 +2312,7 @@ wg dead-agents --purge [--delete-dirs]           # purge dead/done/failed agents
 | `--remove` | Remove dead agents from the registry entirely |
 | `--processes` | Check if agent processes are still running at the OS level |
 | `--purge` | Purge dead/done/failed agents from registry (and optionally delete dirs) |
-| `--delete-dirs` | Also delete agent work directories (`.workgraph/agents/<id>/`) when purging |
+| `--delete-dirs` | Also delete agent work directories (`.wg/agents/<id>/`) when purging |
 | `--threshold <MINUTES>` | Override heartbeat timeout threshold in minutes |
 
 **Examples:**
@@ -2327,11 +2381,11 @@ wg checkpoint my-task --list
 
 ## Peer Commands
 
-Manage peer workgraph instances for cross-repo communication and function sharing.
+Manage peer wg instances for cross-repo communication and function sharing.
 
 ### `wg peer add`
 
-Register a peer workgraph instance.
+Register a peer wg instance.
 
 ```bash
 wg peer add <NAME> <PATH> [-d <DESCRIPTION>]
@@ -2339,7 +2393,7 @@ wg peer add <NAME> <PATH> [-d <DESCRIPTION>]
 
 **Arguments:**
 - `NAME` — Peer name (used as shorthand reference)
-- `PATH` — Path to the peer project (containing `.workgraph/`)
+- `PATH` — Path to the peer project (containing `.wg/`)
 
 **Options:**
 | Option | Description |
@@ -2412,7 +2466,7 @@ wg service start [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--port <PORT>` | Port for HTTP API (optional) |
-| `--socket <PATH>` | Unix socket path (default: `.workgraph/service/daemon.sock`) |
+| `--socket <PATH>` | Unix socket path (default: `.wg/service/daemon.sock`) |
 | `--max-agents <N>` | Max parallel agents (overrides config) |
 | `--executor <NAME>` | Executor for spawned agents (overrides config) |
 | `--interval <SECS>` | Background poll interval in seconds (overrides config) |
@@ -2568,7 +2622,7 @@ wg service tick --executor claude --model haiku
 
 ### `wg service install`
 
-Generate a systemd user service file for the wg service daemon.
+Generate a systemd user service file for the WG service daemon.
 
 ```bash
 wg service install
@@ -2580,62 +2634,91 @@ wg service install
 # Outputs a systemd unit file; follow instructions to enable auto-start
 ```
 
-### `wg service create-coordinator`
+### Chat-agent management
 
-Create a new coordinator session.
+The canonical surface for chat-agent lifecycle is `wg chat <subcommand>` (see [Communication Commands](#communication-commands)). The `wg service` subcommands below are the parallel surface; the legacy names (`create-coordinator` / `stop-coordinator` / etc.) still work as aliases for back-compat with prior versions.
+
+### `wg service create-chat`
+
+Create a new chat agent session. (Legacy alias: `wg service create-coordinator`.)
 
 ```bash
-wg service create-coordinator [--name <NAME>]
+wg service create-chat [OPTIONS]
 ```
 
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--name <NAME>` | Optional name for the coordinator |
+| `--name <NAME>` | Optional name for the chat agent |
+| `--executor <NAME>` | Per-chat executor override |
+| `-m, --model <MODEL>` | Per-chat model override |
+| `-e, --endpoint <URL>` | Per-chat endpoint override |
 
 **Example:**
 ```bash
-wg service create-coordinator --name "release-v2"
-# Creates a new coordinator session with the given name
+wg service create-chat --name "release-v2" --executor codex -m codex:gpt-5.5
+# Creates a new chat agent with name and per-chat executor/model overrides
 ```
 
 ---
 
-### `wg service delete-coordinator`
+### `wg service delete-chat`
 
-Delete a coordinator session.
+Delete a chat agent session. (Legacy alias: `wg service delete-coordinator`.)
 
 ```bash
-wg service delete-coordinator <ID>
+wg service delete-chat <ID>
 ```
 
 **Arguments:**
-- `ID` — Coordinator ID to delete (required)
-
-**Example:**
-```bash
-wg service delete-coordinator 2
-# Permanently removes coordinator session 2
-```
+- `ID` — Chat agent ID to delete (required)
 
 ---
 
-### `wg service archive-coordinator`
+### `wg service archive-chat`
 
-Archive a coordinator session (mark as Done).
+Archive a chat agent session (mark as Done). (Legacy alias: `wg service archive-coordinator`.)
 
 ```bash
-wg service archive-coordinator <ID>
+wg service archive-chat <ID>
 ```
 
 **Arguments:**
-- `ID` — Coordinator ID to archive (required)
+- `ID` — Chat agent ID to archive (required)
 
-**Example:**
+---
+
+### `wg service set-executor`
+
+Hot-swap a chat agent's executor and/or model. SIGTERMs the live handler; the supervisor respawns it with the new settings. Conversation history is preserved via `chat/<ref>/{inbox,outbox}.jsonl` — the new handler sees prior turns on startup.
+
 ```bash
-wg service archive-coordinator 1
-# Marks coordinator 1 as Done — preserved in history but no longer active
+wg service set-executor <ID> [--executor <NAME>] [-m <MODEL>]
 ```
+
+**Arguments:**
+- `ID` — Chat agent ID to reconfigure (required)
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--executor <NAME>` | New executor (claude, codex, nex, shell, ...) |
+| `-m, --model <MODEL>` | New model spec (`provider:model`) |
+
+---
+
+### `wg service purge-chats`
+
+Bulk-purge all chat agents — archive every chat-loop task, kill every live chat handler, prevent respawn on daemon restart. Preserves chat task nodes + history. Idempotent. Reversible via `wg chat create`.
+
+```bash
+wg service purge-chats [--include-active]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--include-active` | Also kill live handlers (default: only archive idle chats) |
 
 ---
 
@@ -2671,41 +2754,29 @@ wg service thaw
 
 ---
 
-### `wg service interrupt-coordinator`
+### `wg service interrupt-chat`
 
-Interrupt a coordinator's current generation (sends SIGINT, preserves context).
+Interrupt a chat agent's current generation (sends SIGINT, preserves context). (Legacy alias: `wg service interrupt-coordinator`.)
 
 ```bash
-wg service interrupt-coordinator <ID>
+wg service interrupt-chat <ID>
 ```
 
 **Arguments:**
-- `ID` — Coordinator ID to interrupt (required)
-
-**Example:**
-```bash
-wg service interrupt-coordinator 0
-# Interrupts the coordinator's current LLM generation without killing the session
-```
+- `ID` — Chat agent ID to interrupt (required)
 
 ---
 
-### `wg service stop-coordinator`
+### `wg service stop-chat`
 
-Stop a coordinator session (kill agent, reset to Open).
+Stop a chat agent session (kill agent, reset to Open). (Legacy alias: `wg service stop-coordinator`.)
 
 ```bash
-wg service stop-coordinator <ID>
+wg service stop-chat <ID>
 ```
 
 **Arguments:**
-- `ID` — Coordinator ID to stop (required)
-
-**Example:**
-```bash
-wg service stop-coordinator 1
-# Kills the coordinator agent and resets the session to Open
-```
+- `ID` — Chat agent ID to stop (required)
 
 ---
 
@@ -2713,7 +2784,7 @@ wg service stop-coordinator 1
 
 ### `wg watch`
 
-Stream workgraph events as JSON lines. Useful for live monitoring, external dashboards, or piping into other tools.
+Stream wg events as JSON lines. Useful for live monitoring, external dashboards, or piping into other tools.
 
 ```bash
 wg watch [OPTIONS]
@@ -2890,45 +2961,68 @@ wg msg poll my-task --agent agent-1234
 
 ### `wg chat`
 
-Chat with the coordinator agent.
+Chat with the chat agent (the persistent LLM session). Each chat agent is a graph entity (`.chat-N`); the dispatcher supervisor spawns a handler subprocess per active chat. `wg chat` has both a one-shot/positional form (`wg chat "<message>"`) and a full subcommand surface for chat lifecycle management.
 
 ```bash
 wg chat [OPTIONS] [MESSAGE]
+wg chat <SUBCOMMAND>
 ```
 
 **Arguments:**
 - `MESSAGE` - Message to send (omit for interactive mode)
 
-**Options:**
+**Subcommands** (canonical chat lifecycle surface — `wg service create-chat` etc. are the legacy aliases):
+
+| Subcommand | Description |
+|------------|-------------|
+| `create` | Create a new chat agent task in the graph. Works with the service running or stopped — the supervisor picks up the new chat on next start. Flags: `--name`, `--executor`, `-m/--model`, `-e/--endpoint` |
+| `list` | List all chat agents with their runtime status |
+| `show <id>` | Detailed view of one chat: task, runtime, executor, model |
+| `attach <id>` | Open an interactive view of the chat session (TUI on TTY; `--cli` forces read-only stream) |
+| `send <id> "<msg>"` | Append a one-shot message to a chat's inbox; does NOT wait for a response. Works with the daemon up or down (queues until the handler is alive) |
+| `stop <id>` | SIGTERM the live handler (chat entity stays in graph). Reversible via `wg chat resume`. Requires the service daemon |
+| `resume <id>` | Ask the supervisor to (re)spawn the handler. Errors clearly if the service daemon is not running |
+| `archive <id>` | Mark the chat as Done and tag it `archived`. Out of the active set; chat directory is preserved |
+| `delete <id>` | Hard delete: abandon the graph task. Chat directory is preserved (archived under `.archive/` by the daemon, or left in-place when the daemon is down) |
+
+**Options** (positional / one-shot mode):
 | Option | Description |
 |--------|-------------|
 | `-i, --interactive` | Interactive REPL mode |
 | `--history` | Show chat history |
 | `--clear` | Clear chat history |
 | `--timeout <TIMEOUT>` | Timeout in seconds waiting for response (default: 120) |
-| `--attachment <ATTACHMENT>` | Attach a file (copied to `.workgraph/attachments/`) |
-| `--coordinator <ID>` | Target coordinator ID (default: 0) — for multi-coordinator setups |
+| `--attachment <ATTACHMENT>` | Attach a file (copied to `.wg/attachments/`) |
+| `--coordinator <ID>` | Target a specific chat (default: 0) — legacy flag; the canonical form is `wg chat send <id>` |
 | `--history-depth <N>` | Show only the last N messages (with `--history`) or load only the last N messages in interactive mode |
 | `--no-history` | Start with no history loaded. History is still persisted — this only affects the initial display |
 | `--rotate` | Rotate chat files to archive (force-rotate regardless of thresholds) |
 | `--cleanup` | Clean up archived files older than the retention period |
 | `--compact` | Compact chat history into a context summary |
-| `--share-from <FROM_ID>` | Share context from another coordinator into this one. Copies the source coordinator's compacted summary as imported context. Use with `--coordinator` to specify the target (default: 0) |
+| `--share-from <FROM_ID>` | Share context from another chat into this one. Copies the source chat's compacted summary as imported context. Use with `--coordinator` to specify the target (default: 0) |
 
 **Examples:**
 ```bash
 wg chat "What tasks are blocked?"
-# Send a one-shot message to the coordinator
+# Send a one-shot message to the default chat agent
 
 wg chat -i
 # Start an interactive chat session
 
-wg chat --history
-# View previous chat messages
+wg chat list
+# List active chat agents
 
-wg chat "Review this file" --attachment src/main.rs
-# Send a message with a file attachment
+wg chat create --name research --executor codex -m codex:gpt-5.5
+# Create a new chat agent with a non-default executor / model
+
+wg chat send 1 "Reset the failed worker on task X"
+# Send a message to chat 1 (does not wait for response)
+
+wg chat --history --history-depth 50
+# View the last 50 messages
 ```
+
+**Legacy graph migration:** Existing graphs with `.coordinator-N` task IDs can be rewritten via `wg migrate chat-rename` (rewrites IDs, tags, and after-edges, and rewrites `Coordinator: <name>` titles to `Chat agent: <name>`).
 
 ---
 
@@ -2984,7 +3078,7 @@ wg model add <ALIAS> --provider <PROVIDER> [OPTIONS]
 | `--context-window <N>` | Context window in tokens |
 | `--cost-in <N>` | Cost per million input tokens (USD) |
 | `--cost-out <N>` | Cost per million output tokens (USD) |
-| `--global` | Write to global config (`~/.workgraph/config.toml`) |
+| `--global` | Write to global config (`~/.wg/config.toml`) |
 
 #### `wg model remove`
 
@@ -3087,8 +3181,8 @@ wg key set <PROVIDER> [OPTIONS]
 |--------|-------------|
 | `--env <VAR>` | Reference an environment variable by name |
 | `--file <PATH>` | Path to a file containing the key |
-| `--value <VALUE>` | Store key value directly (written to `~/.workgraph/keys/<provider>.key`, NOT to config) |
-| `--global` | Apply to global config (`~/.workgraph/config.toml`) |
+| `--value <VALUE>` | Store key value directly (written to `~/.wg/keys/<provider>.key`, NOT to config) |
+| `--global` | Apply to global config (`~/.wg/config.toml`) |
 
 #### `wg key check`
 
@@ -3357,19 +3451,124 @@ wg openrouter set-limit --global 100 --session 10 --task 2
 
 ### `wg init`
 
-Initialize a new workgraph in the current directory.
+Initialize a new WG directory in the current directory.
 
 ```bash
 wg init
 ```
 
-Creates `.workgraph/` directory with `graph.jsonl`.
+Creates `.wg/` directory with `graph.jsonl`.
 
 **Example:**
 ```bash
 cd my-project && wg init
-# Creates .workgraph/ directory ready for task management
+# Creates .wg/ directory ready for task management
 ```
+
+---
+
+### `wg which`
+
+Print the WG directory that `wg` would use from here, and show which resolver step won (CLI flag / env / walk-up / home / default). Useful when you're confused about which graph `wg add` is talking to.
+
+```bash
+wg which
+```
+
+**Example output:**
+```
+/home/erik/workgraph/.wg (resolver step: walk-up)
+```
+
+---
+
+### `wg executors`
+
+List executors `wg` knows about, which are usable on this system, and where their backing binaries live. Useful for seeing what `--executor` values `wg service create-coordinator` and `wg edit --model` can target.
+
+```bash
+wg executors
+```
+
+---
+
+### `wg secret`
+
+Manage secrets (API keys) in the credential store. Backends: keyring (OS native, default), keystore (~/.wg/keystore/, 0600), plaintext (requires `[secrets].allow_plaintext = true`). Endpoints reference secrets via `api_key_ref = "keyring:<name>"`. Passthrough URI schemes (`op://...`, `pass:...`, `env:VAR`, `literal:...`) work without storing the secret in wg.
+
+```bash
+wg secret <SUBCOMMAND>
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `set <name>` | Store a secret in the credential store |
+| `get <name>` | Show a secret (redacted by default) |
+| `list` | List stored secret names (never values) |
+| `rm <name>` | Delete a stored secret |
+| `check <ref>` | Check whether a secret ref is reachable (pre-flight validation) |
+| `backend show` | Show which backends are active and reachable |
+| `backend set <kind>` | Set the default backend for new `wg secret set` calls |
+
+**Migration:** `wg migrate secrets` walks existing configs that use `api_key_env` and rewrites them to `api_key_ref = "keyring:<name>"`, prompting before each change.
+
+---
+
+### `wg html`
+
+Render the WG task graph as a static, clickable HTML viewer (TUI-parity).
+
+```bash
+wg html [OUTPUT]
+```
+
+Writes a self-contained HTML file with the graph, search, and per-task drill-down (artifacts, logs, messages).
+
+---
+
+### `wg reprioritize`
+
+Change a task's priority level.
+
+```bash
+wg reprioritize <TASK_ID> <LEVEL>
+```
+
+`<LEVEL>` ∈ `critical`, `high`, `normal`, `low`, `idle`.
+
+---
+
+### `wg insert`
+
+Insert a new task at a position relative to an existing target. Graph-surgery primitive; used as the foundation for `wg rescue`.
+
+```bash
+wg insert <POSITION> <TARGET> --title "<TITLE>" [-d "<DESC>"]
+```
+
+`<POSITION>` ∈ `before`, `after`, `parallel`.
+
+---
+
+### `wg rescue`
+
+Rescue a failed task by inserting a first-class replacement at its graph slot. Successors are rewired to unblock from the rescue instead of the failed target; the target stays in the graph for history with `superseded_by` log entries.
+
+```bash
+wg rescue <TARGET> --description "<DESC>"
+```
+
+---
+
+### `wg reap`
+
+Reap dead/done/failed agents from the registry.
+
+```bash
+wg reap [--dry-run]
+```
+
+Garbage-collects agent records from `.wg/service/registry.json`. Compare to `wg dead-agents --purge`, which is the more granular surface.
 
 ### `wg cleanup`
 
@@ -3607,7 +3806,7 @@ With no options (or `--show`), displays current configuration.
 |--------|-------------|
 | `--show` | Display current configuration |
 | `--init` | Create default config file |
-| `--global` | Target global config (`~/.workgraph/config.toml`) instead of local |
+| `--global` | Target global config (`~/.wg/config.toml`) instead of local |
 | `--local` | Explicitly target local config (default for writes) |
 | `--list` | Show merged config with source annotations (global/local/default) |
 | `--executor <NAME>` | Set executor (claude, amplifier, shell, or custom config name) |
@@ -3649,7 +3848,7 @@ With no options (or `--show`), displays current configuration.
 | `--tui-counters <LIST>` | TUI time counters (comma-separated: `uptime`, `cumulative`, `active`, `session`) |
 | `--retry-context-tokens <N>` | Max tokens of previous-attempt context to inject on retry (default: 2000, 0 = disabled) |
 | `--viz-edge-color <STYLE>` | Viz edge color style: `gray` (default), `white`, or `mixed` |
-| `--install-global` | Install project config as global default (`~/.workgraph/config.toml`) |
+| `--install-global` | Install project config as global default (`~/.wg/config.toml`) |
 | `--force` | Skip confirmation when overwriting existing global config |
 | `--homeserver <URL>` | Set Matrix homeserver URL |
 | `--username <USER>` | Set Matrix username |
@@ -3796,7 +3995,7 @@ wg setup
 **Example:**
 ```bash
 wg setup
-# Launches interactive prompts to configure your workgraph project
+# Launches interactive prompts to configure your wg project
 ```
 
 ---
@@ -3913,7 +4112,7 @@ wg compact
 **Example:**
 ```bash
 wg compact
-# Distills current graph state into .workgraph/context.md for context preservation
+# Distills current graph state into .wg/context.md for context preservation
 ```
 
 ---
@@ -4195,7 +4394,7 @@ All commands support these options:
 
 | Option | Description |
 |--------|-------------|
-| `--dir <PATH>` | Workgraph directory (default: .workgraph) |
+| `--dir <PATH>` | WG directory (default: .wg) |
 | `--json` | Output as JSON for machine consumption |
 | `-h, --help` | Show help (use `--help-all` for full command list) |
 | `--help-all` | Show all commands in help output (including less common ones) |

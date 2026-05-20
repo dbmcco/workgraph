@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::hash::short_hash;
+use super::run_mode;
 use super::run_mode::AssignmentPath;
 use super::store;
 use super::types::*;
@@ -24,7 +25,7 @@ fn expand_tilde(path: &Path) -> PathBuf {
 /// - `Url`: fetches the URL content (requires `matrix-lite` feature for reqwest).
 /// - `Inline`: returns the content directly.
 ///
-/// `workgraph_root` is the project root directory (parent of `.workgraph/`).
+/// `workgraph_root` is the project root directory (parent of `.wg/`).
 pub fn resolve_skill(skill: &ContentRef, workgraph_root: &Path) -> Result<ResolvedSkill, String> {
     match skill {
         ContentRef::Name(name) => {
@@ -130,16 +131,49 @@ fn is_content_ref_id(id: &str) -> bool {
 /// primitives store when available. Falls back to `ContentRef` resolution for IDs
 /// that are content refs (inline:, file:///, http(s)://) or not found in the store.
 ///
-/// `agency_dir` is the `.workgraph/agency/` directory containing `primitives/components/`.
+/// `agency_dir` is the `.wg/agency/` directory containing `primitives/components/`.
 pub fn resolve_all_components(
     role: &Role,
     workgraph_root: &Path,
     agency_dir: &Path,
 ) -> Vec<ResolvedSkill> {
+    resolve_all_components_for_scope(role, workgraph_root, agency_dir, None)
+}
+
+/// Scope-aware variant of [`resolve_all_components`].
+///
+/// When `required_scope` is `Some("meta:evaluator")` (or any other scope
+/// string), components whose typed `scope` field (or legacy
+/// `metadata["scope"]`) does NOT match the required scope are dropped. The
+/// composer uses this to bias the evaluator/assigner identity prompt
+/// toward primitives that were authored for that role even when the
+/// underlying `Role` happens to bundle off-scope component IDs.
+///
+/// Components that are content-ref IDs (inline:, file:///, http(s)://)
+/// or not found in the store are left unfiltered — only first-class
+/// store-backed primitives carry scope metadata to filter on.
+pub fn resolve_all_components_for_scope(
+    role: &Role,
+    workgraph_root: &Path,
+    agency_dir: &Path,
+    required_scope: Option<&str>,
+) -> Vec<ResolvedSkill> {
     let components_dir = agency_dir.join("primitives/components");
     role.component_ids
         .iter()
         .filter_map(|id| {
+            // Helper: drop store-backed components whose scope mismatches.
+            let scope_ok = |comp: &RoleComponent| -> bool {
+                let Some(req) = required_scope else {
+                    return true;
+                };
+                let comp_scope = run_mode::component_scope(comp);
+                match comp_scope {
+                    None | Some("") => true, // untagged → match everything
+                    Some(s) => s == req || (s == "meta" && req.starts_with("meta:")),
+                }
+            };
+
             // First: if it's a content-ref prefix, use existing resolution
             if is_content_ref_id(id) {
                 let content_ref = parse_component_id(id);
@@ -155,6 +189,9 @@ pub fn resolve_all_components(
             // Second: try loading from the primitives store as a RoleComponent
             let component_path = components_dir.join(format!("{}.yaml", id));
             if let Ok(comp) = store::load_component(&component_path) {
+                if !scope_ok(&comp) {
+                    return None;
+                }
                 // Resolve the component's inner content ref to get actual content
                 let content = match resolve_skill(&comp.content, workgraph_root) {
                     Ok(resolved) => resolved.content,
@@ -168,6 +205,9 @@ pub fn resolve_all_components(
 
             // Third: try prefix match in the store
             if let Ok(comp) = store::find_component_by_prefix(&components_dir, id) {
+                if !scope_ok(&comp) {
+                    return None;
+                }
                 let content = match resolve_skill(&comp.content, workgraph_root) {
                     Ok(resolved) => resolved.content,
                     Err(_) => comp.description.clone(),
@@ -1917,7 +1957,7 @@ mod tests {
         use super::super::starters::seed_starters;
 
         let dir = TempDir::new().unwrap();
-        let agency_dir = dir.path().join(".workgraph/agency");
+        let agency_dir = dir.path().join(".wg/agency");
         seed_starters(&agency_dir).unwrap();
 
         // Pick any seeded role (they all have hash-based component_ids/outcome_id)

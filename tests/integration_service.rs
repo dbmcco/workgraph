@@ -69,7 +69,7 @@ fn should_skip_timing_tests() -> bool {
     false
 }
 
-/// Helper: run `wg` with given args in a specific workgraph directory.
+/// Helper: run `wg` with given args in a specific WG directory.
 fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
     let wg = wg_binary();
     Command::new(&wg)
@@ -99,12 +99,12 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
     stdout
 }
 
-/// Helper: initialize a fresh workgraph in a temp directory,
+/// Helper: initialize a fresh WG graph in a temp directory,
 /// and configure a shell executor with the correct working_dir
-/// so that the wrapper script's bare `wg` commands can find `.workgraph`.
+/// so that the wrapper script's bare `wg` commands can find `.wg`.
 fn setup_workgraph(tmp_root: &Path) -> PathBuf {
-    let wg_dir = tmp_root.join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp_root.join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     // Get the directory containing the test-built wg binary.
     // The wrapper script uses bare `wg` commands; we need those to resolve
@@ -118,11 +118,11 @@ fn setup_workgraph(tmp_root: &Path) -> PathBuf {
 
     // Create a shell executor config with working_dir set to the tmp root.
     // This ensures the wrapper script runs with cwd = tmp_root, so bare `wg`
-    // commands (which default to .workgraph in cwd) find the right workgraph.
+    // commands (which default to .wg in cwd) find the right WG directory.
     // PATH is overridden to ensure the test binary is found first.
     // Disable auto_assign and auto_evaluate so the coordinator doesn't
     // create blocking assignment/evaluation tasks that the shell executor
-    // can't handle.  Without this, a global ~/.workgraph/config.toml with
+    // can't handle.  Without this, a global ~/.wg/config.toml with
     // auto_assign = true would cause every test task to be blocked behind an
     // unexecutable assign-* task.
     let config_content = "[agency]\nauto_assign = false\nauto_evaluate = false\n";
@@ -327,7 +327,7 @@ fn coordinator_ticks(wg_dir: &Path) -> u64 {
 /// Test 1: End-to-end auto-pickup flow via GraphChanged notification.
 ///
 /// Scenario:
-/// 1. Initialize a workgraph
+/// 1. Initialize WG
 /// 2. Start the service daemon with shell executor, poll_interval=300s (slow),
 ///    max_agents=2
 /// 3. Add a task with a shell exec command (echo done)
@@ -797,8 +797,8 @@ fn test_service_start_on_bare_graph_does_not_create_daemon_tasks() {
 
     let status = wg_ok(&wg_dir, &["service", "status"]);
     assert!(
-        status.contains("Coordinator:"),
-        "service status should still report coordinator state:\n{}",
+        status.contains("Dispatcher:"),
+        "service status should still report dispatcher state:\n{}",
         status
     );
 

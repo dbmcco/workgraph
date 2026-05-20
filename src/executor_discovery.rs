@@ -16,7 +16,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorInfo {
     /// Short name matching `coordinator.executor` config values:
-    /// "native", "claude", "codex", "gemini", "amplifier".
+    /// "native", "claude", "codex", "gemini".
     pub name: &'static str,
     /// Human-readable description.
     pub description: &'static str,
@@ -69,7 +69,7 @@ struct ExecutorSpec {
 const EXECUTORS: &[ExecutorSpec] = &[
     ExecutorSpec {
         name: "native",
-        description: "workgraph's built-in LLM agent loop (oai-compat, Anthropic, etc.)",
+        description: "nex — WG's built-in LLM agent loop (use endpoint URL for non-default servers)",
         binary_candidates: &[],
     },
     ExecutorSpec {
@@ -86,11 +86,6 @@ const EXECUTORS: &[ExecutorSpec] = &[
         name: "gemini",
         description: "Google Gemini CLI",
         binary_candidates: &["gemini"],
-    },
-    ExecutorSpec {
-        name: "amplifier",
-        description: "Amplifier (multi-agent delegation)",
-        binary_candidates: &["amplifier"],
     },
 ];
 
@@ -158,7 +153,7 @@ mod tests {
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
         assert!(names.contains(&"gemini"));
-        assert!(names.contains(&"amplifier"));
+        assert!(!names.contains(&"amplifier"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use workgraph::parser::load_graph;
 pub fn run(dir: &Path, id: &str, reason: Option<&str>, superseded_by: &[String]) -> Result<()> {
     let path = super::graph_path(dir);
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     let mut error: Option<anyhow::Error> = None;
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn test_abandon_open_task() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Open task")));
         setup_graph(&dir, &graph);
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_abandon_done_task_errors() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         let mut t = make_task("t1", "Done");
         t.status = Status::Done;
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn test_abandon_already_abandoned_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         let mut t = make_task("t1", "Abandoned");
         t.status = Status::Abandoned;
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn test_abandon_cascades_to_system_tasks() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Main task")));
         let mut eval = make_task(".evaluate-t1", "Eval t1");
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn test_abandon_does_not_cascade_to_terminal() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Main")));
         let mut eval = make_task(".evaluate-t1", "Eval t1");
@@ -255,7 +255,7 @@ mod tests {
         // .evaluate-task depends on .flip-task, NOT on task directly.
         // The cascade must still abandon .evaluate-task.
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Main task")));
 
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn test_abandon_cascades_to_assign_task() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
 
         let mut main = make_task("t1", "Main task");
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_abandon_does_not_cascade_done_assign() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
 
         let mut main = make_task("t1", "Main task");
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn test_abandon_with_superseded_by() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join(".workgraph");
+        let dir = tmp.path().join(".wg");
         let mut graph = WorkGraph::new();
         graph.add_node(Node::Task(make_task("t1", "Original")));
         setup_graph(&dir, &graph);

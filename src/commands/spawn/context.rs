@@ -451,7 +451,7 @@ pub(crate) fn build_graph_summary(
             Status::Blocked => blocked += 1,
             Status::Incomplete => open += 1,
             Status::Abandoned | Status::Waiting | Status::PendingValidation => {}
-            Status::PendingEval => in_progress += 1,
+            Status::PendingEval | Status::FailedPendingEval => in_progress += 1,
         }
     }
     parts.push(format!(
@@ -578,7 +578,7 @@ pub(crate) fn build_full_graph_summary(graph: &workgraph::WorkGraph) -> String {
     parts.join("")
 }
 
-/// Read CLAUDE.md content from the project root (parent of .workgraph/).
+/// Read CLAUDE.md content from the project root (parent of .wg/).
 fn read_claude_md(workgraph_dir: &Path) -> String {
     let project_root = workgraph_dir
         .canonicalize()
@@ -594,9 +594,9 @@ fn read_claude_md(workgraph_dir: &Path) -> String {
     std::fs::read_to_string(&claude_md_path).unwrap_or_default()
 }
 
-/// Read the workgraph usage guide for non-Claude models.
+/// Read the WG usage guide for non-Claude models.
 ///
-/// Checks for a user-customizable guide at `.workgraph/wg-guide.md`. If that file
+/// Checks for a user-customizable guide at `.wg/wg-guide.md`. If that file
 /// exists, its content is used. Otherwise falls back to the built-in default guide
 /// embedded in the binary.
 #[allow(dead_code)]
@@ -631,6 +631,8 @@ pub(crate) fn classify_model_tier(model: &str) -> KnowledgeTier {
         || model_lower.contains("llama3.1")
         || model_lower.contains("claude-sonnet")
         || model_lower.contains("claude-opus")
+        || model_lower.contains("gpt-5")
+        || model_lower.contains("gpt-4")
     {
         KnowledgeTier::Full
     }
@@ -643,7 +645,7 @@ pub(crate) fn classify_model_tier(model: &str) -> KnowledgeTier {
 /// Check if Telegram escalation is configured and available.
 ///
 /// Looks for a valid Telegram configuration in either the project-local
-/// `.workgraph/notify.toml` or global `~/.config/workgraph/notify.toml`.
+/// `.wg/notify.toml` or global `~/.config/workgraph/notify.toml`.
 /// Returns true if Telegram bot token and chat ID are configured.
 fn is_telegram_configured(workgraph_dir: &Path) -> bool {
     // Try project-local config first
@@ -667,7 +669,7 @@ fn is_telegram_configured(workgraph_dir: &Path) -> bool {
     false
 }
 
-/// Build tiered workgraph knowledge guide based on model capabilities
+/// Build tiered WG knowledge guide based on model capabilities
 pub(crate) fn build_tiered_guide(
     workgraph_dir: &Path,
     tier: KnowledgeTier,
@@ -695,9 +697,9 @@ fn build_essential_guide(workgraph_dir: &Path) -> String {
     let memory_md = read_memory_md(workgraph_dir);
 
     format!(
-        r#"# Workgraph Agent Guide (Essential)
+        r#"# WG Agent Guide (Essential)
 
-**You are an AI agent working on one task in a workgraph project.** Other agents work on other tasks concurrently.
+**You are an AI agent working on one task in a WG project.** Other agents work on other tasks concurrently.
 
 ## CRITICAL: Attempt Work Before Failing or Decomposing
 
@@ -775,6 +777,38 @@ Every **code task** description MUST include:
 ```
 
 The agency evaluator (auto_evaluate + FLIP) reads the `## Validation` section and scores the agent's output against it.
+
+### User-visible behavior fixes require live human-flow validation
+
+For any task that fixes a **user-visible behavior** (anything a human notices in the TUI, a browser, terminal output, or another interactive surface), the `## Validation` section MUST require a live or scripted simulation of the *actual* human flow, not only CLI / unit / library paths. A passing CLI test does not prove the TUI keystroke handler, the browser click handler, or the terminal-render path actually works — the CLI path is often already correct while the user-facing caller is the broken one (this is exactly how `fix-chat-tasks` shipped green and `fix-last-interaction` had to follow up).
+
+Wrong vs right:
+
+- Bug: typing in the TUI does not update `last_interaction_at`.
+  - Wrong (CLI-only): call `wg msg send <chat>` and assert the chat file mtime advanced.
+  - Right (human flow): start `wg tui` in tmux, drive keystrokes via `tmux send-keys`, read `last_interaction_at` from the chat file (see `tests/smoke/scenarios/tui_chat_pty_last_interaction.sh`).
+- Bug: a button in a web app fails to submit.
+  - Wrong: POST directly to the form endpoint.
+  - Right: drive the click via a headless browser.
+- Bug: a cancellation key in an editor view does the wrong thing.
+  - Wrong: call `cancel()` in a unit test.
+  - Right: feed keystrokes through the real keymap dispatcher and observe view state.
+
+Validation checklist for user-visible fixes:
+
+```markdown
+## Validation
+- [ ] Reproducer is a live or scripted simulation of the real human flow
+      (TUI via tmux/PTY, browser via headless driver, terminal via `expect`
+      or equivalent), not only a CLI / unit substitute
+- [ ] The reproducer fails on `main` and passes after the fix
+- [ ] A scenario is added to `tests/smoke/scenarios/` and listed in `owners`
+      of `tests/smoke/manifest.toml` so future regressions are caught by the
+      smoke gate (the manifest is grow-only)
+- [ ] cargo build + cargo test pass with no regressions
+```
+
+If you are tempted to validate a user-visible fix with only a CLI or unit test "because it exercises the same code", stop. Add the human-flow simulation.
 
 ## Core Commands
 
@@ -876,7 +910,7 @@ fn read_memory_md(workgraph_dir: &Path) -> String {
         }
     }
 
-    // Fallback - try relative to workgraph dir
+    // Fallback - try relative to WG dir
     let memory_path = project_root
         .join(".claude")
         .join("memory")
@@ -895,7 +929,7 @@ fn extract_project_instructions(claude_md: &str) -> String {
 
     if claude_md.contains("orchestrating agent") || claude_md.contains("Orchestrating agent") {
         instructions.push_str("\n## Project Role (from CLAUDE.md)\n");
-        instructions.push_str("**You are a distributed agent** in a workgraph system. Other agents handle other tasks.\n");
+        instructions.push_str("**You are a distributed agent** in WG's graph-based workflow. Other agents handle other tasks.\n");
         instructions.push_str("**CRITICAL:** Use `wg add` for task creation. Do NOT attempt monolithic implementations.\n");
     }
 
@@ -916,10 +950,8 @@ fn extract_project_context(memory_md: &str) -> String {
     context.push_str("\n## Project Context\n");
 
     // Extract key project facts - limit to essential info for Tier 1
-    if memory_md.contains("Workgraph") {
-        context.push_str(
-            "**Project:** Workgraph - task coordination graph for humans and AI agents\n",
-        );
+    if memory_md.contains("workgraph") {
+        context.push_str("**Project:** WG - task coordination graph for humans and AI agents\n");
     }
 
     if memory_md.contains("Rust") {
@@ -929,7 +961,7 @@ fn extract_project_context(memory_md: &str) -> String {
 
     if memory_md.contains("graph.jsonl") {
         context.push_str(
-            "**Core files:** `.workgraph/graph.jsonl` (task storage), `src/` (implementation)\n",
+            "**Core files:** `.wg/graph.jsonl` (task storage), `src/` (implementation)\n",
         );
     }
 
@@ -959,7 +991,7 @@ fn build_graph_patterns_section() -> String {
     r#"## Advanced Graph Patterns
 
 ### Cycles and Loops
-Workgraph supports cycles for recurring work:
+The WG task graph supports cycles for recurring work:
 ```bash
 wg add 'Review code' --after implement-feature --max-iterations 3
 wg add 'Fix issues' --after review-code
@@ -2325,7 +2357,7 @@ mod tests {
     #[test]
     fn test_read_wg_guide_returns_default_when_no_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let guide = read_wg_guide(&wg_dir);
@@ -2335,7 +2367,7 @@ mod tests {
     #[test]
     fn test_read_wg_guide_reads_custom_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let custom_guide = "Custom wg guide for this project.";
@@ -2348,12 +2380,37 @@ mod tests {
     #[test]
     fn test_read_wg_guide_falls_back_on_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         std::fs::write(wg_dir.join("wg-guide.md"), "  \n  ").unwrap();
 
         let guide = read_wg_guide(&wg_dir);
         assert_eq!(guide, workgraph::service::executor::DEFAULT_WG_GUIDE);
+    }
+
+    #[test]
+    fn test_classify_model_tier_gpt5_family_is_full() {
+        assert_eq!(classify_model_tier("gpt-5.5"), KnowledgeTier::Full);
+        assert_eq!(classify_model_tier("codex:gpt-5.5"), KnowledgeTier::Full);
+        assert_eq!(classify_model_tier("gpt-5"), KnowledgeTier::Full);
+        assert_eq!(classify_model_tier("gpt-4o"), KnowledgeTier::Full);
+        assert_eq!(classify_model_tier("gpt-4-turbo"), KnowledgeTier::Full);
+    }
+
+    #[test]
+    fn test_classify_model_tier_existing_models_unchanged() {
+        assert_eq!(classify_model_tier("claude-opus-4-7"), KnowledgeTier::Full);
+        assert_eq!(
+            classify_model_tier("claude-sonnet-4-6"),
+            KnowledgeTier::Full
+        );
+        assert_eq!(classify_model_tier("claude-haiku-4-5"), KnowledgeTier::Core);
+        assert_eq!(classify_model_tier("deepseek-v3"), KnowledgeTier::Core);
+        assert_eq!(classify_model_tier("minimax-m2"), KnowledgeTier::Essential);
+        assert_eq!(
+            classify_model_tier("unknown-model-xyz"),
+            KnowledgeTier::Essential
+        );
     }
 }

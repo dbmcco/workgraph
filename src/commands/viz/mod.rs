@@ -5,7 +5,8 @@ mod graph;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, parse_token_usage_live};
+use workgraph::graph::{Status, Task, TokenUsage, WorkGraph, parse_token_usage_live_cached};
+use workgraph::messages::message_stats_pair_cached;
 
 // Re-export public API
 pub use graph::{generate_graph, generate_graph_with_overrides};
@@ -22,6 +23,7 @@ pub struct AnnotationInfo {
 
 /// Structured output from viz generation, containing both the rendered string
 /// and metadata needed for interactive features (e.g., TUI task selection).
+#[derive(Clone)]
 pub struct VizOutput {
     /// The rendered visualization string.
     pub text: String,
@@ -194,7 +196,10 @@ pub(crate) fn is_legacy_coordinator_task(task: &Task) -> bool {
 fn is_pipeline_active(task: &Task) -> bool {
     matches!(
         task.status,
-        Status::InProgress | Status::PendingValidation | Status::PendingEval
+        Status::InProgress
+            | Status::PendingValidation
+            | Status::PendingEval
+            | Status::FailedPendingEval
     )
 }
 
@@ -358,6 +363,7 @@ fn add_parent_state_annotations(
         }
         let annotation = match task.status {
             Status::PendingEval => "[∴ evaluating]",
+            Status::FailedPendingEval => "[∴ rescue eval]",
             Status::PendingValidation => "[∴ validating]",
             _ => continue,
         };
@@ -497,6 +503,7 @@ pub fn generate_viz_output_from_graph(
             Status::Abandoned => "abandoned",
             Status::Waiting | Status::PendingValidation => "waiting",
             Status::PendingEval => "pending-eval",
+            Status::FailedPendingEval => "failed-pending-eval",
             Status::Incomplete => "incomplete",
         }
     };
@@ -634,6 +641,11 @@ pub fn generate_viz_output_from_graph(
 
     // Enrich tasks with live token usage from agent output logs when not persisted.
     // Includes InProgress, Done, and Failed tasks — any with an assigned agent.
+    //
+    // `parse_token_usage_live_cached` memoizes by (path, mtime) so repeated
+    // refreshes of the same active agent's log are O(1) lookups instead of
+    // re-reading + re-parsing the (often multi-MB) JSONL output (fix-tui-perf-2,
+    // diagnose hot path #1).
     let agents_dir = dir.join("agents");
     let live_token_usage: HashMap<String, TokenUsage> = tasks_to_show
         .iter()
@@ -643,7 +655,7 @@ pub fn generate_viz_output_from_graph(
             // Try live agent dir first
             let usage = t.assigned.as_deref().and_then(|agent_id| {
                 let log_path = agents_dir.join(agent_id).join("output.log");
-                parse_token_usage_live(&log_path)
+                parse_token_usage_live_cached(&log_path)
             });
             if let Some(u) = usage {
                 return Some((t.id.clone(), u));
@@ -662,7 +674,7 @@ pub fn generate_viz_output_from_graph(
             for entry in entries {
                 let candidate = entry.path().join("output.txt");
                 if candidate.exists()
-                    && let Some(u) = parse_token_usage_live(&candidate)
+                    && let Some(u) = parse_token_usage_live_cached(&candidate)
                 {
                     return Some((t.id.clone(), u));
                 }
@@ -688,7 +700,7 @@ pub fn generate_viz_output_from_graph(
                 // Try live agent dir first
                 let agent_id = task.assigned.as_deref()?;
                 let log_path = agents_dir.join(agent_id).join("output.log");
-                parse_token_usage_live(&log_path)
+                parse_token_usage_live_cached(&log_path)
             })
             .or_else(|| {
                 // Fall back to archived output for cleaned-up agents
@@ -705,7 +717,7 @@ pub fn generate_viz_output_from_graph(
                 for entry in entries {
                     let candidate = entry.path().join("output.txt");
                     if candidate.exists()
-                        && let Some(usage) = parse_token_usage_live(&candidate)
+                        && let Some(usage) = parse_token_usage_live_cached(&candidate)
                     {
                         return Some(usage);
                     }
@@ -724,28 +736,22 @@ pub fn generate_viz_output_from_graph(
         }
     }
 
-    // Compute per-task message stats (in/out counts, read status).
-    let message_stats: HashMap<String, workgraph::messages::MessageStats> = tasks_to_show
-        .iter()
-        .filter_map(|t| {
-            let stats = workgraph::messages::message_stats(dir, &t.id, t.assigned.as_deref());
-            if stats.incoming > 0 || stats.outgoing > 0 {
-                Some((t.id.clone(), stats))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Compute per-task coordinator message status (TUI-perspective read state).
-    let coordinator_status: HashMap<String, workgraph::messages::CoordinatorMessageStatus> =
-        tasks_to_show
-            .iter()
-            .filter_map(|t| {
-                workgraph::messages::coordinator_message_status(dir, &t.id)
-                    .map(|s| (t.id.clone(), s))
-            })
-            .collect();
+    // Compute per-task message stats AND coordinator status in a single pass
+    // over each task's `messages/<task>.jsonl` file. The combined function
+    // halves disk-I/O vs the previous double-read pattern, and the (path,
+    // mtime, assigned_agent) cache makes a no-op refresh free.
+    let mut message_stats: HashMap<String, workgraph::messages::MessageStats> = HashMap::new();
+    let mut coordinator_status: HashMap<String, workgraph::messages::CoordinatorMessageStatus> =
+        HashMap::new();
+    for t in &tasks_to_show {
+        let (stats, coord) = message_stats_pair_cached(dir, &t.id, t.assigned.as_deref());
+        if stats.incoming > 0 || stats.outgoing > 0 {
+            message_stats.insert(t.id.clone(), stats);
+        }
+        if let Some(c) = coord {
+            coordinator_status.insert(t.id.clone(), c);
+        }
+    }
 
     // Generate output
     let output = match options.format {
@@ -825,6 +831,73 @@ pub fn run(dir: &Path, options: &VizOptions) -> Result<()> {
         println!("{}", text);
     }
 
+    Ok(())
+}
+
+/// JSON-mode entry point. Emits a structured dump of `VizOutput` for use as
+/// a sidecar by external tools (notably `wg html`). The shape:
+///
+/// ```json
+/// {
+///   "text": "<rendered ASCII, may contain ANSI escapes>",
+///   "node_lines": {"task-id": <line_index>, ...},
+///   "task_order": ["task-id", ...],
+///   "forward_edges": {"task-id": ["dependent-id", ...], ...},
+///   "reverse_edges": {"task-id": ["dependency-id", ...], ...},
+///   "char_edges": [
+///     {"line": <usize>, "col": <usize>, "from": "src-id", "to": "tgt-id"},
+///     ...
+///   ],
+///   "cycle_members": {"task-id": ["other-id-in-scc", ...], ...}
+/// }
+/// ```
+pub fn run_json(dir: &Path, options: &VizOptions) -> Result<()> {
+    let output = generate_viz_output(dir, options)?;
+    let text = if let Some(cols) = options.max_columns {
+        ascii::truncate_lines(&output.text, cols)
+    } else {
+        output.text
+    };
+
+    let mut char_edges = Vec::with_capacity(output.char_edge_map.len());
+    for ((line, col), edges) in &output.char_edge_map {
+        for (from, to) in edges {
+            char_edges.push(serde_json::json!({
+                "line": line,
+                "col": col,
+                "from": from,
+                "to": to,
+            }));
+        }
+    }
+    char_edges.sort_by(|a, b| {
+        let la = a.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let lb = b.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ca = a.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cb = b.get("col").and_then(|v| v.as_u64()).unwrap_or(0);
+        (la, ca).cmp(&(lb, cb))
+    });
+
+    let cycle_members: serde_json::Map<String, serde_json::Value> = output
+        .cycle_members
+        .iter()
+        .map(|(k, set)| {
+            let mut v: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
+            v.sort();
+            (k.clone(), serde_json::json!(v))
+        })
+        .collect();
+
+    let payload = serde_json::json!({
+        "text": text,
+        "node_lines": output.node_line_map,
+        "task_order": output.task_order,
+        "forward_edges": output.forward_edges,
+        "reverse_edges": output.reverse_edges,
+        "char_edges": char_edges,
+        "cycle_members": cycle_members,
+    });
+    println!("{}", serde_json::to_string(&payload)?);
     Ok(())
 }
 

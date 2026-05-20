@@ -1,4 +1,4 @@
-# Workgraph Agent Guide
+# WG Agent Guide
 
 How spawned agents should think about task graphs: recognizing patterns, building structures, staffing work, and staying in control.
 
@@ -36,7 +36,8 @@ Every task moves through a state machine. Understanding the states and transitio
 | **Open** | Ready to be claimed/dispatched (all `--after` deps are done) |
 | **Blocked** | Waiting for upstream dependencies to complete |
 | **InProgress** | An agent has claimed the task and is working on it |
-| **PendingValidation** | Agent called `wg done`, but the task has a `--verify` criterion requiring external validation |
+| **PendingValidation** | Agent called `wg done`, but the task is queued for external validation (e.g. via `wg reject` retry loop) |
+| **FailedPendingEval** | Agent exited without `wg done` and `auto_evaluate` is enabled — awaits evaluator verdict before terminal Failed |
 | **Done** | Completed successfully |
 | **Failed** | Agent called `wg fail` or validation failed |
 | **Abandoned** | Manually abandoned via `wg abandon` |
@@ -44,7 +45,7 @@ Every task moves through a state machine. Understanding the states and transitio
 
 ### Validation flow (PendingValidation)
 
-Tasks created with `--verify` go through an extra validation gate:
+Tasks describe acceptance criteria via a `## Validation` section in the task description. The agency evaluator (auto_evaluate + FLIP) reads that section and scores the agent's output against it. Tasks may also be queued for manual review via `wg reject` (which keeps the task in `pending-validation` while retries remain).
 
 ```
 InProgress → wg done → PendingValidation → wg approve → Done
@@ -54,6 +55,34 @@ InProgress → wg done → PendingValidation → wg approve → Done
 - `wg approve <task-id>` — transitions PendingValidation → Done
 - `wg reject <task-id> --reason "..."` — reopens the task for re-dispatch (clears assignment)
 - After `max_rejections` (default: 3), `wg reject` transitions the task to Failed instead of Open
+- The legacy `--verify <CRITERIA>` flag is no longer accepted (errors at runtime). Put criteria under `## Validation` in the description.
+
+#### User-visible behavior fixes require live human-flow validation
+
+For any task that fixes a **user-visible behavior** — anything a human notices in the TUI, a browser, terminal output, or another interactive surface — the `## Validation` section MUST require a live or scripted simulation of the *actual* human flow, not only CLI / unit / library paths. A passing CLI test does not prove the TUI keystroke handler, the browser click handler, or the terminal-render path actually works; the CLI path is often already correct while the user-facing caller is the broken one. The `fix-chat-tasks` regression shipped green for exactly this reason: the test exercised `wg msg send` instead of the actual TUI keystroke flow. The bug was only caught when `fix-last-interaction` added a tmux/PTY scenario that drove the real `wg tui` session.
+
+Wrong vs right:
+
+| Bug | Wrong (CLI/unit only) | Right (human flow) |
+|---|---|---|
+| Typing in TUI doesn't update `last_interaction_at` | `wg msg send <chat>`, assert chat-file mtime advanced | `wg tui` in tmux, drive keystrokes via `tmux send-keys`, read `last_interaction_at` from the chat file (`tests/smoke/scenarios/tui_chat_pty_last_interaction.sh`) |
+| Web button submit fails | POST the form endpoint directly | Headless browser drives the real click handler |
+| Editor cancellation key misbehaves | Call `cancel()` in a unit test | Feed keystrokes through the real keymap dispatcher and observe view state |
+
+For a user-visible fix, the `## Validation` section should look like:
+
+```markdown
+## Validation
+- [ ] Reproducer is a live or scripted simulation of the real human flow
+      (TUI via tmux/PTY, browser via headless driver, terminal via `expect`),
+      not only a CLI / unit substitute
+- [ ] Reproducer fails on `main` and passes after the fix
+- [ ] Scenario added to `tests/smoke/scenarios/` and listed in `owners` of
+      `tests/smoke/manifest.toml` so the smoke gate catches future regressions
+- [ ] cargo build + cargo test pass with no regressions
+```
+
+If you are tempted to validate a user-visible fix with only a CLI or unit test "because it exercises the same code", stop. Add the human-flow simulation.
 
 ### Retry workflow
 
@@ -552,7 +581,7 @@ Escalate from single to double loop when the same task type fails repeatedly.
 | Anti-pattern | What goes wrong | Fix |
 |--------------|----------------|-----|
 | **Parallel file conflict** | Two concurrent tasks edit the same file → one overwrites the other | Serialize with `--after` or decompose so each task owns distinct files |
-| **Using built-in TaskCreate** | Built-in task tools are a separate system that does NOT interact with workgraph | Always use `wg` CLI commands (`wg add`, `wg done`, etc.) |
+| **Using built-in TaskCreate** | Built-in task tools are a separate system that does NOT interact with WG | Always use `wg` CLI commands (`wg add`, `wg done`, etc.) |
 | **Missing integrator** | Diamond with no join point → parallel outputs never get merged | Always add a synthesizer task with `--after worker-a,worker-b,...` |
 | **Missing loop-back on refine** | Review identifies issues but there's no path back to fix them | Add a revise task in the cycle with a back-edge to the cycle header |
 | **Unbounded loop** | Cycle without `--max-iterations` → runs forever | Always set `--max-iterations` on cycle headers |
@@ -624,7 +653,7 @@ wg tui                         # interactive dashboard (equiv. to wg viz --all -
 wg tui --no-mouse              # TUI without mouse capture (useful in tmux)
 wg status                      # one-screen summary
 wg analyze                     # comprehensive health report
-wg watch                       # stream workgraph events as JSON lines
+wg watch                       # stream wg events as JSON lines
 ```
 
 #### TUI views and keybindings
@@ -664,16 +693,17 @@ The user-facing primitives are **model** and **endpoint**. Pass a `provider:mode
 | Model spec example                          | Handler            | Wire protocol  | Endpoint required          |
 |---------------------------------------------|--------------------|----------------|----------------------------|
 | `claude:opus` (or bare `opus`/`sonnet`)     | claude CLI         | Anthropic      | no (CLI auths itself)      |
-| `codex:gpt-5`                               | codex CLI          | OAI-compat     | no (CLI auths itself)      |
-| `local:qwen3-coder`                         | nex (in-process)   | OAI-compat     | yes (`-e <url>`)           |
-| `openrouter:anthropic/claude-opus-4-6`      | nex (in-process)   | OAI-compat     | optional                   |
-| `oai-compat:gpt-5`                          | nex (in-process)   | OAI-compat     | yes                        |
+| `codex:gpt-5.5`                             | codex CLI          | OAI-compat     | no (CLI auths itself)      |
+| `nex:qwen3-coder`                           | nex (in-process)   | OAI-compat     | yes (`-e <url>`)           |
+| `openrouter:anthropic/claude-opus-4-7`      | nex (in-process)   | OAI-compat     | optional                   |
 
 ```bash
 wg config -m claude:opus                                  # claude handler
-wg config -m local:qwen3-coder -e http://127.0.0.1:8088   # nex handler against local server
-wg config -m openrouter:anthropic/claude-opus-4-6         # nex handler against openrouter
+wg config -m nex:qwen3-coder -e http://127.0.0.1:8088     # nex handler against local server
+wg config -m openrouter:anthropic/claude-opus-4-7         # nex handler against openrouter
 ```
+
+The `local:` and `oai-compat:` prefixes are deprecated aliases for `nex:`; they still load with a stderr warning, and `wg migrate config` rewrites them.
 
 The legacy `--executor` / `-x` CLI flag and `[agent].executor` / `[dispatcher].executor` config keys are deprecated. They still work for one release with a deprecation warning, but the model spec is the single source of truth — see `src/dispatch/handler_for_model.rs`. After the deprecation window, `executor` is removed entirely.
 
@@ -688,7 +718,7 @@ Spawned agents receive environment variables indicating their runtime context:
 ### Configuration
 
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 [dispatcher]
 max_agents = 4
 poll_interval = 5
@@ -1045,9 +1075,9 @@ wg trace import <file>          # import a peer's trace as read-only context
 
 ## 11. Cross-Repo Collaboration
 
-### 11.1 Peer workgraphs
+### 11.1 Peer WG instances
 
-Connect workgraphs across repositories for cross-project coordination:
+Connect WG instances across repositories for cross-project coordination:
 
 ```bash
 wg peer add alice /path/to/alice/repo    # register a peer
@@ -1216,11 +1246,11 @@ wg done <task> --converged
 
 **Never do this:**
 ```bash
-# WRONG: built-in task tools don't interact with workgraph
+# WRONG: built-in task tools don't interact with WG
 TaskCreate(...)   # ← NO
 TaskUpdate(...)   # ← NO
 
-# RIGHT: always use wg CLI
+# RIGHT: always use the `wg` CLI
 wg add "Task title" --id my-task
 wg done my-task
 ```

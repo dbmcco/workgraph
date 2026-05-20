@@ -2,7 +2,7 @@
 
 ## The principle (2026-04-18 refinement)
 
-There are currently four LLM-driven runtimes in workgraph. They should
+There are currently four LLM-driven runtimes in wg. They should
 be one codepath with pluggable input/output surfaces:
 
 | Role | Input source | Output sink | System prompt | Tool filter |
@@ -31,7 +31,7 @@ chat "feels different."
 
 ## Why
 
-Workgraph currently has two parallel agent runtimes:
+wg currently has two parallel agent runtimes:
 
 - **Coordinator daemon** (`wg service start`) — a long-running background
   process with a deterministic tick loop. Checks the graph, identifies
@@ -81,10 +81,10 @@ wg nex --role coordinator --detach [--foreground]
 ```
 
 `--detach` forks to background, sets up the file-based inbox at
-`<workgraph>/inbox/coordinator-<id>.jsonl` (reusing the Stage F
+`<wg>/inbox/coordinator-<id>.jsonl` (reusing the Stage F
 inbox machinery), redirects streaming output to
-`<workgraph>/coordinator-<id>/stream.ndjson`, and keeps the journal
-at `<workgraph>/coordinator-<id>/conversation.jsonl`.
+`<wg>/coordinator-<id>/stream.ndjson`, and keeps the journal
+at `<wg>/coordinator-<id>/conversation.jsonl`.
 
 From the outside it looks exactly like `wg service start` looks
 today — a daemon with a log and a pid. From the inside it's a
@@ -171,17 +171,17 @@ These wrap existing functionality. Tests: each tool in isolation.
 ### Phase 3 + 4: shipped 2026-04-18
 
 **Phase 3 (I/O surface):** `wg nex --chat-id N [--role coordinator]
-[--resume]` reads user turns from `.workgraph/chat/N/inbox.jsonl`,
-streams tokens to `.workgraph/chat/N/.streaming`, and appends
-finalized replies to `.workgraph/chat/N/outbox.jsonl` — same paths,
+[--resume]` reads user turns from `.wg/chat/N/inbox.jsonl`,
+streams tokens to `.wg/chat/N/.streaming`, and appends
+finalized replies to `.wg/chat/N/outbox.jsonl` — same paths,
 same `ChatMessage` format, same streaming dotfile the TUI tails.
-Journal is pinned to `.workgraph/chat/N/conversation.jsonl` so
+Journal is pinned to `.wg/chat/N/conversation.jsonl` so
 `--resume` picks up the right session deterministically.
 
 See `src/executor/native/chat_surface.rs` (adapter over `crate::chat`)
 and the `with_chat_id` builder on `AgentLoop`.
 
-**Phase 4 (flip the default):** The workgraph daemon now spawns
+**Phase 4 (flip the default):** The wg daemon now spawns
 `wg nex --chat-id N --role coordinator --resume` as a subprocess
 for any non-Anthropic coordinator (executor=native, provider in
 {oai-compat, openrouter, openai, local}, or model tagged
@@ -215,7 +215,7 @@ system prompt that explains the tick semantics. Keep old
 `wg service start` working side-by-side.
 
 System prompt for the coordinator role explicitly covers:
-- "You are workgraph's coordinator."
+- "You are wg's coordinator."
 - "Your tools are: wg_list, wg_show, wg_ready_tasks, wg_spawn,
   wg_check_workers, wg_kill_worker, wg_add, wg_done, wg_fail,
   wg_rescue, wg_log."

@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-21
 **Source:** [vx-integration-response.md](vx-integration-response.md) (sections 6, 7, 8)
-**Scope:** Six concrete changes to workgraph core enabling VX adapter integration
+**Scope:** Six concrete changes to wg core enabling VX adapter integration
 
 ---
 
@@ -170,7 +170,7 @@ pub fn run_show(
 ```
 
 Logic:
-1. Read all evaluation files from `.workgraph/agency/evaluations/`.
+1. Read all evaluation files from `.wg/agency/evaluations/`.
 2. Deserialize each as `Evaluation`.
 3. Apply filters:
    - `--task`: prefix match on `evaluation.task_id`
@@ -323,7 +323,7 @@ Handle the new `--visibility` flag: validate and set `task.visibility`.
 
 ### Problem
 
-There is no way to produce a shareable, filtered view of workgraph data. Full trace data includes internal tasks, agent logs, and operational details that shouldn't cross organizational boundaries.
+There is no way to produce a shareable, filtered view of wg data. Full trace data includes internal tasks, agent logs, and operational details that shouldn't cross organizational boundaries.
 
 ### CLI Changes
 
@@ -368,7 +368,7 @@ pub struct TraceExport {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExportMetadata {
-    /// Workgraph version that produced this export
+    /// wg version that produced this export
     pub version: String,
     /// Timestamp of export
     pub exported_at: String,
@@ -424,7 +424,7 @@ Logic:
    - `"internal"`: Include all tasks in scope (no filtering).
    - `"public"`: Include only tasks with `visibility == "public"`. Strip agent output, log entries, and agent assignment from exported tasks.
    - `"peer"`: Include tasks with `visibility == "public"` OR `visibility == "peer"`. Include evaluations and agent lineage but strip raw agent logs/output.
-5. **Load evaluations:** Read all evaluation files from `.workgraph/agency/evaluations/`. Filter to only evaluations whose `task_id` matches an included task.
+5. **Load evaluations:** Read all evaluation files from `.wg/agency/evaluations/`. Filter to only evaluations whose `task_id` matches an included task.
    - For `"public"` exports: exclude evaluations entirely.
    - For `"peer"` exports: include evaluations but strip `notes` field (may contain internal detail).
    - For `"internal"` exports: include everything.
@@ -515,13 +515,13 @@ Logic:
    - Add tag `imported` and tag `source:<source>` to each task.
    - Set `visibility: "internal"` on imported tasks (they're now local context).
    - **Do NOT** add imported tasks to the main graph's dependency structure — they exist as reference, not as blocking/blocked relationships.
-   - Store imported tasks in `.workgraph/imports/<source>/tasks.yaml` (separate from the main graph file to prevent accidental modification).
+   - Store imported tasks in `.wg/imports/<source>/tasks.yaml` (separate from the main graph file to prevent accidental modification).
 5. **Import evaluations:**
-   - Write evaluation files to `.workgraph/agency/evaluations/` with an `imported-` prefix on filenames.
+   - Write evaluation files to `.wg/agency/evaluations/` with an `imported-` prefix on filenames.
    - Set `source` field to `"import:<original-source>"` (e.g. if original source was `"outcome:sharpe"`, imported version becomes `"import:outcome:sharpe"`).
    - **Do NOT** propagate imported evaluations to local agent/role/motivation performance records. These are reference data, not performance signals for local agents.
 6. **Import operations:**
-   - Append to a separate import log: `.workgraph/imports/<source>/operations.jsonl`.
+   - Append to a separate import log: `.wg/imports/<source>/operations.jsonl`.
    - Do not mix with the local provenance log.
 7. **Dry run:** If `--dry-run`, print summary of what would be imported (task count, evaluation count, operation count) without writing anything.
 8. Record provenance: `provenance::record(dir, "trace_import", None, Some("user"), detail)` where detail includes source, file path, and counts.
@@ -536,7 +536,7 @@ Imported data should be accessible to agents via the existing context system:
 
 ### Test Cases
 
-1. **Basic import:** Export from one workgraph, import into another → imported tasks appear with namespaced IDs.
+1. **Basic import:** Export from one wg, import into another → imported tasks appear with namespaced IDs.
 2. **Dry run:** `wg trace import export.json --dry-run` → prints summary, no files written.
 3. **Source tagging:** `wg trace import export.json --source "peer:alice"` → tasks tagged `source:peer:alice`.
 4. **ID namespacing:** Imported task `portfolio-q1` becomes `imported/peer-alice/portfolio-q1` — no collision with local task `portfolio-q1`.
@@ -552,7 +552,7 @@ Imported data should be accessible to agents via the existing context system:
 
 ### Problem
 
-External systems (VX adapter, CI, dashboards) have no way to react to workgraph events in real time. They must poll `wg list --json`, which is inefficient and misses transient state changes.
+External systems (VX adapter, CI, dashboards) have no way to react to wg events in real time. They must poll `wg list --json`, which is inefficient and misses transient state changes.
 
 ### CLI Changes
 
@@ -561,7 +561,7 @@ External systems (VX adapter, CI, dashboards) have no way to react to workgraph 
 Add a new `Watch` command:
 
 ```rust
-/// Stream workgraph events as JSON lines
+/// Stream wg events as JSON lines
 Watch {
     /// Filter events by type (repeatable). Types: task_state, evaluation, agent, all.
     #[arg(long = "event", default_value = "all")]
@@ -624,7 +624,7 @@ pub fn run(
 
 Logic:
 
-1. **Source:** Use the provenance operation log (`.workgraph/log/operations.jsonl`) as the event source. The operation log already records all state-changing operations with timestamps, task IDs, and detail payloads.
+1. **Source:** Use the provenance operation log (`.wg/log/operations.jsonl`) as the event source. The operation log already records all state-changing operations with timestamps, task IDs, and detail payloads.
 
 2. **Historical replay:** If `--replay N`, read the last N operations from the log, convert each to a `WatchEvent`, apply filters, and emit them.
 

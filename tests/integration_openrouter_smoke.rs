@@ -38,7 +38,7 @@ fn wg_binary() -> PathBuf {
 }
 
 fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
-    // Use a fake HOME so the user's real ~/.workgraph/config.toml
+    // Use a fake HOME so the user's real ~/.wg/config.toml
     // does not bleed into the test.
     let fake_home = wg_dir.parent().unwrap_or(wg_dir).join("fakehome");
     fs::create_dir_all(&fake_home).unwrap_or_default();
@@ -69,7 +69,7 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
 }
 
 fn setup_workgraph(tmp: &TempDir) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let graph = WorkGraph::new();
@@ -123,6 +123,7 @@ fn openrouter_endpoint_config_roundtrip() {
             api_key: Some("sk-or-test-key-1234567890".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -160,6 +161,7 @@ fn openrouter_endpoint_bound_to_evaluator_resolves_correctly() {
             api_key: Some("sk-or-test-key".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -213,6 +215,7 @@ fn openrouter_client_creation_from_resolved_config() {
             api_key: Some("sk-or-v1-realkey".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -279,6 +282,7 @@ fn mixed_endpoints_different_roles_different_providers() {
                 api_key: Some("sk-ant-key-direct".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -290,6 +294,7 @@ fn mixed_endpoints_different_roles_different_providers() {
                 api_key: Some("sk-or-eval-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             },
@@ -366,6 +371,7 @@ fn endpoint_cascades_from_default_role() {
             api_key: Some("sk-or-global".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         }],
@@ -411,6 +417,7 @@ fn api_key_file_loading_end_to_end() {
         api_key: None,
         api_key_file: Some(key_file.to_string_lossy().to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: true,
         context_window: None,
     };
@@ -426,7 +433,7 @@ fn api_key_file_loading_end_to_end() {
 #[test]
 fn api_key_file_relative_to_workgraph_dir() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let key_file = wg_dir.join("secrets").join("or.key");
     fs::create_dir_all(key_file.parent().unwrap()).unwrap();
@@ -440,6 +447,7 @@ fn api_key_file_relative_to_workgraph_dir() {
         api_key: None,
         api_key_file: Some("secrets/or.key".to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -459,6 +467,7 @@ fn api_key_file_missing_returns_error() {
         api_key: None,
         api_key_file: Some("/nonexistent/path/key.txt".to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -481,6 +490,7 @@ fn api_key_file_empty_returns_error() {
         api_key: None,
         api_key_file: Some(key_file.to_string_lossy().to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -503,6 +513,7 @@ fn api_key_takes_priority_over_key_file() {
         api_key: Some("inline-key".to_string()),
         api_key_file: Some(key_file.to_string_lossy().to_string()),
         api_key_env: None,
+        api_key_ref: None,
         is_default: false,
         context_window: None,
     };
@@ -761,7 +772,7 @@ fn cli_set_endpoint_for_role() {
 #[test]
 fn config_toml_roundtrip_with_endpoints() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
     let mut config = Config::default();
@@ -776,6 +787,7 @@ fn config_toml_roundtrip_with_endpoints() {
                 api_key: Some("sk-or-roundtrip-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -787,6 +799,7 @@ fn config_toml_roundtrip_with_endpoints() {
                 api_key: Some("sk-ant-roundtrip".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: false,
                 context_window: None,
             },
@@ -1113,7 +1126,7 @@ fn create_provider_ext_validates_openrouter_model() {
     use workgraph::executor::native::provider::create_provider_ext;
 
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
     // Write a config

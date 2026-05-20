@@ -4,7 +4,7 @@
 
 ## Context
 
-Workgraph has 50+ subcommands. Reordering `--help` output by actual usage would improve discoverability for users who run `wg --help` frequently. This requires tracking which commands are invoked and how often.
+wg has 50+ subcommands. Reordering `--help` output by actual usage would improve discoverability for users who run `wg --help` frequently. This requires tracking which commands are invoked and how often.
 
 ### Current Dependencies (Relevant)
 
@@ -18,7 +18,7 @@ From `Cargo.toml`:
 
 ### Option 1: Append-Only Log File
 
-**Implementation:** `.workgraph/usage.log`
+**Implementation:** `.wg/usage.log`
 
 ```
 2025-02-03T16:00:00Z list
@@ -47,10 +47,10 @@ From `Cargo.toml`:
 
 ### Option 2: Counter File Per Subcommand
 
-**Implementation:** `.workgraph/stats/list.count`, `.workgraph/stats/done.count`, etc.
+**Implementation:** `.wg/stats/list.count`, `.wg/stats/done.count`, etc.
 
 ```
-# .workgraph/stats/list.count
+# .wg/stats/list.count
 47
 ```
 
@@ -75,7 +75,7 @@ From `Cargo.toml`:
 
 ### Option 3: Single JSON Stats File
 
-**Implementation:** `.workgraph/stats.json`
+**Implementation:** `.wg/stats.json`
 
 ```json
 {
@@ -111,7 +111,7 @@ From `Cargo.toml`:
 
 ### Option 4: SQLite
 
-**Implementation:** `.workgraph/stats.db`
+**Implementation:** `.wg/stats.db`
 
 ```sql
 CREATE TABLE usage (command TEXT PRIMARY KEY, count INTEGER);
@@ -154,8 +154,8 @@ Typical scenarios:
 
 **Recommendation: Both, with preference for per-repo**
 
-- **Per-repo (`.workgraph/stats.json`)**: Different projects have different command profiles. A data-heavy project uses `wg analyze` more; an agent project uses `wg spawn` more.
-- **Global (`~/.config/workgraph/stats.json`)**: Could aggregate across all repos for the user's overall usage pattern.
+- **Per-repo (`.wg/stats.json`)**: Different projects have different command profiles. A data-heavy project uses `wg analyze` more; an agent project uses `wg spawn` more.
+- **Global (`~/.config/wg/stats.json`)**: Could aggregate across all repos for the user's overall usage pattern.
 
 Start with per-repo only. Global is a nice-to-have for later.
 
@@ -177,11 +177,11 @@ const DEFAULT_ORDER: &[&str] = &[
 
 ## Recommendation: Option 3 (Single JSON Stats File)
 
-**Chosen approach:** `.workgraph/stats.json` with file locking
+**Chosen approach:** `.wg/stats.json` with file locking
 
 ### Rationale
 
-1. **Simplicity:** JSON is already a first-class citizen in workgraph (serde_json is used everywhere)
+1. **Simplicity:** JSON is already a first-class citizen in wg (serde_json is used everywhere)
 2. **Readability:** Users can inspect/edit stats manually if needed
 3. **Minimal overhead:** ~50 commands × ~20 bytes = ~1KB file
 4. **Sufficient concurrency:** `flock()` is adequate for the expected concurrency levels
@@ -260,7 +260,7 @@ In `main.rs`, immediately after parsing:
 ```rust
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let workgraph_dir = cli.dir.unwrap_or_else(|| PathBuf::from(".workgraph"));
+    let workgraph_dir = cli.dir.unwrap_or_else(|| PathBuf::from(".wg"));
 
     // Track usage (fire-and-forget, ignore errors)
     let _ = increment_usage(&workgraph_dir, cli.command.name());
@@ -271,7 +271,7 @@ fn main() -> Result<()> {
 
 The increment should:
 - Not block on errors
-- Handle missing .workgraph gracefully (skip if not initialized)
+- Handle missing .wg gracefully (skip if not initialized)
 - Be fast enough to not add perceptible latency
 
 ### Future Enhancements (Not for MVP)
@@ -307,7 +307,7 @@ The increment should:
 - `version`: Schema version for future migrations
 - `counts`: Map of command name → invocation count
 
-**File location:** `.workgraph/stats.json`
+**File location:** `.wg/stats.json`
 
 **Concurrency:** Exclusive flock during write, shared flock (or no lock) during read.
 
@@ -322,4 +322,4 @@ The increment should:
 | **Single JSON** | Low | Good (flock) | None | **Recommended** |
 | SQLite | High | Excellent | rusqlite | Not chosen - overkill |
 
-**Recommendation:** Implement Option 3 (single JSON stats file) with `flock()` for concurrency safety. It balances simplicity, performance, and maintainability for workgraph's use case.
+**Recommendation:** Implement Option 3 (single JSON stats file) with `flock()` for concurrency safety. It balances simplicity, performance, and maintainability for wg's use case.

@@ -1,4 +1,4 @@
-# File Locking Audit: Workgraph Concurrent Access
+# File Locking Audit: wg Concurrent Access
 
 **Date:** 2026-02-18
 **Scope:** Correctness of file locking under 5x agent parallelism
@@ -7,7 +7,7 @@
 
 ## Executive Summary
 
-Workgraph uses `flock(2)` advisory locking around `graph.jsonl` reads and writes, plus atomic write-rename for crash safety. These mechanisms **prevent corruption and partial reads**, but do **not prevent lost updates** due to a classic TOCTOU (time-of-check-time-of-use) gap. Under 5x parallelism, every `wg` command that mutates the graph (done, fail, log, artifact, claim) follows a load→modify→save pattern where the lock is held separately for the load and the save, not across the entire read-modify-write cycle. This means concurrent writes **will silently overwrite each other**.
+wg uses `flock(2)` advisory locking around `graph.jsonl` reads and writes, plus atomic write-rename for crash safety. These mechanisms **prevent corruption and partial reads**, but do **not prevent lost updates** due to a classic TOCTOU (time-of-check-time-of-use) gap. Under 5x parallelism, every `wg` command that mutates the graph (done, fail, log, artifact, claim) follows a load→modify→save pattern where the lock is held separately for the load and the save, not across the entire read-modify-write cycle. This means concurrent writes **will silently overwrite each other**.
 
 **Severity: HIGH** — Lost updates are virtually guaranteed under normal 5-agent operation. The most likely symptom is log entries, status changes, or artifact registrations silently vanishing.
 
@@ -17,7 +17,7 @@ Workgraph uses `flock(2)` advisory locking around `graph.jsonl` reads and writes
 
 ### 1.1 graph.jsonl — `parser.rs`
 
-**Mechanism:** `flock(2)` advisory lock on `.workgraph/graph.lock`
+**Mechanism:** `flock(2)` advisory lock on `.wg/graph.lock`
 
 - `load_graph()` acquires an **exclusive lock** (`LOCK_EX`), reads the file, then releases the lock when `FileLock` is dropped (line 96–132).
 - `save_graph()` acquires an **exclusive lock**, writes to a temp file (`.graph.tmp.<pid>`), calls `fsync()`, then atomically renames to `graph.jsonl`, then releases the lock (line 138–184).
@@ -28,7 +28,7 @@ Workgraph uses `flock(2)` advisory locking around `graph.jsonl` reads and writes
 
 ### 1.2 Agent Registry — `service/registry.rs`
 
-**Mechanism:** `flock(2)` advisory lock on `.workgraph/service/.registry.lock`
+**Mechanism:** `flock(2)` advisory lock on `.wg/service/.registry.lock`
 
 - `AgentRegistry::load()` / `save()` — **no locking** (line 127, 161). Used by `spawn.rs`.
 - `AgentRegistry::load_locked()` — acquires exclusive flock, returns a `LockedRegistry` that holds the lock until dropped or saved (line 196–237). Used by `cleanup_dead_agents()` in `service.rs`.
@@ -187,7 +187,7 @@ Create a new function that holds the lock for the entire transaction:
 ```rust
 pub fn with_graph_locked<F, T>(path: &Path, f: F) -> Result<T, ParseError>
 where
-    F: FnOnce(&mut WorkGraph) -> T,
+    F: FnOnce(&mut wg) -> T,
 {
     let lock_path = get_lock_path(path);
     let _lock = FileLock::acquire(&lock_path)?;  // held for entire scope
@@ -212,7 +212,7 @@ where
 Add a checksum/version field to the graph file. On save, verify the checksum matches what was loaded. If not, reload and retry.
 
 ```rust
-pub fn save_graph_checked(graph: &WorkGraph, path: &Path, expected_checksum: u64) -> Result<(), SaveConflict> {
+pub fn save_graph_checked(graph: &wg, path: &Path, expected_checksum: u64) -> Result<(), SaveConflict> {
     let _lock = FileLock::acquire(&lock_path)?;
     let current_checksum = compute_checksum(path)?;
     if current_checksum != expected_checksum {
@@ -250,7 +250,7 @@ Create a higher-level function that wraps the load-modify-save pattern with a he
 ```rust
 pub fn mutate_graph<F>(dir: &Path, f: F) -> Result<()>
 where
-    F: FnOnce(&mut WorkGraph) -> Result<()>,
+    F: FnOnce(&mut wg) -> Result<()>,
 {
     let path = graph_path(dir);
     let lock_path = get_lock_path(&path);
@@ -301,9 +301,9 @@ Adding mutation commands (Done, Fail, Log, Artifact, Claim) is architecturally f
 
 | File | Reason |
 |------|--------|
-| `archive.jsonl` | No such file exists — archives are per-task directories under `.workgraph/agents/` and `.workgraph/archive/`. Written once per task completion, no concurrent access risk. |
-| `.workgraph/agency/*.yaml` | Role/motivation/agent configs. Written during `wg role`/`wg motivation` commands, not during agent execution. No concurrency risk. |
-| `.workgraph/config.toml` | Read-only during agent operation. |
+| `archive.jsonl` | No such file exists — archives are per-task directories under `.wg/agents/` and `.wg/archive/`. Written once per task completion, no concurrent access risk. |
+| `.wg/agency/*.yaml` | Role/motivation/agent configs. Written during `wg role`/`wg motivation` commands, not during agent execution. No concurrency risk. |
+| `.wg/config.toml` | Read-only during agent operation. |
 | Agent output files (`output.log`) | Each agent writes to its own file. No shared access. |
 
 ---

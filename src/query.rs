@@ -102,10 +102,9 @@ pub fn project_summary(graph: &WorkGraph) -> ProjectSummary {
             Status::Failed | Status::Abandoned | Status::Waiting | Status::PendingValidation => {
                 // Failed, abandoned, and waiting tasks are not counted as open
             }
-            Status::PendingEval => {
-                // Soft-done: agent finished, awaiting eval. Count as in-progress
-                // for board display purposes — work is "in flight" until eval
-                // resolves it.
+            Status::PendingEval | Status::FailedPendingEval => {
+                // Soft-done/soft-failed: agent finished, awaiting eval. Count as
+                // in-progress for board display — work is "in flight" until eval resolves.
                 in_progress += 1;
             }
         }
@@ -208,12 +207,12 @@ where
                 continue; // Already processed
             }
 
-            // Check if all blockers are now resolved (in our plan or terminal)
+            // Check if all blockers are now resolved (in our plan or dep-satisfied)
             let blockers_done = task.after.iter().all(|blocker_id| {
                 completed_in_plan.contains(blocker_id.as_str())
                     || graph
                         .get_task(blocker_id)
-                        .map(|t| t.status.is_terminal())
+                        .map(|t| t.status.is_dep_satisfied())
                         .unwrap_or(true)
             });
 
@@ -338,31 +337,34 @@ pub fn ready_tasks(graph: &WorkGraph) -> Vec<&Task> {
 /// Predicate: is `blocker_id` satisfied for a dependent task?
 ///
 /// Handles the new `PendingEval` soft-done state:
-/// - System dependents (e.g. `.flip-X`, `.evaluate-X`) treat `PendingEval` as
-///   "the agent finished, output is captured" and proceed. Without this, the
-///   eval pipeline would deadlock because `.evaluate-X` cannot run until
-///   `X` is `Done` — but `X` cannot reach `Done` until `.evaluate-X` finishes.
-/// - Non-system dependents (regular work) treat `PendingEval` as still in
-///   flight and block until the dispatcher promotes the source to `Done`.
+/// - System dependents (e.g. `.flip-X`, `.evaluate-X`) treat `PendingEval` and
+///   `FailedPendingEval` as "the agent finished, output is captured" and proceed.
+///   Without this, the eval pipeline would deadlock because `.evaluate-X` cannot
+///   run until `X` is `Done` — but `X` cannot reach `Done` until `.evaluate-X`
+///   finishes.
+/// - Non-system dependents (regular work) treat `PendingEval`/`FailedPendingEval`
+///   as still in flight and block until the dispatcher promotes to `Done`.
 fn blocker_satisfied_for_dependent(
     blocker_id: &str,
     graph: &WorkGraph,
     dependent_is_system: bool,
 ) -> bool {
     let blocker = graph.get_task(blocker_id);
-    let blocker_terminal = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
+    let blocker_dep_satisfied = blocker
+        .map(|t| t.status.is_dep_satisfied())
+        .unwrap_or(false);
     let blocker_pending_eval = blocker
-        .map(|t| t.status == Status::PendingEval)
+        .map(|t| matches!(t.status, Status::PendingEval | Status::FailedPendingEval))
         .unwrap_or(false);
 
-    if !blocker_terminal {
-        // The PendingEval bypass only fires for system dependents. Regular
-        // tasks must wait for the dispatcher to promote the source to Done.
+    if !blocker_dep_satisfied {
+        // The PendingEval/FailedPendingEval bypass only fires for system dependents.
+        // Regular tasks must wait for the dispatcher to promote the source to Done.
         if !(dependent_is_system && blocker_pending_eval) {
             return false;
         }
     }
-    // Either the blocker is terminal, or the PendingEval bypass let us through.
+    // Either the blocker satisfies the dep, or the PendingEval bypass let us through.
     if dependent_is_system {
         // System tasks skip the eval gate too — they ARE the eval gate.
         return true;
@@ -370,7 +372,11 @@ fn blocker_satisfied_for_dependent(
     !is_eval_gate_pending(blocker_id, graph)
 }
 
-/// Check whether a single after dependency is satisfied (terminal).
+/// Check whether a single after dependency is satisfied.
+///
+/// Satisfied means Done or Abandoned.  Failed is NOT satisfied — a failed
+/// upstream produced no valid output and must be retried before downstream
+/// work can proceed.
 ///
 /// Handles both local and remote (`peer:task-id`) references.
 /// For remote refs, resolves via federation config using IPC or direct file access.
@@ -385,17 +391,17 @@ pub fn is_blocker_satisfied(
     if let Some((peer_name, remote_task_id)) = crate::federation::parse_remote_ref(blocker_id) {
         // Cross-repo dependency
         let Some(wg_dir) = workgraph_dir else {
-            return false; // Can't resolve without workgraph dir; treat as blocked
+            return false; // Can't resolve without WG dir; treat as blocked
         };
         let remote =
             crate::federation::resolve_remote_task_status(peer_name, remote_task_id, wg_dir);
-        remote.status.is_terminal()
+        remote.status.is_dep_satisfied()
     } else {
         // Local dependency — non-existent blocker blocks (prevents premature
         // dispatch during burst graph construction).
         graph
             .get_task(blocker_id)
-            .map(|t| t.status.is_terminal())
+            .map(|t| t.status.is_dep_satisfied())
             .unwrap_or(false)
     }
 }
@@ -420,12 +426,12 @@ pub fn is_blocker_satisfied_with_eval_gate(
 ) -> bool {
     let satisfied = is_blocker_satisfied(blocker_id, graph, workgraph_dir);
     if !satisfied {
-        // Allow system dependents to advance over a PendingEval source — the
-        // agent is done, only the eval has not scored yet.
+        // Allow system dependents to advance over a PendingEval/FailedPendingEval source
+        // — the agent is done (or exited), only the eval has not scored yet.
         if !(dependent_is_system
             && graph
                 .get_task(blocker_id)
-                .map(|t| t.status == Status::PendingEval)
+                .map(|t| matches!(t.status, Status::PendingEval | Status::FailedPendingEval))
                 .unwrap_or(false))
         {
             return false;
@@ -493,12 +499,14 @@ pub fn ready_tasks_cycle_aware<'a>(
             let dependent_is_system = task.id.starts_with('.');
             task.after.iter().all(|blocker_id| {
                 let blocker = graph.get_task(blocker_id);
-                let blocker_done = blocker.map(|t| t.status.is_terminal()).unwrap_or(false);
-                let blocker_pending_eval = blocker
-                    .map(|t| t.status == Status::PendingEval)
+                let blocker_dep_satisfied = blocker
+                    .map(|t| t.status.is_dep_satisfied())
                     .unwrap_or(false);
-                if blocker_done {
-                    // Eval gate: even when blocker is terminal, wait for
+                let blocker_pending_eval = blocker
+                    .map(|t| matches!(t.status, Status::PendingEval | Status::FailedPendingEval))
+                    .unwrap_or(false);
+                if blocker_dep_satisfied {
+                    // Eval gate: even when blocker satisfies the dep, wait for
                     // `.evaluate-X` to also be terminal. System dependents
                     // (dot-prefixed) skip the gate.
                     if dependent_is_system {
@@ -506,9 +514,9 @@ pub fn ready_tasks_cycle_aware<'a>(
                     }
                     return !is_eval_gate_pending(blocker_id, graph);
                 }
-                // PendingEval bypass for system dependents: `.flip-X` and
-                // `.evaluate-X` need to run on a soft-done source — without
-                // this the eval pipeline deadlocks itself.
+                // PendingEval/FailedPendingEval bypass for system dependents:
+                // `.flip-X` and `.evaluate-X` need to run on a soft-done/soft-failed
+                // source — without this the eval pipeline deadlocks itself.
                 if dependent_is_system && blocker_pending_eval {
                     return true;
                 }
@@ -623,7 +631,9 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
                 if dependent_is_system
                     && graph
                         .get_task(blocker_id)
-                        .map(|t| t.status == Status::PendingEval)
+                        .map(|t| {
+                            matches!(t.status, Status::PendingEval | Status::FailedPendingEval)
+                        })
                         .unwrap_or(false)
                 {
                     return true;
@@ -643,7 +653,11 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
         .collect()
 }
 
-/// Find what tasks are blocking a given task
+/// Find what tasks are blocking a given task.
+///
+/// A blocker is any upstream that has not yet satisfied its dependency — i.e.
+/// not Done and not Abandoned.  Failed upstreams are included because they
+/// did not produce valid output.
 pub fn after<'a>(graph: &'a WorkGraph, task_id: &str) -> Vec<&'a Task> {
     let Some(task) = graph.get_task(task_id) else {
         return vec![];
@@ -652,7 +666,7 @@ pub fn after<'a>(graph: &'a WorkGraph, task_id: &str) -> Vec<&'a Task> {
     task.after
         .iter()
         .filter_map(|id| graph.get_task(id))
-        .filter(|t| !t.status.is_terminal())
+        .filter(|t| !t.status.is_dep_satisfied())
         .collect()
 }
 
@@ -807,7 +821,9 @@ mod tests {
     }
 
     #[test]
-    fn test_after_excludes_failed_blockers() {
+    fn test_after_includes_failed_blockers() {
+        // A failed upstream is still a blocker — it did not produce valid output.
+        // `after()` must return it so callers know the dependency is unresolved.
         let mut graph = WorkGraph::new();
 
         let mut blocker = make_task("blocker", "Blocker");
@@ -820,9 +836,10 @@ mod tests {
         graph.add_node(Node::Task(blocked));
 
         let blockers = after(&graph, "blocked");
-        assert!(
-            blockers.is_empty(),
-            "Failed blockers should not block dependents"
+        assert_eq!(
+            blockers.len(),
+            1,
+            "Failed blocker must appear in after() — the dependency is not satisfied"
         );
     }
 
@@ -1304,25 +1321,25 @@ mod tests {
         graph.add_node(Node::Task(b_failed));
         graph.add_node(Node::Task(task));
 
-        // Terminal states (Done, Failed, Abandoned) count as resolved.
-        // InProgress still blocks, so t should NOT be ready.
+        // InProgress and Failed both block, so t should NOT be ready.
         let ready = ready_tasks(&graph);
         let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert!(
             !ready_ids.contains(&"t"),
-            "t should NOT be ready (b-ip is still in-progress)"
+            "t should NOT be ready (b-ip is in-progress and b-failed is failed)"
         );
     }
 
     #[test]
-    fn test_ready_tasks_failed_blocker_unblocks() {
-        // A task whose only blocker has failed should become ready
+    fn test_failed_upstream_blocks_downstream() {
+        // A failed upstream must NOT unblock downstream — it should remain blocked
+        // until the upstream is retried and reaches done.
         let mut graph = WorkGraph::new();
 
         let mut b_failed = make_task("b-failed", "Failed blocker");
         b_failed.status = Status::Failed;
 
-        let mut task = make_task("t", "Blocked task");
+        let mut task = make_task("t", "Downstream task");
         task.after = vec!["b-failed".to_string()];
 
         graph.add_node(Node::Task(b_failed));
@@ -1331,8 +1348,53 @@ mod tests {
         let ready = ready_tasks(&graph);
         let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
         assert!(
-            ready_ids.contains(&"t"),
-            "t should be ready when blocker has failed"
+            !ready_ids.contains(&"t"),
+            "t must NOT be ready when upstream has failed"
+        );
+    }
+
+    #[test]
+    fn test_failed_then_open_upstream_still_blocks() {
+        // After wg retry (failed → open), downstream must remain blocked.
+        // This validates the inverse: open upstream is still blocking.
+        let mut graph = WorkGraph::new();
+
+        let mut upstream = make_task("upstream", "Retried upstream");
+        upstream.status = Status::Open;
+
+        let mut downstream = make_task("downstream", "Downstream task");
+        downstream.after = vec!["upstream".to_string()];
+
+        graph.add_node(Node::Task(upstream));
+        graph.add_node(Node::Task(downstream));
+
+        let ready = ready_tasks(&graph);
+        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            !ready_ids.contains(&"downstream"),
+            "downstream must NOT be ready when upstream is open (post-retry)"
+        );
+    }
+
+    #[test]
+    fn test_done_upstream_unblocks_downstream() {
+        // Once the upstream reaches done, the downstream must become ready.
+        let mut graph = WorkGraph::new();
+
+        let mut upstream = make_task("upstream", "Done upstream");
+        upstream.status = Status::Done;
+
+        let mut downstream = make_task("downstream", "Downstream task");
+        downstream.after = vec!["upstream".to_string()];
+
+        graph.add_node(Node::Task(upstream));
+        graph.add_node(Node::Task(downstream));
+
+        let ready = ready_tasks(&graph);
+        let ready_ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            ready_ids.contains(&"downstream"),
+            "downstream must be ready when upstream is done"
         );
     }
 

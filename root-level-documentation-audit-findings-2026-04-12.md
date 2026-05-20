@@ -31,7 +31,7 @@ Total root-level .md files: **57**
 - Task creation syntax and all documented flags verified against `wg add --help`
 - Service mode instructions (`wg service start`, `wg agents`, `wg tui`) are accurate
 - Advanced features like `--verify`, `--delay`, `--not-before` all present in current CLI
-- Configuration examples match actual `.workgraph/config.toml` structure
+- Configuration examples match actual `.wg/config.toml` structure
 - Agency system coverage (`wg agent create`, roles, tradeoffs) is current
 
 **Verified Commands (all functional):**
@@ -51,7 +51,7 @@ Total root-level .md files: **57**
    - Cycle detection and analysis (`wg cycles`)
    - Functions system (`wg func`)
    - Telegram integration (`wg telegram`)
-   - Peer workgraphs (`wg peer`)
+   - Peer WG instances (`wg peer`)
    - Cost tracking (`wg spend`, `wg cost`)
    - Many analysis commands (`wg analyze`, `wg structure`, `wg bottlenecks`)
 
@@ -64,7 +64,7 @@ Total root-level .md files: **57**
 - `wg quickstart` recommendation is exactly what current CLI provides
 - Warning against built-in TaskCreate/TaskUpdate tools is critical and current
 - Cycle support description matches CLI (`--max-iterations`, `wg done --converged`)
-- Orchestrator role definition accurately reflects workgraph philosophy
+- Orchestrator role definition accurately reflects wg philosophy
 - Task description template format is current and correct
 
 **Commands Verified:**
@@ -135,7 +135,7 @@ Total root-level .md files: **57**
 3. **Functions system introduction** - Brief mention of workflow pattern reuse
 
 ### Low Priority
-1. **Advanced features reference** - Multi-coordinator, peer workgraphs, traces/replay
+1. **Advanced features reference** - Multi-coordinator, peer WG instances, traces/replay
 2. **Developer tools section** - TUI debugging, screencast generation
 3. **Consider CLI reference appendix** - Link to or embed `wg quickstart` output
 
@@ -153,4 +153,4 @@ Total root-level .md files: **57**
 
 Both core documentation files (README.md and CLAUDE.md) are fundamentally sound and accurate for the features they cover. The main opportunity is expanding coverage to match the rich CLI that has evolved. CLAUDE.md is perfectly aligned with current behavior, while README.md covers core workflows well but misses significant newer functionality.
 
-**Recommendation:** Prioritize expanding README.md to cover model management and communication features, as these are increasingly important for users setting up workgraph in team environments.
+**Recommendation:** Prioritize expanding README.md to cover model management and communication features, as these are increasingly important for users setting up wg in team environments.

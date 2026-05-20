@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This audit examines the worktree cleanup mechanisms when agents exit normally or crash in the workgraph system. The investigation reveals a comprehensive cleanup infrastructure with multiple entry points and safety nets, though some gaps exist in testing and edge case handling.
+This audit examines the worktree cleanup mechanisms when agents exit normally or crash in the wg system. The investigation reveals a comprehensive cleanup infrastructure with multiple entry points and safety nets, though some gaps exist in testing and edge case handling.
 
 ## Current Cleanup Architecture
 
@@ -17,7 +17,7 @@ This audit examines the worktree cleanup mechanisms when agents exit normally or
 
 **Cleanup Process:**
 1. Recover any uncommitted commits to `recover/<agent-id>/<task-id>` branch
-2. Remove `.workgraph` symlink 
+2. Remove `.wg` symlink 
 3. Remove isolated cargo `target/` directory
 4. Force-remove worktree with `git worktree remove --force`
 5. Delete agent branch with `git branch -D`
@@ -99,7 +99,7 @@ This audit examines the worktree cleanup mechanisms when agents exit normally or
 
 ### 4. Resource Leaks
 - **Recovery branch accumulation**: No automatic pruning of recovery branches
-- **Symlink persistence**: Race conditions could leave dangling `.workgraph` symlinks  
+- **Symlink persistence**: Race conditions could leave dangling `.wg` symlinks  
 - **Target directory cleanup**: Large cargo artifacts not immediately reclaimed
 
 ## Verification Results
@@ -145,4 +145,4 @@ This audit examines the worktree cleanup mechanisms when agents exit normally or
 
 ## Conclusion
 
-The workgraph agent exit worktree cleanup system is architecturally sound with comprehensive coverage of normal operations. The multi-layered approach (coordinator ticks + service startup + process monitoring) provides good resilience against most failure modes. However, testing gaps around crash scenarios and edge cases represent the primary areas for improvement. The cleanup infrastructure is well-designed but would benefit from enhanced error handling and monitoring capabilities.
+The wg agent exit worktree cleanup system is architecturally sound with comprehensive coverage of normal operations. The multi-layered approach (coordinator ticks + service startup + process monitoring) provides good resilience against most failure modes. However, testing gaps around crash scenarios and edge cases represent the primary areas for improvement. The cleanup infrastructure is well-designed but would benefit from enhanced error handling and monitoring capabilities.

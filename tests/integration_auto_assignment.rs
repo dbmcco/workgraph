@@ -46,7 +46,7 @@ fn make_task_with_skills(id: &str, title: &str, skills: Vec<&str>) -> Task {
     t
 }
 
-/// Set up a workgraph directory with graph.jsonl containing the given tasks.
+/// Set up a WG directory with graph.jsonl containing the given tasks.
 fn setup_workgraph(dir: &Path, tasks: Vec<Task>) {
     fs::create_dir_all(dir).unwrap();
     let path = dir.join("graph.jsonl");
@@ -247,13 +247,18 @@ fn build_assign_subgraph(dir: &Path) {
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             provider: None,
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None,
             verify_timeout: None,
             agent: None,
@@ -283,6 +288,8 @@ fn build_assign_subgraph(dir: &Path) {
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -697,7 +704,7 @@ fn test_full_assignment_pipeline() {
     let (agent_id, _, _) = setup_agency(dir);
     let _second_agent_id = setup_second_agent(dir);
 
-    // Set up workgraph with a task that needs assignment
+    // Set up WG with a task that needs assignment
     let task = make_task_with_desc(
         "feature-1",
         "Add authentication",
@@ -791,10 +798,10 @@ fn test_assignment_pipeline_with_mixed_tasks() {
 #[test]
 fn test_assigned_agent_appears_in_rendered_prompt() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
-    // Set up agency in .workgraph
+    // Set up agency in .wg
     let agency_dir = wg_dir.join("agency");
     agency::init(&agency_dir).unwrap();
 
@@ -991,7 +998,7 @@ mod llm_tests {
         path
     }
 
-    /// Run `wg` with given args in a specific workgraph directory.
+    /// Run `wg` with given args in a specific WG directory.
     fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
         let wg = wg_binary();
         Command::new(&wg)
@@ -1054,12 +1061,12 @@ mod llm_tests {
         false
     }
 
-    /// Set up a workgraph directory via `wg init`, then write a claude executor
+    /// Set up a WG directory via `wg init`, then write a claude executor
     /// config with working_dir and PATH so the wrapper script's bare `wg`
-    /// commands find the test binary and the workgraph.
+    /// commands find the test binary and the WG directory.
     fn setup_llm_workgraph(tmp_root: &Path) -> PathBuf {
-        let wg_dir = tmp_root.join(".workgraph");
-        wg_ok(&wg_dir, &["init"]);
+        let wg_dir = tmp_root.join(".wg");
+        wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
         let wg_bin_dir = wg_binary().parent().unwrap().to_string_lossy().to_string();
         let path_with_test_binary = format!(
@@ -1086,7 +1093,7 @@ PATH = "{path}"
 template = """
 # Task Assignment
 
-You are an AI agent working on a task in a workgraph project.
+You are an AI agent working on a task in a WG project.
 
 {{{{task_identity}}}}
 ## Your Task
@@ -1176,6 +1183,7 @@ Begin working on the task now.
             title: "Assign agent for: Implement a Rust parser".to_string(),
             description: Some(assign_desc),
             status: Status::Open,
+            priority: PRIORITY_DEFAULT,
             assigned: None,
             estimate: None,
             before: vec!["rust-feature".to_string()],
@@ -1192,13 +1200,18 @@ Begin working on the task now.
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             provider: None,
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None,
             verify_timeout: None,
             agent: None,
@@ -1209,6 +1222,7 @@ Begin working on the task now.
             paused: false,
             visibility: "internal".to_string(),
             cycle_config: None,
+            ..Task::default()
         };
 
         // Wire up: assign-rust-feature blocks rust-feature

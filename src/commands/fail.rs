@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
 use workgraph::agency::capture_task_output;
+use workgraph::config::Config;
 use workgraph::graph::{
-    LogEntry, Status, evaluate_cycle_on_failure, parse_token_usage, parse_wg_tokens,
+    FailureClass, LogEntry, Status, evaluate_cycle_on_failure, parse_token_usage, parse_wg_tokens,
 };
 use workgraph::parser::modify_graph;
 use workgraph::service::registry::AgentRegistry;
@@ -13,15 +14,21 @@ use super::graph_path;
 #[cfg(test)]
 use workgraph::parser::load_graph;
 
-pub fn run(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
-    run_inner(dir, id, reason, false)
+pub fn run(dir: &Path, id: &str, reason: Option<&str>, class: Option<FailureClass>) -> Result<()> {
+    run_inner(dir, id, reason, class, false)
 }
 
 pub fn run_eval_reject(dir: &Path, id: &str, reason: Option<&str>) -> Result<()> {
-    run_inner(dir, id, reason, true)
+    run_inner(dir, id, reason, None, true)
 }
 
-fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> Result<()> {
+fn run_inner(
+    dir: &Path,
+    id: &str,
+    reason: Option<&str>,
+    class: Option<FailureClass>,
+    eval_reject: bool,
+) -> Result<()> {
     // Pre-check with a non-atomic read (gate only — not used for mutation).
     {
         let (graph, _path) = super::load_workgraph_mut(dir)?;
@@ -53,6 +60,22 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
     }
 
     let path = super::graph_path(dir);
+
+    // Shell tasks (exec set or exec_mode="shell") have no .evaluate-* scaffold
+    // (suppressed in eval_scaffold), so the rescue path can never resolve.
+    // Route them straight to terminal Failed.
+    let is_shell = workgraph::parser::load_graph(&path)
+        .ok()
+        .and_then(|g| g.get_task(id).map(super::eval_scaffold::is_shell_task))
+        .unwrap_or(false);
+
+    // If this is an AgentExitNonzero failure AND auto_evaluate is on, route to
+    // FailedPendingEval instead of terminal Failed so the evaluator can rescue
+    // the task when the output is actually acceptable.
+    let use_failed_pending_eval = !eval_reject
+        && !is_shell
+        && class == Some(FailureClass::AgentExitNonzero)
+        && Config::load_or_default(dir).agency.auto_evaluate;
 
     // Resolve token usage outside the lock (registry read + file I/O).
     let token_usage = AgentRegistry::load(dir).ok().and_then(|registry| {
@@ -96,10 +119,42 @@ fn run_inner(dir: &Path, id: &str, reason: Option<&str>, eval_reject: bool) -> R
         }
         // PendingEval → Failed is allowed from both `wg fail` and the
         // eval-reject path. Falls through to the generic mutation below.
+        //
+        // FailedPendingEval → Failed is the terminal path after eval rejection
+        // (or operator-forced fail). Does NOT trigger auto-rescue spawn.
+
+        // Route to FailedPendingEval when conditions are met (Fork 5):
+        // agent-exit-nonzero + auto_evaluate + not an eval-reject call.
+        // Do NOT re-enter FailedPendingEval if already there (operator can
+        // force terminal-fail from FailedPendingEval by calling wg fail again).
+        if use_failed_pending_eval && task.status != Status::FailedPendingEval {
+            task.status = Status::FailedPendingEval;
+            task.failure_class = class;
+            task.failure_reason = reason_owned.clone();
+            task.log.push(LogEntry {
+                timestamp: Utc::now().to_rfc3339(),
+                actor: task.assigned.clone(),
+                user: Some(workgraph::current_user()),
+                message: "Agent exited without wg done — entering failed-pending-eval for rescue evaluation".to_string(),
+            });
+
+            // Apply pre-resolved token usage
+            if task.token_usage.is_none()
+                && let Some(ref usage) = token_usage
+            {
+                task.token_usage = Some(usage.clone());
+            }
+
+            retry_count = task.retry_count;
+            max_retries = task.max_retries;
+            agent_id_for_archive = task.assigned.clone();
+            return true;
+        }
 
         task.status = Status::Failed;
         task.retry_count += 1;
         task.failure_reason = reason_owned.clone();
+        task.failure_class = class;
 
         let log_message = if eval_reject {
             match reason_owned.as_deref() {
@@ -234,7 +289,7 @@ mod tests {
         task.assigned = Some("agent-1".to_string());
         setup_workgraph(dir_path, vec![task]);
 
-        let result = run(dir_path, "t1", Some("compilation error"));
+        let result = run(dir_path, "t1", Some("compilation error"), None);
         assert!(result.is_ok());
 
         let path = graph_path(dir_path);
@@ -249,7 +304,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Open)]);
 
-        let result = run(dir_path, "t1", None);
+        let result = run(dir_path, "t1", None, None);
         assert!(result.is_ok());
 
         let path = graph_path(dir_path);
@@ -264,7 +319,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Done)]);
 
-        let result = run(dir_path, "t1", Some("reason"));
+        let result = run(dir_path, "t1", Some("reason"), None);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -283,7 +338,7 @@ mod tests {
             vec![make_task("t1", "Test task", Status::Abandoned)],
         );
 
-        let result = run(dir_path, "t1", Some("reason"));
+        let result = run(dir_path, "t1", Some("reason"), None);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -299,7 +354,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Open)]);
 
-        run(dir_path, "t1", None).unwrap();
+        run(dir_path, "t1", None, None).unwrap();
 
         let path = graph_path(dir_path);
         let graph = load_graph(&path).unwrap();
@@ -316,7 +371,7 @@ mod tests {
             vec![make_task("t1", "Test task", Status::InProgress)],
         );
 
-        run(dir_path, "t1", Some("timeout exceeded")).unwrap();
+        run(dir_path, "t1", Some("timeout exceeded"), None).unwrap();
 
         let path = graph_path(dir_path);
         let graph = load_graph(&path).unwrap();
@@ -332,7 +387,7 @@ mod tests {
         task.failure_reason = Some("old reason".to_string());
         setup_workgraph(dir_path, vec![task]);
 
-        run(dir_path, "t1", None).unwrap();
+        run(dir_path, "t1", None, None).unwrap();
 
         let path = graph_path(dir_path);
         let graph = load_graph(&path).unwrap();
@@ -346,7 +401,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Open)]);
 
-        run(dir_path, "t1", Some("network failure")).unwrap();
+        run(dir_path, "t1", Some("network failure"), None).unwrap();
 
         let path = graph_path(dir_path);
         let graph = load_graph(&path).unwrap();
@@ -366,7 +421,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Open)]);
 
-        run(dir_path, "t1", None).unwrap();
+        run(dir_path, "t1", None, None).unwrap();
 
         let path = graph_path(dir_path);
         let graph = load_graph(&path).unwrap();
@@ -383,7 +438,7 @@ mod tests {
         task.retry_count = 2;
         setup_workgraph(dir_path, vec![task]);
 
-        let result = run(dir_path, "t1", Some("new reason"));
+        let result = run(dir_path, "t1", Some("new reason"), None);
         assert!(result.is_ok());
 
         // Verify nothing changed
@@ -400,7 +455,7 @@ mod tests {
         let dir_path = dir.path();
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Open)]);
 
-        let result = run(dir_path, "nonexistent", None);
+        let result = run(dir_path, "nonexistent", None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
@@ -413,7 +468,7 @@ mod tests {
 
         // Run fail - capture_task_output will be called but may fail in test env
         // (no git repo). The important thing is that run() itself still succeeds.
-        let result = run(dir_path, "t1", None);
+        let result = run(dir_path, "t1", None, None);
         assert!(result.is_ok());
 
         // Verify the task was still properly marked as failed despite capture outcome
@@ -430,7 +485,7 @@ mod tests {
         setup_workgraph(dir_path, vec![make_task("t1", "Test task", Status::Done)]);
 
         // Normal fail should error on done tasks
-        let result = run(dir_path, "t1", Some("reason"));
+        let result = run(dir_path, "t1", Some("reason"), None);
         assert!(result.is_err());
 
         // eval_reject should succeed
@@ -492,7 +547,7 @@ mod tests {
         registry.register_agent(99999, "t1", "claude", "/tmp/output.log");
         registry.save(dir_path).unwrap();
 
-        let result = run(dir_path, "t1", Some("test failure"));
+        let result = run(dir_path, "t1", Some("test failure"), None);
         assert!(result.is_ok());
 
         // Verify registry was updated

@@ -301,7 +301,7 @@ pub fn run(
 
     let path = graph_path(dir);
     if !path.exists() {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     }
 
     // --- Autopoietic guardrails ---
@@ -444,18 +444,20 @@ pub fn run(
         default_parent_after(graph, after)
     };
 
-    // 2. Task depth limit (enforced when --after is specified)
+    // 2. User-visible task depth limit (enforced when --after is specified)
     if !effective_after.is_empty() {
-        // The new task's depth = max(depth of each parent) + 1
+        // The new task's visible depth = max(visible depth of each parent) + 1.
+        // Internal agency scaffolding collapses onto the user task it gates.
         let max_parent_depth = effective_after
             .iter()
-            .map(|parent_id| graph.task_depth(parent_id))
+            .map(|parent_id| graph.user_visible_task_depth(parent_id))
             .max()
             .unwrap_or(0);
         let new_depth = max_parent_depth + 1;
         if new_depth > max_depth {
             error = Some(anyhow::anyhow!(
-                "Task would be at depth {} (max: {}). \
+                "Task would be at user-visible depth {} (configured max_task_depth: {}). \
+                 Internal agency scaffold tasks (.assign-*, .flip-*, .evaluate-*) do not count toward this limit. \
                  Consider creating tasks at the current level instead.",
                 new_depth,
                 max_depth
@@ -555,13 +557,18 @@ pub fn run(
         created_at: Some(Utc::now().to_rfc3339()),
         started_at: None,
         completed_at: None,
+        last_interaction_at: None,
         log: log.clone(),
         retry_count: 0,
         max_retries,
         failure_reason: None,
+            failure_class: None,
         model: model.map(String::from),
         provider: provider.map(String::from),
         endpoint: None,
+        command_argv: vec![],
+        working_dir: None,
+        executor_preset_name: None,
         verify: verify.map(String::from),
         verify_timeout: verify_timeout.map(String::from),
         agent: None,
@@ -591,6 +598,8 @@ pub fn run(
         max_rejections: None,
         verify_failures: 0,
         rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -796,10 +805,10 @@ pub fn run(
     Ok(())
 }
 
-/// Add a task to a remote peer workgraph.
+/// Add a task to a remote peer WG project.
 ///
 /// Dispatch order (per §3.2 of cross-repo design doc):
-/// 1. Resolve peer to a .workgraph directory
+/// 1. Resolve peer to a .wg directory
 /// 2. If peer service is running → send AddTask IPC request
 /// 3. If not running → directly modify the peer's graph.jsonl
 /// 4. Print the created task ID with peer prefix
@@ -855,7 +864,7 @@ pub fn run_remote(
         );
     }
 
-    // Resolve peer reference to a concrete .workgraph directory
+    // Resolve peer reference to a concrete .wg directory
     let resolved = resolve_peer(peer_ref, local_workgraph_dir)?;
 
     // Build origin string for provenance
@@ -954,7 +963,7 @@ fn add_task_directly(
     let graph_path = super::graph_path(peer_workgraph_dir);
     if !graph_path.exists() {
         anyhow::bail!(
-            "No graph.jsonl at '{}'. Is this a workgraph project?",
+            "No graph.jsonl at '{}'. Is this a WG project?",
             peer_workgraph_dir.display()
         );
     }
@@ -1022,13 +1031,18 @@ fn add_task_directly(
             created_at: Some(chrono::Utc::now().to_rfc3339()),
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: model.map(String::from),
             provider: provider.map(String::from),
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: verify.map(String::from),
             verify_timeout: verify_timeout.map(String::from),
             agent: None,
@@ -1058,6 +1072,8 @@ fn add_task_directly(
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -1101,7 +1117,7 @@ fn add_task_directly(
 
     let task_id = task_id_out;
 
-    // Record provenance in the peer's workgraph
+    // Record provenance in the peer's WG project
     let config = workgraph::config::Config::load_or_default(peer_workgraph_dir);
     let _ = workgraph::provenance::record(
         peer_workgraph_dir,
@@ -1246,13 +1262,76 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// Helper: create a minimal task with the given ID for inserting into a WorkGraph.
+    /// Helper: create a minimal task with the given ID for inserting into a `WorkGraph`.
     fn stub_task(id: &str) -> Task {
         Task {
             id: id.to_string(),
             title: id.to_string(),
             ..Task::default()
         }
+    }
+
+    fn stub_task_after(id: &str, after: &[&str]) -> Task {
+        let mut task = stub_task(id);
+        task.after = after.iter().map(|dep| (*dep).to_string()).collect();
+        task
+    }
+
+    fn add_minimal_task(dir: &Path, title: &str, id: &str, after: &[String]) -> Result<()> {
+        run(
+            dir,
+            title,
+            Some(id),
+            None,
+            after,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            "internal",
+            None,
+            None,
+            None,
+            None,
+            false,
+            true,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn write_max_task_depth_config(dir: &Path, max_depth: u32) {
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[guardrails]\nmax_task_depth = {}\n", max_depth),
+        )
+        .unwrap();
     }
 
     // ---- validate_verify_command tests ----
@@ -1581,7 +1660,7 @@ mod tests {
     fn empty_title_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path();
-        // Initialize a workgraph
+        // Initialize a WG graph
         std::fs::create_dir_all(dir_path).unwrap();
         let path = super::graph_path(dir_path);
         let graph = WorkGraph::new();
@@ -2028,6 +2107,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn max_task_depth_uses_user_visible_depth_through_agency_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        write_max_task_depth_config(dir_path, 2);
+        let path = super::graph_path(dir_path);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(stub_task(".assign-visible-root")));
+        graph.add_node(Node::Task(stub_task_after(
+            "visible-root",
+            &[".assign-visible-root"],
+        )));
+        graph.add_node(Node::Task(stub_task_after(
+            ".flip-visible-root",
+            &["visible-root"],
+        )));
+        graph.add_node(Node::Task(stub_task_after(
+            ".evaluate-visible-root",
+            &[".flip-visible-root"],
+        )));
+        graph.add_node(Node::Task(stub_task(".assign-visible-one")));
+        graph.add_node(Node::Task(stub_task_after(
+            "visible-one",
+            &[".evaluate-visible-root", ".assign-visible-one"],
+        )));
+        graph.add_node(Node::Task(stub_task_after(
+            ".flip-visible-one",
+            &["visible-one"],
+        )));
+        graph.add_node(Node::Task(stub_task_after(
+            ".evaluate-visible-one",
+            &[".flip-visible-one"],
+        )));
+        save_graph(&graph, &path).unwrap();
+
+        let result = add_minimal_task(
+            dir_path,
+            "Visible two",
+            "visible-two",
+            &[".evaluate-visible-one".to_string()],
+        );
+
+        assert!(
+            result.is_ok(),
+            "internal assignment/flip/evaluation scaffold should not make visible depth 2 exceed max_task_depth=2: {:?}",
+            result
+        );
+
+        let graph = load_graph(&path).unwrap();
+        assert_eq!(graph.user_visible_task_depth("visible-two"), 2);
+    }
+
+    #[test]
+    fn max_task_depth_still_rejects_deep_user_dependency_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        std::fs::create_dir_all(dir_path).unwrap();
+        write_max_task_depth_config(dir_path, 2);
+        let path = super::graph_path(dir_path);
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(stub_task("visible-root")));
+        graph.add_node(Node::Task(stub_task_after(
+            "visible-one",
+            &["visible-root"],
+        )));
+        graph.add_node(Node::Task(stub_task_after("visible-two", &["visible-one"])));
+        save_graph(&graph, &path).unwrap();
+
+        let result = add_minimal_task(
+            dir_path,
+            "Visible three",
+            "visible-three",
+            &["visible-two".to_string()],
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("user-visible depth 3"),
+            "depth error should report user-visible depth, got: {err}"
+        );
+        assert!(
+            err.contains("configured max_task_depth: 2"),
+            "depth error should report configured limit, got: {err}"
+        );
+    }
+
     // ── resolve_model_input tests ──────────────────────────────────────
 
     #[test]
@@ -2104,11 +2273,12 @@ context_window = 32768
         std::fs::write(dir.path().join("model_cache.json"), cache.to_string()).unwrap();
 
         let result = resolve_model_input("qwen3-coder-30b", dir.path()).unwrap();
-        // Serialized models now emit "oai-compat:" prefix (the internal
-        // provider tag "openai" → user-facing prefix "oai-compat" via
-        // native_provider_to_prefix). The legacy "openai:" form still
-        // parses correctly; we just don't emit it any more.
-        assert_eq!(result, "oai-compat:qwen3-coder-30b");
+        // Serialized models now emit "nex:" prefix (the canonical name
+        // matching the `wg nex` subcommand; legacy internal tags "openai"
+        // / "oai-compat" / "local" all map to the user-facing "nex:" via
+        // native_provider_to_prefix). The legacy "openai:" / "oai-compat:"
+        // / "local:" forms still parse correctly; we just don't emit them.
+        assert_eq!(result, "nex:qwen3-coder-30b");
     }
 
     #[test]
@@ -2138,7 +2308,7 @@ tier = "standard"
     #[test]
     fn test_add_with_exec_sets_shell_mode() {
         let dir = tempfile::TempDir::new().unwrap();
-        let wg_dir = dir.path().join(".workgraph");
+        let wg_dir = dir.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&WorkGraph::new(), &graph_path).unwrap();
@@ -2204,7 +2374,7 @@ tier = "standard"
     #[test]
     fn test_add_with_exec_respects_explicit_exec_mode() {
         let dir = tempfile::TempDir::new().unwrap();
-        let wg_dir = dir.path().join(".workgraph");
+        let wg_dir = dir.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&WorkGraph::new(), &graph_path).unwrap();
@@ -2270,7 +2440,7 @@ tier = "standard"
     #[test]
     fn test_add_with_timeout() {
         let dir = tempfile::TempDir::new().unwrap();
-        let wg_dir = dir.path().join(".workgraph");
+        let wg_dir = dir.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&WorkGraph::new(), &graph_path).unwrap();

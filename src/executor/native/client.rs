@@ -259,16 +259,16 @@ impl AnthropicClient {
 
     /// Auth-config hint string injected into 401/403 error messages.
     /// Names the `[[llm_endpoints.endpoints]]` block to set `api_key`
-    /// in — NEVER an env var, per the workgraph credential contract.
+    /// in — NEVER an env var, per the WG credential contract.
     fn auth_config_hint(&self) -> String {
         match &self.endpoint_name {
             Some(name) => format!(
                 " To configure: set `api_key = \"...\"` (or `api_key_file`) under \
-                 [[llm_endpoints.endpoints]] block named '{}' in .workgraph/config.toml.",
+                 [[llm_endpoints.endpoints]] block named '{}' in .wg/config.toml.",
                 name
             ),
             None => " To configure: add an `[[llm_endpoints.endpoints]]` entry with `api_key = \"...\"` \
-                     to .workgraph/config.toml (run `wg endpoints add` for a wizard)."
+                     to .wg/config.toml (run `wg endpoints add` for a wizard)."
                 .to_string(),
         }
     }
@@ -553,8 +553,8 @@ fn resolve_api_key() -> Result<String> {
         return Ok(key);
     }
 
-    // 2. .workgraph/config.toml [native_executor] api_key
-    if let Ok(content) = std::fs::read_to_string(".workgraph/config.toml")
+    // 2. .wg/config.toml [native_executor] api_key
+    if let Ok(content) = std::fs::read_to_string(".wg/config.toml")
         && let Ok(val) = toml::from_str::<toml::Value>(&content)
         && let Some(key) = val
             .get("native_executor")
@@ -578,12 +578,12 @@ fn resolve_api_key() -> Result<String> {
 
     Err(anyhow!(
         "No Anthropic API key found. Set ANTHROPIC_API_KEY environment variable, \
-         add [native_executor] api_key to .workgraph/config.toml, \
+         add [native_executor] api_key to .wg/config.toml, \
          or create ~/.config/anthropic/api_key"
     ))
 }
 
-/// Resolve the API key, optionally looking in a specific workgraph directory.
+/// Resolve the API key, optionally looking in a specific WG directory.
 pub fn resolve_api_key_from_dir(workgraph_dir: &Path) -> Result<String> {
     // 1. Environment variable
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
@@ -592,7 +592,7 @@ pub fn resolve_api_key_from_dir(workgraph_dir: &Path) -> Result<String> {
         return Ok(key);
     }
 
-    // 2. Workgraph config (merged: global + local)
+    // 2. WG config (merged: global + local)
     if let Ok(merged_val) = crate::config::Config::load_merged_toml_value(workgraph_dir)
         && let Some(key) = merged_val
             .get("native_executor")
@@ -616,7 +616,7 @@ pub fn resolve_api_key_from_dir(workgraph_dir: &Path) -> Result<String> {
 
     Err(anyhow!(
         "No Anthropic API key found. Set ANTHROPIC_API_KEY environment variable, \
-         add [native_executor] api_key to .workgraph/config.toml, \
+         add [native_executor] api_key to .wg/config.toml, \
          or create ~/.config/anthropic/api_key"
     ))
 }

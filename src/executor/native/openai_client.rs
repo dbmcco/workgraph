@@ -1416,9 +1416,9 @@ impl OpenAiClient {
         if self.provider_hint.as_deref() == Some("openrouter") {
             headers.insert(
                 "http-referer",
-                HeaderValue::from_static("https://github.com/anthropics/workgraph"),
+                HeaderValue::from_static("https://github.com/graphwork/wg"),
             );
-            headers.insert("x-title", HeaderValue::from_static("workgraph"));
+            headers.insert("x-title", HeaderValue::from_static("wg"));
         }
 
         headers
@@ -1426,17 +1426,17 @@ impl OpenAiClient {
 
     /// Build the auth-config hint string injected into 401/403 error
     /// messages. Names the `[[llm_endpoints.endpoints]]` block to set
-    /// `api_key` in — NEVER an env var, per the workgraph credential
-    /// contract (credentials live in workgraph config exclusively).
+    /// `api_key` in — NEVER an env var, per the WG credential
+    /// contract (credentials live in WG config exclusively).
     fn auth_config_hint(&self) -> String {
         match &self.endpoint_name {
             Some(name) => format!(
                 " To configure: set `api_key = \"...\"` (or `api_key_file`) under \
-                 [[llm_endpoints.endpoints]] block named '{}' in .workgraph/config.toml.",
+                 [[llm_endpoints.endpoints]] block named '{}' in .wg/config.toml.",
                 name
             ),
             None => " To configure: add an `[[llm_endpoints.endpoints]]` entry with `api_key = \"...\"` \
-                     to .workgraph/config.toml (run `wg endpoints add` for a wizard)."
+                     to .wg/config.toml (run `wg endpoints add` for a wizard)."
                 .to_string(),
         }
     }
@@ -1487,11 +1487,11 @@ impl super::provider::Provider for OpenAiClient {
 /// 2. Environment variables (OPENROUTER_API_KEY, OPENAI_API_KEY)
 /// 3. `[native_executor]` api_key (legacy path)
 fn resolve_openai_api_key() -> Result<String> {
-    let workgraph_dir = std::path::Path::new(".workgraph");
+    let workgraph_dir = std::path::Path::new(".wg");
     resolve_openai_api_key_from_dir(workgraph_dir)
 }
 
-/// Resolve API key from a specific workgraph directory.
+/// Resolve API key from a specific WG directory.
 ///
 /// Loads config and delegates to `Config::resolve_api_key_for_provider`.
 pub fn resolve_openai_api_key_from_dir(workgraph_dir: &std::path::Path) -> Result<String> {
@@ -1575,7 +1575,7 @@ fn oai_api_error(status: u16, body: &str) -> anyhow::Error {
     ApiError { status, message }.into()
 }
 
-/// Same as `oai_api_error`, but appends a workgraph-config-pointing hint
+/// Same as `oai_api_error`, but appends a WG-config-pointing hint
 /// when the status is auth-related (401/403). The hint names the
 /// `[[llm_endpoints.endpoints]]` block — never an env var.
 fn oai_api_error_with_hint(status: u16, body: &str, config_hint: &str) -> anyhow::Error {
@@ -3604,6 +3604,7 @@ mod tests {
             api_key: Some("sk-test-inline".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -3626,6 +3627,7 @@ mod tests {
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -3648,6 +3650,7 @@ mod tests {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -3668,6 +3671,7 @@ mod tests {
             api_key: Some("sk-test".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -4184,7 +4188,7 @@ Done."#;
     fn test_extract_minimax_tool_call_no_panic_on_invoke_text() {
         // Regression test: text containing <invoke> XML format (used by some models)
         // with ':tool_call>' absent should not panic. Pattern 3 should not match.
-        let text = r#"<invoke name="wg_msg_read">
+        let text = r#"<invoke name="unknown_tool">
 <parameter name="task_id">some-task</parameter>
 </invoke>"#;
         // This should not panic — extract_tool_calls_from_text must handle

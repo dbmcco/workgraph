@@ -21,7 +21,7 @@ See `docs/KEY_DOCS.md` for the canonical list of documentation files to keep in 
 cargo install --path .          # rebuild global wg binary
 wg service stop                 # stop before rebuilding
 cargo test                      # run tests
-typst compile docs/manual/workgraph-manual.typ   # rebuild manual PDF
+typst compile docs/manual/wg-manual.typ   # rebuild manual PDF
 typst compile docs/research/organizational-patterns.typ  # rebuild org patterns PDF
 ```
 
@@ -30,7 +30,7 @@ typst compile docs/research/organizational-patterns.typ  # rebuild org patterns 
 **Typst (.typ) files are the ground truth.** Markdown versions exist for developers who prefer .md and for the website. Keep them in sync.
 
 Markdown locations:
-- `docs/manual/workgraph-manual.md` — full manual (glossary + chapters 01-05)
+- `docs/manual/wg-manual.md` — full manual (glossary + chapters 01-05)
 - `docs/research/organizational-patterns.md` — theory document
 - `graphwork.github.io/` — website copies (same files)
 
@@ -49,7 +49,7 @@ pandoc -f typst -t gfm --wrap=none docs/manual/01-overview.typ -o out.md
 # scripts/typst-to-md.py (if available) or see the convert-typst-docs task
 # logs for the preprocessing approach.
 #
-# The full manual is assembled from: glossary (from workgraph-manual.typ)
+# The full manual is assembled from: glossary (from wg-manual.typ)
 # + chapters 01-05, each converted separately, then concatenated.
 ```
 
@@ -80,7 +80,7 @@ merge_strategy = "squash"   # "merge", "squash", or "rebase"
 
 The coordinator creates a worktree per agent at spawn time:
 1. `git worktree add .wg-worktrees/<agent-id> -b wg/<agent-id>/<task-id> HEAD`
-2. Symlinks `.workgraph` into the worktree (shared task state)
+2. Symlinks `.wg` into the worktree (shared task state)
 3. Agent runs inside `.wg-worktrees/<agent-id>/`
 4. On completion: squash-merges branch back to main, removes worktree
 
@@ -90,7 +90,7 @@ The coordinator creates a worktree per agent at spawn time:
 .wg-worktrees/           # in .gitignore
 ├── agent-42/             # full working tree for agent-42
 │   ├── .git              # file pointing to .git/worktrees/agent-42
-│   ├── .workgraph -> /abs/path/.workgraph   # symlink (shared state)
+│   ├── .wg -> /abs/path/.wg   # symlink (shared state)
 │   └── src/              # independent file copy
 └── agent-43/             # another agent's worktree
 ```

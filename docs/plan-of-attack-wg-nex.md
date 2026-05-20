@@ -114,7 +114,7 @@ For full coordinator path (Conditions B–G), the existing adapter already handl
 
 | Variable | Required for eval-mode? | Required for coordinator? | Source |
 |----------|------------------------|--------------------------|--------|
-| `WG_DIR` | Yes (points to trial .workgraph/) | Yes | Set in exec command |
+| `WG_DIR` | Yes (points to trial .wg/) | Yes | Set in exec command |
 | `OPENROUTER_API_KEY` | If using OpenRouter | If using OpenRouter | Inherited from host |
 | `WG_TASK_ID` | No (eval-mode is taskless) | Yes | Coordinator spawn |
 | `WG_AGENT_ID` | No | Yes | Coordinator spawn |
@@ -139,7 +139,7 @@ context_window = 32768
 
 | Layer | What | When needed |
 |-------|------|------------|
-| 1. Binary + init | wg on PATH, `.workgraph/` initialized | All conditions |
+| 1. Binary + init | wg on PATH, `.wg/` initialized | All conditions |
 | 2. Env vars | `WG_TASK_ID`, `WG_AGENT_ID`, etc. | Conditions B+ |
 | 3. Tool surface | wg_* tools in tool registry (or excluded) | Conditions B+ (excluded for A) |
 | 4. Prompt injection | Tiered guide (8KB essential → 40KB full) | Conditions C+ |
@@ -273,7 +273,7 @@ For Condition A eval-mode, only Layer 1 is strictly needed (and even that only f
 | Harbor adapter | `terminal-bench/wg/adapter.py` |
 | Existing Python runner | `terminal-bench/run_pilot_qwen3_local_10.py` |
 | Smoke harness script | `scripts/eval-harness-smoke.sh` |
-| Lambda01 endpoint config | `.workgraph.1/config.toml` (llm_endpoints section) |
+| Lambda01 endpoint config | `.wg.1/config.toml` (llm_endpoints section) |
 | Task definitions | `terminal-bench/wg/tasks.py` |
 | Task setup files | `terminal-bench/tasks/` |
 | Tiered guide system | `src/commands/spawn/context.rs:644-664` |

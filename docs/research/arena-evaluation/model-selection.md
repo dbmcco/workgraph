@@ -1,10 +1,10 @@
-# Arena-Based Model Selection for Workgraph
+# Arena-Based Model Selection for WG
 
-Research doc covering how FLIP-style arena evaluation (Wang et al., 2025; arXiv:2602.13551) can drive model selection in workgraph.
+Research doc covering how FLIP-style arena evaluation (Wang et al., 2025; arXiv:2602.13551) can drive model selection in WG.
 
 ## 1. Current Model Selection
 
-Workgraph resolves which model runs a task through a fixed hierarchy (`src/commands/spawn.rs:209-213`):
+wg resolves which model runs a task through a fixed hierarchy (`src/commands/spawn.rs:209-213`):
 
 ```
 task.model > executor.model > coordinator.model (CLI --model) > default
@@ -12,11 +12,11 @@ task.model > executor.model > coordinator.model (CLI --model) > default
 
 **Per-task override:** `wg add "title" --model sonnet` sets `task.model` on the Task struct (`src/graph.rs`). Highest priority.
 
-**Executor-level default:** Each executor config (`.workgraph/executors/<name>.toml`) can specify a `model` field (`src/service/executor.rs:256-259`). Useful for giving the `amplifier` executor a different default than `claude`.
+**Executor-level default:** Each executor config (`.wg/executors/<name>.toml`) can specify a `model` field (`src/service/executor.rs:256-259`). Useful for giving the `amplifier` executor a different default than `claude`.
 
 **Coordinator default:** `wg config coordinator.model <model>` or `wg service start --model <model>`. Stored in `CoordinatorConfig.model` (`src/config.rs:225`). Applied to all spawned agents unless overridden above.
 
-**Model registry:** `wg models list/add/default` manages `.workgraph/models.yaml` (`src/models.rs`). The registry catalogs models with cost, tier (frontier/mid/budget), capabilities, and context window metadata. Currently informational — the coordinator doesn't query it when spawning. The `default_model` field exists but isn't wired into the spawn hierarchy.
+**Model registry:** `wg models list/add/default` manages `.wg/models.yaml` (`src/models.rs`). The registry catalogs models with cost, tier (frontier/mid/budget), capabilities, and context window metadata. Currently informational — the coordinator doesn't query it when spawning. The `default_model` field exists but isn't wired into the spawn hierarchy.
 
 **Key gap:** Model selection is entirely static. The user (or config) picks a model before seeing results. There's no mechanism to compare model outputs on the same task and pick the best one.
 
@@ -29,7 +29,7 @@ The FLIP method (§4.2 of the paper) enables cheap Best-of-N selection:
 3. Score each: `rᵢ = F1(x, x'ᵢ)` — word-level F1 between original task description and inferred instruction
 4. Select the response with the highest score: `y* = argmax rᵢ`
 
-**Why this works for workgraph:** Task descriptions are explicit instructions. FLIP measures how faithfully a response follows its instruction — exactly the quality signal workgraph needs. A response that addresses the task description well will allow a small model to reconstruct that description from the response alone.
+**Why this works for WG:** Task descriptions are explicit instructions. FLIP measures how faithfully a response follows its instruction — exactly the quality signal WG needs. A response that addresses the task description well will allow a small model to reconstruct that description from the response alone.
 
 **Scoring is model-agnostic and training-free.** The FLIP evaluator can be any small model (1B-12B parameters). It doesn't need to understand code quality — it just needs to generate plausible instructions from responses. The F1 computation is pure string matching.
 
@@ -79,11 +79,11 @@ Task: 10k-token description, 50k-token response. Arena with 3 models:
 | Normal single run | ~$0.80 |
 | **Arena overhead** | **~$1.65** (~2× normal) |
 
-Arena is cost-effective when the quality gain from selecting the best model saves downstream rework, retry costs, or evaluation failures. With workgraph's retry mechanism (`max_retries`), a single failed attempt at $0.80 + retry at $0.80 = $1.60 — comparable to arena's upfront cost.
+Arena is cost-effective when the quality gain from selecting the best model saves downstream rework, retry costs, or evaluation failures. With wg's retry mechanism (`max_retries`), a single failed attempt at $0.80 + retry at $0.80 = $1.60 — comparable to arena's upfront cost.
 
 ### Latency
 
-Arena runs are inherently sequential if models share rate limits, or parallel if using different providers. With workgraph's multi-provider model registry, parallel arena runs are possible. The FLIP scoring step is fast (~1-2s per evaluation with a small model).
+Arena runs are inherently sequential if models share rate limits, or parallel if using different providers. With wg's multi-provider model registry, parallel arena runs are possible. The FLIP scoring step is fast (~1-2s per evaluation with a small model).
 
 ## 5. Integration with Model Registry and Per-Task Override
 
@@ -108,7 +108,7 @@ The existing `task.model` field takes priority in the spawn hierarchy. Arena sho
 Arena results should feed back into the registry or a separate stats file:
 
 ```yaml
-# .workgraph/arena-stats.yaml
+# .wg/arena-stats.yaml
 win_rates:
   anthropic/claude-sonnet-4-6:
     tasks_entered: 42
@@ -168,14 +168,14 @@ wg add "arena-probe-{task-id}" --after dependencies --before {task-id} \
   --exec "wg arena-select {task-id} --candidates 3"
 ```
 
-This fits naturally into workgraph's graph model — the probe task completes, sets the model, then the real task dispatches with the selected model.
+This fits naturally into wg's graph model — the probe task completes, sets the model, then the real task dispatches with the selected model.
 
 ### Recommended approach
 
 Start with **Option A** (`wg arena-select` command) because:
 - No changes to coordinator logic
 - Users opt in explicitly
-- Easy to test and validate FLIP scoring accuracy on real workgraph tasks
+- Easy to test and validate FLIP scoring accuracy on real WG tasks
 - Win-rate data accumulates and informs whether Option B (automatic) is worth building
 
 Then graduate to **Option B** once win-rate data shows meaningful quality differences between models for different task types.

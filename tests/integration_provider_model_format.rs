@@ -51,6 +51,19 @@ fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("Failed to run wg {:?}: {}", args, e))
 }
 
+fn wg_cmd_with_home(wg_dir: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(wg_binary())
+        .arg("--dir")
+        .arg(wg_dir)
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run wg {:?}: {}", args, e))
+}
+
 fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
     let output = wg_cmd(wg_dir, args);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -65,13 +78,202 @@ fn wg_ok(wg_dir: &Path, args: &[&str]) -> String {
     stdout
 }
 
+fn wg_ok_with_home(wg_dir: &Path, home: &Path, args: &[&str]) -> String {
+    let output = wg_cmd_with_home(wg_dir, home, args);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "wg {:?} failed.\nstdout: {}\nstderr: {}",
+        args,
+        stdout,
+        stderr
+    );
+    stdout
+}
+
 fn setup_workgraph(tmp: &TempDir) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let graph = WorkGraph::new();
     save_graph(&graph, &graph_path).unwrap();
     wg_dir
+}
+
+fn setup_workgraph_under(tmp: &TempDir, rel: &str) -> PathBuf {
+    let wg_dir = tmp.path().join(rel).join(".wg");
+    fs::create_dir_all(&wg_dir).unwrap();
+    let graph_path = wg_dir.join("graph.jsonl");
+    let graph = WorkGraph::new();
+    save_graph(&graph, &graph_path).unwrap();
+    wg_dir
+}
+
+#[test]
+fn named_profile_use_is_authoritative_over_local_model_routing() {
+    // Regression for make-profile-switching: a repo-local config can pin
+    // Claude models in [agent], [dispatcher], [tiers], and [models.*].
+    // `wg profile use codex` must be sufficient to switch the effective
+    // routing to Codex while preserving unrelated local settings.
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".wg")).unwrap();
+    let wg_dir = setup_workgraph_under(&tmp, "project");
+
+    fs::write(
+        wg_dir.join("config.toml"),
+        r#"
+[agent]
+model = "claude:opus"
+
+[dispatcher]
+model = "claude:opus"
+executor = "claude"
+provider = "claude"
+max_agents = 5
+
+[tiers]
+fast = "claude:haiku"
+standard = "claude:sonnet"
+premium = "claude:opus"
+
+[models.default]
+model = "claude:opus"
+
+[models.evaluator]
+model = "claude:haiku"
+
+[agency]
+auto_assign = false
+auto_evaluate = false
+auto_evolve = false
+assigner_agent = "local-assigner"
+"#,
+    )
+    .unwrap();
+
+    wg_ok_with_home(&wg_dir, &home, &["profile", "init-starters"]);
+    let use_out = wg_ok_with_home(&wg_dir, &home, &["profile", "use", "codex", "--no-reload"]);
+    assert!(
+        use_out.contains("Cleared local routing overrides"),
+        "profile use should report the local routing pins it cleared:\n{}",
+        use_out
+    );
+
+    let config = wg_ok_with_home(&wg_dir, &home, &["config", "--merged"]);
+    assert!(
+        config.contains("executor = \"codex\""),
+        "effective merged config should resolve codex executor:\n{}",
+        config
+    );
+    assert!(
+        config.contains("model = \"codex:gpt-5.5\""),
+        "effective merged config should resolve codex model:\n{}",
+        config
+    );
+    assert!(
+        config.contains("max_agents = 5"),
+        "unrelated local dispatcher.max_agents must be preserved:\n{}",
+        config
+    );
+    assert!(
+        config.contains("assigner_agent = \"local-assigner\""),
+        "unrelated local agency settings must be preserved:\n{}",
+        config
+    );
+
+    let profile_show = wg_ok_with_home(&wg_dir, &home, &["profile", "show"]);
+    assert!(
+        profile_show.contains("Active named profile: codex"),
+        "profile show should report the active named profile:\n{}",
+        profile_show
+    );
+    assert!(
+        profile_show.contains("authoritative for routing"),
+        "profile show should declare profile routing authority:\n{}",
+        profile_show
+    );
+    assert!(
+        profile_show.contains("agent.model")
+            && profile_show.contains("codex:gpt-5.5")
+            && profile_show.contains("dispatcher.model"),
+        "profile show should render the effective codex models, not stale local claude pins:\n{}",
+        profile_show
+    );
+
+    let models_out = wg_ok_with_home(&wg_dir, &home, &["config", "--models"]);
+    let evaluator_line = models_out
+        .lines()
+        .find(|line| line.contains("evaluator"))
+        .unwrap_or_else(|| panic!("missing evaluator line in:\n{models_out}"));
+    assert!(
+        evaluator_line.contains("codex"),
+        "stale local [models.evaluator] must not shadow codex profile:\n{}",
+        models_out
+    );
+
+    let local_after = fs::read_to_string(wg_dir.join("config.toml")).unwrap();
+    assert!(
+        local_after.contains("max_agents = 5")
+            && local_after.contains("assigner_agent = \"local-assigner\""),
+        "local non-routing settings must remain after profile switch:\n{}",
+        local_after
+    );
+    assert!(
+        !local_after.contains("[tiers]")
+            && !local_after.contains("[models")
+            && !local_after.contains("claude:opus")
+            && !local_after.contains("claude:haiku"),
+        "local model-routing pins must be removed after profile switch:\n{}",
+        local_after
+    );
+
+    wg_ok_with_home(&wg_dir, &home, &["profile", "use", "claude", "--no-reload"]);
+    let switched_back = wg_ok_with_home(&wg_dir, &home, &["config", "--merged"]);
+    assert!(
+        switched_back.contains("executor = \"claude\""),
+        "switching back using only profile use claude should resolve claude executor:\n{}",
+        switched_back
+    );
+    assert!(
+        switched_back.contains("model = \"claude:opus\""),
+        "switching back using only profile use claude should resolve claude model:\n{}",
+        switched_back
+    );
+    assert!(
+        switched_back.contains("max_agents = 5")
+            && switched_back.contains("assigner_agent = \"local-assigner\""),
+        "unrelated local settings must remain after switching back:\n{}",
+        switched_back
+    );
+}
+
+#[test]
+fn config_models_displays_codex_provider_for_codex_profile_roles() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".wg")).unwrap();
+    let wg_dir = setup_workgraph_under(&tmp, "project");
+
+    wg_ok_with_home(&wg_dir, &home, &["profile", "init-starters"]);
+    wg_ok_with_home(&wg_dir, &home, &["profile", "use", "codex", "--no-reload"]);
+
+    let out = wg_ok_with_home(&wg_dir, &home, &["config", "--models"]);
+    for role in ["task_agent", "evaluator", "assigner", "evolver"] {
+        let line = out
+            .lines()
+            .find(|line| line.contains(role))
+            .unwrap_or_else(|| panic!("missing {role} line in:\n{out}"));
+        assert!(
+            line.contains("codex"),
+            "{role} should display provider codex, got line:\n{line}\nfull output:\n{out}"
+        );
+        assert!(
+            !line.contains(" nex "),
+            "{role} must not be displayed as nex for codex:gpt-* settings, got line:\n{line}"
+        );
+    }
 }
 
 // ===========================================================================

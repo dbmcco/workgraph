@@ -1,9 +1,9 @@
 ---
 name: wg
-description: Use this skill for task coordination with workgraph (wg). Triggers include "workgraph", "wg", task graphs, multi-step projects, tracking dependencies, coordinating agents, or when you see a .workgraph directory.
+description: Use this skill for task coordination with WG. Triggers include "wg", task graphs, multi-step projects, tracking dependencies, coordinating agents, or when you see a .wg directory.
 ---
 
-# workgraph
+# WG
 
 ## First: orient and start the service
 
@@ -175,7 +175,7 @@ open → [claim] → in-progress → [done] → done
 
 ## Cycles (repeating workflows)
 
-Some workflows repeat. Workgraph models these as **structural cycles** — `after` back-edges with a `CycleConfig` that controls iteration limits. When a cycle iteration completes, the cycle header task is reset to `open` with its `loop_iteration` incremented, and intermediate tasks are re-opened automatically.
+Some workflows repeat. wg models these as **structural cycles** — `after` back-edges with a `CycleConfig` that controls iteration limits. When a cycle iteration completes, the cycle header task is reset to `open` with its `loop_iteration` incremented, and intermediate tasks are re-opened automatically.
 
 ```bash
 # Create a write/review cycle, max 3 iterations
@@ -251,7 +251,7 @@ wg service resume           # Resume dispatching
 | `wg add "X" --no-place` | Skip automatic placement analysis |
 | `wg add "X" --place-near a,b` | Placement hint: near these tasks |
 | `wg add "X" --place-before a,b` | Placement hint: before these tasks |
-| `wg add "X" --repo peer-name` | Create task in a peer workgraph (by name or path) |
+| `wg add "X" --repo peer-name` | Create task in a peer wg (by name or path) |
 | `wg edit <id> --title "New" --description "New"` | Edit task fields |
 | `wg edit <id> --add-after X --remove-after Y` | Modify dependencies |
 | `wg edit <id> --add-after X --max-iterations 3` | Add cycle back-edge |
@@ -341,7 +341,7 @@ wg service resume           # Resume dispatching
 
 | Command | Purpose |
 |---------|---------|
-| `wg watch` | Stream workgraph events as JSON lines |
+| `wg watch` | Stream wg events as JSON lines |
 | `wg watch --event task_state` | Filter by event type (task_state, evaluation, agent, all) |
 | `wg watch --task <id>` | Filter events to a specific task (prefix match) |
 | `wg watch --replay 10` | Include N recent historical events before streaming |
@@ -572,11 +572,11 @@ wg service resume           # Resume dispatching
 | `wg agency push <target>` | Push local entities to another agency store |
 | `wg agency merge <sources...>` | Merge entities from multiple stores |
 
-### Peer workgraphs (cross-repo communication)
+### Peer WG instances (cross-repo communication)
 
 | Command | Purpose |
 |---------|---------|
-| `wg peer add <name> <path>` | Register a peer workgraph instance |
+| `wg peer add <name> <path>` | Register a peer WG instance |
 | `wg peer remove <name>` | Remove a registered peer |
 | `wg peer list` | List all configured peers with service status |
 | `wg peer show <name>` | Show detailed info about a peer |
@@ -653,18 +653,18 @@ wg service resume           # Resume dispatching
 | `wg skill list` | List all skills used across tasks |
 | `wg skill task <id>` | Show skills for a specific task |
 | `wg skill find <name>` | Find tasks requiring a specific skill |
-| `wg skill install` | Install the wg Claude Code skill to ~/.claude/skills/wg/ |
+| `wg skill install` | Install the WG Claude Code skill to ~/.claude/skills/wg/ |
 
 ### Setup & configuration
 
 | Command | Purpose |
 |---------|---------|
-| `wg init` | Initialize a new workgraph in the current directory |
+| `wg init` | Initialize a new WG directory in the current directory |
 | `wg setup` | Interactive configuration wizard for first-time setup |
 | `wg config --show` | Show current config |
 | `wg config --list` | Show merged config with source annotations (global/local/default) |
 | `wg config --init` | Create default config |
-| `wg config --global --executor claude` | Write to global config (~/.workgraph/config.toml) |
+| `wg config --global --executor claude` | Write to global config (~/.wg/config.toml) |
 | `wg config --local --model opus` | Write to local config (default for writes) |
 | `wg config --executor claude` | Set executor |
 | `wg config --model opus` | Set default model |
@@ -784,7 +784,7 @@ Tasks can specify `--exec-mode` to control what tools the agent receives:
 |------|-------------|----------|
 | `full` | Full Claude Code tools (file editing, bash, etc.) — default | Standard implementation, debugging |
 | `light` | Read-only tools (no file writes, no destructive commands) | Code review, analysis, audit |
-| `bare` | Only wg CLI instructions, no extra tools | Meta-tasks, workflow management |
+| `bare` | Only `wg` CLI instructions, no extra tools | Meta-tasks, workflow management |
 | `shell` | No LLM — direct shell execution of `exec` command | Scripted automation, CI/CD |
 
 ```bash
@@ -799,8 +799,8 @@ Tasks can specify a `--context-scope` that controls how much context the agent r
 
 | Scope | Description | Use Case |
 |-------|-------------|----------|
-| `clean` | Bare executor — no wg CLI instructions | Pure computation, translation, writing |
-| `task` | Task-aware with wg workflow instructions (default) | Standard implementation, bug fixes |
+| `clean` | Bare executor — no WG CLI instructions | Pure computation, translation, writing |
+| `task` | Task-aware with WG workflow instructions (default) | Standard implementation, bug fixes |
 | `graph` | Adds project description, 1-hop neighborhood, status summary | Integration, cross-component review |
 | `full` | Adds full graph summary, CLAUDE.md, system preamble | Meta-tasks, workflow design |
 

@@ -173,7 +173,7 @@ Within Tier 2, the differences between C, D, and E are **not statistically signi
 
 The FLIP model investigation (tb-investigate-flip-model) established:
 
-- **FLIP always uses fixed evaluator models**: Claude Sonnet (inference) + Claude Haiku (comparison), per `.workgraph/config.toml` configuration.
+- **FLIP always uses fixed evaluator models**: Claude Sonnet (inference) + Claude Haiku (comparison), per `.wg/config.toml` configuration.
 - **The task agent's model is recorded but never used** for FLIP probes (`src/commands/evaluate.rs:674-684`).
 - **For the full-sweep data (Sonnet 4.6 agents), this is not a confound** — the FLIP inference model (also Sonnet) naturally understands Sonnet's output patterns.
 
@@ -245,9 +245,9 @@ FLIP provides far stronger discriminative power than LLM eval for separating sha
 ### 5.5 Condition F: Discover-and-Verify
 
 - **Strategy:** Find existing tests → classify task → implement → run discovered tests → iterate on failures
-- **wg usage:** Uses wg in workgraph execution (logging, done) but not designed for Harbor wg tools
+- **wg usage:** Uses wg in wg execution (logging, done) but not designed for Harbor wg tools
 - **Verification:** Empirical — existing tests are authoritative, not self-authored tests
-- **Termination:** wg_done (workgraph context)
+- **Termination:** wg_done (wg context)
 - **Strength:** Test discovery bridges the verification gap; adaptive classification avoids E's decomposition trap
 - **Weakness:** Falls back to A-like behavior when no tests exist; incomplete trial data
 
@@ -307,7 +307,7 @@ F's design teaches *when* to decompose rather than forcing it:
 - **Atomic tasks** (single file, single function): Implement directly
 - **Multi-step tasks** (multiple files, build pipeline): Plan steps, implement sequentially
 
-This avoids E's failure mode (decomposing atomic tasks) while preserving the option for complex tasks. However, F's full-sweep trials use Sonnet 4.6 via workgraph (not Harbor with minimax), so a direct comparison of decomposition behavior is not yet available.
+This avoids E's failure mode (decomposing atomic tasks) while preserving the option for complex tasks. However, F's full-sweep trials use Sonnet 4.6 via wg (not Harbor with minimax), so a direct comparison of decomposition behavior is not yet available.
 
 ---
 
@@ -403,7 +403,7 @@ Condition F synthesizes the key lessons from A through E:
 
 1. **F's FLIP scores.** Until FLIP evaluations are collected for F, we cannot quantify whether F achieves Tier 2 understanding.
 2. **F vs D on harder tasks.** The full-sweep tasks are too easy. The Harbor H2H tasks (33% false-PASS rate) are the right difficulty target.
-3. **Multi-agent effects.** All data is single-agent. wg's coordination features (dependency dispatch, agent handoffs, concurrent execution) have never been tested in the benchmark.
+3. **Multi-agent effects.** All data is single-agent. WG's coordination features (dependency dispatch, agent handoffs, concurrent execution) have never been tested in the benchmark.
 4. **Model interaction effects.** Conditions may rank differently with different models. The only cross-model data point is minimax m2.7 (Harbor) vs Sonnet 4.6 (full-sweep), which confounds model capability with condition effects.
 
 ### 8.5 Actionable Next Steps
@@ -411,7 +411,7 @@ Condition F synthesizes the key lessons from A through E:
 1. **Complete Condition F sweep.** 4 trials remain in-progress. Once done, collect FLIP/LLM eval via tb-collect-condition-f.
 2. **Run harder tasks.** Port the H2H trial tasks (cancel-async-tasks, regex-log, build-cython-ext, overfull-hbox, etc. — known to produce failures) into a new sweep with conditions D, E, and F.
 3. **Fix the FLIP model mismatch.** Implement per-task FLIP model override (`src/commands/evaluate.rs:674`) so F's Gemini trials are scored by a Gemini evaluator, not Sonnet.
-4. **Test multi-agent scenarios.** Run the benchmark with `wg service --max-agents 4` to test whether wg's coordination features improve outcomes on tasks with genuine parallelism.
+4. **Test multi-agent scenarios.** Run the benchmark with `wg service --max-agents 4` to test whether WG's coordination features improve outcomes on tasks with genuine parallelism.
 5. **Increase replicas.** 3 replicas per cell produces wide confidence intervals. 5–10 replicas on a focused task set would enable within-Tier-2 discrimination.
 
 ---

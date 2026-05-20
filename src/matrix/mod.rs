@@ -1,4 +1,4 @@
-//! Matrix client wrapper for workgraph
+//! Matrix client wrapper for WG
 //!
 //! Provides a high-level interface for Matrix communication:
 //! - Login and session management (with persistent session storage)
@@ -8,7 +8,7 @@
 //! - E2EE key verification handling
 //! - Command parsing and message listener for interactive control
 //!
-//! State is stored in `.workgraph/matrix/` for session reuse.
+//! State is stored in `.wg/matrix/` for session reuse.
 
 pub use crate::matrix_commands as commands;
 pub mod listener;
@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 
 use crate::config::MatrixConfig;
 
-/// State directory name within .workgraph
+/// State directory name within .wg
 const MATRIX_STATE_DIR: &str = "matrix";
 
 /// Incoming Matrix message from a room
@@ -54,12 +54,12 @@ pub struct IncomingMessage {
 
 /// Matrix client wrapper
 ///
-/// Wraps the matrix-sdk Client with workgraph-specific functionality
+/// Wraps the matrix-sdk Client with WG-specific functionality
 /// including session persistence and simplified API.
 pub struct MatrixClient {
     /// The underlying matrix-sdk client
     client: Client,
-    /// Path to the workgraph directory
+    /// Path to the WG directory
     workgraph_dir: PathBuf,
     /// Our own user ID (after login)
     user_id: Option<OwnedUserId>,
@@ -69,7 +69,7 @@ impl MatrixClient {
     /// Create a new Matrix client
     ///
     /// # Arguments
-    /// * `workgraph_dir` - Path to the .workgraph directory
+    /// * `workgraph_dir` - Path to the .wg directory
     /// * `config` - Matrix configuration with credentials
     ///
     /// This will:
@@ -161,7 +161,7 @@ impl MatrixClient {
         Ok(())
     }
 
-    /// Get or create a device ID for this workgraph instance
+    /// Get or create a device ID for this WG instance
     fn get_or_create_device_id(&self) -> Result<matrix_sdk::ruma::OwnedDeviceId> {
         let device_id_path = self.state_dir().join("device_id");
 
@@ -184,7 +184,7 @@ impl MatrixClient {
         self.client
             .matrix_auth()
             .login_username(user_id.localpart(), password)
-            .initial_device_display_name("workgraph")
+            .initial_device_display_name("WG")
             .await
             .context("Failed to login with password")?;
 

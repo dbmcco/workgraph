@@ -1,7 +1,7 @@
 # Current Worktree Lifecycle Implementation Analysis
 
 ## Overview
-This document analyzes how worktrees are currently created, managed, and cleaned up in the workgraph system to understand where issues lie.
+This document analyzes how worktrees are currently created, managed, and cleaned up in the wg system to understand where issues lie.
 
 ## 1. Worktree Creation Flow
 
@@ -11,7 +11,7 @@ This document analyzes how worktrees are currently created, managed, and cleaned
 - Key steps:
   1. Create a new git branch named `wg/{agent_id}/{task_id}` from HEAD
   2. Create worktree directory at `.wg-worktrees/{agent_id}`
-  3. Symlink `.workgraph` into the worktree so CLI works from there
+  3. Symlink `.wg` into the worktree so CLI works from there
   4. Run `worktree-setup.sh` if it exists (best-effort)
 
 ### Key function: `create_worktree()`

@@ -15,7 +15,7 @@ use super::graph_path;
 /// Resolution order (per §5.4 of cross-repo design doc):
 /// 1. If source contains `:` → parse as `peer:function-id`, resolve peer, load from peer's functions dir
 /// 2. If source ends in `.yaml` or `.yml` → treat as a file path, load directly
-/// 3. Otherwise → existing behavior (search local `.workgraph/functions/`)
+/// 3. Otherwise → existing behavior (search local `.wg/functions/`)
 fn resolve_function_source(
     source: &str,
     function_id: &str,
@@ -140,7 +140,7 @@ pub fn run(
     let mut graph = if graph_file.exists() {
         load_graph_locked(&graph_file, &_lock).context("Failed to load graph")?
     } else {
-        anyhow::bail!("Workgraph not initialized. Run 'wg init' first.");
+        anyhow::bail!("WG not initialized. Run 'wg init' first.");
     };
 
     // Validate external blocked-by references exist
@@ -261,13 +261,18 @@ pub fn run(
                 created_at: Some(Utc::now().to_rfc3339()),
                 started_at: None,
                 completed_at: None,
+                last_interaction_at: None,
                 log: vec![],
                 retry_count: 0,
                 max_retries: None,
                 failure_reason: None,
+                failure_class: None,
                 model: task_model,
                 provider: None,
                 endpoint: None,
+                command_argv: vec![],
+                working_dir: None,
+                executor_preset_name: None,
                 verify: rendered.verify.clone(),
                 verify_timeout: None,
                 agent: None,
@@ -297,6 +302,8 @@ pub fn run(
                 exec_mode: None,
                 verify_failures: 0,
                 rescue_count: 0,
+                rescued: false,
+                meta_eval_attempts: 0,
                 spawn_failures: 0,
                 dispatch_count: 0,
                 tier: None,
@@ -1452,15 +1459,15 @@ mod tests {
     fn instantiate_from_peer() {
         let tmp = TempDir::new().unwrap();
 
-        // Set up "local" workgraph
-        let local_dir = tmp.path().join("local").join(".workgraph");
+        // Set up "local" WG project
+        let local_dir = tmp.path().join("local").join(".wg");
         std::fs::create_dir_all(&local_dir).unwrap();
         let graph = WorkGraph::new();
         save_graph(&graph, local_dir.join("graph.jsonl")).unwrap();
 
-        // Set up "peer" workgraph with a function
+        // Set up "peer" WG project with a function
         let peer_project = tmp.path().join("peer-project");
-        let peer_wg_dir = peer_project.join(".workgraph");
+        let peer_wg_dir = peer_project.join(".wg");
         std::fs::create_dir_all(&peer_wg_dir).unwrap();
         let peer_func_dir = peer_wg_dir.join("functions");
         function::save_function(&sample_function(), &peer_func_dir).unwrap();
@@ -1502,15 +1509,15 @@ mod tests {
     fn instantiate_from_peer_name_only() {
         let tmp = TempDir::new().unwrap();
 
-        // Set up local workgraph
-        let local_dir = tmp.path().join("local").join(".workgraph");
+        // Set up local WG project
+        let local_dir = tmp.path().join("local").join(".wg");
         std::fs::create_dir_all(&local_dir).unwrap();
         let graph = WorkGraph::new();
         save_graph(&graph, local_dir.join("graph.jsonl")).unwrap();
 
-        // Set up peer workgraph with a function
+        // Set up peer WG project with a function
         let peer_project = tmp.path().join("peer-project");
-        let peer_wg_dir = peer_project.join(".workgraph");
+        let peer_wg_dir = peer_project.join(".wg");
         std::fs::create_dir_all(&peer_wg_dir).unwrap();
         let peer_func_dir = peer_wg_dir.join("functions");
         function::save_function(&sample_function(), &peer_func_dir).unwrap();

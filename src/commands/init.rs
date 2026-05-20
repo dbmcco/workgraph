@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 use workgraph::config_defaults::{RouteParams, SetupRoute, config_for_route};
 
-/// Default content for .workgraph/.gitignore
-const GITIGNORE_CONTENT: &str = r#"# Workgraph gitignore
+/// Default content for .wg/.gitignore
+const GITIGNORE_CONTENT: &str = r#"# WG gitignore
 # Agent output logs (can be large)
 agents/
 
@@ -25,7 +25,7 @@ matrix.toml
 /// warning) but the supported entry points are now:
 ///
 /// - `wg init -m claude:opus`           (claude handler implied)
-/// - `wg init -m local:qwen3-coder -e https://…`   (nex/native implied)
+/// - `wg init -m nex:qwen3-coder -e https://…`     (nex/native implied)
 /// - `wg init --route <name>`           (canonical for fully-filled tiers)
 ///
 /// When the user supplies neither route nor model we fall back to the
@@ -60,8 +60,8 @@ pub fn run_with_route(
     // 2. Explicit --route always wins. Otherwise, derive a route from the
     //    (legacy or model-derived) executor — but ONLY when the executor
     //    maps to one of the named routes. Unknown executors (`shell`,
-    //    `amplifier`, custom names) fall through to the legacy path so we
-    //    don't clobber them with claude defaults.
+    //    custom names) fall through to the legacy path so we don't clobber
+    //    them with claude defaults.
     let resolved_route: Option<SetupRoute> = if let Some(name) = route {
         Some(SetupRoute::from_name(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -71,6 +71,24 @@ pub fn run_with_route(
         })?)
     } else {
         effective_executor.and_then(SetupRoute::try_from_executor)
+    };
+    // When nothing was supplied explicitly, decide the default route based on
+    // whether a global config already exists. If `~/.wg/config.toml` is
+    // present, the user already picked their provider (via `wg profile use`
+    // or a manual edit) — bake in the *same* route so the project's local
+    // config remains a thin overlay rather than overwriting global with claude
+    // defaults. This is what makes `wg profile use codex && cd proj && wg
+    // init` work end-to-end: the local config inherits codex rather than
+    // silently restating claude:opus.
+    let resolved_route = if resolved_route.is_none()
+        && executor.is_none()
+        && route.is_none()
+        && model.is_none()
+        && endpoint.is_none()
+    {
+        Some(default_route_from_global_or_claude())
+    } else {
+        resolved_route
     };
 
     if dry_run {
@@ -104,7 +122,7 @@ pub fn run_with_route(
 
     // Route-driven init: create dir, write config from route defaults.
     if dir.exists() {
-        anyhow::bail!("Workgraph already initialized at {}", dir.display());
+        anyhow::bail!("WG already initialized at {}", dir.display());
     }
     if let Some(parent) = dir.parent()
         && let Some(target_name) = dir.file_name().and_then(|n| n.to_str())
@@ -116,7 +134,7 @@ pub fn run_with_route(
             let sibling_path = parent.join(sibling);
             if sibling_path.is_dir() {
                 anyhow::bail!(
-                    "Workgraph already initialized at {} (legacy dir name). \
+                    "WG already initialized at {} (legacy dir name). \
                      Either use it as-is, or remove/rename it before running `wg init`.",
                     sibling_path.display()
                 );
@@ -124,7 +142,7 @@ pub fn run_with_route(
         }
     }
 
-    fs::create_dir_all(dir).context("Failed to create workgraph directory")?;
+    fs::create_dir_all(dir).context("Failed to create WG directory")?;
     write_repo_gitignore(dir)?;
     let graph_path = dir.join("graph.jsonl");
     fs::write(&graph_path, "").context("Failed to create graph.jsonl")?;
@@ -132,7 +150,7 @@ pub fn run_with_route(
     fs::write(&gitignore_path, GITIGNORE_CONTENT).context("Failed to create .gitignore")?;
     write_executor_templates(dir)?;
 
-    println!("Initialized workgraph at {}", dir.display());
+    println!("Initialized WG at {}", dir.display());
 
     let params = RouteParams {
         api_key_env: None,
@@ -195,10 +213,8 @@ pub fn run_with_route(
         println!("  Run: wg skill install");
     }
 
-    if route == SetupRoute::ClaudeCli
-        && let Some(project_dir) = dir.parent()
-    {
-        let (status, changed) = super::setup::configure_project_claude_md(project_dir)?;
+    if let Some(project_dir) = dir.parent() {
+        let (status, changed) = super::setup::configure_project_agent_guides(project_dir)?;
         if changed {
             println!();
             println!("{}", status);
@@ -206,6 +222,27 @@ pub fn run_with_route(
     }
 
     Ok(())
+}
+
+/// Default route for a no-arg `wg init`. Reads `~/.wg/config.toml` and picks
+/// the route whose primary model provider matches the global `[agent].model`
+/// prefix. Falls back to `ClaudeCli` if no global exists or the provider is
+/// unrecognized.
+///
+/// This is the glue that makes `wg profile use <provider> && wg init` produce
+/// a project config consistent with the active profile. Without it, the
+/// previous default (always ClaudeCli) overwrote codex/nex globals with
+/// claude:opus the moment a user ran `wg init`.
+fn default_route_from_global_or_claude() -> SetupRoute {
+    let Ok(Some(global)) = workgraph::config::Config::load_global() else {
+        return SetupRoute::ClaudeCli;
+    };
+    let spec = workgraph::config::parse_model_spec(&global.agent.model);
+    spec.provider
+        .as_deref()
+        .map(workgraph::config::provider_to_executor)
+        .and_then(SetupRoute::try_from_executor)
+        .unwrap_or(SetupRoute::ClaudeCli)
 }
 
 /// Map a model spec (e.g. `claude:opus`, `local:qwen3-coder`) to the
@@ -241,14 +278,13 @@ fn suggested_model_for_executor(executor: &str) -> &'static str {
     match executor {
         "claude" => "claude:opus",
         "codex" => "codex:gpt-5",
-        "nex" | "native" => "local:qwen3-coder -e <ENDPOINT>",
-        "amplifier" => "claude:opus  # amplifier wraps the same model",
+        "nex" | "native" => "nex:qwen3-coder -e <ENDPOINT>",
         "shell" => "shell  # exec_mode, not a model — keep the route",
         _ => "<provider>:<model>",
     }
 }
 
-/// Write the repo-level .gitignore entry for the workgraph dir basename.
+/// Write the repo-level .gitignore entry for the WG dir basename.
 fn write_repo_gitignore(dir: &Path) -> Result<()> {
     let dir_basename = dir
         .file_name()
@@ -284,7 +320,7 @@ fn write_repo_gitignore(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `.workgraph/executors/*.example` template files.
+/// Write `.wg/executors/*.example` template files.
 fn write_executor_templates(dir: &Path) -> Result<()> {
     let executors_dir = dir.join("executors");
     fs::create_dir_all(&executors_dir).context("Failed to create executors directory")?;
@@ -296,10 +332,6 @@ fn write_executor_templates(dir: &Path) -> Result<()> {
         (
             "codex.toml.example",
             include_str!("../../templates/executors/codex.toml.example"),
-        ),
-        (
-            "amplifier.toml.example",
-            include_str!("../../templates/executors/amplifier.toml.example"),
         ),
     ] {
         fs::write(executors_dir.join(name), contents)
@@ -326,7 +358,7 @@ pub fn run(
                 \n\
                   wg init -m claude:opus                                 # Anthropic Claude Code\n\
                   wg init -m codex:gpt-5                                 # OpenAI Codex CLI\n\
-                  wg init -m local:qwen3-coder -e http://127.0.0.1:8088  # local OAI-compat server\n\
+                  wg init -m nex:qwen3-coder -e http://127.0.0.1:8088    # local OAI-compat server (via nex)\n\
                   wg init -m openrouter:anthropic/claude-opus-4-6        # OpenRouter via nex\n\
                 \n\
                 Or pick a complete preset with --route:\n\
@@ -341,10 +373,10 @@ pub fn run(
     };
 
     if dir.exists() {
-        anyhow::bail!("Workgraph already initialized at {}", dir.display());
+        anyhow::bail!("WG already initialized at {}", dir.display());
     }
     // Refuse if the sibling legacy dir exists — we'd silently shadow it.
-    // e.g. user asks for `.wg` but `.workgraph` already exists next to it.
+    // e.g. user asks for `.wg` but `.wg` already exists next to it.
     if let Some(parent) = dir.parent()
         && let Some(target_name) = dir.file_name().and_then(|n| n.to_str())
     {
@@ -355,7 +387,7 @@ pub fn run(
             let sibling_path = parent.join(sibling);
             if sibling_path.is_dir() {
                 anyhow::bail!(
-                    "Workgraph already initialized at {} (legacy dir name). \
+                    "WG already initialized at {} (legacy dir name). \
                      Either use it as-is, or remove/rename it before running `wg init`.",
                     sibling_path.display()
                 );
@@ -363,10 +395,10 @@ pub fn run(
         }
     }
 
-    fs::create_dir_all(dir).context("Failed to create workgraph directory")?;
+    fs::create_dir_all(dir).context("Failed to create WG directory")?;
 
-    // Add the dir name (`.wg` for new projects, `.workgraph` for legacy init
-    // targets) to repo-level .gitignore.
+    // Add the dir name (`.wg` for new projects, `.workgraph` for legacy
+    // init targets) to repo-level .gitignore.
     let dir_basename = dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -427,16 +459,12 @@ pub fn run(
             "codex.toml.example",
             include_str!("../../templates/executors/codex.toml.example"),
         ),
-        (
-            "amplifier.toml.example",
-            include_str!("../../templates/executors/amplifier.toml.example"),
-        ),
     ] {
         fs::write(executors_dir.join(name), contents)
             .with_context(|| format!("Failed to write executor template {}", name))?;
     }
 
-    println!("Initialized workgraph at {}", dir.display());
+    println!("Initialized WG at {}", dir.display());
 
     // Always write the executor choice to config.toml.
     apply_executor(dir, executor).context("Failed to write executor config")?;
@@ -472,26 +500,12 @@ pub fn run(
                 println!("  Run: wg skill install");
             }
         }
-        "amplifier" => {
-            // Check if executor config exists in the newly created .workgraph
-            let executor_toml = dir.join("executors/amplifier.toml");
-            if !executor_toml.exists() {
-                println!();
-                println!(
-                    "Hint: Amplifier executor is configured but not installed in this project."
-                );
-                println!("  Spawned agents won't know wg commands without the workgraph bundle.");
-                println!("  Run: cd ~/amplifier-bundle-workgraph && ./setup.sh");
-            }
-        }
         _ => {} // Custom executor — user knows what they're doing
     }
 
-    // Configure project-level CLAUDE.md if using Claude executor
-    if executor == "claude"
-        && let Some(project_dir) = dir.parent()
-    {
-        let (status, changed) = super::setup::configure_project_claude_md(project_dir)?;
+    // Configure project-level agent guides for Claude Code / Claude CLI and Codex.
+    if let Some(project_dir) = dir.parent() {
+        let (status, changed) = super::setup::configure_project_agent_guides(project_dir)?;
         if changed {
             println!();
             println!("{}", status);
@@ -520,8 +534,8 @@ pub fn run(
 /// used to populate `[tiers]` and the model registry — fixing the empty
 /// `[tiers]` bug from the old `wg init -x claude` flow.
 ///
-/// For executors with no matching route (`shell`, `amplifier`, custom),
-/// only `coordinator.executor` is set and `[tiers]` is left empty so the
+/// For executors with no matching route (`shell`, custom), only
+/// `coordinator.executor` is set and `[tiers]` is left empty so the
 /// custom-executor user can decide for themselves.
 fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
     let canonical = match executor {
@@ -599,7 +613,7 @@ mod tests {
     #[test]
     fn test_creates_workgraph_directory() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
@@ -610,7 +624,7 @@ mod tests {
     #[test]
     fn test_creates_graph_jsonl() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
@@ -623,7 +637,7 @@ mod tests {
     #[test]
     fn test_creates_inner_gitignore() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
@@ -639,14 +653,14 @@ mod tests {
     #[test]
     fn test_creates_repo_level_gitignore_when_missing() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
         let repo_gitignore = tmp.path().join(".gitignore");
         assert!(repo_gitignore.exists());
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
-        assert!(contents.contains(".workgraph"));
+        assert!(contents.contains(".wg"));
     }
 
     #[test]
@@ -655,35 +669,35 @@ mod tests {
         let repo_gitignore = tmp.path().join(".gitignore");
         fs::write(&repo_gitignore, "node_modules/\n").unwrap();
 
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert!(contents.contains("node_modules/"));
-        assert!(contents.contains(".workgraph"));
+        assert!(contents.contains(".wg"));
     }
 
     #[test]
     fn test_does_not_duplicate_repo_gitignore_entry() {
         let tmp = TempDir::new().unwrap();
         let repo_gitignore = tmp.path().join(".gitignore");
-        fs::write(&repo_gitignore, ".workgraph\n").unwrap();
+        fs::write(&repo_gitignore, ".wg\n").unwrap();
 
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
         let contents = fs::read_to_string(&repo_gitignore).unwrap();
         assert_eq!(
-            contents.matches(".workgraph").count(),
+            contents.matches(".wg").count(),
             1,
-            "should not duplicate .workgraph entry"
+            "should not duplicate .wg entry"
         );
     }
 
     #[test]
     fn test_full_agency_init() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
 
@@ -724,11 +738,11 @@ mod tests {
     #[test]
     fn test_no_agency_flag() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, true, Some("shell"), None, None).unwrap();
 
-        // Workgraph dir and graph.jsonl should exist
+        // WG dir and graph.jsonl should exist
         assert!(wg_dir.exists());
         assert!(wg_dir.join("graph.jsonl").exists());
 
@@ -743,7 +757,7 @@ mod tests {
     #[test]
     fn test_fails_if_already_initialized() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
 
         run(&wg_dir, false, Some("shell"), None, None).unwrap();
         let result = run(&wg_dir, false, Some("shell"), None, None);
@@ -799,16 +813,17 @@ mod tests {
         .unwrap();
 
         let config = workgraph::config::Config::load(&wg_dir).unwrap();
-        // With an endpoint given, the model fields get the `local:` prefix
-        // so the provider:model validator accepts them on reload.
+        // With an endpoint given, the model fields get the `nex:` prefix
+        // (canonical, matches `wg nex`) so the provider:model validator
+        // accepts them on reload.
         assert_eq!(
             config.coordinator.model.as_deref(),
-            Some("local:nemotron-h-8b"),
-            "coordinator.model should be persisted with local: prefix"
+            Some("nex:nemotron-h-8b"),
+            "coordinator.model should be persisted with nex: prefix"
         );
         assert_eq!(
-            config.agent.model, "local:nemotron-h-8b",
-            "agent.model should be persisted with local: prefix"
+            config.agent.model, "nex:nemotron-h-8b",
+            "agent.model should be persisted with nex: prefix"
         );
         let eps = &config.llm_endpoints.endpoints;
         let default_ep = eps

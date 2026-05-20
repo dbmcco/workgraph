@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Workgraph cycles reset task state **in-place**, reusing the same task IDs across iterations. This means per-iteration artifacts (evaluations, FLIP scores, agent logs, token usage, session IDs, validation results) are either **overwritten** or **orphaned** — they exist in external storage but lose their iteration provenance. The "spiral" concept proposes that each cycle iteration materializes as unique tasks, preserving full per-iteration history while the cycle definition remains the structural template.
+wg cycles reset task state **in-place**, reusing the same task IDs across iterations. This means per-iteration artifacts (evaluations, FLIP scores, agent logs, token usage, session IDs, validation results) are either **overwritten** or **orphaned** — they exist in external storage but lose their iteration provenance. The "spiral" concept proposes that each cycle iteration materializes as unique tasks, preserving full per-iteration history while the cycle definition remains the structural template.
 
 **Key finding**: There is no existing spiral implementation, design doc, or partial code. The gap is significant but well-bounded. The closest existing mechanism is `wg replay` + the runs snapshot system, which archives full graph state before resetting tasks — a coarser version of per-iteration preservation.
 
@@ -89,7 +89,7 @@ Only the cycle "header" task (one member with `cycle_config` set) carries the co
 
 | Search Term | Results |
 |------------|---------|
-| `spiral` | **No code references**. One poem line in `docs/poetry/workgraph-poems.typ` |
+| `spiral` | **No code references**. One poem line in `docs/poetry/wg-poems.typ` |
 | `unroll` | **No results** in code or git history |
 | `materialize` | **No results** in code or git history |
 | `git log --grep spiral` | **No commits** |
@@ -100,7 +100,7 @@ Only the cycle "header" task (one member with `cycle_config` set) carries the co
 **`docs/research/cyclic-processes.md`** (2026-02-14) is the closest prior art. It surveyed 8 workflow systems and identified two philosophies:
 
 - **Philosophy A: Immutable runs, new instances** (Temporal, Airflow, Argo, Cylc) — each iteration creates a new execution/run/node. The spiral concept aligns with this philosophy.
-- **Philosophy B: Mutable status, re-activation** (n8n, BPMN, Step Functions) — the same task transitions back. **This is what workgraph currently implements.**
+- **Philosophy B: Mutable status, re-activation** (n8n, BPMN, Step Functions) — the same task transitions back. **This is what wg currently implements.**
 
 The research recommended a hybrid approach (Section 3.2):
 > "For retry/revision loops (short cycles, same work unit): Allow Done -> Open re-activation on the same task."
@@ -111,7 +111,7 @@ The Cylc pattern was specifically called out as elegant: "parameterizing tasks b
 ### 2.3 Related Existing Mechanisms
 
 **`wg replay` + runs system** (`src/commands/replay.rs`, `src/runs.rs`):
-- Snapshots the entire `graph.jsonl` to `.workgraph/runs/run-NNN/` before resetting tasks
+- Snapshots the entire `graph.jsonl` to `.wg/runs/run-NNN/` before resetting tasks
 - `reset_task()` clears: status, assigned, started_at, completed_at, artifacts, loop_iteration, failure_reason, paused
 - Preserves: log, after, blocks, description, tags, skills
 - This is a **manual, graph-wide** mechanism, not per-cycle-iteration
@@ -122,7 +122,7 @@ The Cylc pattern was specifically called out as elegant: "parameterizing tasks b
 - `output_file` points to the agent's log file, which survives cycle reset
 - **But**: the `task_id` in the registry is the bare task ID (e.g., "my-task"), with no iteration suffix. Multiple agents working different iterations of the same task produce separate registry entries, but correlation requires timestamp matching.
 
-**Evaluation storage** (`src/agency/eval.rs`, `.workgraph/agency/evaluations/`):
+**Evaluation storage** (`src/agency/eval.rs`, `.wg/agency/evaluations/`):
 - Evaluations are stored as JSON files: `eval-{task_id}-{timestamp}.json`
 - Each `Evaluation` has `task_id`, `agent_id`, `role_id`, `tradeoff_id`, `score`, `dimensions`, `notes`, `timestamp`
 - **No `loop_iteration` field** — evaluations don't know which iteration they belong to
@@ -140,11 +140,11 @@ The Cylc pattern was specifically called out as elegant: "parameterizing tasks b
 | Log entries | `task.log` (in graph.jsonl) | Appended, never cleared | Implicitly (via timestamps + re-activation log entries) |
 | `loop_iteration` counter | `task.loop_iteration` | Incremented | Yes — but only current value, no history |
 | `last_iteration_completed_at` | `task.last_iteration_completed_at` | Overwritten each reset | No — only most recent |
-| Evaluation JSONs | `.workgraph/agency/evaluations/` | Separate files, never deleted | No — keyed by task_id, not task_id+iteration |
-| Agent registry entries | `.workgraph/service/registry.json` | Append-only | No — task_id only, no iteration field |
+| Evaluation JSONs | `.wg/agency/evaluations/` | Separate files, never deleted | No — keyed by task_id, not task_id+iteration |
+| Agent registry entries | `.wg/service/registry.json` | Append-only | No — task_id only, no iteration field |
 | Agent output logs | File referenced by `AgentEntry.output_file` | Separate files persist | No — file names don't encode iteration |
 | Git commits | `.git/` | Immutable | No — commit messages reference task_id, not iteration |
-| Provenance log | `.workgraph/provenance/` | Append-only | No — records task_id events |
+| Provenance log | `.wg/provenance/` | Append-only | No — records task_id events |
 
 ### 3.2 Data That Is LOST or OVERWRITTEN
 
@@ -270,7 +270,7 @@ Each cycle iteration creates new tasks with unique IDs (`task-id~N`). Cycle defi
 
 ### Option B: Iteration Snapshots (Medium effort, Good fidelity)
 
-Keep in-place mutation but snapshot per-iteration state before reset. Add `iteration` field to evaluations and agent records. Store snapshots in `.workgraph/iterations/{task-id}/iter-{N}.json`.
+Keep in-place mutation but snapshot per-iteration state before reset. Add `iteration` field to evaluations and agent records. Store snapshots in `.wg/iterations/{task-id}/iter-{N}.json`.
 
 - **Pros**: Minimal graph model changes, preserves all per-iteration data, backward compatible
 - **Cons**: Iteration history is in a side-channel, not in the graph itself. Querying requires joining

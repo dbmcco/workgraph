@@ -2,7 +2,7 @@
 
 ## Overview
 
-Agents currently receive a one-size-fits-all prompt assembled from `TemplateVars` in `executor.rs`. This design introduces configurable **context scopes** that control how much information an agent receives about the workgraph, its neighbors, and the system itself. The goal: give each agent exactly the context it needs — no more, no less.
+Agents currently receive a one-size-fits-all prompt assembled from `TemplateVars` in `executor.rs`. This design introduces configurable **context scopes** that control how much information an agent receives about the wg, its neighbors, and the system itself. The goal: give each agent exactly the context it needs — no more, no less.
 
 ---
 
@@ -12,7 +12,7 @@ Four tiers, ordered by increasing context breadth:
 
 ### 1.1 `clean` — Bare Executor
 
-**Purpose:** Pure computation, writing, or analysis tasks that have no need for workgraph awareness. The agent is a stateless tool.
+**Purpose:** Pure computation, writing, or analysis tasks that have no need for wg awareness. The agent is a stateless tool.
 
 **What the agent receives:**
 - `{{skills_preamble}}` (if present)
@@ -49,7 +49,7 @@ Four tiers, ordered by increasing context breadth:
 **What is omitted:**
 - No graph topology beyond immediate neighbors
 - No project-level summary or description
-- No system awareness (what workgraph is, how coordinator works)
+- No system awareness (what wg is, how coordinator works)
 
 **When to use:** Most implementation tasks, bug fixes, code review, test writing — anything that benefits from `wg` CLI access and dependency awareness.
 
@@ -78,12 +78,12 @@ Four tiers, ordered by increasing context breadth:
 
 ### 1.4 `full` — System-Aware
 
-**Purpose:** The agent understands the entire workgraph system — what it is, how the coordinator works, how tasks flow, what trace functions and the agency model are. For meta-tasks like architecture design, spec writing, workflow optimization, and debugging workgraph itself.
+**Purpose:** The agent understands the entire WG system — what it is, how the coordinator works, how tasks flow, what trace functions and the agency model are. For meta-tasks like architecture design, spec writing, workflow optimization, and debugging WG itself.
 
 **What the agent receives:**
 - Everything from `graph`
-- **System awareness preamble:** A ~300-token explanation of workgraph concepts:
-  - What workgraph is (graph-based task orchestration)
+- **System awareness preamble:** A ~300-token explanation of wg concepts:
+  - What wg is (graph-based task orchestration)
   - How the coordinator works (polls for ready tasks, spawns agents, monitors health)
   - How cycles/loops work
   - How the agency system works (roles, motivations, agents, evaluation, evolution)
@@ -94,7 +94,7 @@ Four tiers, ordered by increasing context breadth:
 **What is omitted:**
 - Nothing. This is the maximum context tier.
 
-**When to use:** Meta-tasks (designing workflows, writing specs about workgraph), debugging task failures across the graph, architecture decisions, onboarding-style tasks where the agent needs to understand the whole system.
+**When to use:** Meta-tasks (designing workflows, writing specs about wg), debugging task failures across the graph, architecture decisions, onboarding-style tasks where the agent needs to understand the whole system.
 
 **Estimated token cost:** ~3000-6000 tokens depending on graph size. Budget: hard cap at 8000 tokens for the full context additions, with aggressive summarization if exceeded.
 
@@ -131,7 +131,7 @@ pub context_scope: Option<String>,
 #### Per-role (medium priority):
 Roles can declare a default context scope in their YAML definition:
 ```yaml
-# .workgraph/agency/roles/<hash>.yaml
+# .wg/agency/roles/<hash>.yaml
 name: "Integrator"
 description: "Integrates outputs from multiple tasks"
 default_context_scope: "graph"
@@ -147,7 +147,7 @@ pub default_context_scope: Option<String>,
 
 #### Global default (lowest priority):
 ```toml
-# .workgraph/config.toml
+# .wg/config.toml
 [coordinator]
 default_context_scope = "task"
 ```
@@ -349,7 +349,7 @@ const GRAPH_PATTERNS_SECTION: &str = r#"## Graph Patterns
 
 ```rust
 fn build_task_context(
-    graph: &WorkGraph,
+    graph: &wg,
     task: &Task,
     scope: ContextScope,
 ) -> String {
@@ -415,7 +415,7 @@ pub struct TemplateVars {
 }
 ```
 
-The monolithic template string in `default_config("claude")` is replaced with a call to `build_prompt()` that assembles sections based on scope. Custom executor configs (in `.workgraph/executors/`) can still use the old monolithic template approach — the scope-based assembly is only for the built-in defaults.
+The monolithic template string in `default_config("claude")` is replaced with a call to `build_prompt()` that assembles sections based on scope. Custom executor configs (in `.wg/executors/`) can still use the old monolithic template approach — the scope-based assembly is only for the built-in defaults.
 
 ---
 
@@ -428,7 +428,7 @@ The monolithic template string in `default_config("claude")` is replaced with a 
 Gathered by a new `build_graph_summary()` function in spawn.rs:
 
 ```rust
-fn build_graph_summary(graph: &WorkGraph, task: &Task) -> String {
+fn build_graph_summary(graph: &wg, task: &Task) -> String {
     let mut lines = Vec::new();
 
     // Status counts
@@ -536,9 +536,9 @@ Loaded from `Config::load_or_default(workgraph_dir).project.description`. Alread
 A static string constant:
 
 ```rust
-const SYSTEM_AWARENESS_PREAMBLE: &str = r#"## About Workgraph
+const SYSTEM_AWARENESS_PREAMBLE: &str = r#"## About wg
 
-Workgraph is a directed-graph-based task orchestration system. Tasks have dependencies (edges),
+wg is a directed-graph-based task orchestration system. Tasks have dependencies (edges),
 statuses (open → in-progress → done/failed), and can be assigned to AI agents.
 
 **Coordinator:** A daemon that polls for ready tasks (all dependencies satisfied),
@@ -572,7 +572,7 @@ fn load_claude_md(workgraph_dir: &Path) -> String {
 For `full` scope, instead of just 1-hop, include all tasks:
 
 ```rust
-fn build_full_graph_summary(graph: &WorkGraph) -> String {
+fn build_full_graph_summary(graph: &wg) -> String {
     let mut lines = Vec::new();
     lines.push("All tasks:".to_string());
 
@@ -662,7 +662,7 @@ full_context_token_budget = 8000
 ### 5.5 Backward Compatibility
 
 - Tasks without `context_scope` set default to `task`, which produces the same prompt as today (modulo the R1-R5 improvements that should be applied regardless).
-- Custom executor configs in `.workgraph/executors/` that define their own `prompt_template.template` are unaffected — scope-based assembly only applies to built-in defaults.
+- Custom executor configs in `.wg/executors/` that define their own `prompt_template.template` are unaffected — scope-based assembly only applies to built-in defaults.
 - The `context_scope` field on Task uses `skip_serializing_if = "Option::is_none"`, so existing graph.jsonl files are unaffected.
 
 ---
@@ -694,7 +694,7 @@ full_context_token_budget = 8000
 16. Update tests
 17. Update AGENT-GUIDE.md with scope documentation
 
-Each phase can be a separate task in the workgraph with pipeline edges (Phase 1 → Phase 2 → Phase 3 → Phase 4).
+Each phase can be a separate task in the wg with pipeline edges (Phase 1 → Phase 2 → Phase 3 → Phase 4).
 
 ---
 

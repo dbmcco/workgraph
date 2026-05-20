@@ -222,6 +222,7 @@ fn test_full_agency_lifecycle() {
         timestamp: "2025-01-15T11:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     let eval_path = agency::record_evaluation(&evaluation, &agency_dir).unwrap();
@@ -292,6 +293,7 @@ fn test_full_agency_lifecycle() {
         timestamp: "2025-01-16T09:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     agency::record_evaluation(&evaluation2, &agency_dir).unwrap();
@@ -377,7 +379,7 @@ fn test_seed_starters_and_round_trip() {
 #[test]
 fn test_full_agency_lifecycle_new_design() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     let agency_dir = wg_dir.join("agency");
 
     // ---------------------------------------------------------------
@@ -612,6 +614,7 @@ fn test_full_agency_lifecycle_new_design() {
         timestamp: "2025-06-01T12:30:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
 
     let eval_path = agency::record_evaluation(&evaluation, &agency_dir).unwrap();
@@ -707,6 +710,7 @@ fn test_full_agency_lifecycle_new_design() {
         timestamp: "2025-06-02T10:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
     agency::record_evaluation(&eval2, &agency_dir).unwrap();
 
@@ -833,7 +837,7 @@ fn test_full_agency_lifecycle_new_design() {
     );
     assert_eq!(role_ancestry[0].id, evolved_role_id);
     assert_eq!(role_ancestry[0].generation, 1);
-    assert_eq!(role_ancestry[0].created_by, "evolver-evo-run-1");
+    assert_eq!(role_ancestry[0].created_by, "evolver");
     assert_eq!(role_ancestry[1].id, role_id);
     assert_eq!(role_ancestry[1].generation, 0);
 
@@ -846,7 +850,7 @@ fn test_full_agency_lifecycle_new_design() {
     );
     assert_eq!(mot_ancestry[0].id, crossover_mot_id);
     assert_eq!(mot_ancestry[0].generation, 1);
-    assert_eq!(mot_ancestry[0].created_by, "evolver-evo-run-2");
+    assert_eq!(mot_ancestry[0].created_by, "evolver");
     let parent_ids: Vec<&str> = mot_ancestry[1..].iter().map(|n| n.id.as_str()).collect();
     assert!(parent_ids.contains(&motivation_id.as_str()));
     assert!(parent_ids.contains(&motivation_b_id.as_str()));
@@ -877,7 +881,7 @@ fn test_full_agency_lifecycle_new_design() {
     let loaded_evolved = agency::find_agent_by_prefix(&agents_dir, &evolved_agent_id).unwrap();
     assert_eq!(loaded_evolved.lineage.generation, 1);
     assert_eq!(loaded_evolved.lineage.parent_ids, vec![agent_id.clone()]);
-    assert_eq!(loaded_evolved.lineage.created_by, "evolver-agent-evo-1");
+    assert_eq!(loaded_evolved.lineage.created_by, "evolver");
 
     // ---------------------------------------------------------------
     // Step 9: Test that old slug-based entities are rejected gracefully
@@ -957,6 +961,7 @@ performance:
         timestamp: "2025-06-03T08:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
     let slug_eval_result = agency::record_evaluation(&slug_eval, &agency_dir);
     assert!(
@@ -986,7 +991,7 @@ performance:
 #[test]
 fn test_output_capture_standalone() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let mut task = make_task(
@@ -1117,6 +1122,7 @@ fn test_agent_independent_performance() {
         timestamp: "2025-08-01T10:00:00Z".to_string(),
         model: None,
         source: "llm".to_string(),
+        loop_iteration: 0,
     };
     agency::record_evaluation(&eval_a, &agency_dir).unwrap();
 

@@ -217,29 +217,27 @@ pub fn remove_worktree(project_root: &Path, worktree_path: &Path, branch: &str) 
     // Calculate disk space before cleanup for metrics
     let initial_size = calculate_directory_size(worktree_path).unwrap_or(0);
 
-    // Remove .workgraph symlink first (git worktree remove won't remove it)
-    let symlink_path = worktree_path.join(".workgraph");
+    // Remove .wg symlink first (git worktree remove won't remove it)
+    let symlink_path = worktree_path.join(".wg");
     if symlink_path.exists() {
         match fs::remove_file(&symlink_path) {
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                 eprintln!(
-                    "[worktree] Permission denied removing .workgraph symlink, attempting permission fix"
+                    "[worktree] Permission denied removing .wg symlink, attempting permission fix"
                 );
                 if let Err(fallback_err) = fix_permissions_and_remove_file(&symlink_path) {
                     cleanup_errors.push(format!(
-                        "Failed to remove .workgraph symlink {:?} even after permission fix: {}",
+                        "Failed to remove .wg symlink {:?} even after permission fix: {}",
                         symlink_path, fallback_err
                     ));
                 } else {
-                    eprintln!(
-                        "[worktree] Successfully removed .workgraph symlink after permission fix"
-                    );
+                    eprintln!("[worktree] Successfully removed .wg symlink after permission fix");
                     resources.symlinks_cleaned += 1;
                 }
             }
             Err(e) => {
                 cleanup_errors.push(format!(
-                    "Failed to remove .workgraph symlink {:?}: {}",
+                    "Failed to remove .wg symlink {:?}: {}",
                     symlink_path, e
                 ));
             }
@@ -391,13 +389,10 @@ pub fn verify_worktree_cleanup(
         }
     }
 
-    // Check for .workgraph symlink
-    let symlink_path = worktree_path.join(".workgraph");
+    // Check for .wg symlink
+    let symlink_path = worktree_path.join(".wg");
     if symlink_path.exists() {
-        verification_errors.push(format!(
-            ".workgraph symlink still exists: {:?}",
-            symlink_path
-        ));
+        verification_errors.push(format!(".wg symlink still exists: {:?}", symlink_path));
     }
 
     // Check for target directory
@@ -768,12 +763,12 @@ pub fn cleanup_orphaned_worktrees(dir: &Path) -> Result<usize> {
                 // No branch found — use fallback cleanup with error reporting
                 let mut cleanup_errors = Vec::new();
 
-                // Remove .workgraph symlink
-                let symlink_path = wt_path.join(".workgraph");
+                // Remove .wg symlink
+                let symlink_path = wt_path.join(".wg");
                 if symlink_path.exists()
                     && let Err(e) = fs::remove_file(&symlink_path)
                 {
-                    cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
+                    cleanup_errors.push(format!("Failed to remove .wg symlink: {}", e));
                 }
 
                 // Remove isolated cargo target directory
@@ -1180,11 +1175,11 @@ pub fn prune_stale_worktrees(dir: &Path, max_age_secs: u64) -> Result<usize> {
                 // Use fallback cleanup with error reporting (same as orphaned cleanup)
                 let mut cleanup_errors = Vec::new();
 
-                let symlink_path = wt_path.join(".workgraph");
+                let symlink_path = wt_path.join(".wg");
                 if symlink_path.exists()
                     && let Err(e) = fs::remove_file(&symlink_path)
                 {
-                    cleanup_errors.push(format!("Failed to remove .workgraph symlink: {}", e));
+                    cleanup_errors.push(format!("Failed to remove .wg symlink: {}", e));
                 }
 
                 let target_dir = wt_path.join("target");
@@ -2290,7 +2285,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Create worktrees for two agents: one live, one dead
@@ -2426,7 +2421,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Agent completed successfully AND eval passed AND branch merged into main.
@@ -2466,7 +2461,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Agent failed: task=Failed, agent=Failed, marker present.
@@ -2500,7 +2495,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Agent may have died before writing marker: don't touch it from sweep.
@@ -2533,7 +2528,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Marker present but agent is still live (stuck wrapper + race):
@@ -2564,7 +2559,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Marker present, agent dead, but task still in-progress (triage will
@@ -2597,7 +2592,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Worktree exists with marker, but agent has NO registry entry
@@ -2628,7 +2623,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Same as above but task is Done with eval pass + merged branch —
@@ -2656,7 +2651,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
 
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         let (wt_path, branch) = create_test_worktree(&project, "agent-idem", "task-idem");
@@ -2692,7 +2687,7 @@ mod tests {
         let project_a = temp_a.path().join("project");
         fs::create_dir_all(&project_a).unwrap();
         init_git_repo(&project_a);
-        let wg_dir_a = project_a.join(".workgraph");
+        let wg_dir_a = project_a.join(".wg");
         fs::create_dir_all(wg_dir_a.join("service")).unwrap();
 
         let (wt_a, branch_a) = create_test_worktree(&project_a, "agent-a", "task-a");
@@ -2719,7 +2714,7 @@ mod tests {
         let project_b = temp_b.path().join("project");
         fs::create_dir_all(&project_b).unwrap();
         init_git_repo(&project_b);
-        let wg_dir_b = project_b.join(".workgraph");
+        let wg_dir_b = project_b.join(".wg");
         fs::create_dir_all(wg_dir_b.join("service")).unwrap();
 
         let (wt_b, _branch_b) = create_test_worktree(&project_b, "agent-b", "task-b");
@@ -2764,7 +2759,7 @@ mod tests {
         let project_c = temp_c.path().join("project");
         fs::create_dir_all(&project_c).unwrap();
         init_git_repo(&project_c);
-        let wg_dir_c = project_c.join(".workgraph");
+        let wg_dir_c = project_c.join(".wg");
         fs::create_dir_all(wg_dir_c.join("service")).unwrap();
 
         let (wt_c, branch_c) = create_test_worktree(&project_c, "agent-c", "task-c");
@@ -2797,7 +2792,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Worktree exists, no agent registered (crash scenario), no marker.
@@ -2881,7 +2876,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Live agent: registered with our own PID + fresh heartbeat.
@@ -2930,7 +2925,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
         // Save an empty registry so load() succeeds.
         workgraph::service::registry::AgentRegistry::default()
@@ -2955,7 +2950,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         let (wt_path, _) = create_test_worktree(&project, "agent-dead", "task-dead");
@@ -2993,7 +2988,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
         init_git_repo(&project);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         // Worktree directory was created for agent-A; the dir is named "agent-A".
@@ -3039,7 +3034,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("project");
         fs::create_dir_all(&project).unwrap();
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         fs::create_dir_all(wg_dir.join("service")).unwrap();
 
         let (reaped, freed) = reap_dead_target_dirs(&wg_dir).unwrap();

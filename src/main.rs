@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![warn(clippy::redundant_closure)]
 // Pre-existing clippy lints surfaced by rust 1.95 that weren't in
 // 1.93. Allowed crate-wide while we decide whether to refactor each
@@ -23,7 +24,7 @@ mod tui;
 
 use cli::*;
 
-/// Resolve the workgraph directory for this invocation.
+/// Resolve the WG directory for this invocation.
 ///
 /// Precedence (highest first):
 ///
@@ -31,18 +32,19 @@ use cli::*;
 /// 2. **`WG_DIR` environment variable.** Second-highest — lets users
 ///    script `wg` commands against a specific graph without a flag.
 /// 3. **Project discovery.** Walk up from `cwd` looking for a
-///    `.workgraph` directory. If found, use it. This matches how
-///    `git` finds `.git`, `cargo` finds `Cargo.toml`, etc.
-/// 4. **Global fallback `~/.workgraph`.** If the user has a global
-///    workgraph directory in their home, use it. This makes `wg nex`
-///    usable from any directory without littering `.workgraph` dirs
+///    WG directory. Prefer `.wg` (canonical), fall back to the
+///    legacy `.workgraph` name. This matches how `git` finds `.git`,
+///    `cargo` finds `Cargo.toml`, etc.
+/// 4. **Global fallback `~/.wg`.** If the user has a global
+///    WG directory in their home, use it. This makes `wg nex`
+///    usable from any directory without littering WG dirs
 ///    across the filesystem. Primarily for REPL-style interactive
 ///    commands; project-scoped commands (`wg add`, `wg done`, etc.)
 ///    will still fail-on-missing when they try to load the graph.
-/// 5. **Default `./.workgraph` in current directory.** Backward-
-///    compatible final fallback. Same as the old pre-resolver
-///    behavior — will error cleanly downstream if the directory
-///    doesn't exist and a graph-reading command is run.
+///    Legacy `~/.workgraph` is also accepted for back-compat.
+/// 5. **Default `./.wg` in current directory.** Final fallback —
+///    will error cleanly downstream if the directory doesn't exist
+///    and a graph-reading command is run.
 ///
 /// The resolver does NOT create any directories — it only locates
 /// one. Auto-creation is the responsibility of individual commands
@@ -60,15 +62,15 @@ fn resolve_workgraph_dir(
 ) -> PathBuf {
     // 1. Explicit CLI flag
     if let Some(p) = cli_dir {
-        return p;
+        return descend_into_wg_subdir_if_project_root(p);
     }
 
     // 2. WG_DIR env var
     if let Some(p) = env_dir.filter(|p| !p.as_os_str().is_empty()) {
-        return p;
+        return descend_into_wg_subdir_if_project_root(p);
     }
 
-    // 3. Walk up from cwd looking for an existing workgraph dir.
+    // 3. Walk up from cwd looking for an existing WG dir.
     //    Prefer `.wg`, fall back to legacy `.workgraph`.
     if let Some(start) = cwd.as_ref() {
         let mut cur: &Path = start;
@@ -101,6 +103,39 @@ fn resolve_workgraph_dir(
         .unwrap_or_else(|| PathBuf::from(".wg"))
 }
 
+/// If the given path looks like a project root containing a `.wg` or
+/// `.workgraph` subdir, descend into that subdir. Otherwise return the
+/// path unchanged.
+///
+/// This is what makes `WG_DIR=<project_root>` and `--dir <project_root>`
+/// behave the same as `cd <project_root>` with no env var: the user
+/// usually means "the WG directory for this project", not "use this exact
+/// directory as the WG dir even though it's missing graph.jsonl".
+///
+/// The descent is skipped when:
+///   - the path's basename is itself `.wg` or `.workgraph` (already a
+///     WG dir — don't descend into a nested .wg/.wg/),
+///   - the path itself contains `graph.jsonl` (treat as a literal
+///     WG dir even if its basename is unusual — this preserves
+///     the legacy "WG_DIR points at the actual graph dir" behavior for
+///     users who already do that).
+fn descend_into_wg_subdir_if_project_root(p: PathBuf) -> PathBuf {
+    let basename = p.file_name().and_then(|n| n.to_str());
+    if matches!(basename, Some(".wg") | Some(".workgraph")) {
+        return p;
+    }
+    if p.join("graph.jsonl").is_file() {
+        return p;
+    }
+    for name in WORKGRAPH_DIR_NAMES {
+        let candidate = p.join(name);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    p
+}
+
 #[cfg(test)]
 mod resolver_tests {
     use super::resolve_workgraph_dir;
@@ -110,7 +145,7 @@ mod resolver_tests {
     #[test]
     fn explicit_cli_flag_wins_over_everything() {
         let tmp = TempDir::new().unwrap();
-        let explicit = tmp.path().join("explicit/.workgraph");
+        let explicit = tmp.path().join("explicit/.wg");
         let result = resolve_workgraph_dir(
             Some(explicit.clone()),
             Some(PathBuf::from("/should/not/be/used")),
@@ -123,7 +158,7 @@ mod resolver_tests {
     #[test]
     fn wg_dir_env_var_wins_over_discovery_and_global() {
         let tmp = TempDir::new().unwrap();
-        let env = tmp.path().join("from-env/.workgraph");
+        let env = tmp.path().join("from-env/.wg");
         let result = resolve_workgraph_dir(
             None,
             Some(env.clone()),
@@ -161,11 +196,11 @@ mod resolver_tests {
     fn project_discovery_finds_legacy_workgraph_in_cwd() {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("project");
-        let wg = project.join(".workgraph");
-        std::fs::create_dir_all(&wg).unwrap();
+        let legacy = project.join(".workgraph");
+        std::fs::create_dir_all(&legacy).unwrap();
         let result =
             resolve_workgraph_dir(None, None, Some(project), Some(tmp.path().to_path_buf()));
-        assert_eq!(result, wg);
+        assert_eq!(result, legacy);
     }
 
     #[test]
@@ -235,10 +270,120 @@ mod resolver_tests {
         let tmp = TempDir::new().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let home = tmp.path().join("home"); // no workgraph inside
+        let home = tmp.path().join("home"); // no WG directory inside
         let result = resolve_workgraph_dir(None, None, Some(outside.clone()), Some(home));
         // New default is `.wg`
         assert_eq!(result, outside.join(".wg"));
+    }
+
+    /// Regression for fix-wg-init: `WG_DIR=<project_root>` (a path that
+    /// contains a `.wg` subdir but is NOT itself named `.wg`) must
+    /// descend into the subdir. Otherwise every subsystem looks for
+    /// graph.jsonl, service/, agency/ literally inside the project
+    /// root, breaking the dispatcher.
+    #[test]
+    fn wg_dir_descends_into_dot_wg_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("myproj");
+        let wg = project.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        // WG_DIR points at the project root, not the .wg subdir.
+        let result = resolve_workgraph_dir(
+            None,
+            Some(project.clone()),
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(result, wg, "WG_DIR=<project_root> must descend into .wg");
+    }
+
+    /// Same descent logic for the legacy `.workgraph` name.
+    #[test]
+    fn wg_dir_descends_into_legacy_workgraph_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("myproj");
+        let legacy = project.join(".workgraph");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let result = resolve_workgraph_dir(
+            None,
+            Some(project.clone()),
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(
+            result, legacy,
+            "WG_DIR=<project_root> must descend into legacy .workgraph"
+        );
+    }
+
+    /// `--dir <project_root>` should descend into `.wg` for the same
+    /// reason WG_DIR does — the user's mental model is "this is the
+    /// project, find its WG directory."
+    #[test]
+    fn cli_dir_descends_into_dot_wg_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("myproj");
+        let wg = project.join(".wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let result = resolve_workgraph_dir(
+            Some(project.clone()),
+            None,
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(result, wg);
+    }
+
+    /// If WG_DIR already points at a `.wg` directory, leave it alone —
+    /// don't try to descend into `<wg>/.wg/`.
+    #[test]
+    fn wg_dir_pointing_at_dot_wg_directly_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let wg = tmp.path().join("myproj/.wg");
+        std::fs::create_dir_all(&wg).unwrap();
+        let result =
+            resolve_workgraph_dir(None, Some(wg.clone()), None, Some(tmp.path().to_path_buf()));
+        assert_eq!(result, wg);
+    }
+
+    /// If WG_DIR points at a directory containing graph.jsonl directly,
+    /// treat it as the literal WG dir even if its basename is
+    /// unusual. Preserves the existing "WG_DIR is the graph dir" contract
+    /// for users who already rely on it.
+    #[test]
+    fn wg_dir_with_graph_jsonl_at_top_is_treated_literally() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("custom-graph-dir");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("graph.jsonl"), "").unwrap();
+        // Even though we add a stray .wg subdir, the top-level graph.jsonl
+        // wins and we use the path as-is.
+        std::fs::create_dir_all(custom.join(".wg")).unwrap();
+        let result = resolve_workgraph_dir(
+            None,
+            Some(custom.clone()),
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(result, custom);
+    }
+
+    /// If WG_DIR points at a directory that is neither named `.wg`/
+    /// `.workgraph` nor contains one (and has no graph.jsonl), use it
+    /// literally — this is "user knows what they're doing" territory.
+    #[test]
+    fn wg_dir_with_no_descent_target_is_literal() {
+        let tmp = TempDir::new().unwrap();
+        let custom = tmp.path().join("brand-new-empty");
+        // Don't create the dir — resolver shouldn't care; downstream
+        // commands will error cleanly when they try to load the graph.
+        let result = resolve_workgraph_dir(
+            None,
+            Some(custom.clone()),
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(result, custom);
     }
 }
 
@@ -266,7 +411,7 @@ fn print_help(dir: &Path, show_all: bool, alphabetical: bool) {
     let config = Config::load_or_default(dir);
     let use_alphabetical = alphabetical || config.help.ordering == "alphabetical";
 
-    println!("wg - workgraph task management\n");
+    println!("wg - WG task management\n");
 
     if use_alphabetical {
         // Simple alphabetical listing
@@ -374,7 +519,7 @@ fn print_help(dir: &Path, show_all: bool, alphabetical: bool) {
     }
 
     println!("\nOptions:");
-    println!("  -d, --dir <PATH>    Workgraph directory [default: .workgraph]");
+    println!("  -d, --dir <PATH>    WG directory [default: .wg]");
     println!("  -h, --help          Print help (--help-all for all commands)");
     println!("      --alphabetical  Sort commands alphabetically");
     println!("      --json          Output as JSON");
@@ -467,9 +612,13 @@ fn maybe_print_subcommand_help() -> bool {
     }
 
     // Walk the subcommand chain: start from the root command and drill down
-    // through non-flag args that match subcommand names at each level.
+    // through non-flag args that match subcommand names at each level. Track
+    // the matched names so the final help output's `Usage:` line reflects the
+    // full invocation path (`wg html publish` vs. just `publish`) — clap does
+    // not propagate bin_name through cloned subcommands, so we set it
+    // explicitly on the leaf.
     let mut current_cmd = Cli::command();
-    let mut matched_any = false;
+    let mut path: Vec<String> = vec![current_cmd.get_name().to_string()];
 
     for arg in args.iter().skip(1) {
         if arg.starts_with('-') {
@@ -480,13 +629,14 @@ fn maybe_print_subcommand_help() -> bool {
             .find(|c| c.get_name() == arg)
             .cloned();
         if let Some(sub) = maybe_sub {
+            path.push(sub.get_name().to_string());
             current_cmd = sub;
-            matched_any = true;
         }
     }
 
-    if matched_any {
-        let mut cmd = current_cmd.disable_help_flag(false);
+    if path.len() > 1 {
+        let bin_name = path.join(" ");
+        let mut cmd = current_cmd.disable_help_flag(false).bin_name(bin_name);
         cmd.print_help().ok();
         println!();
         std::process::exit(0);
@@ -560,10 +710,10 @@ fn main() -> Result<()> {
         dirs::home_dir(),
     );
 
-    // Auto-create the global fallback `~/.workgraph` for REPL-style
+    // Auto-create the global fallback `~/.wg` for REPL-style
     // commands that should Just Work from any directory. Project-
     // scoped commands (wg add, wg list, etc.) still require an
-    // existing workgraph dir and will error cleanly downstream if
+    // existing WG dir and will error cleanly downstream if
     // one isn't found. This mirrors how `gh auth` can create
     // `~/.config/gh` on first use without requiring `gh init`.
     let is_repl_style = matches!(
@@ -573,17 +723,17 @@ fn main() -> Result<()> {
     if is_repl_style
         && !workgraph_dir.exists()
         && let Some(home) = dirs::home_dir()
-        && workgraph_dir == home.join(".workgraph")
+        && workgraph_dir == home.join(".wg")
     {
         if let Err(e) = std::fs::create_dir_all(&workgraph_dir) {
             eprintln!(
-                "warning: failed to create global workgraph dir {}: {}",
+                "warning: failed to create global WG dir {}: {}",
                 workgraph_dir.display(),
                 e
             );
         } else {
             eprintln!(
-                "\x1b[2m[wg] created global workgraph directory: {}\x1b[0m",
+                "\x1b[2m[wg] created global WG directory: {}\x1b[0m",
                 workgraph_dir.display()
             );
         }
@@ -1014,14 +1164,20 @@ fn main() -> Result<()> {
         Commands::Fail {
             id,
             reason,
+            class,
             eval_reject,
         } => {
             if eval_reject {
                 commands::fail::run_eval_reject(&workgraph_dir, &id, reason.as_deref())
             } else {
-                commands::fail::run(&workgraph_dir, &id, reason.as_deref())
+                let failure_class = class.as_deref().and_then(parse_failure_class);
+                commands::fail::run(&workgraph_dir, &id, reason.as_deref(), failure_class)
             }
         }
+        Commands::ClassifyFailure {
+            raw_stream,
+            exit_code,
+        } => commands::classify_failure::run(raw_stream.as_deref(), exit_code),
         Commands::Incomplete { id, reason } => {
             commands::incomplete::run(&workgraph_dir, &id, reason.as_deref())
         }
@@ -1071,7 +1227,9 @@ fn main() -> Result<()> {
         Commands::Unclaim { id } => commands::claim::unclaim(&workgraph_dir, &id),
         Commands::Pause { id } => commands::pause::run(&workgraph_dir, &id),
         Commands::Resume { id, only } => commands::resume::run(&workgraph_dir, &id, only),
-        Commands::Publish { id, only } => commands::resume::publish(&workgraph_dir, &id, only),
+        Commands::Publish { id, only, wcc } => {
+            commands::resume::publish(&workgraph_dir, &id, only, wcc)
+        }
         Commands::Wait {
             id,
             until,
@@ -1197,7 +1355,11 @@ fn main() -> Result<()> {
                     edge_color: resolved_edge_color,
                     max_columns,
                 };
-                commands::viz::run(&workgraph_dir, &options)
+                if cli.json {
+                    commands::viz::run_json(&workgraph_dir, &options)
+                } else {
+                    commands::viz::run(&workgraph_dir, &options)
+                }
             }
         }
         Commands::GraphExport {
@@ -1670,11 +1832,15 @@ fn main() -> Result<()> {
                         name,
                         executor,
                         model,
+                        endpoint,
+                        command,
                     } => commands::chat_cmd::run_create(
                         &workgraph_dir,
                         name.as_deref(),
                         model.as_deref(),
                         executor.as_deref(),
+                        endpoint.as_deref(),
+                        command.as_deref(),
                         cli.json,
                     ),
                     ChatCommands::List => commands::chat_cmd::run_list(&workgraph_dir, cli.json),
@@ -1838,24 +2004,42 @@ fn main() -> Result<()> {
             }
             AgencyCommands::Import {
                 csv_path,
+                format,
                 url,
                 upstream,
                 dry_run,
                 tag,
                 force,
                 check,
+                strict,
             } => {
                 let opts = commands::agency_import::ImportOptions {
                     csv_path,
                     url,
                     upstream,
+                    format,
                     dry_run,
                     tag,
                     force,
                     check,
+                    strict,
                 };
                 commands::agency_import::run_import(&workgraph_dir, opts).map(|_| ())
             }
+            AgencyCommands::Export {
+                output,
+                format,
+                filter,
+                global,
+            } => commands::agency_push::run_export(
+                &workgraph_dir,
+                &commands::agency_push::ExportOptions {
+                    output: &output,
+                    format: &format,
+                    filter: filter.as_deref(),
+                    global,
+                },
+            ),
             AgencyCommands::Push {
                 target,
                 entity_ids,
@@ -2240,10 +2424,55 @@ fn main() -> Result<()> {
                 standard.as_deref(),
                 premium.as_deref(),
             ),
-            ProfileCommands::Show { verbose } => {
-                commands::profile_cmd::show(&workgraph_dir, cli.json, verbose)
+            ProfileCommands::Use {
+                name,
+                no_reload,
+                clear,
+            } => commands::profile_cmd::use_profile(
+                &workgraph_dir,
+                name.as_deref(),
+                no_reload,
+                clear,
+            ),
+            ProfileCommands::Show {
+                profile_name,
+                verbose,
+                diff_base,
+            } => commands::profile_cmd::show(
+                &workgraph_dir,
+                cli.json,
+                verbose,
+                profile_name.as_deref(),
+                diff_base,
+            ),
+            ProfileCommands::List { installed } => {
+                commands::profile_cmd::list(&workgraph_dir, cli.json, installed)
             }
-            ProfileCommands::List => commands::profile_cmd::list(&workgraph_dir, cli.json),
+            ProfileCommands::Create {
+                name,
+                model,
+                endpoint,
+                from,
+                description,
+                force,
+            } => commands::profile_cmd::create_profile(
+                &name,
+                model.as_deref(),
+                endpoint.as_deref(),
+                from.as_deref(),
+                description.as_deref(),
+                force,
+            ),
+            ProfileCommands::Edit { name, no_reload } => {
+                commands::profile_cmd::edit_profile(&workgraph_dir, &name, no_reload)
+            }
+            ProfileCommands::Delete { name, force } => {
+                commands::profile_cmd::delete_profile(&name, force)
+            }
+            ProfileCommands::Diff { a, b } => {
+                commands::profile_cmd::diff_profiles(&a, b.as_deref())
+            }
+            ProfileCommands::InitStarters { force } => commands::profile_cmd::init_starters(force),
             ProfileCommands::Refresh => commands::profile_cmd::refresh(&workgraph_dir),
         },
         Commands::Config {
@@ -2465,12 +2694,6 @@ fn main() -> Result<()> {
                 return commands::config_cmd::show_tiers(&workgraph_dir, cli.json);
             }
 
-            // Handle --tier <tier>=<model-id>
-            if let Some(ref tier_spec) = set_tier {
-                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
-                return commands::config_cmd::set_tier(&workgraph_dir, write_scope, tier_spec);
-            }
-
             // Handle Matrix configuration
             if matrix
                 || homeserver.is_some()
@@ -2498,71 +2721,6 @@ fn main() -> Result<()> {
                 }
             } else if show_models {
                 commands::config_cmd::show_model_routing(&workgraph_dir, cli.json)
-            } else if set_model.is_some()
-                || set_provider.is_some()
-                || set_endpoint.is_some()
-                || role_model.is_some()
-                || role_provider.is_some()
-                || flip_inference_model.is_some()
-                || flip_comparison_model.is_some()
-                || flip_model.is_some()
-            {
-                // Merge --role-model/--role-provider (key=value) into set_model/set_provider format
-                let effective_model = if let Some(ref kv) = role_model {
-                    let parts: Vec<&str> = kv.splitn(2, '=').collect();
-                    if parts.len() != 2 {
-                        anyhow::bail!(
-                            "--role-model requires format <role>=<model>, got \"{}\"",
-                            kv
-                        );
-                    }
-                    Some(vec![parts[0].to_string(), parts[1].to_string()])
-                } else {
-                    set_model
-                };
-                let effective_provider = if let Some(ref kv) = role_provider {
-                    let parts: Vec<&str> = kv.splitn(2, '=').collect();
-                    if parts.len() != 2 {
-                        anyhow::bail!(
-                            "--role-provider requires format <role>=<provider>, got \"{}\"",
-                            kv
-                        );
-                    }
-                    Some(vec![parts[0].to_string(), parts[1].to_string()])
-                } else {
-                    set_provider
-                };
-                // Default scope for writes = Local
-                let write_scope = scope.unwrap_or(commands::config_cmd::ConfigScope::Local);
-
-                // Handle --flip-model / --flip-inference-model / --flip-comparison-model
-                // These are shorthand for --set-model flip_inference/flip_comparison <model>
-                let flip_inf = flip_inference_model.or_else(|| flip_model.clone());
-                let flip_cmp = flip_comparison_model.or(flip_model);
-                if flip_inf.is_some() || flip_cmp.is_some() {
-                    commands::config_cmd::update_flip_models(
-                        &workgraph_dir,
-                        write_scope,
-                        flip_inf.as_deref(),
-                        flip_cmp.as_deref(),
-                    )?;
-                }
-
-                // Handle standard model routing if present
-                if effective_model.is_some()
-                    || effective_provider.is_some()
-                    || set_endpoint.is_some()
-                {
-                    commands::config_cmd::update_model_routing(
-                        &workgraph_dir,
-                        write_scope,
-                        effective_model.as_deref(),
-                        effective_provider.as_deref(),
-                        set_endpoint.as_deref(),
-                    )?;
-                }
-
-                Ok(())
             } else if list {
                 commands::config_cmd::list(&workgraph_dir, cli.json)
             } else if init {
@@ -2602,12 +2760,21 @@ fn main() -> Result<()> {
                     && eval_gate_threshold.is_none()
                     && eval_gate_all.is_none()
                     && flip_enabled.is_none()
+                    && flip_inference_model.is_none()
+                    && flip_comparison_model.is_none()
+                    && flip_model.is_none()
                     && flip_verification_threshold.is_none()
                     && chat_history.is_none()
                     && chat_history_max.is_none()
                     && tui_counters.is_none()
                     && retry_context_tokens.is_none()
-                    && endpoint.is_none())
+                    && endpoint.is_none()
+                    && set_tier.is_empty()
+                    && set_model.is_empty()
+                    && set_provider.is_empty()
+                    && set_endpoint.is_empty()
+                    && role_model.is_empty()
+                    && role_provider.is_empty())
             {
                 commands::config_cmd::show(&workgraph_dir, scope, cli.json)
             } else {
@@ -2650,6 +2817,15 @@ fn main() -> Result<()> {
                     tui_counters.as_deref(),
                     retry_context_tokens,
                     endpoint.as_deref(),
+                    &set_tier,
+                    &set_model,
+                    &set_provider,
+                    &set_endpoint,
+                    &role_model,
+                    &role_provider,
+                    flip_inference_model.as_deref(),
+                    flip_comparison_model.as_deref(),
+                    flip_model.as_deref(),
                     no_reload,
                 )
             }
@@ -2675,6 +2851,79 @@ fn main() -> Result<()> {
                 commands::dead_agents::run_check(&workgraph_dir, threshold, cli.json)
             }
         }
+        Commands::Html {
+            command,
+            out,
+            public_only,
+            all,
+            chat,
+            since,
+        } => match command {
+            Some(HtmlCommands::Publish { command }) => match command {
+                HtmlPublishCommands::Add {
+                    name,
+                    rsync,
+                    schedule,
+                    since,
+                    public_only,
+                    include_chat,
+                    out,
+                    ssh_key,
+                    ssh_config_host,
+                    mkpath,
+                    rsync_flags,
+                    title,
+                    byline,
+                    abstract_path,
+                } => commands::publish::run_add(
+                    &workgraph_dir,
+                    &name,
+                    &rsync,
+                    schedule.as_deref(),
+                    since.as_deref(),
+                    public_only,
+                    include_chat,
+                    out.as_deref(),
+                    ssh_key.as_deref(),
+                    ssh_config_host.as_deref(),
+                    rsync_flags.as_deref(),
+                    mkpath,
+                    title.as_deref(),
+                    byline.as_deref(),
+                    abstract_path.as_deref(),
+                ),
+                HtmlPublishCommands::List => commands::publish::run_list(&workgraph_dir, cli.json),
+                HtmlPublishCommands::Show { name } => {
+                    commands::publish::run_show(&workgraph_dir, &name, cli.json)
+                }
+                HtmlPublishCommands::Run { name, dry_run } => {
+                    commands::publish::run_run(&workgraph_dir, &name, dry_run)
+                }
+                HtmlPublishCommands::Remove { name } => {
+                    commands::publish::run_remove(&workgraph_dir, &name)
+                }
+                HtmlPublishCommands::Edit => commands::publish::run_edit(&workgraph_dir),
+            },
+            None => {
+                // Defaults: include all tasks (TUI parity). `--public-only` opts
+                // in to the legacy public-only mirror for sanitized output.
+                // `--chat` opts into rendering chat transcripts; `--all`
+                // (when paired with `--chat`) extends transcript inclusion to
+                // non-public chats.
+                let show_all_tasks = !public_only;
+                let include_chat = chat;
+                let all_chats = chat && all;
+                workgraph::html::run(
+                    &workgraph_dir,
+                    &out,
+                    show_all_tasks,
+                    since.as_deref(),
+                    include_chat,
+                    all_chats,
+                    cli.json,
+                )
+            }
+        },
         Commands::Sweep {
             dry_run,
             reap_targets,
@@ -2699,11 +2948,23 @@ fn main() -> Result<()> {
                 } else if local {
                     commands::migrate::ConfigMigrateTarget::Local
                 } else {
-                    // Default: migrate the local config in this workgraph dir.
+                    // Default: migrate the local config in this WG dir.
                     commands::migrate::ConfigMigrateTarget::Local
                 };
                 commands::migrate::run_config_migrate(&workgraph_dir, target, dry_run, cli.json)
             }
+            MigrateCommands::Secrets {
+                dry_run,
+                global,
+                local,
+                no_copy,
+            } => commands::secret_cmd::run_migrate_secrets(
+                &workgraph_dir,
+                dry_run,
+                global,
+                local,
+                no_copy,
+            ),
         },
         Commands::Agents {
             command,
@@ -2823,6 +3084,8 @@ fn main() -> Result<()> {
                 name,
                 model,
                 executor,
+                endpoint,
+                command,
             } => {
                 eprintln!(
                     "warning: 'wg service create-chat' is deprecated; use 'wg chat create' instead."
@@ -2832,6 +3095,8 @@ fn main() -> Result<()> {
                     name.as_deref(),
                     model.as_deref(),
                     executor.as_deref(),
+                    endpoint.as_deref(),
+                    command.as_deref(),
                     cli.json,
                 )
             }
@@ -2867,8 +3132,8 @@ fn main() -> Result<()> {
             ServiceCommands::InterruptChat { id } => {
                 commands::service::run_interrupt_coordinator(&workgraph_dir, id, cli.json)
             }
-            ServiceCommands::PurgeChats => {
-                commands::service::run_purge_chats(&workgraph_dir, cli.json)
+            ServiceCommands::PurgeChats { include_active } => {
+                commands::service::run_purge_chats(&workgraph_dir, cli.json, include_active)
             }
             ServiceCommands::Daemon {
                 socket,
@@ -3016,6 +3281,8 @@ fn main() -> Result<()> {
             commands::setup::run_with_args(&args)
         }
         Commands::Quickstart => commands::quickstart::run(cli.json),
+        Commands::DevCheck => commands::dev_check::run(cli.json),
+        Commands::AgentGuide => commands::agent_guide::run(),
         Commands::Status { all } => commands::status::run(&workgraph_dir, cli.json, all),
         Commands::Stats => commands::stats::run(&workgraph_dir, cli.json),
         Commands::Metrics { json } => commands::metrics::run(&workgraph_dir, json),
@@ -3378,6 +3645,54 @@ fn main() -> Result<()> {
         cli::Commands::Openrouter { command } => {
             commands::openrouter::run(&workgraph_dir, &command, cli.json)
         }
+        Commands::Secret { command } => match command {
+            cli::SecretCommands::Set {
+                name,
+                value,
+                from_stdin,
+                backend,
+            } => commands::secret_cmd::run_set(
+                &workgraph_dir,
+                &name,
+                value.as_deref(),
+                backend.as_deref(),
+                from_stdin,
+            ),
+            cli::SecretCommands::Get {
+                name,
+                reveal,
+                backend,
+            } => commands::secret_cmd::run_get(&workgraph_dir, &name, backend.as_deref(), reveal),
+            cli::SecretCommands::List => commands::secret_cmd::run_list(&workgraph_dir, cli.json),
+            cli::SecretCommands::Rm { name, backend, yes } => {
+                commands::secret_cmd::run_rm(&workgraph_dir, &name, backend.as_deref(), yes)
+            }
+            cli::SecretCommands::Check { api_key_ref } => {
+                commands::secret_cmd::run_check(&workgraph_dir, &api_key_ref)
+            }
+            cli::SecretCommands::Backend { command } => match command {
+                cli::SecretBackendCommands::Show => {
+                    commands::secret_cmd::run_backend_show(&workgraph_dir)
+                }
+                cli::SecretBackendCommands::Set { backend } => {
+                    commands::secret_cmd::run_backend_set(&workgraph_dir, &backend)
+                }
+            },
+        },
+    }
+}
+
+/// Parse a kebab-case failure class string from `wg fail --class`.
+fn parse_failure_class(s: &str) -> Option<workgraph::graph::FailureClass> {
+    use workgraph::graph::FailureClass;
+    match s.trim() {
+        "api-error-400-document" => Some(FailureClass::ApiError400Document),
+        "api-error-429-rate-limit" => Some(FailureClass::ApiError429RateLimit),
+        "api-error-5xx-transient" => Some(FailureClass::ApiError5xxTransient),
+        "agent-hard-timeout" => Some(FailureClass::AgentHardTimeout),
+        "agent-exit-nonzero" => Some(FailureClass::AgentExitNonzero),
+        "wrapper-internal" => Some(FailureClass::WrapperInternal),
+        _ => None,
     }
 }
 

@@ -1,8 +1,8 @@
-# Research: Autopoietic TB-Workgraph Integration
+# Research: Autopoietic TB-wg Integration
 
 ## Summary
 
-Terminal Bench (TB) trials currently bypass workgraph's agency pipeline. The harbor
+Terminal Bench (TB) trials currently bypass wg's agency pipeline. The harbor
 adapter (`terminal-bench/wg/adapter.py`) runs agents directly via litellm inside
 Docker containers, managing its own agent loop. The full agency lifecycle
 (`.assign` -> agent executes -> `.flip` -> `.evaluate` -> `.verify`) never fires.
@@ -18,7 +18,7 @@ start`, enabling FLIP-based false-PASS detection.
 The adapter implements Harbor's `BaseAgent` protocol:
 
 1. **`setup()`** (line 1296): Creates a temp directory on the host, runs `wg init`
-   to initialize a host-side workgraph. For conditions D/E, it bootstraps agency
+   to initialize a host-side wg. For conditions D/E, it bootstraps agency
    (`wg agency init`, `wg agent create`).
 
 2. **`run()`** (line 1351): Runs an LLM-in-the-loop agent. Key flow:
@@ -33,14 +33,14 @@ The adapter implements Harbor's `BaseAgent` protocol:
    container with `exec()` method) and `AgentContext` (metadata accumulator). The
    adapter does ALL orchestration — Harbor just provides the sandbox and scoring.
 
-**What's missing**: The host-side workgraph is isolated per trial (tempdir). No
+**What's missing**: The host-side wg is isolated per trial (tempdir). No
 coordinator runs. No `.assign-*`, `.flip-*`, or `.evaluate-*` tasks are ever created
 because `scaffold_full_pipeline()` (`src/commands/eval_scaffold.rs`) only runs inside
 the coordinator loop (`src/commands/service/coordinator.rs`).
 
 ---
 
-## Q2: Making TB Tasks Into Real Workgraph Tasks
+## Q2: Making TB Tasks Into Real wg Tasks
 
 **Goal**: Replace the adapter's custom agent loop with `wg service start`.
 
@@ -52,7 +52,7 @@ TB Trial Runner (Python)
   |  For each TB task definition:
   |    1. wg add "TB: <task-name>" --verify "<harbor-verifier-cmd>" \
   |         -d "<task instruction from harbor>"
-  |    2. Configure .workgraph/config.toml:
+  |    2. Configure .wg/config.toml:
   |         [agency] auto_assign=true, auto_evaluate=true, flip_enabled=true
   |         [coordinator] verify_mode="separate"
   |
@@ -81,7 +81,7 @@ Agent calls wg done -> triggers:
   |
   v
 Results Collection Task (--after all trial tasks)
-  - Reads evaluations from .workgraph/agency/evaluations/
+  - Reads evaluations from .wg/agency/evaluations/
   - Compares FLIP scores against Harbor's external verifier results
   - Produces correlation analysis: FLIP vs ground truth
 ```
@@ -98,7 +98,7 @@ A. **Shell executor + Docker bridge**: Configure tasks with `exec_mode: shell` a
    have the exec command start a Docker container matching the Harbor task spec. The
    agent's bash commands get proxied into the container.
 
-B. **Custom executor type**: Add a `harbor` executor to workgraph that wraps
+B. **Custom executor type**: Add a `harbor` executor to wg that wraps
    `BaseEnvironment.exec()`. This is the cleanest but requires Rust code changes.
 
 C. **Host-side execution only**: For tasks that don't need specialized Docker envs
@@ -217,7 +217,7 @@ The coordinator handles:
 # Create condition-specific configs by setting agency knobs differently
 # Condition A: no agency pipeline
 # Condition D: full pipeline with auto_assign + flip_enabled
-# Run each condition as a separate wg instance (separate .workgraph dirs)
+# Run each condition as a separate WG instance (separate .wg dirs)
 # OR use coordinator namespacing (separate coordinators per condition)
 ```
 
@@ -257,7 +257,7 @@ wg add "Collect trial results" \
     --id "collect-results" \
     --after "tb-chess,tb-povray,tb-regex" \
     -d "## Description
-Read .workgraph/agency/evaluations/ for all completed trial tasks.
+Read .wg/agency/evaluations/ for all completed trial tasks.
 Compare FLIP scores against harbor verifier outcomes.
 Produce correlation table and false-PASS analysis.
 
@@ -381,7 +381,7 @@ For evolution to be meaningful with TB data:
 | Eval JSON failures | **High** | Evaluator returns prose instead of JSON | Use native API with JSON mode; improve retry prompts |
 | Eval timeouts | **High** | Claude CLI call hits 300s timeout | Configure native API provider; increase timeout |
 | Harbor verifier integration | **Medium** | Need to capture harbor verifier results alongside FLIP | Post-trial comparison script; harbor API or file-based results |
-| Config propagation | **Medium** | Per-trial config needs isolation | Separate .workgraph dirs per condition |
+| Config propagation | **Medium** | Per-trial config needs isolation | Separate .wg dirs per condition |
 | Worktree isolation vs Docker | **Low** | Git worktrees don't help if work happens in Docker | Each trial task gets its own container; worktree is just for wg state |
 
 ---

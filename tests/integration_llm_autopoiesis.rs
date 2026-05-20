@@ -1,7 +1,7 @@
 //! LLM integration tests for autopoietic behaviors.
 //!
 //! Tests that real LLM-backed agents perform autopoietic behaviors correctly
-//! within workgraph: task completion, subtask creation, context reading,
+//! within WG: task completion, subtask creation, context reading,
 //! artifact propagation, cycle convergence, and survey synthesis.
 //!
 //! Run with: cargo test --features llm-tests --test integration_llm_autopoiesis -- --nocapture
@@ -37,7 +37,7 @@ mod llm_autopoiesis {
         path
     }
 
-    /// Run `wg` with given args in a specific workgraph directory.
+    /// Run `wg` with given args in a specific WG directory.
     fn wg_cmd(wg_dir: &Path, args: &[&str]) -> std::process::Output {
         let wg = wg_binary();
         Command::new(&wg)
@@ -104,12 +104,12 @@ mod llm_autopoiesis {
         std::env::var("WG_TEST_MODEL").unwrap_or_else(|_| "haiku".to_string())
     }
 
-    /// Set up a workgraph directory via `wg init`, then write a claude executor
+    /// Set up a WG directory via `wg init`, then write a claude executor
     /// config with working_dir and PATH so the wrapper script's bare `wg`
-    /// commands find the test binary and the workgraph.
+    /// commands find the test binary and the WG directory.
     fn setup_llm_workgraph(tmp_root: &Path) -> PathBuf {
-        let wg_dir = tmp_root.join(".workgraph");
-        wg_ok(&wg_dir, &["init"]);
+        let wg_dir = tmp_root.join(".wg");
+        wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
         let wg_bin_dir = wg_binary().parent().unwrap().to_string_lossy().to_string();
         let path_with_test_binary = format!(
@@ -134,7 +134,7 @@ PATH = "{path}"
 template = """
 # Task Assignment
 
-You are an AI agent working on a task in a workgraph project.
+You are an AI agent working on a task in a WG project.
 
 {{{{task_identity}}}}
 ## Your Task
@@ -402,11 +402,7 @@ Begin working on the task now.
         .unwrap();
         wg_ok(
             &wg_dir,
-            &[
-                "artifact",
-                "upstream-ctx",
-                ".workgraph/artifacts/upstream-data.md",
-            ],
+            &["artifact", "upstream-ctx", ".wg/artifacts/upstream-data.md"],
         );
 
         // Create downstream task that depends on upstream
@@ -646,7 +642,7 @@ Begin working on the task now.
         .unwrap();
         wg_ok(
             &wg_dir,
-            &["artifact", "survey-a", ".workgraph/artifacts/survey-a.md"],
+            &["artifact", "survey-a", ".wg/artifacts/survey-a.md"],
         );
 
         // Create survey-b with artifact
@@ -663,7 +659,7 @@ Begin working on the task now.
         .unwrap();
         wg_ok(
             &wg_dir,
-            &["artifact", "survey-b", ".workgraph/artifacts/survey-b.md"],
+            &["artifact", "survey-b", ".wg/artifacts/survey-b.md"],
         );
 
         // Create synthesis task depending on both surveys

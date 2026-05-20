@@ -1,14 +1,14 @@
 //! Session registry for chat-file nex sessions.
 //!
 //! Every nex session — interactive, coordinator, or task-agent —
-//! lives under `<workgraph>/chat/<uuid>/` with the same file layout
+//! lives under `<wg-dir>/chat/<uuid>/` with the same file layout
 //! (inbox.jsonl, outbox.jsonl, .streaming, conversation.jsonl, ...).
 //! A session is identified by its UUID. Humans and legacy code
 //! address sessions by **alias**, which resolves to a UUID via
 //! this registry.
 //!
 //! Aliases:
-//! - `coordinator-0`, `coordinator-1`, ... for workgraph coordinators
+//! - `coordinator-0`, `coordinator-1`, ... for legacy WG coordinators
 //!   (what used to be numeric `chat/0/`, `chat/1/` directly)
 //! - `task-<task-id>` for task-agent sessions
 //! - `tty-<slug>` for interactive sessions pinned to a terminal
@@ -16,7 +16,7 @@
 //!   `wg chat new --alias X`
 //!
 //! The registry is a single JSON file at
-//! `<workgraph>/chat/sessions.json` plus one filesystem symlink per
+//! `<wg-dir>/chat/sessions.json` plus one filesystem symlink per
 //! alias (`chat/<alias>` → `chat/<uuid>`). Symlinks mean existing
 //! code that writes `chat/0/inbox.jsonl` keeps working unchanged —
 //! the kernel resolves the alias for us. The JSON registry is the
@@ -336,12 +336,15 @@ pub fn register_coordinator_session(workgraph_dir: &Path, n: u32) -> Result<Stri
         )?
     };
 
+    let chat_dir = chat_dir_for_uuid(workgraph_dir, &uuid);
+    fs::create_dir_all(&chat_dir)
+        .with_context(|| format!("create chat session dir {:?}", chat_dir))?;
+
     // Register all three aliases. Swallow "already points to same session"
     // errors (steady-state on restart); propagate unexpected errors.
     let numeric_alias = n.to_string();
     for alias in [
         new_canonical.as_str(),
-        task_alias.as_str(),
         legacy_canonical.as_str(),
         numeric_alias.as_str(),
     ] {
@@ -831,6 +834,42 @@ mod tests {
         // And the alias still resolves via the registry.
         assert_eq!(resolve_ref(wg, "0").unwrap(), uuid);
         assert_eq!(resolve_ref(wg, "coordinator-0").unwrap(), uuid);
+    }
+
+    #[test]
+    fn register_coordinator_session_creates_missing_uuid_chat_dir() {
+        let dir = tempdir().unwrap();
+        let wg = dir.path();
+        let uuid = Uuid::now_v7().to_string();
+
+        let mut reg = Registry::default();
+        reg.sessions.insert(
+            uuid.clone(),
+            SessionMeta {
+                kind: SessionKind::Coordinator,
+                created: Utc::now().to_rfc3339(),
+                aliases: vec!["chat-7".to_string(), "coordinator-7".to_string()],
+                label: Some("chat 7".to_string()),
+                forked_from: None,
+                archived_at: None,
+            },
+        );
+        save(wg, &reg).unwrap();
+
+        let chat_dir = chat_dir_for_uuid(wg, &uuid);
+        assert!(
+            !chat_dir.exists(),
+            "fixture should simulate supervisor registration before dispatch_boot creates chat dir"
+        );
+
+        let registered = register_coordinator_session(wg, 7).unwrap();
+
+        assert_eq!(registered, uuid);
+        assert!(
+            chat_dir.is_dir(),
+            "register_coordinator_session must defensively create the UUID chat dir"
+        );
+        assert_eq!(resolve_ref(wg, "7").unwrap(), registered);
     }
 
     #[test]

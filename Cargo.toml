@@ -2,10 +2,10 @@
 name = "workgraph"
 version = "0.1.0"
 edition = "2024"
-description = "A lightweight work coordination graph for humans and AI agents"
+description = "A lightweight wg coordination graph for humans and AI agents"
 license = "MIT"
-repository = "https://github.com/erikg/workgraph"
-homepage = "https://github.com/erikg/workgraph"
+repository = "https://github.com/graphwork/wg"
+homepage = "https://github.com/graphwork/wg"
 
 [[bin]]
 name = "wg"
@@ -63,8 +63,9 @@ cron = "0.12"
 log = "0.4"
 env_logger = "0.11"
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
-rquest = { version = "5", features = ["json", "gzip", "brotli"] }
-rquest-util = "2"
+# rquest 5.x is yanked on crates.io; 3.0.0 is the newest non-yanked release.
+# It provides built-in Chrome impersonation, so no rquest-util shim is needed.
+rquest = { version = "3.0.0", features = ["json", "gzip", "brotli", "deflate", "zstd"] }
 
 # Optional Matrix integration (requires sqlite3)
 matrix-sdk = { version = "0.16", features = ["e2e-encryption", "sqlite"], optional = true }
@@ -84,6 +85,7 @@ notify-debouncer-mini = "0.5"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 tiktoken-rs = "0.7"
 pulldown-cmark = "0.13.1"
+ammonia = "4"
 hmac = "0.12.1"
 hex = "0.4.3"
 
@@ -93,6 +95,7 @@ hex = "0.4.3"
 portable-pty = "0.9"
 vt100 = "0.16"
 tui-term = "0.3"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

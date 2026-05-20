@@ -1,4 +1,4 @@
-# Spec: Replace LiteLLM Agent Loop with wg Native Executor in Harbor Adapter
+# Spec: Replace LiteLLM Agent Loop with WG Native Executor in Harbor Adapter
 
 ## Problem
 
@@ -7,14 +7,14 @@ The Harbor adapter (`terminal-bench/wg/adapter.py`) currently runs a **Python Li
 - Defines its own 3-tool set (bash, write_file, read_file)
 - Routes tool executions through `environment.exec()` into Docker containers
 
-This is **not** the wg executor. The whole point of the experiment is to test the wg system — the Rust native executor (`wg native-exec`) with its full tool set, context assembly, and coordinator logic. The LiteLLM loop is a completely different agent with different tools, prompts, and behavior.
+This is **not** the WG executor. The whole point of the experiment is to test the WG system — the Rust native executor (`wg native-exec`) with its full tool set, context assembly, and coordinator logic. The LiteLLM loop is a completely different agent with different tools, prompts, and behavior.
 
 ## Goal
 
 Replace `_run_docker_agent_loop()` with a `_run_native_executor()` path that:
 1. Uses `wg` on the **host** to manage the task graph and coordinate execution
 2. The wg native executor runs commands **inside the Docker container** via `environment.exec()`
-3. All conditions (A-F) use the same wg executor, differentiated only by config (context_scope, exec_mode, bundles, agency)
+3. All conditions (A-F) use the same WG executor, differentiated only by config (context_scope, exec_mode, bundles, agency)
 
 ## Current Architecture (What Exists)
 
@@ -100,17 +100,17 @@ async def setup(self, environment: BaseEnvironment) -> None:
     # Upload wg binary — need to check Harbor's file upload API
     # Alternative: mount host binary path as a Docker volume
     
-    # Initialize workgraph inside the container
+    # Initialize wg inside the container
     await environment.exec(command="wg init")
     
     # Write config.toml based on condition
     config_content = self._build_config_toml()
-    await environment.exec(command=f"cat > .workgraph/config.toml << 'EOF'\n{config_content}\nEOF")
+    await environment.exec(command=f"cat > .wg/config.toml << 'EOF'\n{config_content}\nEOF")
     
     # Write custom bundles if needed (Condition A: no wg tools)
     if CONDITION_CONFIG[self.condition].get("exclude_wg_tools"):
         bundle_content = self._build_condition_a_bundle()
-        await environment.exec(command=f"mkdir -p .workgraph/bundles && cat > .workgraph/bundles/implementer.toml << 'EOF'\n{bundle_content}\nEOF")
+        await environment.exec(command=f"mkdir -p .wg/bundles && cat > .wg/bundles/implementer.toml << 'EOF'\n{bundle_content}\nEOF")
 ```
 
 #### 2. Modify `run()` to use wg service inside the container
@@ -133,14 +133,14 @@ async def run(self, instruction: str, environment: BaseEnvironment, context: Age
     )
     
     # wg service start blocks until all tasks complete (or use polling)
-    # Collect metrics from .workgraph/agents/*/stream.jsonl inside container
+    # Collect metrics from .wg/agents/*/stream.jsonl inside container
 ```
 
 #### 3. Collect metrics from inside the container
 
 ```python
     # Read stream.jsonl from inside container
-    result = await environment.exec(command="cat .workgraph/agents/*/stream.jsonl")
+    result = await environment.exec(command="cat .wg/agents/*/stream.jsonl")
     # Parse metrics same as _collect_agent_metrics() but from exec output
 ```
 
@@ -186,12 +186,12 @@ if result.return_code != 0:
 - `_write_trial_wg_config()` — reuse the config generation logic, just write it inside container instead of host
 - `_write_trial_bundle()` — same, write inside container
 - Condition-specific agent classes (ConditionAAgent through ConditionFAgent) — no changes needed
-- `WG_QUICK_GUIDE`, `CONDITION_F_MEMORY` — these get injected by wg's context assembly, not by Python
+- `WG_QUICK_GUIDE`, `CONDITION_F_MEMORY` — these get injected by WG's context assembly, not by Python
 
 ### Key consideration: How wg service start works
 
 `wg service start` is the coordinator. It:
-1. Reads `.workgraph/config.toml` for executor type, model, context scope
+1. Reads `.wg/config.toml` for executor type, model, context scope
 2. Finds ready tasks
 3. Spawns `wg native-exec` for each ready task
 4. Native-exec reads the task description, assembles context based on scope, calls the LLM
@@ -203,6 +203,6 @@ This all needs to happen **inside** the Docker container. The `OPENROUTER_API_KE
 
 ### Verification plan
 
-1. Single-task smoke test: `harbor run` with ConditionAAgent on `fix-git`, verify wg executor is used (check for `.workgraph/agents/*/stream.jsonl` inside container)
+1. Single-task smoke test: `harbor run` with ConditionAAgent on `fix-git`, verify WG executor is used (check for `.wg/agents/*/stream.jsonl` inside container)
 2. Verify Condition F: same test, check that graph context and wg tools are available to the agent
 3. Compare results with existing pilot data to sanity-check behavior parity

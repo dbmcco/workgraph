@@ -65,7 +65,7 @@ fn make_task(id: &str, title: &str, status: Status) -> Task {
 }
 
 fn setup_workgraph(tmp: &TempDir, tasks: Vec<Task>) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let mut graph = WorkGraph::new();
@@ -198,8 +198,8 @@ fn test_abandon_cascades_to_in_progress_system_tasks() {
 #[test]
 fn test_retry_after_failure_with_eval_task() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     // Create and complete a task
     wg_ok(
@@ -244,7 +244,7 @@ fn test_retry_after_failure_with_eval_task() {
     wg_ok(&wg_dir, &["done", "flaky"]);
 
     let g = graph(&wg_dir);
-    assert_eq!(g.get_task("flaky").unwrap().status, Status::Done);
+    assert_eq!(g.get_task("flaky").unwrap().status, Status::PendingEval);
 }
 
 /// Retry clears assigned and failure_reason, allowing coordinator re-dispatch.
@@ -281,8 +281,8 @@ fn test_retry_resets_state_for_redispatch() {
 #[test]
 fn test_supersession_via_abandon_flag() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     wg_ok(
         &wg_dir,
@@ -403,8 +403,8 @@ fn test_no_zombie_system_tasks_after_abandon() {
 #[test]
 fn test_no_zombie_accumulation_across_multiple_abandons() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     // Create 3 tasks, each with system children
     for i in 1..=3 {
@@ -465,8 +465,8 @@ fn test_no_zombie_accumulation_across_multiple_abandons() {
 #[test]
 fn test_full_lifecycle_abandon_supersede_cascade() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--route", "claude-cli"]);
 
     // Create original task
     wg_ok(

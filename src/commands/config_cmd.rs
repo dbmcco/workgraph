@@ -6,6 +6,17 @@ use workgraph::config::{
     Config, ConfigSource, EndpointConfig, MatrixConfig, ModelRegistryEntry, Tier,
 };
 
+fn clear_dispatcher_executor_for_model(config: &mut Config, model: &str) -> Option<String> {
+    let spec = workgraph::config::parse_model_spec(model);
+    let provider = spec.provider.as_deref()?;
+    let implied = workgraph::config::provider_to_executor(provider);
+    let previous = config.coordinator.executor.take()?;
+    Some(format!(
+        "Cleared deprecated dispatcher.executor = \"{}\"; dispatcher.model implies executor = \"{}\"",
+        previous, implied
+    ))
+}
+
 /// When model/endpoint changes land, a soft reload (`Reconfigure` IPC)
 /// isn't enough — already-spawned coordinator subprocesses keep their
 /// old env. We restart the daemon instead so the coordinator respawns
@@ -91,7 +102,7 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&config)?);
     } else {
-        println!("Workgraph Configuration");
+        println!("WG Configuration");
         println!("========================");
         println!();
         println!("[agent]");
@@ -360,9 +371,9 @@ pub fn init(dir: &Path, scope: Option<ConfigScope>) -> Result<()> {
             println!("Global configuration already exists at {}", path.display());
         }
     } else if Config::init(dir)? {
-        println!("Created default configuration at .workgraph/config.toml");
+        println!("Created default configuration at .wg/config.toml");
     } else {
-        println!("Configuration already exists at .workgraph/config.toml");
+        println!("Configuration already exists at .wg/config.toml");
     }
     Ok(())
 }
@@ -514,25 +525,18 @@ pub fn render_minimal_config(
     );
 
     match (route, scope) {
-        (R::ClaudeCli, ConfigScope::Global) => format!(
-            "{header}\
-             [agent]\n\
-             model = \"{premium}\"\n\
-             \n\
-             [tiers]\n\
-             fast = \"{fast}\"\n\
-             standard = \"{standard}\"\n\
-             premium = \"{premium}\"\n\
-             \n\
-             [models.evaluator]\n\
-             model = \"{fast}\"\n\
-             \n\
-             [models.assigner]\n\
-             model = \"{fast}\"\n",
-            fast = route_spec("claude", WORKGRAPH_CLAUDE_CLI_FAST_ROUTE),
-            standard = route_spec("claude", WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE),
-            premium = route_spec("claude", WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE),
-        ),
+        // For routes that have a matching profile template, return the profile
+        // template content verbatim. This is the single source of truth: `wg
+        // config init --route <X>` = "copy profile <X> as starting config."
+        // Drops the header comment when serving from the profile template
+        // (the template's own `description = "..."` line is the equivalent).
+        (R::ClaudeCli, ConfigScope::Global) => {
+            workgraph::profile::named::STARTER_CLAUDE.to_string()
+        }
+
+        (R::CodexCli, ConfigScope::Global) => workgraph::profile::named::STARTER_CODEX.to_string(),
+
+        (R::Local, ConfigScope::Global) => workgraph::profile::named::STARTER_NEX.to_string(),
 
         (R::Openrouter, ConfigScope::Global) => format!(
             "{header}\
@@ -555,32 +559,7 @@ pub fn render_minimal_config(
             premium = route_spec("openrouter", WORKGRAPH_OPENROUTER_PREMIUM_ROUTE),
         ),
 
-        (R::CodexCli, ConfigScope::Global) => format!(
-            "{header}\
-             [agent]\n\
-             model = \"{premium}\"\n\
-             \n\
-             [tiers]\n\
-             fast = \"{fast}\"\n\
-             standard = \"{standard}\"\n\
-             premium = \"{premium}\"\n",
-            fast = route_spec("codex", WORKGRAPH_CODEX_CLI_FAST_ROUTE),
-            standard = route_spec("codex", WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
-            premium = route_spec("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
-        ),
 
-        (R::Local, ConfigScope::Global) => format!(
-            "{header}\
-             [agent]\n\
-             model = \"{model}\"\n\
-             \n\
-             [[llm_endpoints.endpoints]]\n\
-             name = \"local\"\n\
-             provider = \"local\"\n\
-             url = \"http://localhost:11434/v1\"\n\
-             is_default = true\n",
-            model = route_spec("local", WORKGRAPH_LOCAL_DEFAULT_ROUTE),
-        ),
 
         (R::NexCustom, ConfigScope::Global) => format!(
             "{header}\
@@ -710,6 +689,15 @@ pub fn update(
     tui_counters: Option<&str>,
     retry_context_tokens: Option<u32>,
     endpoint: Option<&str>,
+    tier_specs: &[String],
+    set_models: &[String],
+    set_providers: &[String],
+    set_endpoints: &[String],
+    role_models: &[String],
+    role_providers: &[String],
+    flip_inference_model: Option<&str>,
+    flip_comparison_model: Option<&str>,
+    flip_model: Option<&str>,
     no_reload: bool,
 ) -> Result<()> {
     let mut config = match scope {
@@ -719,15 +707,22 @@ pub fn update(
     let mut changed = false;
 
     // Endpoint-driven update: shares semantics with `wg init -m/-e`.
-    // Writes a default oai-compat endpoint entry + applies the `local:`
+    // Writes a default oai-compat endpoint entry + applies the `nex:`
     // prefix to the model name so the provider:model validator accepts
     // it on reload. Model-only sets flow through the existing validated
-    // agent.model / coordinator.model blocks further down (we re-check
+    // agent.model / dispatcher.model blocks further down (we re-check
     // here so the existing blocks don't double-apply when we already did).
     let endpoint_handled_model = if endpoint.is_some() {
         let summary = config.apply_model_endpoint(model, endpoint)?;
         for line in &summary {
             println!("Set {}", line);
+        }
+        if coordinator_executor.is_none()
+            && let Some(dispatcher_model) = config.coordinator.model.clone()
+            && let Some(summary) =
+                clear_dispatcher_executor_for_model(&mut config, &dispatcher_model)
+        {
+            println!("{}", summary);
         }
         changed = true;
         true
@@ -761,6 +756,16 @@ pub fn update(
         }
         config.agent.model = m.to_string();
         println!("Set agent.model = \"{}\"", m);
+        if coordinator_model.is_none() {
+            config.coordinator.model = Some(m.to_string());
+            config.coordinator.provider = None;
+            println!("Set dispatcher.model = \"{}\"", m);
+            if coordinator_executor.is_none()
+                && let Some(summary) = clear_dispatcher_executor_for_model(&mut config, m)
+            {
+                println!("{}", summary);
+            }
+        }
         changed = true;
     }
 
@@ -799,13 +804,13 @@ pub fn update(
         eprintln!(
             "warning: `wg config --dispatcher-executor {0}` (and the legacy \
              `--coordinator-executor` alias) is deprecated; pass a \
-             `provider:model` spec to `--model` / `--coordinator-model` \
+             `provider:model` spec to `--model` / `--dispatcher-model` \
              instead (e.g. `wg config --model claude:opus`). The handler \
              is derived from the model's provider prefix.",
             exec,
         );
         config.coordinator.executor = Some(exec.to_string());
-        println!("Set coordinator.executor = \"{}\"", exec);
+        println!("Set dispatcher.executor = \"{}\"", exec);
         changed = true;
     }
 
@@ -819,7 +824,12 @@ pub fn update(
         }
         config.coordinator.model = Some(m.to_string());
         config.coordinator.provider = None; // Clear deprecated field
-        println!("Set coordinator.model = \"{}\"", m);
+        println!("Set dispatcher.model = \"{}\"", m);
+        if coordinator_executor.is_none()
+            && let Some(summary) = clear_dispatcher_executor_for_model(&mut config, m)
+        {
+            println!("{}", summary);
+        }
         changed = true;
     }
 
@@ -833,8 +843,8 @@ pub fn update(
         // Extract just the model ID (strip any existing provider prefix)
         let current_model_id = workgraph::config::parse_model_spec(current_model_raw).model_id;
         eprintln!(
-            "Warning: --coordinator-provider is deprecated. Use provider:model format in --coordinator-model instead.\n\
-             Example: wg config --coordinator-model {}:{}",
+            "Warning: --coordinator-provider is deprecated. Use provider:model format in --dispatcher-model instead.\n\
+             Example: wg config --dispatcher-model {}:{}",
             suggested_provider, current_model_id,
         );
         config.coordinator.provider = Some(p.to_string());
@@ -1013,17 +1023,46 @@ pub fn update(
         }
     }
 
+    let registry_config = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
+    changed |= apply_tier_updates(&mut config, &registry_config, tier_specs)?;
+
+    // Handle --flip-model / --flip-inference-model / --flip-comparison-model
+    // before explicit role routing, preserving the old precedence where a
+    // subsequent --set-model flip_* override wins over the shorthand.
+    let flip_inf = flip_inference_model.or(flip_model);
+    let flip_cmp = flip_comparison_model.or(flip_model);
+    changed |= apply_flip_model_updates(&mut config, flip_inf, flip_cmp)?;
+    changed |= apply_model_routing_updates(
+        &mut config,
+        &registry_config,
+        set_models,
+        set_providers,
+        set_endpoints,
+        role_models,
+        role_providers,
+    )?;
+
     // Record executor/model config change in launcher history
     if coordinator_executor.is_some() || coordinator_model.is_some() || endpoint.is_some() {
+        let mdl = coordinator_model
+            .or(config.coordinator.model.as_deref())
+            .or(model);
         let exec = coordinator_executor
             .or(config.coordinator.executor.as_deref())
-            .unwrap_or(&config.agent.executor);
-        let mdl = coordinator_model
-            .or(model)
-            .or(config.coordinator.model.as_deref());
+            .map(std::string::ToString::to_string)
+            .or_else(|| {
+                mdl.and_then(|m| {
+                    workgraph::config::parse_model_spec(m)
+                        .provider
+                        .as_deref()
+                        .map(workgraph::config::provider_to_executor)
+                        .map(std::string::ToString::to_string)
+                })
+            })
+            .unwrap_or_else(|| config.agent.executor.clone());
         let ep = endpoint;
         let _ = workgraph::launcher_history::record_use(
-            &workgraph::launcher_history::HistoryEntry::new(exec, mdl, ep, "config"),
+            &workgraph::launcher_history::HistoryEntry::new(&exec, mdl, ep, "config"),
         );
     }
 
@@ -1055,10 +1094,10 @@ pub fn update(
         // new model/endpoint end-to-end. Skip with `--no-reload`.
         let wants_restart = !no_reload
             && matches!(scope, ConfigScope::Local)
-            && (endpoint.is_some() || model.is_some());
+            && (endpoint.is_some() || model.is_some() || coordinator_model.is_some());
         if wants_restart {
             match try_restart_daemon(dir) {
-                Ok(true) => println!("Daemon restarted (coordinator respawned with new config)."),
+                Ok(true) => println!("Daemon restarted (dispatcher respawned with new config)."),
                 Ok(false) => {} // no daemon running; nothing to do
                 Err(e) => {
                     println!(
@@ -1089,7 +1128,7 @@ pub fn list(dir: &Path, json: bool) -> Result<()> {
         let mut entries = Vec::new();
         collect_leaf_entries(&merged_val, "", &sources, &mut entries);
 
-        println!("Workgraph Configuration (merged)");
+        println!("WG Configuration (merged)");
         println!("=================================");
         println!();
         for entry in &entries {
@@ -1409,19 +1448,53 @@ pub fn show_model_routing(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Update FLIP model configuration (--flip-model / --flip-inference-model / --flip-comparison-model).
-pub fn update_flip_models(
-    dir: &Path,
-    scope: ConfigScope,
+fn split_key_value<'a>(flag: &str, value: &'a str, expected: &str) -> Result<(&'a str, &'a str)> {
+    let parts: Vec<&str> = value.splitn(2, '=').collect();
+    if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        anyhow::bail!("{} requires format {}, got \"{}\"", flag, expected, value);
+    }
+    Ok((parts[0].trim(), parts[1].trim()))
+}
+
+fn apply_tier_updates(
+    config: &mut Config,
+    registry_config: &Config,
+    tier_specs: &[String],
+) -> Result<bool> {
+    let mut changed = false;
+
+    for tier_spec in tier_specs {
+        let (tier_name, model_id) = split_key_value("--tier", tier_spec, "<tier>=<model-id>")?;
+        let _tier: Tier = tier_name.parse()?;
+
+        if registry_config.registry_lookup(model_id).is_none() {
+            eprintln!(
+                "Warning: '{}' is not in the model registry. \
+                 Tier will resolve to it as a bare model name.",
+                model_id
+            );
+        }
+
+        match tier_name {
+            "fast" => config.tiers.fast = Some(model_id.to_string()),
+            "standard" => config.tiers.standard = Some(model_id.to_string()),
+            "premium" => config.tiers.premium = Some(model_id.to_string()),
+            _ => unreachable!(), // already validated by Tier::from_str
+        }
+
+        println!("Set tiers.{} = \"{}\"", tier_name, model_id);
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+fn apply_flip_model_updates(
+    config: &mut Config,
     inference_model: Option<&str>,
     comparison_model: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     use workgraph::config::DispatchRole;
-
-    let mut config = match scope {
-        ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
-        ConfigScope::Local => Config::load(dir)?,
-    };
 
     let mut changed = false;
 
@@ -1461,14 +1534,158 @@ pub fn update_flip_models(
         changed = true;
     }
 
-    if changed {
-        match scope {
-            ConfigScope::Global => config.save_global()?,
-            ConfigScope::Local => config.save(dir)?,
+    Ok(changed)
+}
+
+fn apply_model_for_role(
+    config: &mut Config,
+    registry_config: &Config,
+    role_name: &str,
+    model: &str,
+) -> Result<()> {
+    use workgraph::config::DispatchRole;
+
+    let role: DispatchRole = role_name.parse()?;
+
+    if let Err(e) = workgraph::config::parse_model_spec_strict(model) {
+        anyhow::bail!(
+            "Invalid model format: {}. Use provider:model format (e.g., 'claude:opus').",
+            e
+        );
+    }
+
+    config.models.set_model(role, model);
+    println!("Set models.{}.model = \"{}\"", role, model);
+
+    let spec = workgraph::config::parse_model_spec(model);
+    if let Some(ref provider) = spec.provider {
+        config.models.set_provider(role, provider);
+        println!(
+            "Set models.{}.provider = \"{}\" (from provider:model)",
+            role, provider
+        );
+    }
+
+    let lookup_id = &spec.model_id;
+    if registry_config.registry_lookup(lookup_id).is_none() {
+        eprintln!(
+            "Warning: model '{}' is not in the registry. It will be used as a raw model ID.",
+            lookup_id
+        );
+        eprintln!(
+            "  If this is a short alias, add it with: wg config --registry-add --id {} ...",
+            lookup_id
+        );
+    } else if let Some(entry) = registry_config.registry_lookup(lookup_id) {
+        let role_tier = role.default_tier();
+        if entry.tier != role_tier {
+            eprintln!(
+                "Note: model '{}' is tier '{}' but role '{}' defaults to tier '{}'.",
+                lookup_id, entry.tier, role, role_tier
+            );
         }
     }
 
     Ok(())
+}
+
+fn apply_provider_for_role(config: &mut Config, role_name: &str, provider: &str) -> Result<()> {
+    use workgraph::config::DispatchRole;
+
+    let suggested_provider = if provider == "anthropic" {
+        "claude"
+    } else {
+        provider
+    };
+    eprintln!(
+        "Warning: --set-provider is deprecated. Use provider:model format in --set-model instead.\n\
+         Example: wg config --set-model {} {}:MODEL",
+        role_name, suggested_provider,
+    );
+    let role: DispatchRole = role_name.parse()?;
+    config.models.set_provider(role, provider);
+    println!("Set models.{}.provider = \"{}\"", role, provider);
+    Ok(())
+}
+
+fn apply_endpoint_for_role(
+    config: &mut Config,
+    role_name: &str,
+    endpoint_name: &str,
+) -> Result<()> {
+    use workgraph::config::DispatchRole;
+
+    let role: DispatchRole = role_name.parse()?;
+    if config.llm_endpoints.find_by_name(endpoint_name).is_none() {
+        eprintln!(
+            "Warning: endpoint '{}' is not configured. Add it with: wg endpoints add {}",
+            endpoint_name, endpoint_name
+        );
+    }
+
+    config.models.set_endpoint(role, endpoint_name);
+    println!("Set models.{}.endpoint = \"{}\"", role, endpoint_name);
+    Ok(())
+}
+
+fn apply_model_routing_updates(
+    config: &mut Config,
+    registry_config: &Config,
+    set_models: &[String],
+    set_providers: &[String],
+    set_endpoints: &[String],
+    role_models: &[String],
+    role_providers: &[String],
+) -> Result<bool> {
+    let mut changed = false;
+
+    if !set_models.is_empty() {
+        if set_models.len() % 2 != 0 {
+            anyhow::bail!("--set-model requires pairs of arguments: <role> <model>");
+        }
+        for pair in set_models.chunks(2) {
+            apply_model_for_role(config, registry_config, &pair[0], &pair[1])?;
+            changed = true;
+        }
+    }
+
+    if !role_models.is_empty() {
+        for kv in role_models {
+            let (role, model) = split_key_value("--role-model", kv, "<role>=<model>")?;
+            apply_model_for_role(config, registry_config, role, model)?;
+            changed = true;
+        }
+    }
+
+    if !set_providers.is_empty() {
+        if set_providers.len() % 2 != 0 {
+            anyhow::bail!("--set-provider requires pairs of arguments: <role> <provider>");
+        }
+        for pair in set_providers.chunks(2) {
+            apply_provider_for_role(config, &pair[0], &pair[1])?;
+            changed = true;
+        }
+    }
+
+    if !role_providers.is_empty() {
+        for kv in role_providers {
+            let (role, provider) = split_key_value("--role-provider", kv, "<role>=<provider>")?;
+            apply_provider_for_role(config, role, provider)?;
+            changed = true;
+        }
+    }
+
+    if !set_endpoints.is_empty() {
+        if set_endpoints.len() % 2 != 0 {
+            anyhow::bail!("--set-endpoint requires pairs of arguments: <role> <endpoint-name>");
+        }
+        for pair in set_endpoints.chunks(2) {
+            apply_endpoint_for_role(config, &pair[0], &pair[1])?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
 }
 
 /// Update model routing configuration (--set-model / --set-provider / --set-endpoint).
@@ -1479,111 +1696,22 @@ pub fn update_model_routing(
     set_provider: Option<&[String]>,
     set_endpoint: Option<&[String]>,
 ) -> Result<()> {
-    use workgraph::config::DispatchRole;
-
     let mut config = match scope {
         ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
         ConfigScope::Local => Config::load(dir)?,
     };
 
-    let mut changed = false;
-
-    if let Some(args) = set_model {
-        if args.len() != 2 {
-            anyhow::bail!("--set-model requires exactly 2 arguments: <role> <model>");
-        }
-        let role: DispatchRole = args[0].parse()?;
-        let model = &args[1];
-
-        // Validate provider:model format
-        if let Err(e) = workgraph::config::parse_model_spec_strict(model) {
-            anyhow::bail!(
-                "Invalid model format: {}. Use provider:model format (e.g., 'claude:opus').",
-                e
-            );
-        }
-
-        config.models.set_model(role, model);
-        println!("Set models.{}.model = \"{}\"", role, model);
-
-        // Auto-populate provider from provider:model spec
-        let spec = workgraph::config::parse_model_spec(model);
-        if let Some(ref provider) = spec.provider {
-            config.models.set_provider(role, provider);
-            println!(
-                "Set models.{}.provider = \"{}\" (from provider:model)",
-                role, provider
-            );
-        }
-
-        // Validate: warn if model ID is not in the registry
-        let spec = workgraph::config::parse_model_spec(model);
-        let lookup_id = &spec.model_id;
-        if config.registry_lookup(lookup_id).is_none() {
-            eprintln!(
-                "Warning: model '{}' is not in the registry. It will be used as a raw model ID.",
-                lookup_id
-            );
-            eprintln!(
-                "  If this is a short alias, add it with: wg config --registry-add --id {} ...",
-                lookup_id
-            );
-        } else {
-            // Informational: check tier compatibility
-            if let Some(entry) = config.registry_lookup(lookup_id) {
-                let role_tier = role.default_tier();
-                if entry.tier != role_tier {
-                    eprintln!(
-                        "Note: model '{}' is tier '{}' but role '{}' defaults to tier '{}'.",
-                        lookup_id, entry.tier, role, role_tier
-                    );
-                }
-            }
-        }
-        changed = true;
-    }
-
-    if let Some(args) = set_provider {
-        if args.len() != 2 {
-            anyhow::bail!("--set-provider requires exactly 2 arguments: <role> <provider>");
-        }
-        let role_name = &args[0];
-        let provider = &args[1];
-        let suggested_provider = if provider == "anthropic" {
-            "claude"
-        } else {
-            provider
-        };
-        eprintln!(
-            "Warning: --set-provider is deprecated. Use provider:model format in --set-model instead.\n\
-             Example: wg config --set-model {} {}:MODEL",
-            role_name, suggested_provider,
-        );
-        let role: DispatchRole = role_name.parse()?;
-        config.models.set_provider(role, provider);
-        println!("Set models.{}.provider = \"{}\"", role, provider);
-        changed = true;
-    }
-
-    if let Some(args) = set_endpoint {
-        if args.len() != 2 {
-            anyhow::bail!("--set-endpoint requires exactly 2 arguments: <role> <endpoint-name>");
-        }
-        let role: DispatchRole = args[0].parse()?;
-        let endpoint_name = &args[1];
-
-        // Validate: warn if endpoint name is not configured
-        if config.llm_endpoints.find_by_name(endpoint_name).is_none() {
-            eprintln!(
-                "Warning: endpoint '{}' is not configured. Add it with: wg endpoints add {}",
-                endpoint_name, endpoint_name
-            );
-        }
-
-        config.models.set_endpoint(role, endpoint_name);
-        println!("Set models.{}.endpoint = \"{}\"", role, endpoint_name);
-        changed = true;
-    }
+    let registry_config = Config::load_merged(dir).unwrap_or_else(|_| config.clone());
+    let empty: &[String] = &[];
+    let changed = apply_model_routing_updates(
+        &mut config,
+        &registry_config,
+        set_model.unwrap_or(empty),
+        set_provider.unwrap_or(empty),
+        set_endpoint.unwrap_or(empty),
+        empty,
+        empty,
+    )?;
 
     if changed {
         match scope {
@@ -1863,51 +1991,6 @@ pub fn show_tiers(dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Set which model a tier uses. Format: <tier>=<model-id>
-pub fn set_tier(dir: &Path, scope: ConfigScope, tier_spec: &str) -> Result<()> {
-    let parts: Vec<&str> = tier_spec.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        anyhow::bail!(
-            "--tier requires format <tier>=<model-id>, got \"{}\"",
-            tier_spec
-        );
-    }
-
-    let tier_name = parts[0].trim();
-    let model_id = parts[1].trim();
-
-    // Validate tier name
-    let _tier: Tier = tier_name.parse()?;
-
-    let mut config = match scope {
-        ConfigScope::Global => Config::load_global()?.unwrap_or_default(),
-        ConfigScope::Local => Config::load(dir)?,
-    };
-
-    // Warn if model_id is not in registry
-    let merged = Config::load_merged(dir)?;
-    if merged.registry_lookup(model_id).is_none() {
-        eprintln!(
-            "Warning: '{}' is not in the model registry. \
-             Tier will resolve to it as a bare model name.",
-            model_id
-        );
-    }
-
-    match tier_name {
-        "fast" => config.tiers.fast = Some(model_id.to_string()),
-        "standard" => config.tiers.standard = Some(model_id.to_string()),
-        "premium" => config.tiers.premium = Some(model_id.to_string()),
-        _ => unreachable!(), // already validated by Tier::from_str
-    }
-
-    save_config(&config, dir, scope)?;
-
-    println!("Set tiers.{} = \"{}\"", tier_name, model_id);
-
-    Ok(())
-}
-
 /// Helper: save config to the appropriate location based on scope.
 fn save_config(config: &Config, dir: &Path, scope: ConfigScope) -> Result<()> {
     match scope {
@@ -1934,7 +2017,7 @@ pub fn check_key(dir: &Path, json: bool) -> Result<()> {
                 eprintln!("Configure a key via:");
                 eprintln!("  - wg endpoints add (recommended)");
                 eprintln!("  - Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable");
-                eprintln!("  - Add [native_executor] api_key to .workgraph/config.toml");
+                eprintln!("  - Add [native_executor] api_key to .wg/config.toml");
             }
             std::process::exit(1);
         }
@@ -2044,7 +2127,7 @@ fn mask_token(token: &str) -> String {
 
 /// Install the current project's config as the global default.
 ///
-/// Copies `.workgraph/config.toml` → `~/.workgraph/config.toml`.
+/// Copies `.wg/config.toml` → `~/.wg/config.toml`.
 /// If the global config already exists and `--force` is not set, shows a diff
 /// summary and asks for confirmation on stdin.
 pub fn install_global(workgraph_dir: &Path, force: bool) -> Result<()> {
@@ -2308,7 +2391,7 @@ fn print_diff_summary(old: &str, new: &str) {
 /// matching `Config` field, validates where appropriate, and saves to the
 /// requested scope. This is intentionally a thin dispatcher over the
 /// existing `Config` struct — the canonical CLI setters in this file
-/// (`update`, `set_tier`, `set_key`) handle their own bespoke flows; this
+/// (`update`, `set_key`) handle their own bespoke flows; this
 /// helper covers the simple per-key edits the Settings tab issues.
 pub fn set_setting_value(
     workgraph_dir: &Path,
@@ -2386,7 +2469,7 @@ fn apply_setting(config: &mut Config, key: &str, value: &str) -> Result<()> {
         "coordinator.coordinator_agent" | "dispatcher.coordinator_agent" => {
             config.coordinator.coordinator_agent = parse_bool(v)?;
         }
-        "coordinator.model" => {
+        "coordinator.model" | "dispatcher.model" => {
             workgraph::config::parse_model_spec_strict(v).map_err(|e| {
                 anyhow::anyhow!(
                     "Invalid model format: {}. Use provider:model (e.g. 'claude:opus').",
@@ -2395,7 +2478,7 @@ fn apply_setting(config: &mut Config, key: &str, value: &str) -> Result<()> {
             })?;
             config.coordinator.model = Some(v.to_string());
         }
-        "coordinator.executor" => {
+        "coordinator.executor" | "dispatcher.executor" => {
             config.coordinator.executor = Some(v.to_string());
         }
         "coordinator.agent_timeout" => {
@@ -2472,6 +2555,7 @@ pub fn set_key(
             api_key: None,
             api_key_file: Some(file_path.to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: is_first,
             context_window: None,
         });
@@ -2789,7 +2873,16 @@ mod tests {
             None,
             None,
             None,
-            None,  // endpoint
+            None, // endpoint
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
             false, // no_reload
         );
         assert!(result.is_ok());
@@ -2841,7 +2934,16 @@ mod tests {
             None,
             None,
             None,
-            None,  // endpoint
+            None, // endpoint
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
             false, // no_reload
         );
         assert!(result.is_ok());
@@ -2893,7 +2995,16 @@ mod tests {
             None,
             None,
             None,
-            None,  // endpoint
+            None, // endpoint
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
             false, // no_reload
         );
         assert!(result.is_ok());
@@ -2927,23 +3038,32 @@ mod tests {
             Some("evolver-hash"),
             Some("creator-hash"),
             Some("Retire below 0.3 after 10 evals"),
-            None,  // auto_triage
-            None,  // auto_place
-            None,  // auto_create
-            None,  // triage_timeout
-            None,  // triage_max_log_bytes
-            None,  // max_child_tasks
-            None,  // max_task_depth
-            None,  // viz_edge_color
-            None,  // eval_gate_threshold
-            None,  // eval_gate_all
-            None,  // flip_enabled
-            None,  // flip_verification_threshold
-            None,  // chat_history
-            None,  // chat_history_max
-            None,  // tui_counters
-            None,  // retry_context_tokens
-            None,  // endpoint
+            None, // auto_triage
+            None, // auto_place
+            None, // auto_create
+            None, // triage_timeout
+            None, // triage_max_log_bytes
+            None, // max_child_tasks
+            None, // max_task_depth
+            None, // viz_edge_color
+            None, // eval_gate_threshold
+            None, // eval_gate_all
+            None, // flip_enabled
+            None, // flip_verification_threshold
+            None, // chat_history
+            None, // chat_history_max
+            None, // tui_counters
+            None, // retry_context_tokens
+            None, // endpoint
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
             false, // no_reload
         );
         assert!(result.is_ok());
@@ -3065,6 +3185,7 @@ mod tests {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         });
@@ -3145,7 +3266,7 @@ mod tests {
 
         // Point to a nested global path that doesn't exist yet
         let global_base = TempDir::new().unwrap();
-        let global_dir = global_base.path().join("nested").join(".workgraph");
+        let global_dir = global_base.path().join("nested").join(".wg");
         let global_path = global_dir.join("config.toml");
 
         let result = install_global_to(project_dir.path(), &global_path, &global_dir, true);

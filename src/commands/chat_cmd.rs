@@ -6,8 +6,8 @@
 //!
 //! Design constraints:
 //! - `wg chat create`, `send`, `list`, `show` MUST work when the service
-//!   daemon is down — they operate directly on `.workgraph/graph.jsonl`
-//!   and `.workgraph/chat/<uuid>/`.
+//!   daemon is down — they operate directly on `.wg/graph.jsonl`
+//!   and `.wg/chat/<uuid>/`.
 //! - `wg chat resume` and `wg chat stop` require the daemon (the handler
 //!   process is owned by the supervisor); they error clearly when down.
 //! - When the daemon IS running, `create` / `delete` / `archive` go
@@ -154,6 +154,45 @@ fn supervised_chat_ids(dir: &Path) -> Vec<u32> {
         .collect()
 }
 
+fn migrate_existing_chat_tasks(dir: &Path) -> Result<()> {
+    let path = graph_path(dir);
+    workgraph::parser::modify_graph(&path, |graph| {
+        let mut changed = false;
+        let ids: Vec<String> = graph
+            .tasks()
+            .filter(|t| t.tags.iter().any(|tag| chat_id::is_chat_loop_tag(tag)))
+            .map(|t| t.id.clone())
+            .collect();
+        for task_id in ids {
+            let Some(cid) = chat_id::parse_chat_task_id(&task_id) else {
+                continue;
+            };
+            let coord_state = crate::commands::service::CoordinatorState::load_for(dir, cid);
+            if let Some(task) = graph.get_task_mut(&task_id) {
+                let task_model = task.model.clone();
+                let task_endpoint = task.endpoint.clone();
+                let executor = coord_state
+                    .as_ref()
+                    .and_then(|s| s.executor_override.as_deref());
+                let model = coord_state
+                    .as_ref()
+                    .and_then(|s| s.model_override.as_deref())
+                    .or(task_model.as_deref());
+                let endpoint = coord_state
+                    .as_ref()
+                    .and_then(|s| s.endpoint_override.as_deref())
+                    .or(task_endpoint.as_deref());
+                changed |= workgraph::chat_command::migrate_chat_task_metadata(
+                    task, dir, executor, model, endpoint,
+                );
+            }
+        }
+        changed
+    })
+    .with_context(|| "Failed to migrate chat task metadata")?;
+    Ok(())
+}
+
 // ============================================================================
 // Subcommand: create
 // ============================================================================
@@ -169,12 +208,14 @@ pub fn run_create(
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
+    endpoint: Option<&str>,
+    command: Option<&str>,
     json: bool,
 ) -> Result<()> {
     if service_is_running(dir) {
-        run_create_via_ipc(dir, name, model, executor, json)
+        run_create_via_ipc(dir, name, model, executor, endpoint, command, json)
     } else {
-        run_create_direct(dir, name, model, executor, json)
+        run_create_direct(dir, name, model, executor, endpoint, command, json)
     }
 }
 
@@ -184,9 +225,13 @@ fn run_create_via_ipc(
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
+    endpoint: Option<&str>,
+    command: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    crate::commands::service::run_create_coordinator(dir, name, model, executor, json)
+    crate::commands::service::run_create_coordinator(
+        dir, name, model, executor, endpoint, command, json,
+    )
 }
 
 #[cfg(not(unix))]
@@ -195,6 +240,8 @@ fn run_create_via_ipc(
     _name: Option<&str>,
     _model: Option<&str>,
     _executor: Option<&str>,
+    _endpoint: Option<&str>,
+    _command: Option<&str>,
     _json: bool,
 ) -> Result<()> {
     anyhow::bail!("Service IPC is only supported on Unix systems")
@@ -205,9 +252,13 @@ fn run_create_direct(
     name: Option<&str>,
     model: Option<&str>,
     executor: Option<&str>,
+    endpoint: Option<&str>,
+    command: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let next_id = crate::commands::service::ipc::create_chat_in_graph(dir, name, model, executor)?;
+    let next_id = crate::commands::service::ipc::create_chat_in_graph(
+        dir, name, model, executor, endpoint, command,
+    )?;
     let task_id = chat_id::format_chat_task_id(next_id);
     if json {
         let v = serde_json::json!({
@@ -237,6 +288,7 @@ fn run_create_direct(
 
 /// `wg chat list` — show all chat entities with truthful status.
 pub fn run_list(dir: &Path, json: bool) -> Result<()> {
+    migrate_existing_chat_tasks(dir)?;
     let graph =
         workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
 
@@ -308,6 +360,7 @@ pub fn run_list(dir: &Path, json: bool) -> Result<()> {
 
 /// `wg chat show` — detailed view of a single chat entity.
 pub fn run_show(dir: &Path, reference: &str, json: bool) -> Result<()> {
+    migrate_existing_chat_tasks(dir)?;
     let graph =
         workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
 
@@ -491,11 +544,16 @@ pub fn run_archive(dir: &Path, reference: &str, json: bool) -> Result<()> {
         workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
     let cid = resolve_chat_id(&graph, reference)
         .with_context(|| format!("No chat matching '{}'", reference))?;
-    if service_is_running(dir) {
+    let result = if service_is_running(dir) {
         crate::commands::service::run_archive_coordinator(dir, cid, json)
     } else {
         archive_chat_direct(dir, cid, json)
-    }
+    };
+    // Tear down the tmux chat session so we don't accumulate orphan
+    // wg-chat-* sessions. Best-effort — the archive itself succeeded
+    // (or failed) before this runs.
+    chat_id::kill_chat_tmux_session_for_id(dir, cid);
+    result
 }
 
 fn archive_chat_direct(dir: &Path, cid: u32, json: bool) -> Result<()> {
@@ -560,11 +618,14 @@ pub fn run_delete(dir: &Path, reference: &str, yes: bool, json: bool) -> Result<
         }
     }
 
-    if service_is_running(dir) {
+    let result = if service_is_running(dir) {
         crate::commands::service::run_delete_coordinator(dir, cid, json)
     } else {
         delete_chat_direct(dir, cid, json)
-    }
+    };
+    // Tear down the tmux chat session if any — see run_archive.
+    chat_id::kill_chat_tmux_session_for_id(dir, cid);
+    result
 }
 
 fn delete_chat_direct(dir: &Path, cid: u32, json: bool) -> Result<()> {
@@ -611,9 +672,17 @@ fn delete_chat_direct(dir: &Path, cid: u32, json: bool) -> Result<()> {
 
 /// `wg chat attach` — open an interactive view of the chat session.
 ///
-/// Defaults to TUI mode when running on a TTY. With `--cli` (or in a
-/// non-TTY) falls back to streaming the outbox to stderr. The CLI
-/// fallback is read-only — to send a message use `wg chat send`.
+/// Preferred path: when a tmux session exists for this chat (TUI was
+/// run with chat-persistence wrappers), `exec tmux attach -t <session>`
+/// hands the user the live vendor CLI directly — including history and
+/// in-flight tool calls. This is the strongest reattach UX and works
+/// from any terminal (no TUI required).
+///
+/// Fallbacks (in order):
+///   1. TUI mode via `chat::run_interactive` when on a TTY + service is
+///      up. Talks to daemon over IPC.
+///   2. Read-only outbox stream (CLI mode). Use `wg chat send` to
+///      enqueue messages.
 pub fn run_attach(dir: &Path, reference: &str, force_cli: bool) -> Result<()> {
     let graph =
         workgraph::parser::load_graph(&graph_path(dir)).with_context(|| "Failed to load graph")?;
@@ -622,6 +691,30 @@ pub fn run_attach(dir: &Path, reference: &str, force_cli: bool) -> Result<()> {
 
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout());
+
+    // Try the tmux fast-path first when on a TTY: if the wg-chat-* tmux
+    // session for this chat is alive, attach to it. This is what the
+    // user actually wants for "drop me back into my chat" — no
+    // outbox-tail, no IPC roundtrip. Skip when --cli forced or when not
+    // on a TTY (tmux attach into a pipe would hang).
+    if !force_cli
+        && is_tty
+        && let Some(session) = chat_tmux_session_for_dir(dir, cid)
+        && tmux_session_alive(&session)
+    {
+        eprintln!("Attaching to tmux session: {}", session);
+        let status = std::process::Command::new("tmux")
+            .args(["attach", "-d", "-t", &session])
+            .status()
+            .with_context(|| "Failed to invoke tmux attach")?;
+        if status.success() {
+            return Ok(());
+        }
+        eprintln!(
+            "tmux attach exited with status {:?}; falling back to other modes.",
+            status.code()
+        );
+    }
 
     if !force_cli && is_tty {
         // Interactive REPL via existing chat::run_interactive (talks to
@@ -637,6 +730,26 @@ pub fn run_attach(dir: &Path, reference: &str, force_cli: bool) -> Result<()> {
     } else {
         read_only_attach(dir, cid)
     }
+}
+
+fn chat_tmux_session_for_dir(dir: &Path, cid: u32) -> Option<String> {
+    let project_root = dir.parent().unwrap_or(dir).to_path_buf();
+    let project_tag = project_root.file_name().and_then(|n| n.to_str())?;
+    let chat_ref = format!("chat-{}", cid);
+    Some(workgraph::chat_id::chat_tmux_session_name(
+        project_tag,
+        &chat_ref,
+    ))
+}
+
+fn tmux_session_alive(name: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["has-session", "-t", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn read_only_attach(dir: &Path, cid: u32) -> Result<()> {
@@ -672,7 +785,7 @@ mod tests {
         // service_is_running is false (no service/state.json) — exercise
         // the direct path:
         assert!(!service_is_running(dir));
-        run_create_direct(dir, Some("alpha"), None, None, true).unwrap();
+        run_create_direct(dir, Some("alpha"), None, None, None, None, true).unwrap();
 
         // Graph contains a .chat-N task
         let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
@@ -682,13 +795,64 @@ mod tests {
             .collect();
         assert_eq!(chat_tasks.len(), 1, "Should have created one chat task");
         assert!(chat_tasks[0].id.starts_with(".chat-"));
+        assert_eq!(
+            chat_tasks[0].executor_preset_name.as_deref(),
+            Some("claude")
+        );
+        assert!(!chat_tasks[0].command_argv.is_empty());
+        assert!(chat_tasks[0].working_dir.is_some());
+    }
+
+    #[test]
+    fn create_custom_command_chat_stores_command_metadata() {
+        let td = mk_workgraph_dir();
+        let dir = td.path();
+        run_create_direct(dir, Some("shell"), None, None, None, Some("bash"), true).unwrap();
+
+        let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
+        let chat = g
+            .tasks()
+            .find(|t| t.tags.iter().any(|x| chat_id::is_chat_loop_tag(x)))
+            .expect("chat task exists");
+        assert_eq!(chat.executor_preset_name, None);
+        assert_eq!(
+            chat.command_argv,
+            vec!["bash".to_string(), "-lc".to_string(), "bash".to_string()]
+        );
+        assert!(chat.working_dir.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    #[test]
+    fn migrate_legacy_preset_chat_writes_command_metadata() {
+        let td = mk_workgraph_dir();
+        let dir = td.path();
+        let mut graph = workgraph::graph::WorkGraph::new();
+        graph.add_node(workgraph::graph::Node::Task(workgraph::graph::Task {
+            id: ".chat-0".to_string(),
+            title: "Chat 0".to_string(),
+            status: workgraph::graph::Status::InProgress,
+            tags: vec![chat_id::CHAT_LOOP_TAG.to_string()],
+            model: Some("nex:qwen3-coder".to_string()),
+            endpoint: Some("http://127.0.0.1:8088".to_string()),
+            ..Default::default()
+        }));
+        workgraph::parser::save_graph(&graph, &graph_path(dir)).unwrap();
+
+        migrate_existing_chat_tasks(dir).unwrap();
+
+        let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
+        let chat = g.get_task(".chat-0").unwrap();
+        assert_eq!(chat.executor_preset_name.as_deref(), Some("nex"));
+        assert_eq!(chat.command_argv[0], "wg");
+        assert!(chat.command_argv.contains(&"nex".to_string()));
+        assert!(chat.working_dir.as_deref().is_some_and(|d| !d.is_empty()));
     }
 
     #[test]
     fn send_to_dormant_chat_appends_inbox() {
         let td = mk_workgraph_dir();
         let dir = td.path();
-        run_create_direct(dir, Some("bot"), None, None, true).unwrap();
+        run_create_direct(dir, Some("bot"), None, None, None, None, true).unwrap();
 
         // Find the chat id we just created
         let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
@@ -715,7 +879,7 @@ mod tests {
     fn resume_errors_clearly_when_service_down() {
         let td = mk_workgraph_dir();
         let dir = td.path();
-        run_create_direct(dir, Some("c"), None, None, true).unwrap();
+        run_create_direct(dir, Some("c"), None, None, None, None, true).unwrap();
         let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();
         let chat = g
             .tasks()
@@ -736,8 +900,8 @@ mod tests {
     fn list_truthful_status_when_service_down() {
         let td = mk_workgraph_dir();
         let dir = td.path();
-        run_create_direct(dir, Some("alpha"), None, None, true).unwrap();
-        run_create_direct(dir, Some("beta"), None, None, true).unwrap();
+        run_create_direct(dir, Some("alpha"), None, None, None, None, true).unwrap();
+        run_create_direct(dir, Some("beta"), None, None, None, None, true).unwrap();
 
         // Build the in-memory representation list_truthfully would emit.
         let g = workgraph::parser::load_graph(&graph_path(dir)).unwrap();

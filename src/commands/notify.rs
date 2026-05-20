@@ -59,7 +59,7 @@ pub fn run(
             json,
             task_id,
             None,
-            "Workgraph not initialized. Run 'wg init' first.",
+            "WG not initialized. Run 'wg init' first.",
         );
     }
 
@@ -204,6 +204,7 @@ fn format_notification(task: &Task, custom_message: Option<&str>) -> (String, St
         Status::Waiting => "⏸️",
         Status::PendingValidation => "🔍",
         Status::PendingEval => "🔍",
+        Status::FailedPendingEval => "⚠️",
         Status::Incomplete => "🔁",
     };
 
@@ -341,13 +342,18 @@ mod tests {
             created_at: None,
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             provider: None,
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None,
             verify_timeout: None,
             agent: None,
@@ -377,6 +383,8 @@ mod tests {
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,

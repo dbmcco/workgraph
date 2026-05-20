@@ -89,12 +89,12 @@ This means the "organization" is **cognitive**, not parallel. The agent shifts r
 - When working on `verify-1`, it's a reviewer (crucially, working from the ARTIFACTS, not from memory of writing the code)
 - When triaging a failure, it's a coordinator deciding next steps
 
-The cycle is implemented via **iteration tracking in the prompt**, not via wg's native cycle edges. The agent tracks:
+The cycle is implemented via **iteration tracking in the prompt**, not via WG's native cycle edges. The agent tracks:
 - Current iteration number
 - Previous failure context (what the verifier found wrong)
 - Accumulated fix history
 
-**Why not native wg cycles?** Native cycles (`--max-iterations`) require the coordinator service to reset tasks. Harbor runs a single agent — there's no coordinator. The cycle must be agent-driven: the agent itself decides when to iterate and when to declare convergence.
+**Why not native WG cycles?** Native cycles (`--max-iterations`) require the coordinator service to reset tasks. Harbor runs a single agent — there's no coordinator. The cycle must be agent-driven: the agent itself decides when to iterate and when to declare convergence.
 
 ### 3.4 Verification Protocol
 
@@ -178,7 +178,7 @@ def build_condition_e_prompt(instruction: str, root_task_id: str, agent_identity
         "every triage decision. Your log is the organization's memory.\n"
         "5. **Iterate, don't spin.** Each fix attempt must be DIFFERENT from the last. "
         "If you're trying the same thing twice, step back and reconsider.\n\n"
-        "## Workgraph Tools\n\n"
+        "## wg Tools\n\n"
         f'- `wg_log("{root_task_id}", "message")` — Record progress (every phase)\n'
         f'- `wg_done("{root_task_id}")` — Root task complete (ONLY after PASS verdict)\n'
         f'- `wg_fail("{root_task_id}", "reason")` — Cannot complete (with full diagnostics)\n'
@@ -234,7 +234,7 @@ class ConditionEAgent(WorkgraphAgent):
 
     @staticmethod
     def name() -> str:
-        return "workgraph-condition-e"
+        return "wg-condition-e"
 
     def __init__(self, *args, **kwargs):
         kwargs["condition"] = "E"
@@ -375,9 +375,9 @@ Iteration 2:
 
 The wg task graph records this structure — each iteration's implementation and verification are distinct tracked tasks. But the execution is sequential within a single agent loop.
 
-### 6.3 Why Not Native wg Cycles?
+### 6.3 Why Not Native WG Cycles?
 
-Native wg cycles (`--max-iterations`) require:
+Native WG cycles (`--max-iterations`) require:
 1. A coordinator service running to detect cycle completion and reset tasks
 2. Multiple agent processes that can be independently spawned
 
@@ -579,7 +579,7 @@ Since Harbor runs a single agent, the cycle is managed in the prompt:
 | Iteration tracking | wg_log with `VERIFY: PASS/FAIL` | Machine-parseable verdict history. |
 | Fix tracking | `wg_add("Fix: ...")` | Each fix attempt is a distinct task with description. |
 
-### 11.2 Future: Native wg Cycles (Post-Harbor)
+### 11.2 Future: Native WG Cycles (Post-Harbor)
 
 If/when TB trials support multi-agent execution (wg service running), E's cycle could be expressed natively:
 
@@ -667,7 +667,7 @@ class ConditionEAgent(WorkgraphAgent):
 
     @staticmethod
     def name() -> str:
-        return "workgraph-condition-e"
+        return "wg-condition-e"
 
     def __init__(self, *args, **kwargs):
         kwargs["condition"] = "E"
@@ -675,7 +675,7 @@ class ConditionEAgent(WorkgraphAgent):
         super().__init__(*args, **kwargs)
 ```
 
-### 12.6 Save workgraph state (add "E" to condition check)
+### 12.6 Save wg state (add "E" to condition check)
 
 Change:
 ```python
@@ -758,7 +758,7 @@ harbor run \
 5. [ ] Modify `run()` to route condition "E" (prompt + assignment + tracking)
 6. [ ] Add E-specific tracking (decomposition, verdicts, triage) to tool loop
 7. [ ] Add enhanced metadata fields to `context.metadata`
-8. [ ] Add "E" to workgraph state save condition
+8. [ ] Add "E" to wg state save condition
 9. [ ] Update module docstring
 10. [ ] Smoke test with 1 trial on `constraints-scheduling`
 11. [ ] Verify workgraph_state has decomposed task graph
@@ -807,7 +807,7 @@ If E succeeds, the natural next step is Condition F: true multi-agent (wg servic
 |---|----------|--------|
 | 1 | How does the agent know HOW to decompose? | System prompt teaches the protocol (Section 4.1): analyze → create wg_add tasks → implement → verify → triage. |
 | 2 | How does independent verification work inside Docker? | Same agent, same env, but explicit ROLE SHIFT in prompt. "Read files from disk, not memory." Cognitive independence, not process independence. |
-| 3 | How do we handle the cycle inside Harbor? | Agent-driven cycle (Section 6.2): agent tracks iterations in its own context. Not native wg cycles (no service running). |
+| 3 | How do we handle the cycle inside Harbor? | Agent-driven cycle (Section 6.2): agent tracks iterations in its own context. Not native WG cycles (no service running). |
 | 4 | Cost model? | Expected $1.44/trial (2.4x A), $384 for full run. Pessimistic $2.28/trial, $609 total (Section 7). |
 | 5 | How do we measure? | Decomposition depth, verification verdicts (PASS/FAIL), triage count, cycle iterations, total tokens, wall-clock time — all in metadata (Section 8). |
 | 6 | Max iterations? | 6 (Section 11.1). Higher than D's 3 because each iteration is tracked and distinct. |

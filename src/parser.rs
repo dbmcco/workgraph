@@ -1,4 +1,5 @@
-use crate::graph::{Node, WorkGraph};
+use crate::graph::{Node, Task, WorkGraph};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -33,13 +34,20 @@ impl FileLock {
     #[cfg(not(unix))]
     fn acquire<P: AsRef<Path>>(_lock_path: P) -> Result<Self, ParseError> {
         // On non-Unix systems, we can't use flock - return a no-op lock
-        // This is a limitation but workgraph is primarily for Unix systems
+        // This is a limitation but WG is primarily for Unix systems
         Ok(FileLock {})
     }
 
     /// Try to acquire a shared (read) lock, non-blocking.
     /// Returns `Ok(Some(lock))` on success, `Ok(None)` if the lock is held
     /// exclusively by another process (EWOULDBLOCK).
+    ///
+    /// Transient `EIO` / `EINTR` (notably MooseFS surfacing flock contention
+    /// as `EIO`) are retried with bounded exponential backoff via
+    /// [`crate::lock::retry_acquire`]. `EWOULDBLOCK` is intentionally NOT
+    /// retried here — it is the documented non-error signal that another
+    /// process holds the exclusive lock, and the caller proceeds without
+    /// taking the shared lock (atomic-rename writes make readers safe).
     #[cfg(unix)]
     fn try_acquire_shared<P: AsRef<Path>>(lock_path: P) -> Result<Option<Self>, ParseError> {
         use std::os::unix::io::AsRawFd;
@@ -56,21 +64,31 @@ impl FileLock {
             .open(&lock_path)?;
 
         let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+        let policy = crate::lock::RetryPolicy::default();
+        let mut wouldblock = false;
+        let res =
+            crate::lock::retry_acquire(&policy, crate::lock::is_transient_nonblocking, || {
+                let ret = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) };
+                if ret == 0 {
+                    return Ok(());
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    wouldblock = true;
+                    return Ok(()); // Stop retrying; caller proceeds lockless.
+                }
+                Err(err)
+            });
 
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(ParseError::Lock(format!(
+        match res {
+            Ok(()) if wouldblock => Ok(None),
+            Ok(()) => Ok(Some(FileLock { file })),
+            Err(err) => Err(ParseError::Lock(format!(
                 "Failed to acquire shared lock on {:?}: {}",
                 lock_path.as_ref(),
                 err
-            )));
+            ))),
         }
-
-        Ok(Some(FileLock { file }))
     }
 
     #[cfg(not(unix))]
@@ -97,15 +115,22 @@ impl FileLock {
             .open(&lock_path)?;
 
         let fd = file.as_raw_fd();
-        let ret = unsafe { libc::flock(fd, operation) };
-
-        if ret != 0 {
-            return Err(ParseError::Lock(format!(
+        let policy = crate::lock::RetryPolicy::default();
+        crate::lock::retry_acquire(&policy, crate::lock::is_transient_blocking, || {
+            let ret = unsafe { libc::flock(fd, operation) };
+            if ret == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        })
+        .map_err(|err| {
+            ParseError::Lock(format!(
                 "Failed to acquire lock on {:?}: {}",
                 lock_path.as_ref(),
-                std::io::Error::last_os_error()
-            )));
-        }
+                err
+            ))
+        })?;
 
         Ok(FileLock { file })
     }
@@ -135,7 +160,7 @@ fn get_lock_path<P: AsRef<Path>>(graph_path: P) -> PathBuf {
     }
 }
 
-/// Load a work graph from a JSONL file (internal, no locking).
+/// Load a WG task graph from a JSONL file (internal, no locking).
 ///
 /// Callers must hold the flock themselves or use [`load_graph`] which
 /// acquires it automatically.
@@ -174,7 +199,7 @@ fn load_graph_inner<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
     Ok(graph)
 }
 
-/// Load a work graph from a JSONL file.
+/// Load a WG task graph from a JSONL file.
 ///
 /// Uses a non-blocking shared lock (`LOCK_SH | LOCK_NB`). If another process
 /// holds an exclusive lock (e.g. `modify_graph` in the coordinator), the read
@@ -193,7 +218,7 @@ pub fn load_graph<P: AsRef<Path>>(path: P) -> Result<WorkGraph, ParseError> {
     // Lock (if acquired) is automatically released when _lock goes out of scope
 }
 
-/// Save a work graph to a JSONL file (internal, no locking).
+/// Save a WG task graph to a JSONL file (internal, no locking).
 ///
 /// Callers must hold the flock themselves or use [`save_graph`] which
 /// acquires it automatically.
@@ -240,7 +265,7 @@ fn save_graph_inner<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), Pa
     result
 }
 
-/// Save a work graph to a JSONL file
+/// Save a WG task graph to a JSONL file
 /// Uses advisory file locking and atomic write (temp file + rename) to
 /// prevent data loss on crash.
 pub fn save_graph<P: AsRef<Path>>(graph: &WorkGraph, path: P) -> Result<(), ParseError> {
@@ -295,8 +320,14 @@ where
     let _lock = FileLock::acquire(&lock_path)?;
 
     let mut graph = load_graph_inner(path)?;
+    // Snapshot every task before the closure runs so we can detect which
+    // tasks changed substantively (anything other than `last_interaction_at`)
+    // and bump their interaction timestamp. This is the single helper that
+    // wraps mutation + timestamp-bump for every modify_graph caller.
+    let before: HashMap<String, Task> = graph.tasks().map(|t| (t.id.clone(), t.clone())).collect();
     let modified = f(&mut graph);
     if modified {
+        bump_interaction_timestamps(&mut graph, &before);
         save_graph_inner(&graph, path)?;
     }
     Ok(graph)
@@ -320,6 +351,28 @@ where
     let result = f(&mut graph)?;
     save_graph_inner(&graph, path).map_err(E::from)?;
     Ok(result)
+}
+
+/// For every task whose persistent fields changed (other than
+/// `last_interaction_at` itself), set `last_interaction_at` to now.
+/// New tasks created in the closure are bumped if they don't already have
+/// an interaction timestamp set.
+fn bump_interaction_timestamps(graph: &mut WorkGraph, before: &HashMap<String, Task>) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for task in graph.tasks_mut() {
+        match before.get(&task.id) {
+            None => {
+                if task.last_interaction_at.is_none() {
+                    task.last_interaction_at = Some(now.clone());
+                }
+            }
+            Some(prev) => {
+                if !task.substantively_eq(prev) {
+                    task.last_interaction_at = Some(now.clone());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

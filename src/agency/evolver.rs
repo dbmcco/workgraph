@@ -36,7 +36,7 @@ pub struct EvolutionRecord {
     pub task_id: Option<String>,
 }
 
-/// Persistent evolver state, stored in `.workgraph/agency/evolver_state.json`.
+/// Persistent evolver state, stored in `.wg/agency/evolver_state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvolverState {
     /// Total evaluations processed up to the last evolution cycle.
@@ -313,6 +313,7 @@ mod tests {
                 timestamp: format!("2025-06-01T1{}:00:00Z", i),
                 model: None,
                 source: "llm".into(),
+                loop_iteration: 0,
             };
             let path = evals_dir.join(format!("eval-{}.json", i));
             fs::write(&path, serde_json::to_string(&eval).unwrap()).unwrap();
@@ -356,6 +357,7 @@ mod tests {
                 timestamp: format!("2025-06-01T1{}:00:00Z", i),
                 model: None,
                 source: "llm".into(),
+                loop_iteration: 0,
             };
             let path = evals_dir.join(format!("eval-{}.json", i));
             fs::write(&path, serde_json::to_string(&eval).unwrap()).unwrap();
@@ -402,6 +404,7 @@ mod tests {
                 timestamp: format!("2025-06-01T1{}:00:00Z", i),
                 model: None,
                 source: "llm".into(),
+                loop_iteration: 0,
             };
             let path = evals_dir.join(format!("eval-{}.json", i));
             fs::write(&path, serde_json::to_string(&eval).unwrap()).unwrap();
@@ -492,6 +495,7 @@ mod tests {
                 timestamp: format!("2025-06-01T1{}:00:00Z", i),
                 model: None,
                 source: "llm".into(),
+                loop_iteration: 0,
             };
             let path = evals_dir.join(format!("eval-{}.json", i));
             fs::write(&path, serde_json::to_string(&eval).unwrap()).unwrap();

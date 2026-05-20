@@ -136,7 +136,7 @@ fn run_orphaned_cleanup(args: OrphanedArgs) -> Result<()> {
         project_root.display()
     );
 
-    // Load workgraph to verify project structure
+    // Load WG task graph to verify project structure
     let (_graph, _graph_path) = load_workgraph(&project_root)?;
 
     let worktrees_dir = project_root.join(WORKTREES_DIR);
@@ -148,7 +148,7 @@ fn run_orphaned_cleanup(args: OrphanedArgs) -> Result<()> {
         return Ok(());
     }
 
-    let agents_dir = project_root.join(".workgraph").join("agents");
+    let agents_dir = project_root.join(".wg").join("agents");
 
     // Get list of active agents from metadata
     let mut active_agents = HashSet::new();
@@ -434,15 +434,15 @@ fn attempt_manual_worktree_cleanup(
 ) -> Result<()> {
     let mut cleanup_errors = Vec::new();
 
-    // Step 1: Clean up .workgraph symlink with permission handling
-    let wg_symlink = worktree_path.join(".workgraph");
+    // Step 1: Clean up .wg symlink with permission handling
+    let wg_symlink = worktree_path.join(".wg");
     if wg_symlink.exists() {
         match fs::remove_file(&wg_symlink) {
             Ok(()) => {
-                eprintln!("[cleanup] Successfully removed .workgraph symlink");
+                eprintln!("[cleanup] Successfully removed .wg symlink");
             }
             Err(e) => {
-                let error_msg = format!("Failed to remove .workgraph symlink: {}", e);
+                let error_msg = format!("Failed to remove .wg symlink: {}", e);
                 cleanup_errors.push(error_msg.clone());
                 eprintln!("[cleanup] {}", error_msg);
 
@@ -450,9 +450,7 @@ fn attempt_manual_worktree_cleanup(
                 if let Err(perm_err) = fix_permissions_and_retry_removal(&wg_symlink) {
                     cleanup_errors.push(format!("Permission fix also failed: {}", perm_err));
                 } else {
-                    eprintln!(
-                        "[cleanup] Successfully removed .workgraph symlink after permission fix"
-                    );
+                    eprintln!("[cleanup] Successfully removed .wg symlink after permission fix");
                 }
             }
         }
@@ -612,7 +610,7 @@ fn run_nightly_cleanup(args: NightlyArgs) -> Result<()> {
 
     let project_root = std::env::current_dir().context("Failed to get current directory")?;
 
-    // Load workgraph for task cleanup
+    // Load WG task graph for task cleanup
     let (graph, _graph_path) = load_workgraph(&project_root)?;
 
     // Initialize cleanup summary
@@ -770,7 +768,7 @@ fn cleanup_filesystem(
         ("tmp", Duration::from_secs(24 * 3600)), // 1 day
         ("temp", Duration::from_secs(24 * 3600)),
         ("target", Duration::from_secs(24 * 3600)), // Rust build artifacts
-        (".workgraph/logs", Duration::from_secs(30 * 24 * 3600)), // 30 days
+        (".wg/logs", Duration::from_secs(30 * 24 * 3600)), // 30 days
     ];
 
     for (dir_name, max_age) in cleanup_targets {

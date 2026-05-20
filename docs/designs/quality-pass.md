@@ -1,8 +1,14 @@
 # Design: Post-Triage Quality Pass
 
+> **Contributor doc — not required to USE wg.** The behavior described
+> here is implemented. The authoritative description of when chat agents
+> insert a quality-pass task lives in `wg agent-guide` (bundled with the `wg`
+> binary). This document explains the rationale and design choices for
+> people hacking on wg itself.
+
 ## Overview
 
-The quality pass is a regular workgraph task that reviews and adjusts task metadata
+The quality pass is a regular wg task that reviews and adjusts task metadata
 after the coordinator creates tasks from a user request. It sits in the dependency
 chain between task creation and task execution:
 
@@ -10,7 +16,7 @@ chain between task creation and task execution:
 coordinator creates tasks → .quality-pass-<batch> reviews them → downstream tasks execute
 ```
 
-The quality pass uses **only existing workgraph primitives**: `wg assign`, `wg edit`,
+The quality pass uses **only existing wg primitives**: `wg assign`, `wg edit`,
 regular tasks, and dependency edges. No new task states, lifecycle phases, or special
 coordinator logic.
 
@@ -63,10 +69,10 @@ The quality pass agent reads:
 
 2. **Agency profiles** — via `wg agency stats` for the role leaderboard (which
    roles perform best), plus reading individual agent YAML files from
-   `.workgraph/agency/primitives/` when needed. The agent catalog is available
+   `.wg/agency/primitives/` when needed. The agent catalog is available
    via the same data the assigner uses.
 
-3. **Evaluation history** — via scanning `.workgraph/agency/evaluations/` for
+3. **Evaluation history** — via scanning `.wg/agency/evaluations/` for
    scores segmented by:
    - Agent (role + tradeoff combination) — which agents do well on which task types
    - Model tier — which models succeed on which complexity levels
@@ -201,7 +207,7 @@ For each task:
 ## Data sources
 - Role performance: \`wg agency stats\`
 - Task details: \`wg show <task-id>\`
-- Evaluation history: \`.workgraph/agency/evaluations/\`"
+- Evaluation history: \`.wg/agency/evaluations/\`"
 
 # Step 3: Wire batch tasks to depend on the quality pass:
 
@@ -323,7 +329,7 @@ the concrete feedback loop:
      "model": "sonnet",
      "dimensions": { ... }
    }
-3. Evaluation accumulates in .workgraph/agency/evaluations/
+3. Evaluation accumulates in .wg/agency/evaluations/
 4. `wg agency stats` aggregates into role leaderboard
 5. NEXT quality pass reads this data → better assignment decisions
 

@@ -1,6 +1,6 @@
-//! Interactive configuration wizard for first-time workgraph setup.
+//! Interactive configuration wizard for first-time WG setup.
 //!
-//! Creates/updates ~/.workgraph/config.toml via guided prompts using dialoguer.
+//! Creates/updates ~/.wg/config.toml via guided prompts using dialoguer.
 
 use anyhow::{Context, Result, bail};
 use dialoguer::{Confirm, Input, Select};
@@ -13,41 +13,36 @@ use workgraph::config_defaults::{RouteParams, SetupRoute, config_for_route};
 use workgraph::models::ModelRegistry;
 use workgraph::notify::config as notify_config;
 
-/// Marker used to detect whether workgraph directives are already present in CLAUDE.md.
-const CLAUDE_MD_MARKER: &str = "<!-- workgraph-managed -->";
+/// Marker used to detect whether WG directives are already present in agent guides.
+const CLAUDE_MD_MARKER: &str = "<!-- WG-managed -->";
 
-/// The workgraph directives block appended to CLAUDE.md.
-const CLAUDE_MD_DIRECTIVES: &str = r#"<!-- workgraph-managed -->
-# Workgraph
+/// The WG directives block appended to agent guides.
+const CLAUDE_MD_DIRECTIVES: &str = r#"<!-- WG-managed -->
+# WG (project-specific guide)
 
-Use workgraph for task management.
+This file is the **layer-2** project guide for agents working in this
+WG project. It is NOT the universal chat-agent / worker-agent
+contract — that is bundled inside the `wg` binary and emitted by:
+
+```
+wg agent-guide
+```
+
+Run `wg agent-guide` at session start (or read its output from a previous
+session) to get the universal role contract: chat agent vs dispatcher vs worker
+distinction, `## Validation` requirement, smoke-gate, cycle handling, git
+hygiene, worktree isolation, "no built-in Task tool" rules, etc.
+
+This file only covers things specific to this project. Add project-specific
+build commands, test commands, architecture notes, and service recipes here.
 
 **At the start of each session, run `wg quickstart` in your terminal to orient yourself.**
 Use `wg service start` to dispatch work — do not manually claim tasks.
 
-## For All Agents (Including the Orchestrating Agent)
-
-CRITICAL: Do NOT use built-in TaskCreate/TaskUpdate/TaskList/TaskGet tools.
-These are a separate system that does NOT interact with workgraph.
-Always use `wg` CLI commands for all task management.
-
-CRITICAL: Do NOT use the built-in **Task tool** (subagents). NEVER spawn Explore, Plan,
-general-purpose, or any other subagent type. The Task tool creates processes outside
-workgraph, which defeats the entire system. If you need research, exploration, or planning
-done — create a `wg add` task and let the coordinator dispatch it.
-
-ALL tasks — including research, exploration, and planning — should be workgraph tasks.
-
-### Orchestrating agent role
-
-The orchestrating agent (the one the user interacts with directly) does ONLY:
-- **Conversation** with the user
-- **Inspection** via `wg show`, `wg viz`, `wg list`, `wg status`, and reading files
-- **Task creation** via `wg add` with descriptions, dependencies, and context
-- **Monitoring** via `wg agents`, `wg service status`, `wg watch`
-
-It NEVER writes code, implements features, or does research itself.
-Everything gets dispatched through `wg add` and `wg service start`.
+This guide is written to both `CLAUDE.md` and `AGENTS.md` and kept in
+lock-step. The two files exist because Claude Code and Codex CLI look for
+different filenames, but they should never drift in content. Any divergence is
+a bug. Update both together.
 "#;
 
 /// CLI arguments for `wg setup` (non-interactive mode).
@@ -213,6 +208,7 @@ pub fn build_config(choices: &SetupChoices, base: Option<&Config>) -> Config {
             api_key: None,
             api_key_file: ep.api_key_file.clone(),
             api_key_env: ep.api_key_env.clone(),
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         };
@@ -391,7 +387,7 @@ pub fn format_summary(choices: &SetupChoices) -> String {
     lines.join("\n")
 }
 
-/// Check whether a CLAUDE.md file already contains workgraph directives.
+/// Check whether a CLAUDE.md file already contains WG directives.
 pub fn has_workgraph_directives(path: &Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
         content.contains(CLAUDE_MD_MARKER)
@@ -400,11 +396,11 @@ pub fn has_workgraph_directives(path: &Path) -> bool {
     }
 }
 
-/// Configure ~/.claude/CLAUDE.md with workgraph directives.
+/// Configure ~/.claude/CLAUDE.md with WG directives.
 ///
 /// - If ~/.claude/ doesn't exist, it is created.
 /// - If CLAUDE.md doesn't exist, it is created with the directives.
-/// - If CLAUDE.md exists but has no workgraph marker, directives are appended.
+/// - If CLAUDE.md exists but has no WG marker, directives are appended.
 /// - If CLAUDE.md already contains the marker, it is left unchanged (idempotent).
 ///
 /// Returns a status string for display and whether changes were made.
@@ -416,13 +412,22 @@ pub fn configure_claude_md() -> Result<(String, bool)> {
     configure_claude_md_at(&claude_md)
 }
 
-/// Configure a CLAUDE.md at the given project directory.
+/// Configure both project-level agent guides.
 ///
-/// Creates or updates `<project_dir>/CLAUDE.md` with workgraph directives.
-/// Same idempotency rules as `configure_claude_md`.
-pub fn configure_project_claude_md(project_dir: &Path) -> Result<(String, bool)> {
-    let claude_md = project_dir.join("CLAUDE.md");
-    configure_claude_md_at(&claude_md)
+/// `CLAUDE.md` and `AGENTS.md` are written from the same template so Claude
+/// Code / Claude CLI and Codex sessions receive the same project context.
+pub fn configure_project_agent_guides(project_dir: &Path) -> Result<(String, bool)> {
+    let mut statuses = Vec::new();
+    let mut changed = false;
+
+    for filename in ["CLAUDE.md", "AGENTS.md"] {
+        let path = project_dir.join(filename);
+        let (status, did_change) = configure_claude_md_at(&path)?;
+        statuses.push(status);
+        changed |= did_change;
+    }
+
+    Ok((statuses.join("\n"), changed))
 }
 
 /// Shared implementation for configuring a CLAUDE.md at a specific path.
@@ -450,7 +455,7 @@ fn configure_claude_md_at(claude_md: &Path) -> Result<(String, bool)> {
         std::fs::write(claude_md, new_content)
             .with_context(|| format!("Failed to write {}", claude_md.display()))?;
         Ok((
-            format!("Updated {} with workgraph directives", claude_md.display()),
+            format!("Updated {} with WG directives", claude_md.display()),
             true,
         ))
     } else {
@@ -458,7 +463,7 @@ fn configure_claude_md_at(claude_md: &Path) -> Result<(String, bool)> {
         std::fs::write(claude_md, CLAUDE_MD_DIRECTIVES)
             .with_context(|| format!("Failed to create {}", claude_md.display()))?;
         Ok((
-            format!("Created {} with workgraph directives", claude_md.display()),
+            format!("Created {} with WG directives", claude_md.display()),
             true,
         ))
     }
@@ -1312,7 +1317,7 @@ pub fn run() -> Result<()> {
     let existing = Config::load_global()?.unwrap_or_default();
     let global_path = Config::global_config_path()?;
 
-    println!("Hey! Welcome to workgraph setup.");
+    println!("Hey! Welcome to WG setup.");
     println!("We'll get you configured at {}", global_path.display());
     println!("(Press Ctrl-C at any prompt to exit without saving.)");
     println!();
@@ -1378,20 +1383,15 @@ pub fn run() -> Result<()> {
     };
 
     println!();
-    let executor_ok = match (default_executor, detection.claude_cli, detection.amplifier) {
-        ("claude", true, _) => {
+    let executor_ok = match (default_executor, detection.claude_cli) {
+        ("claude", true) => {
             println!(
                 "  Using '{}' executor — you've got the claude CLI, perfect.",
                 default_executor
             );
             true
         }
-        ("claude", false, true) => {
-            println!("  Heads up: claude CLI isn't installed, but amplifier is.");
-            println!("  You might want to switch the executor.");
-            false
-        }
-        ("claude", false, false) => {
+        ("claude", false) => {
             println!("  Note: claude CLI isn't installed yet.");
             println!(
                 "  You'll need it before running agents. Install from: https://docs.anthropic.com/claude-code"
@@ -1420,7 +1420,7 @@ pub fn run() -> Result<()> {
     };
 
     let executor = if override_executor {
-        let executor_options = &["claude", "native", "amplifier", "custom"];
+        let executor_options = &["claude", "native", "custom"];
         let current_idx = executor_options
             .iter()
             .position(|&e| e == default_executor)
@@ -1430,7 +1430,7 @@ pub fn run() -> Result<()> {
             .items(executor_options)
             .default(current_idx)
             .interact()?;
-        if idx == 3 {
+        if idx == executor_options.len() - 1 {
             let custom: String = Input::new()
                 .with_prompt("Custom executor name")
                 .interact_text()?;
@@ -1515,7 +1515,7 @@ pub fn run() -> Result<()> {
 
     // 4. Agency
     println!();
-    println!("Agency lets workgraph automatically match the best agent identity to each task");
+    println!("Agency lets WG automatically match the best agent identity to each task");
     println!("and evaluate their work when done. It's the evolutionary identity system.");
     let agency_enabled = Confirm::new()
         .with_prompt("Enable agency?")
@@ -1592,7 +1592,7 @@ pub fn run() -> Result<()> {
 
     // 7. Notification setup (optional)
     println!();
-    println!("Notifications let workgraph ping you when tasks need attention,");
+    println!("Notifications let WG ping you when tasks need attention,");
     println!("agents get stuck, or work is done.");
     let notify_status = guide_notification_setup()?;
 
@@ -1963,17 +1963,6 @@ pub fn is_claude_skill_installed() -> bool {
     }
 }
 
-/// Check if the amplifier-bundle-workgraph setup script exists in common locations.
-fn find_amplifier_bundle_setup() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(&home).join("amplifier-bundle-workgraph/setup.sh");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// After executor selection, guide the user to install the appropriate skill or bundle.
 /// Returns a status string for the summary.
 fn guide_skill_bundle_install(executor: &str) -> Result<String> {
@@ -1982,9 +1971,7 @@ fn guide_skill_bundle_install(executor: &str) -> Result<String> {
             if is_claude_skill_installed() {
                 Ok("wg skill installed ✓".to_string())
             } else {
-                println!(
-                    "Spawned Claude Code agents need the wg skill to understand workgraph commands."
-                );
+                println!("Spawned Claude Code agents need the wg skill to understand WG commands.");
                 let install = Confirm::new()
                     .with_prompt("Install wg skill for Claude Code? (recommended)")
                     .default(true)
@@ -1997,36 +1984,6 @@ fn guide_skill_bundle_install(executor: &str) -> Result<String> {
                     Ok("wg skill NOT installed — run `wg skill install`".to_string())
                 }
             }
-        }
-        "amplifier" => {
-            if let Some(setup_path) = find_amplifier_bundle_setup() {
-                println!(
-                    "Found amplifier-bundle-workgraph at: {}",
-                    setup_path.parent().unwrap().display()
-                );
-                println!("  Run the setup script to install the executor and bundle:");
-                println!("    {}", setup_path.display());
-                println!();
-                println!("  Then start sessions with: amplifier run -B workgraph");
-            } else {
-                println!(
-                    "Spawned Amplifier agents need the workgraph bundle to understand wg commands."
-                );
-                println!();
-                println!("  Install the bundle:");
-                println!(
-                    "    git clone https://github.com/graphwork/amplifier-bundle-workgraph ~/amplifier-bundle-workgraph"
-                );
-                println!("    cd ~/amplifier-bundle-workgraph && ./setup.sh");
-                println!();
-                println!("  Or add it directly:");
-                println!(
-                    "    amplifier bundle add git+https://github.com/graphwork/amplifier-bundle-workgraph"
-                );
-                println!();
-                println!("  Then start sessions with: amplifier run -B workgraph");
-            }
-            Ok("amplifier bundle — see instructions above".to_string())
         }
         _ => {
             println!("Custom executor selected. Make sure your agents know about wg commands.");
@@ -2046,8 +2003,6 @@ pub struct DetectionResult {
     pub claude_cli: bool,
     /// Version string of the `claude` CLI, if detected.
     pub claude_cli_version: Option<String>,
-    /// Whether `amplifier` was found in PATH.
-    pub amplifier: bool,
     /// Whether `git` was found in PATH.
     pub git: bool,
     /// Whether `tmux` was found in PATH.
@@ -2058,9 +2013,9 @@ pub struct DetectionResult {
     pub openrouter_key: bool,
     /// Whether OPENAI_API_KEY is set.
     pub openai_key: bool,
-    /// Whether `.workgraph/config.toml` exists in current directory.
+    /// Whether `.wg/config.toml` exists in current directory.
     pub local_config: bool,
-    /// Whether `~/.workgraph/config.toml` exists.
+    /// Whether `~/.wg/config.toml` exists.
     pub global_config: bool,
 }
 
@@ -2109,7 +2064,6 @@ pub fn detect_environment() -> DetectionResult {
     DetectionResult {
         claude_cli,
         claude_cli_version,
-        amplifier: is_command_available("amplifier"),
         git: is_command_available("git"),
         tmux: is_command_available("tmux"),
         anthropic_key: std::env::var("ANTHROPIC_API_KEY")
@@ -2121,7 +2075,7 @@ pub fn detect_environment() -> DetectionResult {
         openai_key: std::env::var("OPENAI_API_KEY")
             .map(|v| !v.trim().is_empty())
             .unwrap_or(false),
-        local_config: std::path::Path::new(".workgraph/config.toml").exists(),
+        local_config: std::path::Path::new(".wg/config.toml").exists(),
         global_config,
     }
 }
@@ -2143,12 +2097,6 @@ pub fn format_detection_summary(det: &DetectionResult) -> String {
         lines.push("  ✗ claude CLI — not found (needed for executor=claude)".to_string());
     }
 
-    if det.amplifier {
-        lines.push("  ✓ amplifier — installed!".to_string());
-    } else {
-        lines.push("  · amplifier — not installed (optional)".to_string());
-    }
-
     if det.git {
         lines.push("  ✓ git — yep!".to_string());
     } else {
@@ -2156,9 +2104,11 @@ pub fn format_detection_summary(det: &DetectionResult) -> String {
     }
 
     if det.tmux {
-        lines.push("  ✓ tmux — ready for `wg server`!".to_string());
+        lines.push("  ✓ tmux — ready for chat persistence + `wg server`!".to_string());
     } else {
-        lines.push("  · tmux — not installed (needed for `wg server`)".to_string());
+        lines.push(
+            "  · tmux — not installed (needed for chat persistence + `wg server`)".to_string(),
+        );
     }
 
     // API keys
@@ -2188,7 +2138,7 @@ pub fn format_detection_summary(det: &DetectionResult) -> String {
         lines.push("  · No global config yet — we'll create one for you.".to_string());
     }
     if det.local_config {
-        lines.push("  ✓ Project config found (.workgraph/config.toml).".to_string());
+        lines.push("  ✓ Project config found (.wg/config.toml).".to_string());
     }
 
     lines.join("\n")
@@ -2204,13 +2154,13 @@ fn guide_claude_md_install() -> Result<String> {
         return Ok("already configured ✓".to_string());
     }
 
-    println!("Claude Code's built-in task and agent tools conflict with workgraph.");
+    println!("Claude Code's built-in task and agent tools conflict with WG.");
     println!(
         "Configuring ~/.claude/CLAUDE.md suppresses them so Claude uses `wg` commands instead."
     );
 
     let action = if claude_md.exists() {
-        "Append workgraph directives to"
+        "Append WG directives to"
     } else {
         "Create"
     };
@@ -2316,7 +2266,7 @@ fn guide_notification_setup() -> Result<String> {
     let channel_keys = &["telegram", "slack", "email", "webhook", "skip"];
 
     let idx = Select::new()
-        .with_prompt("How should workgraph notify you?")
+        .with_prompt("How should WG notify you?")
         .items(channel_options)
         .default(4)
         .interact()?;
@@ -2439,27 +2389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_config_amplifier() {
-        let choices = SetupChoices {
-            provider: "anthropic".to_string(),
-            executor: "amplifier".to_string(),
-            model: "sonnet".to_string(),
-            agency_enabled: false,
-            max_agents: 8,
-            endpoint: None,
-            model_registry_entries: vec![],
-        };
-
-        let config = build_config(&choices, None);
-        assert_eq!(config.coordinator.executor, Some("amplifier".to_string()));
-        assert_eq!(config.agent.executor, "amplifier");
-        assert_eq!(config.agent.model, "claude:sonnet");
-        assert_eq!(config.coordinator.max_agents, 8);
-        assert!(!config.agency.auto_assign);
-        assert!(!config.agency.auto_evaluate);
-    }
-
-    #[test]
     fn test_build_config_preserves_base() {
         let mut base = Config::default();
         base.project.name = Some("my-project".to_string());
@@ -2549,7 +2478,7 @@ mod tests {
     fn test_format_summary_agency_disabled() {
         let choices = SetupChoices {
             provider: "anthropic".to_string(),
-            executor: "amplifier".to_string(),
+            executor: "claude".to_string(),
             model: "sonnet".to_string(),
             agency_enabled: false,
             max_agents: 8,
@@ -2558,7 +2487,7 @@ mod tests {
         };
 
         let summary = format_summary(&choices);
-        assert!(summary.contains("executor = \"amplifier\""));
+        assert!(summary.contains("executor = \"claude\""));
         assert!(summary.contains("auto_assign = false"));
         assert!(summary.contains("auto_evaluate = false"));
     }
@@ -2788,8 +2717,8 @@ mod tests {
 
         let content = std::fs::read_to_string(&claude_md).unwrap();
         assert!(content.contains(CLAUDE_MD_MARKER));
-        assert!(content.contains("Do NOT use built-in TaskCreate"));
-        assert!(content.contains("Do NOT use the built-in **Task tool**"));
+        assert!(content.contains("wg agent-guide"));
+        assert!(content.contains("layer-2"));
         assert!(content.contains("wg quickstart"));
     }
 
@@ -2809,9 +2738,9 @@ mod tests {
         // Original content preserved
         assert!(content.contains("# My Existing Config"));
         assert!(content.contains("Some custom rules here."));
-        // Workgraph directives appended
+        // WG directives appended
         assert!(content.contains(CLAUDE_MD_MARKER));
-        assert!(content.contains("Do NOT use built-in TaskCreate"));
+        assert!(content.contains("wg agent-guide"));
     }
 
     #[test]
@@ -2893,32 +2822,28 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_project_claude_md() {
+    fn test_configure_project_agent_guides_writes_lockstep_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path();
 
-        let (status, changed) = configure_project_claude_md(project_dir).unwrap();
+        let (status, changed) = configure_project_agent_guides(project_dir).unwrap();
         assert!(changed);
-        assert!(status.contains("Created"));
+        assert!(status.contains("CLAUDE.md"));
+        assert!(status.contains("AGENTS.md"));
 
-        let claude_md = project_dir.join("CLAUDE.md");
-        let content = std::fs::read_to_string(&claude_md).unwrap();
-        assert!(content.contains(CLAUDE_MD_MARKER));
-        assert!(content.contains("wg quickstart"));
+        let claude_md = std::fs::read(project_dir.join("CLAUDE.md")).unwrap();
+        let agents_md = std::fs::read(project_dir.join("AGENTS.md")).unwrap();
+        assert_eq!(claude_md, agents_md);
     }
 
     #[test]
     fn test_claude_md_directives_contain_critical_rules() {
-        // Verify the template contains all the critical rules from the task description
-        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskCreate"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskUpdate"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskList"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("TaskGet"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("Task tool"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("subagent"));
+        // The project guide delegates universal rules to the bundled agent guide.
+        assert!(CLAUDE_MD_DIRECTIVES.contains("wg agent-guide"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("layer-2"));
         assert!(CLAUDE_MD_DIRECTIVES.contains("wg quickstart"));
-        assert!(CLAUDE_MD_DIRECTIVES.contains("Orchestrating agent"));
         assert!(CLAUDE_MD_DIRECTIVES.contains("wg service start"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("lock-step"));
     }
 
     // ── parse_model_ids_from_response ─────────────────────────────────
@@ -3100,6 +3025,7 @@ mod tests {
                 api_key: Some("sk-test".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             });
@@ -3301,7 +3227,6 @@ mod tests {
     fn test_detection_result_default_all_false() {
         let det = DetectionResult::default();
         assert!(!det.claude_cli);
-        assert!(!det.amplifier);
         assert!(!det.git);
         assert!(!det.tmux);
         assert!(!det.anthropic_key);
@@ -3319,7 +3244,6 @@ mod tests {
         assert!(summary.contains("Let's see what you've got"));
         assert!(summary.contains("✗ claude CLI"));
         assert!(summary.contains("not found"));
-        assert!(summary.contains("· amplifier"));
         assert!(summary.contains("No API keys detected"));
         assert!(summary.contains("No global config yet"));
     }
@@ -3329,7 +3253,6 @@ mod tests {
         let det = DetectionResult {
             claude_cli: true,
             claude_cli_version: Some("1.2.3".to_string()),
-            amplifier: true,
             git: true,
             tmux: true,
             anthropic_key: true,
@@ -3340,7 +3263,6 @@ mod tests {
         };
         let summary = format_detection_summary(&det);
         assert!(summary.contains("claude CLI — 1.2.3 — nice!"));
-        assert!(summary.contains("✓ amplifier"));
         assert!(summary.contains("✓ git"));
         assert!(summary.contains("✓ tmux"));
         assert!(summary.contains("ANTHROPIC_API_KEY — set!"));

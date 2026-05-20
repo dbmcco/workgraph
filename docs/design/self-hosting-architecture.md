@@ -1,10 +1,10 @@
-# Self-Hosting Workgraph: Architecture Design
+# Self-Hosting WG: Architecture Design
 
 ## Status: Design (March 2026)
 
 ## Vision
 
-Workgraph becomes its own primary interface. Users interact with the system through the system itself — no separate Claude Code window on top. Two complementary interaction modes: a persistent coordinator agent that lives inside the graph and accepts user messages, and a TUI that serves as a full control surface for viewing, creating, editing, and communicating.
+WG becomes its own primary interface. Users interact with the system through the system itself — no separate Claude Code window on top. Two complementary interaction modes: a persistent coordinator agent that lives inside the graph and accepts user messages, and a TUI that serves as a full control surface for viewing, creating, editing, and communicating.
 
 ## Current State
 
@@ -236,7 +236,7 @@ pub struct NativeExecutor {
 
 impl NativeExecutor {
     /// Run a single-turn or multi-turn agent conversation.
-    /// Tools are executed in-process via the workgraph library.
+    /// Tools are executed in-process via the wg library.
     pub async fn run_agent(
         &self,
         prompt: &str,
@@ -256,7 +256,7 @@ impl NativeExecutor {
 
 The native executor needs a tool registry mapping tool names to implementations:
 
-- **wg tools**: `wg_add`, `wg_show`, `wg_list`, `wg_edit`, `wg_done`, `wg_fail`, `wg_log`, `wg_artifact`, `wg_msg_send`, `wg_msg_read` — call workgraph library functions directly (no CLI subprocess)
+- **wg tools**: `wg_add`, `wg_show`, `wg_list`, `wg_edit`, `wg_done`, `wg_fail`, `wg_log`, `wg_artifact`, `wg_msg_send`, `wg_msg_read` — call wg library functions directly (no CLI subprocess)
 - **File tools**: `read_file`, `write_file`, `edit_file`, `glob`, `grep` — direct filesystem access
 - **Shell tool**: `bash` — subprocess execution with timeout
 - **Web tool**: `web_fetch` — HTTP client
@@ -268,14 +268,14 @@ This maps closely to Claude Code's tool set, so prompts are portable.
 Bundles define what tools and context an agent gets. This replaces the current ad-hoc `--allowedTools` flags:
 
 ```toml
-# .workgraph/bundles/research.toml
+# .wg/bundles/research.toml
 name = "research"
 description = "Read-only research agent"
 tools = ["read_file", "glob", "grep", "web_fetch", "wg_show", "wg_list", "wg_log", "wg_done"]
 context_scope = "graph"
 system_prompt_suffix = "You are a research agent. Report findings."
 
-# .workgraph/bundles/implementer.toml
+# .wg/bundles/implementer.toml
 name = "implementer"
 description = "Full implementation agent"
 tools = ["*"]
@@ -316,7 +316,7 @@ wg chat "create a task for implementing JWT auth"
 # 2. Daemon injects message into coordinator agent's stdin (stream-json)
 # 3. Coordinator agent processes, calls tools (wg add, etc.)
 # 4. Coordinator agent produces a text response
-# 5. Response is written to .workgraph/chat/response-{id}.txt
+# 5. Response is written to .wg/chat/response-{id}.txt
 # 6. wg chat reads response and displays it
 
 # For TUI:
@@ -340,7 +340,7 @@ IpcRequest::ChatResponse {
 #### File-Based Response Channel
 
 ```
-.workgraph/chat/
+.wg/chat/
 ├── inbox.jsonl           # User messages to coordinator
 ├── outbox.jsonl          # Coordinator responses to user
 └── .cursor               # Last-read response ID
@@ -424,7 +424,7 @@ Already present in the skill/quickstart:
 
 #### Phase 6: Integration and Validation
 - End-to-end test: user creates project via TUI chat → coordinator creates tasks → agents execute → work completes
-- Dogfooding: use self-hosted workgraph to manage its own development
+- Dogfooding: use self-hosted wg to manage its own development
 - Performance benchmarking (chat latency, coordinator overhead)
 - Worktree audit (verify agent isolation, merge workflow)
 - Multi-cycle stress test (loop tasks, failure restart, convergence)

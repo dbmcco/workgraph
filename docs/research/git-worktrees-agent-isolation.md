@@ -75,7 +75,7 @@ Every build tool needs two things configured per worktree:
 1. **Output directory**: where compiled/generated artifacts go
 2. **Cache sharing**: whether and how to share cached artifacts across worktrees
 
-The workgraph integration should:
+The wg integration should:
 
 1. **Detect** the project type (look for `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `Makefile`, etc.)
 2. **Set environment variables** or config that redirects build output per worktree
@@ -166,22 +166,22 @@ make BUILD_DIR="$WORKTREE_PATH/build"
 The worktree setup hook should expose:
 
 ```bash
-# Set by workgraph before agent starts
+# Set by wg before agent starts
 WG_WORKTREE_PATH=/path/to/worktree      # agent's working directory
 WG_PROJECT_ROOT=/path/to/main/repo       # original repo root
 WG_AGENT_ID=agent-XXXX                   # agent identifier
 WG_BRANCH=wg/agent-XXXX/task-id          # agent's branch
 
 # Optional: project-type-specific overrides
-# These could be set by a .workgraph/worktree-setup.sh hook
+# These could be set by a .wg/worktree-setup.sh hook
 CARGO_TARGET_DIR="$WG_WORKTREE_PATH/.wg-target"
 ```
 
-Projects can provide a `.workgraph/worktree-setup.sh` script for custom build isolation:
+Projects can provide a `.wg/worktree-setup.sh` script for custom build isolation:
 
 ```bash
 #!/bin/bash
-# .workgraph/worktree-setup.sh — run after worktree creation
+# .wg/worktree-setup.sh — run after worktree creation
 # $1 = worktree path, $2 = project root
 
 WORKTREE="$1"
@@ -236,7 +236,7 @@ coordinator claims task
 #!/bin/bash
 TASK_ID='implement-foo'
 AGENT_ID='agent-7500'
-OUTPUT_FILE='/path/to/.workgraph/agents/agent-7500/output.log'
+OUTPUT_FILE='/path/to/.wg/agents/agent-7500/output.log'
 PROJECT_ROOT='/home/user/myproject'
 
 # --- Worktree Setup ---
@@ -251,12 +251,12 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Symlink shared .workgraph so wg CLI works from worktree
-ln -s "$PROJECT_ROOT/.workgraph" "$WG_WORKTREE_PATH/.workgraph"
+# Symlink shared .wg so wg CLI works from worktree
+ln -s "$PROJECT_ROOT/.wg" "$WG_WORKTREE_PATH/.wg"
 
 # Run project-specific build setup if it exists
-if [ -x "$PROJECT_ROOT/.workgraph/worktree-setup.sh" ]; then
-    source "$PROJECT_ROOT/.workgraph/worktree-setup.sh" "$WG_WORKTREE_PATH" "$PROJECT_ROOT"
+if [ -x "$PROJECT_ROOT/.wg/worktree-setup.sh" ]; then
+    source "$PROJECT_ROOT/.wg/worktree-setup.sh" "$WG_WORKTREE_PATH" "$PROJECT_ROOT"
 fi
 
 # Export env vars for the agent
@@ -332,7 +332,7 @@ exit $EXIT_CODE
 ### Key Design Decisions in the Sketch
 
 1. **Worktree created BEFORE agent starts** — agent's cwd is set to the worktree
-2. **`.workgraph` symlinked** — all wg CLI commands work transparently
+2. **`.wg` symlinked** — all wg CLI commands work transparently
 3. **Merge happens in wrapper AFTER agent exits** — agent doesn't need to merge
 4. **Squash merge by default** — clean one-commit-per-task history
 5. **Conflict = auto-fail for retry** — coordinator re-dispatches from updated HEAD
@@ -472,14 +472,14 @@ The best merge strategy is avoiding conflicts in the first place:
 - `wg worktree clean` command removes all worktrees not associated with running agents
 - `.wg-worktrees/` should be in `.gitignore` so it doesn't pollute status
 
-### The `.workgraph` Directory
+### The `.wg` Directory
 
 **Should it be shared or per-worktree?** Shared, via symlink.
 
-- `.workgraph/` contains task state, agent registry, config — all agents must see the same data
-- Symlink from worktree to main repo's `.workgraph/` is the simplest solution
+- `.wg/` contains task state, agent registry, config — all agents must see the same data
+- Symlink from worktree to main repo's `.wg/` is the simplest solution
 - Fallback: `WG_DIR` env var pointing to absolute path (requires minor CLI change)
-- Since `.workgraph/` is in `.gitignore`, it doesn't appear in the worktree's git status
+- Since `.wg/` is in `.gitignore`, it doesn't appear in the worktree's git status
 
 ### Submodules
 
@@ -514,7 +514,7 @@ The best merge strategy is avoiding conflicts in the first place:
 ### Agent Creates Files Outside Worktree
 
 - Agent runs in worktree cwd — relative paths resolve inside worktree
-- `wg` commands use the symlinked `.workgraph` — artifacts are recorded relative to project root
+- `wg` commands use the symlinked `.wg` — artifacts are recorded relative to project root
 - Risk: agent uses absolute paths from task description pointing to main repo
 - Mitigation: agent prompt should not include absolute paths; use relative paths only
 
@@ -573,7 +573,7 @@ Potentially:
 | Isolation mechanism | Git worktrees (native, no dependencies) |
 | Worktree location | `.wg-worktrees/<agent-id>/` inside repo, added to `.gitignore` |
 | Branch naming | `wg/<agent-id>/<task-id>` |
-| Shared state | Symlink `.workgraph` from worktree to main repo |
+| Shared state | Symlink `.wg` from worktree to main repo |
 | Build isolation | Generic `worktree-setup.sh` hook, per-language env vars |
 | Merge strategy | Squash merge by default, configurable |
 | Conflict handling | Abort + auto-retry (re-dispatch from updated HEAD) |

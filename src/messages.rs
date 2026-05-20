@@ -1,14 +1,17 @@
 //! Message queue storage for inter-agent and user-to-agent communication.
 //!
-//! Messages are stored as JSONL files in `.workgraph/messages/{task-id}.jsonl`.
-//! Read cursors are stored in `.workgraph/messages/.cursors/{agent-id}.{task-id}`.
+//! Messages are stored as JSONL files in `.wg/messages/{task-id}.jsonl`.
+//! Read cursors are stored in `.wg/messages/.cursors/{agent-id}.{task-id}`.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Delivery status of a message through its lifecycle.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,7 +88,7 @@ fn cursor_file(workgraph_dir: &Path, agent_id: &str, task_id: &str) -> PathBuf {
 
 /// Send a message to a task's queue.
 ///
-/// Appends a new message to `.workgraph/messages/{task-id}.jsonl`.
+/// Appends a new message to `.wg/messages/{task-id}.jsonl`.
 /// Uses file locking (flock) to safely assign the next message ID.
 /// Returns the assigned message ID.
 pub fn send_message(
@@ -164,7 +167,21 @@ pub fn send_message(
 
     // Lock is released when file is dropped
 
+    touch_task_interaction(workgraph_dir, task_id);
+
     Ok(next_id)
+}
+
+fn touch_task_interaction(workgraph_dir: &Path, task_id: &str) {
+    let graph_path = workgraph_dir.join("graph.jsonl");
+    let _ = crate::parser::modify_graph(&graph_path, |graph| {
+        if let Some(task) = graph.get_task_mut(task_id) {
+            task.touch();
+            true
+        } else {
+            false
+        }
+    });
 }
 
 /// Count the number of messages for a task (without parsing them).
@@ -485,7 +502,7 @@ use crate::service::registry::AgentEntry;
 
 /// Defines how an executor delivers messages to a running agent.
 ///
-/// Each executor type (claude, amplifier, shell) has different capabilities
+/// Each executor type (claude, codex, shell) has different capabilities
 /// for mid-session message injection. The adapter abstracts these differences.
 pub trait MessageAdapter: Send + Sync {
     /// Deliver a message to a running agent.
@@ -501,7 +518,7 @@ pub trait MessageAdapter: Send + Sync {
     /// poll using `wg msg read` or `wg msg poll`.
     fn supports_realtime(&self) -> bool;
 
-    /// Executor type name (e.g. "claude", "amplifier", "shell").
+    /// Executor type name (e.g. "claude", "codex", "shell").
     fn executor_type(&self) -> &str;
 }
 
@@ -588,35 +605,6 @@ impl MessageAdapter for CodexMessageAdapter {
 
     fn executor_type(&self) -> &str {
         "codex"
-    }
-}
-
-/// Amplifier executor message adapter.
-///
-/// Amplifier runs in `--mode single` with text output. Like the Claude adapter,
-/// mid-session injection is not supported in v1. Messages accumulate in the queue
-/// and are written to a notification file. The agent can self-poll using
-/// `wg msg poll` or `wg msg read`.
-///
-/// When spawning a new Amplifier agent, queued messages are included in the
-/// initial prompt context via `ScopeContext::queued_messages` (handled by
-/// `build_scope_context` in `src/commands/spawn/context.rs`).
-pub struct AmplifierMessageAdapter;
-
-impl MessageAdapter for AmplifierMessageAdapter {
-    fn deliver(&self, workgraph_dir: &Path, agent: &AgentEntry, message: &Message) -> Result<bool> {
-        // Write notification file for the agent to detect
-        write_notification(workgraph_dir, &agent.id, message)?;
-        // Amplifier --mode single doesn't support mid-session injection
-        Ok(false)
-    }
-
-    fn supports_realtime(&self) -> bool {
-        false
-    }
-
-    fn executor_type(&self) -> &str {
-        "amplifier"
     }
 }
 
@@ -741,6 +729,195 @@ pub fn coordinator_message_status(
     }
 }
 
+/// Compute message_stats and coordinator_message_status in a single pass over
+/// the message file. The TUI viz pipeline calls both per task on every refresh,
+/// and each one independently parsed the same JSONL file — folding to one
+/// read halves the per-task disk I/O during the heavy `generate_viz_output`
+/// pass (see fix-tui-perf-2 / diagnose-tui-scales hot path #1).
+///
+/// Returns `None` for the coordinator status component when there are no
+/// incoming messages (matches the standalone function's behavior).
+pub fn message_stats_pair(
+    workgraph_dir: &Path,
+    task_id: &str,
+    assigned_agent: Option<&str>,
+) -> (MessageStats, Option<CoordinatorMessageStatus>) {
+    let messages = match list_messages(workgraph_dir, task_id) {
+        Ok(msgs) => msgs,
+        Err(_) => return (MessageStats::default(), None),
+    };
+
+    if messages.is_empty() {
+        return (MessageStats::default(), None);
+    }
+
+    // ---- message_stats half ----
+    let mut incoming = 0usize;
+    let mut outgoing = 0usize;
+    let mut last_incoming_id_agent: u64 = 0;
+    let mut last_outgoing_id_agent: u64 = 0;
+
+    // ---- coordinator_message_status half ----
+    let is_coordinator_sender = |sender: &str| matches!(sender, "tui" | "user" | "coordinator");
+    let mut coord_last_incoming_id: u64 = 0;
+    let mut coord_last_outgoing_after_incoming_id: u64 = 0;
+
+    for msg in &messages {
+        // message_stats partitioning: relative to the assigned agent.
+        let is_from_agent = assigned_agent.map(|a| msg.sender == a).unwrap_or(false);
+        if is_from_agent {
+            outgoing += 1;
+            last_outgoing_id_agent = msg.id;
+        } else {
+            incoming += 1;
+            last_incoming_id_agent = msg.id;
+        }
+
+        // coordinator_message_status partitioning: tui/user/coordinator vs others.
+        if is_coordinator_sender(&msg.sender) {
+            if coord_last_incoming_id > 0 && msg.id > coord_last_incoming_id {
+                coord_last_outgoing_after_incoming_id = msg.id;
+            }
+        } else {
+            coord_last_incoming_id = msg.id;
+            coord_last_outgoing_after_incoming_id = 0;
+        }
+    }
+
+    let max_id = messages.last().map(|m| m.id).unwrap_or(0);
+    let has_unread = if let Some(agent_id) = assigned_agent {
+        let cursor = read_cursor(workgraph_dir, agent_id, task_id).unwrap_or(0);
+        cursor < max_id
+    } else {
+        true
+    };
+    let responded = last_outgoing_id_agent > 0 && last_outgoing_id_agent > last_incoming_id_agent;
+
+    let stats = MessageStats {
+        incoming,
+        outgoing,
+        has_unread,
+        responded,
+    };
+
+    let coord_status = if coord_last_incoming_id == 0 {
+        None
+    } else if coord_last_outgoing_after_incoming_id > coord_last_incoming_id {
+        Some(CoordinatorMessageStatus::Replied)
+    } else {
+        let tui_cursor = read_cursor(workgraph_dir, "tui", task_id).unwrap_or(0);
+        if tui_cursor >= coord_last_incoming_id {
+            Some(CoordinatorMessageStatus::Seen)
+        } else {
+            Some(CoordinatorMessageStatus::Unseen)
+        }
+    };
+
+    (stats, coord_status)
+}
+
+/// Public helper to expose the underlying message-file path for cache keying.
+/// Used by viz_viewer / viz/mod.rs to invalidate cached `message_stats_pair`
+/// results based on file mtime without re-implementing the path conventions.
+pub fn message_file_path(workgraph_dir: &Path, task_id: &str) -> PathBuf {
+    message_file(workgraph_dir, task_id)
+}
+
+/// Process-wide cache for `message_stats_pair` results.
+///
+/// Cache key components:
+///   - message file path
+///   - message file mtime (invalidates when a new message lands)
+///   - assigned-agent id (`MessageStats` partitions by agent — a reassign
+///     with identical mtime would still need recomputation)
+///   - assigned-agent cursor mtime (`has_unread` reads the agent cursor —
+///     `wg msg read` advances it without touching the message file mtime)
+///   - "tui" cursor mtime (`coordinator_message_status` reads the tui
+///     cursor — opening the Messages tab advances it without touching
+///     the message file mtime)
+///
+/// Each metadata syscall is microseconds; together they let the cache hit
+/// the steady-state common case (no incoming messages, no cursor advance)
+/// while still invalidating the moment something the result depends on
+/// changes.
+type MessageCacheKey = (
+    PathBuf,
+    Option<SystemTime>,
+    Option<String>,
+    Option<SystemTime>, // assigned-agent cursor mtime
+    Option<SystemTime>, // tui cursor mtime
+);
+type MessageCacheValue = (MessageStats, Option<CoordinatorMessageStatus>);
+
+fn message_cache() -> &'static Mutex<HashMap<MessageCacheKey, MessageCacheValue>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<MessageCacheKey, MessageCacheValue>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cursor_mtime(workgraph_dir: &Path, agent_id: &str, task_id: &str) -> Option<SystemTime> {
+    let path = cursor_file(workgraph_dir, agent_id, task_id);
+    std::fs::metadata(&path).and_then(|m| m.modified()).ok()
+}
+
+/// Cached counterpart of `message_stats_pair`. Returns memoized values when
+/// the message file + relevant cursor files are unchanged; otherwise
+/// recomputes and updates the cache.
+pub fn message_stats_pair_cached(
+    workgraph_dir: &Path,
+    task_id: &str,
+    assigned_agent: Option<&str>,
+) -> MessageCacheValue {
+    let path = message_file(workgraph_dir, task_id);
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    let agent_cursor = assigned_agent
+        .map(|a| cursor_mtime(workgraph_dir, a, task_id))
+        .unwrap_or(None);
+    let tui_cursor = cursor_mtime(workgraph_dir, "tui", task_id);
+    let key: MessageCacheKey = (
+        path,
+        mtime,
+        assigned_agent.map(String::from),
+        agent_cursor,
+        tui_cursor,
+    );
+
+    if let Ok(cache) = message_cache().lock()
+        && let Some(hit) = cache.get(&key)
+    {
+        return hit.clone();
+    }
+
+    let value = message_stats_pair(workgraph_dir, task_id, assigned_agent);
+
+    if let Ok(mut cache) = message_cache().lock() {
+        // Bound cache size to avoid unbounded growth in long-running TUI
+        // sessions (large graphs + assignment churn could accumulate stale
+        // keys over hours). The cap is generous: typical projects have a
+        // few hundred tasks and reassignments are rare.
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(key, value.clone());
+    }
+    value
+}
+
+/// Cached counterpart of `coordinator_message_status`. Reuses the same
+/// underlying cache as `message_stats_pair_cached` — both computations share
+/// a single read of the message file, so the second-half result is already
+/// available whether the caller needs both or just the coordinator status.
+pub fn coordinator_message_status_cached(
+    workgraph_dir: &Path,
+    task_id: &str,
+) -> Option<CoordinatorMessageStatus> {
+    // We pass `None` for the assigned agent — the coordinator status doesn't
+    // depend on the agent partitioning. This keeps coordinator-only callers
+    // sharing the cache with stats-pair callers when the same task happens to
+    // have no assigned agent on this refresh.
+    message_stats_pair_cached(workgraph_dir, task_id, None).1
+}
+
 /// Create the appropriate message adapter for a given executor type.
 ///
 /// Returns a boxed trait object that handles message delivery for that executor.
@@ -748,7 +925,6 @@ pub fn adapter_for_executor(executor_type: &str) -> Box<dyn MessageAdapter> {
     match executor_type {
         "claude" => Box::new(ClaudeMessageAdapter),
         "codex" => Box::new(CodexMessageAdapter),
-        "amplifier" => Box::new(AmplifierMessageAdapter),
         "shell" => Box::new(ShellMessageAdapter),
         // Default to claude-like behavior for unknown executors
         _ => Box::new(ClaudeMessageAdapter),
@@ -796,7 +972,7 @@ mod tests {
 
     fn setup() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         fs::create_dir_all(&wg_dir).unwrap();
         (tmp, wg_dir)
     }
@@ -1145,13 +1321,6 @@ mod tests {
     }
 
     #[test]
-    fn test_adapter_for_executor_amplifier() {
-        let adapter = adapter_for_executor("amplifier");
-        assert_eq!(adapter.executor_type(), "amplifier");
-        assert!(!adapter.supports_realtime());
-    }
-
-    #[test]
     fn test_adapter_for_executor_codex() {
         let adapter = adapter_for_executor("codex");
         assert_eq!(adapter.executor_type(), "codex");
@@ -1205,46 +1374,12 @@ mod tests {
     }
 
     #[test]
-    fn test_amplifier_adapter_writes_notification() {
-        let (_tmp, wg_dir) = setup();
-        let agent = make_agent("agent-2", "amplifier");
-
-        // Create agent directory
-        fs::create_dir_all(wg_dir.join("agents").join("agent-2")).unwrap();
-
-        let adapter = AmplifierMessageAdapter;
-        let msg = Message {
-            id: 1,
-            timestamp: "2026-02-28T00:00:00Z".to_string(),
-            sender: "coordinator".to_string(),
-            body: "Context update".to_string(),
-            priority: "urgent".to_string(),
-            status: DeliveryStatus::Sent,
-            read_at: None,
-        };
-
-        let delivered = adapter.deliver(&wg_dir, &agent, &msg).unwrap();
-        assert!(
-            !delivered,
-            "Amplifier adapter should not support realtime delivery"
-        );
-
-        // Check notification file was written
-        let notif_path = notification_file(&wg_dir, "agent-2");
-        assert!(notif_path.exists(), "Notification file should exist");
-        let content = fs::read_to_string(&notif_path).unwrap();
-        assert!(content.contains("Context update"));
-        assert!(content.contains("[URGENT]"));
-        assert!(content.contains("coordinator"));
-    }
-
-    #[test]
     fn test_adapter_notification_accumulates() {
         let (_tmp, wg_dir) = setup();
-        let agent = make_agent("agent-3", "amplifier");
+        let agent = make_agent("agent-3", "claude");
         fs::create_dir_all(wg_dir.join("agents").join("agent-3")).unwrap();
 
-        let adapter = AmplifierMessageAdapter;
+        let adapter = ClaudeMessageAdapter;
 
         // Send multiple messages
         for i in 1..=3 {
@@ -1272,7 +1407,7 @@ mod tests {
     #[test]
     fn test_deliver_message_stores_and_notifies() {
         let (_tmp, wg_dir) = setup();
-        let agent = make_agent("agent-4", "amplifier");
+        let agent = make_agent("agent-4", "claude");
         fs::create_dir_all(wg_dir.join("agents").join("agent-4")).unwrap();
 
         let (msg_id, delivered) = deliver_message(

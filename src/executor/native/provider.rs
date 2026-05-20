@@ -81,10 +81,10 @@ fn normalize_oai_compat_base_url(url: &str) -> String {
 /// optional key override. Used by the `-e <url>` shortcut so local
 /// servers (Ollama, vLLM, llama.cpp) work without any config.
 ///
-/// Per the workgraph credential contract, this path NEVER reads
+/// Per the WG credential contract, this path NEVER reads
 /// `OPENAI_API_KEY` / `WG_API_KEY` from the environment. If the user
 /// supplied `--api-key` (the only legitimate keyless input besides
-/// workgraph config), we use it; otherwise the client is built with
+/// WG config), we use it; otherwise the client is built with
 /// an empty key and the HTTP layer skips the Authorization header.
 /// If the endpoint requires auth, the 401 path surfaces a config-
 /// pointing error.
@@ -159,7 +159,7 @@ fn parse_endpoint_model_shorthand(
 
 /// Create a provider, optionally overriding the provider name, endpoint, and/or API key.
 ///
-/// Resolution order for API key (workgraph credential contract — see
+/// Resolution order for API key (WG credential contract — see
 /// `feedback_native_executor_no_env_vars` and the `native-executor-client`
 /// task description):
 /// 1. `api_key_override` parameter (pre-resolved by spawn path; eg `wg nex --api-key`)
@@ -208,12 +208,12 @@ pub fn create_provider_ext(
     if let Some(url) = endpoint_name
         && (url.starts_with("http://") || url.starts_with("https://"))
     {
-        // Strip the canonical provider prefix (`local:`, `oai-compat:`,
-        // `openrouter:`, etc.) before passing the model name to the
-        // wire layer. `wg init` stores models in the prefixed form
-        // (`local:qwen3-coder`), but downstream OAI-compat servers
-        // (SGLang, vLLM, llama.cpp, Ollama) treat a colon in the
-        // `model` field as a LoRA-adapter reference and reject
+        // Strip the canonical provider prefix (`nex:`, `local:`,
+        // `oai-compat:`, `openrouter:`, etc.) before passing the model
+        // name to the wire layer. `wg init` stores models in the
+        // prefixed form (`nex:qwen3-coder`), but downstream OAI-compat
+        // servers (SGLang, vLLM, llama.cpp, Ollama) treat a colon in
+        // the `model` field as a LoRA-adapter reference and reject
         // anything they don't have loaded with HTTP 400 — which broke
         // every `wg nex -e <url> -m <prefixed>` invocation on the
         // first message.
@@ -246,9 +246,14 @@ pub fn create_provider_ext(
     // compatible endpoint. Purely additive; doesn't replace the full
     // endpoint lookup below which also handles provider-based and
     // default fallbacks.
+    //
+    // Endpoint config may contain the legacy "openai" alias; normalize
+    // through provider_to_native_provider so the canonical internal
+    // tag ("oai-compat") flows downstream and `provider.name()` reports
+    // it consistently.
     let endpoint_provider_override: Option<String> = endpoint_name
         .and_then(|name| config.llm_endpoints.find_by_name(name))
-        .map(|ep| ep.provider.clone());
+        .map(|ep| crate::config::provider_to_native_provider(&ep.provider).to_string());
 
     // Load merged TOML value (global + local) for legacy [native_executor] access
     let config_val: Option<toml::Value> =
@@ -268,8 +273,8 @@ pub fn create_provider_ext(
         .map(crate::config::provider_to_native_provider)
         .map(String::from);
 
-    // Resolve provider name: spec prefix > override > model heuristic >
-    // named-endpoint.provider > config > env var > openai default.
+    // Resolve provider name: spec prefix > override > named-endpoint.provider >
+    // config > model heuristic > env var > oai-compat default.
     //
     // Two key changes from legacy behavior:
     //
@@ -280,7 +285,7 @@ pub fn create_provider_ext(
     //    `provider` field instead.
     //
     // 2. The fallback for unrecognized bare names is `"openai"`, not
-    //    `"anthropic"`. Workgraph has shifted toward local/open-model-
+    //    `"anthropic"`. WG has shifted toward local/open-model-
     //    first operation and the overwhelming majority of new deployments
     //    use OpenAI-compatible endpoints (Ollama, vLLM, llama.cpp, lambda,
     //    etc.). Known Claude-family model names (opus, sonnet, haiku,
@@ -288,6 +293,19 @@ pub fn create_provider_ext(
     //    anthropic — see `looks_like_claude_model`.
     let provider_name = spec_provider
         .or_else(|| provider_override.map(String::from))
+        .or_else(|| endpoint_provider_override.clone())
+        .or_else(|| {
+            // Legacy [native_executor].provider — preserved verbatim so the
+            // user-facing label they configured ("openai", "openrouter", etc.)
+            // round-trips through `provider.name()`. Consistent with the
+            // explicit `provider_override` path above. The match arm below
+            // accepts both the canonical "oai-compat" tag and the legacy
+            // "openai" alias, so verbatim preservation does not affect routing.
+            native_cfg
+                .and_then(|c| c.get("provider"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .or_else(|| {
             // Legacy heuristic takes precedence over env var for explicit model prefixes
             if spec.model_id.starts_with("anthropic/") {
@@ -299,13 +317,6 @@ pub fn create_provider_ext(
             } else {
                 None
             }
-        })
-        .or_else(|| endpoint_provider_override.clone())
-        .or_else(|| {
-            native_cfg
-                .and_then(|c| c.get("provider"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
         })
         .or_else(|| std::env::var("WG_LLM_PROVIDER").ok())
         .unwrap_or_else(|| {
@@ -333,7 +344,7 @@ pub fn create_provider_ext(
     // STRICT key resolution: read api_key / api_key_file / api_key_env
     // from the matched endpoint's config — NEVER fall back to implicit
     // provider env vars (ANTHROPIC_API_KEY etc). See create_provider_ext
-    // doc comment for the workgraph credential contract.
+    // doc comment for the WG credential contract.
     let endpoint_key = endpoint.and_then(|ep| {
         ep.resolve_api_key_strict(Some(workgraph_dir))
             .ok()
@@ -358,9 +369,9 @@ pub fn create_provider_ext(
     let resolved_context_window = endpoint_context_window.or(registry_context_window);
 
     // Base URL resolution: endpoint config > legacy [native_executor] api_base.
-    // Per the workgraph credential contract, env vars (WG_ENDPOINT_URL,
+    // Per the WG credential contract, env vars (WG_ENDPOINT_URL,
     // OPENAI_BASE_URL, OPENROUTER_BASE_URL) are NOT consulted — endpoint
-    // configuration lives in workgraph config exclusively.
+    // configuration lives in WG config exclusively.
     let api_base: Option<String> = endpoint_url.or_else(|| {
         native_cfg
             .and_then(|c| c.get("api_base"))
@@ -384,7 +395,7 @@ pub fn create_provider_ext(
             // the [[llm_endpoints.endpoints]] block — never an env var.
             //
             // See feedback `native-executor-client` for the rationale: the
-            // user's contract is that credentials live in workgraph config
+            // user's contract is that credentials live in WG config
             // exclusively, and the autohaiku failure was caused by this
             // path bailing with "No Anthropic API key found" before any
             // HTTP call when no env var was set.
@@ -493,6 +504,7 @@ mod tests {
                 model: None,
                 api_key: None,
                 api_key_env: None,
+                api_key_ref: None,
                 api_key_file: None,
                 is_default: false,
                 context_window: Some(32768),

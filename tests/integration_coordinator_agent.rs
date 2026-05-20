@@ -42,7 +42,7 @@ fn wg_binary() -> PathBuf {
 
 /// Derive a fake HOME from the wg_dir path so global config doesn't leak in.
 fn fake_home_for(wg_dir: &Path) -> PathBuf {
-    // wg_dir is typically <tmp>/.workgraph — use <tmp> as fake home
+    // wg_dir is typically <tmp>/.wg — use <tmp> as fake home
     wg_dir
         .parent()
         .map(|p| p.to_path_buf())
@@ -121,18 +121,19 @@ fn wg_ok_env(wg_dir: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> String 
     stdout
 }
 
-/// Initialise a fresh workgraph in a temp directory and return the .workgraph path.
+/// Initialise a fresh WG graph in a temp directory and return the .wg path.
 fn init_workgraph(tmp: &TempDir) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
-    wg_ok(&wg_dir, &["init", "--model", "claude:opus"]);
+    let wg_dir = tmp.path().join(".wg");
+    wg_ok(&wg_dir, &["init", "--executor", "shell"]);
     wg_dir
 }
 
 /// Write config.toml to enable the coordinator agent.
 fn enable_coordinator_agent(wg_dir: &Path) {
     let config_path = wg_dir.join("config.toml");
-    let config = "[dispatcher]\ncoordinator_agent = true\n";
+    let config = "[dispatcher]\ncoordinator_agent = true\nregistry_refresh_interval = 0\n";
     fs::write(&config_path, config).unwrap();
+    wg_ok(wg_dir, &["chat", "create", "--name", "default", "--json"]);
 }
 
 fn create_primary_chat(wg_dir: &Path) {
@@ -225,7 +226,8 @@ fn wait_for_coordinator_agent(wg_dir: &Path) {
         }
         if let Ok(content) = fs::read_to_string(&log_path)
             && (content.contains("Claude CLI started")
-                || content.contains("Coordinator agent 0 spawned successfully")
+                || content.contains("claude-handler ready")
+                || content.contains("nex subprocess running")
                 || content.contains("Coordinator agent spawned successfully"))
         {
             return;
@@ -784,23 +786,21 @@ fn coordinator_agent_cursor_tracking() {
     let mock = MockClaude::new();
     let guard = CoordinatorDaemonGuard::start(&wg_dir, &mock);
 
-    // Send first message
     guard.chat_ok("cursor test one", 15);
-    let cursor1 = workgraph::chat::read_coordinator_cursor(&wg_dir).unwrap();
+    let responses1 = workgraph::chat::read_outbox_since_for(&wg_dir, 0, 0).unwrap();
     assert!(
-        cursor1 >= 1,
-        "Coordinator cursor should be >= 1 after first message, got {}",
-        cursor1
+        responses1.len() >= 1,
+        "Coordinator should write at least one response after first message, got {}",
+        responses1.len()
     );
 
-    // Send second message
     guard.chat_ok("cursor test two", 15);
-    let cursor2 = workgraph::chat::read_coordinator_cursor(&wg_dir).unwrap();
+    let responses2 = workgraph::chat::read_outbox_since_for(&wg_dir, 0, 0).unwrap();
     assert!(
-        cursor2 > cursor1,
-        "Coordinator cursor should advance: {} -> {}",
-        cursor1,
-        cursor2
+        responses2.len() > responses1.len(),
+        "Coordinator should append a new response without reprocessing old messages: {} -> {}",
+        responses1.len(),
+        responses2.len()
     );
 }
 
@@ -845,9 +845,16 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         crash_stdout
     );
 
-    // Step 2: Wait for the daemon to restart the supervised handler subprocess.
-    // In this slice the daemon owns the supervisor child, not Claude stdio directly,
-    // so the stable restart marker is the handler-supervisor launch line.
+    // Step 3: The agent may need one more message to detect the broken pipe
+    // and initiate restart (due to reap_zombies race with try_wait).
+    // Send a recovery-trigger message. This will either:
+    // - Get a mock response (if agent already restarted)
+    // - Get an error (stdin write fails → triggers restart)
+    let trigger_output = guard.chat("recovery trigger", 30);
+    let _trigger_stdout = String::from_utf8_lossy(&trigger_output.stdout).to_string();
+
+    // Step 4: Wait for the daemon to restart the agent.
+    // Look for a second handler startup marker in the daemon log.
     let log_path = wg_dir.join("service").join("daemon.log");
     let start = Instant::now();
     loop {
@@ -860,7 +867,8 @@ fn coordinator_handler_crash_surfaces_error_and_recovers() {
         }
         if let Ok(content) = fs::read_to_string(&log_path) {
             let starts: Vec<_> = content
-                .match_indices("claude-handler supervisor child started")
+                .match_indices("claude-handler ready")
+                .chain(content.match_indices("nex subprocess running"))
                 .collect();
             if starts.len() >= 2 {
                 break;

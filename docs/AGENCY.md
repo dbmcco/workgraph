@@ -1,6 +1,6 @@
 # Agency System
 
-The agency system gives workgraph agents composable identities. Instead of every agent being a generic assistant, you define **roles** (what an agent does), **tradeoffs** (why it acts that way), and pair them into **agents** that are assigned to tasks, evaluated, and evolved over time.
+The agency system gives wg agents composable identities. Instead of every agent being a generic assistant, you define **roles** (what an agent does), **tradeoffs** (why it acts that way), and pair them into **agents** that are assigned to tasks, evaluated, and evolved over time.
 
 Agents can be **human or AI**. The difference is the executor: AI agents use `claude` (or similar), human agents use `matrix`, `email`, or `shell`. Both share the same identity model — roles, tradeoffs, capabilities, trust levels, and performance tracking all work uniformly regardless of who (or what) is doing the work.
 
@@ -36,7 +36,7 @@ A tradeoff defines **why** an agent acts the way it does.
 
 ### Agent
 
-An agent is the **unified identity** in workgraph — it can represent a human or an AI. For AI agents, it is a named pairing of a role and a tradeoff. For human agents, role and tradeoff are optional.
+An agent is the **unified identity** in wg — it can represent a human or an AI. For AI agents, it is a named pairing of a role and a tradeoff. For human agents, role and tradeoff are optional.
 
 | Field | Description |
 |-------|-------------|
@@ -439,7 +439,7 @@ wg evolve run --single-shot                       # force legacy single-shot mod
 | `wg agency init` | Seed agency with starter roles and tradeoffs |
 | `wg agency stats [--min-evals <N>] [--by-model] [--by-task-type]` | Show agency performance analytics |
 | `wg agency create [--model <MODEL>] [--dry-run]` | Invoke the creator agent to discover and add new primitives |
-| `wg agency import [CSV_PATH] [--url <URL>] [--upstream] [--dry-run] [--tag <TAG>] [--force] [--check]` | Import Agency starter.csv primitives into WorkGraph |
+| `wg agency import [CSV_PATH] [--url <URL>] [--upstream] [--dry-run] [--tag <TAG>] [--force] [--check]` | Import Agency starter.csv primitives into wg |
 | `wg agency migrate [--dry-run]` | Migrate old-format agency store to primitive+cache format |
 | `wg agency deferred` | List pending deferred evolver operations (alias for `wg evolve review list`) |
 | `wg agency approve <id>` | Approve a deferred operation (alias for `wg evolve review approve`) |
@@ -519,7 +519,7 @@ wg role add "Writer" --skill "tone:inline:Write in a clear, technical style" --o
 
 ### Installing skills
 
-The workgraph skill can be installed as a Claude Code skill:
+The wg skill can be installed as a Claude Code skill:
 
 ```bash
 wg skill install     # installs to ~/.claude/skills/wg/
@@ -616,7 +616,7 @@ Some operations are too impactful to apply immediately. The evolver automaticall
 - **Protected objectives** — outcomes marked with the `requires_human_oversight` flag in their YAML, or referenced by `random_compose_role`
 - **Self-mutation** — operations targeting the evolver's own role or tradeoff (creates a review task in the graph rather than a deferred-ops file)
 
-Deferred operations are saved to `.workgraph/agency/deferred/` and can be managed with:
+Deferred operations are saved to `.wg/agency/deferred/` and can be managed with:
 
 ```bash
 wg evolve review list              # view pending deferred operations
@@ -626,7 +626,7 @@ wg evolve review reject <id>       # reject and discard
 
 ### Coordinator prompt evolution
 
-The evolver can modify the coordinator agent's behavior by writing to mutable prompt files in `.workgraph/agency/coordinator-prompt/`:
+The evolver can modify the coordinator agent's behavior by writing to mutable prompt files in `.wg/agency/coordinator-prompt/`:
 
 | File | Mutability | Purpose |
 |------|-----------|---------|
@@ -688,14 +688,14 @@ wg config --retention-heuristics "Retire roles scoring below 0.3 after 10 evalua
 
 The evolver prompt includes:
 - Performance summaries for all roles and tradeoffs
-- Strategy-specific skill documents from `.workgraph/agency/evolver-skills/`
+- Strategy-specific skill documents from `.wg/agency/evolver-skills/`
 - The evolver's own identity (if configured)
 - References to the assigner, evaluator, and evolver agent hashes
 - Retention heuristics (if configured)
 
 ### Evolver skills
 
-Strategy-specific guidance documents live in `.workgraph/agency/evolver-skills/`:
+Strategy-specific guidance documents live in `.wg/agency/evolver-skills/`:
 
 - `role-mutation.md` — procedures for improving a single role
 - `role-crossover.md` — procedures for combining two roles
@@ -711,7 +711,7 @@ Strategy-specific guidance documents live in `.workgraph/agency/evolver-skills/`
 ### Evaluation flow
 
 1. Task completes → evaluation is created (4 dimensions + overall score)
-2. Evaluation saved as YAML in `.workgraph/agency/evaluations/`
+2. Evaluation saved as YAML in `.wg/agency/evaluations/`
 3. **Agent's** performance record updated (task count, avg score, eval history)
 4. **Role's** performance record updated (with tradeoff_id as `context_id`)
 5. **Tradeoff's** performance record updated (with role_id as `context_id`)
@@ -772,7 +772,7 @@ wg agent lineage <id>        # shows agent + role + tradeoff ancestry
 ## Storage Layout
 
 ```
-.workgraph/agency/
+.wg/agency/
 ├── primitives/
 │   ├── components/              # Skill components (atomic capabilities)
 │   │   └── <sha256>.yaml
@@ -819,7 +819,7 @@ Roles, tradeoffs, and agents are stored as YAML. Evaluations are stored as JSON.
 
 ## Federation
 
-Federation lets you share agency entities (roles, tradeoffs, agents) and their performance data across workgraph projects. Because entities use content-hash IDs, the same role in two projects has the same ID — pull/push merges performance records automatically.
+Federation lets you share agency entities (roles, tradeoffs, agents) and their performance data across wg projects. Because entities use content-hash IDs, the same role in two projects has the same ID — pull/push merges performance records automatically.
 
 ### Remotes
 
@@ -834,10 +834,10 @@ wg agency remote remove <name>           # remove a named remote
 
 ### Discovering stores
 
-Scan a directory tree for workgraph agency stores:
+Scan a directory tree for wg agency stores:
 
 ```bash
-wg agency scan <root-dir>                 # find all .workgraph/agency/ stores
+wg agency scan <root-dir>                 # find all .wg/agency/ stores
 wg agency scan <root-dir> --max-depth 5   # limit recursion depth (default: 10)
 ```
 
@@ -851,14 +851,14 @@ wg agency pull <source> --entity <id-prefix>         # specific entities
 wg agency pull <source> --dry-run                    # preview without writing
 wg agency pull <source> --no-performance             # definitions only, skip scores
 wg agency pull <source> --no-evaluations             # skip evaluation JSON files
-wg agency pull <source> --global                     # pull into ~/.workgraph/agency/
+wg agency pull <source> --global                     # pull into ~/.wg/agency/
 
 # Push local entities to another store
 wg agency push <target>                              # push all to path or named remote
 wg agency push <target> --type tradeoff            # only tradeoffs
 wg agency push <target> --entity <id-prefix>         # specific entities
 wg agency push <target> --dry-run                    # preview without writing
-wg agency push <target> --global                     # push from ~/.workgraph/agency/
+wg agency push <target> --global                     # push from ~/.wg/agency/
 
 # Merge multiple stores
 wg agency merge <source1> <source2> ...              # merge into local project

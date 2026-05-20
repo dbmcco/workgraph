@@ -19,12 +19,12 @@ The graph directory is resolved first, **then** config is loaded:
 
 | step | what is read | from |
 |------|-------------|------|
-| graph-dir resolution | `--dir` → `WG_DIR` → walk-up from cwd for `.wg`/`.workgraph` → `~/.wg`/`~/.workgraph` → default `./.wg` | `src/main.rs:55-102` |
-| global config | `~/.workgraph/config.toml` (note: **hardcoded `.workgraph`**, not `.wg`) | `src/config.rs:3669-3677` (`Config::global_dir`) |
-| project config | `<workgraph_dir>/config.toml` (whichever name resolved above) | `src/config.rs:3749-3754` (`Config::load_merged`) |
-| matrix creds | `~/.config/workgraph/matrix.toml` (separate file, not merged into Config) | `src/config.rs:3367-3370` |
+| graph-dir resolution | `--dir` → `WG_DIR` → walk-up from cwd for `.wg`/`.wg` → `~/.wg`/`~/.wg` → default `./.wg` | `src/main.rs:55-102` |
+| global config | `~/.wg/config.toml` (note: **hardcoded `.wg`**, not `.wg`) | `src/config.rs:3669-3677` (`Config::global_dir`) |
+| project config | `<graph_dir>/config.toml` (whichever name resolved above) | `src/config.rs:3749-3754` (`Config::load_merged`) |
+| matrix creds | `~/.config/wg/matrix.toml` (separate file, not merged into Config) | `src/config.rs:3367-3370` |
 
-**Stale alert:** `Config::global_dir()` joins `.workgraph` literally; `resolve_workgraph_dir()` in `main.rs:53` prefers `.wg`. On Erik's system the two are hardlinked and that masks the inconsistency. New users running `wg init --global` get `~/.wg/config.toml` (per `main.rs:710-712`) — but `Config::load_global()` will then try to read `~/.workgraph/config.toml` and silently get `None`. **Fix candidate:** make `Config::global_dir()` use the same resolver order as `main.rs::resolve_workgraph_dir`.
+**Stale alert:** `Config::global_dir()` joins `.wg` literally; `resolve_workgraph_dir()` in `main.rs:53` prefers `.wg`. On Erik's system the two are hardlinked and that masks the inconsistency. New users running `wg init --global` get `~/.wg/config.toml` (per `main.rs:710-712`) — but `Config::load_global()` will then try to read `~/.wg/config.toml` and silently get `None`. **Fix candidate:** make `Config::global_dir()` use the same resolver order as `main.rs::resolve_workgraph_dir`.
 
 ### Per-key precedence
 
@@ -33,8 +33,8 @@ For any single setting, resolution flows top-down (highest precedence first):
 1. **Per-task field** (`task.model`, `task.exec`, `task.tags`, `task.context_scope`) — set on the graph entry itself.
 2. **CLI flag** for one-shot overrides — e.g. `wg add ... --model claude:opus`, `wg service start --max-agents 4`. Most wg subcommands accept `--model`/`--endpoint`/etc. (see `src/cli.rs`).
 3. **Tag routing** — `[[tag_routing]]` rules match `task.tags` and provide a model+executor when `task.model` is unset (`src/config.rs:1388-1395`).
-4. **Project-local config** — `<workgraph_dir>/config.toml`.
-5. **Global config** — `~/.workgraph/config.toml` (deep-merged: project keys override globally; for `[[llm_endpoints.endpoints]]` see special opt-in below).
+4. **Project-local config** — `<graph_dir>/config.toml`.
+5. **Global config** — `~/.wg/config.toml` (deep-merged: project keys override globally; for `[[llm_endpoints.endpoints]]` see special opt-in below).
 6. **Profile defaults** — when `profile = "anthropic"` (etc.) is set, that profile supplies tier defaults (`src/config.rs:2078-2092`).
 7. **Hardcoded defaults** — `default_*()` functions and `Default for *Config` impls (`src/config.rs:184-…`, scattered).
 8. **Built-in registry** — `Config::builtin_registry()` provides Anthropic Claude entries when `[[model_registry]]` is empty (`src/config.rs:1964-2053`).
@@ -103,7 +103,7 @@ The whole table renames `[coordinator]` → `[dispatcher]` automatically (`LEGAC
 | `compaction_threshold_ratio` | (no-op) | `:2844, 3108` | `0.8` | — | **deprecated** |
 | `eval_frequency` | Coordinator turn-eval cadence. `every_5` etc. | `:2849, 3112` | `"every_5"` | G | current |
 | `worktree_isolation` | Isolate each agent in its own git worktree. | `:2855, 3116` | `true` | G | current |
-| `max_coordinators` | Concurrent chat (LLM) sessions cap. | `:2860, 3120` | `4` | G | current. **NOTE: there is NO `max_chats` alias.** |
+| `max_coordinators` | Concurrent chat (LLM) sessions cap. | `:2860, 3120` | `16` | G | current. **NOTE: there is NO `max_chats` alias.** |
 | `archive_retention_days` | Days before done/abandoned tasks archived (0 disables). | `:2867, 3124` | `7` | G | current |
 | `registry_refresh_interval` | Seconds between OpenRouter registry refresh (0 disables). | `:2875, 3160` | `86400` | G | current |
 | `verify_mode` | `inline` or `separate` for legacy verify-cmd tasks. | `:2883, 3128` | `"inline"` | — | **soon-to-deprecate** — replaced by `## Validation` section in task descriptions; agency evaluator reads it instead |
@@ -150,7 +150,7 @@ A large block. Only the keys most likely to matter to set are listed; full schem
 |-----|------|---------|-------|-------|
 | `auto_evaluate` | `:2433` | `true` | B | post-task evaluation |
 | `auto_assign` | `:2437` | `true` | B | auto-assign agent identity |
-| `assigner_agent`, `evaluator_agent`, `evolver_agent`, `creator_agent`, `placer_agent` | `:2441-2458` | `None` | B (per project; identity hashes are content-addressable) | content-hash refs into `.workgraph/agency/` |
+| `assigner_agent`, `evaluator_agent`, `evolver_agent`, `creator_agent`, `placer_agent` | `:2441-2458` | `None` | B (per project; identity hashes are content-addressable) | content-hash refs into `.wg/agency/` |
 | `auto_place` | `:2464` | `false` | B | placement during assignment |
 | `auto_create` | `:2469` | `false` | B | auto-invoke creator agent |
 | `auto_create_threshold` | `:2474` | `20` | B | |
@@ -267,7 +267,7 @@ Scope: typically **G** for shared endpoints (the openrouter API key etc.); **P**
 
 ### Matrix credentials — separate file
 
-Stored at `~/.config/workgraph/matrix.toml`, NOT in main config (`src/config.rs:3340-3421`). Keys: `homeserver_url`, `username`, `password`, `access_token`, `default_room`. Scope: G-only (it's user creds).
+Stored at `~/.config/wg/matrix.toml`, NOT in main config (`src/config.rs:3340-3421`). Keys: `homeserver_url`, `username`, `password`, `access_token`, `default_room`. Scope: G-only (it's user creds).
 
 ---
 
@@ -283,7 +283,7 @@ Stored at `~/.config/workgraph/matrix.toml`, NOT in main config (`src/config.rs:
 | 149-162 | `[[model_registry]]` qwen3-coder-30b | `endpoint = "lambda01"` | Stale endpoint name (no `[[llm_endpoints.endpoints]]` named `lambda01` in the same file). Either add the endpoint or drop the registry entry. |
 | 191 | `[mcp]` | empty | OK — empty section is harmless but produces a non-default output on `wg config show`. Drop the line. |
 
-### Confirmed staleness in current local `.workgraph/config.toml` (this repo)
+### Confirmed staleness in current local `.wg/config.toml` (this repo)
 
 | line | key | current value | issue |
 |-----|-----|---------------|-------|
@@ -304,7 +304,7 @@ Items listed as **deprecated** above. The big ones:
 
 ### Naming inconsistencies worth tracking
 
-- **`global_dir()` returns `~/.workgraph`** even though `wg init --global` writes `~/.wg/config.toml`. Currently masked by hardlinks; will silently break for new users.
+- **`global_dir()` returns `~/.wg`** even though `wg init --global` writes `~/.wg/config.toml`. Currently masked by hardlinks; will silently break for new users.
 - **`coordinator_agent`/`max_coordinators`** in the schema vs **`chat_agent`/`max_chats`** that the user wrote in local config. One of:
     - add `serde(alias = "chat_agent")` so the rename works,
     - or document the canonical name and drop the legacy attempt from the project file.
@@ -312,7 +312,7 @@ Items listed as **deprecated** above. The big ones:
 
 ---
 
-## 4. Minimal global config — `~/.wg/config.toml` (or `~/.workgraph/config.toml`)
+## 4. Minimal global config — `~/.wg/config.toml` (or `~/.wg/config.toml`)
 
 For a "I use claude CLI for everything, opus is my workhorse" user, this is the entire config:
 
@@ -353,7 +353,7 @@ counters = "uptime,cumulative,active,compact"
 # only override defaults you actually disagree with
 ```
 
-If you use Matrix/Telegram/etc. notifications, those live in their own files (`~/.config/workgraph/matrix.toml`) — don't pollute `config.toml` with them.
+If you use Matrix/Telegram/etc. notifications, those live in their own files (`~/.config/wg/matrix.toml`) — don't pollute `config.toml` with them.
 
 **What you should NOT keep in global** (these are restated built-in defaults):
 
@@ -420,7 +420,7 @@ Real reasons to write a project-local config:
   [agent]
   model = "claude:opus"
   ```
-- **Shadow the global default endpoint** to force fallback (e.g. workgraph repo wants `claude` CLI not OpenRouter):
+- **Shadow the global default endpoint** to force fallback (e.g. wg repo wants `claude` CLI not OpenRouter):
   ```toml
   [[llm_endpoints.endpoints]]
   # Shadow global openrouter so claude_handler is used.
@@ -453,10 +453,10 @@ Real reasons to write a project-local config:
   deny_tools = ["bash", "wg_done"]
   ```
 
-### Recommended minimal project config (concrete proposal for the workgraph repo)
+### Recommended minimal project config (concrete proposal for the wg repo)
 
 ```toml
-# .wg/config.toml — workgraph repo
+# .wg/config.toml — wg repo
 
 [agent]
 model = "claude:opus"
@@ -490,7 +490,7 @@ Because we don't break compatibility:
 
 1. **Unknown-key warnings.** Add an opt-in lint command (`wg config lint` or `wg config check`) that walks the merged config and warns about keys serde silently dropped. Easy because we already have raw `toml::Value` available. Without `deny_unknown_fields` (which would be too aggressive — would break `flip_*` extension keys etc.), a positive allowlist of known keys per section is the only way to catch `chat_agent` typos.
 2. **Add a `[serde(alias = "chat_agent")]` on `coordinator_agent`** and `[serde(alias = "max_chats")]` on `max_coordinators`. Two lines of change. Local config keeps working; future renames don't silently drop.
-3. **Fix `Config::global_dir()` to use the same resolver order as `main.rs`** — try `~/.wg` first, fall back to `~/.workgraph` for legacy. Avoids the silent-divergence bug for new users.
+3. **Fix `Config::global_dir()` to use the same resolver order as `main.rs`** — try `~/.wg` first, fall back to `~/.wg` for legacy. Avoids the silent-divergence bug for new users.
 4. **`wg config trim`** — read merged config, compare against built-in defaults, write back only the differences (with comments preserved if possible). Equivalent to "manually clean my config." First-time users running `wg config init <route>` already get this cleanly; existing users are stuck with whatever their config has accumulated.
 5. **Stale-default sweep**: replace `openrouter:anthropic/claude-sonnet-4` references in `[models.default]` and `[tiers]` with `claude:opus` (or whatever the user's actual default is). The route generators in `src/config_defaults.rs:199-201` still write `claude-sonnet-4`; if Anthropic has moved to `claude-sonnet-4-6` on OpenRouter that's a one-line fix in `openrouter_default_registry()`.
 
@@ -503,8 +503,8 @@ If `wg show <task>` or `wg config show` displays a value you didn't set, the cas
 1. **Per-task `task.<field>`** — set on the graph entry (`graph.jsonl`).
 2. **CLI flag** — `wg add ... --model X`, `wg service start --max-agents N`.
 3. **Tag routing** — `[[tag_routing]]` rules with matching tag.
-4. **Project `<workgraph_dir>/config.toml`**.
-5. **Global `~/.workgraph/config.toml`** (deep-merged).
+4. **Project `<graph_dir>/config.toml`**.
+5. **Global `~/.wg/config.toml`** (deep-merged).
 6. **Profile defaults** — when `profile = "..."` is set.
 7. **Hardcoded `default_*()` functions** (`src/config.rs`).
 8. **Built-in registry** — `Config::builtin_registry()` (Anthropic Claude haiku/sonnet/opus baked in).

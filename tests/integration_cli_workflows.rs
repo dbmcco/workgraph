@@ -65,7 +65,7 @@ fn make_task(id: &str, title: &str, status: Status) -> Task {
 }
 
 fn setup_workgraph(tmp: &TempDir, tasks: Vec<Task>) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let mut graph = WorkGraph::new();
@@ -215,7 +215,7 @@ fn test_check_clean_graph() {
 #[test]
 fn test_check_detects_orphan_blockers() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     fs::create_dir_all(&wg_dir).unwrap();
 
     let mut task = make_task("t1", "Broken dep", Status::Open);
@@ -949,6 +949,22 @@ fn test_show_json_minimal_task() {
     assert!(parsed.get("assigned").is_none() || parsed["assigned"].is_null());
 }
 
+#[test]
+fn test_show_text_includes_last_interaction() {
+    let tmp = TempDir::new().unwrap();
+    let mut task = make_task("li1", "Activity timestamp", Status::Open);
+    task.created_at = Some("2026-04-30T00:00:00+00:00".to_string());
+    task.last_interaction_at = Some("2026-05-01T12:00:00+00:00".to_string());
+    let wg_dir = setup_workgraph(&tmp, vec![task]);
+
+    let output = wg_ok(&wg_dir, &["show", "li1"]);
+    assert!(
+        output.contains("Last interaction: 2026-05-01T12:00:00+00:00"),
+        "wg show must surface last_interaction_at in text output, got:\n{}",
+        output
+    );
+}
+
 // ── wg ready --json ─────────────────────────────────────────────────
 
 #[test]
@@ -1151,7 +1167,7 @@ fn test_check_json_clean_graph() {
 #[test]
 fn test_check_json_with_orphan_refs() {
     let tmp = TempDir::new().unwrap();
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
 
     let mut task = make_task("t1", "Broken", Status::Open);

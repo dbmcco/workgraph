@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use workgraph::federation;
 
-/// Add a named peer workgraph instance.
+/// Add a named peer WG project.
 pub fn run_add(
     workgraph_dir: &Path,
     name: &str,
@@ -38,9 +38,9 @@ pub fn run_add(
              The peer will be added anyway.",
             path
         );
-    } else if !resolved_path.join(".workgraph").is_dir() {
+    } else if !resolved_path.join(".wg").is_dir() {
         eprintln!(
-            "Warning: No .workgraph directory found at '{}'. \
+            "Warning: No .wg directory found at '{}'. \
              The peer will be added anyway (it may not be initialized yet).",
             path
         );
@@ -176,10 +176,10 @@ pub fn run_show(workgraph_dir: &Path, name: &str, json: bool) -> Result<()> {
 
     match &resolved {
         Ok(wg_dir) => {
-            println!("  Workgraph:   {}", wg_dir.display());
+            println!("  WG dir:      {}", wg_dir.display());
         }
         Err(e) => {
-            println!("  Workgraph:   inaccessible ({})", e);
+            println!("  WG dir:      inaccessible ({})", e);
         }
     }
 
@@ -281,7 +281,7 @@ pub fn run_status(workgraph_dir: &Path, json: bool) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve a peer path to its .workgraph directory.
+/// Resolve a peer path to its .wg directory.
 fn resolve_peer_path(path: &str) -> Result<std::path::PathBuf> {
     let expanded = if let Some(suffix) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -300,10 +300,10 @@ fn resolve_peer_path(path: &str) -> Result<std::path::PathBuf> {
     };
 
     let abs_path = abs_path.canonicalize().unwrap_or(abs_path);
-    let wg_dir = abs_path.join(".workgraph");
+    let wg_dir = abs_path.join(".wg");
 
     if !wg_dir.is_dir() {
-        anyhow::bail!("No .workgraph directory at '{}'", abs_path.display());
+        anyhow::bail!("No .wg directory at '{}'", abs_path.display());
     }
 
     Ok(wg_dir)
@@ -322,7 +322,7 @@ fn check_peer_status_for_config(peer: &federation::PeerConfig) -> federation::Pe
     }
 }
 
-/// Task counts from a workgraph.
+/// Task counts from a WG project.
 #[derive(Debug, Clone, serde::Serialize)]
 struct TaskCounts {
     total: usize,
@@ -355,7 +355,9 @@ fn count_tasks_in_graph(graph_path: &Path) -> Result<TaskCounts> {
             | workgraph::graph::Status::Waiting
             | workgraph::graph::Status::PendingValidation
             | workgraph::graph::Status::Incomplete => {}
-            workgraph::graph::Status::PendingEval => counts.in_progress += 1,
+            workgraph::graph::Status::PendingEval | workgraph::graph::Status::FailedPendingEval => {
+                counts.in_progress += 1
+            }
         }
     }
 
@@ -368,14 +370,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn setup_workgraph_dir(tmp: &TempDir) -> std::path::PathBuf {
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         wg_dir
     }
 
     fn setup_peer_project(tmp: &TempDir, name: &str) -> std::path::PathBuf {
         let project = tmp.path().join(name);
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         // Create a minimal graph.jsonl
         std::fs::write(wg_dir.join("graph.jsonl"), "").unwrap();

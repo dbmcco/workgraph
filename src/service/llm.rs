@@ -1,16 +1,21 @@
-//! Lightweight LLM dispatch for internal workgraph calls (triage, checkpoint, etc.).
+//! Lightweight LLM dispatch for internal WG calls (triage, checkpoint, etc.).
 //!
 //! Resolves model + provider via `resolve_model_for_role()` and dispatches to either:
 //! - Claude CLI (`claude --model X --print --dangerously-skip-permissions PROMPT`)
 //! - Native Anthropic API client (when provider is "anthropic" and native executor is configured)
 //! - Native OpenAI-compatible API client (when provider is "openai"/"openrouter")
 
+use std::io::{BufRead, BufReader};
 use std::process;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::config::{CLAUDE_HAIKU_MODEL_ID, Config, DispatchRole, ModelRegistryEntry};
+use crate::config::{
+    CLAUDE_HAIKU_MODEL_ID, CLAUDE_OPUS_MODEL_ID, CLAUDE_SONNET_MODEL_ID, Config, DispatchRole,
+    ModelRegistryEntry, parse_model_spec,
+};
+use crate::dispatch::{ExecutorKind, handler_for_model};
 use crate::graph::TokenUsage;
 
 /// Result of a lightweight LLM call, including both the text response and token usage.
@@ -46,16 +51,88 @@ fn is_agency_oneshot_role(role: DispatchRole) -> bool {
     )
 }
 
-/// True when the user has explicitly configured `[models.<role>]` with
-/// a model or provider override (i.e., the resolved provider for this role
-/// is NOT the result of cascade from `[models.default]` or
-/// `coordinator.model` / `agent.model`).
-fn role_has_explicit_override(config: &Config, role: DispatchRole) -> bool {
-    config
+/// The dispatch target for an agency one-shot LLM call (.assign-* /
+/// .evaluate-* / .flip-*). Computed in one place so the spawn site (which
+/// labels the agent in the registry) and the LLM call site (which actually
+/// invokes the binary) cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgencyDispatch {
+    /// Which CLI/handler will execute this call.
+    pub handler: ExecutorKind,
+    /// The full model spec as the user wrote it (e.g. `"codex:gpt-5.4-mini"`,
+    /// `"claude:haiku"`). Stored in the agent registry for `wg agents`
+    /// display and for diagnostic logs.
+    pub raw_spec: String,
+    /// The bare model id (no provider prefix) — passed to `--model` on the
+    /// CLI subprocess.
+    pub model_id: String,
+}
+
+/// Convert provider/model Claude IDs into the bare aliases accepted by the
+/// Claude CLI. OpenRouter and registry entries use IDs like
+/// `anthropic/claude-haiku-4-5`, but the CLI expects `haiku`, `sonnet`, or
+/// `opus`.
+fn claude_cli_alias_for_model(model_id: &str) -> Option<&'static str> {
+    let lower = model_id.to_ascii_lowercase();
+    let claude_part = lower.strip_prefix("anthropic/").unwrap_or(lower.as_str());
+
+    if !claude_part.starts_with("claude") {
+        return None;
+    }
+
+    if claude_part.contains("haiku") {
+        Some(CLAUDE_HAIKU_MODEL_ID)
+    } else if claude_part.contains("sonnet") {
+        Some(CLAUDE_SONNET_MODEL_ID)
+    } else if claude_part.contains("opus") {
+        Some(CLAUDE_OPUS_MODEL_ID)
+    } else {
+        None
+    }
+}
+
+fn normalize_claude_cli_model(model_id: &str) -> String {
+    claude_cli_alias_for_model(model_id)
+        .unwrap_or(model_id)
+        .to_string()
+}
+
+/// Resolve which handler+model an agency one-shot role should dispatch to.
+///
+/// Contract (matches CLAUDE.md "explicit overrides win, cascade does not"):
+///
+/// - Explicit `[models.<role>].model` → use that spec; route via
+///   `handler_for_model` (so `codex:X` runs on `codex` CLI, `openrouter:X`
+///   runs through the native HTTP path, etc).
+/// - No explicit per-role model → pin to `claude:haiku` on the claude CLI.
+///   Project-level cascade from `coordinator.model` / `[models.default]`
+///   is ignored on purpose: agency tasks must be cheap and immune to
+///   silent provider failures.
+pub fn resolve_agency_dispatch(config: &Config, role: DispatchRole) -> AgencyDispatch {
+    debug_assert!(
+        is_agency_oneshot_role(role),
+        "resolve_agency_dispatch is only valid for agency one-shot roles"
+    );
+
+    let raw_spec = config
         .models
         .get_role(role)
-        .map(|c| c.model.is_some() || c.provider.is_some())
-        .unwrap_or(false)
+        .and_then(|c| c.model.clone())
+        .unwrap_or_else(|| CLAUDE_HAIKU_MODEL_ID.to_string());
+
+    let spec = parse_model_spec(&raw_spec);
+    let claude_cli_alias = claude_cli_alias_for_model(&spec.model_id);
+    let handler = if claude_cli_alias.is_some() {
+        ExecutorKind::Claude
+    } else {
+        handler_for_model(&raw_spec)
+    };
+
+    AgencyDispatch {
+        handler,
+        raw_spec,
+        model_id: claude_cli_alias.unwrap_or(&spec.model_id).to_string(),
+    }
 }
 
 /// Run a lightweight (no tool-use) LLM call for an internal dispatch role.
@@ -79,8 +156,31 @@ pub fn run_lightweight_llm_call(
     prompt: &str,
     timeout_secs: u64,
 ) -> Result<LlmCallResult> {
-    if is_agency_oneshot_role(role) && !role_has_explicit_override(config, role) {
-        return call_claude_cli(CLAUDE_HAIKU_MODEL_ID, prompt, timeout_secs);
+    if is_agency_oneshot_role(role) {
+        let dispatch = resolve_agency_dispatch(config, role);
+        // For CLI-handler targets (claude, codex), route directly to the
+        // CLI — the `provider_to_native_provider` mapping in the cascade
+        // resolver collapses `codex` → `oai-compat`, which would otherwise
+        // misroute the call into the OpenAI-compat HTTP client (no key /
+        // wrong endpoint for codex CLI users).
+        match dispatch.handler {
+            ExecutorKind::Claude => {
+                return call_claude_cli(&dispatch.model_id, prompt, timeout_secs);
+            }
+            ExecutorKind::Codex => {
+                return call_codex_cli(&dispatch.model_id, prompt, timeout_secs);
+            }
+            ExecutorKind::Native => {
+                // Fall through to the native HTTP path below — openrouter,
+                // local, oai-compat, etc. are real HTTP providers that the
+                // cascade-based dispatch handles correctly.
+            }
+            ExecutorKind::Shell => {
+                // Shell doesn't make sense for a one-shot LLM call; degrade to
+                // the safe default (claude CLI on haiku).
+                return call_claude_cli(CLAUDE_HAIKU_MODEL_ID, prompt, timeout_secs);
+            }
+        }
     }
 
     let resolved = config.resolve_model_for_role(role);
@@ -125,6 +225,7 @@ pub fn run_lightweight_llm_call(
                     ),
                 }
             }
+            "codex" => return call_codex_cli(model, prompt, timeout_secs),
             _ => {}
         }
     }
@@ -155,6 +256,8 @@ fn estimate_cost(entry: &ModelRegistryEntry, usage: &TokenUsage) -> f64 {
 
 fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
     use std::io::Write as _;
+
+    let model = normalize_claude_cli_model(model);
 
     // Pipe the prompt via stdin instead of passing it as a CLI argument.
     // Eval prompts can be very large (30KB+ with diffs, logs, artifacts) and
@@ -213,6 +316,123 @@ fn call_claude_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCa
 
     if text.is_empty() {
         anyhow::bail!("Empty response from claude CLI");
+    }
+    Ok(LlmCallResult { text, token_usage })
+}
+
+/// One-shot LLM call via the Codex CLI (`codex exec --json`).
+///
+/// Codex is single-shot by nature — `codex exec` reads a prompt on stdin,
+/// runs the turn, prints JSONL events, and exits. We parse the JSONL
+/// stream to extract the final `agent_message` text and `turn.completed`
+/// usage. Output format mirrors `call_claude_cli` so the caller doesn't
+/// need to special-case which CLI ran.
+fn call_codex_cli(model: &str, prompt: &str, timeout_secs: u64) -> Result<LlmCallResult> {
+    use std::io::Write as _;
+
+    let mut child = process::Command::new("timeout")
+        .arg(format!("{}s", timeout_secs))
+        .arg("codex")
+        .arg("exec")
+        .arg("--json")
+        .arg("--skip-git-repo-check")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("--model")
+        .arg(model)
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .context("Failed to spawn codex CLI for lightweight LLM call")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .context("Failed to write prompt to codex CLI stdin")?;
+    }
+
+    // Stream-parse stdout line-by-line — codex emits one JSON event per
+    // line. We track the most recent `agent_message` text and the
+    // `turn.completed` usage block.
+    let stdout = child.stdout.take().context("codex stdout take")?;
+    let reader = BufReader::new(stdout);
+    let mut last_agent_text: Option<String> = None;
+    let mut token_usage: Option<TokenUsage> = None;
+
+    for line in reader.lines().map_while(|l| l.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ty = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match ty {
+            "item.completed" | "item.updated" => {
+                if let Some(item) = val.get("item")
+                    && item.get("type").and_then(|t| t.as_str()) == Some("agent_message")
+                    && let Some(text) = item.get("text").and_then(|t| t.as_str())
+                {
+                    last_agent_text = Some(text.to_string());
+                }
+            }
+            "turn.completed" => {
+                if let Some(usage) = val.get("usage") {
+                    let input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cache_read = usage
+                        .get("cached_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    token_usage = Some(TokenUsage {
+                        cost_usd: 0.0,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens: cache_read,
+                        cache_creation_input_tokens: 0,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let stderr_buf = child
+        .stderr
+        .take()
+        .map(|stderr| {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut buf);
+            buf
+        })
+        .unwrap_or_default();
+
+    let status = child
+        .wait()
+        .context("Failed to wait for codex CLI output")?;
+
+    if !status.success() {
+        let stderr_trim = stderr_buf.trim();
+        anyhow::bail!(
+            "Codex CLI call failed (exit {:?}): {}",
+            status.code(),
+            stderr_trim.chars().take(500).collect::<String>()
+        );
+    }
+
+    let text = last_agent_text
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if text.is_empty() {
+        anyhow::bail!("Empty response from codex CLI");
     }
     Ok(LlmCallResult { text, token_usage })
 }
@@ -595,26 +815,191 @@ mod tests {
     }
 
     #[test]
-    fn test_role_has_explicit_override_detects_user_config() {
+    fn test_resolve_agency_dispatch_default_pins_to_claude_haiku() {
+        // No [models.<role>] override — agency pins to claude:haiku on
+        // the claude CLI handler, ignoring any project-level cascade.
         let mut config = Config::default();
-        // No per-role config → not explicit (cascade-only).
-        assert!(!role_has_explicit_override(
-            &config,
-            DispatchRole::Evaluator
-        ));
+        config.coordinator.model = Some("openrouter:anthropic/claude-sonnet-4-6".to_string());
 
-        // Setting a per-role provider counts as explicit.
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Assigner);
+        assert_eq!(dispatch.handler, ExecutorKind::Claude);
+        assert_eq!(dispatch.raw_spec, CLAUDE_HAIKU_MODEL_ID);
+        assert_eq!(dispatch.model_id, CLAUDE_HAIKU_MODEL_ID);
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_codex_override_routes_to_codex_cli() {
+        // Reproduces the autohaiku regression: `wg init --route codex-cli`
+        // writes [models.assigner].model = "codex:gpt-5.4-mini" but the
+        // runtime fell back to claude. The fix routes via handler_for_model
+        // so the explicit override actually lands on the codex CLI.
+        let mut config = Config::default();
         config
             .models
-            .set_provider(DispatchRole::Evaluator, "openrouter");
-        assert!(role_has_explicit_override(&config, DispatchRole::Evaluator));
+            .set_model(DispatchRole::Assigner, "codex:gpt-5.4-mini");
 
-        // Setting a per-role model also counts as explicit.
-        let mut config2 = Config::default();
-        config2
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Assigner);
+        assert_eq!(
+            dispatch.handler,
+            ExecutorKind::Codex,
+            "explicit codex:* override must dispatch via codex CLI, not claude"
+        );
+        assert_eq!(dispatch.raw_spec, "codex:gpt-5.4-mini");
+        assert_eq!(
+            dispatch.model_id, "gpt-5.4-mini",
+            "model_id must strip the provider prefix for `--model` arg"
+        );
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_codex_override_for_evaluator_and_flip() {
+        // Same TDD coverage for Evaluator, FlipInference, FlipComparison —
+        // the codex-cli init route writes ALL FOUR roles, so they must all
+        // route via codex CLI.
+        for role in [
+            DispatchRole::Evaluator,
+            DispatchRole::FlipInference,
+            DispatchRole::FlipComparison,
+            DispatchRole::Assigner,
+        ] {
+            let mut config = Config::default();
+            config.models.set_model(role, "codex:gpt-5.4-mini");
+            let dispatch = resolve_agency_dispatch(&config, role);
+            assert_eq!(
+                dispatch.handler,
+                ExecutorKind::Codex,
+                "role {:?} with codex override must route to codex CLI",
+                role
+            );
+            assert_eq!(dispatch.model_id, "gpt-5.4-mini", "role {:?}", role);
+        }
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_claude_override_keeps_claude_cli() {
+        // A user who explicitly sets `[models.evaluator].model = "claude:sonnet"`
+        // gets claude CLI on sonnet (not the haiku default).
+        let mut config = Config::default();
+        config
             .models
-            .set_model(DispatchRole::Assigner, "claude:sonnet");
-        assert!(role_has_explicit_override(&config2, DispatchRole::Assigner));
+            .set_model(DispatchRole::Evaluator, "claude:sonnet");
+
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Evaluator);
+        assert_eq!(dispatch.handler, ExecutorKind::Claude);
+        assert_eq!(dispatch.raw_spec, "claude:sonnet");
+        assert_eq!(dispatch.model_id, "sonnet");
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_anthropic_slash_model_routes_to_claude_cli() {
+        // Regression for fix-evaluator-role: registry/OpenRouter model IDs
+        // like `anthropic/claude-haiku-4-5` are Claude models, but the
+        // Claude CLI only accepts the bare family alias.
+        let mut config = Config::default();
+        config
+            .models
+            .set_model(DispatchRole::Evaluator, "anthropic/claude-haiku-4-5");
+
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Evaluator);
+        assert_eq!(
+            dispatch.handler,
+            ExecutorKind::Claude,
+            "slash-form Claude evaluator model must bypass native/OpenRouter"
+        );
+        assert_eq!(dispatch.raw_spec, "anthropic/claude-haiku-4-5");
+        assert_eq!(dispatch.model_id, "haiku");
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_openrouter_claude_model_bypasses_openrouter() {
+        // Even when the model is written with an OpenRouter prefix, agency
+        // one-shot roles should not detour through OpenRouter just to call a
+        // Claude-family model.
+        let mut config = Config::default();
+        config.models.set_model(
+            DispatchRole::Evaluator,
+            "openrouter:anthropic/claude-sonnet-4-6",
+        );
+
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Evaluator);
+        assert_eq!(dispatch.handler, ExecutorKind::Claude);
+        assert_eq!(dispatch.raw_spec, "openrouter:anthropic/claude-sonnet-4-6");
+        assert_eq!(dispatch.model_id, "sonnet");
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_anthropic_slash_model_for_all_agency_roles() {
+        // Audit coverage: evaluator, assigner, and both FLIP phases share the
+        // same one-shot dispatch path.
+        for (role, model, expected_alias) in [
+            (
+                DispatchRole::Evaluator,
+                "anthropic/claude-haiku-4-5",
+                "haiku",
+            ),
+            (
+                DispatchRole::FlipInference,
+                "anthropic/claude-sonnet-4-6",
+                "sonnet",
+            ),
+            (
+                DispatchRole::FlipComparison,
+                "anthropic/claude-opus-4-7",
+                "opus",
+            ),
+            (
+                DispatchRole::Assigner,
+                "anthropic/claude-3.5-haiku",
+                "haiku",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.models.set_model(role, model);
+            let dispatch = resolve_agency_dispatch(&config, role);
+            assert_eq!(
+                dispatch.handler,
+                ExecutorKind::Claude,
+                "role {:?} should route Claude-family slash models to Claude CLI",
+                role
+            );
+            assert_eq!(dispatch.model_id, expected_alias, "role {:?}", role);
+        }
+    }
+
+    #[test]
+    fn test_claude_cli_model_normalization() {
+        assert_eq!(
+            normalize_claude_cli_model("anthropic/claude-haiku-4-5"),
+            "haiku"
+        );
+        assert_eq!(
+            normalize_claude_cli_model("anthropic/claude-sonnet-4-6"),
+            "sonnet"
+        );
+        assert_eq!(
+            normalize_claude_cli_model("anthropic/claude-opus-4-7"),
+            "opus"
+        );
+        assert_eq!(normalize_claude_cli_model("haiku"), "haiku");
+        assert_eq!(
+            normalize_claude_cli_model("qwen/qwen3-coder"),
+            "qwen/qwen3-coder"
+        );
+    }
+
+    #[test]
+    fn test_resolve_agency_dispatch_native_override_routes_to_native() {
+        // openrouter:* / local:* / oai-compat:* explicit overrides for
+        // non-Claude models keep the existing native HTTP dispatch path.
+        let mut config = Config::default();
+        config
+            .models
+            .set_model(DispatchRole::Assigner, "openrouter:qwen/qwen3-coder");
+
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Assigner);
+        assert_eq!(dispatch.handler, ExecutorKind::Native);
+        assert_eq!(dispatch.raw_spec, "openrouter:qwen/qwen3-coder");
+        assert_eq!(dispatch.model_id, "qwen/qwen3-coder");
     }
 
     #[test]
@@ -636,12 +1021,12 @@ mod tests {
             "cascade pollution exists at the resolver level — exactly the case the bypass guards against"
         );
 
-        // The bypass kicks in because no per-role explicit override is set.
+        // The bypass kicks in because no per-role explicit override is set —
+        // resolve_agency_dispatch ignores cascade and pins to claude:haiku.
         assert!(is_agency_oneshot_role(DispatchRole::Evaluator));
-        assert!(!role_has_explicit_override(
-            &config,
-            DispatchRole::Evaluator
-        ));
+        let dispatch = resolve_agency_dispatch(&config, DispatchRole::Evaluator);
+        assert_eq!(dispatch.handler, ExecutorKind::Claude);
+        assert_eq!(dispatch.raw_spec, CLAUDE_HAIKU_MODEL_ID);
     }
 
     #[test]

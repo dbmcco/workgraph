@@ -1,0 +1,29 @@
+description = "wg nex: in-process LLM handler at a localhost endpoint (edit URL per machine)"
+
+[agent]
+model = "nex:qwen3-coder-30b"
+
+[dispatcher]
+model = "nex:qwen3-coder-30b"
+max_agents = 8
+
+[tiers]
+fast = "nex:qwen3-coder-30b"
+standard = "nex:qwen3-coder-30b"
+premium = "nex:qwen3-coder-30b"
+
+[models.default]
+model = "nex:qwen3-coder-30b"
+
+[models.task_agent]
+model = "nex:qwen3-coder-30b"
+
+# NOTE: agency tasks (.evaluate-*, .flip-*, .assign-*) are pinned to claude:haiku
+# by design (see CLAUDE.md "Agency tasks run on claude CLI"). Override here only
+# if you have a *better* local model for these short calls.
+
+[[llm_endpoints.endpoints]]
+name = "default"
+provider = "oai-compat"
+url = "http://127.0.0.1:8088"
+is_default = true

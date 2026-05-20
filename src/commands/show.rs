@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use workgraph::config::Config;
 use workgraph::graph::{
-    CycleConfig, LogEntry, LoopGuard, PRIORITY_DEFAULT, Priority, Status, Task, TokenUsage,
-    format_tokens, parse_token_usage_live,
+    CycleConfig, FailureClass, LogEntry, LoopGuard, PRIORITY_DEFAULT, Priority, Status, Task,
+    TokenUsage, format_tokens, parse_token_usage_live,
 };
 use workgraph::query::build_reverse_index;
 use workgraph::service::AgentRegistry;
@@ -64,6 +64,8 @@ struct TaskDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    last_interaction_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     not_before: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     log: Vec<LogEntry>,
@@ -73,6 +75,8 @@ struct TaskDetails {
     max_retries: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<FailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +135,10 @@ struct TaskDetails {
     iteration_parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     iteration_config: Option<workgraph::agency::IterationConfig>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rescued: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    meta_eval_attempts: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evaluations: Vec<EvalSummary>,
     /// Snapshot of the task's worktree (when one exists). Populated for
@@ -166,6 +174,7 @@ struct EvalSummary {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     dimensions: HashMap<String, f64>,
     timestamp: String,
+    loop_iteration: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,8 +365,15 @@ fn gather_worktree_state(dir: &Path, task_id: &str) -> Option<WorktreeStateInfo>
         .join(crate::commands::service::worktree::CLEANUP_PENDING_MARKER)
         .exists();
 
+    // A branch is only honestly "merged to main" when *all* of the agent's
+    // work has actually landed. `is_branch_merged` alone returns true whenever
+    // the branch tip is reachable from main — but a branch with 0 commits
+    // ahead and uncommitted/staged tracked files has work that has NOT landed.
+    // Reporting `Merged to main: true` in that case is the lie that hid the
+    // wg-done-silent bug (see docs/codex-handler-merge-bug.md).
     let merged_to_main =
-        crate::commands::service::worktree::is_branch_merged(project_root, &branch);
+        crate::commands::service::worktree::is_branch_merged(project_root, &branch)
+            && uncommitted_files == 0;
 
     Some(WorktreeStateInfo {
         path: path.to_string_lossy().into_owned(),
@@ -477,6 +493,7 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
                     source: e.source,
                     dimensions: e.dimensions,
                     timestamp: e.timestamp,
+                    loop_iteration: e.loop_iteration,
                 })
                 .collect()
         } else {
@@ -504,11 +521,13 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         created_at: task.created_at.clone(),
         started_at: task.started_at.clone(),
         completed_at: task.completed_at.clone(),
+        last_interaction_at: task.last_interaction_at.clone(),
         not_before: task.not_before.clone(),
         log: task.log.clone(),
         retry_count: task.retry_count,
         max_retries: task.max_retries,
         failure_reason: task.failure_reason.clone(),
+        failure_class: task.failure_class,
         model: task.model.clone(),
         actual_executor,
         actual_model,
@@ -538,6 +557,8 @@ pub fn run(dir: &Path, id: &str, json: bool) -> Result<()> {
         iteration_anchor: task.iteration_anchor.clone(),
         iteration_parent: task.iteration_parent.clone(),
         iteration_config: task.iteration_config.clone(),
+        rescued: task.rescued,
+        meta_eval_attempts: task.meta_eval_attempts,
         evaluations,
         worktree_state: gather_worktree_state(dir, id),
     };
@@ -681,11 +702,43 @@ fn print_human_readable(details: &TaskDetails) {
         }
     }
 
+    // Rescue info (for tasks that were implicit-failed then eval-rescued)
+    if details.rescued {
+        println!("rescued: true  (↻ agent exited without wg done; eval approved output)");
+    }
+    if details.status == Status::FailedPendingEval {
+        println!(
+            "status: failed pending evaluation  (awaiting rescue eval from .evaluate-{} — score ≥ {:.2} required to rescue)",
+            details.id,
+            0.7_f64, // shown as human hint; actual threshold from config
+        );
+    }
+    if details.meta_eval_attempts > 0 {
+        println!("meta_eval_attempts: {}", details.meta_eval_attempts);
+    }
+
     // Failure info
-    if (details.status == Status::Failed || details.status == Status::Abandoned)
+    if (details.status == Status::Failed
+        || details.status == Status::Abandoned
+        || details.status == Status::FailedPendingEval)
         && let Some(ref reason) = details.failure_reason
     {
         println!("Failure reason: {}", reason);
+    }
+    if let Some(class) = details.failure_class {
+        println!("failure_class: {}", class);
+        use FailureClass::*;
+        let hint = match class {
+            ApiError400Document => {
+                "fix the input (malformed/encrypted PDF or document) before retry — do not auto-retry"
+            }
+            ApiError429RateLimit => "rate limit — back off and retry",
+            ApiError5xxTransient => "transient upstream error — retry is safe",
+            AgentHardTimeout => "agent exceeded hard timeout — split task or raise timeout",
+            AgentExitNonzero => "generic non-zero exit — inspect agent output for details",
+            WrapperInternal => "wrapper-side issue — inspect the wrapper log (output.log)",
+        };
+        println!("  hint: {}", hint);
     }
     if !details.superseded_by.is_empty() {
         println!("Superseded by: {}", details.superseded_by.join(", "));
@@ -855,6 +908,9 @@ fn print_human_readable(details: &TaskDetails) {
     if let Some(ref completed) = details.completed_at {
         println!("Completed: {}", completed);
     }
+    if let Some(ref last_interaction) = details.last_interaction_at {
+        println!("Last interaction: {}", last_interaction);
+    }
     if let Some(ref not_before) = details.not_before {
         println!("Not before: {}{}", not_before, format_countdown(not_before));
     }
@@ -916,23 +972,8 @@ fn print_human_readable(details: &TaskDetails) {
     if !details.evaluations.is_empty() {
         println!();
         println!("Evaluations:");
-        for eval in &details.evaluations {
-            println!(
-                "  Score: {:.2}  Source: {}  {}",
-                eval.score, eval.source, eval.timestamp
-            );
-            // Show key dimensions inline
-            if let Some(cf) = eval.dimensions.get("constraint_fidelity") {
-                let flag = if *cf < 0.5 {
-                    " \x1b[33m⚠ unanchored constraints\x1b[0m"
-                } else {
-                    ""
-                };
-                println!("    constraint_fidelity: {:.2}{}", cf, flag);
-            }
-            if let Some(f) = eval.dimensions.get("intent_fidelity") {
-                println!("    intent_fidelity:    {:.2}", f);
-            }
+        for line in format_evaluations(&details.evaluations) {
+            println!("{}", line);
         }
     }
 
@@ -949,6 +990,33 @@ fn print_human_readable(details: &TaskDetails) {
             println!("  {} {}{}", entry.timestamp, entry.message, actor_str);
         }
     }
+}
+
+/// Render evaluation entries with iteration labels so users grepping the
+/// output of `wg show` on a cycle task can tell which iteration produced which
+/// score. Every entry is labeled, including `[iter 0]` for non-cycle tasks —
+/// the label is uniform rather than conditional so log greps don't have to
+/// pattern-match around its absence.
+fn format_evaluations(evals: &[EvalSummary]) -> Vec<String> {
+    let mut out = Vec::with_capacity(evals.len());
+    for eval in evals {
+        out.push(format!(
+            "  [iter {}] Score: {:.2}  Source: {}  {}",
+            eval.loop_iteration, eval.score, eval.source, eval.timestamp
+        ));
+        if let Some(cf) = eval.dimensions.get("constraint_fidelity") {
+            let flag = if *cf < 0.5 {
+                " \x1b[33m⚠ unanchored constraints\x1b[0m"
+            } else {
+                ""
+            };
+            out.push(format!("    constraint_fidelity: {:.2}{}", cf, flag));
+        }
+        if let Some(f) = eval.dimensions.get("intent_fidelity") {
+            out.push(format!("    intent_fidelity:    {:.2}", f));
+        }
+    }
+    out
 }
 
 /// Format a timestamp as a countdown string if it's in the future, or "(elapsed)" if in the past.
@@ -1149,6 +1217,65 @@ mod tests {
         assert_eq!(Status::Blocked.to_string(), "blocked");
     }
 
+    /// Each evaluation line in `wg show` must include an iteration label so
+    /// users on a cycle task can tell iteration 1's stale score from iteration
+    /// 2's fresh one. Without the label, two distinct flip scores look
+    /// identical except for timestamps. See task tui-detail-view.
+    #[test]
+    fn test_format_evaluations_labels_each_iteration() {
+        let evals = vec![
+            EvalSummary {
+                score: 0.04,
+                source: "flip".to_string(),
+                dimensions: HashMap::new(),
+                timestamp: "2026-04-28T20:04:45Z".to_string(),
+                loop_iteration: 1,
+            },
+            EvalSummary {
+                score: 0.65,
+                source: "flip".to_string(),
+                dimensions: HashMap::new(),
+                timestamp: "2026-04-28T22:14:00Z".to_string(),
+                loop_iteration: 2,
+            },
+        ];
+
+        let lines = format_evaluations(&evals);
+        // Each evaluation produces its own labeled line — never just a single
+        // unlabeled "Score: 0.04" with no iteration context.
+        let iter1_line = lines
+            .iter()
+            .find(|l| l.contains("[iter 1]"))
+            .expect("iteration 1 line should be rendered with [iter 1] label");
+        let iter2_line = lines
+            .iter()
+            .find(|l| l.contains("[iter 2]"))
+            .expect("iteration 2 line should be rendered with [iter 2] label");
+        assert!(iter1_line.contains("0.04"));
+        assert!(iter2_line.contains("0.65"));
+    }
+
+    /// Non-cycle tasks should still get a uniform `[iter 0]` label rather than
+    /// no label, so downstream consumers don't have to special-case the
+    /// cycle-vs-non-cycle distinction when parsing.
+    #[test]
+    fn test_format_evaluations_labels_zero_iteration() {
+        let evals = vec![EvalSummary {
+            score: 0.91,
+            source: "llm".to_string(),
+            dimensions: HashMap::new(),
+            timestamp: "2026-04-28T18:00:00Z".to_string(),
+            loop_iteration: 0,
+        }];
+        let lines = format_evaluations(&evals);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("[iter 0]"),
+            "non-cycle eval should still carry [iter 0] label, got: {}",
+            lines[0]
+        );
+    }
+
     #[test]
     fn test_task_details_serialization() {
         let details = TaskDetails {
@@ -1174,11 +1301,13 @@ mod tests {
             created_at: Some("2026-01-20T15:35:50+00:00".to_string()),
             started_at: Some("2026-01-20T16:30:00+00:00".to_string()),
             completed_at: None,
+            last_interaction_at: None,
             not_before: None,
             log: vec![],
             retry_count: 0,
             max_retries: None,
             failure_reason: None,
+            failure_class: None,
             model: None,
             actual_executor: Some("native".to_string()),
             actual_model: Some("openrouter/minimax".to_string()),
@@ -1215,6 +1344,8 @@ mod tests {
             iteration_anchor: None,
             iteration_parent: None,
             iteration_config: None,
+            rescued: false,
+            meta_eval_attempts: 0,
             evaluations: vec![],
             worktree_state: None,
         };
@@ -1575,7 +1706,7 @@ mod tests {
             .unwrap();
 
         // Set up a graph with a task
-        let wg_dir = project.join(".workgraph");
+        let wg_dir = project.join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let mut graph = WorkGraph::new();
         let mut t = make_task("retried-task", "test");

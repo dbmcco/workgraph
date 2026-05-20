@@ -70,9 +70,9 @@ fn make_task(id: &str, title: &str, status: Status) -> Task {
     }
 }
 
-/// Create the .workgraph directory with a graph and return its path.
+/// Create the .wg directory with a graph and return its path.
 fn setup_workgraph(tmp: &TempDir, tasks: Vec<Task>) -> PathBuf {
-    let wg_dir = tmp.path().join(".workgraph");
+    let wg_dir = tmp.path().join(".wg");
     std::fs::create_dir_all(&wg_dir).unwrap();
     let graph_path = wg_dir.join("graph.jsonl");
     let mut graph = WorkGraph::new();
@@ -83,19 +83,19 @@ fn setup_workgraph(tmp: &TempDir, tasks: Vec<Task>) -> PathBuf {
     wg_dir
 }
 
-/// Load the current graph from the workgraph directory.
+/// Load the current graph from the WG directory.
 fn graph(wg_dir: &Path) -> WorkGraph {
     load_graph(wg_dir.join("graph.jsonl")).unwrap()
 }
 
-/// Save a registry into the workgraph service directory.
+/// Save a registry into the WG service directory.
 fn save_registry(wg_dir: &Path, registry: &AgentRegistry) {
     let service_dir = wg_dir.join("service");
     std::fs::create_dir_all(&service_dir).unwrap();
     registry.save(wg_dir).unwrap();
 }
 
-/// Load the registry from the workgraph service directory.
+/// Load the registry from the WG service directory.
 fn load_registry(wg_dir: &Path) -> AgentRegistry {
     AgentRegistry::load(wg_dir).unwrap()
 }

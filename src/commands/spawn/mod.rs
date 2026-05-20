@@ -5,7 +5,7 @@
 //!
 //! The spawn command:
 //! 1. Claims the task (fails if already claimed)
-//! 2. Loads executor config from .workgraph/executors/<name>.toml
+//! 2. Loads executor config from .wg/executors/<name>.toml
 //! 3. Starts the executor process with task context
 //! 4. Registers the agent in the registry
 //! 5. Prints agent info (ID, PID, output file)
@@ -13,6 +13,7 @@
 
 pub(crate) mod context;
 mod execution;
+pub mod raw_stream_classifier;
 pub(crate) mod worktree;
 
 use anyhow::{Context, Result};
@@ -300,8 +301,8 @@ mod tests {
 
         copy_dir_recursive(&project_root, dir).unwrap();
 
-        // Now create the graph file in the copied .workgraph directory
-        let wg_dir = dir.join(".workgraph");
+        // Now create the graph file in the copied .wg directory
+        let wg_dir = dir.join(".wg");
         let graph_path = wg_dir.join("graph.jsonl");
         let mut graph = WorkGraph::new();
         for task in &tasks {
@@ -405,8 +406,8 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
 
         // This will actually spawn a process
         let result = run(&workgraph_dir, &task_id, "shell", None, None, false);
@@ -432,8 +433,8 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Poll for the spawned process to create output file (up to 5s)
@@ -468,8 +469,8 @@ mod tests {
         task.verify = None; // Not verified, should use wg done
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
@@ -503,8 +504,8 @@ mod tests {
         task.verify = Some("manual".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
@@ -531,8 +532,8 @@ mod tests {
         task.exec = Some("exit 1".to_string()); // Will fail
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script was created in agents directory
@@ -559,8 +560,8 @@ mod tests {
         task.exec = Some(format!("wg done {}", task_id)); // Agent marks it done
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script detects if task already done by agent
@@ -584,8 +585,8 @@ mod tests {
         task.exec = Some("exit 42".to_string()); // Specific exit code
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script preserves exit code
@@ -607,8 +608,8 @@ mod tests {
         task.exec = Some("echo 'Agent output'".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script appends to output file
@@ -633,8 +634,8 @@ mod tests {
         task.exec = Some("true".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         // Check wrapper script suppresses wg command errors
@@ -681,8 +682,8 @@ mod tests {
         setup_graph(temp_dir.path(), vec![task]);
 
         // Spawn with explicit timeout
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", Some("5m"), None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -716,8 +717,8 @@ mod tests {
         setup_graph(temp_dir.path(), vec![task]);
 
         // Default config has agent_timeout = "30m", no explicit timeout
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -741,8 +742,8 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", Some("10m"), None, false).unwrap();
 
         let metadata_path = agent_output_dir(&workgraph_dir, "agent-1").join("metadata.json");
@@ -764,8 +765,8 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -792,7 +793,7 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -822,8 +823,8 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        // Pass the .workgraph subdirectory to run(), not the project root
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        // Pass the .wg subdirectory to run(), not the project root
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -842,8 +843,8 @@ mod tests {
             "Wrapper script must not auto-delete worktree branches"
         );
         assert!(
-            !script.contains(r#"rm -f "$WG_WORKTREE_PATH/.workgraph""#),
-            "Wrapper script must not remove the .workgraph symlink"
+            !script.contains(r#"rm -f "$WG_WORKTREE_PATH/.wg""#),
+            "Wrapper script must not remove the .wg symlink"
         );
     }
 
@@ -858,7 +859,7 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -871,6 +872,14 @@ mod tests {
         assert!(
             script.contains("touch \"$WG_WORKTREE_PATH/.wg-cleanup-pending\""),
             "Marker must be written inside the worktree, guarded by WG_WORKTREE_PATH"
+        );
+        assert!(
+            script.contains("CURRENT_DIR_REAL=$(pwd -P"),
+            "Wrapper must verify it is running inside WG_WORKTREE_PATH before cleanup"
+        );
+        assert!(
+            script.contains("Skipping worktree cleanup"),
+            "Wrapper must skip cleanup when WG_WORKTREE_PATH was inherited from a parent agent"
         );
     }
 
@@ -887,7 +896,7 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");
@@ -909,7 +918,7 @@ mod tests {
         task.exec = Some("echo hello".to_string());
         setup_graph(temp_dir.path(), vec![task]);
 
-        let workgraph_dir = temp_dir.path().join(".workgraph");
+        let workgraph_dir = temp_dir.path().join(".wg");
         run(&workgraph_dir, &task_id, "shell", None, None, false).unwrap();
 
         let wrapper_path = agent_output_dir(&workgraph_dir, "agent-1").join("run.sh");

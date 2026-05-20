@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use fuzzy_matcher::FuzzyMatcher;
@@ -15,12 +15,16 @@ use ratatui::layout::Rect;
 
 use crate::commands::viz::{VizOptions, VizOutput};
 use workgraph::config::Config;
-use workgraph::graph::{CycleAnalysis, Status, TokenUsage, format_tokens, parse_token_usage_live};
+use workgraph::graph::{
+    CycleAnalysis, Status, TokenUsage, format_tokens, parse_token_usage_live_cached,
+};
 use workgraph::models::load_model_choices;
 use workgraph::parser::load_graph;
 use workgraph::{AgentRegistry, AgentStatus};
 
 use edtui::{EditorEventHandler, EditorMode, EditorState};
+
+const CHAT_PTY_ACTIVITY_BUMP_DEBOUNCE: Duration = Duration::from_secs(5);
 
 pub fn new_emacs_editor() -> EditorState {
     let mut state = EditorState::default();
@@ -208,6 +212,21 @@ pub struct AnnotationClickFlash {
     pub start: Instant,
 }
 
+/// Override for which task fills the Detail inspector, decoupling it from
+/// `selected_task_idx`. Set when the user clicks a phase annotation
+/// (e.g. `[∴ evaluating]`) so the inspector shows the meta-task while the
+/// parent stays selected for graph trace highlighting. The pin auto-clears
+/// when the user navigates to a different parent (anchor mismatch) or via
+/// any user-driven selection change.
+#[derive(Clone, Debug)]
+pub struct HudPin {
+    /// Task ID to load into hud_detail (e.g. ".evaluate-foo").
+    pub dot_task_id: String,
+    /// The selected parent task ID at the moment the pin was set.
+    /// If `selected_task_id()` later differs from this, the pin is stale.
+    pub anchor_parent_id: String,
+}
+
 /// A single active flash-and-fade animation on a task.
 #[derive(Clone)]
 pub struct Animation {
@@ -281,7 +300,8 @@ fn flash_color_for_status(status: &Status) -> (u8, u8, u8) {
         Status::Abandoned => (140, 100, 160), // muted purple
         Status::Waiting | Status::PendingValidation => (60, 160, 220), // blue
         Status::PendingEval => (140, 230, 80), // chartreuse: between yellow (in-progress) and green (done)
-        Status::Incomplete => (255, 165, 0),   // orange
+        Status::FailedPendingEval => (210, 130, 70), // warm coral: between failed-red and pending-yellow
+        Status::Incomplete => (255, 165, 0),         // orange
     }
 }
 
@@ -815,6 +835,10 @@ pub enum InputMode {
     ChoiceDialog(ChoiceDialogState),
     /// Coordinator picker overlay (list of all coordinators).
     CoordinatorPicker,
+    /// Chat manager pane: list of all chat tasks with multi-select +
+    /// bulk-abandon, plus filter (all/empty/non-empty/alive).
+    /// See `ChatManagerState`. Triggered by uppercase `M` from the Chat tab.
+    ChatManager,
     /// Config panel text editing mode.
     ConfigEdit,
     /// Settings tab text editing mode (per-key edit dialog).
@@ -823,6 +847,42 @@ pub enum InputMode {
     ChatSearch,
     /// Full-pane coordinator launcher (replaces chat view area).
     Launcher,
+    /// Scroll mode on the active chat PTY pane (Ctrl+] toggle).
+    /// Inner PTY receives no input; arrow keys/PgUp/PgDn navigate scrollback.
+    ScrollMode { task_id: String },
+    /// Chat-exit confirmation: ask the user whether to leave chat tmux
+    /// sessions running (resume next launch) or close them (kill the
+    /// chat process, no resume). Triggered when the user requests quit
+    /// while one or more chat tmux sessions are alive.
+    ExitPrompt(ExitPromptState),
+}
+
+/// State for the chat-exit prompt that fires when the user quits the
+/// TUI with active chat tmux sessions. See task implement-tmux-wrapped
+/// for the design rationale (codex resume integrity vs clean-end UX).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitPromptState {
+    /// All live chat ids at the moment the prompt opened.
+    pub chats: Vec<u32>,
+    /// When `Some(i)`, the user picked "Select per-chat" and we are
+    /// currently prompting about chats[i]. The accumulated decisions
+    /// live in `per_chat_close`.
+    pub per_chat_idx: Option<usize>,
+    /// Per-chat close decision (true = close / kill tmux session).
+    /// Same length as `chats`; entries past `per_chat_idx` are stale
+    /// (default false until the user advances).
+    pub per_chat_close: Vec<bool>,
+}
+
+impl ExitPromptState {
+    pub fn new(chats: Vec<u32>) -> Self {
+        let n = chats.len();
+        Self {
+            chats,
+            per_chat_idx: None,
+            per_chat_close: vec![false; n],
+        }
+    }
 }
 
 /// What action the confirmation dialog is for.
@@ -870,6 +930,11 @@ pub struct FilterPicker {
     pub custom_active: bool,
     /// Custom value text buffer.
     pub custom_text: String,
+    /// Label for the custom row — defaults to "Custom" but the endpoint
+    /// picker overrides to "Custom URL" so users with no registered
+    /// endpoints see an obvious "drop a URL in here" affordance instead
+    /// of a generic "Custom" they have to guess about (fix-new-chat).
+    pub custom_label: String,
     /// Hint to show when items list is empty.
     pub empty_hint: String,
     /// First visible filtered-row index (for scroll-window rendering).
@@ -889,6 +954,7 @@ impl FilterPicker {
             allow_custom,
             custom_active: false,
             custom_text: String::new(),
+            custom_label: "Custom".to_string(),
             empty_hint: String::new(),
             scroll_offset: 0,
         }
@@ -896,6 +962,11 @@ impl FilterPicker {
 
     pub fn with_hint(mut self, hint: &str) -> Self {
         self.empty_hint = hint.to_string();
+        self
+    }
+
+    pub fn with_custom_label(mut self, label: &str) -> Self {
+        self.custom_label = label.to_string();
         self
     }
 
@@ -1030,39 +1101,132 @@ impl FilterPicker {
     }
 }
 
-/// Which section of the launcher pane has keyboard focus.
+/// Which mode the launcher is in.
+///
+/// The default state shows a tiny radio of preset (executor, model)
+/// combos — matching the user's repeatedly-stated preference for "just
+/// let me launch" with the common defaults. Picking the "+ Add new..."
+/// row flips the launcher into `AddNew` mode, which surfaces the full
+/// form (executor radio, model field, optional endpoint, name).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LauncherSection {
-    Name,
+pub enum LauncherMode {
+    Default,
+    AddNew,
+}
+
+/// Which field of the Add-new form has keyboard focus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AddNewField {
     Executor,
     Model,
     Endpoint,
-    Recent,
+    Name,
 }
 
-/// What a row in a launcher FilterPicker maps to when clicked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LauncherListHit {
-    /// Click selected the filtered list row at this index in `selected`-space.
-    Item(usize),
-    /// Click landed on the "Custom: ..." row (entry mode).
-    Custom,
+/// Which section of the launcher pane has keyboard focus.
+///
+/// Default mode focuses either the radio of presets or the optional
+/// Name field. Add-new mode focuses one of the AddNew form fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LauncherSection {
+    /// Default-mode radio: select a preset combo or "+ Add new..."
+    Defaults,
+    /// Optional chat name field (shown in both modes).
+    Name,
+    /// Add-new mode: focused on one of the AddNew form fields.
+    AddNew(AddNewField),
 }
+
+/// One preset combo offered in Default mode (e.g. codex:gpt-5.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LauncherPreset {
+    /// Internal executor handler name passed to `--executor` (e.g.
+    /// "claude", "codex"). Distinct from `label` for nex/native.
+    pub executor: String,
+    /// Model spec passed to `--model` (e.g. "claude:opus").
+    pub model: String,
+    /// Short user-facing label shown in the radio (e.g. "claude:opus").
+    pub label: String,
+    /// One-line description shown next to the label.
+    pub description: String,
+}
+
+/// Add-new form's executor radio choice.
+///
+/// `internal_executor` is what gets passed to `--executor`; `label` is
+/// what the user sees. Diverges only for the in-process nex handler,
+/// which the dispatch layer still calls "native".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddNewExecutorChoice {
+    pub label: &'static str,
+    pub internal_executor: &'static str,
+}
+
+/// The three executor options offered in Add-new mode.
+pub const ADD_NEW_EXECUTOR_CHOICES: &[AddNewExecutorChoice] = &[
+    AddNewExecutorChoice {
+        label: "claude",
+        internal_executor: "claude",
+    },
+    AddNewExecutorChoice {
+        label: "codex",
+        internal_executor: "codex",
+    },
+    AddNewExecutorChoice {
+        label: "nex",
+        internal_executor: "native",
+    },
+    AddNewExecutorChoice {
+        label: "Custom Command",
+        internal_executor: "command",
+    },
+];
 
 /// State for the full-pane coordinator launcher.
+///
+/// Two-mode design (redesign-new-chat 2026-04-30):
+///   * `Default` mode: ~10-line dialog with two preset radios
+///     (codex:gpt-5.5, claude:opus) plus a "+ Add new..." row.
+///   * `AddNew` mode: ~15-line form (executor radio + model + optional
+///     endpoint + name) revealed when the user picks "+ Add new...".
 #[derive(Clone, Debug)]
 pub struct LauncherState {
+    pub mode: LauncherMode,
     pub active_section: LauncherSection,
     pub name: String,
-    pub executor_list: Vec<(String, String, bool)>, // (name, description, available)
-    pub executor_selected: usize,
-    pub model_picker: FilterPicker,
-    pub endpoint_picker: FilterPicker,
-    pub recent_list: Vec<workgraph::launcher_history::HistoryEntry>,
-    pub recent_selected: usize,
-    /// Full unfiltered model catalog. The model_picker holds the
-    /// executor-filtered subset; we re-derive it on executor change.
-    pub all_models: Vec<(String, String)>,
+
+    // ── Default-mode state ──
+    /// Preset combos shown as radio rows. The "+ Add new..." row is
+    /// implicit (its index is `presets.len()`).
+    pub presets: Vec<LauncherPreset>,
+    /// Selected radio row, in `0..=presets.len()`. Equal to
+    /// `presets.len()` when "+ Add new..." is highlighted.
+    pub default_selected: usize,
+
+    // ── Add-new-mode state ──
+    /// Index into `ADD_NEW_EXECUTOR_CHOICES`.
+    pub add_executor_idx: usize,
+    /// User-typed model spec (free text).
+    pub add_model: String,
+    /// User-typed endpoint URL (free text). Only relevant when the
+    /// selected Add-new executor is `nex`.
+    pub add_endpoint: String,
+
+    // ── Status / IPC flags ──
+    /// True between Enter-to-launch and the IPC roundtrip completing.
+    /// Closes the input gate (no double-submit, no field edits) and
+    /// keeps the pane visible so we don't briefly fall back to the
+    /// previously-active chat while `wg service create-coordinator`
+    /// runs on the worker thread. Cleared in `drain_commands` —
+    /// success drops the launcher entirely; failure resets this flag
+    /// so the user can fix their selection and retry.
+    pub creating: bool,
+    /// Last provisioning error shown in the launcher pane when an IPC
+    /// roundtrip fails. Persists across re-renders so the user can see
+    /// what went wrong (bogus endpoint URL, vendor CLI missing, etc.) —
+    /// the toast alone disappears too quickly to read. Cleared on the
+    /// next successful submit attempt or when the launcher is closed.
+    pub last_error: Option<String>,
 }
 
 /// Return models, ordered for the given `executor` (compatible-first).
@@ -1077,7 +1241,132 @@ pub struct LauncherState {
 /// - `claude`  → put `claude:*` and `*claude*` ids first
 /// - `codex`   → put `openai:*` first
 /// - `gemini`  → put `google:*` first
-/// - `native`/`amplifier` → no reorder (all models work via OAI-compat)
+/// - `native` → no reorder (all models work via OAI-compat)
+/// Resolve the executor + model the TUI's auto-PTY launcher should use for
+/// chat `coordinator_id`. Per-chat overrides written by `wg chat create
+/// --executor <X> --model <M>` (stored in `CoordinatorState`) win over
+/// the global `[dispatcher].executor` / `[dispatcher].model`. Returns
+/// `(executor, model)` where `model` is `None` when no per-chat or
+/// global override is configured (the vendor CLI then runs with its own
+/// default).
+///
+/// Pure function (no &mut self) so unit tests can exercise it without
+/// constructing a full `VizViewer`. See
+/// `chat_launched_with_uses_per_chat_executor` for the regression lock.
+pub fn resolve_chat_pty_executor_and_model(
+    workgraph_dir: &std::path::Path,
+    config: &Config,
+    coordinator_id: u32,
+) -> (String, Option<String>) {
+    let coord_state =
+        crate::commands::service::CoordinatorState::load_for(workgraph_dir, coordinator_id);
+    let executor = coord_state
+        .as_ref()
+        .and_then(|s| s.executor_override.clone())
+        .unwrap_or_else(|| config.coordinator.effective_executor());
+    let model = coord_state
+        .as_ref()
+        .and_then(|s| s.model_override.clone())
+        .or_else(|| config.coordinator.model.clone());
+    (executor, model)
+}
+
+/// Build the argv for the TUI's interactive `codex` PTY chat pane.
+///
+/// The bypass flag (`--dangerously-bypass-approvals-and-sandbox`) is
+/// required: without it, codex prompts the user to approve every shell
+/// command (including `wg status`), so chat agents driven from the wg
+/// TUI cannot inspect the graph or call `wg add`. The user already
+/// authorized the chat agent implicitly by opening the TUI from their
+/// own terminal — same posture as the claude path
+/// (`--dangerously-skip-permissions`).
+///
+/// `prior_session_id` selects the resume strategy:
+/// - `Some(uuid)` → `codex resume <uuid>` (daemon-persisted session)
+/// - `None` + `pty_marker_exists=true` → `codex resume --last`
+/// - `None` + `pty_marker_exists=false` → fresh interactive session
+///
+/// `chat_model` is an optional model override (provider prefix is
+/// stripped — codex expects bare model ids).
+///
+/// `chat_dir` is the per-chat scratch directory (e.g.
+/// `<project>/.wg/chat/chat-0/`). It is NOT used as the spawn cwd —
+/// the spawn cwd is the project root, mirroring the claude chat path.
+/// We pass it via `--add-dir` so the agent can still write per-chat
+/// scratch files (chat history persistence, codex's `.codex-session-id`
+/// marker) without giving up project-root visibility.
+///
+/// The args also include `--no-alt-screen` (fix-pass-no): codex
+/// defaults to alternate-screen TUI mode, which the wg PTY emulator
+/// handles poorly (lost scrollback, stacked animation frames, fragile
+/// cursor-overwrite). `--no-alt-screen` switches codex to inline /
+/// line-streamed output — the same shape the claude chat path emits.
+pub fn build_codex_chat_pty_args(
+    prior_session_id: Option<&str>,
+    pty_marker_exists: bool,
+    chat_model: Option<&str>,
+    chat_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = if let Some(sid) = prior_session_id {
+        vec!["resume".to_string(), sid.to_string()]
+    } else if pty_marker_exists {
+        vec!["resume".to_string(), "--last".to_string()]
+    } else {
+        Vec::new()
+    };
+    // Always bypass approvals + sandbox: the user authorized the chat
+    // agent implicitly by opening the TUI. Without this, codex prompts
+    // the user for every `wg` command the chat agent runs and the
+    // agent cannot do its job. Mirrors the claude path's
+    // `--dangerously-skip-permissions`.
+    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    // Disable codex's alternate-screen TUI mode (fix-pass-no). Codex
+    // defaults to alt-screen, which loses scrollback (alt-screen
+    // content never enters the main buffer), stacks animation frames,
+    // and exercises cursor-overwrite paths our PTY emulator handles
+    // poorly. `--no-alt-screen` switches codex to inline / line-
+    // streamed output — the same mode the claude path emits, which
+    // our emulator handles cleanly.
+    args.push("--no-alt-screen".to_string());
+    if let Some(dir) = chat_dir {
+        args.push("--add-dir".to_string());
+        args.push(dir.display().to_string());
+    }
+    if let Some(m) = chat_model {
+        let spec = workgraph::config::parse_model_spec(m);
+        if !spec.model_id.is_empty() {
+            args.push("--model".to_string());
+            args.push(spec.model_id);
+        }
+    }
+    args
+}
+
+/// Build the argv for the TUI's interactive `wg nex` PTY chat pane.
+///
+/// The TUI/native path intentionally mirrors a user-launched nex REPL:
+/// `wg nex -m <model> -e <endpoint>`. Do not pass `--chat`, `--role`, or
+/// `--resume` here; those switch nex away from the normal rustyline stdin
+/// path or create a divergent session shape from the working CLI invocation.
+pub fn build_nex_chat_pty_args(chat_model: Option<&str>, endpoint: Option<&str>) -> Vec<String> {
+    let mut args = vec!["nex".to_string()];
+    if let Some(m) = chat_model.filter(|m| !m.is_empty()) {
+        let spec = workgraph::config::parse_model_spec(m);
+        let model = if spec.model_id.is_empty() {
+            m.to_string()
+        } else {
+            spec.model_id
+        };
+        args.push("-m".to_string());
+        args.push(model);
+    }
+    if let Some(ep) = endpoint.filter(|ep| !ep.is_empty()) {
+        args.push("-e".to_string());
+        args.push(ep.to_string());
+    }
+    args
+}
+
 pub fn filter_models_for_executor(
     all_models: &[(String, String)],
     executor: &str,
@@ -1102,137 +1391,148 @@ pub fn filter_models_for_executor(
 }
 
 impl LauncherState {
-    pub fn selected_executor(&self) -> &str {
-        self.executor_list
-            .get(self.executor_selected)
-            .map(|(name, _, _)| name.as_str())
-            .unwrap_or("claude")
+    /// Built-in default presets shown in Default mode. Two combos:
+    /// codex:gpt-5.5 and claude:opus. Order is significant — the
+    /// initially-selected row is index 0 (codex per spec).
+    pub fn default_presets() -> Vec<LauncherPreset> {
+        vec![
+            LauncherPreset {
+                executor: "codex".to_string(),
+                model: "codex:gpt-5.5".to_string(),
+                label: "codex:gpt-5.5".to_string(),
+                description: "OpenAI Codex CLI (gpt-5.5)".to_string(),
+            },
+            LauncherPreset {
+                executor: "claude".to_string(),
+                model: "claude:opus".to_string(),
+                label: "claude:opus".to_string(),
+                description: "Claude CLI (Opus)".to_string(),
+            },
+        ]
     }
 
-    /// Rebuild `model_picker.items` for the current executor.
-    /// Preserves filter text + custom_text but resets selection + scroll.
-    pub fn refresh_model_filter_for_executor(&mut self) {
-        let executor = self.selected_executor().to_string();
-        let new_items = filter_models_for_executor(&self.all_models, &executor);
-        let preserved_filter = self.model_picker.filter.clone();
-        let preserved_custom = self.model_picker.custom_text.clone();
-        let hint = self.model_picker.empty_hint.clone();
-        let allow_custom = self.model_picker.allow_custom;
-        let mut new_picker = FilterPicker::new(new_items, allow_custom);
-        new_picker.empty_hint = hint;
-        new_picker.filter = preserved_filter;
-        new_picker.custom_text = preserved_custom;
-        new_picker.apply_filter();
-        self.model_picker = new_picker;
+    /// True when the highlighted Default-mode row is "+ Add new...".
+    pub fn is_add_new_highlighted(&self) -> bool {
+        self.default_selected >= self.presets.len()
     }
 
-    /// Move the executor cursor by `delta` (positive = down) and refresh
-    /// the model list. Returns true if executor selection changed.
-    pub fn select_executor(&mut self, idx: usize) -> bool {
-        if idx >= self.executor_list.len() || idx == self.executor_selected {
-            return false;
-        }
-        self.executor_selected = idx;
-        self.refresh_model_filter_for_executor();
-        true
+    /// The preset at the currently-highlighted Default-mode row, or
+    /// `None` when "+ Add new..." is highlighted.
+    pub fn highlighted_preset(&self) -> Option<&LauncherPreset> {
+        self.presets.get(self.default_selected)
     }
 
-    pub fn show_endpoint(&self) -> bool {
-        self.selected_executor() == "native"
+    /// The Add-new executor choice currently selected in the radio.
+    pub fn add_executor_choice(&self) -> &'static AddNewExecutorChoice {
+        ADD_NEW_EXECUTOR_CHOICES
+            .get(self.add_executor_idx)
+            .unwrap_or(&ADD_NEW_EXECUTOR_CHOICES[0])
     }
 
-    pub fn selected_model(&self) -> Option<String> {
-        self.model_picker.value()
+    /// In Add-new mode: whether the Endpoint field is shown. Only true
+    /// when the selected executor is `nex` — claude and codex auth
+    /// themselves and have no endpoint to specify.
+    pub fn add_new_show_endpoint(&self) -> bool {
+        self.add_executor_choice().label == "nex"
     }
 
-    pub fn selected_endpoint(&self) -> Option<String> {
-        if !self.show_endpoint() {
-            return None;
-        }
-        self.endpoint_picker.value()
+    /// Switch the launcher into Add-new mode. Resets the form fields so
+    /// stale state from a previous open doesn't bleed through.
+    pub fn enter_add_new(&mut self) {
+        self.mode = LauncherMode::AddNew;
+        self.add_executor_idx = 0;
+        self.add_model.clear();
+        self.add_endpoint.clear();
+        self.active_section = LauncherSection::AddNew(AddNewField::Executor);
     }
 
-    // Backward-compat accessors used by event.rs Recent-entry population
-    pub fn select_model_by_id(&mut self, id: &str) {
-        self.model_picker.filter.clear();
-        self.model_picker.apply_filter();
-        self.model_picker.custom_active = false;
-        if let Some(pos) = self
-            .model_picker
-            .filtered_indices
-            .iter()
-            .position(|&i| self.model_picker.items[i].0 == id)
-        {
-            self.model_picker.selected = pos;
-        } else {
-            self.model_picker.custom_text = id.to_string();
-            self.model_picker.selected = self.model_picker.filtered_indices.len();
-        }
-    }
-
-    pub fn select_endpoint_by_value(&mut self, val: &str) {
-        self.endpoint_picker.filter.clear();
-        self.endpoint_picker.apply_filter();
-        self.endpoint_picker.custom_active = false;
-        if let Some(pos) = self
-            .endpoint_picker
-            .filtered_indices
-            .iter()
-            .position(|&i| self.endpoint_picker.items[i].1 == val)
-        {
-            self.endpoint_picker.selected = pos;
-        } else {
-            self.endpoint_picker.custom_text = val.to_string();
-            self.endpoint_picker.selected = self.endpoint_picker.filtered_indices.len();
-        }
-    }
-
+    /// Cycle to the next form field. Default mode toggles between the
+    /// preset radio and the Name field. Add-new mode walks
+    /// Executor → Model → [Endpoint when nex] → Name → Executor.
     pub fn next_section(&mut self) {
-        self.active_section = match self.active_section {
-            LauncherSection::Name => LauncherSection::Executor,
-            LauncherSection::Executor => LauncherSection::Model,
-            LauncherSection::Model => {
-                if self.show_endpoint() {
-                    LauncherSection::Endpoint
-                } else if !self.recent_list.is_empty() {
-                    LauncherSection::Recent
+        self.active_section = match (&self.mode, &self.active_section) {
+            (LauncherMode::Default, LauncherSection::Defaults) => LauncherSection::Name,
+            (LauncherMode::Default, LauncherSection::Name) => LauncherSection::Defaults,
+            (LauncherMode::Default, LauncherSection::AddNew(_)) => LauncherSection::Defaults,
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Executor)) => {
+                LauncherSection::AddNew(AddNewField::Model)
+            }
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Model)) => {
+                if self.add_new_show_endpoint() {
+                    LauncherSection::AddNew(AddNewField::Endpoint)
                 } else {
-                    LauncherSection::Name
+                    LauncherSection::AddNew(AddNewField::Name)
                 }
             }
-            LauncherSection::Endpoint => {
-                if !self.recent_list.is_empty() {
-                    LauncherSection::Recent
-                } else {
-                    LauncherSection::Name
-                }
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Endpoint)) => {
+                LauncherSection::AddNew(AddNewField::Name)
             }
-            LauncherSection::Recent => LauncherSection::Name,
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Name)) => {
+                LauncherSection::AddNew(AddNewField::Executor)
+            }
+            (LauncherMode::AddNew, _) => LauncherSection::AddNew(AddNewField::Executor),
         };
     }
 
+    /// Cycle to the previous form field — inverse of `next_section`.
     pub fn prev_section(&mut self) {
-        self.active_section = match self.active_section {
-            LauncherSection::Name => {
-                if !self.recent_list.is_empty() {
-                    LauncherSection::Recent
-                } else if self.show_endpoint() {
-                    LauncherSection::Endpoint
+        self.active_section = match (&self.mode, &self.active_section) {
+            (LauncherMode::Default, LauncherSection::Defaults) => LauncherSection::Name,
+            (LauncherMode::Default, LauncherSection::Name) => LauncherSection::Defaults,
+            (LauncherMode::Default, LauncherSection::AddNew(_)) => LauncherSection::Defaults,
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Executor)) => {
+                LauncherSection::AddNew(AddNewField::Name)
+            }
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Model)) => {
+                LauncherSection::AddNew(AddNewField::Executor)
+            }
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Endpoint)) => {
+                LauncherSection::AddNew(AddNewField::Model)
+            }
+            (LauncherMode::AddNew, LauncherSection::AddNew(AddNewField::Name)) => {
+                if self.add_new_show_endpoint() {
+                    LauncherSection::AddNew(AddNewField::Endpoint)
                 } else {
-                    LauncherSection::Model
+                    LauncherSection::AddNew(AddNewField::Model)
                 }
             }
-            LauncherSection::Executor => LauncherSection::Name,
-            LauncherSection::Model => LauncherSection::Executor,
-            LauncherSection::Endpoint => LauncherSection::Model,
-            LauncherSection::Recent => {
-                if self.show_endpoint() {
-                    LauncherSection::Endpoint
-                } else {
-                    LauncherSection::Model
-                }
-            }
+            (LauncherMode::AddNew, _) => LauncherSection::AddNew(AddNewField::Executor),
         };
+    }
+
+    /// Resolve the (executor, model, endpoint) tuple that Launch will
+    /// dispatch with. Returns `None` when "+ Add new..." is highlighted
+    /// in Default mode (the caller should switch into Add-new mode
+    /// rather than try to launch nothing) or when Add-new is missing
+    /// a required field (model).
+    pub fn resolved_launch_args(&self) -> Option<(String, Option<String>, Option<String>)> {
+        match self.mode {
+            LauncherMode::Default => {
+                let preset = self.presets.get(self.default_selected)?;
+                Some((preset.executor.clone(), Some(preset.model.clone()), None))
+            }
+            LauncherMode::AddNew => {
+                let executor = self.add_executor_choice().internal_executor.to_string();
+                let model_trimmed = self.add_model.trim();
+                if model_trimmed.is_empty() {
+                    return None;
+                }
+                if executor == "command" {
+                    return Some((executor, Some(model_trimmed.to_string()), None));
+                }
+                let endpoint = if self.add_new_show_endpoint() {
+                    let trimmed = self.add_endpoint.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                } else {
+                    None
+                };
+                Some((executor, Some(model_trimmed.to_string()), endpoint))
+            }
+        }
     }
 }
 
@@ -1262,6 +1562,91 @@ pub struct CoordinatorPickerState {
     pub entries: Vec<(u32, String, String, bool)>,
 }
 
+/// Filter mode for the chat manager pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatManagerFilter {
+    /// Show every chat task except those tagged `archived`.
+    All,
+    /// Hide chats whose history file is missing or has zero messages.
+    NonEmpty,
+    /// Show only chats with zero messages — the typical bulk-cleanup target.
+    EmptyOnly,
+    /// Hide chats whose underlying task is already in a terminal state
+    /// (Done/Abandoned/Failed). Useful for "what's still alive".
+    AliveOnly,
+}
+
+impl ChatManagerFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::NonEmpty => "non-empty",
+            Self::EmptyOnly => "empty",
+            Self::AliveOnly => "alive",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::NonEmpty,
+            Self::NonEmpty => Self::EmptyOnly,
+            Self::EmptyOnly => Self::AliveOnly,
+            Self::AliveOnly => Self::All,
+        }
+    }
+}
+
+/// One row in the chat manager pane.
+#[derive(Clone, Debug)]
+pub struct ChatManagerEntry {
+    /// Numeric chat coordinator id.
+    pub cid: u32,
+    /// Resolved task id (e.g. `.chat-3`, `.coordinator-3`, or `.coordinator`).
+    pub task_id: String,
+    /// Lower-case status label (open, in-progress, done, abandoned, ...).
+    pub status: String,
+    /// True iff the underlying task is in a terminal state.
+    pub terminal: bool,
+    /// Number of persisted chat messages on disk.
+    pub message_count: usize,
+    /// ISO 8601 timestamp of the last log entry on the chat task, if any.
+    pub last_activity: Option<String>,
+    /// Task title.
+    pub title: String,
+}
+
+/// State for the chat manager pane (bulk cleanup of chat tasks).
+///
+/// Per fix-tui-chat: the user accumulated many empty `.chat-N` tasks and
+/// needs a list view with multi-select + bulk-abandon to clean them up.
+#[derive(Clone, Debug)]
+pub struct ChatManagerState {
+    pub entries: Vec<ChatManagerEntry>,
+    /// Index of the currently highlighted row (post-filter).
+    pub selected: usize,
+    /// Set of `cid`s the user has marked for bulk action via Space.
+    pub multi_selected: std::collections::HashSet<u32>,
+    /// Active filter (cycles via `f` key).
+    pub filter: ChatManagerFilter,
+}
+
+impl ChatManagerState {
+    /// Indices into `entries` that pass the current filter, in original order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| match self.filter {
+                ChatManagerFilter::All => true,
+                ChatManagerFilter::NonEmpty => e.message_count > 0,
+                ChatManagerFilter::EmptyOnly => e.message_count == 0,
+                ChatManagerFilter::AliveOnly => !e.terminal,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
 /// What kind of entry a tab bar hit represents.
 #[derive(Clone, Debug)]
 pub enum TabBarEntryKind {
@@ -1288,6 +1673,15 @@ pub struct CoordinatorTabHit {
 /// Column range for the [+] button in the coordinator tab bar.
 #[derive(Clone, Debug, Default)]
 pub struct CoordinatorPlusHit {
+    pub start: u16,
+    pub end: u16,
+}
+
+/// Column range for the off-screen-tabs scroll arrows (◀ / ▶) in the
+/// coordinator tab bar. `start == end` means the arrow is not currently
+/// rendered (no overflow on that side).
+#[derive(Clone, Debug, Default)]
+pub struct CoordinatorArrowHit {
     pub start: u16,
     pub end: u16,
 }
@@ -1412,7 +1806,7 @@ pub struct ChatState {
     pub deferred_user_indices: Vec<usize>,
     /// Whether the service coordinator is currently active.
     pub coordinator_active: bool,
-    /// Pending attachments for the next message (file paths, already stored in .workgraph/attachments/).
+    /// Pending attachments for the next message (file paths, already stored in .wg/attachments/).
     pub pending_attachments: Vec<PendingAttachment>,
     /// Total rendered lines (set each frame by renderer, for scrollbar dragging).
     pub total_rendered_lines: usize,
@@ -1529,7 +1923,7 @@ impl Default for ChatState {
 pub struct PendingAttachment {
     /// Display filename (e.g. "screenshot.png").
     pub filename: String,
-    /// Relative path to the stored copy (e.g. ".workgraph/attachments/20260303-...png").
+    /// Relative path to the stored copy (e.g. ".wg/attachments/20260303-...png").
     pub stored_path: String,
     /// MIME type.
     pub mime_type: String,
@@ -1602,6 +1996,18 @@ struct PersistedChatMessage {
 /// Uses `chat-history-{cid}.jsonl` for all coordinators.
 fn chat_history_path(workgraph_dir: &std::path::Path, coordinator_id: u32) -> std::path::PathBuf {
     workgraph_dir.join(format!("chat-history-{}.jsonl", coordinator_id))
+}
+
+/// Count persisted chat messages for a given coordinator id by counting
+/// non-empty lines in the JSONL history file. Returns 0 if the file is
+/// missing or unreadable. Used by the chat manager pane for the
+/// "empty / non-empty" filter.
+fn count_chat_messages(workgraph_dir: &std::path::Path, coordinator_id: u32) -> usize {
+    let path = chat_history_path(workgraph_dir, coordinator_id);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    content.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 /// Path to the legacy JSON array chat history file (for backward-compat migration).
@@ -2148,6 +2554,37 @@ pub struct DashboardCoordinatorCard {
     pub max_agents: usize,
     pub model: Option<String>,
     pub accumulated_tokens: u64,
+}
+
+/// Resolved spawn config for the embedded chat PTY pane, captured up
+/// front but not executed until the render path knows the actual chat
+/// message area dimensions. Spawning at the right size eliminates the
+/// SIGWINCH reflow on first resize that would otherwise echo wrap-mismatched
+/// content into vt100 scrollback.
+#[derive(Clone, Debug)]
+pub struct PendingChatPtySpawn {
+    pub task_id: String,
+    pub bin: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<PathBuf>,
+    pub executor: String,
+    /// When `Some`, route this spawn through tmux: the chat process
+    /// runs inside the named session and survives TUI exit. None falls
+    /// back to plain `spawn_in` (used when tmux is not on PATH).
+    pub tmux_session: Option<String>,
+}
+
+/// Info recorded when a chat agent PTY process exits unexpectedly.
+/// Displayed in the chat tab instead of the normal "chat agent not active" placeholder.
+#[derive(Clone, Debug)]
+pub struct ChatAgentDeathInfo {
+    /// Human-readable exit status, e.g. "exit code 1".
+    pub exit_status: String,
+    /// Executor type that was running, e.g. "claude", "nex", "codex".
+    pub executor: String,
+    /// Full spawn command (bin + args) for display in the error panel.
+    pub spawn_cmd: String,
 }
 
 /// State for the Dashboard panel tab.
@@ -2758,6 +3195,7 @@ impl HistoryBrowserState {
 }
 
 /// Live JSONL stream state for a single agent.
+#[derive(Default, Clone)]
 pub struct AgentStreamInfo {
     /// File position (byte offset) — resume reading from here.
     pub file_offset: u64,
@@ -2767,6 +3205,184 @@ pub struct AgentStreamInfo {
     pub latest_snippet: Option<String>,
     /// Whether the latest event was a tool use (vs text).
     pub latest_is_tool: bool,
+}
+
+impl AgentStreamInfo {
+    /// Parse one JSONL line from an agent's output.log and update self.
+    /// Extracted from `update_agent_streams` so per-agent tail threads can
+    /// call it off the main render thread (fix-tui-perf-2 fix 6).
+    fn process_jsonl_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            return;
+        }
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match msg_type {
+            "assistant" => {
+                self.message_count += 1;
+                if let Some(content) = val
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match block_type {
+                            "text" => {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    let trimmed = text.trim();
+                                    if !trimmed.is_empty() {
+                                        let snippet = trimmed.lines().last().unwrap_or(trimmed);
+                                        let snippet = if snippet.len() > 120 {
+                                            format!(
+                                                "{}…",
+                                                &snippet[..snippet.floor_char_boundary(120)]
+                                            )
+                                        } else {
+                                            snippet.to_string()
+                                        };
+                                        self.latest_snippet = Some(snippet);
+                                        self.latest_is_tool = false;
+                                    }
+                                }
+                            }
+                            "tool_use" => {
+                                let name =
+                                    block.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let detail = match name {
+                                    "Bash" => block
+                                        .get("input")
+                                        .and_then(|i| i.get("command"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|c| {
+                                            let c = c.trim();
+                                            if c.len() > 80 {
+                                                format!(
+                                                    "{name}: {}…",
+                                                    &c[..c.floor_char_boundary(80)]
+                                                )
+                                            } else {
+                                                format!("{name}: {c}")
+                                            }
+                                        }),
+                                    "Read" | "Write" | "Edit" => block
+                                        .get("input")
+                                        .and_then(|i| i.get("file_path"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|p| format!("{name}: {p}")),
+                                    "Grep" => block
+                                        .get("input")
+                                        .and_then(|i| i.get("pattern"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|p| format!("{name}: {p}")),
+                                    "Glob" => block
+                                        .get("input")
+                                        .and_then(|i| i.get("pattern"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|p| format!("{name}: {p}")),
+                                    _ => None,
+                                };
+                                self.latest_snippet =
+                                    Some(detail.unwrap_or_else(|| name.to_string()));
+                                self.latest_is_tool = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "turn" => {
+                self.message_count += 1;
+                if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match block_type {
+                            "text" => {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                    let trimmed = text.trim();
+                                    if !trimmed.is_empty() {
+                                        let snippet = trimmed.lines().last().unwrap_or(trimmed);
+                                        let snippet = if snippet.len() > 120 {
+                                            format!(
+                                                "{}…",
+                                                &snippet[..snippet.floor_char_boundary(120)]
+                                            )
+                                        } else {
+                                            snippet.to_string()
+                                        };
+                                        self.latest_snippet = Some(snippet);
+                                        self.latest_is_tool = false;
+                                    }
+                                }
+                            }
+                            "tool_use" => {
+                                let name =
+                                    block.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                self.latest_snippet = Some(name.to_string());
+                                self.latest_is_tool = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "tool_call" => {
+                let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let detail = match name {
+                    "Bash" | "bash" => val
+                        .get("input")
+                        .and_then(|i| i.get("command"))
+                        .and_then(|v| v.as_str())
+                        .map(|c| {
+                            let c = c.trim();
+                            if c.len() > 80 {
+                                format!("{name}: {}…", &c[..c.floor_char_boundary(80)])
+                            } else {
+                                format!("{name}: {c}")
+                            }
+                        }),
+                    "Read" | "Write" | "Edit" => val
+                        .get("input")
+                        .and_then(|i| i.get("file_path"))
+                        .and_then(|v| v.as_str())
+                        .map(|p| format!("{name}: {p}")),
+                    "Grep" | "Glob" => val
+                        .get("input")
+                        .and_then(|i| i.get("pattern"))
+                        .and_then(|v| v.as_str())
+                        .map(|p| format!("{name}: {p}")),
+                    _ => None,
+                };
+                self.latest_snippet = Some(detail.unwrap_or_else(|| name.to_string()));
+                self.latest_is_tool = true;
+            }
+            "user" | "result" => {
+                self.message_count += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Per-agent tail-thread handle. Holds the shared `AgentStreamInfo` updated
+/// from a background thread that incrementally reads the agent's output.log,
+/// plus a stop flag for clean shutdown when the agent goes inactive.
+///
+/// Spawned once per active agent in `update_agent_streams`. Replaces the
+/// previous main-thread JSONL parsing loop (diagnose-tui-scales hot path #4 —
+/// update_agent_streams ran serialized with the chat-PTY render).
+pub struct AgentTailHandle {
+    pub info: std::sync::Arc<std::sync::Mutex<AgentStreamInfo>>,
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Joined when the handle is dropped (best-effort; the thread observes
+    /// `stop` and exits within `TAIL_POLL_INTERVAL`).
+    pub _handle: std::thread::JoinHandle<()>,
 }
 
 /// A single phase in the agency lifecycle (assignment, execution, or evaluation).
@@ -2866,7 +3482,7 @@ pub enum LogViewMode {
     /// Pretty-printed full transcript: every event rendered with its own
     /// formatter, NOT a JSON dump.
     RawPretty,
-    /// Workgraph-level log entries only: `wg log` writes, dispatcher
+    /// WG-level log entries only: `wg log` writes, dispatcher
     /// status updates, and task lifecycle transitions sourced from the
     /// task's `log` field on the graph. NO LLM stream content.
     WgLog,
@@ -3201,6 +3817,133 @@ pub fn parse_raw_stream_line(line: &str, default_agent_id: &str) -> Option<Agent
             }
             None
         }
+        // ── Codex CLI stream events (`codex exec --json`) ───────────────────
+        // Codex emits JSONL with a different shape than claude. The notable
+        // ones are `item.completed` (final form of an item, with output) and
+        // `item.started` (in-progress, no output yet). We only surface
+        // `item.completed` to keep events de-duplicated — matching codex's
+        // own streaming-text vs finalized-message races (mirror of the
+        // streaming/finalized pairing the native PTY-doubling fix handled).
+        // Bookkeeping events (`thread.started`, `turn.started`, `turn.completed`)
+        // are swallowed so they don't pollute the live pane.
+        "thread.started" | "turn.started" | "turn.completed" => None,
+        "item.started" | "item.updated" => None,
+        "item.completed" => {
+            let item = val.get("item")?;
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match item_type {
+                "agent_message" => {
+                    let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(AgentStreamEvent {
+                        kind: AgentStreamEventKind::TextOutput,
+                        agent_id: default_agent_id.to_string(),
+                        summary: text.to_string(),
+                        details: Some(EventDetails::TextOutput {
+                            text: text.to_string(),
+                        }),
+                    })
+                }
+                "command_execution" => {
+                    let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    let output = item
+                        .get("aggregated_output")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let exit_code = item.get("exit_code").and_then(|v| v.as_i64());
+                    let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_error = status == "failed" || matches!(exit_code, Some(c) if c != 0);
+                    let cmd_trimmed = command.trim();
+                    let cmd_display = if cmd_trimmed.len() > 120 {
+                        format!("{}…", &cmd_trimmed[..cmd_trimmed.floor_char_boundary(120)])
+                    } else {
+                        cmd_trimmed.to_string()
+                    };
+                    let call_summary = if cmd_display.is_empty() {
+                        "⌁ Bash".to_string()
+                    } else {
+                        format!("⌁ Bash → {}", cmd_display)
+                    };
+                    let output_trimmed = output.trim();
+                    let summary = if output_trimmed.is_empty() {
+                        // Even with no output captured, embed a status marker
+                        // so the renderer paints the leading ✓ / ✗ — otherwise
+                        // a successful no-output codex command (e.g. `mv a b`)
+                        // looks "in flight" forever.
+                        let prefix = if is_error { "✗" } else { "✓" };
+                        format!("{}\n  {} (no output)", call_summary, prefix)
+                    } else {
+                        let preview = if output_trimmed.len() > 100 {
+                            format!(
+                                "{}…",
+                                &output_trimmed[..output_trimmed.floor_char_boundary(100)]
+                            )
+                        } else {
+                            output_trimmed.to_string()
+                        };
+                        let prefix = if is_error { "✗" } else { "✓" };
+                        format!("{}\n  {} {}", call_summary, prefix, preview)
+                    };
+                    Some(AgentStreamEvent {
+                        kind: if is_error {
+                            AgentStreamEventKind::Error
+                        } else {
+                            AgentStreamEventKind::ToolCall
+                        },
+                        agent_id: default_agent_id.to_string(),
+                        summary,
+                        details: Some(EventDetails::ToolCall {
+                            name: "Bash".to_string(),
+                            input: serde_json::json!({ "command": command }),
+                        }),
+                    })
+                }
+                "reasoning" => {
+                    let text = item
+                        .get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let truncated = if text.len() > 200 {
+                        format!("{}…", &text[..text.floor_char_boundary(200)])
+                    } else {
+                        text.to_string()
+                    };
+                    Some(AgentStreamEvent {
+                        kind: AgentStreamEventKind::Thinking,
+                        agent_id: default_agent_id.to_string(),
+                        summary: format!("💭 {}", truncated),
+                        details: Some(EventDetails::Thinking {
+                            text: text.to_string(),
+                        }),
+                    })
+                }
+                _ => None,
+            }
+        }
+        "error" | "turn.failed" => {
+            let message = val
+                .get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| val.get("error").and_then(|v| v.as_str()))
+                .unwrap_or("codex error");
+            Some(AgentStreamEvent {
+                kind: AgentStreamEventKind::Error,
+                agent_id: default_agent_id.to_string(),
+                summary: format!("✗ {}", message),
+                details: Some(EventDetails::ToolResult {
+                    content: message.to_string(),
+                    is_error: true,
+                }),
+            })
+        }
         _ => None,
     }
 }
@@ -3216,6 +3959,11 @@ pub struct LogPaneState {
     /// Which of the four view modes is active. Cycled by pressing `4`
     /// while the Log pane is focused: events → high-level → raw → wg-log → events.
     pub view_mode: LogViewMode,
+    /// In RawPretty view, when true, long multi-line bodies (tool result
+    /// content, assistant text, etc.) collapse to head + elision marker
+    /// + tail. Toggled with `s` while the Log pane is active.
+    /// In-session only — does not persist across TUI restarts.
+    pub summary_mode: bool,
     /// Cached rendered log lines for the currently selected task.
     pub rendered_lines: Vec<String>,
     /// Task ID these lines were rendered for (to detect staleness).
@@ -3246,6 +3994,7 @@ impl Default for LogPaneState {
             auto_tail: true,
             json_mode: false,
             view_mode: LogViewMode::Events,
+            summary_mode: false,
             rendered_lines: Vec::new(),
             task_id: None,
             viewport_height: 0,
@@ -4179,12 +4928,18 @@ pub struct FuzzyLineMatch {
 
 /// Main application state for the viz viewer.
 pub struct VizApp {
-    /// Path to the workgraph directory.
+    /// Path to the WG directory.
     pub workgraph_dir: PathBuf,
     /// Viz options passed from CLI (--all, --status, --critical-path, etc.).
     viz_options: VizOptions,
     /// Whether the app should quit on next loop iteration.
     pub should_quit: bool,
+    /// Set true once the user has resolved the chat-exit prompt for the
+    /// current quit attempt. Prevents the intercept from re-opening the
+    /// prompt after the user has chosen "leave all" or "close all".
+    /// Reset whenever input_mode becomes Normal again (so a *cancelled*
+    /// exit still triggers the prompt on the next quit attempt).
+    pub exit_prompt_resolved: bool,
 
     // ── Viz content ──
     /// Raw lines from `wg viz` output (may contain ANSI color codes).
@@ -4224,7 +4979,7 @@ pub struct VizApp {
     pub cycle_timing: Vec<CycleTimingEntry>,
 
     // ── Token display toggle ──
-    /// When true, show total workgraph token usage; when false, show visible-tasks only.
+    /// When true, show total WG token usage; when false, show visible-tasks only.
     pub show_total_tokens: bool,
 
     // ── Help overlay ──
@@ -4306,6 +5061,15 @@ pub struct VizApp {
     pub coordinator_tab_hits: Vec<CoordinatorTabHit>,
     /// Hit area for the [+] button in the coordinator tab bar.
     pub coordinator_plus_hit: CoordinatorPlusHit,
+    /// Index of the first visible tab in the combined coordinator + user-board
+    /// tab list. When the bar overflows, tabs before this index are hidden
+    /// behind a `◀` indicator. The renderer auto-adjusts this so the active
+    /// tab is always visible.
+    pub chat_tab_scroll_offset: usize,
+    /// Hit area for the left scroll arrow (◀) in the coordinator tab bar.
+    pub coordinator_left_arrow_hit: CoordinatorArrowHit,
+    /// Hit area for the right scroll arrow (▶) in the coordinator tab bar.
+    pub coordinator_right_arrow_hit: CoordinatorArrowHit,
     /// The message input area from the last render frame (for click-to-type).
     pub last_message_input_area: Rect,
 
@@ -4365,6 +5129,12 @@ pub struct VizApp {
     pub annotation_hit_regions: Vec<AnnotationHitRegion>,
     /// Active annotation click flash (for visual feedback). Clears after 500ms.
     pub annotation_click_flash: Option<AnnotationClickFlash>,
+    /// When set, `load_hud_detail()` loads `dot_task_id` instead of the
+    /// currently-selected task. Used to keep the meta-task (e.g.
+    /// `.evaluate-foo`) visible in the inspector after the user clicked
+    /// its `[∴ evaluating]` annotation, surviving graph-refresh ticks
+    /// that would otherwise reset the inspector to the parent task.
+    pub hud_pin: Option<HudPin>,
     /// Set of task IDs in the same SCC as the currently selected task.
     /// Empty if the selected task is not in any cycle.
     pub cycle_set: HashSet<String>,
@@ -4431,24 +5201,27 @@ pub struct VizApp {
     pub last_launcher_area: Rect,
     /// Hit area for the launcher's Name field (single line).
     pub launcher_name_hit: Rect,
-    /// Per-row hit areas for executor list: (executor_idx, row Rect).
-    pub launcher_executor_hits: Vec<(usize, Rect)>,
-    /// Per-row hit areas for model list: (LauncherListHit, row Rect).
-    pub launcher_model_hits: Vec<(LauncherListHit, Rect)>,
-    /// Bounding area of the model picker rows (for scroll-wheel routing).
-    pub launcher_model_list_area: Rect,
-    /// Per-row hit areas for endpoint list: (LauncherListHit, row Rect).
-    pub launcher_endpoint_hits: Vec<(LauncherListHit, Rect)>,
-    /// Bounding area of the endpoint picker rows (for scroll-wheel routing).
-    pub launcher_endpoint_list_area: Rect,
-    /// Per-row hit areas for recent list: (recent_idx, row Rect).
-    pub launcher_recent_hits: Vec<(usize, Rect)>,
+    /// Per-row hit areas for Default-mode preset radio rows. The
+    /// "+ Add new..." row is included as the trailing entry; its
+    /// `usize` payload equals `presets.len()`.
+    pub launcher_default_hits: Vec<(usize, Rect)>,
+    /// Per-row hit areas for Add-new mode executor radio (claude /
+    /// codex / nex). The `usize` is the index into
+    /// `ADD_NEW_EXECUTOR_CHOICES`.
+    pub launcher_add_executor_hits: Vec<(usize, Rect)>,
+    /// Hit area for the Add-new mode Model text field.
+    pub launcher_add_model_hit: Rect,
+    /// Hit area for the Add-new mode Endpoint text field. Empty when
+    /// the selected executor is not nex (the field isn't rendered).
+    pub launcher_add_endpoint_hit: Rect,
     /// Hit area for the [Launch] button in the launcher footer.
     pub launcher_launch_btn_hit: Rect,
     /// Hit area for the [Cancel] button in the launcher footer.
     pub launcher_cancel_btn_hit: Rect,
     /// State for the coordinator picker overlay.
     pub coordinator_picker: Option<CoordinatorPickerState>,
+    /// State for the chat manager pane (bulk-cleanup of chat tasks).
+    pub chat_manager: Option<ChatManagerState>,
 
     // ── Text prompt ──
     /// Text prompt input buffer (for fail reason, message, etc.)
@@ -4481,6 +5254,17 @@ pub struct VizApp {
     /// Phase 3 of docs/design/sessions-as-identity-rollout.md.
     pub task_panes: std::collections::HashMap<String, crate::tui::pty_pane::PtyPane>,
 
+    /// Most recent `bytes_processed` count seen per `task_panes` entry,
+    /// captured at the end of each redraw. The event loop's idle-poll
+    /// branch consults `chat_pty_has_new_bytes()` to decide whether to
+    /// redraw — a PTY child emitting bytes between user keypresses
+    /// (e.g. codex's animation frames, claude's streaming output) MUST
+    /// trigger a redraw or the user sees a stalled UI even though the
+    /// reader thread is parsing bytes (fix-codex-chat-3, "real-time
+    /// animations don't render"). One u64 per pane keeps memory flat;
+    /// entries are pruned alongside `task_panes` on pane drop.
+    pub task_pane_last_bytes_seen: std::collections::HashMap<String, u64>,
+
     /// When true, the Chat tab renders PTY output for the active
     /// coordinator's task instead of the file-tailing ChatMessage
     /// widgets. Toggle with Ctrl+T in the Chat tab.
@@ -4499,16 +5283,46 @@ pub struct VizApp {
     /// Phase 3c of sessions-as-identity-rollout.md.
     pub chat_pty_takeover_pending_since: Option<std::time::Instant>,
 
+    /// Last graph timestamp bump caused by embedded chat PTY activity.
+    /// Child output can stream many times per second, so this keeps activity
+    /// sorting responsive without re-sorting on every terminal frame.
+    pub last_chat_pty_activity_bump: Option<std::time::Instant>,
+
     /// When true, keystrokes in the Chat tab forward to the embedded
     /// PTY child's stdin instead of the TUI's chat composer. Set for
     /// all PTY executors (native, claude, codex) — they all run
     /// interactive REPLs that read from stdin.
     pub chat_pty_forwards_stdin: bool,
 
+    /// Resolved spawn config for the chat PTY pane, captured by
+    /// `maybe_auto_enable_chat_pty` and consumed by the render path
+    /// at the first frame that knows the actual chat message area.
+    /// Spawning lazily at the correct dimensions avoids the SIGWINCH
+    /// reflow that would otherwise produce wrap-mismatched echoes in
+    /// scrollback when the user opens a chat tab with multi-screen
+    /// history (fix-pty-scrollback).
+    pub pending_chat_pty_spawn: Option<PendingChatPtySpawn>,
+
+    /// Per-coordinator death info: set when a chat agent PTY exits unexpectedly.
+    /// Cleared by the user pressing R (retry), X (dismiss), or E (edit config).
+    pub chat_agent_death: HashMap<u32, ChatAgentDeathInfo>,
+    /// Per-coordinator last spawn info (executor, spawn_cmd), recorded at
+    /// successful spawn so the death panel can display it when the pane exits.
+    pub chat_last_spawn_info: HashMap<u32, (String, String)>,
+
     // ── Agent monitor state ──
     pub agent_monitor: AgentMonitorState,
-    /// Per-agent JSONL stream state for live activity feed.
+    /// Per-agent JSONL stream state for live activity feed. Snapshot copy
+    /// of the data maintained by `agent_stream_tails` background threads;
+    /// refreshed by `update_agent_streams` (a cheap clone per active agent
+    /// instead of a full re-read of every output.log on the main thread).
     pub agent_streams: HashMap<String, AgentStreamInfo>,
+    /// Per-agent background tail threads that incrementally parse each
+    /// active agent's output.log. Spawned lazily when an agent first goes
+    /// Working; reaped (stop flag set, info dropped) when the agent's
+    /// status leaves Working. Decouples agent-stream parsing from the main
+    /// render loop (fix-tui-perf-2 fix 6 / diagnose hot path #4).
+    pub agent_stream_tails: HashMap<String, AgentTailHandle>,
 
     // ── Service health indicator ──
     pub service_health: ServiceHealthState,
@@ -4552,6 +5366,26 @@ pub struct VizApp {
     /// Cached coordinator message status per task ID (TUI-perspective read state).
     /// Refreshed each graph reload. Used to color the Messages tab header.
     pub task_message_statuses: HashMap<String, workgraph::messages::CoordinatorMessageStatus>,
+
+    /// Cached per-task (status-priority, interaction-sort-key) tuple used by
+    /// `apply_sort_mode` for the StatusGrouped path. Populated in
+    /// `load_stats_from_graph` (which already has the graph in hand) so the
+    /// sort path does NOT need to re-deserialize graph.jsonl on every event.
+    /// Eliminates the second full graph load identified as diagnose hot
+    /// path #2 (state.rs:7815-7835 in the diagnose's snapshot).
+    pub sort_status_map: HashMap<String, (u8, String)>,
+
+    /// Timestamp of the most recent heavy graph-reload tick (the
+    /// load_viz_from_graph + load_stats_from_graph + per-tab reload
+    /// pipeline driven by an fs-watcher event). Throttle window is
+    /// [`HEAVY_REFRESH_THROTTLE`]. Without this throttle, 8 simultaneously
+    /// active agents writing output.log at sub-100ms cadence would fire
+    /// the fs-watcher's 5ms debounce 20-50 times/sec, and each tick
+    /// re-deserialized the multi-MB graph.jsonl (diagnose hot path:
+    /// 60-87% sustained CPU, chat-input lag 200-300ms). Cap the heavy
+    /// pipeline at ~5 fps so fs-event burstiness no longer scales the
+    /// visible CPU cost or starves the chat-PTY render.
+    pub last_heavy_refresh_at: Option<Instant>,
 
     // ── Config panel state (panel 5) ──
     pub config_panel: ConfigPanelState,
@@ -4598,6 +5432,16 @@ pub struct VizApp {
     // ── Sort mode ──
     /// Current sort mode for task ordering in the graph view.
     pub sort_mode: SortMode,
+
+    // ── Sort debounce ──
+    /// Timestamp of the most recent `apply_sort_mode` call. Used to throttle
+    /// sort re-application when the graph file changes faster than the user
+    /// can read. Without this, every state-change event triggers a re-sort
+    /// which yanks tasks past the viewport.
+    pub last_sort_apply: Option<Instant>,
+    /// Set when a graph reload requested a sort but the debounce window had
+    /// not elapsed; flushed by `maybe_refresh` once the window passes.
+    pub pending_sort_apply: bool,
 
     // ── Smart-follow ──
     /// Whether the user was at/near the bottom of the viewport before the last refresh.
@@ -4677,8 +5521,15 @@ pub struct VizApp {
     #[allow(dead_code)]
     pub last_log_new_output_area: Rect,
 
-    /// Hit-test area for the ◀ ▶ iteration navigation arrows in the Detail tab header.
+    /// Hit-test area for the entire iteration navigation bar in the Detail tab header.
+    /// Used to short-circuit pass-through to other detail-tab handlers.
     pub last_iter_nav_area: Rect,
+    /// Hit-test area for the "previous iteration" segment of the Detail tab nav bar.
+    /// Always at least 3 cells wide when visible so mouse precision isn't required.
+    pub iter_nav_prev_zone: Rect,
+    /// Hit-test area for the "next iteration" segment of the Detail tab nav bar.
+    /// Always at least 3 cells wide when visible.
+    pub iter_nav_next_zone: Rect,
 
     // ── Touch echo (click/touch visual feedback) ──
     /// Whether touch echo indicators are enabled (toggled with `*`).
@@ -4693,8 +5544,26 @@ pub struct VizApp {
 
     pub editor_handler: EditorEventHandler,
 
-    // ── Frame counter (for animations) ──
-    pub tick_count: u64,
+    // ── Render-path graph caches ──
+    /// Cached `(cid, label)` entries for the chat tab bar — refreshed in
+    /// `maybe_refresh()` whenever the graph reloads. The chat-tab renderer
+    /// reads this instead of calling `active_tab_ids_and_labels()` per frame
+    /// (which would re-parse `graph.jsonl` 10-40 times/sec under animation).
+    pub cached_chat_tab_entries: Vec<(u32, String)>,
+    /// Cached `(task_id, label)` entries for user-board tabs — refreshed in
+    /// `maybe_refresh()` alongside `cached_chat_tab_entries`. Pairs with the
+    /// chat-tab renderer's tab-bar build.
+    pub cached_user_board_entries: Vec<(String, String)>,
+    /// Map of cid → canonical task id (`.chat-N` for new chats, `.coordinator-N`
+    /// for legacy graphs) from the most recently loaded graph. Used by
+    /// `rebuild_active_tab_entries_from_cache()` to recompute
+    /// `cached_chat_tab_entries` after `active_tabs` mutations (close_tab,
+    /// sync_active_tabs_from_graph) without touching disk. Storing canonical
+    /// labels here is what lets the chat-tab renderer keep the muted-gray
+    /// treatment for legacy `.coordinator-N` ids — losing the label would
+    /// always coerce to `.chat-N` and the deprecation styling would silently
+    /// stop firing.
+    cached_coordinator_id_set: std::collections::HashMap<u32, String>,
 
     // ── Live refresh ──
     /// Last observed modification time of graph.jsonl.
@@ -4707,9 +5576,15 @@ pub struct VizApp {
     refresh_interval: std::time::Duration,
 
     // ── File system watcher (for real-time streaming) ──
-    /// Flag set by the background file watcher when `.workgraph/` content changes.
+    /// Flag set by the background file watcher when `.wg/` content changes.
     /// Checked and cleared by `maybe_refresh()` to trigger immediate panel reloads.
     pub fs_change_pending: Arc<AtomicBool>,
+    /// Flag set by the background file watcher when a file under
+    /// `.wg/messages/` (excluding `.cursors/`) changes. Drives a viz
+    /// reload so per-task message indicators and the right-panel Msg tab
+    /// indicator update promptly after `wg msg send` — graph.jsonl is not
+    /// touched by message writes, so the graph-mtime check alone misses them.
+    pub messages_change_pending: Arc<AtomicBool>,
     /// Keep the watcher alive for the lifetime of the app.
     _fs_watcher: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
     /// Last mtime of the messages file for the currently-viewed task.
@@ -4728,6 +5603,9 @@ pub struct VizApp {
     /// Set by the fast path when graph.jsonl changes but the full viz wasn't reloaded.
     /// Checked by the slow path to ensure the viz reload isn't skipped.
     graph_viz_stale: bool,
+    /// True after a graph change has requested an async graph reload and before
+    /// that freshly loaded graph has been applied to the visible TUI state.
+    graph_reload_pending: bool,
 
     // ── Event tracing ──
     /// When `Some`, records all input events to a JSONL file for replay.
@@ -4739,6 +5617,19 @@ pub struct VizApp {
     /// Recent key presses for the feedback overlay, with timestamps.
     /// Newest entries at the back.
     pub key_feedback: VecDeque<(String, Instant)>,
+
+    // ── Theme ──
+    /// Whether the TUI should render for a light terminal background.
+    /// Set from `tui.color_theme = "light"` in config.
+    pub is_light_theme: bool,
+
+    // ── Background filesystem service ──
+    /// Owns a worker thread that performs all heavy disk I/O (graph.jsonl
+    /// reads, stat() calls for the fs watcher, streaming-text reads, chat
+    /// interaction bumps). The main thread reads cached values and
+    /// dispatches refreshes via channels — it never blocks on disk, even
+    /// on a high-latency filesystem (NFS, sshfs). See task `fix-tui-must`.
+    pub async_fs: super::async_fs::AsyncFs,
 }
 
 /// Scroll state for a 2D viewport.
@@ -4780,6 +5671,7 @@ impl VizApp {
             workgraph_dir,
             viz_options,
             should_quit: false,
+            exit_prompt_resolved: false,
             lines: Vec::new(),
             plain_lines: Vec::new(),
             search_lines: Vec::new(),
@@ -4835,6 +5727,9 @@ impl VizApp {
             last_coordinator_bar_area: Rect::default(),
             coordinator_tab_hits: Vec::new(),
             coordinator_plus_hit: CoordinatorPlusHit::default(),
+            chat_tab_scroll_offset: 0,
+            coordinator_left_arrow_hit: CoordinatorArrowHit::default(),
+            coordinator_right_arrow_hit: CoordinatorArrowHit::default(),
             last_message_input_area: Rect::default(),
             last_text_prompt_area: Rect::default(),
             last_dialog_area: Rect::default(),
@@ -4856,6 +5751,7 @@ impl VizApp {
             sticky_annotations: HashMap::new(),
             annotation_hit_regions: Vec::new(),
             annotation_click_flash: None,
+            hud_pin: None,
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
@@ -4888,15 +5784,14 @@ impl VizApp {
             launcher: None,
             last_launcher_area: Rect::default(),
             launcher_name_hit: Rect::default(),
-            launcher_executor_hits: Vec::new(),
-            launcher_model_hits: Vec::new(),
-            launcher_model_list_area: Rect::default(),
-            launcher_endpoint_hits: Vec::new(),
-            launcher_endpoint_list_area: Rect::default(),
-            launcher_recent_hits: Vec::new(),
+            launcher_default_hits: Vec::new(),
+            launcher_add_executor_hits: Vec::new(),
+            launcher_add_model_hit: Rect::default(),
+            launcher_add_endpoint_hit: Rect::default(),
             launcher_launch_btn_hit: Rect::default(),
             launcher_cancel_btn_hit: Rect::default(),
             coordinator_picker: None,
+            chat_manager: None,
             text_prompt: TextPromptState {
                 editor: new_emacs_editor(),
             },
@@ -4908,12 +5803,18 @@ impl VizApp {
             history_depth_override,
             no_history,
             task_panes: HashMap::new(),
+            task_pane_last_bytes_seen: HashMap::new(),
             chat_pty_mode: false,
             chat_pty_observer: false,
             chat_pty_takeover_pending_since: None,
+            last_chat_pty_activity_bump: None,
             chat_pty_forwards_stdin: false,
+            pending_chat_pty_spawn: None,
+            chat_agent_death: HashMap::new(),
+            chat_last_spawn_info: HashMap::new(),
             agent_monitor: AgentMonitorState::default(),
             agent_streams: HashMap::new(),
+            agent_stream_tails: HashMap::new(),
             service_health: ServiceHealthState::default(),
             last_service_badge_area: Rect::default(),
             vitals: VitalsState::default(),
@@ -4929,6 +5830,8 @@ impl VizApp {
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
             task_message_statuses: HashMap::new(),
+            sort_status_map: HashMap::new(),
+            last_heavy_refresh_at: None,
             config_panel: ConfigPanelState::default(),
             settings_panel: SettingsPanelState::default(),
             archive_browser: ArchiveBrowserState::default(),
@@ -4943,6 +5846,8 @@ impl VizApp {
             prev_agent_statuses: HashMap::new(),
             last_tab_press: None,
             sort_mode: SortMode::Chronological,
+            last_sort_apply: None,
+            pending_sort_apply: false,
             smart_follow_active: true,
             initial_load: true,
             splash_animations: HashMap::new(),
@@ -4973,16 +5878,21 @@ impl VizApp {
             last_panel_hscrollbar_area: Rect::default(),
             last_log_new_output_area: Rect::default(),
             last_iter_nav_area: Rect::default(),
+            iter_nav_prev_zone: Rect::default(),
+            iter_nav_next_zone: Rect::default(),
             touch_echo_enabled: false,
             touch_echoes: Vec::new(),
             has_keyboard_enhancement: false,
             editor_handler: create_editor_handler(),
-            tick_count: 0,
+            cached_chat_tab_entries: Vec::new(),
+            cached_user_board_entries: Vec::new(),
+            cached_coordinator_id_set: std::collections::HashMap::new(),
             last_graph_mtime: graph_mtime,
             last_refresh: Instant::now(),
             last_refresh_display: chrono::Local::now().format("%H:%M:%S").to_string(),
             refresh_interval: std::time::Duration::from_secs(1),
             fs_change_pending: Arc::new(AtomicBool::new(false)),
+            messages_change_pending: Arc::new(AtomicBool::new(false)),
             _fs_watcher: None,
             last_messages_mtime: None,
             last_daemon_log_mtime: None,
@@ -4991,16 +5901,26 @@ impl VizApp {
             last_detail_output_mtime: None,
             hud_follow: false,
             graph_viz_stale: false,
+            graph_reload_pending: false,
             tracer: None,
             key_feedback_enabled: false,
             key_feedback: VecDeque::new(),
+            is_light_theme: config.tui.color_theme == "light",
+            async_fs: super::async_fs::AsyncFs::new(),
         };
         app.start_fs_watcher();
-        // Load graph once for both viz and stats on startup.
+        // Load graph once for both viz and stats on startup. This is the
+        // ONLY synchronous disk read in the TUI startup path — once the
+        // app is running, all graph reloads go through `app.async_fs`.
+        // Seeding the cache here means the first frame renders with real
+        // data instead of an empty placeholder.
         let graph_path = app.workgraph_dir.join("graph.jsonl");
+        app.async_fs.seed_stat(graph_path.clone(), graph_mtime);
         if let Ok(graph) = load_graph(&graph_path) {
             app.load_viz_from_graph(&graph);
             app.load_stats_from_graph(&graph);
+            app.refresh_chat_tab_caches(&graph);
+            app.async_fs.seed_graph(graph, graph_mtime);
         } else {
             app.load_viz();
             app.load_stats();
@@ -5038,8 +5958,15 @@ impl VizApp {
 
     /// Apply a viz result (shared implementation for load_viz and load_viz_from_graph).
     fn apply_viz_result(&mut self, viz_result: Result<VizOutput>) {
-        // Smart-follow: snapshot whether the user is at the bottom before reloading.
-        let was_at_bottom = self.smart_follow_active || self.initial_load;
+        // Smart-follow: check whether the user is at the exact bottom before reloading.
+        // Use strict (no +3 slack) so users who scrolled near-but-not-at the bottom
+        // are not dragged along by new content appended below them.
+        let was_at_bottom = self.scroll.is_at_bottom_strict() || self.initial_load;
+        // Top-follow: if the user is watching the top of the graph, keep the
+        // viewport pinned there even if rows are inserted above the selected
+        // task. This must outrank the selected-task relative anchor below,
+        // otherwise the old selected task pulls the viewport down.
+        let was_at_top = self.scroll.is_at_top() || self.initial_load;
 
         // Anchor on the selected task's RELATIVE position within the viewport.
         // This keeps the task visually stable even when lines shift above it.
@@ -5213,10 +6140,10 @@ impl VizApp {
                 // Re-apply the current sort mode so task_order reflects the
                 // user's selected ordering (e.g. StatusGrouped) immediately,
                 // rather than staying in raw viz line order until the next
-                // manual sort-cycle.  This prevents new tasks from briefly
-                // appearing at their dependency position before jumping to
-                // their correct sorted position on the next refresh.
-                self.apply_sort_mode();
+                // manual sort-cycle. Routed through the debounce path so a
+                // burst of graph events doesn't trigger a re-sort per event
+                // (which yanked the viewport in the previous fix).
+                self.request_sort_apply();
 
                 // Preserve selection by task ID (not index) across refreshes.
                 // The task_order may have changed, so resolve the old ID to
@@ -5292,26 +6219,9 @@ impl VizApp {
                     // First load: scroll to top so tasks are visible immediately.
                     self.scroll.go_top();
                     self.initial_load = false;
-                } else if was_system_toggle {
-                    // System task visibility toggled — preserve scroll
-                    // position relative to the selected task (instant
-                    // show/hide, no centering jump).
-                    let anchored = old_relative_pos.and_then(|rel_pos| {
-                        let id = new_selected_id.as_ref()?;
-                        let new_orig_line = *self.node_line_map.get(id)?;
-                        let new_visible_pos = self.original_to_visible(new_orig_line)?;
-                        let raw = new_visible_pos as isize - rel_pos;
-                        let clamped = raw.max(0) as usize;
-                        Some(clamped)
-                    });
-                    if let Some(new_offset) = anchored {
-                        self.scroll.offset_y = new_offset;
-                        self.scroll.clamp();
-                    } else {
-                        self.scroll.offset_y = old_offset_y;
-                        self.scroll.clamp();
-                        self.scroll_to_selected_task();
-                    }
+                } else if was_at_top {
+                    // Top-anchor: user was watching newest/top-of-graph rows.
+                    self.scroll.go_top();
                 } else if was_at_bottom && !new_task_focused {
                     // Smart-follow: user was at the bottom, keep them there.
                     self.scroll.go_bottom();
@@ -5337,8 +6247,16 @@ impl VizApp {
                         self.scroll_to_selected_task();
                     }
                 } else if new_task_focused {
-                    // New task appeared — defer centering until render sets viewport_height.
-                    self.needs_center_on_selected = true;
+                    // Sticky viewport policy for new tasks.
+                    // If the user is anchored at the top (offset_y == 0), keep them
+                    // there — top-anchor wins over the focus pull.
+                    // Otherwise, use a gentle comfort-zone scroll (scroll_to_selected_task)
+                    // deferred to render time. That function is a no-op when the task is
+                    // already on-screen, so the viewport only moves when the new task is
+                    // genuinely off-screen.
+                    if self.scroll.offset_y != 0 {
+                        self.needs_scroll_into_view = true;
+                    }
                 } else {
                     // Selection changed (different task) — only scroll if off-screen.
                     self.needs_scroll_into_view = true;
@@ -5435,6 +6353,7 @@ impl VizApp {
             Some(i) => i - 1,
             None => 0,
         };
+        self.hud_pin = None;
         self.selected_task_idx = Some(idx);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5452,6 +6371,7 @@ impl VizApp {
             Some(i) => i + 1,
             None => 0,
         };
+        self.hud_pin = None;
         self.selected_task_idx = Some(idx);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5467,6 +6387,7 @@ impl VizApp {
             Some(i) => i.saturating_sub(n),
             None => 0,
         };
+        self.hud_pin = None;
         self.selected_task_idx = Some(idx);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5483,6 +6404,7 @@ impl VizApp {
             Some(i) => (i + n).min(last),
             None => 0,
         };
+        self.hud_pin = None;
         self.selected_task_idx = Some(idx);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5494,6 +6416,7 @@ impl VizApp {
         if self.task_order.is_empty() {
             return;
         }
+        self.hud_pin = None;
         self.selected_task_idx = Some(0);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5505,6 +6428,7 @@ impl VizApp {
         if self.task_order.is_empty() {
             return;
         }
+        self.hud_pin = None;
         self.selected_task_idx = Some(self.task_order.len() - 1);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5749,6 +6673,11 @@ impl VizApp {
             Some(i) => i,
             None => return false,
         };
+        // User-driven selection change always invalidates any pinned meta-task
+        // override. Annotation-click handlers re-set `hud_pin` after this call
+        // returns; text-body / chat-node clicks leave it cleared so the
+        // inspector falls back to the parent task.
+        self.hud_pin = None;
         self.selected_task_idx = Some(idx);
         self.recompute_trace();
         self.sync_coordinator_from_selection();
@@ -5877,6 +6806,7 @@ impl VizApp {
         // to see their fresh work.  The splash animation (registered earlier
         // in refresh_data) provides an additional visual highlight.
         if let Some(idx) = self.task_order.iter().position(|id| id == &task_id) {
+            self.hud_pin = None;
             self.selected_task_idx = Some(idx);
             self.recompute_trace();
             self.sync_coordinator_from_selection();
@@ -6463,7 +7393,9 @@ impl VizApp {
         };
         let mut task_token_map: HashMap<String, TokenUsage> = HashMap::new();
 
-        // Build a map of agent_id -> live token usage for in-progress agents
+        // Build a map of agent_id -> live token usage for in-progress agents.
+        // Uses the (path, mtime)-keyed cache so a no-op refresh is one
+        // metadata syscall per agent instead of a full JSONL parse.
         let mut live_agent_usage: HashMap<String, TokenUsage> = HashMap::new();
         if let Ok(registry) = AgentRegistry::load(&self.workgraph_dir) {
             for (id, agent) in &registry.agents {
@@ -6471,7 +7403,7 @@ impl VizApp {
                     continue;
                 }
                 let path = std::path::Path::new(&agent.output_file);
-                if let Some(usage) = parse_token_usage_live(path) {
+                if let Some(usage) = parse_token_usage_live_cached(path) {
                     live_agent_usage.insert(id.clone(), usage);
                 }
             }
@@ -6497,7 +7429,10 @@ impl VizApp {
                     Status::Open | Status::Incomplete => counts.open += 1,
                     Status::Failed => counts.failed += 1,
                     Status::Blocked | Status::Waiting => counts.blocked += 1,
-                    Status::InProgress | Status::PendingValidation | Status::PendingEval => {
+                    Status::InProgress
+                    | Status::PendingValidation
+                    | Status::PendingEval
+                    | Status::FailedPendingEval => {
                         unreachable!("handled by is_active branch")
                     }
                 }
@@ -6757,12 +7692,40 @@ impl VizApp {
             self.cycle_timing = entries;
         }
 
-        // Refresh coordinator message statuses for all tasks.
+        // Refresh coordinator message statuses for all tasks. Uses the cached
+        // single-pass reader so this O(N-tasks) loop is free on no-op refreshes
+        // and avoids the second JSONL parse the standalone function would do.
         self.task_message_statuses = graph
             .tasks()
             .filter_map(|t| {
-                workgraph::messages::coordinator_message_status(&self.workgraph_dir, &t.id)
+                workgraph::messages::coordinator_message_status_cached(&self.workgraph_dir, &t.id)
                     .map(|s| (t.id.clone(), s))
+            })
+            .collect();
+
+        // Build the StatusGrouped sort key map from the in-memory graph so
+        // `apply_sort_mode` does not need to re-load graph.jsonl from disk
+        // on every event. Mirrors the priority assignment in
+        // apply_sort_mode's StatusGrouped branch — kept identical so a
+        // refactor to consolidate the two would be a no-op.
+        self.sort_status_map = graph
+            .tasks()
+            .map(|t| {
+                let priority = match t.status {
+                    Status::InProgress => 0,
+                    Status::Failed => 1,
+                    Status::Open => 2,
+                    Status::Blocked => 3,
+                    Status::Done => 4,
+                    Status::Abandoned => 5,
+                    Status::Waiting | Status::PendingValidation => 3,
+                    Status::PendingEval | Status::FailedPendingEval => 0,
+                    Status::Incomplete => 1,
+                };
+                (
+                    t.id.clone(),
+                    (priority, t.interaction_sort_key().to_string()),
+                )
             })
             .collect();
 
@@ -6770,24 +7733,44 @@ impl VizApp {
         self.enforce_animation_cap();
     }
 
-    /// Start a background file watcher on the `.workgraph/` directory.
+    /// Start a background file watcher on the `.wg/` directory.
     /// Sets `fs_change_pending` flag when any file changes, which triggers
-    /// immediate panel reloads in `maybe_refresh()`.
+    /// immediate panel reloads in `maybe_refresh()`. Also sets
+    /// `messages_change_pending` when a message file (under `messages/`,
+    /// excluding the `.cursors/` subdir) changes, since `wg msg send` writes
+    /// only there and doesn't bump graph.jsonl mtime — the message indicator
+    /// would otherwise stay stale until something else mutates the graph.
     fn start_fs_watcher(&mut self) {
         use notify_debouncer_mini::new_debouncer;
         use std::time::Duration;
 
         let flag = self.fs_change_pending.clone();
+        let messages_flag = self.messages_change_pending.clone();
+        let messages_dir = self.workgraph_dir.join("messages");
+        let cursors_segment = std::ffi::OsString::from(".cursors");
         // 5ms debounce: just enough to coalesce a burst of events
         // from one write (inotify can fire twice per append on some
         // filesystems), not so much that the user perceives lag.
         // On a chat write, we want the TUI to react within a single
         // frame (16ms @ 60Hz), and 5ms leaves plenty of headroom.
-        let debouncer = new_debouncer(Duration::from_millis(5), move |res| {
-            if let Ok(_events) = res {
-                flag.store(true, Ordering::Relaxed);
-            }
-        });
+        let debouncer = new_debouncer(
+            Duration::from_millis(5),
+            move |res: notify_debouncer_mini::DebounceEventResult| {
+                if let Ok(events) = res {
+                    flag.store(true, Ordering::Relaxed);
+                    let touched_messages = events.iter().any(|e| {
+                        e.path.starts_with(&messages_dir)
+                            && !e
+                                .path
+                                .components()
+                                .any(|c| c.as_os_str() == cursors_segment.as_os_str())
+                    });
+                    if touched_messages {
+                        messages_flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+        );
 
         match debouncer {
             Ok(mut debouncer) => {
@@ -6806,18 +7789,107 @@ impl VizApp {
         }
     }
 
+    fn apply_loaded_graph_refresh(
+        &mut self,
+        graph: &workgraph::graph::WorkGraph,
+        graph_mtime: Option<SystemTime>,
+    ) {
+        self.graph_reload_pending = false;
+        self.graph_viz_stale = false;
+        self.last_graph_mtime = graph_mtime;
+        self.last_heavy_refresh_at = Some(Instant::now());
+
+        let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
+        let prev_hud_scroll = self.hud_scroll;
+        let prev_hud_follow = self.hud_follow;
+
+        self.smart_follow_active = self.scroll.is_at_bottom();
+        self.load_viz_from_graph(graph);
+        if !self.search_input.is_empty() {
+            self.rerun_search();
+        }
+        self.load_stats_from_graph(graph);
+        self.refresh_chat_tab_caches(graph);
+        self.load_agent_monitor();
+        self.update_agent_streams();
+        if self.right_panel_tab == RightPanelTab::Firehose {
+            self.update_firehose();
+        }
+        if self.right_panel_tab == RightPanelTab::Output {
+            self.update_output_pane();
+        }
+        if self.right_panel_tab == RightPanelTab::Log {
+            self.update_log_output();
+            self.update_log_stream_events();
+        }
+        self.invalidate_hud();
+        self.load_hud_detail();
+        if prev_hud_task.is_some()
+            && prev_hud_task == self.hud_detail.as_ref().map(|d| d.task_id.clone())
+        {
+            if prev_hud_follow {
+                self.hud_scroll = usize::MAX;
+            } else {
+                self.hud_scroll = prev_hud_scroll;
+            }
+        }
+        if self.right_panel_tab == RightPanelTab::Log {
+            self.invalidate_log_pane();
+            self.load_log_pane();
+        }
+        if self.right_panel_tab == RightPanelTab::Agency {
+            self.invalidate_agency_lifecycle();
+            self.load_agency_lifecycle();
+        }
+        if self.right_panel_tab == RightPanelTab::Files
+            && let Some(ref mut fb) = self.file_browser
+        {
+            fb.refresh();
+        }
+        if self.right_panel_tab == RightPanelTab::CoordLog {
+            self.load_coord_log();
+            self.load_activity_feed();
+        }
+    }
+
     /// Check if the graph has changed on disk and refresh if needed.
     /// Returns `true` if any work was done (graph reloaded, service polled, etc.).
     pub fn maybe_refresh(&mut self) -> bool {
-        // Check if the file watcher detected changes in .workgraph/.
+        // Flush a deferred sort apply if the debounce window has elapsed.
+        // Run before consuming fs events so a burst of events doesn't keep
+        // pushing the flush forward indefinitely.
+        self.maybe_flush_sort_apply();
+
+        // Drain any completed async-fs responses BEFORE deciding whether
+        // the main loop has work to do. This lets cached-graph and
+        // cached-stat values reflect the worker's most recent results
+        // without ever blocking on disk. (See `async_fs.rs`.)
+        let async_changes = self.async_fs.drain_responses();
+        if async_changes.graph
+            && self.graph_reload_pending
+            && let Some((graph, graph_mtime)) = self.async_fs.cached_graph()
+        {
+            self.apply_loaded_graph_refresh(&graph, graph_mtime);
+            return true;
+        }
+
+        // Check if the file watcher detected changes in .wg/.
         let fs_changed = self.fs_change_pending.swap(false, Ordering::Relaxed);
+        // Drain messages_change_pending lazily — only when we actually plan to
+        // consume it — so a chat-streaming early-return doesn't drop a pending
+        // message-indicator refresh.
 
         // Fast-path: when the streaming file changes (via fs watcher or polling),
-        // immediately read it so chat text appears token-by-token.
+        // immediately read it so chat text appears token-by-token. The actual
+        // disk read happens on the async-fs worker; here we only consult the
+        // cached value (and dispatch a refresh if needed).
         if self.chat.awaiting_response() {
+            let coord_id = self.active_coordinator_id;
+            let streaming_path =
+                workgraph::chat::streaming_path_ref(&self.workgraph_dir, &coord_id.to_string());
+            self.async_fs.request_streaming(streaming_path, coord_id);
             let prev = self.chat.streaming_text.clone();
-            let streaming =
-                workgraph::chat::read_streaming(&self.workgraph_dir, self.active_coordinator_id);
+            let streaming = self.async_fs.cached_streaming(coord_id);
             if streaming != prev {
                 self.chat.streaming_text = streaming;
                 // Also check outbox in case the response just completed.
@@ -6832,72 +7904,64 @@ impl VizApp {
         // chat outbox) update in real-time.
         if fs_changed {
             let mut content_updated = false;
+            let messages_changed = self.messages_change_pending.swap(false, Ordering::Relaxed);
 
             // Graph-dependent content: check if graph.jsonl itself changed.
             // Log entries are stored in graph.jsonl, so we need to detect
             // graph changes here too for immediate log updates.
-            let current_mtime = std::fs::metadata(self.workgraph_dir.join("graph.jsonl"))
-                .and_then(|m| m.modified())
-                .ok();
-            if current_mtime != self.last_graph_mtime {
-                self.last_graph_mtime = current_mtime;
-                // Full viz reload on every graph mutation — this catches
-                // transient states (assigning, evaluating) that would
-                // otherwise be missed by the 1-second slow-path tick.
-                let graph_path = self.workgraph_dir.join("graph.jsonl");
-                if let Ok(graph) = load_graph(&graph_path) {
-                    let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
-                    let prev_hud_scroll = self.hud_scroll;
-                    let prev_hud_follow = self.hud_follow;
-                    self.smart_follow_active = self.scroll.is_at_bottom();
+            let graph_path = self.workgraph_dir.join("graph.jsonl");
+            self.async_fs.request_stat(graph_path.clone());
+            let current_mtime = self.async_fs.cached_stat(&graph_path);
+            // Heavy-reload throttle (fix-tui-perf-2 fix 4 / fix 5a):
+            // - When graph.jsonl is mutating faster than `HEAVY_REFRESH_THROTTLE`,
+            //   defer the heavy reload pipeline to the next tick. The
+            //   `fs_change_pending` flag is set back to `true` so the next
+            //   `is_refresh_due` returns `true` and we re-enter this branch
+            //   once the throttle window elapses.
+            // - This caps the visible CPU cost of graph mutations at ~5fps,
+            //   independent of fs-event burstiness.
+            // - It also decouples the embedded chat-PTY render from graph
+            //   render: when the user is typing into the chat tab, the
+            //   redraw is driven by `chat_pty_has_new_bytes()` (PTY echo)
+            //   on the main loop's poll, not by graph state, so deferring
+            //   the heavy graph pipeline keeps keystroke-echo latency at
+            //   PTY speed instead of graph speed.
+            let graph_mutated = current_mtime != self.last_graph_mtime;
+            let throttle_open = self
+                .last_heavy_refresh_at
+                .map(|t| t.elapsed() >= Self::HEAVY_REFRESH_THROTTLE)
+                .unwrap_or(true);
+            if graph_mutated && !throttle_open {
+                // Re-arm fs_change_pending so we re-check next iteration.
+                // The mtime is intentionally left at its old value so the
+                // graph_mutated test still fires on the next tick (otherwise
+                // a transient mtime read could lose the pending mutation).
+                self.fs_change_pending.store(true, Ordering::Relaxed);
+                if messages_changed {
+                    self.messages_change_pending.store(true, Ordering::Relaxed);
+                }
+                return false;
+            }
+            if graph_mutated {
+                // Dispatch a background graph reload (no-op if one is in
+                // flight). Do not apply the old cached graph or record the
+                // new mtime yet; `drain_responses()` will apply the freshly
+                // loaded graph on a later loop tick.
+                self.graph_reload_pending = true;
+                self.graph_viz_stale = true;
+                self.async_fs.request_graph_load(graph_path.clone());
+                content_updated = true;
+            } else if messages_changed {
+                // A message file changed but graph.jsonl didn't — `wg msg send`
+                // writes only to `messages/<task>.jsonl`, so the graph-mtime
+                // check above misses it. Reload viz + stats so the per-task
+                // ✉ indicator and the right-panel Msg tab indicator update
+                // promptly.
+                if let Some((graph, _)) = self.async_fs.cached_graph() {
                     self.load_viz_from_graph(&graph);
                     self.load_stats_from_graph(&graph);
-                    self.load_agent_monitor();
-                    self.update_agent_streams();
-                    if self.right_panel_tab == RightPanelTab::Firehose {
-                        self.update_firehose();
-                    }
-                    if self.right_panel_tab == RightPanelTab::Output {
-                        self.update_output_pane();
-                    }
-                    if self.right_panel_tab == RightPanelTab::Log {
-                        self.update_log_output();
-                        self.update_log_stream_events();
-                    }
-                    self.invalidate_hud();
-                    self.load_hud_detail();
-                    if prev_hud_task.is_some()
-                        && prev_hud_task == self.hud_detail.as_ref().map(|d| d.task_id.clone())
-                    {
-                        if prev_hud_follow {
-                            self.hud_scroll = usize::MAX; // renderer clamps to actual max
-                        } else {
-                            self.hud_scroll = prev_hud_scroll;
-                        }
-                    }
-                    if !self.search_input.is_empty() {
-                        self.rerun_search();
-                    }
+                    content_updated = true;
                 }
-                // Log pane: reload if active (log entries are in graph.jsonl).
-                if self.right_panel_tab == RightPanelTab::Log {
-                    self.invalidate_log_pane();
-                    self.load_log_pane();
-                }
-                if self.right_panel_tab == RightPanelTab::Agency {
-                    self.invalidate_agency_lifecycle();
-                    self.load_agency_lifecycle();
-                }
-                if self.right_panel_tab == RightPanelTab::Files
-                    && let Some(ref mut fb) = self.file_browser
-                {
-                    fb.refresh();
-                }
-                if self.right_panel_tab == RightPanelTab::CoordLog {
-                    self.load_coord_log();
-                    self.load_activity_feed();
-                }
-                content_updated = true;
             }
 
             // Messages panel: check if the message file for the viewed task changed.
@@ -6908,7 +7972,8 @@ impl VizApp {
                     .workgraph_dir
                     .join("messages")
                     .join(format!("{}.jsonl", task_id));
-                let msg_mtime = std::fs::metadata(&msg_path).and_then(|m| m.modified()).ok();
+                self.async_fs.request_stat(msg_path.clone());
+                let msg_mtime = self.async_fs.cached_stat(&msg_path);
                 if msg_mtime != self.last_messages_mtime {
                     self.last_messages_mtime = msg_mtime;
                     self.save_message_draft();
@@ -6921,14 +7986,16 @@ impl VizApp {
             // Coordinator log: check if daemon.log or operations.jsonl changed.
             if self.right_panel_tab == RightPanelTab::CoordLog {
                 let log_path = self.workgraph_dir.join("service").join("daemon.log");
-                let log_mtime = std::fs::metadata(&log_path).and_then(|m| m.modified()).ok();
+                self.async_fs.request_stat(log_path.clone());
+                let log_mtime = self.async_fs.cached_stat(&log_path);
                 if log_mtime != self.last_daemon_log_mtime {
                     self.last_daemon_log_mtime = log_mtime;
                     self.load_coord_log();
                     content_updated = true;
                 }
                 let ops_path = self.workgraph_dir.join("log").join("operations.jsonl");
-                let ops_mtime = std::fs::metadata(&ops_path).and_then(|m| m.modified()).ok();
+                self.async_fs.request_stat(ops_path.clone());
+                let ops_mtime = self.async_fs.cached_stat(&ops_path);
                 if ops_mtime != self.last_ops_log_mtime {
                     self.last_ops_log_mtime = ops_mtime;
                     self.load_activity_feed();
@@ -6942,9 +8009,8 @@ impl VizApp {
                     &self.workgraph_dir,
                     &self.active_coordinator_id.to_string(),
                 );
-                let outbox_mtime = std::fs::metadata(&outbox_path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                self.async_fs.request_stat(outbox_path.clone());
+                let outbox_mtime = self.async_fs.cached_stat(&outbox_path);
                 if outbox_mtime != self.last_chat_outbox_mtime {
                     self.last_chat_outbox_mtime = outbox_mtime;
                     self.check_coordinator_status();
@@ -6982,11 +8048,17 @@ impl VizApp {
             // Detail tab: live-refresh when the agent output.log changes independently
             // of graph.jsonl (e.g. agent is actively writing output).
             if self.right_panel_tab == RightPanelTab::Detail {
-                let new_output_mtime = self
+                let output_path = self
                     .hud_detail
                     .as_ref()
                     .and_then(|d| d.output_path.as_ref())
-                    .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+                    .cloned();
+                let new_output_mtime = if let Some(p) = output_path {
+                    self.async_fs.request_stat(p.clone());
+                    self.async_fs.cached_stat(&p)
+                } else {
+                    None
+                };
                 if new_output_mtime.is_some() && new_output_mtime != self.last_detail_output_mtime {
                     self.last_detail_output_mtime = new_output_mtime;
                     let prev_hud_follow = self.hud_follow;
@@ -7044,9 +8116,9 @@ impl VizApp {
             && !self.config_panel.adding_endpoint
             && !self.config_panel.adding_model
         {
-            let current_mtime = std::fs::metadata(self.workgraph_dir.join("config.toml"))
-                .and_then(|m| m.modified())
-                .ok();
+            let cfg_path = self.workgraph_dir.join("config.toml");
+            self.async_fs.request_stat(cfg_path.clone());
+            let current_mtime = self.async_fs.cached_stat(&cfg_path);
             if current_mtime != self.config_panel.last_config_mtime {
                 self.load_config_panel();
             }
@@ -7057,9 +8129,9 @@ impl VizApp {
         }
 
         // --- Heavy data refresh (graph-dependent) ---
-        let current_mtime = std::fs::metadata(self.workgraph_dir.join("graph.jsonl"))
-            .and_then(|m| m.modified())
-            .ok();
+        let graph_path = self.workgraph_dir.join("graph.jsonl");
+        self.async_fs.request_stat(graph_path.clone());
+        let current_mtime = self.async_fs.cached_stat(&graph_path);
 
         let graph_changed = current_mtime != self.last_graph_mtime || self.graph_viz_stale;
         let needs_token_refresh = self.task_counts.in_progress > 0;
@@ -7071,19 +8143,23 @@ impl VizApp {
             .values()
             .any(|s| s.last_seen.elapsed() >= hold);
 
-        if graph_changed || needs_token_refresh || has_expiring_stickies {
-            self.graph_viz_stale = false;
-            // Load graph once and share between viz and stats (avoids double read+parse).
-            let graph_path = self.workgraph_dir.join("graph.jsonl");
-            if let Ok(graph) = load_graph(&graph_path) {
+        if graph_changed {
+            // Dispatch a background graph reload and apply it only after the
+            // async worker has populated the cache. Applying the old cached
+            // graph here would make the TUI record the new mtime while still
+            // showing stale rows, losing the refresh.
+            self.graph_reload_pending = true;
+            self.graph_viz_stale = true;
+            self.async_fs.request_graph_load(graph_path.clone());
+        } else if needs_token_refresh || has_expiring_stickies {
+            if let Some((graph, _)) = self.async_fs.cached_graph() {
                 // Capture HUD scroll state BEFORE load_viz(), because load_viz() ->
                 // recompute_trace() -> invalidate_hud() clears hud_detail.
                 let prev_hud_task = self.hud_detail.as_ref().map(|d| d.task_id.clone());
                 let prev_hud_scroll = self.hud_scroll;
                 let prev_hud_follow = self.hud_follow;
 
-                if graph_changed || has_expiring_stickies {
-                    self.last_graph_mtime = current_mtime;
+                if has_expiring_stickies {
                     // Update smart-follow state before reloading: track if user is at bottom.
                     self.smart_follow_active = self.scroll.is_at_bottom();
                     self.load_viz_from_graph(&graph);
@@ -7092,6 +8168,7 @@ impl VizApp {
                     }
                 }
                 self.load_stats_from_graph(&graph);
+                self.refresh_chat_tab_caches(&graph);
                 self.load_agent_monitor();
                 self.update_agent_streams();
                 // Update firehose with new agent output if Firehose tab is active.
@@ -7153,17 +8230,17 @@ impl VizApp {
 
         // Re-check: if changes arrived during the refresh, reload once more
         // so rapid-fire changes don't require a full extra tick to propagate.
+        // All disk reads are dispatched to the async-fs worker; this branch
+        // applies the freshest cached graph if the mtime cache shows a
+        // change since the last application.
         if self.fs_change_pending.swap(false, Ordering::Relaxed) {
-            let fresh_mtime = std::fs::metadata(self.workgraph_dir.join("graph.jsonl"))
-                .and_then(|m| m.modified())
-                .ok();
+            let graph_path = self.workgraph_dir.join("graph.jsonl");
+            self.async_fs.request_stat(graph_path.clone());
+            let fresh_mtime = self.async_fs.cached_stat(&graph_path);
             if fresh_mtime != self.last_graph_mtime {
-                self.last_graph_mtime = fresh_mtime;
-                let graph_path = self.workgraph_dir.join("graph.jsonl");
-                if let Ok(graph) = load_graph(&graph_path) {
-                    self.load_viz_from_graph(&graph);
-                    self.load_stats_from_graph(&graph);
-                }
+                self.graph_reload_pending = true;
+                self.graph_viz_stale = true;
+                self.async_fs.request_graph_load(graph_path);
             }
         }
 
@@ -7175,6 +8252,73 @@ impl VizApp {
     pub fn is_refresh_due(&self) -> bool {
         self.fs_change_pending.load(Ordering::Relaxed)
             || self.last_refresh.elapsed() >= self.refresh_interval
+    }
+
+    /// Whether any embedded chat-PTY pane has emitted bytes since the
+    /// last redraw observed it. Drives the event loop's idle-poll
+    /// branch so animation frames from the PTY child (codex's spinner,
+    /// claude's streaming output) trigger a redraw without needing a
+    /// user keypress. Without this check the loop wakes every 16ms (per
+    /// `next_poll_timeout`'s chat_pty_mode branch) but never redraws,
+    /// and the user sees a stalled UI even though bytes are arriving —
+    /// the regression reported in fix-codex-chat-3 ("real-time
+    /// animations don't render"). After redraw,
+    /// `update_task_pane_byte_watermarks` advances the per-pane
+    /// watermarks so the next call is a no-op until more bytes land.
+    pub fn chat_pty_has_new_bytes(&self) -> bool {
+        if self.task_panes.is_empty() {
+            return false;
+        }
+        for (id, pane) in &self.task_panes {
+            let now = pane.bytes_processed();
+            let last = self.task_pane_last_bytes_seen.get(id).copied().unwrap_or(0);
+            if now != last {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Snapshot every pane's `bytes_processed` counter into the
+    /// per-pane watermark map. Called from the event loop right after
+    /// a redraw so subsequent `chat_pty_has_new_bytes()` calls only
+    /// fire when fresh bytes have arrived. Also prunes watermark
+    /// entries for panes that no longer exist (chat closed / abandoned)
+    /// so the map can't accumulate stale ids.
+    pub fn update_task_pane_byte_watermarks(&mut self) {
+        self.task_pane_last_bytes_seen
+            .retain(|id, _| self.task_panes.contains_key(id));
+        for (id, pane) in &self.task_panes {
+            self.task_pane_last_bytes_seen
+                .insert(id.clone(), pane.bytes_processed());
+        }
+    }
+
+    /// Record substantive interaction with the active embedded chat PTY.
+    ///
+    /// User sends force an immediate bump. Child output is debounced because
+    /// streaming terminal frames should not constantly reshuffle the task list.
+    pub fn bump_active_chat_pty_interaction(&mut self, force: bool) {
+        if !force
+            && self
+                .last_chat_pty_activity_bump
+                .is_some_and(|last| last.elapsed() < CHAT_PTY_ACTIVITY_BUMP_DEBOUNCE)
+        {
+            return;
+        }
+
+        // Fire-and-forget: the actual graph.jsonl read+write happens on
+        // the async-fs worker thread, so a slow filesystem can never
+        // block keystroke echo through this path. (See task fix-tui-must
+        // — the synchronous version blocked the chat-PTY render loop on
+        // every keystroke burst that crossed the debounce window.)
+        self.async_fs.bump_chat_interaction(
+            self.workgraph_dir.clone(),
+            self.active_coordinator_id.to_string(),
+        );
+        self.last_chat_pty_activity_bump = Some(std::time::Instant::now());
+        self.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn poll_thinking_tokens(&mut self) {}
@@ -7249,6 +8393,12 @@ impl VizApp {
         }
         // Touch echo indicators (fade after ~0.7s)
         if self.has_active_touch_echoes() {
+            return true;
+        }
+        // Embedded chat PTY emitted bytes since last frame — drives
+        // codex / claude / nex animation rendering between user keypresses.
+        // (Cheap: an atomic load per active pane.)
+        if self.chat_pty_has_new_bytes() {
             return true;
         }
         false
@@ -7389,6 +8539,7 @@ impl VizApp {
             SortMode::Chronological => {
                 self.scroll.go_top();
                 if !self.task_order.is_empty() {
+                    self.hud_pin = None;
                     self.selected_task_idx = Some(0);
                     self.recompute_trace();
                     self.sync_coordinator_from_selection();
@@ -7397,6 +8548,7 @@ impl VizApp {
             SortMode::ReverseChronological => {
                 self.scroll.go_bottom();
                 if !self.task_order.is_empty() {
+                    self.hud_pin = None;
                     self.selected_task_idx = Some(self.task_order.len() - 1);
                     self.recompute_trace();
                     self.sync_coordinator_from_selection();
@@ -7405,6 +8557,7 @@ impl VizApp {
             SortMode::StatusGrouped => {
                 // Select the first task in priority order (likely in-progress).
                 if !self.task_order.is_empty() {
+                    self.hud_pin = None;
                     self.selected_task_idx = Some(0);
                     self.recompute_trace();
                     self.sync_coordinator_from_selection();
@@ -7420,7 +8573,14 @@ impl VizApp {
 
     /// Apply the current sort mode to reorder `task_order`.
     /// Preserves the selected task ID across the reorder.
-    fn apply_sort_mode(&mut self) {
+    pub(crate) fn apply_sort_mode(&mut self) {
+        // Record the apply timestamp regardless of whether anything changed,
+        // so the debounce window resets on every legitimate flush. This must
+        // run even on empty graphs so a flush request after a reload that
+        // emptied the task list still clears `pending_sort_apply`.
+        self.last_sort_apply = Some(Instant::now());
+        self.pending_sort_apply = false;
+
         if self.task_order.is_empty() {
             return;
         }
@@ -7436,37 +8596,59 @@ impl VizApp {
             }
             SortMode::StatusGrouped => {
                 // Sort navigation order by status priority: in-progress first, then
-                // failed, open, blocked, and done last. Within each group, preserve
-                // the tree line order.
-                let graph_path = self.workgraph_dir.join("graph.jsonl");
-                let status_map: HashMap<String, u8> = match load_graph(&graph_path) {
-                    Ok(g) => g
-                        .tasks()
-                        .map(|t| {
-                            let priority = match t.status {
-                                Status::InProgress => 0,
-                                Status::Failed => 1,
-                                Status::Open => 2,
-                                Status::Blocked => 3,
-                                Status::Done => 4,
-                                Status::Abandoned => 5,
-                                Status::Waiting | Status::PendingValidation => 3,
-                                Status::PendingEval => 0, // visible like in-progress
-                                Status::Incomplete => 1,  // high priority like failed
-                            };
-                            (t.id.clone(), priority)
-                        })
-                        .collect(),
-                    Err(_) => HashMap::new(),
-                };
+                // failed, open, blocked, and done last. Within each group, sort
+                // by `last_interaction_at` descending (newest first) so an
+                // actively-touched task bubbles to the top of its group. Tie-
+                // break by task id so two tasks with identical timestamps
+                // (e.g. populated by the same modify_graph call) keep a
+                // deterministic order — the cure for the "viewport flips
+                // every event" failure mode of the previous fix.
+                //
+                // Reads the (priority, sort_key) map cached by
+                // `load_stats_from_graph`. The previous implementation
+                // re-loaded graph.jsonl here on every refresh, which under
+                // 8/8-busy load deserialized the 3+MB JSONL file at the
+                // 5ms-debounced fs-watcher cadence (diagnose hot path #2).
+                //
+                // Bootstrap fallback: if the cache hasn't been populated
+                // yet (first sort before the first stats refresh, or a
+                // test fixture that bypassed load_stats_from_graph), do
+                // the load_graph here as a one-shot. Subsequent sorts
+                // hit the cache populated by the next stats refresh.
+                if self.sort_status_map.is_empty() {
+                    let graph_path = self.workgraph_dir.join("graph.jsonl");
+                    if let Ok(g) = load_graph(&graph_path) {
+                        self.sort_status_map = g
+                            .tasks()
+                            .map(|t| {
+                                let priority = match t.status {
+                                    Status::InProgress => 0,
+                                    Status::Failed => 1,
+                                    Status::Open => 2,
+                                    Status::Blocked => 3,
+                                    Status::Done => 4,
+                                    Status::Abandoned => 5,
+                                    Status::Waiting | Status::PendingValidation => 3,
+                                    Status::PendingEval | Status::FailedPendingEval => 0,
+                                    Status::Incomplete => 1,
+                                };
+                                (
+                                    t.id.clone(),
+                                    (priority, t.interaction_sort_key().to_string()),
+                                )
+                            })
+                            .collect();
+                    }
+                }
                 self.task_order.sort_by(|a, b| {
-                    let sa = status_map.get(a).copied().unwrap_or(99);
-                    let sb = status_map.get(b).copied().unwrap_or(99);
-                    sa.cmp(&sb).then_with(|| {
-                        let la = self.node_line_map.get(a).copied().unwrap_or(usize::MAX);
-                        let lb = self.node_line_map.get(b).copied().unwrap_or(usize::MAX);
-                        la.cmp(&lb)
-                    })
+                    let default_meta = (99u8, String::new());
+                    let ma = self.sort_status_map.get(a).unwrap_or(&default_meta);
+                    let mb = self.sort_status_map.get(b).unwrap_or(&default_meta);
+                    // Status group ascending, then activity descending, then
+                    // stable id tie-break.
+                    ma.0.cmp(&mb.0)
+                        .then_with(|| mb.1.cmp(&ma.1))
+                        .then_with(|| a.cmp(b))
                 });
             }
         }
@@ -7481,12 +8663,74 @@ impl VizApp {
         }
     }
 
+    /// Minimum interval between sort applications driven by graph reloads.
+    /// 200ms ≈ 5 events/sec, which keeps the visible task ordering stable
+    /// under a burst of mutations (compaction, agency pipeline, chat) while
+    /// still feeling responsive on a single user-initiated change.
+    pub(crate) const SORT_DEBOUNCE: Duration = Duration::from_millis(200);
+
+    /// Minimum interval between heavy graph-reload pipelines triggered by an
+    /// fs-watcher event. Mirrors `SORT_DEBOUNCE` (200ms / ~5fps). Without
+    /// this cap, 8 active agents whose output.log writes drive the 5ms
+    /// debouncer would re-run the full pipeline 20-50 times per second
+    /// even though the user can only see ~5 of those redraws.
+    pub(crate) const HEAVY_REFRESH_THROTTLE: Duration = Duration::from_millis(200);
+
+    /// Request a sort re-application; defer if the debounce window has not
+    /// yet elapsed since the last apply. Called from the graph-reload path.
+    /// User-initiated sort changes (e.g. cycling sort mode via keypress)
+    /// should call `apply_sort_mode` directly to bypass the debounce.
+    pub(crate) fn request_sort_apply(&mut self) {
+        let elapsed = self
+            .last_sort_apply
+            .map(|t| t.elapsed())
+            .unwrap_or(Self::SORT_DEBOUNCE);
+        if elapsed >= Self::SORT_DEBOUNCE {
+            self.apply_sort_mode();
+        } else {
+            self.pending_sort_apply = true;
+        }
+    }
+
+    /// If a sort flush was deferred and the debounce window has now elapsed,
+    /// apply it. Called from `maybe_refresh` on every TUI tick so that
+    /// pending flushes complete promptly even when no further graph events
+    /// arrive.
+    pub(crate) fn maybe_flush_sort_apply(&mut self) {
+        if !self.pending_sort_apply {
+            return;
+        }
+        let elapsed = self
+            .last_sort_apply
+            .map(|t| t.elapsed())
+            .unwrap_or(Self::SORT_DEBOUNCE);
+        if elapsed >= Self::SORT_DEBOUNCE {
+            self.apply_sort_mode();
+        }
+    }
+
     /// Load HUD detail for the currently selected task.
     /// Called when selection changes or trace is toggled on.
     pub fn load_hud_detail(&mut self) {
-        let task_id = match self.selected_task_id() {
-            Some(id) => id.to_string(),
-            None => {
+        // If an annotation-click pinned a meta-task to the inspector, honor
+        // it as long as the parent it was anchored to is still selected.
+        // Without this, the periodic graph-refresh path (invalidate_hud +
+        // load_hud_detail) flips the inspector back to the parent task,
+        // making `[∴ evaluating]` clicks appear to "open the parent".
+        let selected = self.selected_task_id().map(|s| s.to_string());
+        let pinned = match (&self.hud_pin, &selected) {
+            (Some(pin), Some(sel)) if &pin.anchor_parent_id == sel => Some(pin.dot_task_id.clone()),
+            (Some(_), _) => {
+                // Selection drifted away from the anchor — pin is stale.
+                self.hud_pin = None;
+                None
+            }
+            _ => None,
+        };
+        let task_id = match (pinned, selected) {
+            (Some(pin_id), _) => pin_id,
+            (None, Some(sel)) => sel,
+            (None, None) => {
                 self.hud_detail = None;
                 return;
             }
@@ -7863,10 +9107,16 @@ impl VizApp {
                         .map(|s| s == "flip")
                         .unwrap_or(false);
 
+                    let eval_iter = eval
+                        .get("loop_iteration")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let iter_label = format!(" [iter {}]", eval_iter);
+
                     if is_flip {
-                        lines.push("── Evaluation (FLIP) ──".to_string());
+                        lines.push(format!("── Evaluation (FLIP){} ──", iter_label));
                     } else {
-                        lines.push("── Evaluation ──".to_string());
+                        lines.push(format!("── Evaluation{} ──", iter_label));
                     }
                     if let Some(score) = eval.get("score").and_then(|v| v.as_f64()) {
                         lines.push(format!("  Score: {:.2}", score));
@@ -8009,9 +9259,10 @@ impl VizApp {
                         Status::Open | Status::Blocked | Status::Waiting => {
                             "scheduled (no score yet)"
                         }
-                        Status::InProgress | Status::PendingValidation | Status::PendingEval => {
-                            "running…"
-                        }
+                        Status::InProgress
+                        | Status::PendingValidation
+                        | Status::PendingEval
+                        | Status::FailedPendingEval => "running…",
                         Status::Done => "done (no score recorded)",
                         Status::Failed => "failed (no score recorded)",
                         Status::Abandoned => "abandoned (no score recorded)",
@@ -8050,7 +9301,7 @@ impl VizApp {
                 t.token_usage.clone().or_else(|| {
                     let agent_id = t.assigned.as_deref()?;
                     let log_path = agents_dir.join(agent_id).join("output.log");
-                    parse_token_usage_live(&log_path)
+                    parse_token_usage_live_cached(&log_path)
                 })
             };
 
@@ -8269,6 +9520,9 @@ impl VizApp {
         if let Some(ref reason) = task.failure_reason {
             lines.push("── Failure ──".to_string());
             lines.push(format!("  {}", reason));
+            if let Some(class) = task.failure_class {
+                lines.push(format!("  class: {}", class));
+            }
             lines.push(String::new());
         }
 
@@ -8542,6 +9796,9 @@ impl VizApp {
         if let Some(ref reason) = task.failure_reason {
             lines.push("── Failure ──".to_string());
             lines.push(format!("  {}", reason));
+            if let Some(class) = task.failure_class {
+                lines.push(format!("  class: {}", class));
+            }
             lines.push(String::new());
         }
 
@@ -8644,6 +9901,78 @@ impl VizApp {
                 }
             }
         }
+    }
+
+    /// True iff prev-iteration navigation would change the view from the
+    /// currently-displayed iteration. Used to gate the click handler and
+    /// to gray out the prev arrow when it has nothing to do.
+    pub fn iter_can_go_prev(&self) -> bool {
+        if self.iteration_archives.is_empty() {
+            return false;
+        }
+        match self.viewing_iteration {
+            None => true, // viewing live, can drop to most recent archive
+            Some(idx) => idx > 0,
+        }
+    }
+
+    /// True iff next-iteration navigation would change the view. Mirrors
+    /// `iteration_next()` — clicking ▶ from the last archive transitions
+    /// to live (`None`), so that case is also "can go next".
+    pub fn iter_can_go_next(&self) -> bool {
+        if self.iteration_archives.is_empty() {
+            return false;
+        }
+        match self.viewing_iteration {
+            None => false, // already on live
+            Some(_) => true,
+        }
+    }
+
+    /// Build the informative center label shown in the Detail tab iteration
+    /// nav bar: e.g. `"Iteration 2 of 3 · started 14:23 · archived"` or
+    /// `"Iteration 3 of 3 · live"`. The label tells the user (a) which
+    /// iteration is being displayed, (b) how many exist total, (c) when it
+    /// started if known, and (d) its outcome / live state.
+    pub fn iteration_bar_label(&self) -> String {
+        let total = self.iteration_archives.len() + 1;
+        let task_status = self.hud_detail.as_ref().map(|d| d.task_status);
+        let (display_idx, started_iso) = match self.viewing_iteration {
+            Some(idx) => (
+                idx + 1,
+                self.iteration_archives
+                    .get(idx)
+                    .map(|(name, _)| name.clone()),
+            ),
+            None => (total, None),
+        };
+        let status_text = match self.viewing_iteration {
+            Some(_) => "archived".to_string(),
+            None => match task_status {
+                Some(Status::InProgress) => "live".to_string(),
+                Some(Status::Done) => "done".to_string(),
+                Some(Status::Failed) => "failed".to_string(),
+                Some(Status::Abandoned) => "abandoned".to_string(),
+                Some(Status::Waiting) => "waiting".to_string(),
+                Some(Status::Blocked) => "blocked".to_string(),
+                Some(Status::PendingValidation) => "pending-validation".to_string(),
+                Some(Status::PendingEval) => "pending-eval".to_string(),
+                Some(Status::FailedPendingEval) => "failed pending evaluation".to_string(),
+                Some(Status::Incomplete) => "incomplete".to_string(),
+                Some(Status::Open) => "open".to_string(),
+                None => "current".to_string(),
+            },
+        };
+        let started_short = started_iso
+            .as_deref()
+            .and_then(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string());
+        let mut parts: Vec<String> = vec![format!("Iteration {} of {}", display_idx, total)];
+        if let Some(s) = started_short {
+            parts.push(format!("started {}", s));
+        }
+        parts.push(status_text);
+        parts.join(" · ")
     }
 
     /// Returns a label describing the current iteration view, if any.
@@ -8982,6 +10311,16 @@ impl VizApp {
     /// (auto-tail enabled).
     pub fn cycle_log_view(&mut self) {
         self.log_pane.view_mode = self.log_pane.view_mode.next();
+        self.log_scroll_to_bottom();
+    }
+
+    /// Toggle the log pane's summary (head/tail) rendering for the
+    /// RawPretty view. Long multi-line bodies collapse to head + elision
+    /// marker + tail when on. Affects only RawPretty rendering — toggling
+    /// in another view mode is a no-op visually until the user cycles
+    /// back to raw. Resets scroll to keep the latest content visible.
+    pub fn toggle_log_summary(&mut self) {
+        self.log_pane.summary_mode = !self.log_pane.summary_mode;
         self.log_scroll_to_bottom();
     }
 
@@ -9352,7 +10691,7 @@ impl VizApp {
     }
 
     /// Construct a VizApp from pre-built VizOutput for unit testing.
-    /// Avoids needing a real workgraph directory on disk.
+    /// Avoids needing a real WG directory on disk.
     #[cfg(test)]
     pub(crate) fn from_viz_output_for_test(viz: &crate::commands::viz::VizOutput) -> Self {
         let lines: Vec<String> = viz.text.lines().map(String::from).collect();
@@ -9377,6 +10716,7 @@ impl VizApp {
             workgraph_dir: std::path::PathBuf::from("/tmp/test-workgraph"),
             viz_options: crate::commands::viz::VizOptions::default(),
             should_quit: false,
+            exit_prompt_resolved: false,
             lines,
             plain_lines,
             search_lines,
@@ -9432,6 +10772,9 @@ impl VizApp {
             last_coordinator_bar_area: Rect::default(),
             coordinator_tab_hits: Vec::new(),
             coordinator_plus_hit: CoordinatorPlusHit::default(),
+            chat_tab_scroll_offset: 0,
+            coordinator_left_arrow_hit: CoordinatorArrowHit::default(),
+            coordinator_right_arrow_hit: CoordinatorArrowHit::default(),
             last_message_input_area: Rect::default(),
             last_text_prompt_area: Rect::default(),
             last_dialog_area: Rect::default(),
@@ -9453,6 +10796,7 @@ impl VizApp {
             sticky_annotations: HashMap::new(),
             annotation_hit_regions: Vec::new(),
             annotation_click_flash: None,
+            hud_pin: None,
             cycle_set: HashSet::new(),
             hud_detail: None,
             hud_scroll: 0,
@@ -9484,15 +10828,14 @@ impl VizApp {
             launcher: None,
             last_launcher_area: Rect::default(),
             launcher_name_hit: Rect::default(),
-            launcher_executor_hits: Vec::new(),
-            launcher_model_hits: Vec::new(),
-            launcher_model_list_area: Rect::default(),
-            launcher_endpoint_hits: Vec::new(),
-            launcher_endpoint_list_area: Rect::default(),
-            launcher_recent_hits: Vec::new(),
+            launcher_default_hits: Vec::new(),
+            launcher_add_executor_hits: Vec::new(),
+            launcher_add_model_hit: Rect::default(),
+            launcher_add_endpoint_hit: Rect::default(),
             launcher_launch_btn_hit: Rect::default(),
             launcher_cancel_btn_hit: Rect::default(),
             coordinator_picker: None,
+            chat_manager: None,
             text_prompt: TextPromptState {
                 editor: new_emacs_editor(),
             },
@@ -9504,12 +10847,18 @@ impl VizApp {
             history_depth_override: None,
             no_history: false,
             task_panes: HashMap::new(),
+            task_pane_last_bytes_seen: HashMap::new(),
             chat_pty_mode: false,
             chat_pty_observer: false,
             chat_pty_takeover_pending_since: None,
+            last_chat_pty_activity_bump: None,
             chat_pty_forwards_stdin: false,
+            pending_chat_pty_spawn: None,
+            chat_agent_death: HashMap::new(),
+            chat_last_spawn_info: HashMap::new(),
             agent_monitor: AgentMonitorState::default(),
             agent_streams: HashMap::new(),
+            agent_stream_tails: HashMap::new(),
             service_health: ServiceHealthState::default(),
             last_service_badge_area: Rect::default(),
             vitals: VitalsState::default(),
@@ -9525,12 +10874,16 @@ impl VizApp {
             messages_panel: MessagesPanelState::default(),
             message_drafts: HashMap::new(),
             task_message_statuses: HashMap::new(),
+            sort_status_map: HashMap::new(),
+            last_heavy_refresh_at: None,
             cmd_rx: mpsc::channel().1,
             cmd_tx: mpsc::channel().0,
             toasts: Vec::new(),
             prev_agent_statuses: HashMap::new(),
             last_tab_press: None,
             sort_mode: SortMode::ReverseChronological,
+            last_sort_apply: None,
+            pending_sort_apply: false,
             smart_follow_active: true,
             initial_load: false,
             splash_animations: HashMap::new(),
@@ -9561,11 +10914,15 @@ impl VizApp {
             last_panel_hscrollbar_area: Rect::default(),
             last_log_new_output_area: Rect::default(),
             last_iter_nav_area: Rect::default(),
+            iter_nav_prev_zone: Rect::default(),
+            iter_nav_next_zone: Rect::default(),
             touch_echo_enabled: false,
             touch_echoes: Vec::new(),
             has_keyboard_enhancement: false,
             editor_handler: create_editor_handler(),
-            tick_count: 0,
+            cached_chat_tab_entries: Vec::new(),
+            cached_user_board_entries: Vec::new(),
+            cached_coordinator_id_set: std::collections::HashMap::new(),
             last_graph_mtime: None,
             last_refresh: Instant::now(),
             last_refresh_display: String::new(),
@@ -9579,6 +10936,7 @@ impl VizApp {
             settings_panel: SettingsPanelState::default(),
             file_browser: None,
             fs_change_pending: Arc::new(AtomicBool::new(false)),
+            messages_change_pending: Arc::new(AtomicBool::new(false)),
             _fs_watcher: None,
             last_messages_mtime: None,
             last_daemon_log_mtime: None,
@@ -9587,9 +10945,12 @@ impl VizApp {
             last_detail_output_mtime: None,
             hud_follow: false,
             graph_viz_stale: false,
+            graph_reload_pending: false,
             tracer: None,
             key_feedback_enabled: false,
             key_feedback: VecDeque::new(),
+            is_light_theme: false,
+            async_fs: super::async_fs::AsyncFs::new(),
         }
     }
 
@@ -9608,6 +10969,7 @@ impl VizApp {
                 self.rerun_search();
             }
             self.load_stats_from_graph(&graph);
+            self.refresh_chat_tab_caches(&graph);
         } else {
             self.load_viz();
             if !self.search_input.is_empty() {
@@ -9874,40 +11236,62 @@ impl VizApp {
     /// Execute a wg command in a background thread.
     pub fn exec_command(&self, args: Vec<String>, effect: CommandEffect) {
         let tx = self.cmd_tx.clone();
-        // self.workgraph_dir is the `.workgraph` directory itself (e.g.
-        // /project/.workgraph). The `wg` binary expects to run from the
-        // project root so it can find `.workgraph` as a child — running
-        // from *inside* `.workgraph` causes it to look for the non-existent
-        // `.workgraph/.workgraph`. Use the parent directory as the CWD.
-        let project_root = self
-            .workgraph_dir
-            .parent()
-            .unwrap_or(&self.workgraph_dir)
-            .to_path_buf();
-        std::thread::spawn(move || {
-            let result = Command::new("wg")
-                .args(&args)
-                .current_dir(&project_root)
-                .output();
-            let (success, output) = match result {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    let combined = if stderr.is_empty() {
-                        stdout
-                    } else {
-                        format!("{}\n{}", stdout, stderr)
-                    };
-                    (o.status.success(), combined)
-                }
-                Err(e) => (false, format!("Failed to run wg: {}", e)),
-            };
+
+        // Under `cargo test --bin wg`, skip the real subprocess. Tests
+        // assert the routing (i.e. `exec_command` was called with the
+        // requested `effect`) — they do not depend on `wg` from PATH.
+        // Spawning a real subprocess inside the binary's test harness
+        // adds a fork+exec under heavy parallel test load that can
+        // exceed the test's `recv_timeout`. Synthesize an immediate
+        // failed result so the routing assertion fires deterministically.
+        #[cfg(test)]
+        {
+            let _ = args;
             let _ = tx.send(CommandResult {
-                success,
-                output,
+                success: false,
+                output: String::new(),
                 effect,
             });
-        });
+            return;
+        }
+
+        // self.workgraph_dir is the `.wg` directory itself (e.g.
+        // /project/.wg). The `wg` binary expects to run from the
+        // project root so it can find `.wg` as a child — running
+        // from *inside* `.wg` causes it to look for the non-existent
+        // `.wg/.wg`. Use the parent directory as the CWD.
+        #[cfg(not(test))]
+        {
+            let project_root = self
+                .workgraph_dir
+                .parent()
+                .unwrap_or(&self.workgraph_dir)
+                .to_path_buf();
+            std::thread::spawn(move || {
+                let result = Command::new("wg")
+                    .args(&args)
+                    .current_dir(&project_root)
+                    .output();
+                let (success, output) = match result {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                        let combined = if stderr.is_empty() {
+                            stdout
+                        } else {
+                            format!("{}\n{}", stdout, stderr)
+                        };
+                        (o.status.success(), combined)
+                    }
+                    Err(e) => (false, format!("Failed to run wg: {}", e)),
+                };
+                let _ = tx.send(CommandResult {
+                    success,
+                    output,
+                    effect,
+                });
+            });
+        }
     }
 
     /// Drain any completed background commands and apply their effects.
@@ -9999,11 +11383,34 @@ impl VizApp {
                 }
                 CommandEffect::CreateCoordinator => {
                     if result.success {
+                        // Dismiss the launcher pane and switch focus
+                        // ATOMICALLY in this single drain step. The pane
+                        // was held open across the IPC roundtrip
+                        // (`launch_from_launcher` set creating=true)
+                        // precisely so the user does not see the
+                        // previously-active chat between launcher-close
+                        // and new-chat-ready — fix-tui-new symptom 2.
+                        self.launcher = None;
+                        self.input_mode = InputMode::Normal;
                         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&result.output)
                         {
                             if let Some(cid) = data["coordinator_id"].as_u64() {
+                                let cid = cid as u32;
                                 self.force_refresh();
-                                self.switch_coordinator(cid as u32);
+                                // Eagerly record the new tab BEFORE
+                                // switching focus. Without this, a
+                                // subsequent `sync_active_tabs_from_graph`
+                                // — fired by the trailing force_refresh
+                                // below or any later refresh — sees
+                                // `active_coordinator_id` missing from
+                                // `active_tabs` and (pre-fix) flipped
+                                // focus back to `active_tabs[0]`, the
+                                // previous chat. fix-new-chat-4.
+                                if !self.active_tabs.contains(&cid) {
+                                    self.active_tabs.push(cid);
+                                }
+                                self.closed_tabs.remove(&cid);
+                                self.switch_coordinator(cid);
                                 self.right_panel_tab = RightPanelTab::Chat;
                                 self.push_toast(
                                     format!("Chat {} created", cid),
@@ -10015,13 +11422,28 @@ impl VizApp {
                         }
                         self.persist_tab_state();
                     } else {
+                        // Reset the in-flight flag so the user can fix
+                        // their selection and retry without reopening
+                        // the launcher.
                         let err = result
                             .output
                             .lines()
                             .find(|l| !l.is_empty())
-                            .unwrap_or("unknown");
+                            .unwrap_or("unknown")
+                            .to_string();
+                        if let Some(l) = self.launcher.as_mut() {
+                            l.creating = false;
+                            // Persist the error in the launcher pane so it
+                            // stays visible while the user adjusts their
+                            // selection — toasts disappear too quickly to
+                            // read a vendor-CLI / endpoint-unreachable
+                            // message (see fix-chat-creation validation:
+                            // "Failed provisioning ... renders an error
+                            // state in the tab, not silent drop").
+                            l.last_error = Some(err.clone());
+                        }
                         self.push_toast(
-                            format!("Failed to create coordinator: {}", err),
+                            format!("Failed to create chat: {}", err),
                             ToastSeverity::Error,
                         );
                     }
@@ -10029,6 +11451,23 @@ impl VizApp {
                 }
                 CommandEffect::DeleteCoordinator(cid) => {
                     if result.success {
+                        // Tear down the chat tmux session — the chat
+                        // is being abandoned, so we don't want a
+                        // dangling session reattaching on next launch.
+                        let task_id = workgraph::chat_id::format_chat_task_id(cid);
+                        let chat_ref = format!("chat-{}", cid);
+                        let chat_dir =
+                            workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+                        workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                        if let Some(mut pane) = self.task_panes.remove(&task_id) {
+                            pane.kill_underlying_session();
+                        } else {
+                            workgraph::chat_id::kill_chat_tmux_session_for_id(
+                                &self.workgraph_dir,
+                                cid,
+                            );
+                        }
+
                         if cid == self.active_coordinator_id {
                             // Switch to another available coordinator (not the one being deleted)
                             let other = self
@@ -10056,6 +11495,31 @@ impl VizApp {
                 }
                 CommandEffect::ArchiveCoordinator(cid) => {
                     if result.success {
+                        // Kill the tmux chat session (if any) before we
+                        // drop our local pane reference. Doing this in
+                        // the TUI's ArchiveCoordinator handler covers
+                        // archive-via-mouse-click + archive-via-hotkey
+                        // + archive-via-IPC paths uniformly. The CLI
+                        // path (`wg chat archive`) does its own cleanup
+                        // in chat_cmd::run_archive.
+                        let task_id = workgraph::chat_id::format_chat_task_id(cid);
+                        let chat_ref = format!("chat-{}", cid);
+                        let chat_dir =
+                            workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+                        workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                        if let Some(mut pane) = self.task_panes.remove(&task_id) {
+                            pane.kill_underlying_session();
+                        } else {
+                            // No live PTY on this TUI — but the session
+                            // may still be running because another TUI
+                            // (or a prior `wg tui`) spawned it. Reach
+                            // for it by canonical name.
+                            workgraph::chat_id::kill_chat_tmux_session_for_id(
+                                &self.workgraph_dir,
+                                cid,
+                            );
+                        }
+
                         if cid == self.active_coordinator_id {
                             // Switch to another available coordinator (not the one being archived)
                             let other = self
@@ -10307,13 +11771,26 @@ impl VizApp {
     }
 
     /// Update live JSONL stream state for all active (Working) agents.
-    /// Reads new lines from each agent's output.log since the last known offset.
+    ///
+    /// Per-agent tail threads (spawned lazily here) do the actual incremental
+    /// reading + parsing of each agent's `output.log` off the main render
+    /// thread (fix-tui-perf-2 fix 6 / diagnose-tui-scales hot path #4). This
+    /// function only:
+    ///   - reaps tail threads for agents no longer Working,
+    ///   - spawns new tail threads for newly-Working agents,
+    ///   - copies a snapshot from each shared `Arc<Mutex<AgentStreamInfo>>`
+    ///     into `self.agent_streams` so the renderer reads stable values.
+    ///
+    /// The previous implementation opened, seeked, read, and JSON-parsed
+    /// every active agent's output.log on every fs-watcher tick, on the
+    /// same thread that drove `terminal.draw()` and chat-PTY keystroke
+    /// forwarding — that serialization is the chat-input-lag the diagnose
+    /// reported.
     pub fn update_agent_streams(&mut self) {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::collections::HashSet;
 
         let agents_dir = self.workgraph_dir.join("agents");
-        // Collect active agent IDs.
-        let active_ids: Vec<String> = self
+        let active_ids: HashSet<String> = self
             .agent_monitor
             .agents
             .iter()
@@ -10321,225 +11798,98 @@ impl VizApp {
             .map(|a| a.agent_id.clone())
             .collect();
 
-        // Remove stale entries for agents no longer active.
-        self.agent_streams.retain(|id, _| active_ids.contains(id));
+        // Reap tail threads for agents no longer Working. Setting `stop`
+        // signals the thread to exit on its next poll; dropping the handle
+        // releases the shared info Arc so memory clears as soon as the
+        // renderer's snapshot is also dropped.
+        let stale: Vec<String> = self
+            .agent_stream_tails
+            .keys()
+            .filter(|id| !active_ids.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(tail) = self.agent_stream_tails.remove(&id) {
+                tail.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Don't join — let the tail exit on its own poll cycle so
+                // we don't block the render thread for up to TAIL_POLL_INTERVAL.
+            }
+            self.agent_streams.remove(&id);
+        }
 
+        // Spawn tails for newly active agents.
         for agent_id in &active_ids {
+            if self.agent_stream_tails.contains_key(agent_id) {
+                continue;
+            }
             let log_path = agents_dir.join(agent_id).join("output.log");
-            if !log_path.exists() {
-                continue;
+            self.agent_stream_tails
+                .insert(agent_id.clone(), Self::spawn_agent_tail(log_path));
+        }
+
+        // Refresh the renderer-visible snapshot from each tail's shared info.
+        // A clone is cheap (a few Strings + ints); the lock is held briefly.
+        for (agent_id, tail) in &self.agent_stream_tails {
+            if let Ok(info) = tail.info.lock() {
+                self.agent_streams.insert(agent_id.clone(), info.clone());
             }
+        }
+    }
 
-            let info = self
-                .agent_streams
-                .entry(agent_id.clone())
-                .or_insert_with(|| AgentStreamInfo {
-                    file_offset: 0,
-                    message_count: 0,
-                    latest_snippet: None,
-                    latest_is_tool: false,
-                });
+    /// Polling cadence for per-agent tail threads. 100ms keeps the activity
+    /// feed feeling live without spinning a thread tightly. The latest
+    /// snippet is also displayed in the right panel which redraws on the
+    /// next user keypress / fs-event regardless of poll interval.
+    pub(crate) const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-            // Open file and seek to last known position.
-            let mut file = match std::fs::File::open(&log_path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+    /// Spawn a background thread that incrementally tails an agent's
+    /// output.log into a shared `AgentStreamInfo`. Used by
+    /// `update_agent_streams` (fix-tui-perf-2 fix 6).
+    fn spawn_agent_tail(log_path: std::path::PathBuf) -> AgentTailHandle {
+        use std::io::{Read, Seek, SeekFrom};
 
-            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if file_len <= info.file_offset {
-                continue; // No new data.
-            }
+        let info = std::sync::Arc::new(std::sync::Mutex::new(AgentStreamInfo::default()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let info_w = std::sync::Arc::clone(&info);
+        let stop_w = std::sync::Arc::clone(&stop);
 
-            if file.seek(SeekFrom::Start(info.file_offset)).is_err() {
-                continue;
-            }
-
-            let mut new_data = String::new();
-            if file.read_to_string(&mut new_data).is_err() {
-                continue;
-            }
-
-            info.file_offset = file_len;
-
-            // Parse each new JSONL line.
-            for line in new_data.lines() {
-                let line = line.trim();
-                if line.is_empty() || !line.starts_with('{') {
-                    continue;
-                }
-                let val: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                match msg_type {
-                    "assistant" => {
-                        info.message_count += 1;
-                        // Extract content from message.content array.
-                        if let Some(content) = val
-                            .get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_array())
-                        {
-                            // Process content blocks — last text or tool_use wins.
-                            for block in content {
-                                let block_type =
-                                    block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                match block_type {
-                                    "text" => {
-                                        if let Some(text) =
-                                            block.get("text").and_then(|v| v.as_str())
-                                        {
-                                            let trimmed = text.trim();
-                                            if !trimmed.is_empty() {
-                                                // Take the last non-empty line as snippet.
-                                                let snippet =
-                                                    trimmed.lines().last().unwrap_or(trimmed);
-                                                let snippet = if snippet.len() > 120 {
-                                                    format!(
-                                                        "{}…",
-                                                        &snippet
-                                                            [..snippet.floor_char_boundary(120)]
-                                                    )
-                                                } else {
-                                                    snippet.to_string()
-                                                };
-                                                info.latest_snippet = Some(snippet);
-                                                info.latest_is_tool = false;
-                                            }
+        let handle = std::thread::spawn(move || {
+            let mut file_offset: u64 = 0;
+            while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+                let metadata = std::fs::metadata(&log_path).ok();
+                if let Some(meta) = metadata {
+                    let len = meta.len();
+                    if len > file_offset {
+                        if let Ok(mut file) = std::fs::File::open(&log_path) {
+                            if file.seek(SeekFrom::Start(file_offset)).is_ok() {
+                                let mut new_data = String::new();
+                                if file.read_to_string(&mut new_data).is_ok() {
+                                    file_offset = len;
+                                    if let Ok(mut info) = info_w.lock() {
+                                        info.file_offset = file_offset;
+                                        for line in new_data.lines() {
+                                            info.process_jsonl_line(line);
                                         }
                                     }
-                                    "tool_use" => {
-                                        let name = block
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        // For Bash/Edit/Write, show a brief input summary.
-                                        let detail = match name {
-                                            "Bash" => block
-                                                .get("input")
-                                                .and_then(|i| i.get("command"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|c| {
-                                                    let c = c.trim();
-                                                    if c.len() > 80 {
-                                                        format!(
-                                                            "{name}: {}…",
-                                                            &c[..c.floor_char_boundary(80)]
-                                                        )
-                                                    } else {
-                                                        format!("{name}: {c}")
-                                                    }
-                                                }),
-                                            "Read" | "Write" | "Edit" => block
-                                                .get("input")
-                                                .and_then(|i| i.get("file_path"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|p| format!("{name}: {p}")),
-                                            "Grep" => block
-                                                .get("input")
-                                                .and_then(|i| i.get("pattern"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|p| format!("{name}: {p}")),
-                                            "Glob" => block
-                                                .get("input")
-                                                .and_then(|i| i.get("pattern"))
-                                                .and_then(|v| v.as_str())
-                                                .map(|p| format!("{name}: {p}")),
-                                            _ => None,
-                                        };
-                                        info.latest_snippet =
-                                            Some(detail.unwrap_or_else(|| name.to_string()));
-                                        info.latest_is_tool = true;
-                                    }
-                                    _ => {}
                                 }
                             }
                         }
-                    }
-                    "turn" => {
-                        // Native executor format
-                        info.message_count += 1;
-                        if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
-                            for block in content {
-                                let block_type =
-                                    block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                match block_type {
-                                    "text" => {
-                                        if let Some(text) =
-                                            block.get("text").and_then(|v| v.as_str())
-                                        {
-                                            let trimmed = text.trim();
-                                            if !trimmed.is_empty() {
-                                                let snippet =
-                                                    trimmed.lines().last().unwrap_or(trimmed);
-                                                let snippet = if snippet.len() > 120 {
-                                                    format!(
-                                                        "{}…",
-                                                        &snippet
-                                                            [..snippet.floor_char_boundary(120)]
-                                                    )
-                                                } else {
-                                                    snippet.to_string()
-                                                };
-                                                info.latest_snippet = Some(snippet);
-                                                info.latest_is_tool = false;
-                                            }
-                                        }
-                                    }
-                                    "tool_use" => {
-                                        let name = block
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("?");
-                                        info.latest_snippet = Some(name.to_string());
-                                        info.latest_is_tool = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
+                    } else if len < file_offset {
+                        // File was rotated / truncated — restart from 0.
+                        file_offset = 0;
+                        if let Ok(mut info) = info_w.lock() {
+                            *info = AgentStreamInfo::default();
                         }
                     }
-                    "tool_call" => {
-                        // Native executor tool call log
-                        let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                        let detail = match name {
-                            "Bash" | "bash" => val
-                                .get("input")
-                                .and_then(|i| i.get("command"))
-                                .and_then(|v| v.as_str())
-                                .map(|c| {
-                                    let c = c.trim();
-                                    if c.len() > 80 {
-                                        format!("{name}: {}…", &c[..c.floor_char_boundary(80)])
-                                    } else {
-                                        format!("{name}: {c}")
-                                    }
-                                }),
-                            "Read" | "Write" | "Edit" => val
-                                .get("input")
-                                .and_then(|i| i.get("file_path"))
-                                .and_then(|v| v.as_str())
-                                .map(|p| format!("{name}: {p}")),
-                            "Grep" | "Glob" => val
-                                .get("input")
-                                .and_then(|i| i.get("pattern"))
-                                .and_then(|v| v.as_str())
-                                .map(|p| format!("{name}: {p}")),
-                            _ => None,
-                        };
-                        info.latest_snippet = Some(detail.unwrap_or_else(|| name.to_string()));
-                        info.latest_is_tool = true;
-                    }
-                    "user" | "result" => {
-                        info.message_count += 1;
-                    }
-                    _ => {}
                 }
+                std::thread::sleep(Self::TAIL_POLL_INTERVAL);
             }
+        });
+
+        AgentTailHandle {
+            info,
+            stop,
+            _handle: handle,
         }
     }
 
@@ -11010,7 +12360,7 @@ impl VizApp {
                 .or_else(|| {
                     let agent_id = t.assigned.as_deref()?;
                     let log_path = agents_dir.join(agent_id).join("output.log");
-                    parse_token_usage_live(&log_path)
+                    parse_token_usage_live_cached(&log_path)
                 })
                 .or_else(|| {
                     // Fall back to archived output
@@ -11027,7 +12377,7 @@ impl VizApp {
                     for entry in entries {
                         let candidate = entry.path().join("output.txt");
                         if candidate.exists()
-                            && let Some(u) = parse_token_usage_live(&candidate)
+                            && let Some(u) = parse_token_usage_live_cached(&candidate)
                         {
                             return Some(u);
                         }
@@ -12328,7 +13678,7 @@ impl VizApp {
     }
 
     /// Attempt to attach a file at the given path to the pending chat message.
-    /// Validates and copies to .workgraph/attachments/.
+    /// Validates and copies to .wg/attachments/.
     pub fn attach_file(&mut self, path_str: &str) {
         let source = std::path::Path::new(path_str.trim());
         match workgraph::chat::store_attachment(&self.workgraph_dir, source) {
@@ -12604,7 +13954,7 @@ impl VizApp {
         // re-enter chat/message input (Enter, click, 'c', etc.).
         if matches!(
             self.input_mode,
-            InputMode::ChatInput | InputMode::MessageInput
+            InputMode::ChatInput | InputMode::MessageInput | InputMode::ScrollMode { .. }
         ) {
             self.input_mode = InputMode::Normal;
             self.inspector_sub_focus = InspectorSubFocus::ChatHistory;
@@ -12685,7 +14035,7 @@ impl VizApp {
     /// For the currently-active coordinator, auto-enable `chat_pty_mode`
     /// and spawn an embedded REPL chosen by the coordinator's effective
     /// executor. The coordinator view is just a container for
-    /// interactive chat sessions associated with this workgraph — we
+    /// interactive chat sessions associated with this WG project — we
     /// pick the child process per executor type:
     ///
     /// - `native`  → `wg nex --resume <ref>` (our own REPL inside a
@@ -12698,7 +14048,7 @@ impl VizApp {
     ///
     /// The tradeoff for claude/codex is ephemeral: the chat transcript
     /// lives in the vendor's session store, not in `chat/<ref>/`. If
-    /// the user wants the workgraph chat history to include those
+    /// the user wants the WG chat history to include those
     /// turns, they should pick the `native` executor with
     /// `-m claude:opus` — that routes through our REPL which does write
     /// inbox/outbox, at the cost of using the raw API budget instead
@@ -12709,7 +14059,21 @@ impl VizApp {
     /// manually. Idempotent: no-op when a live pane already exists.
     pub fn maybe_auto_enable_chat_pty(&mut self) {
         let config = Config::load_or_default(&self.workgraph_dir);
-        let executor = config.coordinator.effective_executor();
+        // Per-chat overrides win over the global default. Without this
+        // step the TUI was spawning the global `[dispatcher].executor`
+        // binary (typically `claude`) for every chat tab, ignoring the
+        // `--executor codex` / `--model codex:gpt-5` the user actually
+        // picked when creating that chat — chat-launched-with bug.
+        let (executor, chat_model) = resolve_chat_pty_executor_and_model(
+            &self.workgraph_dir,
+            &config,
+            self.active_coordinator_id,
+        );
+        let chat_endpoint = crate::commands::service::CoordinatorState::load_for(
+            &self.workgraph_dir,
+            self.active_coordinator_id,
+        )
+        .and_then(|s| s.endpoint_override);
 
         // Task ID (`.chat-N`, with dot) is what `wg spawn-task`
         // needs to look the task up in the graph and what our
@@ -12723,6 +14087,54 @@ impl VizApp {
         // TUI incorrectly spawns in owner mode — "session lock busy".
         let task_id = workgraph::chat_id::format_chat_task_id(self.active_coordinator_id);
         let chat_ref = format!("chat-{}", self.active_coordinator_id);
+        let chat_task_metadata =
+            workgraph::parser::load_graph(crate::commands::graph_path(&self.workgraph_dir))
+                .ok()
+                .and_then(|g| g.get_task(&task_id).cloned());
+        if let Some(mut task) = chat_task_metadata.clone()
+            && task
+                .tags
+                .iter()
+                .any(|t| workgraph::chat_id::is_chat_loop_tag(t))
+        {
+            let coord_state = crate::commands::service::CoordinatorState::load_for(
+                &self.workgraph_dir,
+                self.active_coordinator_id,
+            );
+            let migrated = workgraph::chat_command::migrate_chat_task_metadata(
+                &mut task,
+                &self.workgraph_dir,
+                coord_state
+                    .as_ref()
+                    .and_then(|s| s.executor_override.as_deref())
+                    .or(Some(executor.as_str())),
+                coord_state
+                    .as_ref()
+                    .and_then(|s| s.model_override.as_deref())
+                    .or(chat_model.as_deref()),
+                coord_state
+                    .as_ref()
+                    .and_then(|s| s.endpoint_override.as_deref())
+                    .or(chat_endpoint.as_deref()),
+            );
+            if migrated {
+                let replacement = task.clone();
+                let task_id_for_write = task_id.clone();
+                let _ = workgraph::parser::modify_graph(
+                    crate::commands::graph_path(&self.workgraph_dir),
+                    |fresh| {
+                        if let Some(t) = fresh.get_task_mut(&task_id_for_write) {
+                            t.command_argv = replacement.command_argv.clone();
+                            t.working_dir = replacement.working_dir.clone();
+                            t.executor_preset_name = replacement.executor_preset_name.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    },
+                );
+            }
+        }
 
         let pane_live = self
             .task_panes
@@ -12756,110 +14168,127 @@ impl VizApp {
         // sure the dir exists; claude/codex will error otherwise.
         let _ = std::fs::create_dir_all(&chat_dir);
 
-        // Forced takeover: if any handler holds this coordinator's
-        // session lock (usually the daemon's own `wg nex --chat` agent
-        // spawned via `wg service start`), we want it gone. The user
-        // opened `wg tui` to drive chat themselves — the daemon's
-        // autonomous-dispatch handler is in the way. Soft release via
-        // the release-marker can stall indefinitely if the holder is
-        // stuck in a retry loop (broken endpoint, slow LLM turn, etc.)
-        // because the marker is only checked at turn boundaries.
-        //
-        // Policy: request release first (gentler, gives the holder a
-        // chance to flush cleanly), wait briefly, then SIGTERM if
-        // still alive. The TUI session owns the chat surface; this is
-        // the `wg tui` contract now.
-        if observer_mode
-            && let Ok(Some(holder)) = workgraph::session_lock::read_holder(&chat_dir)
-            && holder.alive
+        // Claim the chat surface for this TUI before asking any current
+        // handler to release. The supervisor checks this sentinel before
+        // every respawn, so it defers instead of racing the TUI's PTY
+        // handler back to the session lock.
+        if let Err(e) =
+            workgraph::session_lock::write_tui_driver_sentinel(&chat_dir, std::process::id())
         {
-            let _ = workgraph::session_lock::request_release(&chat_dir);
-            // 300ms grace for clean exit.
-            let mut released = false;
-            for _ in 0..3 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let still_held = workgraph::session_lock::read_holder(&chat_dir)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|info| info.alive);
-                if !still_held {
-                    released = true;
-                    break;
-                }
-            }
-            if !released {
-                // Stuck holder — force quit. Safe because:
-                //   - the marker is already written so the handler
-                //     won't spawn a replacement;
-                //   - we own the lock file path, re-acquiring works;
-                //   - any in-flight work this handler was doing is
-                //     recoverable from outbox on next open.
-                unsafe {
-                    libc::kill(holder.pid as libc::pid_t, libc::SIGTERM);
-                }
-                eprintln!(
-                    "[tui] forced takeover: SIGTERM'd stuck handler pid={} for {}",
-                    holder.pid, chat_ref
-                );
-                // Short wait for the process to exit + lock file to clear.
-                for _ in 0..10 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let still_held = workgraph::session_lock::read_holder(&chat_dir)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|info| info.alive);
-                    if !still_held {
-                        break;
-                    }
-                }
-            }
+            eprintln!("[tui] failed to write TUI driver sentinel: {}", e);
         }
-        // Re-check lock state after takeover.
+        if observer_mode {
+            let _ = workgraph::session_lock::request_release(&chat_dir);
+            let _ = workgraph::session_lock::wait_for_release(
+                &chat_dir,
+                std::time::Duration::from_secs(5),
+            );
+        }
+        // Re-check lock state after cooperative handoff.
         let observer_mode = workgraph::session_lock::read_holder(&chat_dir)
             .ok()
             .flatten()
             .is_some_and(|info| info.alive);
+
+        // Custom command chats are already concrete argv; spawn them
+        // directly in the persistent pane instead of routing through an
+        // LLM preset adapter.
+        if let Some(task) = chat_task_metadata.as_ref()
+            && task.executor_preset_name.is_none()
+            && !task.command_argv.is_empty()
+        {
+            let bin = task.command_argv[0].clone();
+            let args_owned = task.command_argv[1..].to_vec();
+            let cwd_opt = task
+                .working_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    Some(
+                        self.workgraph_dir
+                            .parent()
+                            .unwrap_or(&self.workgraph_dir)
+                            .to_path_buf(),
+                    )
+                });
+            self.chat_pty_observer = false;
+            let mut env: Vec<(String, String)> = vec![
+                (
+                    "WG_DIR".to_string(),
+                    self.workgraph_dir.display().to_string(),
+                ),
+                ("WG_EXECUTOR_TYPE".to_string(), "command".to_string()),
+                ("TERM".to_string(), "xterm-256color".to_string()),
+            ];
+            if let Some(ref m) = chat_model {
+                env.push(("WG_MODEL".to_string(), m.clone()));
+            }
+            let project_root = self
+                .workgraph_dir
+                .parent()
+                .unwrap_or(&self.workgraph_dir)
+                .to_path_buf();
+            let project_tag = project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project");
+            let tmux_session = if crate::tui::pty_pane::tmux_available() {
+                Some(workgraph::chat_id::chat_tmux_session_name(
+                    project_tag,
+                    &chat_ref,
+                ))
+            } else {
+                warn_chat_tmux_missing_once();
+                None
+            };
+            self.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+                task_id,
+                bin,
+                args: args_owned,
+                env,
+                cwd: cwd_opt,
+                executor: "command".to_string(),
+                tmux_session,
+            });
+            self.chat_pty_mode = true;
+            self.chat_pty_forwards_stdin = true;
+            self.focused_panel = FocusedPanel::RightPanel;
+            return;
+        }
 
         // Owned String args per executor.
         let (bin, args_owned, cwd_opt): (String, Vec<String>, Option<std::path::PathBuf>) =
             match executor.as_str() {
                 "native" => {
                     // Spawn `wg nex` as a real PTY child, same as
-                    // claude/codex. Uses `--resume` (not `--chat`) so
-                    // nex reads from stdin via rustyline instead of
-                    // inbox.jsonl — keystrokes flow through the PTY.
+                    // claude/codex. Keep the argv identical to the
+                    // working CLI shape (`wg nex -m ... -e ...`) so
+                    // nex stays on rustyline stdin and tmux owns
+                    // persistence/resume for the pane.
                     let _ = workgraph::chat_sessions::ensure_session(
                         &self.workgraph_dir,
                         &chat_ref,
                         workgraph::chat_sessions::SessionKind::Coordinator,
                         Some(format!("chat {}", self.active_coordinator_id)),
                     );
-                    let mut args = vec![
-                        "nex".to_string(),
-                        "--role".to_string(),
-                        "coordinator".to_string(),
-                        "--resume".to_string(),
-                        chat_ref.clone(),
-                    ];
-                    let model = config
-                        .coordinator
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| config.agent.model.clone());
-                    if !model.is_empty() {
-                        args.push("-m".to_string());
-                        args.push(model);
-                    }
-                    if let Some(ep) = config
-                        .llm_endpoints
-                        .endpoints
-                        .iter()
-                        .find(|e| e.is_default)
-                        .and_then(|e| e.url.clone())
-                    {
-                        args.push("-e".to_string());
-                        args.push(ep);
-                    }
+                    // Per-chat model override wins; otherwise use
+                    // config.coordinator.model, then config.agent.model.
+                    let model = chat_model.clone().unwrap_or_else(|| {
+                        config
+                            .coordinator
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| config.agent.model.clone())
+                    });
+                    let endpoint = chat_endpoint.clone().or_else(|| {
+                        config
+                            .llm_endpoints
+                            .endpoints
+                            .iter()
+                            .find(|e| e.is_default)
+                            .and_then(|e| e.url.clone())
+                    });
+                    let args = build_nex_chat_pty_args(Some(&model), endpoint.as_deref());
                     let project_root = self
                         .workgraph_dir
                         .parent()
@@ -12898,29 +14327,46 @@ impl VizApp {
                         args.push("--system-prompt".to_string());
                         args.push(sys_prompt);
                     }
+                    // Honor per-chat model override (e.g. --model opus
+                    // vs sonnet on a per-tab basis). Strip the provider
+                    // prefix — claude CLI expects bare model ids.
+                    if let Some(ref m) = chat_model {
+                        let spec = workgraph::config::parse_model_spec(m);
+                        if !spec.model_id.is_empty() {
+                            args.push("--model".to_string());
+                            args.push(spec.model_id);
+                        }
+                    }
                     ("claude".to_string(), args, Some(project_root))
                 }
                 "codex" => {
-                    // Coordinator priming: codex auto-loads AGENTS.md
-                    // from CWD (hierarchically, up to the git root), so
-                    // we materialize the full coordinator prompt into
-                    // `<chat_dir>/AGENTS.md` before spawn. codex has no
-                    // --system-prompt flag in interactive mode; AGENTS.md
-                    // is the supported mechanism. Scoping to chat_dir
-                    // keeps per-coordinator priming isolated from any
-                    // project-level AGENTS.md.
-                    let sys_prompt =
-                        crate::commands::service::coordinator_agent::build_system_prompt(
-                            &self.workgraph_dir,
-                        );
-                    let agents_md = chat_dir.join("AGENTS.md");
-                    let _ = std::fs::write(&agents_md, sys_prompt);
+                    // Spawn cwd = project root (mirrors the claude path
+                    // above). The previous behaviour of using chat_dir
+                    // as cwd surfaced two user-visible bugs:
+                    //   1. The codex banner reported
+                    //      `directory: <project>/.wg/chat/chat-0`, so
+                    //      the agent appeared to be in a sparse subdir
+                    //      and could not see the user's project files.
+                    //   2. Even with --dangerously-bypass-approvals-and-
+                    //      sandbox, the agent reported it could not
+                    //      launch shell commands — running from a
+                    //      half-empty workspace under .wg/chat/ confused
+                    //      the LLM about its own environment.
+                    // Per-chat scratch (the codex resume marker, the
+                    // session-id file) still lives under chat_dir; we
+                    // pass that via --add-dir so codex retains write
+                    // access to the per-chat dir without making it the
+                    // working root.
+                    let project_root = self
+                        .workgraph_dir
+                        .parent()
+                        .unwrap_or(&self.workgraph_dir)
+                        .to_path_buf();
                     // Resume: three strategies, checked in order:
                     //   1. `.codex-session-id` persisted by the daemon's
                     //      codex_handler → `codex resume <id>`
                     //   2. `.codex-pty-launched` marker from a prior TUI
-                    //      PTY session → `codex resume --last` (codex
-                    //      filters by CWD, so this picks up the right one)
+                    //      PTY session → `codex resume --last`
                     //   3. Neither → fresh session, write the marker
                     let session_id_path = chat_dir.join(".codex-session-id");
                     let pty_marker = chat_dir.join(".codex-pty-launched");
@@ -12928,15 +14374,17 @@ impl VizApp {
                         .ok()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty());
-                    let args = if let Some(sid) = prior_session_id {
-                        vec!["resume".to_string(), sid]
-                    } else if pty_marker.exists() {
-                        vec!["resume".to_string(), "--last".to_string()]
-                    } else {
+                    let pty_marker_exists = pty_marker.exists();
+                    if prior_session_id.is_none() && !pty_marker_exists {
                         let _ = std::fs::write(&pty_marker, "");
-                        Vec::new()
-                    };
-                    ("codex".to_string(), args, Some(chat_dir.clone()))
+                    }
+                    let args = build_codex_chat_pty_args(
+                        prior_session_id.as_deref(),
+                        pty_marker_exists,
+                        chat_model.as_deref(),
+                        Some(chat_dir.as_path()),
+                    );
+                    ("codex".to_string(), args, Some(project_root))
                 }
                 _ => {
                     // Unknown executor — leave file-tailing path in charge.
@@ -12945,8 +14393,7 @@ impl VizApp {
             };
         self.chat_pty_observer = observer_mode && executor == "native";
 
-        let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-        let env: Vec<(String, String)> = vec![
+        let mut env: Vec<(String, String)> = vec![
             (
                 "WG_DIR".to_string(),
                 self.workgraph_dir.display().to_string(),
@@ -12961,39 +14408,169 @@ impl VizApp {
             // minimal terminal like linux console or dumb.
             ("TERM".to_string(), "xterm-256color".to_string()),
         ];
+        // Propagate the resolved per-chat model so any nested
+        // `wg spawn-task` invocation (e.g. native's `wg nex` re-execing)
+        // honors it instead of falling back to `[dispatcher].model`.
+        if let Some(ref m) = chat_model {
+            env.push(("WG_MODEL".to_string(), m.clone()));
+        }
 
-        let spawn_result = crate::tui::pty_pane::PtyPane::spawn_in(
-            &bin,
-            &args_ref,
-            &env,
-            cwd_opt.as_deref(),
-            24,
-            80,
-        );
+        // tmux-wrap the chat process when tmux is on PATH so it
+        // survives TUI exit (the persistence design — see
+        // docs/design/chat-agent-persistence.md). Falls back to plain
+        // spawn with a one-time stderr warning when tmux is missing.
+        let project_root = self
+            .workgraph_dir
+            .parent()
+            .unwrap_or(&self.workgraph_dir)
+            .to_path_buf();
+        let project_tag = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let tmux_session = if crate::tui::pty_pane::tmux_available() {
+            Some(workgraph::chat_id::chat_tmux_session_name(
+                project_tag,
+                &chat_ref,
+            ))
+        } else {
+            warn_chat_tmux_missing_once();
+            None
+        };
+
+        // Defer the actual spawn to the render path so the PTY child's
+        // initial size matches the chat message area exactly. Spawning
+        // at hardcoded 24×80 here and resizing on the first frame fires
+        // SIGWINCH; vendor CLIs reflow by clear-screen-and-reprint, which
+        // pushes the wrap-at-old-size content into vt100 scrollback as
+        // duplicates of the new wrap-at-new-size visible region. The
+        // render path knows msg_area dimensions and calls
+        // `consume_pending_chat_pty_spawn` with them — first paint is
+        // already at the right size, no SIGWINCH echo, no scrollback
+        // duplicates (fix-pty-scrollback).
+        self.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+            task_id,
+            bin,
+            args: args_owned,
+            env,
+            cwd: cwd_opt,
+            executor: executor.clone(),
+            tmux_session,
+        });
+        self.chat_pty_mode = true;
+        self.chat_pty_forwards_stdin = true;
+        // Shift focus into the right panel so keystrokes route
+        // to the PTY (matches `toggle_chat_pty_mode` on Ctrl+T).
+        // Without this, the graph panel owns keys and hotkeys
+        // like 'e' fire graph-side dialogs instead of reaching
+        // `wg nex` inside the pane.
+        self.focused_panel = FocusedPanel::RightPanel;
+    }
+
+    /// Consume `pending_chat_pty_spawn` and spawn the PTY pane at the
+    /// given dimensions. Called from the chat-tab render path once
+    /// `msg_area` is known. Idempotent — does nothing if there is no
+    /// pending spawn, the pane already exists, or `rows`/`cols` are
+    /// zero (e.g. before the first frame populates layout). Returns
+    /// true iff a new pane was successfully spawned.
+    pub fn consume_pending_chat_pty_spawn(&mut self, rows: u16, cols: u16) -> bool {
+        if rows == 0 || cols == 0 {
+            return false;
+        }
+        let Some(pending) = self.pending_chat_pty_spawn.take() else {
+            return false;
+        };
+        if self
+            .task_panes
+            .get_mut(&pending.task_id)
+            .map(|p| p.is_alive())
+            .unwrap_or(false)
+        {
+            // A pane already exists for this task — drop the pending
+            // request without respawning.
+            return false;
+        }
+        self.task_panes.remove(&pending.task_id);
+
+        let args_ref: Vec<&str> = pending.args.iter().map(String::as_str).collect();
+        let spawn_result = if let Some(ref session_name) = pending.tmux_session {
+            // tmux-wrapped path: chat process lives inside the tmux
+            // session and survives TUI exit. If the tmux invocation
+            // itself fails (e.g. tmux removed between the
+            // availability probe and now), fall back to direct spawn.
+            match crate::tui::pty_pane::PtyPane::spawn_via_tmux(
+                session_name,
+                &pending.bin,
+                &args_ref,
+                &pending.env,
+                pending.cwd.as_deref(),
+                rows,
+                cols,
+            ) {
+                Ok(pane) => Ok(pane),
+                Err(e) => {
+                    eprintln!(
+                        "[tui] tmux-wrapped chat spawn failed ({}): falling back to \
+                         direct spawn (chat will not persist across TUI exit)",
+                        e
+                    );
+                    crate::tui::pty_pane::PtyPane::spawn_in(
+                        &pending.bin,
+                        &args_ref,
+                        &pending.env,
+                        pending.cwd.as_deref(),
+                        rows,
+                        cols,
+                    )
+                }
+            }
+        } else {
+            crate::tui::pty_pane::PtyPane::spawn_in(
+                &pending.bin,
+                &args_ref,
+                &pending.env,
+                pending.cwd.as_deref(),
+                rows,
+                cols,
+            )
+        };
         match spawn_result {
             Ok(pane) => {
-                self.task_panes.insert(task_id, pane);
+                // Record spawn info for use in the death panel if this pane later exits.
+                if let Some(cid) = pending
+                    .task_id
+                    .strip_prefix(".chat-")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    let spawn_cmd = format!("{} {}", pending.bin, pending.args.join(" "));
+                    self.chat_last_spawn_info
+                        .insert(cid, (pending.executor.clone(), spawn_cmd));
+                }
+                self.task_panes.insert(pending.task_id, pane);
                 self.chat_pty_mode = true;
-                // All three PTY modes run interactive REPLs that
-                // read from stdin: native wg nex (rustyline),
-                // claude, codex. Forward keystrokes directly.
                 self.chat_pty_forwards_stdin = true;
-                // Shift focus into the right panel so keystrokes route
-                // to the PTY (matches `toggle_chat_pty_mode` on Ctrl+T).
-                // Without this, the graph panel owns keys and hotkeys
-                // like 'e' fire graph-side dialogs instead of reaching
-                // `wg nex` inside the pane.
-                self.focused_panel = FocusedPanel::RightPanel;
+                true
             }
             Err(e) => {
+                if let Some(cid) = pending
+                    .task_id
+                    .strip_prefix(".chat-")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    let chat_ref = format!("chat-{}", cid);
+                    let chat_dir =
+                        workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+                    workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
+                }
                 eprintln!(
                     "[tui] auto-enable chat PTY for executor '{}' failed ({}): \
                      falling back to file-tailing. \
                      Is the `{}` binary on PATH?",
-                    executor, e, bin
+                    pending.executor, e, pending.bin
                 );
                 self.chat_pty_mode = false;
                 self.chat_pty_forwards_stdin = false;
+                false
             }
         }
     }
@@ -13001,7 +14578,122 @@ impl VizApp {
     /// On TUI startup, auto-create a coordinator labeled with the current
     /// WG_USER identity if none exists for that user. This ensures each user
     /// gets their own chat agent managing their own agent budget.
+    /// Tear down any `wg-chat-*` tmux session for THIS project whose
+    /// backing chat task is no longer alive in the graph. Runs once
+    /// at TUI startup. No-op when tmux isn't installed.
+    ///
+    /// Only matches sessions whose project tag equals the current
+    /// project root's basename — so two different projects' TUIs can
+    /// run side-by-side without sweeping each other's sessions.
+    /// Project-namespaced prefix matching every `wg-chat-*` tmux session
+    /// for THIS project (`wg-chat-<project>-`). Used by orphan-sweep,
+    /// settings-sync, and the chat-exit prompt to scope tmux operations
+    /// to this project so co-running TUIs in sibling projects don't
+    /// touch each other's sessions.
+    fn chat_tmux_session_prefix(&self) -> String {
+        let project_root = self
+            .workgraph_dir
+            .parent()
+            .unwrap_or(&self.workgraph_dir)
+            .to_path_buf();
+        let project_tag = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
+        format!(
+            "{}{}-",
+            workgraph::chat_id::CHAT_TMUX_SESSION_PREFIX,
+            project_tag.replace([':', '.'], "-")
+        )
+    }
+
+    /// Re-assert wg's desired tmux session options across every chat
+    /// session for this project. wg owns the state — call this on TUI
+    /// startup, after theme toggles, and from any future hook where a
+    /// setting that affects tmux changes. Idempotent and self-healing:
+    /// running twice produces no observable change, and a session that
+    /// drifted (user manually `tmux set status on`) is corrected on the
+    /// next call. No-op when tmux isn't installed.
+    pub fn sync_chat_tmux_settings(&self) {
+        let prefix = self.chat_tmux_session_prefix();
+        crate::tui::pty_pane::sync_chat_session_settings(&prefix);
+    }
+
+    pub fn sweep_orphan_chat_tmux_sessions(&mut self) {
+        if !crate::tui::pty_pane::tmux_available() {
+            return;
+        }
+        let project_root = self
+            .workgraph_dir
+            .parent()
+            .unwrap_or(&self.workgraph_dir)
+            .to_path_buf();
+        let project_tag = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
+
+        // Build the set of live chat refs from the graph: `chat-N` for
+        // every non-archived/non-abandoned task with the chat-loop tag.
+        let graph_path = self.workgraph_dir.join("graph.jsonl");
+        let live_refs: std::collections::HashSet<String> =
+            workgraph::parser::load_graph(&graph_path)
+                .map(|g| {
+                    g.tasks()
+                        .filter(|t| {
+                            t.tags
+                                .iter()
+                                .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+                        })
+                        .filter(|t| !matches!(t.status, workgraph::graph::Status::Abandoned))
+                        .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
+                        .filter_map(|t| workgraph::chat_id::parse_chat_task_id(&t.id))
+                        .map(|n| format!("chat-{}", n))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        // Enumerate all wg-chat-* sessions and kill the ones whose chat
+        // ref isn't in `live_refs`.
+        let prefix = format!(
+            "{}{}-",
+            workgraph::chat_id::CHAT_TMUX_SESSION_PREFIX,
+            project_tag.replace([':', '.'], "-")
+        );
+        let sessions = crate::tui::pty_pane::tmux_list_sessions_with_prefix(&prefix);
+        for session in &sessions {
+            let Some(chat_ref) = workgraph::chat_id::parse_chat_tmux_session(session, &project_tag)
+            else {
+                continue;
+            };
+            if !live_refs.contains(&chat_ref) {
+                eprintln!(
+                    "[wg-tui] sweeping orphan chat tmux session: {} (no live task)",
+                    session
+                );
+                crate::tui::pty_pane::tmux_kill_session(session);
+            }
+        }
+    }
+
     pub fn ensure_user_coordinator(&mut self) {
+        // Orphan-sweep tmux chat sessions whose backing task is gone
+        // before any chat-tab spawn might reattach to one. Cheap (one
+        // `tmux list-sessions` shell-out + a graph load) and the only
+        // way we don't accumulate `wg-chat-*` sessions across runs of
+        // `wg chat delete` / archive-while-tui-was-down. See design
+        // doc Lifecycle invariants.
+        self.sweep_orphan_chat_tmux_sessions();
+
+        // Re-assert wg's desired tmux options on every surviving chat
+        // session. Catches sessions created by a prior wg version (or
+        // a prior wg with different defaults), and corrects any drift
+        // from manual user edits. See `sync_chat_session_settings` in
+        // pty_pane for the centralized list of options wg owns.
+        self.sync_chat_tmux_settings();
+
         let user = workgraph::current_user();
         // Don't auto-create for the fallback "unknown" identity
         if user == "unknown" {
@@ -13068,12 +14760,13 @@ impl VizApp {
         }
     }
 
-    /// Open the full-pane coordinator launcher, populating it with
-    /// available executors, models, endpoints, and recent combos.
+    /// Open the full-pane coordinator launcher in its minimal default
+    /// state (redesign-new-chat 2026-04-30): two preset radios
+    /// (codex:gpt-5.5, claude:opus) plus an "+ Add new..." row that
+    /// flips into the full form when picked. No openrouter dump, no
+    /// recent-history list, no executor/model/endpoint pickers up
+    /// front — those live in the Add-new flow only.
     pub fn open_launcher(&mut self) {
-        use workgraph::executor_discovery;
-        use workgraph::launcher_history;
-
         let now = Instant::now();
         if let Some(last) = self.last_launcher_open {
             if now.duration_since(last).as_millis() < 250 {
@@ -13084,7 +14777,7 @@ impl VizApp {
 
         let config = Config::load_or_default(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
-        let alive = self.list_coordinator_ids_and_labels().len();
+        let alive = self.live_chat_count();
         if alive >= max {
             self.push_toast(
                 format!("Chat cap reached ({}/{})", alive, max),
@@ -13093,107 +14786,134 @@ impl VizApp {
             return;
         }
 
-        let all_executors = executor_discovery::discover();
-        let executor_list: Vec<(String, String, bool)> = all_executors
-            .iter()
-            .map(|e| (e.name.to_string(), e.description.to_string(), e.available))
-            .collect();
-
-        let all_models =
-            workgraph::models::load_model_choices_with_descriptions(&self.workgraph_dir);
-
-        let endpoint_list: Vec<(String, String)> = config
-            .llm_endpoints
-            .endpoints
-            .iter()
-            .map(|ep| {
-                let desc = ep
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| format!("{} (default)", ep.provider));
-                (ep.name.clone(), desc)
-            })
-            .collect();
-
-        let recent_list = launcher_history::recent_combos(10).unwrap_or_default();
-
-        let default_executor_idx = executor_list
-            .iter()
-            .position(|(name, _, avail)| *avail && name == "claude")
-            .or_else(|| executor_list.iter().position(|(_, _, avail)| *avail))
-            .unwrap_or(0);
-
-        let initial_executor = executor_list
-            .get(default_executor_idx)
-            .map(|(name, _, _)| name.clone())
-            .unwrap_or_else(|| "claude".to_string());
-        let initial_models = filter_models_for_executor(&all_models, &initial_executor);
-        let model_picker = FilterPicker::new(initial_models, true)
-            .with_hint("No models found. Check wg config --registry.");
-        let endpoint_picker = FilterPicker::new(endpoint_list, true)
-            .with_hint("No endpoints registered. wg endpoint add ... to add one.");
-
         self.launcher = Some(LauncherState {
-            active_section: LauncherSection::Executor,
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
             name: String::new(),
-            executor_list,
-            executor_selected: default_executor_idx,
-            model_picker,
-            endpoint_picker,
-            recent_list,
-            recent_selected: 0,
-            all_models,
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            add_endpoint: String::new(),
+            creating: false,
+            last_error: None,
         });
         self.input_mode = InputMode::Launcher;
     }
 
     /// Launch a coordinator with the selections from the launcher pane.
     pub fn launch_from_launcher(&mut self) {
-        let launcher = match self.launcher.take() {
-            Some(l) => l,
-            None => return,
+        // Read selections WITHOUT closing the launcher. The pane stays
+        // visible (with a "Creating chat..." overlay — see render) until
+        // `drain_commands::CreateCoordinator` returns. Closing the
+        // launcher synchronously caused a jarring flash to the
+        // previously-active chat during the ~100-500ms IPC roundtrip
+        // (graph load + coordinator-state write), then a second focus
+        // hop to the new chat — fix-tui-new symptom 2.
+
+        // Read selections WITHOUT closing the launcher. In Default mode
+        // a "+ Add new..." highlight is a UI-only transition (flips into
+        // Add-new mode) — bail before any IPC. Add-new mode without a
+        // model is also a no-op.
+        let (name, mode_was_default, add_new_highlighted) = match self.launcher.as_ref() {
+            Some(l) if !l.creating => (
+                l.name.trim().to_string(),
+                matches!(l.mode, LauncherMode::Default),
+                matches!(l.mode, LauncherMode::Default) && l.is_add_new_highlighted(),
+            ),
+            _ => return,
         };
-        self.input_mode = InputMode::Normal;
+
+        // "+ Add new..." in Default mode flips into Add-new mode rather
+        // than launching. The user needs to fill out the form first.
+        if add_new_highlighted {
+            if let Some(l) = self.launcher.as_mut() {
+                l.enter_add_new();
+            }
+            return;
+        }
+
+        let (executor, model, endpoint) = match self
+            .launcher
+            .as_ref()
+            .and_then(|l| l.resolved_launch_args())
+        {
+            Some(args) => args,
+            None => {
+                if mode_was_default {
+                    return;
+                }
+                if let Some(l) = self.launcher.as_mut() {
+                    l.last_error = Some("Model or command is required".to_string());
+                }
+                return;
+            }
+        };
 
         let config = Config::load_or_default(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
-        let alive = self.list_coordinator_ids_and_labels().len();
+        let alive = self.live_chat_count();
         if alive >= max {
             self.push_toast(
                 format!("Chat cap reached ({}/{})", alive, max),
                 ToastSeverity::Warning,
             );
+            self.launcher = None;
+            self.input_mode = InputMode::Normal;
             return;
         }
 
         let mut args = vec!["service".to_string(), "create-coordinator".to_string()];
 
-        let name = launcher.name.trim().to_string();
         if !name.is_empty() {
             args.push("--name".to_string());
             args.push(name);
         }
 
-        let executor = launcher.selected_executor().to_string();
-        args.push("--executor".to_string());
-        args.push(executor.clone());
+        if executor == "command" {
+            if let Some(ref command) = model {
+                args.push("--command".to_string());
+                args.push(command.clone());
+            }
+        } else {
+            args.push("--exec".to_string());
+            args.push(executor.clone());
 
-        if let Some(model) = launcher.selected_model() {
-            args.push("--model".to_string());
-            args.push(model.clone());
+            if let Some(ref m) = model {
+                args.push("--model".to_string());
+                args.push(m.clone());
+            }
 
-            // Record history entry
-            let endpoint = launcher.selected_endpoint();
+            // Endpoint is only set in Add-new mode with executor=nex. Default
+            // mode never specifies an endpoint — claude/codex auth themselves.
+            if let Some(ref ep) = endpoint {
+                args.push("--endpoint".to_string());
+                args.push(ep.clone());
+            }
+        }
+
+        // Record history (executor + model + endpoint) so a future v2
+        // recall list (deferred — see task spec) can surface this combo.
+        if model.is_some() || endpoint.is_some() {
             if let Ok(()) = workgraph::launcher_history::record_use(
                 &workgraph::launcher_history::HistoryEntry::new(
                     &executor,
-                    Some(&model),
+                    model.as_deref(),
                     endpoint.as_deref(),
                     "tui",
                 ),
             ) {}
         }
 
+        // Mark the launcher as in-flight BEFORE firing the command —
+        // the flag also serves as the input gate (handle_launcher_input
+        // ignores keys while it is set). Clear any prior error: the
+        // user is retrying with new selections, so the stale failure
+        // banner should not stay visible.
+        if let Some(l) = self.launcher.as_mut() {
+            l.creating = true;
+            l.last_error = None;
+        }
         self.exec_command(args, CommandEffect::CreateCoordinator);
     }
 
@@ -13216,11 +14936,18 @@ impl VizApp {
         self.input_mode = InputMode::Normal;
     }
 
+    /// Exit scroll mode if currently active, returning to Normal.
+    pub fn exit_scroll_mode_if_active(&mut self) {
+        if matches!(self.input_mode, InputMode::ScrollMode { .. }) {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
     /// Create a coordinator with defaults (Shift+Plus shortcut, skips picker).
     pub fn create_coordinator_with_defaults(&mut self) {
         let config = Config::load_or_default(&self.workgraph_dir);
         let max = config.coordinator.max_coordinators;
-        let alive = self.list_coordinator_ids_and_labels().len();
+        let alive = self.live_chat_count();
         if alive >= max {
             self.push_toast(
                 format!("Chat cap reached ({}/{})", alive, max),
@@ -13295,9 +15022,293 @@ impl VizApp {
         self.input_mode = InputMode::Normal;
     }
 
+    /// Open the chat manager pane: enumerate every chat-loop task in the
+    /// graph (active + terminal), sort by cid, and present as a multi-
+    /// selectable list for bulk-abandon. See `ChatManagerState`.
+    pub fn open_chat_manager(&mut self) {
+        let graph_path = self.workgraph_dir.join("graph.jsonl");
+        let graph = match workgraph::parser::load_graph(&graph_path) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        let mut entries: Vec<ChatManagerEntry> = Vec::new();
+        for task in graph.tasks() {
+            let is_chat = task
+                .tags
+                .iter()
+                .any(|t| workgraph::chat_id::is_chat_loop_tag(t));
+            if !is_chat {
+                continue;
+            }
+            // Skip tasks already tagged "archived" — those are the user's
+            // intentional "filed away" set, not the cleanup target.
+            if task.tags.iter().any(|t| t == "archived") {
+                continue;
+            }
+            let cid = match workgraph::chat_id::parse_chat_task_id(&task.id) {
+                Some(c) => c,
+                None if task.id == ".coordinator" => 0,
+                None => continue,
+            };
+            let message_count = count_chat_messages(&self.workgraph_dir, cid);
+            let last_activity = task.log.last().map(|e| e.timestamp.clone());
+            entries.push(ChatManagerEntry {
+                cid,
+                task_id: task.id.clone(),
+                status: format!("{:?}", task.status).to_lowercase(),
+                terminal: task.status.is_terminal(),
+                message_count,
+                last_activity,
+                title: task.title.clone(),
+            });
+        }
+        entries.sort_by_key(|e| e.cid);
+
+        if entries.is_empty() {
+            self.push_toast("No chat tasks found".to_string(), ToastSeverity::Info);
+            return;
+        }
+
+        self.chat_manager = Some(ChatManagerState {
+            entries,
+            selected: 0,
+            multi_selected: std::collections::HashSet::new(),
+            filter: ChatManagerFilter::All,
+        });
+        self.input_mode = InputMode::ChatManager;
+    }
+
+    /// Close the chat manager pane.
+    pub fn close_chat_manager(&mut self) {
+        self.chat_manager = None;
+        self.input_mode = InputMode::Normal;
+    }
+
+    /// Abandon the selected chat tasks (multi-select set ∪ highlighted row),
+    /// then close the manager.
+    pub fn chat_manager_abandon_selected(&mut self) {
+        let cids: Vec<u32> = if let Some(ref mgr) = self.chat_manager {
+            let mut cids: Vec<u32> = mgr.multi_selected.iter().copied().collect();
+            if cids.is_empty() {
+                let visible = mgr.visible_indices();
+                if let Some(&idx) = visible.get(mgr.selected)
+                    && let Some(entry) = mgr.entries.get(idx)
+                {
+                    cids.push(entry.cid);
+                }
+            }
+            cids.sort();
+            cids
+        } else {
+            return;
+        };
+        if cids.is_empty() {
+            return;
+        }
+        let count = cids.len();
+        for cid in cids {
+            self.delete_coordinator(cid);
+            self.close_tab(cid);
+        }
+        self.push_toast(
+            format!(
+                "Abandoning {} chat task{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            ToastSeverity::Info,
+        );
+        self.close_chat_manager();
+    }
+
+    /// Toggle multi-select on the currently highlighted row.
+    pub fn chat_manager_toggle_select(&mut self) {
+        if let Some(ref mut mgr) = self.chat_manager {
+            let visible = mgr.visible_indices();
+            if let Some(&idx) = visible.get(mgr.selected)
+                && let Some(entry) = mgr.entries.get(idx)
+            {
+                let cid = entry.cid;
+                if !mgr.multi_selected.insert(cid) {
+                    mgr.multi_selected.remove(&cid);
+                }
+            }
+        }
+    }
+
+    /// Move highlight by `delta` rows, clamped to the visible range.
+    pub fn chat_manager_navigate(&mut self, delta: i32) {
+        if let Some(ref mut mgr) = self.chat_manager {
+            let visible_len = mgr.visible_indices().len();
+            if visible_len == 0 {
+                mgr.selected = 0;
+                return;
+            }
+            let max = visible_len as i32 - 1;
+            let new = (mgr.selected as i32 + delta).clamp(0, max);
+            mgr.selected = new as usize;
+        }
+    }
+
+    /// Cycle through filter modes (all → non-empty → empty → alive → all).
+    pub fn chat_manager_cycle_filter(&mut self) {
+        if let Some(ref mut mgr) = self.chat_manager {
+            mgr.filter = mgr.filter.cycle();
+            // Clamp selected into the new visible range.
+            let len = mgr.visible_indices().len();
+            if len == 0 {
+                mgr.selected = 0;
+            } else if mgr.selected >= len {
+                mgr.selected = len - 1;
+            }
+        }
+    }
+
+    /// Select all currently-visible (post-filter) entries.
+    pub fn chat_manager_select_all_visible(&mut self) {
+        if let Some(ref mut mgr) = self.chat_manager {
+            for &idx in &mgr.visible_indices() {
+                if let Some(entry) = mgr.entries.get(idx) {
+                    mgr.multi_selected.insert(entry.cid);
+                }
+            }
+        }
+    }
+
+    /// Clear the multi-select set without closing.
+    pub fn chat_manager_clear_selection(&mut self) {
+        if let Some(ref mut mgr) = self.chat_manager {
+            mgr.multi_selected.clear();
+        }
+    }
+
     /// Delete a coordinator session via IPC.
     /// Sends the delete command to the backend; on success the effect handler
     /// cleans up local chat state, switches to another coordinator, and refreshes.
+    // ── Chat-exit prompt (tmux-persistence UX) ──────────────────────
+
+    /// Returns chat ids that currently have a live tmux session for
+    /// THIS project. Used by the exit-prompt intercept to decide
+    /// whether to ask "leave running or close?" or to just exit.
+    pub fn live_chat_tmux_ids(&self) -> Vec<u32> {
+        if !crate::tui::pty_pane::tmux_available() {
+            return Vec::new();
+        }
+        let project_root = self
+            .workgraph_dir
+            .parent()
+            .unwrap_or(&self.workgraph_dir)
+            .to_path_buf();
+        let project_tag = project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project")
+            .to_string();
+        let prefix = format!(
+            "{}{}-",
+            workgraph::chat_id::CHAT_TMUX_SESSION_PREFIX,
+            project_tag.replace([':', '.'], "-")
+        );
+        crate::tui::pty_pane::tmux_list_sessions_with_prefix(&prefix)
+            .into_iter()
+            .filter_map(|s| workgraph::chat_id::parse_chat_tmux_session(&s, &project_tag))
+            .filter_map(|cref| {
+                cref.strip_prefix("chat-")
+                    .and_then(|n| n.parse::<u32>().ok())
+            })
+            .collect()
+    }
+
+    /// Open the chat-exit prompt overlay. Caller is responsible for
+    /// having decided that one is warranted (see `live_chat_tmux_ids`).
+    pub fn open_exit_prompt(&mut self, chats: Vec<u32>) {
+        self.input_mode = InputMode::ExitPrompt(ExitPromptState::new(chats));
+    }
+
+    /// Resolve the exit prompt with "leave all running": exit the TUI
+    /// without touching tmux sessions; next `wg tui` reattaches.
+    pub fn resolve_exit_prompt_leave_all(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.should_quit = true;
+        self.exit_prompt_resolved = true;
+    }
+
+    /// Resolve the exit prompt with "close all": kill every chat tmux
+    /// session for this project, then exit.
+    pub fn resolve_exit_prompt_close_all(&mut self) {
+        let chats = match &self.input_mode {
+            InputMode::ExitPrompt(s) => s.chats.clone(),
+            _ => Vec::new(),
+        };
+        for cid in chats {
+            // Prefer pane-owned cleanup so the local task_panes entry is
+            // disposed; fall back to direct kill-by-name otherwise (e.g.
+            // for chats spawned under a prior TUI process).
+            let task_id = workgraph::chat_id::format_chat_task_id(cid);
+            let chat_ref = format!("chat-{}", cid);
+            let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+            workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
+            if let Some(mut pane) = self.task_panes.remove(&task_id) {
+                pane.kill_underlying_session();
+            } else {
+                workgraph::chat_id::kill_chat_tmux_session_for_id(&self.workgraph_dir, cid);
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.should_quit = true;
+        self.exit_prompt_resolved = true;
+    }
+
+    /// Resolve per-chat decisions: kill tmux sessions for chats marked
+    /// `close`, leave the rest alone, then exit.
+    pub fn resolve_exit_prompt_per_chat(&mut self) {
+        let (chats, decisions) = match &self.input_mode {
+            InputMode::ExitPrompt(s) => (s.chats.clone(), s.per_chat_close.clone()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        for (cid, close) in chats.iter().zip(decisions.iter()) {
+            if !close {
+                continue;
+            }
+            let task_id = workgraph::chat_id::format_chat_task_id(*cid);
+            let chat_ref = format!("chat-{}", cid);
+            let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
+            workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
+            if let Some(mut pane) = self.task_panes.remove(&task_id) {
+                pane.kill_underlying_session();
+            } else {
+                workgraph::chat_id::kill_chat_tmux_session_for_id(&self.workgraph_dir, *cid);
+            }
+        }
+        self.input_mode = InputMode::Normal;
+        self.should_quit = true;
+        self.exit_prompt_resolved = true;
+    }
+
+    /// Cancel the exit prompt — return to Normal mode without quitting.
+    pub fn cancel_exit_prompt(&mut self) {
+        self.input_mode = InputMode::Normal;
+        self.should_quit = false;
+        self.exit_prompt_resolved = false;
+    }
+
+    /// Switch the exit prompt into per-chat granular mode.
+    pub fn enter_exit_prompt_per_chat(&mut self) {
+        if let InputMode::ExitPrompt(ref mut s) = self.input_mode {
+            // Skip directly to "all done" if there are 0 chats — but the
+            // intercept already gates on chats.len() > 0, so this is just
+            // a safety belt.
+            if s.chats.is_empty() {
+                self.input_mode = InputMode::Normal;
+                self.should_quit = true;
+                self.exit_prompt_resolved = true;
+                return;
+            }
+            s.per_chat_idx = Some(0);
+        }
+    }
+
     pub fn delete_coordinator(&mut self, cid: u32) {
         let args = vec![
             "service".to_string(),
@@ -13307,12 +15318,132 @@ impl VizApp {
         self.exec_command(args, CommandEffect::DeleteCoordinator(cid));
     }
 
+    /// Mouse click on the `✕` close button of a chat tab.
+    ///
+    /// Per fix-tui-chat: `X = gone for good`. Both kills the underlying chat
+    /// task (via `delete_coordinator` IPC) AND hides the tab immediately for
+    /// snappy UX. If the IPC fails (daemon dead), the tab still stays hidden
+    /// for this session via `close_tab`.
+    pub fn click_close_button(&mut self, cid: u32) {
+        self.delete_coordinator(cid);
+        self.close_tab(cid);
+    }
+
     /// Get a list of known coordinator IDs from the graph.
     pub fn list_coordinator_ids(&self) -> Vec<u32> {
         self.list_coordinator_ids_and_labels()
             .into_iter()
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// Build the `(cid, canonical_chat_task_id)` list directly from a
+    /// pre-loaded graph — no disk I/O. Used by `refresh_chat_tab_caches`
+    /// in the per-tick refresh path (see `maybe_refresh`) so we don't
+    /// re-parse `graph.jsonl` once per render frame.
+    fn list_coordinator_ids_and_labels_from_graph(
+        graph: &workgraph::graph::WorkGraph,
+    ) -> Vec<(u32, String)> {
+        let mut entries: Vec<(u32, String)> = graph
+            .tasks()
+            .filter(|t| {
+                t.tags
+                    .iter()
+                    .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
+            })
+            .filter(|t| !t.status.is_terminal())
+            .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
+            .filter_map(|t| {
+                let cid = workgraph::chat_id::parse_chat_task_id(&t.id)
+                    .or_else(|| (t.id == ".coordinator").then_some(0))?;
+                Some((cid, String::new()))
+            })
+            .collect();
+        entries.sort_by_key(|(id, _)| *id);
+        entries.dedup_by_key(|(id, _)| *id);
+        if entries.is_empty() {
+            entries.push((0, String::new()));
+        }
+        for (cid, label) in entries.iter_mut() {
+            *label = workgraph::chat_id::canonical_chat_task_id(graph, *cid);
+        }
+        entries
+    }
+
+    /// Build the user-board entries list directly from a pre-loaded graph.
+    /// Pairs with `list_coordinator_ids_and_labels_from_graph` for the
+    /// per-tick cache refresh.
+    fn list_user_board_entries_from_graph(
+        graph: &workgraph::graph::WorkGraph,
+    ) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = graph
+            .tasks()
+            .filter(|t| workgraph::graph::is_user_board(&t.id))
+            .filter(|t| !t.status.is_terminal())
+            .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
+            .map(|t| {
+                let label = workgraph::graph::user_board_handle(&t.id)
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| t.id.clone());
+                (t.id.clone(), label)
+            })
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
+    }
+
+    /// Refresh the chat-tab + user-board caches from a pre-loaded graph.
+    /// Called from `maybe_refresh()` whenever the graph reloads. The chat-tab
+    /// renderer (`render::draw_chat_tab`) reads `cached_chat_tab_entries`
+    /// and `cached_user_board_entries` instead of re-loading + re-parsing
+    /// the 2 MB+ `graph.jsonl` on every frame (the original 55 % CPU bug).
+    pub fn refresh_chat_tab_caches(&mut self, graph: &workgraph::graph::WorkGraph) {
+        let coordinator_entries = Self::list_coordinator_ids_and_labels_from_graph(graph);
+        self.cached_coordinator_id_set = coordinator_entries
+            .iter()
+            .map(|(id, label)| (*id, label.clone()))
+            .collect();
+        self.rebuild_active_tab_entries_from_cache();
+        self.cached_user_board_entries = Self::list_user_board_entries_from_graph(graph);
+    }
+
+    /// Recompute `cached_chat_tab_entries` from `active_tabs` ∩
+    /// `cached_coordinator_id_set` — purely in-memory, no disk I/O. Called
+    /// after any mutation of `active_tabs` (`close_tab`,
+    /// `sync_active_tabs_from_graph`) so the cache stays consistent with the
+    /// user-visible tab bar without re-parsing `graph.jsonl`. Falls back to
+    /// `format_chat_task_id` for ids missing from the canonical-label map
+    /// (only happens before the first `refresh_chat_tab_caches`).
+    fn rebuild_active_tab_entries_from_cache(&mut self) {
+        self.cached_chat_tab_entries = self
+            .active_tabs
+            .iter()
+            .filter_map(|&id| {
+                self.cached_coordinator_id_set
+                    .get(&id)
+                    .map(|label| (id, label.clone()))
+            })
+            .collect();
+    }
+
+    /// Count chats that occupy a slot toward `coordinator.max_coordinators`.
+    ///
+    /// Distinct from `list_coordinator_ids_and_labels().len()`: this filters
+    /// out zombie supervisors (handler dead + consumer absent) and Done /
+    /// Abandoned / archived tasks, matching the IPC `CreateChat` cap check.
+    /// Returns 0 on a missing graph file rather than synthesizing a phantom
+    /// chat-0 entry — empty graph means zero live chats.
+    pub fn live_chat_count(&self) -> usize {
+        let graph_path = self.workgraph_dir.join("graph.jsonl");
+        let graph = match workgraph::parser::load_graph(&graph_path) {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        workgraph::chat::count_live_chats(
+            &self.workgraph_dir,
+            &graph,
+            workgraph::chat::CHAT_CAP_IDLE_THRESHOLD,
+        )
     }
 
     /// Get coordinator IDs with display labels from the graph.
@@ -13331,7 +15462,7 @@ impl VizApp {
                     .iter()
                     .any(|tag| workgraph::chat_id::is_chat_loop_tag(tag))
             })
-            .filter(|t| !matches!(t.status, Status::Abandoned))
+            .filter(|t| !t.status.is_terminal())
             .filter(|t| !t.tags.iter().any(|tag| tag == "archived"))
             .filter_map(|t| {
                 // Accept .chat-N, .coordinator-N (legacy), and bare .coordinator
@@ -13362,13 +15493,29 @@ impl VizApp {
     /// tasks are dropped). New graph chats not yet in active_tabs are NOT
     /// included here — use sync_active_tabs_from_graph for that.
     pub fn active_tab_ids_and_labels(&self) -> Vec<(u32, String)> {
-        let current: std::collections::HashSet<u32> =
-            self.list_coordinator_ids().into_iter().collect();
+        let current: std::collections::HashMap<u32, String> =
+            self.list_coordinator_ids_and_labels().into_iter().collect();
         self.active_tabs
             .iter()
-            .filter(|&&id| current.contains(&id))
-            .map(|&id| (id, workgraph::chat_id::format_chat_task_id(id)))
+            .filter_map(|&id| current.get(&id).map(|label| (id, label.clone())))
             .collect()
+    }
+
+    /// Scroll the chat tab bar by `delta` entries (positive = right, negative
+    /// = left). Used by the click handlers on the ◀/▶ overflow arrows. The
+    /// renderer clamps the offset and may re-adjust if the active tab is no
+    /// longer visible after scrolling — this just nudges the user's stored
+    /// preference.
+    pub fn scroll_chat_tabs(&mut self, delta: i32) {
+        let total = self.active_tab_ids_and_labels().len() + self.list_user_board_entries().len();
+        if total == 0 {
+            self.chat_tab_scroll_offset = 0;
+            return;
+        }
+        let max_offset = total.saturating_sub(1);
+        let new_off =
+            (self.chat_tab_scroll_offset as i32 + delta).clamp(0, max_offset as i32) as usize;
+        self.chat_tab_scroll_offset = new_off;
     }
 
     /// Sync active_tabs with the current graph state:
@@ -13376,21 +15523,45 @@ impl VizApp {
     ///     (in sorted order so the initial population is deterministic).
     ///   - Remove tabs for chats that no longer exist (abandoned/archived).
     pub fn sync_active_tabs_from_graph(&mut self) {
-        let sorted_ids = self.list_coordinator_ids(); // already sorted by cid
-        let current: std::collections::HashSet<u32> = sorted_ids.iter().copied().collect();
+        let entries = self.list_coordinator_ids_and_labels(); // canonical labels, sorted
+        let current: std::collections::HashMap<u32, String> = entries
+            .iter()
+            .map(|(id, label)| (*id, label.clone()))
+            .collect();
+        let sorted_ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
         // Add newly-appeared chats in sorted order so the tab bar is stable
         for &id in &sorted_ids {
             if !self.active_tabs.contains(&id) && !self.closed_tabs.contains(&id) {
                 self.active_tabs.push(id);
             }
         }
-        // Drop tabs whose underlying tasks were abandoned/archived
-        self.active_tabs.retain(|id| current.contains(id));
-        // If the active coordinator was dropped, switch to first available tab
-        if !self.active_tabs.is_empty() && !self.active_tabs.contains(&self.active_coordinator_id) {
+        // Drop tabs whose underlying tasks were abandoned/archived,
+        // but keep the active coordinator's tab even if the graph
+        // hasn't reported it yet (fresh-create race — fix-new-chat-4).
+        // Without this carve-out, a launcher submission whose graph
+        // write hasn't been re-stat'd by the next refresh would lose
+        // the new tab, then trip the auto-switch fallback below and
+        // flip focus back to the previous chat.
+        let active_id = self.active_coordinator_id;
+        self.active_tabs
+            .retain(|id| current.contains_key(id) || *id == active_id);
+        // Auto-switch only when the active coordinator is genuinely
+        // gone from the graph (abandoned/archived externally — e.g.
+        // someone ran `wg abandon` from the CLI). A merely-stale
+        // `active_tabs` entry must NOT trigger this — the new chat
+        // we just created is the canonical example: graph hasn't
+        // caught up, but focus belongs on it.
+        if !self.active_tabs.is_empty()
+            && !current.contains_key(&self.active_coordinator_id)
+            && !self.active_tabs.contains(&self.active_coordinator_id)
+        {
             let next = self.active_tabs[0];
             self.switch_coordinator(next);
         }
+        // Refresh the per-frame cache with canonical labels so legacy
+        // `.coordinator-N` ids keep their muted-gray treatment in the tab bar.
+        self.cached_coordinator_id_set = current;
+        self.rebuild_active_tab_entries_from_cache();
     }
 
     /// Close a tab: remove from active_tabs without touching the underlying
@@ -13406,6 +15577,7 @@ impl VizApp {
                 self.active_coordinator_id = 0;
             }
         }
+        self.rebuild_active_tab_entries_from_cache();
     }
 
     /// Get user board entries from the graph.
@@ -13891,7 +16063,6 @@ impl VizApp {
             edit_kind: ConfigEditKind::Choice(vec![
                 "claude".into(),
                 "native".into(),
-                "amplifier".into(),
                 "opencode".into(),
                 "codex".into(),
                 "shell".into(),
@@ -14106,7 +16277,6 @@ impl VizApp {
             value: config.agent.executor.clone(),
             edit_kind: ConfigEditKind::Choice(vec![
                 "claude".into(),
-                "amplifier".into(),
                 "opencode".into(),
                 "codex".into(),
                 "shell".into(),
@@ -14877,7 +17047,16 @@ impl VizApp {
             }
             "tui.default_layout" => config.tui.default_layout = new_value,
             "tui.default_inspector_size" => config.tui.default_inspector_size = new_value,
-            "tui.color_theme" => config.tui.color_theme = new_value,
+            "tui.color_theme" => {
+                config.tui.color_theme = new_value.clone();
+                self.is_light_theme = new_value == "light";
+                // wg owns tmux session state — push the new theme to
+                // every active chat session. Today this re-asserts
+                // `status off`; once theme-aware status colors land
+                // (fix-tmux-status option B), this same hook pushes
+                // the new palette without further plumbing.
+                self.sync_chat_tmux_settings();
+            }
             "tui.timestamp_format" => config.tui.timestamp_format = new_value,
             "tui.show_token_counts" => config.tui.show_token_counts = new_value == "on",
             "tui.detail_tail_lines" => {
@@ -15268,6 +17447,7 @@ impl VizApp {
                 },
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: is_first,
                 context_window: None,
             });
@@ -15762,7 +17942,7 @@ pub(super) fn is_box_drawing(c: char) -> bool {
 
 /// Find the most recent archived agent file for a task.
 ///
-/// Looks in `.workgraph/log/agents/<task-id>/` for timestamped subdirectories
+/// Looks in `.wg/log/agents/<task-id>/` for timestamped subdirectories
 /// and returns the path to `filename` in the most recent one (if it exists).
 fn find_latest_archive(
     workgraph_dir: &std::path::Path,
@@ -15810,6 +17990,21 @@ fn find_all_archives(
     // Sort by name ascending (oldest first — timestamps sort lexicographically)
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries
+}
+
+/// Print the "tmux missing → no chat persistence" warning at most once
+/// per process. Without the once-guard, every chat tab the user opens
+/// in this TUI session would re-emit the same banner.
+fn warn_chat_tmux_missing_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[wg-tui] tmux not installed — chat agents will NOT survive TUI exit. \
+             Install tmux for codex/claude resume integrity. \
+             (See docs/design/chat-agent-persistence.md.)"
+        );
+    }
 }
 
 /// Deterministic session UUID for a coordinator, derived from CWD + session name.
@@ -16199,11 +18394,23 @@ impl ViewportScroll {
         self.offset_y = self.content_height.saturating_sub(self.viewport_height);
     }
 
+    /// Returns true when the viewport is pinned to the top of the graph.
+    pub fn is_at_top(&self) -> bool {
+        self.offset_y == 0
+    }
+
     /// Returns true if the viewport is scrolled to (or near) the bottom.
     /// "Near" means within 3 lines of the bottom, to allow for small render jitter.
     pub fn is_at_bottom(&self) -> bool {
         let max_y = self.content_height.saturating_sub(self.viewport_height);
         self.offset_y + 3 >= max_y || self.content_height <= self.viewport_height
+    }
+
+    /// Returns true only when the viewport is scrolled to the exact bottom (no slack).
+    /// Use this for smart-follow decisions where near-bottom should NOT auto-advance.
+    pub fn is_at_bottom_strict(&self) -> bool {
+        let max_y = self.content_height.saturating_sub(self.viewport_height);
+        self.offset_y >= max_y || self.content_height <= self.viewport_height
     }
 
     pub fn page_left(&mut self) {
@@ -16252,7 +18459,7 @@ mod hud_tests {
     use crate::commands::viz::{LayoutMode, VizOutput};
 
     /// Build a chain graph a -> b -> c plus standalone d, with rich metadata on task a.
-    /// Returns (VizOutput, WorkGraph, TempDir) — keep TempDir alive while using the app.
+    /// Returns (`VizOutput`, `WorkGraph`, `TempDir`) — keep `TempDir` alive while using the app.
     fn build_chain_plus_isolated() -> (VizOutput, WorkGraph, tempfile::TempDir) {
         let mut graph = WorkGraph::new();
         let mut a = make_task_with_status("a", "Task Alpha", Status::Done);
@@ -16313,7 +18520,7 @@ mod hud_tests {
         (result, graph, tmp)
     }
 
-    /// Build a VizApp with a specific task selected, pointed at a real workgraph dir.
+    /// Build a VizApp with a specific task selected, pointed at a real WG dir.
     fn build_app(viz: &VizOutput, selected_id: &str, workgraph_dir: &std::path::Path) -> VizApp {
         let mut app = VizApp::from_viz_output_for_test(viz);
         app.workgraph_dir = workgraph_dir.to_path_buf();
@@ -16691,6 +18898,132 @@ mod hud_tests {
         assert_ne!(
             second_id, back_id,
             "HUD should show different content after navigating back"
+        );
+    }
+
+    /// Build a graph where parent task `b` has a child meta-task `.evaluate-b`
+    /// running. Returns (`VizOutput`, `WorkGraph`, `TempDir`).
+    fn build_with_evaluate_meta() -> (VizOutput, WorkGraph, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        let a = make_task_with_status("a", "Task Alpha", Status::Done);
+        let mut b = make_task_with_status("b", "Task Bravo", Status::PendingEval);
+        b.after = vec!["a".to_string()];
+        let mut eval = make_task_with_status(".evaluate-b", "Evaluate b", Status::InProgress);
+        eval.assigned = Some("agent-eval".to_string());
+        eval.description = Some("Evaluator scoring task b".to_string());
+
+        graph.add_node(Node::Task(a));
+        graph.add_node(Node::Task(b));
+        graph.add_node(Node::Task(eval));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let result = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        (result, graph, tmp)
+    }
+
+    /// Repro for the [∴ evaluating] click bug: when the user clicks a phase
+    /// annotation, the inspector should show the meta-task. A subsequent
+    /// graph-refresh tick (which calls invalidate_hud + load_hud_detail)
+    /// must NOT flip the inspector back to the parent.
+    #[test]
+    fn hud_pin_keeps_meta_task_visible_across_refresh() {
+        let (viz, _, _tmp) = build_with_evaluate_meta();
+        let mut app = build_app(&viz, "b", _tmp.path());
+
+        // Simulate annotation click handler:
+        // 1. select_task_at_line was already done by build_app (parent "b")
+        // 2. set the pin
+        // 3. load_hud_detail_for_task on the dot-task
+        app.hud_pin = Some(HudPin {
+            dot_task_id: ".evaluate-b".to_string(),
+            anchor_parent_id: "b".to_string(),
+        });
+        app.load_hud_detail_for_task(".evaluate-b");
+        assert_eq!(
+            app.hud_detail.as_ref().unwrap().task_id,
+            ".evaluate-b",
+            "Inspector should initially show the meta-task"
+        );
+
+        // Simulate the periodic refresh path: invalidate_hud then load_hud_detail.
+        // Pre-fix: load_hud_detail keys off selected_task_id (still "b") so the
+        // inspector flips back to "b". Post-fix: pin is honored when the
+        // anchor matches the selection.
+        app.invalidate_hud();
+        app.load_hud_detail();
+        assert_eq!(
+            app.hud_detail.as_ref().unwrap().task_id,
+            ".evaluate-b",
+            "Pin should keep meta-task in inspector across graph-refresh ticks"
+        );
+        assert!(app.hud_pin.is_some(), "Pin should still be set");
+    }
+
+    #[test]
+    fn hud_pin_clears_when_user_navigates_away() {
+        let (viz, _, _tmp) = build_with_evaluate_meta();
+        let mut app = build_app(&viz, "b", _tmp.path());
+
+        // Pin to meta-task while parent "b" is selected.
+        app.hud_pin = Some(HudPin {
+            dot_task_id: ".evaluate-b".to_string(),
+            anchor_parent_id: "b".to_string(),
+        });
+        app.load_hud_detail_for_task(".evaluate-b");
+
+        // User keyboard-navigates to the previous task.
+        app.select_prev_task();
+        assert!(
+            app.hud_pin.is_none(),
+            "Keyboard nav must clear hud_pin so the inspector follows selection"
+        );
+
+        // Inspector now shows whatever task was selected, not the meta-task.
+        app.load_hud_detail();
+        let shown = app.hud_detail.as_ref().unwrap().task_id.clone();
+        assert_ne!(
+            shown, ".evaluate-b",
+            "After nav-away, inspector must not still show the meta-task"
+        );
+    }
+
+    #[test]
+    fn hud_pin_clears_when_anchor_drifts() {
+        let (viz, _, _tmp) = build_with_evaluate_meta();
+        let mut app = build_app(&viz, "b", _tmp.path());
+
+        // Pin's anchor is "a" but selection is "b" — pin is stale and must be dropped.
+        app.hud_pin = Some(HudPin {
+            dot_task_id: ".evaluate-b".to_string(),
+            anchor_parent_id: "a".to_string(),
+        });
+
+        app.load_hud_detail();
+        assert!(
+            app.hud_pin.is_none(),
+            "Stale pin (anchor != selection) must be cleared on load_hud_detail"
+        );
+        assert_eq!(
+            app.hud_detail.as_ref().unwrap().task_id,
+            "b",
+            "Inspector should fall back to the selected task when pin is stale"
         );
     }
 
@@ -17590,6 +19923,93 @@ mod hud_tests {
         assert!(
             has_iter_header,
             "Archived iteration should show labeled output section"
+        );
+    }
+
+    #[test]
+    fn iter_can_go_prev_next_states() {
+        // Empty archives: neither direction is enabled.
+        let (viz, _, _tmp) = build_chain_plus_isolated();
+        let app = build_app(&viz, "a", _tmp.path());
+        assert!(!app.iter_can_go_prev());
+        assert!(!app.iter_can_go_next());
+
+        // 3 archives + live: from None (live) prev is enabled, next is not.
+        let (viz, _, _tmp) = build_cyclic_task_with_archives(3);
+        let mut app = build_app(&viz, "cycle-task", _tmp.path());
+        app.load_hud_detail();
+        assert!(app.viewing_iteration.is_none());
+        assert!(
+            app.iter_can_go_prev(),
+            "from live, prev → most recent archive"
+        );
+        assert!(!app.iter_can_go_next(), "already at live, next is no-op");
+
+        // From archive 0 (oldest): prev is no-op, next → archive 1.
+        app.viewing_iteration = Some(0);
+        assert!(!app.iter_can_go_prev());
+        assert!(app.iter_can_go_next());
+
+        // From last archive (idx 2): prev → archive 1, next → live.
+        app.viewing_iteration = Some(2);
+        assert!(app.iter_can_go_prev());
+        assert!(
+            app.iter_can_go_next(),
+            "from last archive, next must drop to live (this was previously broken)"
+        );
+
+        // From middle archive: both directions work.
+        app.viewing_iteration = Some(1);
+        assert!(app.iter_can_go_prev());
+        assert!(app.iter_can_go_next());
+    }
+
+    #[test]
+    fn iteration_bar_label_includes_metadata() {
+        let (viz, _, _tmp) = build_cyclic_task_with_archives(2);
+        let mut app = build_app(&viz, "cycle-task", _tmp.path());
+        app.load_hud_detail();
+
+        // Default: viewing live (None) on InProgress task → "Iteration 3 of 3 · live".
+        // (2 archives + 1 live slot = 3 total)
+        let label = app.iteration_bar_label();
+        assert!(
+            label.contains("Iteration 3 of 3"),
+            "label should identify which iteration: {}",
+            label
+        );
+        assert!(
+            label.contains("live"),
+            "InProgress task on live slot should show 'live': {}",
+            label
+        );
+
+        // Switch to archive 0 → "Iteration 1 of 3 · started HH:MM · archived"
+        app.viewing_iteration = Some(0);
+        let label = app.iteration_bar_label();
+        assert!(
+            label.contains("Iteration 1 of 3"),
+            "archive 0 should display as iteration 1 of 3: {}",
+            label
+        );
+        assert!(
+            label.contains("archived"),
+            "archive should be marked archived: {}",
+            label
+        );
+        assert!(
+            label.contains("started"),
+            "archive label should include start time: {}",
+            label
+        );
+
+        // Switch to archive 1 → "Iteration 2 of 3"
+        app.viewing_iteration = Some(1);
+        let label = app.iteration_bar_label();
+        assert!(
+            label.contains("Iteration 2 of 3"),
+            "archive 1 should display as iteration 2 of 3: {}",
+            label
         );
     }
 
@@ -18659,6 +21079,14 @@ mod tui_config_panel_tests {
     use crate::commands::viz::LayoutMode as VizLayoutMode;
     use crate::commands::viz::ascii::generate_ascii;
 
+    fn active_profile_config_panel_override_keys() -> HashSet<String> {
+        // Under the file-swap profile design, profiles are not overlays —
+        // local config always wins over global (which IS the active profile
+        // snapshot). No key is "masked" by an active profile, so no key
+        // needs to be skipped during the save-roundtrip test.
+        HashSet::new()
+    }
+
     /// Create a minimal VizApp with a real temp directory for config round-trip testing.
     fn build_config_test_app() -> (VizApp, tempfile::TempDir) {
         let mut graph = WorkGraph::new();
@@ -18697,6 +21125,7 @@ mod tui_config_panel_tests {
     fn test_config_panel_all_entries_save_roundtrip() {
         let (mut app, _temp) = build_config_test_app();
         app.load_config_panel();
+        let active_profile_overrides = active_profile_config_panel_override_keys();
 
         // Collect all keys for verification
         let keys: Vec<String> = app
@@ -18731,6 +21160,14 @@ mod tui_config_panel_tests {
             }
             // Skip model registry entries (managed via models.yaml, not config.toml)
             if key.starts_with("model.") {
+                continue;
+            }
+            // Historically, active named profiles were a runtime overlay
+            // and profile-owned keys had to be skipped here. Under the
+            // file-swap design they no longer mask local edits, so the skip
+            // helper returns an empty set. Call retained for clarity / future
+            // safety net.
+            if active_profile_overrides.contains(&key) {
                 continue;
             }
 
@@ -20799,7 +23236,7 @@ mod tui_chat_tests {
 
     // ── helpers ──
 
-    /// Create a minimal workgraph with coordinator tasks so list_coordinator_ids works.
+    /// Create a minimal WG with coordinator tasks so list_coordinator_ids works.
     fn setup_workgraph_with_coordinators(
         tmp: &TempDir,
         coordinator_ids: &[u32],
@@ -20823,7 +23260,7 @@ mod tui_chat_tests {
         let regular = make_task_with_status("test-task", "Test Task", Status::InProgress);
         graph.add_node(Node::Task(regular));
 
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let graph_path = wg_dir.join("graph.jsonl");
         save_graph(&graph, &graph_path).unwrap();
@@ -21558,7 +23995,7 @@ mod tui_chat_tests {
     #[test]
     fn tui_state_persistence_round_trip() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         save_tui_state(
@@ -21580,7 +24017,7 @@ mod tui_chat_tests {
     #[test]
     fn tui_state_no_file_returns_none() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let loaded = load_tui_state(&wg_dir);
@@ -21786,6 +24223,220 @@ mod tui_chat_tests {
             InspectorSubFocus::ChatHistory,
             "Switching coordinator should reset inspector sub-focus"
         );
+    }
+
+    /// Regression lock for fix-tui-new symptom 2 (focus flash).
+    ///
+    /// When the launcher submits, `launch_from_launcher` sets
+    /// `launcher.creating = true` and keeps the pane visible. The
+    /// launcher MUST stay open — and `active_coordinator_id` MUST stay
+    /// pointed at the previous chat — until `drain_commands` processes
+    /// the `CreateCoordinator` result. THEN, in a single drain step, we
+    /// dismiss the launcher AND switch to the new chat. This avoids
+    /// the visible "previous chat" flash that the original
+    /// (synchronously-close-launcher) flow produced.
+    #[test]
+    fn drain_commands_create_coordinator_dismisses_launcher_and_switches() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        // build_test_app wires cmd_tx + cmd_rx to disjoint channels (the
+        // default test scaffold doesn't expect anyone to send). For
+        // drain_commands tests we need both ends connected.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.active_coordinator_id = 0;
+        // Simulate post-launch state: launcher is open and in-flight.
+        app.launcher = Some(LauncherState {
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            add_endpoint: String::new(),
+            creating: true,
+            last_error: None,
+        });
+        app.input_mode = InputMode::Launcher;
+
+        // Hand drain_commands a synthetic IPC success result.
+        app.cmd_tx
+            .send(CommandResult {
+                success: true,
+                output: r#"{"coordinator_id": 1}"#.to_string(),
+                effect: CommandEffect::CreateCoordinator,
+            })
+            .expect("cmd channel should accept send");
+
+        let drained = app.drain_commands();
+        assert!(drained, "drain_commands must report it processed an event");
+
+        // Launcher must be gone and input_mode reset in the SAME drain.
+        assert!(
+            app.launcher.is_none(),
+            "launcher must be dismissed when CreateCoordinator returns success"
+        );
+        assert_eq!(
+            app.input_mode,
+            InputMode::Normal,
+            "input_mode must transition to Normal in the same drain step"
+        );
+        // And focus must have switched to the new chat — not stayed on
+        // the previous one (which was the visible-flash bug).
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "active_coordinator_id must switch to the freshly-created chat"
+        );
+    }
+
+    /// Regression lock for fix-new-chat-4: focus must stick on the
+    /// freshly-created chat even when the graph the TUI re-reads after
+    /// the IPC roundtrip has not yet caught up to the daemon's write.
+    ///
+    /// Pre-fix flow (the bug the user reported 2026-05-01):
+    ///   1. user clicks Launch → `launch_from_launcher` fires the IPC
+    ///   2. IPC returns `{coordinator_id: 1}` and `drain_commands`
+    ///      processes the result
+    ///   3. `force_refresh()` after `switch_coordinator(1)` re-runs
+    ///      `sync_active_tabs_from_graph`. If `graph.jsonl` still
+    ///      reports only the old chat (filesystem caching, stat
+    ///      granularity, or any other reason `current` doesn't include
+    ///      cid=1), the old auto-switch fallback fired
+    ///      `switch_coordinator(active_tabs[0])` — back to the previous
+    ///      chat. Focus visibly flips off the new tab.
+    ///
+    /// Post-fix: the new cid is added to `active_tabs` eagerly in the
+    /// `CreateCoordinator` handler, AND `sync_active_tabs_from_graph`
+    /// only auto-switches when the active coordinator is genuinely
+    /// gone from the graph (not just absent from `active_tabs`).
+    ///
+    /// This test deliberately leaves the simulated graph in the lagged
+    /// state — only the previous chat (cid=0) is in `graph.jsonl` —
+    /// because that's the worst-case race the fix must tolerate.
+    #[test]
+    fn drain_commands_create_coordinator_keeps_focus_on_new_chat_when_graph_lags() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.active_coordinator_id = 0;
+        app.active_tabs = vec![0];
+        app.launcher = Some(LauncherState {
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            add_endpoint: String::new(),
+            creating: true,
+            last_error: None,
+        });
+        app.input_mode = InputMode::Launcher;
+
+        // IPC returns success for cid=1 — but graph.jsonl on disk
+        // still reports only cid=0 (the daemon's write hasn't been
+        // observed by the next stat / load_graph cycle yet).
+        app.cmd_tx
+            .send(CommandResult {
+                success: true,
+                output: r#"{"coordinator_id": 1}"#.to_string(),
+                effect: CommandEffect::CreateCoordinator,
+            })
+            .expect("cmd channel should accept send");
+
+        app.drain_commands();
+
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "active_coordinator_id must stay on the freshly-created \
+             chat (cid=1) even when sync_active_tabs_from_graph \
+             hasn't yet picked it up — fix-new-chat-4"
+        );
+        assert!(
+            app.active_tabs.contains(&1),
+            "active_tabs must include the newly-created chat eagerly \
+             so subsequent refreshes don't treat it as a stale id"
+        );
+        assert!(app.launcher.is_none());
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    /// Regression lock: when the IPC FAILS, the launcher must stay
+    /// visible AND `creating` must reset, so the user can fix their
+    /// selection (e.g. invalid model name, bad endpoint) and retry
+    /// without reopening the picker. Pre-fix this case was unreachable
+    /// because the launcher had already been closed synchronously.
+    #[test]
+    fn drain_commands_create_coordinator_failure_resets_creating_flag() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.active_coordinator_id = 0;
+        app.launcher = Some(LauncherState {
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            add_endpoint: String::new(),
+            creating: true,
+            last_error: None,
+        });
+        app.input_mode = InputMode::Launcher;
+
+        app.cmd_tx
+            .send(CommandResult {
+                success: false,
+                output: "Error: bogus model id".to_string(),
+                effect: CommandEffect::CreateCoordinator,
+            })
+            .unwrap();
+
+        app.drain_commands();
+
+        let l = app
+            .launcher
+            .as_ref()
+            .expect("launcher must remain visible after IPC failure");
+        assert!(
+            !l.creating,
+            "creating flag must reset so the user can retry"
+        );
+        // fix-chat-creation: failed provisioning must surface in the
+        // launcher pane itself (a persistent banner), not just a fading
+        // toast. The user needs to read the actual error to fix their
+        // selection (bogus endpoint URL, missing vendor CLI, etc.).
+        assert!(
+            l.last_error.is_some(),
+            "last_error must be populated when CreateCoordinator IPC fails"
+        );
+        assert!(
+            l.last_error.as_deref().unwrap().contains("bogus"),
+            "last_error must include the underlying daemon error so the user knows what to fix; got: {:?}",
+            l.last_error
+        );
+        assert_eq!(
+            app.input_mode,
+            InputMode::Launcher,
+            "input_mode must stay Launcher when IPC fails"
+        );
+        // active_coordinator_id should not have changed.
+        assert_eq!(app.active_coordinator_id, 0);
     }
 
     #[test]
@@ -22230,7 +24881,7 @@ mod tui_chat_tests {
         let regular = make_task_with_status("test-task", "Test Task", Status::InProgress);
         graph.add_node(Node::Task(regular));
 
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
 
@@ -22299,7 +24950,7 @@ mod tui_chat_tests {
             graph.add_node(Node::Task(task));
         }
 
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
 
@@ -22368,6 +25019,213 @@ mod tui_chat_tests {
             chat_color, coord_color,
             "visual styles must differ between .chat-N and .coordinator-N"
         );
+    }
+
+    /// Regression for `fix-wg-tui` (55 % CPU bug):
+    /// the chat-tab renderer must read the cached chat-tab + user-board
+    /// entries instead of re-loading + re-parsing `graph.jsonl` each frame.
+    /// The cache is populated by `refresh_chat_tab_caches()` from a
+    /// pre-loaded graph in `maybe_refresh()` and stays consistent with
+    /// `active_tab_ids_and_labels()` / `list_user_board_entries()`.
+    #[test]
+    fn refresh_chat_tab_caches_matches_disk_helpers() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1, 2]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        app.active_tabs = vec![0, 1, 2];
+
+        let graph_path = wg_dir.join("graph.jsonl");
+        let graph = workgraph::parser::load_graph(&graph_path).unwrap();
+        app.refresh_chat_tab_caches(&graph);
+
+        let from_disk_chat = app.active_tab_ids_and_labels();
+        let from_disk_user = app.list_user_board_entries();
+
+        assert_eq!(
+            app.cached_chat_tab_entries, from_disk_chat,
+            "cached_chat_tab_entries must equal active_tab_ids_and_labels()"
+        );
+        assert_eq!(
+            app.cached_user_board_entries, from_disk_user,
+            "cached_user_board_entries must equal list_user_board_entries()"
+        );
+    }
+
+    /// Closing a tab must immediately update the cache so the renderer
+    /// stops drawing the closed tab — without re-parsing `graph.jsonl`.
+    #[test]
+    fn close_tab_rebuilds_cache_in_memory() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1, 2]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        app.active_tabs = vec![0, 1, 2];
+
+        let graph = workgraph::parser::load_graph(&wg_dir.join("graph.jsonl")).unwrap();
+        app.refresh_chat_tab_caches(&graph);
+        assert_eq!(app.cached_chat_tab_entries.len(), 3);
+
+        app.close_tab(1);
+
+        let cids: Vec<u32> = app
+            .cached_chat_tab_entries
+            .iter()
+            .map(|(cid, _)| *cid)
+            .collect();
+        assert_eq!(
+            cids,
+            vec![0, 2],
+            "close_tab(1) must drop cid=1 from the render cache"
+        );
+    }
+
+    /// `sync_active_tabs_from_graph` must seed the cache so newly-discovered
+    /// chats appear in the tab bar on the next frame.
+    #[test]
+    fn sync_active_tabs_seeds_render_cache() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0, 1]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        // Start with empty active_tabs — sync should add 0 and 1.
+        app.active_tabs.clear();
+        app.closed_tabs.clear();
+
+        app.sync_active_tabs_from_graph();
+
+        let cids: Vec<u32> = app
+            .cached_chat_tab_entries
+            .iter()
+            .map(|(cid, _)| *cid)
+            .collect();
+        assert_eq!(
+            cids,
+            vec![0, 1],
+            "sync_active_tabs_from_graph must populate cached_chat_tab_entries"
+        );
+    }
+
+    /// chat picker must exclude non-terminal chat tasks only:
+    /// Done, Failed, and Abandoned sessions must NOT appear; Open and InProgress must.
+    #[test]
+    fn chat_picker_excludes_terminal_status_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let mut graph = WorkGraph::new();
+
+        // Active chat: should appear in picker
+        let mut active = make_task_with_status(".chat-1", "Chat 1", Status::InProgress);
+        active.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(active));
+
+        // Open chat: should appear in picker
+        let mut open_chat = make_task_with_status(".chat-2", "Chat 2", Status::Open);
+        open_chat.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(open_chat));
+
+        // Done chat: must NOT appear in picker
+        let mut done_chat = make_task_with_status(".chat-3", "Chat 3 done", Status::Done);
+        done_chat.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(done_chat));
+
+        // Abandoned chat: must NOT appear in picker
+        let mut abandoned = make_task_with_status(".chat-4", "Chat 4 abandoned", Status::Abandoned);
+        abandoned.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(abandoned));
+
+        // Failed chat: must NOT appear in picker
+        let mut failed = make_task_with_status(".chat-5", "Chat 5 failed", Status::Failed);
+        failed.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(failed));
+
+        // Regular non-chat task: must NOT appear in picker
+        let regular = make_task_with_status("fix-new-chat-3", "Fix something", Status::Abandoned);
+        graph.add_node(Node::Task(regular));
+
+        let wg_dir = tmp.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        save_graph(&graph, &wg_dir.join("graph.jsonl")).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            VizLayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let app = build_test_app(&viz, &wg_dir);
+
+        let entries = app.list_coordinator_ids_and_labels();
+        let cids: Vec<u32> = entries.iter().map(|(c, _)| *c).collect();
+
+        // Only .chat-1 (cid=1) and .chat-2 (cid=2) should appear
+        assert!(
+            cids.contains(&1),
+            "InProgress chat must appear in picker, got {:?}",
+            cids
+        );
+        assert!(
+            cids.contains(&2),
+            "Open chat must appear in picker, got {:?}",
+            cids
+        );
+        assert!(
+            !cids.contains(&3),
+            "Done chat must NOT appear in picker, got {:?}",
+            cids
+        );
+        assert!(
+            !cids.contains(&4),
+            "Abandoned chat must NOT appear in picker, got {:?}",
+            cids
+        );
+        assert!(
+            !cids.contains(&5),
+            "Failed chat must NOT appear in picker, got {:?}",
+            cids
+        );
+
+        // Labels must not include non-chat task IDs
+        let labels: Vec<&str> = entries.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("fix-new-chat")),
+            "regular non-chat task must not appear in picker, got {:?}",
+            labels
+        );
+    }
+
+    /// Same filtering applies to list_coordinator_ids_and_labels_from_graph
+    /// (the per-tick cache path used by refresh_chat_tab_caches).
+    #[test]
+    fn chat_picker_from_graph_excludes_terminal_status_tasks() {
+        let mut graph = WorkGraph::new();
+
+        let mut active = make_task_with_status(".chat-10", "Active chat", Status::InProgress);
+        active.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(active));
+
+        let mut done_chat = make_task_with_status(".chat-11", "Done chat", Status::Done);
+        done_chat.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(done_chat));
+
+        let mut failed_chat = make_task_with_status(".chat-12", "Failed chat", Status::Failed);
+        failed_chat.tags = vec!["chat-loop".to_string()];
+        graph.add_node(Node::Task(failed_chat));
+
+        let entries = VizApp::list_coordinator_ids_and_labels_from_graph(&graph);
+        let cids: Vec<u32> = entries.iter().map(|(c, _)| *c).collect();
+
+        assert!(cids.contains(&10), "InProgress chat must appear");
+        assert!(!cids.contains(&11), "Done chat must NOT appear");
+        assert!(!cids.contains(&12), "Failed chat must NOT appear");
     }
 }
 
@@ -23037,13 +25895,254 @@ mod filter_picker_tests {
         );
     }
 
+    /// fix-new-chat regression lock: an empty endpoint list with
+    /// allow_custom=true MUST still expose the Custom row as selectable.
+    /// Pre-fix, `visible_count()` reported 1 (the custom row) but the
+    /// renderer early-returned on empty items, so users couldn't drop
+    /// in a URL.
     #[test]
-    fn test_selected_clamps_on_filter() {
+    fn test_empty_picker_keeps_custom_row_selectable() {
+        let mut picker = FilterPicker::new(vec![], true)
+            .with_custom_label("Custom URL")
+            .with_hint("No endpoints registered.");
+        assert!(picker.items.is_empty());
+        assert_eq!(
+            picker.visible_count(),
+            1,
+            "empty + allow_custom must still expose 1 row (the Custom row)"
+        );
+        // Selecting the only row puts focus on the custom entry.
+        assert!(picker.is_custom_selected());
+        picker.enter_custom();
+        picker.custom_text = "https://my-endpoint.example.com:8080".to_string();
+        assert_eq!(
+            picker.value().as_deref(),
+            Some("https://my-endpoint.example.com:8080"),
+            "Custom URL must round-trip through value() even when items is empty"
+        );
+        assert_eq!(picker.custom_label, "Custom URL");
+    }
+
+    #[test]
+    fn test_with_custom_label_overrides_default() {
+        let picker = FilterPicker::new(vec![], true).with_custom_label("Custom URL");
+        assert_eq!(picker.custom_label, "Custom URL");
+
+        let default = FilterPicker::new(vec![], true);
+        assert_eq!(default.custom_label, "Custom");
+    }
+
+    #[test]
+    fn test_selected_clamps_on_filter_again() {
         let mut picker = sample_picker();
         picker.selected = 4; // last item
         picker.filter = "opus".to_string();
         picker.apply_filter();
         assert!(picker.selected < picker.visible_count());
+    }
+}
+
+#[cfg(test)]
+mod launcher_redesign_tests {
+    use super::{
+        ADD_NEW_EXECUTOR_CHOICES, AddNewField, LauncherMode, LauncherSection, LauncherState,
+    };
+
+    fn make_state() -> LauncherState {
+        LauncherState {
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            add_endpoint: String::new(),
+            creating: false,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn default_presets_are_codex_then_claude() {
+        let presets = LauncherState::default_presets();
+        assert_eq!(presets.len(), 2, "exactly two preset rows in default state");
+        assert_eq!(presets[0].executor, "codex");
+        assert_eq!(presets[0].model, "codex:gpt-5.5");
+        assert_eq!(presets[1].executor, "claude");
+        assert_eq!(presets[1].model, "claude:opus");
+    }
+
+    #[test]
+    fn default_mode_resolves_first_preset() {
+        let state = make_state();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "codex");
+        assert_eq!(model.as_deref(), Some("codex:gpt-5.5"));
+        assert!(endpoint.is_none(), "default presets never set an endpoint");
+    }
+
+    #[test]
+    fn default_mode_resolves_claude_preset_when_selected() {
+        let mut state = make_state();
+        state.default_selected = 1;
+        let (executor, model, _) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "claude");
+        assert_eq!(model.as_deref(), Some("claude:opus"));
+    }
+
+    #[test]
+    fn default_mode_returns_none_when_add_new_highlighted() {
+        let mut state = make_state();
+        state.default_selected = state.presets.len();
+        assert!(state.is_add_new_highlighted());
+        assert!(state.resolved_launch_args().is_none());
+    }
+
+    #[test]
+    fn enter_add_new_resets_form_and_focuses_executor() {
+        let mut state = make_state();
+        state.default_selected = state.presets.len();
+        state.add_model = "stale".into();
+        state.add_endpoint = "stale".into();
+        state.enter_add_new();
+        assert_eq!(state.mode, LauncherMode::AddNew);
+        assert_eq!(
+            state.active_section,
+            LauncherSection::AddNew(AddNewField::Executor)
+        );
+        assert_eq!(state.add_executor_idx, 0);
+        assert_eq!(state.add_model, "");
+        assert_eq!(state.add_endpoint, "");
+    }
+
+    #[test]
+    fn add_new_show_endpoint_only_for_nex() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        // claude (idx 0)
+        state.add_executor_idx = 0;
+        assert!(!state.add_new_show_endpoint());
+        // codex (idx 1)
+        state.add_executor_idx = 1;
+        assert!(!state.add_new_show_endpoint());
+        // nex (idx 2)
+        state.add_executor_idx = 2;
+        assert!(state.add_new_show_endpoint());
+    }
+
+    #[test]
+    fn add_new_with_nex_resolves_with_endpoint() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 2; // nex
+        state.add_model = "qwen3-coder".into();
+        state.add_endpoint = "https://lambda01.tail334fe6.ts.net:30000".into();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        // nex maps to internal executor "native"
+        assert_eq!(executor, "native");
+        assert_eq!(model.as_deref(), Some("qwen3-coder"));
+        assert_eq!(
+            endpoint.as_deref(),
+            Some("https://lambda01.tail334fe6.ts.net:30000")
+        );
+    }
+
+    #[test]
+    fn add_new_claude_omits_endpoint_even_when_filled() {
+        // The endpoint field is hidden for claude/codex; if stale text
+        // sits in the buffer (e.g. user toggled executor after typing),
+        // it must NOT be included in the launch args.
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 0; // claude
+        state.add_model = "claude:sonnet".into();
+        state.add_endpoint = "https://stale.example".into();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "claude");
+        assert_eq!(model.as_deref(), Some("claude:sonnet"));
+        assert!(
+            endpoint.is_none(),
+            "claude executor must never carry an endpoint"
+        );
+    }
+
+    #[test]
+    fn add_new_returns_none_when_model_missing() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 1; // codex
+        // No model typed.
+        assert!(state.resolved_launch_args().is_none());
+    }
+
+    #[test]
+    fn add_new_custom_command_resolves_command_line() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 3; // Custom Command
+        state.add_model = "tail -f /tmp/test.log".into();
+        let (executor, command, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "command");
+        assert_eq!(command.as_deref(), Some("tail -f /tmp/test.log"));
+        assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn add_new_executor_choices_match_spec() {
+        // The dialog offers built-in LLM presets plus a generic command pane.
+        let labels: Vec<_> = ADD_NEW_EXECUTOR_CHOICES.iter().map(|c| c.label).collect();
+        assert_eq!(labels, vec!["claude", "codex", "nex", "Custom Command"]);
+        // nex must lower to internal "native" — that's the executor
+        // handler name the dispatch layer uses.
+        let nex = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .find(|c| c.label == "nex")
+            .unwrap();
+        assert_eq!(nex.internal_executor, "native");
+        let command = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .find(|c| c.label == "Custom Command")
+            .unwrap();
+        assert_eq!(command.internal_executor, "command");
+    }
+
+    #[test]
+    fn next_section_default_mode_toggles_between_defaults_and_name() {
+        let mut state = make_state();
+        assert_eq!(state.active_section, LauncherSection::Defaults);
+        state.next_section();
+        assert_eq!(state.active_section, LauncherSection::Name);
+        state.next_section();
+        assert_eq!(state.active_section, LauncherSection::Defaults);
+    }
+
+    #[test]
+    fn next_section_add_new_skips_endpoint_for_claude() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 0; // claude — no endpoint
+        state.active_section = LauncherSection::AddNew(AddNewField::Model);
+        state.next_section();
+        assert_eq!(
+            state.active_section,
+            LauncherSection::AddNew(AddNewField::Name),
+            "claude executor: Tab from Model goes straight to Name (no endpoint field)"
+        );
+    }
+
+    #[test]
+    fn next_section_add_new_includes_endpoint_for_nex() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 2; // nex
+        state.active_section = LauncherSection::AddNew(AddNewField::Model);
+        state.next_section();
+        assert_eq!(
+            state.active_section,
+            LauncherSection::AddNew(AddNewField::Endpoint),
+            "nex executor: Tab from Model goes through the Endpoint field"
+        );
     }
 }
 
@@ -23156,6 +26255,204 @@ mod agent_stream_tests {
         let event = parse_raw_stream_line(line, "agent-11").unwrap();
         assert_eq!(event.kind, AgentStreamEventKind::TextOutput);
         assert!(event.summary.contains("Working on it."));
+    }
+
+    // ── Codex CLI stream parsing (regression: tui-live-log) ─────────────────
+    // Covers the bug where `parse_raw_stream_line` returned None for every
+    // codex `item.completed` / `thread.started` / `turn.*` event, leaving
+    // the TUI live log pane empty for any agent running on a `codex:*`
+    // model.
+
+    #[test]
+    fn test_parse_codex_agent_message() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Starting the task now."}}"#;
+        let event = parse_raw_stream_line(line, "agent-c1").unwrap();
+        assert_eq!(event.kind, AgentStreamEventKind::TextOutput);
+        assert!(event.summary.contains("Starting the task now."));
+        assert_eq!(event.agent_id, "agent-c1");
+    }
+
+    #[test]
+    fn test_parse_codex_command_execution_success() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_5","type":"command_execution","command":"cargo build","aggregated_output":"Compiling...","exit_code":0,"status":"completed"}}"#;
+        let event = parse_raw_stream_line(line, "agent-c2").unwrap();
+        assert_eq!(event.kind, AgentStreamEventKind::ToolCall);
+        assert!(event.summary.contains("Bash"), "got: {}", event.summary);
+        assert!(
+            event.summary.contains("cargo build"),
+            "got: {}",
+            event.summary
+        );
+        assert!(
+            event.summary.contains("Compiling"),
+            "got: {}",
+            event.summary
+        );
+        assert!(event.summary.contains("✓"), "got: {}", event.summary);
+    }
+
+    #[test]
+    fn test_parse_codex_command_execution_failure() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_5","type":"command_execution","command":"false","aggregated_output":"","exit_code":1,"status":"failed"}}"#;
+        let event = parse_raw_stream_line(line, "agent-c3").unwrap();
+        assert_eq!(event.kind, AgentStreamEventKind::Error);
+        assert!(event.summary.contains("✗"), "got: {}", event.summary);
+        assert!(event.summary.contains("false"), "got: {}", event.summary);
+    }
+
+    #[test]
+    fn test_parse_codex_reasoning() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"Considering the next step carefully."}}"#;
+        let event = parse_raw_stream_line(line, "agent-c4").unwrap();
+        assert_eq!(event.kind, AgentStreamEventKind::Thinking);
+        assert!(event.summary.contains("💭"), "got: {}", event.summary);
+        assert!(
+            event.summary.contains("Considering"),
+            "got: {}",
+            event.summary
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_bookkeeping_events_ignored() {
+        // Bookkeeping events are intentionally swallowed so they don't
+        // pollute the live log pane.
+        for line in [
+            r#"{"type":"thread.started","thread_id":"abc-123"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":100}}"#,
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"ls","status":"in_progress"}}"#,
+            r#"{"type":"item.updated","item":{"id":"item_1","type":"agent_message","text":"partial..."}}"#,
+        ] {
+            assert!(
+                parse_raw_stream_line(line, "agent-c").is_none(),
+                "expected None for codex bookkeeping line: {}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_error_event() {
+        let line = r#"{"type":"error","message":"connection lost"}"#;
+        let event = parse_raw_stream_line(line, "agent-c5").unwrap();
+        assert_eq!(event.kind, AgentStreamEventKind::Error);
+        assert!(
+            event.summary.contains("connection lost"),
+            "got: {}",
+            event.summary
+        );
+    }
+
+    /// Regression: a running codex agent's `raw_stream.jsonl` produced
+    /// zero stream_events, so the TUI live log pane stayed empty even
+    /// while `tail -f .wg/agents/<id>/output.log` showed active output.
+    /// This wires the same path the TUI uses (`load_log_pane` →
+    /// `update_log_stream_events`) against a codex-format fixture and
+    /// asserts the pane gets non-empty content.
+    #[test]
+    fn test_log_view_renders_codex_stream_for_running_codex_agent() {
+        use crate::commands::viz::ascii::generate_ascii;
+        use crate::commands::viz::{LayoutMode, VizOutput};
+        use std::collections::{HashMap, HashSet};
+        use workgraph::graph::{Node, Status, WorkGraph};
+        use workgraph::parser::save_graph;
+        use workgraph::test_helpers::make_task_with_status;
+
+        let mut graph = WorkGraph::new();
+        let mut task = make_task_with_status("codex-task", "Codex Task", Status::InProgress);
+        task.assigned = Some("agent-codex".to_string());
+        graph.add_node(Node::Task(task));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let agent_dir = tmp.path().join("agents").join("agent-codex");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // Real fixture pulled from agent-941 (create-agents-md cycle iter 2):
+        // codex `--json` emits these events in this order. Pre-fix the
+        // parser dropped every line and the pane stayed empty.
+        let stream_content = [
+            r#"{"type":"thread.started","thread_id":"019dd603-7cc3-77e3-a49f-ebc4e87faaa1"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I'll continue from the prior staged-copy state."}}"#,
+            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"git status --short","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"git status --short","aggregated_output":"?? AGENTS.md","exit_code":0,"status":"completed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The copy validation passed locally."}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}"#,
+        ];
+        std::fs::write(
+            agent_dir.join("raw_stream.jsonl"),
+            stream_content.join("\n"),
+        )
+        .unwrap();
+        std::fs::write(agent_dir.join("output.log"), "").unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz: VizOutput = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = tmp.path().to_path_buf();
+        let idx = app.task_order.iter().position(|id| id == "codex-task");
+        app.selected_task_idx = idx;
+
+        app.load_log_pane();
+        assert_eq!(app.log_pane.agent_id.as_deref(), Some("agent-codex"));
+
+        app.update_log_stream_events();
+
+        // Pre-fix: stream_events was empty (the bug). Post-fix: 3
+        // surfaceable events — two agent_messages + one command_execution.
+        // Bookkeeping (thread.started, turn.started, turn.completed,
+        // item.started) is intentionally swallowed.
+        assert_eq!(
+            app.log_pane.stream_events.len(),
+            3,
+            "expected 3 events from codex stream, got: {:?}",
+            app.log_pane
+                .stream_events
+                .iter()
+                .map(|e| (e.kind.clone(), e.summary.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.log_pane.stream_events[0].kind,
+            AgentStreamEventKind::TextOutput
+        );
+        assert!(
+            app.log_pane.stream_events[0]
+                .summary
+                .contains("continue from the prior")
+        );
+        assert_eq!(
+            app.log_pane.stream_events[1].kind,
+            AgentStreamEventKind::ToolCall
+        );
+        assert!(app.log_pane.stream_events[1].summary.contains("git status"));
+        assert!(app.log_pane.stream_events[1].summary.contains("AGENTS.md"));
+        assert_eq!(
+            app.log_pane.stream_events[2].kind,
+            AgentStreamEventKind::TextOutput
+        );
+        assert!(
+            app.log_pane.stream_events[2]
+                .summary
+                .contains("copy validation passed")
+        );
     }
 
     #[test]
@@ -23309,37 +26606,17 @@ mod agent_stream_tests {
 }
 
 #[cfg(test)]
-mod launcher_history_tests {
+mod launcher_open_tests {
     use super::*;
-    use std::io::Write as _;
 
-    /// `open_launcher` should pull recent invocations from
-    /// `launcher_history` and surface them as a one-click recall list,
-    /// per the user expectation that any prior CLI/TUI invocation
-    /// reappears as a recallable option.
+    /// open_launcher must initialize the redesigned dialog in Default
+    /// mode with exactly the codex:gpt-5.5 + claude:opus presets and
+    /// nothing else (no openrouter dump, no recent-list, no
+    /// pre-populated executor/model/endpoint pickers). This is the
+    /// regression lock for redesign-new-chat 2026-04-30.
     #[test]
-    #[serial_test::serial(launcher_history_env)]
-    fn test_tui_dialog_reads_history_and_offers_picker() {
+    fn open_launcher_starts_in_default_mode_with_two_presets() {
         let tmp = tempfile::tempdir().unwrap();
-        let history_path = tmp.path().join("launcher-history.jsonl");
-
-        // Seed launcher history with a `wg nex -m qwen3-coder -e ...`
-        // invocation, like the example in the task spec.
-        let entry = workgraph::launcher_history::HistoryEntry::new(
-            "native",
-            Some("qwen3-coder"),
-            Some("https://lambda01.tail334fe6.ts.net:30000"),
-            "cli",
-        );
-        {
-            let mut f = std::fs::File::create(&history_path).unwrap();
-            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
-        }
-
-        unsafe {
-            std::env::set_var("WG_LAUNCHER_HISTORY_PATH", &history_path);
-        }
-
         let workgraph_dir = tmp.path().to_path_buf();
         std::fs::write(workgraph_dir.join("graph.jsonl"), "").unwrap();
         let mut app = VizApp::new(
@@ -23352,24 +26629,1853 @@ mod launcher_history_tests {
 
         app.open_launcher();
 
-        unsafe {
-            std::env::remove_var("WG_LAUNCHER_HISTORY_PATH");
+        let launcher = app.launcher.as_ref().expect("launcher must populate");
+        assert_eq!(launcher.mode, LauncherMode::Default);
+        assert_eq!(launcher.active_section, LauncherSection::Defaults);
+        assert_eq!(launcher.presets.len(), 2);
+        assert_eq!(launcher.presets[0].label, "codex:gpt-5.5");
+        assert_eq!(launcher.presets[1].label, "claude:opus");
+        assert_eq!(launcher.default_selected, 0);
+        // Add-new form starts blank — no stale openrouter / endpoint
+        // values bleeding through.
+        assert_eq!(launcher.add_model, "");
+        assert_eq!(launcher.add_endpoint, "");
+        assert_eq!(launcher.name, "");
+    }
+}
+
+#[cfg(test)]
+mod chat_pty_executor_resolution_tests {
+    use super::*;
+    use crate::commands::service::CoordinatorState;
+
+    fn write_state(dir: &std::path::Path, cid: u32, executor: Option<&str>, model: Option<&str>) {
+        let mut state = CoordinatorState {
+            executor_override: executor.map(String::from),
+            model_override: model.map(String::from),
+            ..CoordinatorState::default()
+        };
+        state.save_for(dir, cid);
+    }
+
+    /// Regression lock for chat-launched-with: when the user creates a
+    /// chat via `wg chat create --executor codex --model codex:gpt-5`
+    /// (or the TUI `+` launcher's codex pick), the per-chat overrides
+    /// land in `CoordinatorState` and MUST beat `[dispatcher].executor`
+    /// when the TUI auto-spawns the embedded PTY pane. Previously the
+    /// resolver read only the global config, so codex chats opened a
+    /// claude session.
+    #[test]
+    fn chat_launched_with_codex_uses_codex_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path();
+        // Simulate the user's environment: global default is claude.
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            b"[coordinator]\nexecutor = \"claude\"\nmodel = \"claude:opus\"\n",
+        )
+        .unwrap();
+        // Chat 0 was created with codex + codex:gpt-5.
+        write_state(wg_dir, 0, Some("codex"), Some("codex:gpt-5"));
+
+        let config = Config::load_or_default(wg_dir);
+        let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 0);
+
+        assert_eq!(
+            executor, "codex",
+            "per-chat executor_override must beat [dispatcher].executor"
+        );
+        assert_eq!(
+            model.as_deref(),
+            Some("codex:gpt-5"),
+            "per-chat model_override must beat [dispatcher].model"
+        );
+    }
+
+    /// Pre-fix chats without overrides keep the effective config default,
+    /// including an active named profile when one is enabled.
+    #[test]
+    fn chat_with_no_overrides_uses_global_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            b"[coordinator]\nexecutor = \"claude\"\nmodel = \"claude:opus\"\n",
+        )
+        .unwrap();
+        // No CoordinatorState file written for chat 0.
+
+        let config = Config::load_or_default(wg_dir);
+        let expected_executor = config.coordinator.effective_executor();
+        let expected_model = config.coordinator.model.clone();
+        let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 0);
+
+        assert_eq!(executor, expected_executor, "effective default executor");
+        assert_eq!(model, expected_model, "effective default model");
+    }
+
+    /// Mixed overrides: only model is per-chat, executor defaults
+    /// globally. Sanity-check the two fields cascade independently.
+    #[test]
+    fn chat_with_only_model_override_keeps_global_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let wg_dir = dir.path();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            b"[coordinator]\nexecutor = \"claude\"\nmodel = \"claude:opus\"\n",
+        )
+        .unwrap();
+        write_state(wg_dir, 1, None, Some("claude:sonnet"));
+
+        let config = Config::load_or_default(wg_dir);
+        let (executor, model) = resolve_chat_pty_executor_and_model(wg_dir, &config, 1);
+
+        assert_eq!(executor, "claude");
+        assert_eq!(model.as_deref(), Some("claude:sonnet"));
+    }
+}
+
+#[cfg(test)]
+mod build_codex_chat_pty_args_tests {
+    use super::build_codex_chat_pty_args;
+    use std::path::Path;
+
+    /// Regression lock for fix-codex-chat: the codex chat agent in the
+    /// wg TUI MUST always be spawned with
+    /// `--dangerously-bypass-approvals-and-sandbox`. Without it codex
+    /// prompts the user to approve every shell command (`wg status`,
+    /// `wg add`, etc.) and the chat agent cannot do its job. The user
+    /// authorized the chat agent implicitly by opening the TUI from
+    /// their own terminal — same posture as the claude path's
+    /// `--dangerously-skip-permissions`.
+    #[test]
+    fn fresh_session_includes_bypass_flag() {
+        let args = build_codex_chat_pty_args(None, false, None, None);
+        assert!(
+            args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()),
+            "codex chat args MUST include --dangerously-bypass-approvals-and-sandbox; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn resume_with_session_id_includes_bypass_flag() {
+        let args = build_codex_chat_pty_args(Some("abc-123-uuid"), false, None, None);
+        assert_eq!(args[0], "resume");
+        assert_eq!(args[1], "abc-123-uuid");
+        assert!(
+            args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()),
+            "codex resume <id> args MUST include --dangerously-bypass-approvals-and-sandbox; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn resume_last_includes_bypass_flag() {
+        let args = build_codex_chat_pty_args(None, true, None, None);
+        assert_eq!(args[0], "resume");
+        assert_eq!(args[1], "--last");
+        assert!(
+            args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()),
+            "codex resume --last args MUST include --dangerously-bypass-approvals-and-sandbox; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn model_override_strips_provider_prefix() {
+        let args = build_codex_chat_pty_args(None, false, Some("codex:gpt-5"), None);
+        let model_idx = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model flag missing");
+        assert_eq!(
+            args[model_idx + 1],
+            "gpt-5",
+            "provider prefix must be stripped"
+        );
+    }
+
+    /// Symmetry check: claude path passes `--dangerously-skip-permissions`,
+    /// codex path passes `--dangerously-bypass-approvals-and-sandbox`.
+    /// If a future refactor renames the codex flag, this test plus the
+    /// `build_codex_chat_pty_args` doc comment are the breadcrumb that
+    /// flags both halves of the symmetry need updating.
+    #[test]
+    fn codex_bypass_flag_is_current_codex_cli_name() {
+        // codex 0.125+ uses --dangerously-bypass-approvals-and-sandbox
+        // (verified via `codex --help` at fix-codex-chat time).
+        let args = build_codex_chat_pty_args(None, false, None, None);
+        let bypass_flags: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("--dangerously"))
+            .collect();
+        assert_eq!(
+            bypass_flags.len(),
+            1,
+            "expected exactly one --dangerously-* flag; got: {:?}",
+            args
+        );
+        assert_eq!(
+            bypass_flags[0], "--dangerously-bypass-approvals-and-sandbox",
+            "if codex CLI renamed the bypass flag, update build_codex_chat_pty_args + this test"
+        );
+    }
+
+    /// Regression lock for fix-codex-chat-2 (Bug 1: wrong cwd).
+    ///
+    /// Before this fix, the codex chat agent was spawned with cwd =
+    /// `<project>/.wg/chat/chat-N/` instead of the project root. The
+    /// codex banner reported `directory: <project>/.wg/chat/chat-0`,
+    /// the agent could not see project files, and (compounded by the
+    /// half-empty workspace under `.wg/chat/`) reported it could not
+    /// launch shell commands at all even with the bypass flag set.
+    ///
+    /// The contract is now: spawn cwd = project root. Per-chat scratch
+    /// (resume markers, session id) still lives under chat_dir; we make
+    /// it writable for the agent by passing `--add-dir <chat_dir>`.
+    /// This test pins that posture: when caller supplies a chat_dir,
+    /// build_codex_chat_pty_args MUST emit `--add-dir <chat_dir>` so
+    /// the project-root cwd choice is symmetric with chat_dir
+    /// writability — neither half can silently disappear.
+    #[test]
+    fn add_dir_includes_chat_dir_when_provided() {
+        let chat_dir = Path::new("/tmp/wgsmoke-fake-project/.wg/chat/chat-0");
+        let args = build_codex_chat_pty_args(None, false, None, Some(chat_dir));
+        let add_dir_idx = args.iter().position(|a| a == "--add-dir").expect(
+            "--add-dir flag missing — codex chat agent will lose write access to chat_dir scratch",
+        );
+        assert_eq!(
+            args[add_dir_idx + 1],
+            chat_dir.display().to_string(),
+            "--add-dir must point at the chat_dir so resume markers + session-id files remain writable"
+        );
+    }
+
+    /// `--add-dir` is conditional on caller supplying a chat_dir. When
+    /// no chat_dir is given (e.g. in a unit test or a future caller that
+    /// does not have a per-chat scratch), no `--add-dir` flag is added.
+    #[test]
+    fn add_dir_omitted_when_chat_dir_not_provided() {
+        let args = build_codex_chat_pty_args(None, false, None, None);
+        assert!(
+            !args.iter().any(|a| a == "--add-dir"),
+            "expected no --add-dir flag when chat_dir is None; got: {:?}",
+            args
+        );
+    }
+
+    /// Regression lock for fix-pass-no.
+    ///
+    /// Codex defaults to alternate-screen TUI mode, which the wg PTY
+    /// emulator handles poorly: scrollback is lost, animation frames
+    /// stack on scroll-back, and cursor-overwrite logic struggles. Our
+    /// emulator handles line-streamed output (the claude default) well.
+    /// Codex exposes `--no-alt-screen` precisely for this case
+    /// ("inline mode, preserving terminal scrollback history" — useful
+    /// in multiplexers that disable scrollback in the alt-screen
+    /// buffer). Passing it eliminates the alt-screen flicker, restores
+    /// scrollback, and matches the claude path's output mode.
+    ///
+    /// If codex renames or removes this flag in the future, this test
+    /// fails and the doc comment in `build_codex_chat_pty_args` is the
+    /// breadcrumb to update both call sites.
+    #[test]
+    fn fresh_session_includes_no_alt_screen() {
+        let args = build_codex_chat_pty_args(None, false, None, None);
+        assert!(
+            args.contains(&"--no-alt-screen".to_string()),
+            "codex chat args MUST include --no-alt-screen so output streams into main scrollback; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn resume_with_session_id_includes_no_alt_screen() {
+        let args = build_codex_chat_pty_args(Some("abc-123-uuid"), false, None, None);
+        assert!(
+            args.contains(&"--no-alt-screen".to_string()),
+            "codex resume <id> args MUST include --no-alt-screen; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn resume_last_includes_no_alt_screen() {
+        let args = build_codex_chat_pty_args(None, true, None, None);
+        assert!(
+            args.contains(&"--no-alt-screen".to_string()),
+            "codex resume --last args MUST include --no-alt-screen; got: {:?}",
+            args
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_nex_chat_pty_args_tests {
+    use super::{VizApp, build_nex_chat_pty_args};
+    use crate::commands::service::CoordinatorState;
+
+    #[test]
+    fn mirrors_working_cli_shape() {
+        let args = build_nex_chat_pty_args(
+            Some("nex:qwen3-coder-30b"),
+            Some("https://lambda01.tail334fe6.ts.net:30000"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "nex",
+                "-m",
+                "qwen3-coder-30b",
+                "-e",
+                "https://lambda01.tail334fe6.ts.net:30000"
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_use_chat_or_resume_mode() {
+        let args = build_nex_chat_pty_args(Some("qwen3-coder-30b"), Some("http://127.0.0.1:8088"));
+
+        for forbidden in ["--chat", "--role", "--resume", "coordinator"] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "TUI nex PTY args must stay on the interactive stdin path; got {:?}",
+                args
+            );
+        }
+    }
+
+    #[test]
+    fn native_chat_pty_spawn_uses_cli_shape_and_endpoint_override() {
+        let project = tempfile::tempdir().unwrap();
+        let wg_dir = project.path().join(".wg");
+        std::fs::create_dir_all(&wg_dir).unwrap();
+        std::fs::write(wg_dir.join("graph.jsonl"), "").unwrap();
+        std::fs::write(
+            wg_dir.join("config.toml"),
+            r#"
+[coordinator]
+executor = "native"
+model = "nex:default-model"
+
+[[llm_endpoints.endpoints]]
+name = "default"
+url = "https://default.example:30000"
+is_default = true
+"#,
+        )
+        .unwrap();
+        CoordinatorState {
+            executor_override: Some("native".to_string()),
+            model_override: Some("nex:qwen3-coder-30b".to_string()),
+            endpoint_override: Some("https://lambda01.tail334fe6.ts.net:30000".to_string()),
+            ..CoordinatorState::default()
+        }
+        .save_for(&wg_dir, 0);
+
+        let mut app = VizApp::new(
+            wg_dir.clone(),
+            crate::commands::viz::VizOptions::default(),
+            Some(true),
+            None,
+            false,
+        );
+        app.pending_chat_pty_spawn = None;
+        app.task_panes.clear();
+        app.maybe_auto_enable_chat_pty();
+
+        let pending = app
+            .pending_chat_pty_spawn
+            .as_ref()
+            .expect("native chat should queue a PTY spawn");
+        assert_eq!(pending.executor, "native");
+        assert_eq!(
+            pending.args,
+            vec![
+                "nex",
+                "-m",
+                "qwen3-coder-30b",
+                "-e",
+                "https://lambda01.tail334fe6.ts.net:30000"
+            ]
+        );
+        assert_eq!(
+            pending.cwd.as_deref(),
+            Some(project.path()),
+            "nex chat PTY should spawn from the project root"
+        );
+        if crate::tui::pty_pane::tmux_available() {
+            assert!(
+                pending
+                    .tmux_session
+                    .as_deref()
+                    .is_some_and(|s| s.contains("chat-0")),
+                "tmux-capable environments should use the persistent wg-chat session path"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_pty_deferred_spawn_tests {
+    //! `maybe_auto_enable_chat_pty` defers the actual `PtyPane::spawn`
+    //! to the chat-tab render path so the child process opens its PTY
+    //! at the real `msg_area` dimensions instead of a hardcoded 24×80.
+    //! Without this, the first frame's resize fired a SIGWINCH that the
+    //! vendor CLI honored by clear-screen + reprint — pushing
+    //! wrap-mismatched copies of recent content into vt100 scrollback,
+    //! which the user observed as "the chat scrollback loops a bit and
+    //! then settles" (fix-pty-scrollback).
+
+    use super::*;
+    use crate::commands::viz::VizOutput;
+
+    fn empty_app() -> VizApp {
+        let viz = VizOutput {
+            text: String::new(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
+        };
+        VizApp::from_viz_output_for_test(&viz)
+    }
+
+    /// `consume_pending_chat_pty_spawn` is a no-op when no spawn is
+    /// pending — the function should return false without panicking.
+    /// This is the steady-state case (pane already spawned and alive).
+    #[test]
+    fn consume_with_no_pending_returns_false() {
+        let mut app = empty_app();
+        assert!(app.pending_chat_pty_spawn.is_none());
+        let spawned = app.consume_pending_chat_pty_spawn(30, 120);
+        assert!(!spawned);
+        assert!(app.pending_chat_pty_spawn.is_none());
+    }
+
+    /// Render is called every frame; the very first frame may report
+    /// `msg_area = (0, 0)` before layout has stabilized. The deferred
+    /// spawn must NOT execute at zero dimensions — that would just
+    /// reintroduce the same wrong-initial-size problem the deferral
+    /// is meant to fix. Pending stays put until a real area arrives.
+    #[test]
+    fn consume_with_zero_dims_keeps_pending() {
+        let mut app = empty_app();
+        app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+            task_id: ".chat-1".to_string(),
+            bin: "/bin/false".to_string(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+            executor: "native".to_string(),
+            tmux_session: None,
+        });
+        let spawned = app.consume_pending_chat_pty_spawn(0, 80);
+        assert!(!spawned);
+        assert!(
+            app.pending_chat_pty_spawn.is_some(),
+            "pending must be preserved across no-op zero-dim consume calls so a \
+             later frame with real dims can still spawn"
+        );
+        let spawned = app.consume_pending_chat_pty_spawn(24, 0);
+        assert!(!spawned);
+        assert!(app.pending_chat_pty_spawn.is_some());
+    }
+
+    /// When `consume_pending_chat_pty_spawn` succeeds, the spawned
+    /// `PtyPane` reports the dimensions that were passed in (no
+    /// implicit clamp at the chat-tab call site — the PtyPane itself
+    /// applies a 10×40 floor internally on resize). This is the
+    /// post-fix contract: chat-tab spawn dims = msg_area dims.
+    #[test]
+    fn consume_with_real_dims_spawns_at_those_dims() {
+        let mut app = empty_app();
+        app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+            task_id: ".chat-test".to_string(),
+            bin: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            env: vec![],
+            cwd: None,
+            executor: "native".to_string(),
+            tmux_session: None,
+        });
+        let rows = 30u16;
+        let cols = 120u16;
+        let spawned = app.consume_pending_chat_pty_spawn(rows, cols);
+        assert!(spawned, "spawn should succeed with /bin/sh -c sleep");
+        assert!(app.pending_chat_pty_spawn.is_none());
+        let pane = app
+            .task_panes
+            .get(".chat-test")
+            .expect("pane should be inserted under task_id");
+        assert_eq!(
+            pane.dims(),
+            (rows, cols),
+            "spawn dims must match the area dims passed by the render path"
+        );
+    }
+
+    /// `consume_pending_chat_pty_spawn` records spawn info in `chat_last_spawn_info`
+    /// on success, so the death panel has executor+cmd when the pane later exits.
+    #[test]
+    fn consume_records_spawn_info_on_success() {
+        let mut app = empty_app();
+        app.pending_chat_pty_spawn = Some(PendingChatPtySpawn {
+            task_id: ".chat-5".to_string(),
+            bin: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            env: vec![],
+            cwd: None,
+            executor: "native".to_string(),
+            tmux_session: None,
+        });
+        let spawned = app.consume_pending_chat_pty_spawn(24, 80);
+        assert!(spawned);
+        let info = app
+            .chat_last_spawn_info
+            .get(&5)
+            .expect("spawn info must be recorded under coordinator id");
+        assert_eq!(info.0, "native", "executor must be recorded");
+        assert!(
+            info.1.contains("/bin/sh"),
+            "spawn_cmd must include the binary: {}",
+            info.1
+        );
+    }
+}
+
+#[cfg(test)]
+mod chat_agent_death_tests {
+    //! Regression tests for the "chat agent died" surfacing layer.
+    //! When a chat PTY process exits unexpectedly, the TUI must:
+    //!  - populate `chat_agent_death` for the active coordinator
+    //!  - NOT auto-switch to coordinator-0 / file-tailing
+    //!  - clear `chat_agent_death` on R (retry), X (dismiss), E (edit)
+    use super::*;
+    use crate::commands::viz::VizOutput;
+
+    fn empty_app() -> VizApp {
+        let viz = VizOutput {
+            text: String::new(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
+        };
+        VizApp::from_viz_output_for_test(&viz)
+    }
+
+    fn make_death_info() -> ChatAgentDeathInfo {
+        ChatAgentDeathInfo {
+            exit_status: "exit code 1".to_string(),
+            executor: "nex".to_string(),
+            spawn_cmd: "wg nex --resume chat-0".to_string(),
+        }
+    }
+
+    /// death info inserted for coordinator 0 must be retrievable.
+    #[test]
+    fn death_info_is_stored_and_retrieved() {
+        let mut app = empty_app();
+        app.active_coordinator_id = 0;
+        app.chat_agent_death.insert(0, make_death_info());
+        assert!(
+            app.chat_agent_death.contains_key(&0),
+            "death info must be present for cid=0"
+        );
+    }
+
+    /// After death, `chat_pty_mode` stays true so the render path knows
+    /// to show the death panel rather than the file-tailing fallback.
+    #[test]
+    fn chat_pty_mode_stays_true_after_death_info_inserted() {
+        let mut app = empty_app();
+        app.active_coordinator_id = 0;
+        app.chat_pty_mode = true;
+        app.chat_agent_death.insert(0, make_death_info());
+        assert!(
+            app.chat_pty_mode,
+            "chat_pty_mode must remain true so the render path shows the death panel"
+        );
+    }
+
+    /// Clearing death info (simulating R/X/E handler) removes the entry.
+    #[test]
+    fn clearing_death_info_removes_entry() {
+        let mut app = empty_app();
+        app.active_coordinator_id = 0;
+        app.chat_agent_death.insert(0, make_death_info());
+        app.chat_agent_death.remove(&0);
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "death info must be gone after removal"
+        );
+    }
+
+    /// Death info is per-coordinator: inserting for cid=1 doesn't affect cid=0.
+    #[test]
+    fn death_info_is_per_coordinator() {
+        let mut app = empty_app();
+        app.chat_agent_death.insert(1, make_death_info());
+        assert!(
+            !app.chat_agent_death.contains_key(&0),
+            "death info for cid=1 must not affect cid=0"
+        );
+        assert!(app.chat_agent_death.contains_key(&1));
+    }
+}
+
+#[cfg(test)]
+mod chat_pty_redraw_trigger_tests {
+    //! Pin the demand-driven redraw signal that drives codex / claude
+    //! animation rendering between user keypresses. Before
+    //! fix-codex-chat-3, the event loop's idle-poll branch only
+    //! redrew on `has_timed_ui_elements()` ∨ `is_refresh_due()`, neither
+    //! of which fires on PTY byte arrivals — so codex's spinner emitted
+    //! frames at 10–20 fps but the TUI rendered at 1 Hz ((the global
+    //! refresh interval), producing the user-reported "real-time
+    //! animations don't render" symptom. The fix adds a per-pane
+    //! `bytes_processed` watermark and a fresh-bytes check that the
+    //! event loop consults each idle-poll tick.
+    use super::*;
+    use crate::commands::viz::VizOutput;
+
+    fn empty_app() -> VizApp {
+        let viz = VizOutput {
+            text: String::new(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
+        };
+        VizApp::from_viz_output_for_test(&viz)
+    }
+
+    /// No panes, no fresh bytes: trivially false.
+    #[test]
+    fn no_panes_means_no_fresh_bytes() {
+        let app = empty_app();
+        assert!(!app.chat_pty_has_new_bytes());
+    }
+
+    /// A freshly spawned pane that has emitted bytes (bash echo runs
+    /// immediately) reports has_new_bytes=true on the FIRST check —
+    /// the watermark is initialized to 0, so any non-zero
+    /// `bytes_processed` counts as "new." This is the cold-start case:
+    /// first chat tab paint must redraw to show whatever the child has
+    /// already emitted.
+    #[test]
+    fn fresh_pane_with_output_reports_new_bytes() {
+        let mut app = empty_app();
+        let pane = crate::tui::pty_pane::PtyPane::spawn(
+            "/bin/sh",
+            &["-c", "printf 'hello\\n'; sleep 5"],
+            &[],
+            10,
+            40,
+        )
+        .expect("spawn /bin/sh -c");
+        app.task_panes.insert(".chat-test".to_string(), pane);
+        // Give the reader thread a moment to drain the bytes.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            app.chat_pty_has_new_bytes(),
+            "freshly spawned pane with output must trigger redraw on first check — \
+             the user-reported symptom is exactly that codex emits frames but the \
+             TUI never sees them"
+        );
+        if let Some(p) = app.task_panes.remove(".chat-test") {
+            drop(p);
+        }
+    }
+
+    /// After `update_task_pane_byte_watermarks` snapshots the current
+    /// counters, a follow-up check with NO new bytes returns false.
+    /// This is the steady-state case that keeps the loop from pinning
+    /// to 60 fps when the PTY child is silent.
+    #[test]
+    fn watermark_update_clears_fresh_bytes_signal() {
+        let mut app = empty_app();
+        let pane = crate::tui::pty_pane::PtyPane::spawn(
+            "/bin/sh",
+            &["-c", "printf 'hello\\n'; sleep 5"],
+            &[],
+            10,
+            40,
+        )
+        .expect("spawn /bin/sh -c");
+        app.task_panes.insert(".chat-test".to_string(), pane);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(app.chat_pty_has_new_bytes());
+        app.update_task_pane_byte_watermarks();
+        assert!(
+            !app.chat_pty_has_new_bytes(),
+            "watermark update must mark current bytes_processed as 'rendered' — \
+             no further redraws should fire until the child emits more bytes"
+        );
+        if let Some(p) = app.task_panes.remove(".chat-test") {
+            drop(p);
+        }
+    }
+
+    /// Watermark map prunes entries for panes that no longer exist —
+    /// the chat-close path drops the pane from `task_panes`, and the
+    /// stale watermark must follow so it can't false-positive against a
+    /// later pane that happens to reuse the same task id.
+    #[test]
+    fn watermark_update_prunes_dropped_panes() {
+        let mut app = empty_app();
+        // Seed a stale watermark for an id that has no pane.
+        app.task_pane_last_bytes_seen
+            .insert(".chat-orphan".to_string(), 9999);
+        app.update_task_pane_byte_watermarks();
+        assert!(
+            !app.task_pane_last_bytes_seen.contains_key(".chat-orphan"),
+            "stale watermarks for non-existent panes must be pruned each tick \
+             so a future pane reusing the id can't be silently skipped"
+        );
+    }
+
+    /// `has_timed_ui_elements()` MUST return true when fresh PTY bytes
+    /// are pending — that's the wiring the event loop reads. If a
+    /// future refactor unwires this, the regression returns and
+    /// animations stall again.
+    #[test]
+    fn has_timed_ui_elements_observes_fresh_pty_bytes() {
+        let mut app = empty_app();
+        let pane = crate::tui::pty_pane::PtyPane::spawn(
+            "/bin/sh",
+            &["-c", "printf 'hello\\n'; sleep 5"],
+            &[],
+            10,
+            40,
+        )
+        .expect("spawn /bin/sh -c");
+        app.task_panes.insert(".chat-test".to_string(), pane);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            app.has_timed_ui_elements(),
+            "has_timed_ui_elements must surface fresh PTY bytes so the event loop's \
+             Timeout branch sets needs_redraw=true and animation frames render"
+        );
+        if let Some(p) = app.task_panes.remove(".chat-test") {
+            drop(p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_exit_prompt_tests {
+    //! Cover the chat-exit prompt state transitions: open / leave-all
+    //! / close-all / per-chat advance / back / cancel. The actual
+    //! kill-tmux side effects are tested separately in pty_pane.rs +
+    //! chat_id.rs unit tests; here we just pin the mode + flag
+    //! transitions so future refactors can't silently regress the UX.
+    use super::*;
+    use crate::commands::viz::VizOutput;
+
+    fn empty_app() -> VizApp {
+        let viz = VizOutput {
+            text: String::new(),
+            node_line_map: HashMap::new(),
+            task_order: Vec::new(),
+            forward_edges: HashMap::new(),
+            reverse_edges: HashMap::new(),
+            char_edge_map: HashMap::new(),
+            cycle_members: HashMap::new(),
+            annotation_map: HashMap::new(),
+        };
+        VizApp::from_viz_output_for_test(&viz)
+    }
+
+    #[test]
+    fn open_exit_prompt_switches_to_exit_mode() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![1, 2, 3]);
+        match app.input_mode {
+            InputMode::ExitPrompt(ref s) => {
+                assert_eq!(s.chats, vec![1, 2, 3]);
+                assert_eq!(s.per_chat_idx, None);
+                assert_eq!(s.per_chat_close, vec![false, false, false]);
+            }
+            _ => panic!("input_mode must be ExitPrompt after open"),
+        }
+        assert!(!app.exit_prompt_resolved);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn resolve_leave_all_sets_should_quit_and_resolved() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![1, 2]);
+        app.resolve_exit_prompt_leave_all();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.should_quit);
+        assert!(app.exit_prompt_resolved);
+    }
+
+    #[test]
+    fn resolve_close_all_sets_should_quit_and_resolved() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![1, 2]);
+        app.resolve_exit_prompt_close_all();
+        // We don't have actual tmux sessions in a unit test; this
+        // exercises the state machine, not the kill side effect.
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.should_quit);
+        assert!(app.exit_prompt_resolved);
+    }
+
+    #[test]
+    fn enter_per_chat_sets_idx_zero() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![5, 6]);
+        app.enter_exit_prompt_per_chat();
+        match &app.input_mode {
+            InputMode::ExitPrompt(s) => assert_eq!(s.per_chat_idx, Some(0)),
+            _ => panic!("must remain in ExitPrompt mode"),
+        }
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn cancel_clears_should_quit_and_resolved() {
+        let mut app = empty_app();
+        app.should_quit = true;
+        app.exit_prompt_resolved = true;
+        app.open_exit_prompt(vec![1]);
+        app.cancel_exit_prompt();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(!app.should_quit, "cancel must clear should_quit");
+        assert!(
+            !app.exit_prompt_resolved,
+            "cancel must reset exit_prompt_resolved so a future quit attempt re-prompts"
+        );
+    }
+
+    #[test]
+    fn per_chat_idx_advances_through_all_chats() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![1, 2, 3]);
+        app.enter_exit_prompt_per_chat();
+        // Manually set per_chat_close + advance idx as the input
+        // handler would.
+        if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+            assert_eq!(s.per_chat_idx, Some(0));
+            s.per_chat_close[0] = false;
+            s.per_chat_idx = Some(1);
+        }
+        if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+            assert_eq!(s.per_chat_idx, Some(1));
+            s.per_chat_close[1] = true;
+            s.per_chat_idx = Some(2);
+        }
+        if let InputMode::ExitPrompt(ref mut s) = app.input_mode {
+            s.per_chat_close[2] = false;
+            s.per_chat_idx = None; // signal "ready to apply"
+            assert_eq!(s.per_chat_close, vec![false, true, false]);
+        }
+        // Now applying per-chat decisions should set should_quit.
+        app.resolve_exit_prompt_per_chat();
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.should_quit);
+        assert!(app.exit_prompt_resolved);
+    }
+
+    #[test]
+    fn enter_per_chat_with_no_chats_skips_to_resolved() {
+        let mut app = empty_app();
+        app.open_exit_prompt(vec![]);
+        app.enter_exit_prompt_per_chat();
+        // Empty chat list short-circuits to "done".
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.should_quit);
+        assert!(app.exit_prompt_resolved);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tests for viewport stability (implement-tui-viewport)
+// ══════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod viewport_stability_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    use crate::commands::viz::ascii::generate_ascii;
+    use crate::commands::viz::{LayoutMode, VizOutput};
+
+    /// Build a linear graph of `n` tasks (task-0, task-1, ...) and return
+    /// the resulting VizOutput, graph, and tempdir.
+    fn build_linear_graph(n: usize) -> (VizOutput, WorkGraph, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        for i in 0..n {
+            let id = format!("task-{}", i);
+            let title = format!("Task {}", i);
+            let mut task = make_task_with_status(&id, &title, Status::Open);
+            if i > 0 {
+                task.after = vec![format!("task-{}", i - 1)];
+            }
+            graph.add_node(Node::Task(task));
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        (viz, graph, tmp)
+    }
+
+    fn generate_viz_for_test(graph: &WorkGraph) -> VizOutput {
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        generate_ascii(
+            graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    }
+
+    fn build_timestamped_linear_graph(n: usize) -> (VizOutput, WorkGraph, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        for i in 0..n {
+            let id = format!("task-{}", i);
+            let title = format!("Task {}", i);
+            let mut task = make_task_with_status(&id, &title, Status::Open);
+            task.created_at = Some(format!("2026-01-01T00:{:02}:00Z", i));
+            if i > 0 {
+                task.after = vec![format!("task-{}", i - 1)];
+            }
+            graph.add_node(Node::Task(task));
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        save_graph(&graph, &tmp.path().join("graph.jsonl")).unwrap();
+        let viz = generate_viz_for_test(&graph);
+        (viz, graph, tmp)
+    }
+
+    /// Build a VizApp that looks like it completed an initial load:
+    /// content_height set, viewport_height simulated, scrolled to top.
+    ///
+    /// Avoids calling apply_viz_result on a fresh (empty) scroll state —
+    /// is_at_bottom_strict() is trivially true when content_height=0, which
+    /// would trigger go_bottom() and leave offset_y at max_y instead of 0.
+    fn build_app_post_initial(
+        viz: &VizOutput,
+        workgraph_dir: &std::path::Path,
+        viewport_height: usize,
+    ) -> VizApp {
+        let mut app = VizApp::from_viz_output_for_test(viz);
+        app.workgraph_dir = workgraph_dir.to_path_buf();
+        // Simulate a real terminal viewport so scroll math works.
+        app.scroll.viewport_height = viewport_height;
+        // Set content_height from lines (mimics update_scroll_bounds).
+        app.update_scroll_bounds();
+        // Start at top as the real initial load would.
+        app.scroll.go_top();
+        app
+    }
+
+    // ── is_at_bottom_strict unit tests ──
+
+    #[test]
+    fn is_at_bottom_strict_true_at_exact_bottom() {
+        let mut s = ViewportScroll::new();
+        s.content_height = 30;
+        s.viewport_height = 20;
+        s.offset_y = 10; // max_y = 30-20 = 10 → exactly at bottom
+        assert!(s.is_at_bottom_strict());
+    }
+
+    #[test]
+    fn is_at_bottom_strict_false_one_line_above_bottom() {
+        let mut s = ViewportScroll::new();
+        s.content_height = 30;
+        s.viewport_height = 20;
+        s.offset_y = 9; // max_y = 10; 9 < 10 → not at bottom
+        assert!(!s.is_at_bottom_strict());
+    }
+
+    #[test]
+    fn is_at_bottom_loose_true_within_3_lines() {
+        let mut s = ViewportScroll::new();
+        s.content_height = 30;
+        s.viewport_height = 20;
+        s.offset_y = 8; // max_y=10; 8+3=11 >= 10 → loose says bottom
+        assert!(s.is_at_bottom());
+        // strict says not
+        assert!(!s.is_at_bottom_strict());
+    }
+
+    // ── Viewport stability: mid-scroll state transition ──
+
+    /// Scroll to mid-graph, simulate a graph reload (status change on another task),
+    /// and assert the viewport did NOT jump.
+    #[test]
+    fn viewport_stable_on_offscreen_state_change() {
+        let (viz, _, tmp) = build_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 20);
+
+        // Scroll to the middle.
+        app.scroll.offset_y = 10;
+
+        // Reload with the same graph — simulates an off-screen status change.
+        app.apply_viz_result(Ok(viz.clone()));
+
+        assert_eq!(
+            app.scroll.offset_y, 10,
+            "viewport must not jump on off-screen state change"
+        );
+        assert!(
+            !app.needs_center_on_selected,
+            "needs_center_on_selected must not be set"
+        );
+    }
+
+    // ── New-task focus: top-anchor wins ──
+
+    /// When the user is at the top (offset_y == 0) and a new task is added,
+    /// the viewport must stay at offset_y == 0 (top-anchor wins).
+    #[test]
+    fn new_task_at_top_viewport_stays_at_top() {
+        let (viz, mut graph, tmp) = build_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 20);
+
+        // Confirm we start at the top.
+        assert_eq!(app.scroll.offset_y, 0);
+
+        // Add a new task to the graph and rebuild viz.
+        let mut new_task = make_task_with_status("task-new", "New Task", Status::Open);
+        new_task.after = vec!["task-29".to_string()];
+        graph.add_node(Node::Task(new_task));
+
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz2 = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Write the .new_task_focus marker.
+        std::fs::write(tmp.path().join(".new_task_focus"), "task-new").unwrap();
+
+        app.apply_viz_result(Ok(viz2));
+
+        assert_eq!(
+            app.scroll.offset_y, 0,
+            "top-anchor must win: viewport must stay at offset_y=0 when user is at top"
+        );
+        assert!(
+            !app.needs_center_on_selected,
+            "needs_center_on_selected must NOT be set when at top"
+        );
+    }
+
+    /// When a graph refresh inserts rows above the existing selected task
+    /// without a `.new_task_focus` marker, a top-positioned viewport must
+    /// remain pinned to graph row 0 instead of preserving the old task's
+    /// screen-relative position.
+    #[test]
+    fn rows_inserted_above_selected_task_preserve_top_anchor_without_focus_marker() {
+        let (viz, mut graph, tmp) = build_timestamped_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 12);
+        let selected_before = app.selected_task_id().unwrap().to_string();
+
+        assert_eq!(app.scroll.offset_y, 0);
+        assert_eq!(selected_before, "task-0");
+
+        let mut top_task = make_task_with_status("task-new-top", "New Top Task", Status::Open);
+        top_task.created_at = Some("2026-01-02T00:00:00Z".to_string());
+        graph.add_node(Node::Task(top_task));
+        save_graph(&graph, &tmp.path().join("graph.jsonl")).unwrap();
+
+        let viz2 = generate_viz_for_test(&graph);
+        assert_eq!(
+            viz2.task_order.first().map(String::as_str),
+            Some("task-new-top")
+        );
+
+        app.apply_viz_result(Ok(viz2));
+
+        assert_eq!(
+            app.scroll.offset_y, 0,
+            "top-anchor must outrank selected-task relative anchoring"
+        );
+        assert_eq!(
+            app.selected_task_id(),
+            Some(selected_before.as_str()),
+            "refresh should still preserve selected task by ID"
+        );
+        let new_top_line = *app.node_line_map.get("task-new-top").unwrap();
+        let new_top_visible = app.original_to_visible(new_top_line).unwrap();
+        assert!(
+            new_top_visible < app.scroll.viewport_height,
+            "new top-of-graph task should be visible when viewport remains top anchored"
+        );
+    }
+
+    /// End-to-end simulation of the async TUI refresh path: a graph mtime
+    /// change first updates the async stat cache, then loads graph.jsonl on
+    /// the worker, and only then applies the fresh graph. This locks the
+    /// regression where the TUI applied the old cached graph and recorded the
+    /// new mtime, permanently hiding inserted top rows until manual refresh.
+    #[test]
+    fn async_refresh_applies_fresh_graph_and_preserves_top_anchor() {
+        let (viz, mut graph, tmp) = build_timestamped_linear_graph(30);
+        let graph_path = tmp.path().join("graph.jsonl");
+        let old_mtime = std::fs::metadata(&graph_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let mut app = build_app_post_initial(&viz, tmp.path(), 12);
+        app.last_graph_mtime = old_mtime;
+        app.refresh_interval = std::time::Duration::ZERO;
+        if let Ok(old_graph) = workgraph::parser::load_graph(&graph_path) {
+            app.async_fs.seed_graph(old_graph, old_mtime);
+        }
+        app.async_fs.seed_stat(graph_path.clone(), old_mtime);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut top_task = make_task_with_status("task-new-top", "New Top Task", Status::Open);
+        top_task.created_at = Some("2026-01-02T00:00:00Z".to_string());
+        graph.add_node(Node::Task(top_task));
+        save_graph(&graph, &graph_path).unwrap();
+
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let start = Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            app.maybe_refresh();
+            if app
+                .task_order
+                .first()
+                .is_some_and(|id| id == "task-new-top")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let launcher = app
-            .launcher
-            .as_ref()
-            .expect("open_launcher should have populated the launcher state");
-        assert!(
-            !launcher.recent_list.is_empty(),
-            "launcher should surface the seeded history entry as a recall option"
-        );
-        let recent = &launcher.recent_list[0];
-        assert_eq!(recent.executor, "native");
-        assert_eq!(recent.model.as_deref(), Some("qwen3-coder"));
         assert_eq!(
-            recent.endpoint.as_deref(),
-            Some("https://lambda01.tail334fe6.ts.net:30000")
+            app.task_order.first().map(String::as_str),
+            Some("task-new-top"),
+            "async refresh must apply the worker-loaded graph, not the stale cache"
+        );
+        assert_eq!(
+            app.scroll.offset_y, 0,
+            "top anchor must survive the real async refresh path"
+        );
+    }
+
+    /// Away from the top, keep the previous selected-task anchoring behavior:
+    /// rows inserted above the selected task should move the scroll offset so
+    /// the selected task stays at the same viewport-relative row.
+    #[test]
+    fn rows_inserted_above_selected_task_preserve_non_top_relative_anchor() {
+        let (viz, mut graph, tmp) = build_timestamped_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 12);
+
+        let selected_id = "task-15";
+        app.selected_task_idx = app.task_order.iter().position(|id| id == selected_id);
+        app.recompute_trace();
+
+        let old_orig_line = *app.node_line_map.get(selected_id).unwrap();
+        let old_visible = app.original_to_visible(old_orig_line).unwrap();
+        app.scroll.offset_y = old_visible.saturating_sub(5);
+        assert!(
+            app.scroll.offset_y > 0,
+            "test setup must place viewport away from top"
+        );
+        let old_offset = app.scroll.offset_y;
+        let old_relative = old_visible as isize - old_offset as isize;
+
+        let mut top_task = make_task_with_status("task-new-top", "New Top Task", Status::Open);
+        top_task.created_at = Some("2026-01-02T00:00:00Z".to_string());
+        graph.add_node(Node::Task(top_task));
+        save_graph(&graph, &tmp.path().join("graph.jsonl")).unwrap();
+
+        let viz2 = generate_viz_for_test(&graph);
+        assert_eq!(
+            viz2.task_order.first().map(String::as_str),
+            Some("task-new-top")
+        );
+
+        app.apply_viz_result(Ok(viz2));
+
+        assert_eq!(
+            app.selected_task_id(),
+            Some(selected_id),
+            "non-top refresh should preserve selected task by ID"
+        );
+        let new_orig_line = *app.node_line_map.get(selected_id).unwrap();
+        let new_visible = app.original_to_visible(new_orig_line).unwrap();
+        let new_relative = new_visible as isize - app.scroll.offset_y as isize;
+        assert_eq!(
+            new_relative, old_relative,
+            "non-top selected task should keep its viewport-relative row"
+        );
+        assert!(
+            app.scroll.offset_y > old_offset,
+            "scroll offset should move down to compensate for inserted top rows"
+        );
+    }
+
+    // ── New-task focus: mid-scroll does NOT center ──
+
+    /// When the user is scrolled mid-graph and a new task is added off-screen,
+    /// the viewport must NOT unconditionally center on the new task.
+    /// Instead, needs_scroll_into_view is used (gentle comfort-zone, not center).
+    #[test]
+    fn new_task_mid_scroll_does_not_center() {
+        let (viz, mut graph, tmp) = build_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 20);
+
+        // Scroll to mid-graph.
+        app.scroll.offset_y = 10;
+
+        // Add a new task to the graph.
+        let mut new_task = make_task_with_status("task-new", "New Task", Status::Open);
+        new_task.after = vec!["task-29".to_string()];
+        graph.add_node(Node::Task(new_task));
+
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz2 = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        // Write the .new_task_focus marker.
+        std::fs::write(tmp.path().join(".new_task_focus"), "task-new").unwrap();
+
+        app.apply_viz_result(Ok(viz2));
+
+        // The critical invariant: unconditional center is forbidden.
+        assert!(
+            !app.needs_center_on_selected,
+            "needs_center_on_selected must NOT be set for mid-scroll new task"
+        );
+        // Offset must not have changed (deferred scroll happens in render, not here).
+        assert_eq!(
+            app.scroll.offset_y, 10,
+            "offset_y must be unchanged before render handles needs_scroll_into_view"
+        );
+    }
+
+    // ── Smart-follow: near-bottom does NOT auto-advance ──
+
+    /// When the user is near (but not at) the exact bottom, adding a new task
+    /// must NOT trigger smart-follow (go_bottom). The strict threshold means
+    /// "within 3 lines" no longer counts.
+    #[test]
+    fn near_bottom_does_not_trigger_smart_follow() {
+        let (viz, mut graph, tmp) = build_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 20);
+
+        // content_height is set by update_scroll_bounds: lines.len() + 1.
+        // For 30 tasks with tree connectors, lines.len() >= 30. max_y = content_height - 20.
+        // Set offset_y to max_y - 2 (near bottom, within the old +3 slack).
+        let max_y = app
+            .scroll
+            .content_height
+            .saturating_sub(app.scroll.viewport_height);
+        assert!(
+            max_y >= 2,
+            "graph must be taller than viewport for this test"
+        );
+        app.scroll.offset_y = max_y.saturating_sub(2);
+        let initial_offset = app.scroll.offset_y;
+
+        // Add a new task that appends below everything.
+        let mut new_task = make_task_with_status("task-new", "New Task", Status::Open);
+        new_task.after = vec!["task-29".to_string()];
+        graph.add_node(Node::Task(new_task));
+
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz2 = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        app.apply_viz_result(Ok(viz2));
+
+        // offset_y must NOT have jumped to the new bottom via go_bottom().
+        // It may have been clamped slightly (new content could extend max_y), but
+        // it must not equal the new max_y (which would indicate smart-follow fired).
+        let new_max_y = app
+            .scroll
+            .content_height
+            .saturating_sub(app.scroll.viewport_height);
+        assert_ne!(
+            app.scroll.offset_y, new_max_y,
+            "near-bottom user must NOT be auto-dragged to new bottom by smart-follow"
+        );
+        // And the offset should not have increased dramatically.
+        assert!(
+            app.scroll.offset_y <= initial_offset + 2,
+            "offset must stay near its original position, got {} (initial {})",
+            app.scroll.offset_y,
+            initial_offset
+        );
+    }
+
+    // ── Smart-follow: exact bottom DOES auto-advance ──
+
+    /// When the user IS at the exact bottom, smart-follow fires and keeps them there.
+    #[test]
+    fn exact_bottom_triggers_smart_follow() {
+        let (viz, mut graph, tmp) = build_linear_graph(30);
+        let mut app = build_app_post_initial(&viz, tmp.path(), 20);
+
+        // Scroll to exact bottom.
+        let max_y = app
+            .scroll
+            .content_height
+            .saturating_sub(app.scroll.viewport_height);
+        app.scroll.offset_y = max_y;
+
+        // Add a new task that appends below everything.
+        let mut new_task = make_task_with_status("task-new", "New Task", Status::Open);
+        new_task.after = vec!["task-29".to_string()];
+        graph.add_node(Node::Task(new_task));
+
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz2 = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        app.apply_viz_result(Ok(viz2));
+
+        // Smart-follow must have fired: offset_y must equal the new max_y.
+        let new_max_y = app
+            .scroll
+            .content_height
+            .saturating_sub(app.scroll.viewport_height);
+        assert_eq!(
+            app.scroll.offset_y, new_max_y,
+            "exact-bottom user must be kept at the new bottom via smart-follow"
+        );
+    }
+}
+
+#[cfg(test)]
+mod message_indicator_refresh_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::messages::CoordinatorMessageStatus;
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    use crate::commands::viz::LayoutMode;
+    use crate::commands::viz::ascii::generate_ascii;
+
+    /// Build a single-task WG task graph on disk and return a VizApp pinned to its
+    /// directory, with `last_graph_mtime` set so a subsequent maybe_refresh
+    /// call sees the graph as unchanged. Mirrors the post-initial-load state.
+    fn build_app_for_msg_test(task_id: &str) -> (VizApp, tempfile::TempDir) {
+        let mut graph = WorkGraph::new();
+        let task = make_task_with_status(task_id, "T", Status::Open);
+        graph.add_node(Node::Task(task));
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph.jsonl");
+        save_graph(&graph, &graph_path).unwrap();
+
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let viz = generate_ascii(
+            &graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = tmp.path().to_path_buf();
+        app.last_graph_mtime = std::fs::metadata(&graph_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        // Seed the async-fs cache with the on-disk graph so the first
+        // maybe_refresh() can use it without waiting for the worker.
+        // Production code seeds this in `VizApp::new`; tests that build
+        // an app via `from_viz_output_for_test` and then re-point
+        // `workgraph_dir` need to seed manually.
+        if let Ok(g) = workgraph::parser::load_graph(&graph_path) {
+            app.async_fs.seed_graph(g, app.last_graph_mtime);
+        }
+        app.async_fs.seed_stat(graph_path, app.last_graph_mtime);
+        (app, tmp)
+    }
+
+    fn write_message(wg_dir: &std::path::Path, task_id: &str, sender: &str, id: u64) {
+        let msg_dir = wg_dir.join("messages");
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        let msg_path = msg_dir.join(format!("{}.jsonl", task_id));
+        let line = serde_json::json!({
+            "id": id,
+            "timestamp": "2026-04-30T10:00:00Z",
+            "sender": sender,
+            "body": "hello",
+            "priority": "normal",
+            "status": "sent"
+        });
+        // Append so multiple messages accumulate in a single file.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&msg_path)
+            .unwrap();
+        writeln!(f, "{}", line).unwrap();
+    }
+
+    /// `wg msg send` from a non-coordinator-side sender (an agent or task
+    /// alias) should make the M:Msg tab indicator appear after the next
+    /// maybe_refresh, even though graph.jsonl mtime did not change.
+    #[test]
+    fn message_file_change_refreshes_tab_indicator() {
+        let (mut app, tmp) = build_app_for_msg_test("t1");
+
+        // Sanity: no messages → no indicator entry.
+        assert!(app.task_message_statuses.is_empty());
+
+        // Simulate `wg msg send t1 "hi"` from an agent context.
+        write_message(tmp.path(), "t1", "agent-x", 1);
+
+        // Simulate the fs watcher firing for the message file.
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.messages_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        app.maybe_refresh();
+
+        assert_eq!(
+            app.task_message_statuses.get("t1"),
+            Some(&CoordinatorMessageStatus::Unseen),
+            "tab indicator must update after a message file write"
+        );
+    }
+
+    /// The indicator must persist across a follow-up refresh that touches no
+    /// message files. Regression for: indicator appearing once and then
+    /// disappearing on the next graph-state-change refresh.
+    #[test]
+    fn message_indicator_persists_across_subsequent_refresh() {
+        let (mut app, tmp) = build_app_for_msg_test("t1");
+        write_message(tmp.path(), "t1", "agent-x", 1);
+
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.messages_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.maybe_refresh();
+        assert!(app.task_message_statuses.contains_key("t1"));
+
+        // Simulate a subsequent unrelated fs change that does NOT touch the
+        // messages dir (e.g., agent output log appended). The indicator must
+        // remain because the underlying message file is still on disk.
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // messages_change_pending intentionally NOT set this time.
+        app.maybe_refresh();
+
+        assert_eq!(
+            app.task_message_statuses.get("t1"),
+            Some(&CoordinatorMessageStatus::Unseen),
+            "indicator must persist when the underlying message file is unchanged"
+        );
+    }
+
+    /// Without the messages_change_pending signal, a fs-watcher tick that
+    /// only saw a graph-unrelated change must NOT pick up message-file
+    /// updates. This codifies the watcher's discrimination: cursor-only
+    /// changes (advancement under `.cursors/`) should not be conflated with
+    /// real message-content changes.
+    #[test]
+    fn fs_change_without_messages_flag_does_not_force_message_reload() {
+        let (mut app, tmp) = build_app_for_msg_test("t1");
+
+        // Pre-state: a message exists on disk but the app has not seen it
+        // yet (initial task_message_statuses is empty and last_graph_mtime
+        // matches current graph mtime, so no reload would happen on its
+        // own).
+        write_message(tmp.path(), "t1", "agent-x", 1);
+        assert!(app.task_message_statuses.is_empty());
+
+        // Simulate a fs change that did NOT touch the messages dir (e.g.,
+        // an agent output log appended). Only fs_change_pending is set.
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // messages_change_pending intentionally NOT set.
+        app.maybe_refresh();
+
+        // Without the messages signal, the heavy viz reload does not run
+        // (graph mtime unchanged), so the indicator stays empty until a
+        // real message change is detected.
+        assert!(
+            app.task_message_statuses.is_empty(),
+            "fs-change without messages signal must not trigger a message-stats reload"
+        );
+    }
+
+    /// The indicator must clear when the TUI cursor is advanced past the last
+    /// incoming message id (i.e., the user has read it). Status flips Unseen
+    /// → Seen, not None — but it must not silently disappear.
+    #[test]
+    fn message_indicator_clears_to_seen_after_cursor_advance() {
+        let (mut app, tmp) = build_app_for_msg_test("t1");
+        write_message(tmp.path(), "t1", "agent-x", 1);
+
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.messages_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.maybe_refresh();
+        assert_eq!(
+            app.task_message_statuses.get("t1"),
+            Some(&CoordinatorMessageStatus::Unseen)
+        );
+
+        // Advance the TUI cursor as load_messages_panel would do when the
+        // user opens the Messages tab on this task.
+        workgraph::messages::write_cursor(tmp.path(), "tui", "t1", 1).unwrap();
+
+        // The cursor file change touches messages/.cursors/, which our
+        // watcher filter excludes. Drive the refresh manually since this
+        // test is not running the real fs watcher.
+        app.fs_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.messages_change_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.maybe_refresh();
+
+        assert_eq!(
+            app.task_message_statuses.get("t1"),
+            Some(&CoordinatorMessageStatus::Seen),
+            "cursor advance must transition Unseen → Seen, not clear the indicator"
+        );
+    }
+}
+
+/// Tests for the `last_interaction_at` sort + render-debounce path
+/// (task `revert-redo-fix`). Locks the regression behind the bad ship of
+/// fix-tui-graph: status-grouped sort must be stable when timestamps tie,
+/// the apply path must throttle to ~5 events/sec under burst, and a
+/// graph-event burst must not trigger more than one re-sort within the
+/// debounce window.
+#[cfg(test)]
+mod activity_sort_debounce_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use workgraph::graph::{Node, Status, WorkGraph};
+    use workgraph::parser::save_graph;
+    use workgraph::test_helpers::make_task_with_status;
+
+    use crate::commands::viz::ascii::generate_ascii;
+    use crate::commands::viz::{LayoutMode, VizOutput};
+
+    fn render_viz(graph: &WorkGraph) -> VizOutput {
+        let tasks: Vec<_> = graph.tasks().collect();
+        let task_ids: HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        generate_ascii(
+            graph,
+            &tasks,
+            &task_ids,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            LayoutMode::Tree,
+            &HashSet::new(),
+            "gray",
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    }
+
+    fn build_app_with_graph(graph: &WorkGraph) -> (VizApp, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        save_graph(graph, tmp.path().join("graph.jsonl")).unwrap();
+        let viz = render_viz(graph);
+        let mut app = VizApp::from_viz_output_for_test(&viz);
+        app.workgraph_dir = tmp.path().to_path_buf();
+        (app, tmp)
+    }
+
+    /// Two in-progress tasks with identical `last_interaction_at` must keep
+    /// a deterministic order across repeated sorts. Without an id-based
+    /// tie-break the sort order would depend on the previous order, and
+    /// any TUI re-sort could swap them — the visible "constant scrolling"
+    /// failure mode of the bad fix.
+    #[test]
+    fn status_grouped_sort_is_stable_when_timestamps_tie() {
+        let mut graph = WorkGraph::new();
+        let same_ts = "2026-05-01T12:00:00+00:00".to_string();
+        for id in &["zeta", "alpha", "mu"] {
+            let mut t = make_task_with_status(id, id, Status::InProgress);
+            t.last_interaction_at = Some(same_ts.clone());
+            t.created_at = Some(same_ts.clone());
+            graph.add_node(Node::Task(t));
+        }
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::StatusGrouped;
+
+        // Apply twice from different starting orders — output must match.
+        app.apply_sort_mode();
+        let first = app.task_order.clone();
+
+        app.task_order.reverse();
+        app.last_sort_apply = None; // bypass debounce
+        app.apply_sort_mode();
+        let second = app.task_order.clone();
+
+        assert_eq!(
+            first, second,
+            "tie-breaker by id must give identical sort order across repeated applies"
+        );
+        // Stable id tie-break = ascending id order.
+        assert_eq!(first, vec!["alpha", "mu", "zeta"]);
+    }
+
+    /// More-recently-touched in-progress tasks must come first within the
+    /// status group. This proves the activity sort actually runs (regression
+    /// gate for "field exists but isn't read").
+    #[test]
+    fn status_grouped_sort_bubbles_recent_activity() {
+        let mut graph = WorkGraph::new();
+        let mut older = make_task_with_status("older", "older", Status::InProgress);
+        older.last_interaction_at = Some("2026-04-01T00:00:00+00:00".to_string());
+        let mut newer = make_task_with_status("newer", "newer", Status::InProgress);
+        newer.last_interaction_at = Some("2026-05-01T00:00:00+00:00".to_string());
+        graph.add_node(Node::Task(older));
+        graph.add_node(Node::Task(newer));
+
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::StatusGrouped;
+        app.apply_sort_mode();
+        assert_eq!(
+            app.task_order,
+            vec!["newer".to_string(), "older".to_string()],
+            "newer last_interaction_at must come first within the in-progress group"
+        );
+    }
+
+    /// Status priority dominates: a stale in-progress task still sorts
+    /// before a freshly-touched done task.
+    #[test]
+    fn status_priority_dominates_activity_sort() {
+        let mut graph = WorkGraph::new();
+        let mut stale_in_progress = make_task_with_status("stale", "stale", Status::InProgress);
+        stale_in_progress.last_interaction_at = Some("2026-01-01T00:00:00+00:00".to_string());
+        let mut fresh_done = make_task_with_status("done", "done", Status::Done);
+        fresh_done.last_interaction_at = Some("2026-05-01T00:00:00+00:00".to_string());
+        graph.add_node(Node::Task(stale_in_progress));
+        graph.add_node(Node::Task(fresh_done));
+
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::StatusGrouped;
+        app.apply_sort_mode();
+        assert_eq!(
+            app.task_order,
+            vec!["stale".to_string(), "done".to_string()],
+            "in-progress (priority 0) must sort before done (priority 4) regardless of activity"
+        );
+    }
+
+    /// 100 successive `request_sort_apply` calls in rapid succession must
+    /// trigger at most one apply within the debounce window. This is the
+    /// core anti-yank guarantee from the task spec.
+    #[test]
+    fn request_sort_apply_throttles_burst_to_one_apply() {
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task_with_status(
+            "a",
+            "a",
+            Status::InProgress,
+        )));
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::StatusGrouped;
+
+        // Fire 100 requests back-to-back. Wall time should be << 200ms,
+        // so only the FIRST one should flip last_sort_apply.
+        let burst_start = Instant::now();
+        for _ in 0..100 {
+            app.request_sort_apply();
+        }
+        let burst_elapsed = burst_start.elapsed();
+        assert!(
+            burst_elapsed < Duration::from_millis(100),
+            "100 requests should run quickly enough that they all fall inside the debounce window (took {:?})",
+            burst_elapsed
+        );
+
+        // Only one apply should have happened — the rest are pending.
+        assert!(app.last_sort_apply.is_some(), "first request must apply");
+        assert!(
+            app.pending_sort_apply,
+            "subsequent requests during the debounce window must defer"
+        );
+    }
+
+    /// After the debounce window passes, the deferred apply flushes via
+    /// `maybe_flush_sort_apply`. Without this, a quiet period after a
+    /// burst would leave the sort pending forever.
+    #[test]
+    fn maybe_flush_sort_apply_runs_after_debounce_window() {
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task_with_status(
+            "a",
+            "a",
+            Status::InProgress,
+        )));
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::StatusGrouped;
+
+        // First apply records last_sort_apply.
+        app.request_sort_apply();
+        let first_apply = app.last_sort_apply.unwrap();
+
+        // Two more requests while inside the window: deferred.
+        app.request_sort_apply();
+        app.request_sort_apply();
+        assert!(app.pending_sort_apply);
+
+        // Pretend SORT_DEBOUNCE has passed by backdating last_sort_apply.
+        app.last_sort_apply = Some(first_apply - VizApp::SORT_DEBOUNCE - Duration::from_millis(10));
+
+        app.maybe_flush_sort_apply();
+        assert!(
+            !app.pending_sort_apply,
+            "flush after window expiry must clear pending_sort_apply"
+        );
+        assert!(
+            app.last_sort_apply.unwrap() > first_apply,
+            "flush must record a fresh last_sort_apply"
+        );
+    }
+
+    /// `cycle_sort_mode` (user keypress path) must bypass the debounce so
+    /// the first 's' tap reorders immediately, even if a graph reload just
+    /// fired.
+    #[test]
+    fn cycle_sort_mode_bypasses_debounce() {
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task_with_status(
+            "a",
+            "a",
+            Status::InProgress,
+        )));
+        let (mut app, _tmp) = build_app_with_graph(&graph);
+        app.sort_mode = SortMode::Chronological;
+
+        // Burst from the graph-watcher path leaves a pending flush.
+        for _ in 0..5 {
+            app.request_sort_apply();
+        }
+        assert!(app.pending_sort_apply);
+
+        // User now taps 's'. cycle_sort_mode should run apply immediately.
+        let _before = Instant::now();
+        app.cycle_sort_mode();
+        assert!(
+            !app.pending_sort_apply,
+            "user-driven cycle_sort_mode must clear the pending flag by applying directly"
         );
     }
 }

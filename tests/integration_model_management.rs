@@ -24,7 +24,7 @@ use workgraph::parser::save_graph;
 // Helpers
 // ===========================================================================
 
-/// Create a minimal workgraph directory with empty graph and default config.
+/// Create a minimal WG directory with empty graph and default config.
 fn setup_workgraph_dir() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path();
@@ -94,6 +94,7 @@ mod model_management_new_user_setup {
                 api_key: Some("sk-or-test-key-12345".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -208,6 +209,7 @@ mod model_management_new_user_setup {
                 api_key: None,
                 api_key_file: Some(key_dir.join("or.key").to_string_lossy().to_string()),
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -494,6 +496,7 @@ mod model_management_key_validation {
             api_key: Some("sk-test-key-abc".to_string()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: true,
             context_window: None,
         };
@@ -515,6 +518,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -532,6 +536,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: None,
             api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -550,6 +555,7 @@ mod model_management_key_validation {
             api_key: Some("sk-123".into()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -564,6 +570,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: Some("/path/to/key".into()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -578,6 +585,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: None,
             api_key_env: Some("MY_KEY".into()),
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -592,6 +600,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -609,6 +618,7 @@ mod model_management_key_validation {
             api_key: Some("sk-or-v1-abcdef123456".into()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -625,6 +635,7 @@ mod model_management_key_validation {
             api_key: Some("short".into()),
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -639,6 +650,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: Some("/path".into()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -653,6 +665,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -673,6 +686,7 @@ mod model_management_key_validation {
             api_key: Some("inline-wins".to_string()),
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -690,6 +704,7 @@ mod model_management_key_validation {
             api_key: None,
             api_key_file: None,
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -711,6 +726,7 @@ mod model_management_key_validation {
                     api_key: Some("sk-staging".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: false,
                     context_window: None,
                 },
@@ -722,6 +738,7 @@ mod model_management_key_validation {
                     api_key: Some("sk-prod".to_string()),
                     api_key_file: None,
                     api_key_env: None,
+                    api_key_ref: None,
                     is_default: true,
                     context_window: None,
                 },
@@ -750,6 +767,7 @@ mod model_management_error_paths {
             api_key: None,
             api_key_file: Some("/nonexistent/path/key.txt".to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -778,6 +796,7 @@ mod model_management_error_paths {
             api_key: None,
             api_key_file: Some(key_path.to_string_lossy().to_string()),
             api_key_env: None,
+            api_key_ref: None,
             is_default: false,
             context_window: None,
         };
@@ -823,6 +842,7 @@ mod model_management_error_paths {
                 api_key: Some("key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             }],
@@ -1133,6 +1153,7 @@ mod model_management_config_persistence {
                 api_key: Some("sk-persist-key".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1215,6 +1236,7 @@ mod model_management_config_persistence {
                 api_key: None,
                 api_key_file: None,
                 api_key_env: Some("MY_CUSTOM_KEY".to_string()),
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1248,6 +1270,7 @@ mod model_management_config_persistence {
                 api_key: None,
                 api_key_file: Some(key_path.to_string_lossy().to_string()),
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1281,6 +1304,7 @@ mod model_management_config_persistence {
                 api_key: Some("sk-roundtrip".to_string()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1417,6 +1441,7 @@ mod model_management_config_persistence {
                 api_key: None,
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1518,6 +1543,7 @@ mod unified_key_resolution {
                 api_key: Some("sk-or-endpoint-key".into()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1567,6 +1593,7 @@ mod unified_key_resolution {
                 api_key: None,
                 api_key_file: Some(key_file.to_string_lossy().into_owned()),
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },
@@ -1640,6 +1667,7 @@ mod unified_key_resolution {
                 api_key: Some("sk-or-e2e-test".into()),
                 api_key_file: None,
                 api_key_env: None,
+                api_key_ref: None,
                 is_default: true,
                 context_window: None,
             },

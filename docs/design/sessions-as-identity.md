@@ -8,14 +8,14 @@
 > The process is an ephemeral *handler* that embodies the session
 > while it's running.
 
-Every LLM-backed task in workgraph — coordinator, agent, evaluator,
+Every LLM-backed task in wg — coordinator, agent, evaluator,
 interactive nex — is (a) a persistent *session* on disk, plus (b) a
 currently-active *handler* process. The session is the identity; the
 handler is the body. Bodies can die and be reborn; the session persists.
 
 This is already true for our native `wg nex` runtime — `--resume`
 restores conversation from the journal, sessions live at
-`.workgraph/chat/<uuid>/`, aliases map human-readable names to UUIDs.
+`.wg/chat/<uuid>/`, aliases map human-readable names to UUIDs.
 What's missing is the *enforcement*: a single-writer lock to guarantee
 at-most-one handler per session, and the lifecycle conventions that
 follow from it.
@@ -25,7 +25,7 @@ This document specifies the full model. The sibling
 
 ## What collapses
 
-Today workgraph has three parallel mental models for "thing an LLM is
+Today wg has three parallel mental models for "thing an LLM is
 doing":
 
 1. **Coordinator.** Spawned by the daemon, identified by numeric id
@@ -35,7 +35,7 @@ doing":
 
 2. **Task agent.** Spawned by the daemon or `wg claim`, identified by
    task id, uses `AgentLoop::run` (soon: `run_interactive` with
-   `--autonomous`), streams to `.workgraph/chat/task-<id>/streaming`.
+   `--autonomous`), streams to `.wg/chat/task-<id>/streaming`.
 
 3. **Interactive nex.** Spawned by the user at a terminal, identified
    by a random UUID alias, uses `AgentLoop::run_interactive` with
@@ -44,7 +44,7 @@ doing":
 These are the same thing in different clothes. Unified model:
 
 - Every LLM activity is a **task** in the graph
-- Every task that has a handler has a **session** at `.workgraph/chat/<uuid>/`
+- Every task that has a handler has a **session** at `.wg/chat/<uuid>/`
 - The task id IS the session alias (coordinator-0 → the alias for
   some UUID, soon replaced by direct UUID-referencing task ids)
 - The **handler** is whichever process currently owns the session
@@ -54,7 +54,7 @@ These are the same thing in different clothes. Unified model:
 
 ### Session
 
-Lives at `.workgraph/chat/<uuid>/`.
+Lives at `.wg/chat/<uuid>/`.
 
 ```
 <uuid>/
@@ -68,7 +68,7 @@ Lives at `.workgraph/chat/<uuid>/`.
   .handler.pid           # NEW: currently-active handler, see §Lock below
 ```
 
-The session registry at `.workgraph/chat/sessions.json` maps UUID →
+The session registry at `.wg/chat/sessions.json` maps UUID →
 `SessionMeta { aliases, kind, created, forked_from }`. Aliases like
 `coordinator-0` or `task-foo` are symlinks in the chat dir pointing at
 the canonical UUID dir.
@@ -94,7 +94,7 @@ removed on clean exit (§Lock).
 
 ## The lock
 
-File: `.workgraph/chat/<uuid>/.handler.pid`. Contents:
+File: `.wg/chat/<uuid>/.handler.pid`. Contents:
 
 ```
 <pid>\n<exec-start-iso8601>\n<handler-kind>\n
@@ -313,7 +313,7 @@ Daemon stops being the coordinator-owner. New role:
 - **Event sink.** Notification backends (Matrix, Telegram) still hook
   into lifecycle events emitted by handlers.
 
-Daemon is opt-in. Running workgraph without a daemon works: the TUI
+Daemon is opt-in. Running wg without a daemon works: the TUI
 (or `wg spawn-task` at a terminal) owns any handler you care about.
 Daemon is for users who want autonomous-when-I'm-away behavior.
 
@@ -338,9 +338,9 @@ order they were raised.)
    transitions the task to `in-progress`.
 
 3. **Remote worktree sessions.** *Hybrid — handler runs in the
-   worktree, chat files live in the main repo's `.workgraph/chat/`.*
+   worktree, chat files live in the main repo's `.wg/chat/`.*
    The handler opens its chat files via absolute path into the main
-   `.workgraph/`, while its working directory is the worktree. TUI in
+   `.wg/`, while its working directory is the worktree. TUI in
    the main repo sees one canonical chat dir; worktree isolation of
    code edits is preserved; no cross-worktree session resolution
    needed.

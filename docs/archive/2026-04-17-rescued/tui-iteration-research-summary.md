@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This research investigates how cycle iteration data is stored and displayed in the workgraph TUI, focusing on the Detail, Log, and Messages tabs. The findings reveal that only the Detail tab is currently iteration-aware, while Log and Messages tabs aggregate data across all iterations.
+This research investigates how cycle iteration data is stored and displayed in the wg TUI, focusing on the Detail, Log, and Messages tabs. The findings reveal that only the Detail tab is currently iteration-aware, while Log and Messages tabs aggregate data across all iterations.
 
 ## Key Questions Answered
 
@@ -17,7 +17,7 @@ This research investigates how cycle iteration data is stored and displayed in t
 - `iteration_parent: Option<String>` - ID of immediate prior iteration
 
 **Archive Storage**:
-- Archives stored in `.workgraph/log/agents/{task_id}/` as timestamp-named directories
+- Archives stored in `.wg/log/agents/{task_id}/` as timestamp-named directories
 - Each archive contains `prompt.txt`, `output.txt`/`output.log` for that iteration
 - Archives sorted oldest-first by timestamp in directory name
 
@@ -82,8 +82,8 @@ pub enum RightPanelTab {
 **Current Boundaries**:
 - **Task Log Entries**: `task.log` field contains log entries that span iterations (no per-iteration separation)
 - **Messages**: Message queue spans iterations (no per-iteration filtering in `workgraph::messages::list_messages()`)
-- **Agent Output**: Archived per-iteration in `.workgraph/log/agents/{task_id}/{timestamp}/output.txt`
-- **Agent Prompt**: Archived per-iteration in `.workgraph/log/agents/{task_id}/{timestamp}/prompt.txt`
+- **Agent Output**: Archived per-iteration in `.wg/log/agents/{task_id}/{timestamp}/output.txt`
+- **Agent Prompt**: Archived per-iteration in `.wg/log/agents/{task_id}/{timestamp}/prompt.txt`
 
 **Missing Boundaries**:
 - Log entries have no `iteration_number` or `loop_iteration` field for filtering

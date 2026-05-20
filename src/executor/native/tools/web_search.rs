@@ -20,8 +20,8 @@
 //!   but scheduled for replacement by a real-browser backend.
 //!
 //! All backends identify with a descriptive User-Agent including the
-//! workgraph repo URL so upstream operators can contact us if they
-//! object to our traffic. JSON APIs use the workgraph UA; DDG uses a
+//! WG repo URL so upstream operators can contact us if they
+//! object to our traffic. JSON APIs use the WG UA; DDG uses a
 //! realistic browser UA (required to avoid challenge pages).
 //!
 //! The DuckDuckGo *Instant Answer API* (`api.duckduckgo.com`) is NOT
@@ -62,10 +62,10 @@ const BROWSER_DISPATCH_TIMEOUT_SECS: u64 = 15;
 const OUTER_JOIN_TIMEOUT_SECS: u64 = 20;
 
 /// Descriptive User-Agent for JSON API backends (Wikipedia, HN Algolia,
-/// Google News RSS). Includes the workgraph repo URL so upstream
+/// Google News RSS). Includes the wg repo URL so upstream
 /// operators can find us and complain if needed. OSM Nominatim and
 /// similar strict-policy APIs explicitly require an identifying UA.
-const WG_USER_AGENT: &str = "workgraph/0.1.0 (+https://github.com/graphwork/workgraph)";
+const WG_USER_AGENT: &str = "wg/0.1.0 (+https://github.com/graphwork/wg)";
 
 /// Realistic browser User-Agent for HTML-scrape backends like DDG
 /// when hit via reqwest. Presents as desktop Linux Firefox. Required
@@ -246,12 +246,12 @@ impl Backend {
 
 // ─── Persistent disk cache ──────────────────────────────────────────────
 //
-// File-per-query cache at `~/.workgraph/web-cache/<sha256>.txt`, shared
+// File-per-query cache at `~/.wg/web-cache/<sha256>.txt`, shared
 // across sessions and projects. Repeat queries within `CACHE_TTL` return
 // the stored response without hitting any backend — at research scale
 // this cuts an order of magnitude off query volume.
 //
-// Matches workgraph's everything-is-a-file ethos (graph.jsonl, agent
+// Matches WG's everything-is-a-file ethos (graph.jsonl, agent
 // output logs, nex-sessions/fetched-pages/). Benefits over a SQLite blob:
 //   - Inspectable: `cat`, `grep -r`, `ls -lt`, `find -mtime`
 //   - Distributed-safe: atomic rename works on NFS/Dropbox/sshfs where
@@ -275,7 +275,7 @@ fn cache_root() -> PathBuf {
     }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".workgraph")
+        .join(".wg")
         .join("web-cache")
 }
 
@@ -496,7 +496,7 @@ impl Tool for WebSearchTool {
 
         // Cache short-circuit. The biggest politeness win — repeat
         // queries within `CACHE_TTL` cost zero backend requests and
-        // persist across sessions via SQLite at `~/.workgraph/web-cache.db`.
+        // persist across sessions via SQLite at `~/.wg/web-cache.db`.
         if let Some(cached) = cache_get(&cache_key) {
             return ToolOutput::success(truncate_for_tool(&cached, "web_search"));
         }
@@ -914,7 +914,7 @@ fn build_client() -> Result<rquest::Client, String> {
     // TLS fingerprinting to distinguish scripts from browsers see
     // us as Chrome, not as rustls.
     rquest::Client::builder()
-        .emulation(rquest_util::Emulation::Chrome136)
+        .impersonate(rquest::Impersonate::Chrome131)
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))
@@ -1025,7 +1025,7 @@ pub(crate) fn is_google_news_redirect(url: &str) -> bool {
 
 /// Resolve a Google News RSS redirect URL to the actual article URL.
 ///
-/// Uses rquest with Chrome136 TLS/HTTP2 fingerprint and no-redirect
+/// Uses rquest with Chrome131 TLS/HTTP2 fingerprint and no-redirect
 /// policy so we capture the `Location` header from Google's 302.
 /// When Google believes it's talking to a browser, the Location
 /// points at the real publisher URL. A short timeout keeps the
@@ -1036,7 +1036,7 @@ pub(crate) fn is_google_news_redirect(url: &str) -> bool {
 /// URL in that case rather than drop the result.
 pub(crate) async fn resolve_google_news_redirect(url: &str) -> Option<String> {
     let client = rquest::Client::builder()
-        .emulation(rquest_util::Emulation::Chrome136)
+        .impersonate(rquest::Impersonate::Chrome131)
         .redirect(rquest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1748,10 +1748,7 @@ async fn search_searxng(client: &rquest::Client, query: &str) -> Result<Vec<Sear
     let body = client
         .get(&url)
         .header("Accept", "application/json")
-        .header(
-            "User-Agent",
-            "workgraph/0.1.0 (+https://github.com/graphwork/workgraph)",
-        )
+        .header("User-Agent", "wg/0.1.0 (+https://github.com/graphwork/wg)")
         .send()
         .await
         .map_err(|e| format!("SearXNG request: {}", e))?
@@ -1892,7 +1889,7 @@ async fn get_or_launch_browser() -> Result<Arc<TokioMutex<Option<BrowserHandle>>
     Ok(cell)
 }
 
-/// Reap an orphaned workgraph Chrome holding our profile's
+/// Reap an orphaned WG Chrome holding our profile's
 /// ProcessSingleton lock. Safe because we only kill processes whose
 /// command line references *our* user_data_dir — interactive user
 /// Chrome sessions or other profiles are left alone.
@@ -1944,7 +1941,7 @@ async fn reap_orphan_workgraph_chrome(user_data_dir: &std::path::Path) {
     }
 
     eprintln!(
-        "[browser] Killing orphaned workgraph Chrome (PID {}) holding SingletonLock",
+        "[browser] Killing orphaned WG Chrome (PID {}) holding SingletonLock",
         pid
     );
     let _ = crate::service::kill_process_force(pid);
@@ -2022,7 +2019,7 @@ async fn launch_browser() -> Result<BrowserHandle, String> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // If an orphaned workgraph Chrome is holding the profile's
+    // If an orphaned WG Chrome is holding the profile's
     // SingletonLock, reap it first. Otherwise Chrome's ProcessSingleton
     // logic refuses to start and chromiumoxide surfaces it as a
     // mysterious "Browser process exited" error.

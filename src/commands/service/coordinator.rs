@@ -15,10 +15,10 @@ use workgraph::agency::{
     render_assigner_mode_context, save_assignment_record,
 };
 use workgraph::chat;
-use workgraph::config::Config;
+use workgraph::config::{Config, DispatchRole};
 use workgraph::graph::{
-    LogEntry, Node, PRIORITY_DEFAULT, PRIORITY_IDLE, PRIORITY_NORMAL, Priority, Status, Task,
-    WaitCondition, WaitSpec, boost_priority, evaluate_all_cycle_failure_restarts,
+    FailureClass, LogEntry, Node, PRIORITY_DEFAULT, PRIORITY_IDLE, PRIORITY_NORMAL, Priority,
+    Status, Task, WaitCondition, WaitSpec, boost_priority, evaluate_all_cycle_failure_restarts,
     evaluate_all_cycle_iterations,
 };
 use workgraph::messages;
@@ -966,6 +966,215 @@ fn resolve_pending_eval_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
     true
 }
 
+/// Resolve `FailedPendingEval` tasks: agent exited without `wg done`,
+/// dispatcher invokes `.evaluate-X` to assess the output, and this function
+/// promotes to `Done` (rescued) or demotes to `Failed` (terminal) based on the score.
+///
+/// Lifecycle:
+/// ```text
+/// in-progress (agent-exit-nonzero) → failed-pending-eval
+///   ├─ eval score ≥ threshold → done (rescued=true)
+///   └─ eval score < threshold OR no usable score after 2 attempts → failed (terminal)
+/// ```
+///
+/// Fork 6: if `.evaluate-X` terminates without a usable score, retry once
+/// (meta_eval_attempts < 2). On second failure, source → Failed (fail-closed).
+///
+/// Returns true if any task was modified.
+fn resolve_failed_pending_eval_tasks(
+    dir: &Path,
+    graph: &mut workgraph::graph::WorkGraph,
+    config: &Config,
+) -> bool {
+    let threshold = config.agency.eval_gate_threshold.unwrap_or(0.7);
+    let max_meta_attempts = config.agency.gate_max_attempts; // default 2
+
+    let evals_dir = dir.join("agency").join("evaluations");
+
+    // Collect decisions first (immutable reads), then apply mutations separately
+    // to avoid dual mutable borrow of graph.
+    struct Decision {
+        source_id: String,
+        eval_id: String,
+        action: EvalAction,
+    }
+    enum EvalAction {
+        Rescue(f64),
+        Reject(f64),
+        RetryEval(u32),       // new meta_eval_attempts value
+        TerminalNoScore(u32), // meta_eval_attempts value that triggered exhaustion
+    }
+
+    let candidates: Vec<Decision> = graph
+        .tasks()
+        .filter(|t| t.status == Status::FailedPendingEval)
+        .filter_map(|t| {
+            let source_id = t.id.clone();
+            let eval_id = format!(".evaluate-{}", source_id);
+            let eval_status = graph.get_task(&eval_id).map(|et| et.status);
+
+            match eval_status {
+                // Eval still in flight → keep waiting
+                None
+                | Some(
+                    Status::Open
+                    | Status::InProgress
+                    | Status::Waiting
+                    | Status::PendingEval
+                    | Status::FailedPendingEval
+                    | Status::PendingValidation,
+                ) => return None,
+                Some(s) if !s.is_terminal() => return None,
+                _ => {}
+            }
+
+            // Eval is terminal — determine action
+            let evals = workgraph::agency::load_all_evaluations_or_warn(&evals_dir);
+            let usable_score = evals
+                .iter()
+                .filter(|e| {
+                    e.task_id == source_id
+                        && e.source != workgraph::agency::eval_source::FLIP
+                        && e.source != "system"
+                })
+                .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
+                .map(|e| e.score);
+
+            let action = match usable_score {
+                Some(score) if score >= threshold => EvalAction::Rescue(score),
+                Some(score) => EvalAction::Reject(score),
+                None => {
+                    let new_attempts = t.meta_eval_attempts + 1;
+                    if new_attempts >= max_meta_attempts {
+                        EvalAction::TerminalNoScore(new_attempts)
+                    } else {
+                        EvalAction::RetryEval(new_attempts)
+                    }
+                }
+            };
+
+            Some(Decision {
+                source_id,
+                eval_id,
+                action,
+            })
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return false;
+    }
+
+    // Apply mutations (may need two separate mutable borrows per iteration,
+    // but they target different task IDs so we do them sequentially).
+    let mut modified = false;
+
+    for decision in &candidates {
+        let source_id = &decision.source_id;
+        let eval_id = &decision.eval_id;
+        let now = Utc::now().to_rfc3339();
+
+        match &decision.action {
+            EvalAction::Rescue(score) => {
+                if let Some(task) = graph.get_task_mut(source_id) {
+                    task.status = Status::Done;
+                    task.rescued = true;
+                    task.completed_at = Some(now.clone());
+                    task.log.push(LogEntry {
+                        timestamp: now,
+                        actor: None,
+                        user: Some(workgraph::current_user()),
+                        message: format!(
+                            "FailedPendingEval → Done (rescued by eval: score={:.2} ≥ threshold={:.2})",
+                            score, threshold
+                        ),
+                    });
+                    eprintln!(
+                        "[dispatcher] Rescued task '{}': eval score {:.2} ≥ {:.2} → Done",
+                        source_id, score, threshold
+                    );
+                    modified = true;
+                }
+            }
+            EvalAction::Reject(score) => {
+                if let Some(task) = graph.get_task_mut(source_id) {
+                    task.status = Status::Failed;
+                    task.failure_reason = Some(format!(
+                        "eval rescue rejected: score={:.2} < threshold={:.2}",
+                        score, threshold
+                    ));
+                    task.failure_class = Some(FailureClass::AgentExitNonzero);
+                    task.log.push(LogEntry {
+                        timestamp: now,
+                        actor: None,
+                        user: Some(workgraph::current_user()),
+                        message: format!(
+                            "FailedPendingEval → Failed (eval rejected: score={:.2} < threshold={:.2})",
+                            score, threshold
+                        ),
+                    });
+                    eprintln!(
+                        "[dispatcher] Task '{}' eval-rejected: score {:.2} < {:.2} → Failed",
+                        source_id, score, threshold
+                    );
+                    modified = true;
+                }
+            }
+            EvalAction::TerminalNoScore(attempts) => {
+                if let Some(task) = graph.get_task_mut(source_id) {
+                    task.meta_eval_attempts = *attempts;
+                    task.status = Status::Failed;
+                    task.failure_reason = Some(format!(
+                        "rescue eval unavailable after {} attempts; falling back to terminal failure",
+                        max_meta_attempts
+                    ));
+                    task.log.push(LogEntry {
+                        timestamp: now,
+                        actor: None,
+                        user: Some(workgraph::current_user()),
+                        message: format!(
+                            "FailedPendingEval → Failed (rescue eval unavailable after {} attempts)",
+                            max_meta_attempts
+                        ),
+                    });
+                    eprintln!(
+                        "[dispatcher] Task '{}' rescue eval exhausted ({} attempts) → Failed",
+                        source_id, max_meta_attempts
+                    );
+                    modified = true;
+                }
+            }
+            EvalAction::RetryEval(attempts) => {
+                // Update source task's meta_eval_attempts first
+                if let Some(task) = graph.get_task_mut(source_id) {
+                    task.meta_eval_attempts = *attempts;
+                }
+                // Re-open .evaluate-X for another attempt (separate mutable borrow)
+                if let Some(eval_task) = graph.get_task_mut(eval_id) {
+                    eval_task.status = Status::Open;
+                    eval_task.assigned = None;
+                    eval_task.log.push(LogEntry {
+                        timestamp: now,
+                        actor: None,
+                        user: Some(workgraph::current_user()),
+                        message: format!(
+                            "Rescue eval retry attempt {} (no usable score from previous run)",
+                            attempts
+                        ),
+                    });
+                    eprintln!(
+                        "[dispatcher] Rescue eval retry {} for task '{}'",
+                        attempts, source_id
+                    );
+                }
+                modified = true;
+            }
+        }
+    }
+
+    modified
+}
+
 fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> bool {
     let mut modified = false;
 
@@ -983,7 +1192,7 @@ fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> 
             Some(task) => task.after.iter().all(|dep_id| {
                 // Check if dependency exists
                 match graph.tasks().find(|t| t.id == *dep_id) {
-                    Some(dep_task) => dep_task.status.is_terminal(),
+                    Some(dep_task) => dep_task.status.is_dep_satisfied(),
                     None => true, // Missing dependency = satisfied for stuck tasks
                 }
             }),
@@ -1147,6 +1356,51 @@ fn build_auto_assign_tasks(
             // Create .assign-* with blocking edge via shared scaffold helper
             crate::commands::eval_scaffold::scaffold_assign_task(graph, &task_id, &task_title);
             modified = true;
+        }
+    }
+
+    // Phase 1b: Reopen Failed/Abandoned `.assign-*` tasks even when their
+    // source task is not "ready" by the standard query — Failed is not
+    // dep-satisfied, so source stays Blocked and Phase 1 above misses it.
+    // Without this, a transient LLM error during assignment permanently
+    // strands the source task. Mirrors Phase 1's reopen logic.
+    {
+        let stuck_assign_ids: Vec<(String, String, Status)> = graph
+            .tasks()
+            .filter_map(|t| {
+                let source_id = t.id.strip_prefix(".assign-")?;
+                if !matches!(t.status, Status::Failed | Status::Abandoned) {
+                    return None;
+                }
+                let source = graph.get_task(source_id)?;
+                if source.agent.is_some() || source.assigned.is_some() {
+                    return None;
+                }
+                if !matches!(source.status, Status::Open | Status::Incomplete) {
+                    return None;
+                }
+                Some((t.id.clone(), source_id.to_string(), t.status))
+            })
+            .collect();
+
+        for (assign_id, _source_id, prev_status) in stuck_assign_ids {
+            if let Some(t) = graph.get_task_mut(&assign_id) {
+                t.status = Status::Open;
+                t.assigned = None;
+                t.completed_at = None;
+                t.description = None;
+                t.failure_reason = None;
+                t.log.push(LogEntry {
+                    timestamp: Utc::now().to_rfc3339(),
+                    actor: Some("coordinator".to_string()),
+                    user: Some(workgraph::current_user()),
+                    message: format!(
+                        "Reopened for retry (was {:?}, source task still needs assignment)",
+                        prev_status
+                    ),
+                });
+                modified = true;
+            }
         }
     }
 
@@ -1603,13 +1857,18 @@ fn build_auto_assign_tasks(
                     created_at: Some(Utc::now().to_rfc3339()),
                     started_at: None,
                     completed_at: None,
+                    last_interaction_at: None,
                     log: vec![],
                     retry_count: 0,
                     max_retries: Some(1),
                     failure_reason: None,
+                    failure_class: None,
                     model: Some(creator_resolved.model),
                     provider: creator_resolved.provider,
                     endpoint: None,
+                    command_argv: vec![],
+                    working_dir: None,
+                    executor_preset_name: None,
                     verify: None,
                     verify_timeout: None,
                     agent: config.agency.creator_agent.clone(),
@@ -1639,6 +1898,8 @@ fn build_auto_assign_tasks(
                     max_rejections: None,
                     verify_failures: 0,
                     rescue_count: 0,
+                    rescued: false,
+                    meta_eval_attempts: 0,
                     spawn_failures: 0,
                     dispatch_count: 0,
                     tier: None,
@@ -1755,10 +2016,10 @@ fn build_auto_evaluate_tasks(
         modified = true;
     }
 
-    // Unblock evaluation tasks whose source task has Failed.
-    // `ready_tasks()` only unblocks when the blocker is Done. For Failed
-    // tasks we still want evaluation to proceed (§4.3: "Failed tasks also
-    // get evaluated"), so we remove the blocker explicitly.
+    // Unblock evaluation tasks whose source task has Failed or FailedPendingEval.
+    // `ready_tasks()` only unblocks when the blocker is Done. For Failed and
+    // FailedPendingEval tasks we still want evaluation to proceed (§4.3:
+    // "Failed tasks also get evaluated"), so we remove the blocker explicitly.
     let eval_fixups: Vec<(String, String)> = graph
         .tasks()
         .filter(|t| t.id.starts_with(".evaluate-") && t.status == Status::Open)
@@ -1767,7 +2028,7 @@ fn build_auto_evaluate_tasks(
             if t.after.len() == 1 {
                 let source_id = &t.after[0];
                 if let Some(source) = graph.get_task(source_id)
-                    && source.status == Status::Failed
+                    && matches!(source.status, Status::Failed | Status::FailedPendingEval)
                 {
                     return Some((t.id.clone(), source_id.clone()));
                 }
@@ -1992,13 +2253,18 @@ fn build_flip_verification_tasks(
             created_at: Some(Utc::now().to_rfc3339()),
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: Some(1),
             failure_reason: None,
+            failure_class: None,
             model: Some(verification_model.clone()),
             provider: verification_resolved.provider.clone(),
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: source_verify_cmd,
             verify_timeout: None,
             agent: None,
@@ -2030,6 +2296,8 @@ fn build_flip_verification_tasks(
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -2260,13 +2528,18 @@ fn build_separate_verify_tasks(
             created_at: Some(Utc::now().to_rfc3339()),
             started_at: None,
             completed_at: None,
+            last_interaction_at: None,
             log: vec![],
             retry_count: 0,
             max_retries: Some(1),
             failure_reason: None,
+            failure_class: None,
             model: Some(verification_model.clone()),
             provider: verification_resolved.provider.clone(),
             endpoint: None,
+            command_argv: vec![],
+            working_dir: None,
+            executor_preset_name: None,
             verify: None, // The verify agent runs the command manually, not via --verify gate
             verify_timeout: None,
             agent: None,
@@ -2296,6 +2569,8 @@ fn build_separate_verify_tasks(
             max_rejections: None,
             verify_failures: 0,
             rescue_count: 0,
+            rescued: false,
+            meta_eval_attempts: 0,
             spawn_failures: 0,
             dispatch_count: 0,
             tier: None,
@@ -2458,13 +2733,18 @@ fn build_auto_evolve_task(
         created_at: Some(Utc::now().to_rfc3339()),
         started_at: None,
         completed_at: None,
+        last_interaction_at: None,
         log: vec![],
         retry_count: 0,
         max_retries: Some(1),
         failure_reason: None,
+        failure_class: None,
         model: Some(evolver_resolved.model),
         provider: evolver_resolved.provider,
         endpoint: None,
+        command_argv: vec![],
+        working_dir: None,
+        executor_preset_name: None,
         verify: None,
         verify_timeout: None,
         agent: config.agency.evolver_agent.clone(),
@@ -2494,6 +2774,8 @@ fn build_auto_evolve_task(
         max_rejections: None,
         verify_failures: 0,
         rescue_count: 0,
+        rescued: false,
+        meta_eval_attempts: 0,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -2659,13 +2941,18 @@ fn build_auto_create_task(
         created_at: Some(Utc::now().to_rfc3339()),
         started_at: None,
         completed_at: None,
+        last_interaction_at: None,
         log: vec![],
         retry_count: 0,
         max_retries: Some(1),
         failure_reason: None,
+        failure_class: None,
         model: Some(creator_resolved.model),
         provider: creator_resolved.provider,
         endpoint: None,
+        command_argv: vec![],
+        working_dir: None,
+        executor_preset_name: None,
         verify: None,
         verify_timeout: None,
         agent: config.agency.creator_agent.clone(),
@@ -2695,6 +2982,8 @@ fn build_auto_create_task(
         max_rejections: None,
         verify_failures: 0,
         rescue_count: 0,
+        rescued: false,
+        meta_eval_attempts: 0,
         spawn_failures: 0,
         dispatch_count: 0,
         tier: None,
@@ -2973,18 +3262,26 @@ fn spawn_eval_inline(
         special_agent_verified.as_deref(),
     );
 
-    // Agency one-shot tasks (.evaluate-* / .flip-*) run on the claude CLI
-    // via run_lightweight_llm_call inside the spawned `wg evaluate` command.
-    // Register them with executor="claude" so observability matches reality
-    // (the binary that ends up doing the LLM call is `claude`, just like
-    // worker agents). The legacy "eval" label was misleading — there is
-    // no separate eval handler.
+    // Agency one-shot tasks (.evaluate-* / .flip-*) run on whichever CLI
+    // handler the user has configured for the role: claude:haiku by default
+    // (per CLAUDE.md "pinned to claude:haiku"), but `[models.evaluator]` /
+    // `[models.flip_*]` overrides win — explicit overrides win, cascade
+    // does not. Resolve once here so the registry display matches what
+    // run_lightweight_llm_call will actually invoke.
+    let eval_role = if eval_task_id.starts_with(".flip-") {
+        DispatchRole::FlipInference
+    } else {
+        DispatchRole::Evaluator
+    };
+    let eval_dispatch = workgraph::service::llm::resolve_agency_dispatch(&config, eval_role);
+    let eval_executor = eval_dispatch.handler.as_str();
+    let eval_recorded_model = eval_dispatch.raw_spec.as_str();
     write_inline_artifacts(
         &output_dir,
         &agent_id,
         eval_task_id,
-        "claude",
-        evaluator_model,
+        eval_executor,
+        Some(evaluator_model.unwrap_or(eval_recorded_model)),
         &script,
     );
 
@@ -3039,9 +3336,9 @@ fn spawn_eval_inline(
     locked_registry.register_agent_with_model(
         pid,
         eval_task_id,
-        "claude",
+        eval_executor,
         &output_file_str,
-        evaluator_model,
+        Some(evaluator_model.unwrap_or(eval_recorded_model)),
     );
     locked_registry
         .save()
@@ -3157,17 +3454,22 @@ fi
 exit $EXIT_CODE"#,
     );
 
-    // Agency one-shot tasks (.assign-*) run on the claude CLI via
-    // run_lightweight_llm_call inside the spawned `wg assign` command.
-    // Register them with executor="claude" / model="claude:haiku" so
-    // observability matches reality. The legacy "assign" label was
-    // misleading — there is no separate assignment handler.
+    // Agency one-shot tasks (.assign-*) run on whichever CLI handler the
+    // user has configured for the Assigner role: claude:haiku by default,
+    // or whatever `[models.assigner]` specifies (codex, claude, native).
+    // Resolve once so the registry display matches what
+    // run_lightweight_llm_call will actually invoke.
+    let assign_config = Config::load_or_default(dir);
+    let assign_dispatch =
+        workgraph::service::llm::resolve_agency_dispatch(&assign_config, DispatchRole::Assigner);
+    let assign_executor = assign_dispatch.handler.as_str();
+    let assign_model = assign_dispatch.raw_spec.as_str();
     write_inline_artifacts(
         &output_dir,
         &agent_id,
         assign_task_id,
-        "claude",
-        Some("claude:haiku"),
+        assign_executor,
+        Some(assign_model),
         &script,
     );
 
@@ -3222,9 +3524,9 @@ exit $EXIT_CODE"#,
     locked_registry.register_agent_with_model(
         pid,
         assign_task_id,
-        "claude",
+        assign_executor,
         &output_file_str,
-        Some("claude:haiku"),
+        Some(assign_model),
     );
     locked_registry
         .save()
@@ -3722,16 +4024,16 @@ fn spawn_agents_for_ready_tasks(
             let task_id = task.id.clone();
             let title = task.title.clone();
             eprintln!(
-                "[coordinator] Spawning shell task inline for: {} - {}",
+                "[dispatcher] Spawning shell task inline for: {} - {}",
                 task_id, title,
             );
             match spawn_shell_inline(dir, &task_id) {
                 Ok((agent_id, pid)) => {
-                    eprintln!("[coordinator] Spawned shell {} (PID {})", agent_id, pid);
+                    eprintln!("[dispatcher] Spawned shell {} (PID {})", agent_id, pid);
                     spawned += 1;
                 }
                 Err(e) => {
-                    eprintln!("[coordinator] Failed to spawn shell for {}: {}", task_id, e);
+                    eprintln!("[dispatcher] Failed to spawn shell for {}: {}", task_id, e);
                     record_spawn_failure(
                         &gp,
                         &task_id,
@@ -4219,6 +4521,12 @@ pub fn coordinator_tick(
         // a rescue), promote PendingEval → Done so downstream dependents
         // unblock. See docs in src/commands/done.rs::pick_done_target_status.
         modified |= resolve_pending_eval_tasks(graph);
+
+        // Phase 2.47: FailedPendingEval resolution.
+        // Tasks that exited without calling `wg done` enter FailedPendingEval;
+        // the dispatcher runs `.evaluate-X` to assess whether the output is
+        // acceptable. Score ≥ threshold → rescued to Done; otherwise → Failed.
+        modified |= resolve_failed_pending_eval_tasks(dir, graph, &config);
 
         // Phase 2.5: Cycle iteration — reactivate cycles where all members are Done.
         {
@@ -6133,6 +6441,7 @@ mod tests {
             timestamp: chrono::Utc::now().to_rfc3339(),
             model: None,
             source: workgraph::agency::eval_source::FLIP.to_string(),
+            loop_iteration: 0,
         };
 
         let eval_path = evals_dir.join("flip-my-task-123.json");
@@ -6257,6 +6566,7 @@ mod tests {
             timestamp: chrono::Utc::now().to_rfc3339(),
             model: None,
             source: workgraph::agency::eval_source::FLIP.to_string(),
+            loop_iteration: 0,
         };
 
         let eval_path = evals_dir.join("flip-t1-123.json");
@@ -6320,7 +6630,7 @@ mod tests {
         // Full integration test: record_spawn_failure increments counter
         // and auto-fails after threshold
         let dir = tempdir().unwrap();
-        let wg_dir = dir.path().join(".workgraph");
+        let wg_dir = dir.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let gp = wg_dir.join("graph.jsonl");
 
@@ -6403,7 +6713,7 @@ mod tests {
     fn test_spawn_circuit_breaker_reset_on_edit() {
         // Verify that editing a task resets spawn_failures
         let dir = tempdir().unwrap();
-        let wg_dir = dir.path().join(".workgraph");
+        let wg_dir = dir.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let gp = wg_dir.join("graph.jsonl");
 

@@ -181,6 +181,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: "test motivation".to_string(),
+            quality: 100,
+            domain_specificity: 0,
+            domain: vec![],
+            scope: None,
+            origin_instance_id: None,
+            parent_content_hash: None,
             acceptable_tradeoffs: Vec::new(),
             unacceptable_tradeoffs: Vec::new(),
             performance: PerformanceRecord::default(),
@@ -238,8 +244,8 @@ mod tests {
             .save_tradeoff(&make_motivation("m2", "b-only-mot"))
             .unwrap();
 
-        // Set up a workgraph dir for the target
-        let wg_dir = tmp.path().join("target").join(".workgraph");
+        // Set up a WG dir for the target
+        let wg_dir = tmp.path().join("target").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
@@ -279,8 +285,8 @@ mod tests {
         let into_dir = tmp.path().join("combined");
         std::fs::create_dir_all(&into_dir).unwrap();
 
-        // Set up a minimal workgraph dir (merge needs it for resolve_source)
-        let wg_dir = tmp.path().join("project").join(".workgraph");
+        // Set up a minimal WG dir (merge needs it for resolve_source)
+        let wg_dir = tmp.path().join("project").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let opts = MergeOptions {
@@ -313,7 +319,7 @@ mod tests {
             .unwrap();
         store_b.save_role(&make_role("r2", "role2")).unwrap();
 
-        let wg_dir = tmp.path().join("target").join(".workgraph");
+        let wg_dir = tmp.path().join("target").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
@@ -385,7 +391,7 @@ mod tests {
         };
         store_b.save_role(&role_b).unwrap();
 
-        let wg_dir = tmp.path().join("target").join(".workgraph");
+        let wg_dir = tmp.path().join("target").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
@@ -420,7 +426,7 @@ mod tests {
         store_a.save_role(&make_role("r1", "role1")).unwrap();
         store_b.save_role(&make_role("r2", "role2")).unwrap();
 
-        let wg_dir = tmp.path().join("target").join(".workgraph");
+        let wg_dir = tmp.path().join("target").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
@@ -445,7 +451,7 @@ mod tests {
     #[test]
     fn merge_requires_at_least_two_sources() {
         let tmp = TempDir::new().unwrap();
-        let wg_dir = tmp.path().join(".workgraph");
+        let wg_dir = tmp.path().join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
 
         let opts = MergeOptions {
@@ -489,7 +495,7 @@ mod tests {
             .save_agent(&make_agent("a2", "quality-tester", "r2", "m2"))
             .unwrap();
 
-        let wg_dir = tmp.path().join("target").join(".workgraph");
+        let wg_dir = tmp.path().join("target").join(".wg");
         std::fs::create_dir_all(&wg_dir).unwrap();
         let agency_dir = wg_dir.join("agency");
         workgraph::agency::init(&agency_dir).unwrap();
