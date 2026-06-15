@@ -3,9 +3,75 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use workgraph::config::Config;
+use workgraph::dispatch::ExecutorKind;
 use workgraph::model_benchmarks::{self, BenchmarkRegistry, RankedTiers};
 use workgraph::profile;
 use workgraph::profile::named as named_profile;
+
+struct ProfileUseTarget {
+    profile_name: String,
+    pinned_model: Option<String>,
+}
+
+fn parse_profile_use_target(name: &str) -> Result<ProfileUseTarget> {
+    if !name.contains(':') {
+        return Ok(ProfileUseTarget {
+            profile_name: name.to_string(),
+            pinned_model: None,
+        });
+    }
+
+    // External CLI executors (`opencode`, `aider`, `goose`, …) are addressed
+    // by *executor* name, not a model provider prefix, so they are
+    // intentionally absent from `KNOWN_PROVIDERS` and would be rejected by the
+    // strict model-spec parser below. Map an `opencode:<route>` activation to
+    // the matching starter profile and pin the literal route so the spawn
+    // path's `parse_executor_model_route` fires unchanged. Guarded on
+    // `is_external_cli` so aider/goose/… compose without new arms.
+    if let Some((prefix, rest)) = name.split_once(':') {
+        if !rest.trim().is_empty() {
+            if let Some(kind) = ExecutorKind::from_str(prefix) {
+                if kind.is_external_cli() {
+                    return Ok(ProfileUseTarget {
+                        profile_name: kind.as_str().to_string(),
+                        pinned_model: Some(name.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    let spec = workgraph::config::parse_model_spec_strict(name).map_err(|e| {
+        anyhow::anyhow!(
+            "Profile '{}' was parsed as a model-qualified profile activation, but the model spec is invalid: {}",
+            name,
+            e
+        )
+    })?;
+    let provider = spec.provider.as_deref().unwrap_or_default();
+    let profile_name = match provider {
+        "claude" | "anthropic" => "claude",
+        "codex" => "codex",
+        "nex" | "local" | "oai-compat" => "nex",
+        _ => {
+            anyhow::bail!(
+                "Model-qualified profile activation supports claude:<model>, codex:<model>, or nex:<model>; got '{}'.",
+                name
+            );
+        }
+    };
+
+    let pinned_model = if provider == "anthropic" {
+        format!("claude:{}", spec.model_id)
+    } else {
+        name.to_string()
+    };
+
+    Ok(ProfileUseTarget {
+        profile_name: profile_name.to_string(),
+        pinned_model: Some(pinned_model),
+    })
+}
 
 /// Extract the top-level `description` key from a profile TOML string.
 /// Returns None if the file has no description or fails to parse.
@@ -329,6 +395,8 @@ pub fn show(
             "profile": config.profile,
             "agent_model": config.agent.model,
             "dispatcher_model": config.coordinator.model,
+            "default_model": config.models.default.as_ref().and_then(|m| m.model.clone()),
+            "task_agent_model": config.models.task_agent.as_ref().and_then(|m| m.model.clone()),
             "effective_tiers": {
                 "fast": effective_tiers.fast,
                 "standard": effective_tiers.standard,
@@ -371,12 +439,32 @@ pub fn show(
     }
 
     println!();
-    println!("  Active config (named profile is authoritative for routing):");
+    if active.is_some() {
+        println!(
+            "  Active config (active named profile/global config is authoritative for routing):"
+        );
+    } else {
+        println!("  Active config (global/local config is authoritative for routing):");
+    }
     println!("    agent.model      = {}", config.agent.model);
     println!(
         "    dispatcher.model = {}",
         config.coordinator.model.as_deref().unwrap_or("(unset)")
     );
+    let default_route = config
+        .models
+        .default
+        .as_ref()
+        .and_then(|m| m.model.as_deref())
+        .unwrap_or(&config.agent.model);
+    let task_agent_route = config
+        .models
+        .task_agent
+        .as_ref()
+        .and_then(|m| m.model.as_deref())
+        .unwrap_or(default_route);
+    println!("    models.default   = {}", default_route);
+    println!("    models.task_agent= {}", task_agent_route);
     println!();
     println!("  Tier Mappings:");
     println!(
@@ -550,7 +638,7 @@ pub fn list(dir: &Path, json: bool, installed_only: bool) -> Result<()> {
                 items.push(serde_json::json!({
                     "name": p.name,
                     "kind": "legacy-builtin",
-                    "active": active.is_none() && false,
+                    "active": false,
                     "description": p.description,
                 }));
             }
@@ -646,7 +734,8 @@ pub fn use_profile(dir: &Path, name: Option<&str>, no_reload: bool, clear: bool)
         return Ok(());
     }
 
-    let profile_name = name.unwrap();
+    let target = parse_profile_use_target(name.unwrap())?;
+    let profile_name = target.profile_name.as_str();
     let prof = named_profile::load(profile_name)?;
 
     // Pre-flight: check that any api_key_ref in the profile's endpoints are reachable.
@@ -680,6 +769,11 @@ pub fn use_profile(dir: &Path, name: Option<&str>, no_reload: bool, clear: bool)
 
     let prev = named_profile::active().unwrap_or(None);
     let written = named_profile::apply_profile_as_global_config(profile_name)?;
+    if let Some(ref pinned_model) = target.pinned_model {
+        let mut config = Config::load_global()?.unwrap_or_else(|| prof.config.clone());
+        config.pin_default_route_model(pinned_model);
+        config.save_global()?;
+    }
     let local_cleanup = named_profile::clear_local_profile_routing_overrides(dir)?;
     named_profile::set_active(Some(profile_name))?;
 
@@ -702,6 +796,12 @@ pub fn use_profile(dir: &Path, name: Option<&str>, no_reload: bool, clear: bool)
             written.display(),
             profile_name
         ),
+    }
+    if let Some(ref pinned_model) = target.pinned_model {
+        println!(
+            "  Default/task-agent route pinned to {} via model-qualified profile activation.",
+            pinned_model
+        );
     }
 
     if let Some(cleanup) = local_cleanup {
@@ -1078,8 +1178,63 @@ pub fn init_starters(force: bool) -> Result<()> {
         }
     );
     if written > 0 {
-        println!("Activate one with: wg profile use claude|codex|nex");
+        println!("Activate one with: wg profile use claude|codex|nex|opencode");
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_profile_use_target_bare_name() {
+        let t = parse_profile_use_target("opencode").unwrap();
+        assert_eq!(t.profile_name, "opencode");
+        assert_eq!(t.pinned_model, None);
+    }
+
+    #[test]
+    fn test_parse_profile_use_target_opencode_model_qualified() {
+        // `wg profile use opencode:openrouter/stepfun/step-3.7-flash` selects
+        // the opencode starter and pins the literal route verbatim so the
+        // spawn path's parse_executor_model_route still fires.
+        let route = "opencode:openrouter/stepfun/step-3.7-flash";
+        let t = parse_profile_use_target(route).unwrap();
+        assert_eq!(t.profile_name, "opencode");
+        assert_eq!(t.pinned_model.as_deref(), Some(route));
+    }
+
+    #[test]
+    fn test_parse_profile_use_target_worker_only_externals_compose() {
+        // Generic over worker-only externals — aider/goose resolve to their
+        // own profile name without bespoke arms.
+        let t = parse_profile_use_target("aider:openrouter/x").unwrap();
+        assert_eq!(t.profile_name, "aider");
+        assert_eq!(t.pinned_model.as_deref(), Some("aider:openrouter/x"));
+    }
+
+    #[test]
+    fn test_parse_profile_use_target_known_providers_still_work() {
+        // Regression guard: existing claude/codex/nex activation is unchanged.
+        let c = parse_profile_use_target("claude:opus").unwrap();
+        assert_eq!(c.profile_name, "claude");
+        assert_eq!(c.pinned_model.as_deref(), Some("claude:opus"));
+
+        let x = parse_profile_use_target("codex:gpt-5.5").unwrap();
+        assert_eq!(x.profile_name, "codex");
+        assert_eq!(x.pinned_model.as_deref(), Some("codex:gpt-5.5"));
+
+        let n = parse_profile_use_target("nex:qwen3-coder").unwrap();
+        assert_eq!(n.profile_name, "nex");
+        assert_eq!(n.pinned_model.as_deref(), Some("nex:qwen3-coder"));
+    }
+
+    #[test]
+    fn test_parse_profile_use_target_unknown_prefix_still_rejected() {
+        // A colon-qualified name that is neither a known provider nor a
+        // worker-only external must still be rejected, not silently accepted.
+        assert!(parse_profile_use_target("foobar:baz").is_err());
+    }
 }

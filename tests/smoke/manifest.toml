@@ -138,6 +138,43 @@ description = "Pins implement-generalize-chat: `--exec claude`, `--exec codex`, 
 timeout_seconds = 30
 
 [[scenario]]
+name = "external_worker_live_chat_rejected"
+script = "scenarios/external_worker_live_chat_rejected.sh"
+owners = [
+    "exec-core-routing",
+    "fix-opencode-build",
+]
+description = "Pins exec-core-routing + fix-opencode-build goal #5: external worker CLIs WITHOUT a live chat handler (aider/goose/…) must fail clearly as worker-only live-chat/spawn-task errors instead of silently routing to Claude, while opencode — which now ships `wg opencode-handler --chat` — must instead create a live chat and dispatch via `wg opencode-handler --chat` with the resolved model passed EXPLICITLY (never claude, never opencode's internal default). No secrets or live LLM endpoint required (uses --dry-run)."
+timeout_seconds = 30
+
+[[scenario]]
+name = "opencode_per_task_model_route"
+script = "scenarios/opencode_per_task_model_route.sh"
+owners = [
+    "fix-opencode-per-task-routing",
+]
+description = "Regression for fix-opencode-per-task-routing: `wg add --model opencode:openrouter/stepfun/step-3.7-flash` must preserve the executor-qualified route, and worker spawn must resolve executor=opencode with inner model=openrouter:stepfun/step-3.7-flash, never native with malformed openrouter:opencode:openrouter/.... No secrets or live LLM endpoint required."
+timeout_seconds = 30
+
+[[scenario]]
+name = "opencode_live_chat_reply"
+script = "scenarios/opencode_live_chat_reply.sh"
+owners = [
+    "verify-opencode-chat",
+]
+description = "Live human-flow guard for verify-opencode-chat: `wg opencode-handler --chat` must produce a genuine model reply in the outbox, NOT the 'encountered an error running opencode' fallback. Catches the two opencode>=1.16 live-path bugs that shipped green from routing-only tests: (1) `--file` is variadic and swallowed the trailing positional message ('File not found', exit 1) — the message must precede `--file`; (2) `run --format json` does not stream assistant text on stdout (only step_start) — the reply is recovered via `opencode export <sessionID>`. SKIPs (exit 77) without the opencode binary or OpenRouter creds."
+timeout_seconds = 120
+
+[[scenario]]
+name = "executor_arena_surfaces"
+script = "scenarios/executor_arena_surfaces.sh"
+owners = [
+    "exec-final-integration",
+]
+description = "Pins exec-final-integration: `wg executors --all`, `wg config --show`, and `wg config --list` must expose the full executor-arena choice set (core, stable external, provider-specific, experimental external) without writing or printing API keys."
+timeout_seconds = 30
+
+[[scenario]]
 name = "nex_two_message_against_lambda01"
 script = "scenarios/nex_two_message_against_lambda01.sh"
 owners = [
@@ -172,6 +209,15 @@ owners = [
 ]
 description = "Local executor=claude + a global openrouter is_default endpoint must spawn with executor=claude (no native-exec routing leak)."
 timeout_seconds = 30
+
+[[scenario]]
+name = "task_agent_codex_model_routes_to_codex"
+script = "scenarios/task_agent_codex_model_routes_to_codex.sh"
+owners = [
+    "fix-wg-executor-model-mismatch",
+]
+description = "Pins fix-wg-executor-model-mismatch: a TaskAgent route resolved as codex:gpt-5.5 must reach dispatcher SpawnPlan as executor=codex with model=codex:gpt-5.5, never executor=claude with bare gpt-5.5."
+timeout_seconds = 45
 
 [[scenario]]
 name = "priority_int_and_string_deserialize"
@@ -260,6 +306,97 @@ description = "redesign-new-chat 2026-04-30: the TUI new-chat dialog opens in a 
 timeout_seconds = 90
 
 [[scenario]]
+name = "tui_plus_opencode_chat"
+script = "scenarios/tui_plus_opencode_chat.sh"
+owners = [
+    "fix-real-tui",
+]
+description = "fix-real-tui 2026-06-13: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, verifies opencode is visible/selectable in Add-new executor choices, launches opencode:openrouter/stepfun/step-3.7-flash, and asserts the resulting .chat-N graph row plus coordinator state carry executor=opencode, the requested model, normalized OpenCode argv, and no endpoint override."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_opencode_scrollback"
+script = "scenarios/tui_opencode_scrollback.sh"
+owners = [
+    "fix-opencode-tui",
+]
+description = "fix-opencode-tui 2026-06-14: live human-flow guard that OpenCode chat scrollback works in the REAL wg tui/tmux path. OpenCode launches its own alternate-screen full-redraw TUI inside WG's tmux-wrapped pane, so WG's default scroll path (drive tmux copy-mode) is a no-op — the alt screen has no tmux history to scan, so the user 'cannot scan up in history'. The fix is executor-scoped: for OpenCode panes WG forwards OpenCode's OWN scroll keys (PageUp/PageDown/Home/End == messages_page_up/down/first/last) into the PTY child and never touches tmux copy-mode; claude/codex/nex keep the copy-mode path. Drives wg tui in tmux, opens an OpenCode chat via the + menu, focuses the live OpenCode PTY pane, scrolls with the same controls a human uses (direct PageUp/Home AND Ctrl+] scroll-mode), then asserts (1) the OpenCode pane's WG_PTY_DUMP forwarded-input tee contains the PageUp (ESC[5~) and Home (ESC[H) sequences and (2) the wrapping wg-chat-*-chat-1 tmux session is NOT in copy-mode. Both assertions flip between main (broken) and the fixed build. Credential-free (OpenCode only needs to launch its TUI; scroll-key forwarding is entirely WG-side). SKIPs without tmux or the opencode binary."
+timeout_seconds = 150
+
+[[scenario]]
+name = "tui_plus_opencode_minimax"
+script = "scenarios/tui_plus_opencode_minimax.sh"
+owners = [
+    "fix-tui-opencode",
+]
+description = "fix-tui-opencode 2026-06-13: drives the real wg tui '+' new-chat menu in tmux, selects opencode, and types the bare OpenRouter route a user naturally types — `minimax/minimax-m3`. Pins the user-reported regression where the launched OpenCode chat opened a DIFFERENT model (the user saw 'nano banana', opencode's internal default) because the bare vendor/model route was passed to OpenCode without the `openrouter/` prefix, so provider `minimax` could not resolve and opencode silently fell back to its default. Asserts the persisted .chat-1 graph row + CoordinatorState preserve the requested minimax route with executor=opencode and NO endpoint override, and that command_argv is the normalized [\"opencode\",\"--model\",\"openrouter/minimax/minimax-m3\"] — never a default/recent/nano-banana fallback. Credential-free (no real OpenRouter/opencode call)."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_plus_nex_chat"
+script = "scenarios/tui_plus_nex_chat.sh"
+owners = [
+    "confirm-real-tui",
+]
+description = "confirm-real-tui 2026-06-14: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects nex in the Add-new executor choices, and confirms the nex-only Endpoint field is actually visible (not clipped below the fold) before typing a `nex:` model and a local OAI-compatible endpoint URL. Asserts the launched .chat-1 graph row + CoordinatorState preserve BOTH typed values exactly (model `nex:qwen3-coder`, the typed endpoint, executor_preset_name=nex / executor_override=native) and that command_argv is the working CLI shape [\"wg\",\"nex\",\"-m\",\"qwen3-coder\",\"-e\",<endpoint>] — never a stale default/recent value. Seeds a decoy global default endpoint AND a decoy recent launcher-history combo so a fallback regression would be caught. Also pins the render fix where the launcher modal is centered over the full frame so the Endpoint/Name/Launch rows are not clipped when a chat PTY shrinks the panel. Credential-free (asserts persisted metadata only; no live nex reply)."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_plus_nex_endpoint_autocomplete"
+script = "scenarios/tui_plus_nex_endpoint_autocomplete.sh"
+owners = [
+    "add-nex-endpoint",
+]
+description = "add-nex-endpoint 2026-06-14: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects nex, and exercises the nex-only Endpoint NAME autocomplete. Configures two named `[[llm_endpoints.endpoints]]` (target `qwen-local` plus a default-marked `fallback-decoy`), confirms the autocomplete dropdown lists endpoint NAMES with a [default] marker when the Endpoint field is focused, then filters by name (`qwen`) and accepts the highlighted named suggestion with Enter. Asserts the launched .chat-1 graph row + CoordinatorState carry the ACCEPTED NAME `qwen-local` exactly (executor_preset_name=nex / executor_override=native, model `nex:qwen3-coder`) and command_argv is [\"wg\",\"nex\",\"-m\",\"qwen3-coder\",\"-e\",\"qwen-local\"] — never the default decoy (name or URL), the recent-history decoy, or the target's raw URL. Seeds a decoy default endpoint AND a decoy recent launcher-history combo so a fallback regression would be caught. Credential-free (asserts persisted metadata only; no live nex reply). Complements tui_plus_nex_chat.sh which pins the raw-URL entry path."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_plus_nex_openrouter_no_endpoint"
+script = "scenarios/tui_plus_nex_openrouter_no_endpoint.sh"
+owners = [
+    "nex-optional-openrouter-endpoint",
+    "nex-openrouter-default-ui",
+]
+description = "nex-optional-openrouter-endpoint 2026-06-14: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects nex, types the OpenRouter route `minimax/minimax-m3` in the Model field, and LAUNCHES with Enter WITHOUT ever touching the Endpoint field — proving the endpoint is optional for OpenRouter nex models. Seeds a DECOY local is_default endpoint (`local-decoy`) plus a decoy recent launcher-history combo so any silent fallback to the local/default endpoint would be caught. Asserts the launched .chat-1 graph row + CoordinatorState route to OpenRouter (executor_preset_name=nex / executor_override=native, model resolves to `openrouter:minimax/minimax-m3`), the endpoint is blank/absent (no endpoint_override), and command_argv is exactly [\"wg\",\"nex\",\"-m\",\"openrouter:minimax/minimax-m3\"] — an explicit OpenRouter route with NO -e/--endpoint flag and no leaked local-default token. Credential-free (asserts persisted metadata only; OpenRouter never has to be reachable). Also owned by nex-openrouter-default-ui: the same blank/OpenRouter-default launch path whose endpoint copy that task fixed (no longer 'required for nex'). Complements tui_plus_nex_endpoint_autocomplete.sh (named-endpoint path) and tui_plus_nex_chat.sh (raw-URL path)."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_plus_nex_global_endpoint_picker"
+script = "scenarios/tui_plus_nex_global_endpoint_picker.sh"
+owners = [
+    "nex-openrouter-default-ui",
+]
+description = "nex-openrouter-default-ui 2026-06-15: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects nex, and proves the Endpoint picker surfaces GLOBALLY-configured endpoint names (union of global + project-local endpoints) even when the project declares its OWN local endpoints and has not opted into global endpoint inheritance. Configures a LOCAL is_default endpoint (`local-only`) AND a GLOBAL-only endpoint (`global-router`, added via `wg endpoints add --global`), verifies the global name is written ONLY to the global config (not the local project config), then Tabs to the Endpoint field and asserts the dropdown lists BOTH names. Filters by `global`, Enter ACCEPTS the highlighted global name + launches. Asserts the launched .chat-1 graph row + CoordinatorState carry endpoint=`global-router` (the accepted GLOBAL name, NOT the local default) with command_argv [\"wg\",\"nex\",\"-m\",\"qwen3-coder\",\"-e\",\"global-router\"] and endpoint_override=global-router. Credential-free (asserts persisted metadata only; the endpoint never has to be reachable)."
+timeout_seconds = 120
+
+[[scenario]]
+name = "nex_stale_tui_sentinel_respawns"
+script = "scenarios/nex_stale_tui_sentinel_respawns.sh"
+owners = [
+    "fix-nex-chat",
+]
+description = "fix-nex-chat 2026-06-15: real daemon/supervisor flow for a Nex chat with .tui-driven pointing at a live sentinel PID, no live .handler.pid, and a prior turns=0 EOF trace. The supervisor must clear/ignore the stale sentinel and respawn instead of logging 'TUI sentinel alive ... deferring respawn' forever; `wg chat resume 0` must recover the same stale-sentinel/no-handler state without manual deletion."
+timeout_seconds = 90
+
+[[scenario]]
+name = "tui_plus_opencode_model_fuzzy"
+script = "scenarios/tui_plus_opencode_model_fuzzy.sh"
+owners = [
+    "add-model-fuzzy",
+]
+description = "add-model-fuzzy 2026-06-14: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects opencode, and exercises the Model field's fuzzy autocomplete (NOT exact typing). Tabs to the Model field and types the search fragment `minimax m3` (two space-separated terms, no `/`), confirms the dropdown surfaces the curated `minimax/minimax-m3` route, then Enter ACCEPTS the highlighted suggestion + launches in one key. Asserts the launched .chat-1 graph row + CoordinatorState carry the fuzzy-selected minimax route (executor_preset_name=opencode / executor_override=opencode, NO endpoint override) and command_argv is the normalized [\"opencode\",\"--model\",\"openrouter/minimax/minimax-m3\"] — never a recent-history decoy or a default fallback. Seeds a decoy recent launcher-history combo so a recall regression would be caught. Credential-free (asserts persisted metadata only; no live opencode/OpenRouter call). The autocomplete sibling of tui_plus_opencode_minimax.sh, which pins the raw free-text route path."
+timeout_seconds = 120
+
+[[scenario]]
+name = "tui_plus_nex_model_fuzzy"
+script = "scenarios/tui_plus_nex_model_fuzzy.sh"
+owners = [
+    "add-model-fuzzy",
+]
+description = "add-model-fuzzy 2026-06-14: drives the real wg tui '+' new-chat menu in tmux from a PTY-focused chat, selects nex, and proves the Model fuzzy autocomplete COMPOSES with the nex Endpoint NAME autocomplete (add-nex-endpoint). Tabs to the Model field, fuzzy-types `minimax m3` (space-separated fragment, no `/`), confirms the dropdown surfaces `minimax/minimax-m3`, then Tab ACCEPTS the model (nex-normalized to `openrouter:minimax/minimax-m3`) AND advances to the Endpoint field; on the Endpoint field it filters by name (`qwen`) and Enter accepts the named endpoint + launches. Configures a target endpoint `qwen-local` plus a default-marked `fallback-decoy`, and seeds a decoy recent combo. Asserts the launched .chat-1 graph row + CoordinatorState carry model `openrouter:minimax/minimax-m3` exactly and endpoint `qwen-local` (executor_preset_name=nex / executor_override=native), with command_argv [\"wg\",\"nex\",\"-m\",\"minimax/minimax-m3\",\"-e\",\"qwen-local\"] — never a default/recent decoy. Credential-free (asserts persisted metadata only; no live nex reply)."
+timeout_seconds = 120
+
+[[scenario]]
 name = "launcher_focus_new_chat_on_launch"
 script = "scenarios/launcher_focus_new_chat_on_launch.sh"
 owners = [
@@ -301,6 +438,15 @@ description = "Resume a 500-msg journal against a 32k context window must trunca
 timeout_seconds = 300
 
 [[scenario]]
+name = "nex_large_output_nonrecursive"
+script = "scenarios/nex_large_output_nonrecursive.sh"
+owners = [
+    "fix-nex-large",
+]
+description = "Pins Nex large-output routing without a live endpoint: bash preserves full output for artifact routing; context-aware thresholds avoid the old ~4 KB premature stop; oversized output gets metadata plus first/last previews; cat of a routed tool-output artifact returns a bounded non-recursive preview instead of creating another artifact."
+timeout_seconds = 120
+
+[[scenario]]
 name = "tui_log_pane_renders_raw_stream"
 script = "scenarios/tui_log_pane_renders_raw_stream.sh"
 owners = [
@@ -310,6 +456,15 @@ owners = [
 ]
 description = "wg tui's '4: Log' pane renders raw_stream.jsonl events for an in-progress task's assigned agent on first draw, and picks up new events as they're appended. Regression for the tui-agent-activity merge that surfaced 'no agent output yet' to users despite stream files existing."
 timeout_seconds = 60
+
+[[scenario]]
+name = "tui_log_scroll_controls"
+script = "scenarios/tui_log_scroll_controls.sh"
+owners = [
+    "fix-tui-event",
+]
+description = "Live tmux-driven wg tui regression for the per-task Log/Events pane: overflowing raw_stream events expose a draggable scrollbar, PageUp/Up/End keyboard navigation changes visible content, SGR mouse wheel and scrollbar drag move through the log, live-tail follows only at bottom, and appended events do not yank a scrolled-up viewport."
+timeout_seconds = 90
 
 [[scenario]]
 name = "evaluate_record_flag_args"
@@ -353,6 +508,15 @@ description = "Dispatcher MUST write a non-empty prompt.txt and a run.sh that pi
 timeout_seconds = 60
 
 [[scenario]]
+name = "codex_optional_tool_config_ignored"
+script = "scenarios/codex_optional_tool_config_ignored.sh"
+owners = [
+    "fix-autopoietic-loop-failure",
+]
+description = "Pins fix-autopoietic-loop-failure: the real dispatcher spawning a Codex worker must pass `--ignore-user-config` so unavailable optional user-configured tool/image models such as gpt-image-2 cannot abort worker startup before useful work begins. Uses a fake codex binary and no external credentials."
+timeout_seconds = 90
+
+[[scenario]]
 name = "tui_new_chat_creates_fresh_ids"
 script = "scenarios/tui_new_chat_creates_fresh_ids.sh"
 owners = [
@@ -391,6 +555,7 @@ name = "evaluate_accepts_pending_eval"
 script = "scenarios/evaluate_accepts_pending_eval.sh"
 owners = [
     "bug-flip-and",
+    "fix-service-recovery",
     "smoke-gate-is",
 ]
 description = "wg evaluate run (and --flip) MUST accept Status::PendingEval as a valid input state. Regression for the 2026-04-27 mass-fail: ~30 .flip-* / .evaluate-* tasks auto-failed with 'has status PendingEval — must be done or failed to evaluate' because the dispatcher correctly fires those tasks while parent is still PendingEval (per the eval-gated unblock contract) but evaluate.rs's precondition rejected it."
@@ -459,6 +624,61 @@ owners = [
 ]
 description = "Pins the user contract: `wg init -m qwen3-coder -e <URL> --executor nex` with NO env vars MUST be sufficient. The autohaiku 100%-failure regression had wg native-exec bailing at init with 'No Anthropic API key found' because the OAI-compat client init path called the Anthropic key resolver as a fallback. This scenario asserts (a) init succeeds without any *_API_KEY env var, (b) config.toml has a complete [[llm_endpoints.endpoints]] block, (c) wg list does not surface ANTHROPIC_API_KEY in errors, (d) native-exec --help advertises --api-key. The wire-level assertions (Authorization header omitted on no-key, configured key wins over env vars, 401 surfaces config-block-named error) live in tests/integration_native_coordinator.rs::credential_wire_contract."
 timeout_seconds = 30
+
+[[scenario]]
+name = "nex_helper_openrouter_route"
+script = "scenarios/nex_helper_openrouter_route.sh"
+owners = [
+    "fix-nex-helper",
+    "smoke-gate-is",
+]
+description = "Regression for fix-nex-helper: in an OpenRouter-backed `wg nex -m openrouter:<model>` session, helper LLM calls made by `summarize` and `delegate` must inherit the active OpenRouter route instead of silently falling back to Anthropic `sonnet`. Drives real `wg nex --eval-mode` through a local OpenRouter-shaped OAI-compatible endpoint, forces both helper tools, and asserts every helper request uses the stripped OpenRouter model (`minimax/minimax-m2.7`) with no Anthropic API error or `model=sonnet` log."
+timeout_seconds = 60
+
+[[scenario]]
+name = "nex_wg_openrouter_endpoint_auth"
+script = "scenarios/nex_wg_openrouter_endpoint_auth.sh"
+owners = [
+    "fix-nex-openrouter",
+    "fix-nex-chat",
+    "fix-wg-nex",
+    "smoke-gate-is",
+]
+description = "Pins fix-wg-nex/fix-nex-openrouter/fix-nex-chat: WG-scoped Nex eval entrypoints (`wg nex --eval-mode` and `nex --wg --eval-mode`) must use configured OpenRouter endpoint credentials from .wg/config.toml, including both api_key_file and api_key_env, instead of falling into standalone .nex-eval config with no Bearer auth. Also covers the explicit global endpoint path: `wg nex -e openrouter -m openrouter:<model>` in a project resolves the global endpoint/key file instead of silently ignoring it."
+timeout_seconds = 90
+
+[[scenario]]
+name = "standalone_nex_entrypoint"
+script = "scenarios/standalone_nex_entrypoint.sh"
+owners = [
+    "add-standalone-nex",
+    "smoke-gate-is",
+]
+description = "Pins add-standalone-nex: installing WG exposes a standalone `nex` binary whose help/options match `wg nex` for shared flags, while `nex -m openrouter:minimax/minimax-m2.7 -e openrouter --eval-mode ...` reaches the same native OpenRouter route as `wg nex` against a local OpenRouter-shaped endpoint."
+timeout_seconds = 45
+
+[[scenario]]
+name = "openrouter_provider_error_402"
+script = "scenarios/openrouter_provider_error_402.sh"
+owners = [
+    "improve-nex-openrouter",
+    "smoke-gate-is",
+]
+description = "Pins improve-nex-openrouter: standalone `nex` against a local OpenRouter-shaped endpoint must render provider-side 402 metadata (`metadata.provider_name` + upstream `metadata.raw` type/code/message), avoid credential-focused guidance and API-key leaks for that provider failure, suggest the non-free model id for `:free` routes, and still succeed on the equivalent paid route."
+timeout_seconds = 45
+
+[[scenario]]
+name = "nex_live_input_pty"
+script = "scenarios/nex_live_input_pty.sh"
+owners = [
+    "improve-nex-live",
+    "polish-nex-queued",
+    "tune-nex-follow",
+    "add-compact-nex",
+    "smoke-gate-is",
+]
+description = "Drives standalone `nex` and `wg nex` through a real PTY with terminal echo disabled against a local OpenAI-compatible server. Asserts normal follow-up prompts stay plain `>`, compact working indicators appear only while busy with safe no-color fallback, a bash tool call does not get preceded by misleading prompt text, and queued input typed while streaming is visibly marked, delivered once, and associated with its assistant turn."
+timeout_seconds = 120
 
 [[scenario]]
 name = "agency_inline_spawn_registers_executor_claude"
@@ -587,7 +807,7 @@ owners = [
     "fix-codex-cli",
     "bump-codex-defaults",
 ]
-description = "Pins the codex-cli route defaults regression: `wg init --route codex-cli` must write gpt-5.5 (newest frontier; user-preferred default per bump-codex-defaults) as the agent/dispatcher model, full tier set (gpt-5.4-mini/gpt-5.4/gpt-5.5), [models.evaluator]/[models.assigner]/[models.flip_inference]/[models.flip_comparison] all pointing to gpt-5.4-mini — so agency meta-tasks AND FLIP scoring run on codex, not fall back to claude:haiku. Also verifies `wg config lint` flags the old codex:o1-pro string. No LLM endpoint needed."
+description = "Pins the codex-cli route defaults regression: `wg init --route codex-cli` must write gpt-5.5 (newest frontier; user-preferred default per bump-codex-defaults) as the agent/dispatcher/default/task-agent model, full tier set (gpt-5.4-mini/gpt-5.5/gpt-5.5), [models.evaluator]/[models.assigner]/[models.flip_inference]/[models.flip_comparison] all pointing to gpt-5.4-mini — so agency meta-tasks AND FLIP scoring run on codex, not fall back to claude:haiku. Also verifies `wg config lint` flags the old codex:o1-pro string. No LLM endpoint needed."
 timeout_seconds = 30
 
 [[scenario]]
@@ -756,6 +976,15 @@ owners = [
 ]
 description = "Named profiles: wg profile use <name> writes active-pointer, wg config --merged reflects the profile's models, wg profile use --clear removes the pointer."
 timeout_seconds = 30
+
+[[scenario]]
+name = "profile_default_model_pins"
+script = "scenarios/profile_default_model_pins.sh"
+owners = [
+    "fix-profile-switching",
+]
+description = "Regression for fix-profile-switching: in a fresh HOME, `wg profile init-starters` plus `wg profile use codex/claude` and model-qualified `wg profile use codex:gpt-5.5` / `wg profile use claude:opus` must resolve default/task-agent/standard routing to codex:gpt-5.5 and claude:opus, not stale gpt-5.4 or sonnet. Also pins `wg setup --route`, `wg config init --route`, direct global model edits clearing active-profile, profile-show clarity, and explicit project-local override precedence."
+timeout_seconds = 60
 
 [[scenario]]
 name = "profile_codex_service_start"
@@ -1104,3 +1333,48 @@ owners = [
 ]
 description = "Pins fix-nex-agent: real `wg nex --eval-mode` CLI invocations against a local OAI-compatible endpoint must send current-data prompt guidance, expose web_fetch/web_search/bash in the default tool surface, accept a non-coder model spec, and make --minimal-tools explicitly fall back to bash without web_fetch/web_search."
 timeout_seconds = 60
+
+[[scenario]]
+name = "tui_new_chat_focus_sticks"
+script = "scenarios/tui_new_chat_focus_sticks.sh"
+owners = [
+    "fix-tui-new-2",
+]
+description = "Pins fix-tui-new-2: the real `wg tui` new-chat launcher flow must focus the freshly-created chat immediately and keep `wg --json tui-dump`'s coordinator_id on that new chat across multiple refresh ticks. Uses a custom-command `cat` chat so the full tmux/PTY/UI path runs without live LLM credentials."
+timeout_seconds = 90
+
+[[scenario]]
+name = "standalone_nex_config_split"
+script = "scenarios/standalone_nex_config_split.sh"
+owners = [
+    "verify-standalone-nex",
+]
+description = "Pins verify-standalone-nex: installed standalone `nex` uses isolated .nex state/config, starts a fresh project session for each bare invocation, honors CLI/NEX_* precedence over project config, and `wg nex --autonomous` ignores human ~/.nex routing state. Uses WG_FAKE_LLM so the actual command-line flow is deterministic and does not require network credentials."
+timeout_seconds = 60
+
+[[scenario]]
+name = "tui_plus_octomind_chat"
+script = "scenarios/tui_plus_octomind_chat.sh"
+owners = [
+    "prototype-octomind-dexto-chat",
+]
+description = "Pins prototype-octomind-dexto-chat: the real `wg tui` `+` new-chat menu can select the octomind executor and type the bare OpenRouter route minimax/minimax-m3; WG must preserve the model and launch `octomind run -m openrouter:minimax/minimax-m3 --sandbox` (octomind's `-m` takes WG's provider:route spelling verbatim), persist executor_preset_name=octomind on .chat-1 + CoordinatorState, and carry NO endpoint override. Credential-free (metadata/argv only). SKIPs without tmux."
+timeout_seconds = 90
+
+[[scenario]]
+name = "tui_plus_dexto_chat"
+script = "scenarios/tui_plus_dexto_chat.sh"
+owners = [
+    "prototype-octomind-dexto-chat",
+]
+description = "Pins prototype-octomind-dexto-chat: the real `wg tui` `+` new-chat menu can select the dexto executor and type minimax/minimax-m3; because dexto's --model rejects provider/model OpenRouter routes, WG must launch `dexto --agent <abs>/dexto-agent.yml --auto-approve` and write that per-chat agent YAML pinning `provider: openrouter` + `model: minimax/minimax-m3` (typed model preserved, no fallback), persist executor_preset_name=dexto, and carry NO endpoint override. Credential-free (metadata/config only). SKIPs without tmux."
+timeout_seconds = 90
+
+[[scenario]]
+name = "nex_openrouter_chat_stays_alive_and_resumes"
+script = "scenarios/nex_openrouter_chat_stays_alive_and_resumes.sh"
+owners = [
+    "fix-nex-chat23-eof-resume",
+]
+description = "Pins fix-nex-chat23-eof-resume: a Nex/OpenRouter chat (blank endpoint → OpenRouter default) created against an isolated daemon must come up with a LIVE inbox-driven handler and stay alive — no session_end reason=eof at turns=0 from a stale .handler.release-requested marker. `wg chat show` and `wg session status` must agree on the live handler, and `wg chat resume <id>` must succeed from saved executor/model metadata without the internal 'at least one of --executor or --model' error. Credential-free: the inbox handler blocks without calling the model."
+timeout_seconds = 90

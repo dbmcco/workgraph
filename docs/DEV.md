@@ -18,7 +18,7 @@ See `docs/KEY_DOCS.md` for the canonical list of documentation files to keep in 
 ## Build & Test
 
 ```
-cargo install --path .          # rebuild global wg binary
+cargo install --path . --locked # rebuild global wg and nex binaries
 wg service stop                 # stop before rebuilding
 cargo test                      # run tests
 typst compile docs/manual/wg-manual.typ   # rebuild manual PDF
@@ -133,7 +133,7 @@ To update when Agency releases new primitives:
 
 ```bash
 cp ~/agency/primitives/starter.csv agency/starter.csv
-cargo install --path .   # rebuild with new pool embedded
+cargo install --path . --locked # rebuild wg/nex with new pool embedded
 git add agency/starter.csv
 git commit -m "primitives: sync from Agency vX.Y.Z (637→N)"
 ```
@@ -151,7 +151,7 @@ The CSV is a vendored dependency — no auto-sync. Update it on your schedule.
 FLIP (Fidelity via Latent Intent Probing) validates task output by reconstructing the prompt from the output and comparing it to the original. It runs as part of the evaluation pipeline.
 
 FLIP uses two model roles:
-- **FlipInference** (standard tier, default: sonnet) — reconstructs the prompt
+- **FlipInference** (standard tier, default: opus) — reconstructs the prompt
 - **FlipComparison** (fast tier, default: haiku) — scores similarity
 
 Low FLIP scores can trigger **Verification** tasks (premium tier, default: opus) for deeper review.
@@ -177,7 +177,7 @@ Models are routed per-role via the `DispatchRole` enum (`src/config.rs`). Each r
 | Tier | Default Model | Roles |
 |------|---------------|-------|
 | **fast** | haiku | Triage, FlipComparison, Assigner |
-| **standard** | sonnet | TaskAgent, Evaluator, FlipInference, Evolver, Default |
+| **standard** | opus | TaskAgent, Evaluator, FlipInference, Evolver, Default |
 | **premium** | opus | Creator, Verification |
 
 Resolution hierarchy (highest priority first):
@@ -190,7 +190,7 @@ Resolution hierarchy (highest priority first):
 
 ```bash
 # Set tier defaults
-wg config --tier fast=haiku --tier standard=sonnet --tier premium=opus
+wg config --tier fast=haiku --tier standard=opus --tier premium=opus
 
 # Override a role's tier
 wg config --model-role task_agent --tier premium
@@ -200,7 +200,7 @@ See `docs/MODEL_REGISTRY.md` for the full registry design (multi-provider suppor
 
 ## Common Pitfalls
 
-- Forgot `cargo install --path .` after code changes — old binary runs
+- Forgot `cargo install --path . --locked` after code changes — old binaries run
 - `wg evaluate` requires `run` subcommand: `wg evaluate run <task-id>`
 - `wg retry` must clear `assigned` field or coordinator skips the task
 - `--output-format stream-json` requires `--verbose` with `--print` in Claude CLI

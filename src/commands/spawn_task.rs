@@ -11,11 +11,13 @@
 //!      the PTY embedding in `wg tui` just spawns `wg spawn-task`
 //!      and gets the handler's output as its own.
 //!
-//! Adapters live inline here (one match arm per executor). Native
-//! execs into `wg nex`; Claude execs into `wg claude-handler`
-//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex and
-//! OpenCode use single-shot CLI handlers. Gemini is still a stub — it
-//! errors cleanly with a "not yet implemented" message when selected.
+//! Adapters live inline here (one match arm per live-session executor).
+//! Native execs into `wg nex`; Claude execs into `wg claude-handler`
+//! (the standalone Claude CLI ↔ chat/*.jsonl bridge). Codex and OpenCode
+//! have live handlers. Worker-only external executors such as Aider,
+//! Goose, Qwen, Cline, Crush, and Amplifier are rejected here with a clear
+//! error because they belong on the task-agent worker path, not the live
+//! chat path.
 //!
 //! ## Stdout-is-protocol contract
 //!
@@ -32,6 +34,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 
+use workgraph::dispatch::ExecutorKind;
 use workgraph::graph::Task;
 
 /// Dispatch table for what handler to run for a task. Parsed from
@@ -247,17 +250,36 @@ pub fn resolve_handler(
     let endpoint = plan.endpoint.as_ref().map(|e| e.name.clone());
 
     Ok(match plan.executor {
-        workgraph::dispatch::ExecutorKind::Native => HandlerSpec::Native {
+        ExecutorKind::Native => HandlerSpec::Native {
             chat_ref,
             role,
             resume: journal_exists,
             model,
             endpoint,
         },
-        workgraph::dispatch::ExecutorKind::Claude => HandlerSpec::Claude { chat_ref, model },
-        workgraph::dispatch::ExecutorKind::Codex => HandlerSpec::Codex { chat_ref, model },
-        workgraph::dispatch::ExecutorKind::OpenCode => HandlerSpec::OpenCode { chat_ref, model },
-        workgraph::dispatch::ExecutorKind::Shell => {
+        ExecutorKind::Claude => HandlerSpec::Claude { chat_ref, model },
+        ExecutorKind::Codex => HandlerSpec::Codex { chat_ref, model },
+        ExecutorKind::OpenCode => HandlerSpec::OpenCode { chat_ref, model },
+        ExecutorKind::Aider
+        | ExecutorKind::Goose
+        | ExecutorKind::Qwen
+        | ExecutorKind::Cline
+        | ExecutorKind::Crush
+        | ExecutorKind::Amplifier => {
+            return Err(worker_only_executor_error(plan.executor));
+        }
+        ExecutorKind::Octomind | ExecutorKind::Dexto => {
+            // Chat-capable external CLIs wired only into the TUI live-chat PTY
+            // path (which owns chat_dir + PTY sizing), not the daemon
+            // spawn-task handler path (prototype-octomind-dexto-chat).
+            return Err(anyhow!(
+                "executor '{}' currently runs only via the TUI live-chat PTY path \
+                 (open a chat from the TUI [+] menu and choose it); it has no \
+                 spawn-task / daemon handler yet",
+                plan.executor.as_str()
+            ));
+        }
+        ExecutorKind::Shell => {
             return Err(anyhow!(
                 "shell executor is not supported by spawn-task; \
                  task.exec runs through the dispatcher's shell-spawn path, \
@@ -265,6 +287,15 @@ pub fn resolve_handler(
             ));
         }
     })
+}
+
+fn worker_only_executor_error(executor: ExecutorKind) -> anyhow::Error {
+    anyhow!(
+        "executor '{}' is worker-only and cannot run through spawn-task/live chat; \
+         use it for task-agent workers via the dispatcher or `wg spawn`, or choose \
+         a live chat executor such as claude, codex, opencode, or native/nex",
+        executor.as_str()
+    )
 }
 
 fn is_coordinator_id(task_id: &str) -> bool {
@@ -276,7 +307,7 @@ fn is_coordinator_id(task_id: &str) -> bool {
 /// Exec into the handler process. This REPLACES the current process
 /// (via `execvp`) on Unix so stdio passes through cleanly — the PTY
 /// parent sees the handler's bytes directly.
-fn dispatch(spec: &HandlerSpec, _workgraph_dir: &Path) -> Result<()> {
+fn dispatch(spec: &HandlerSpec, workgraph_dir: &Path) -> Result<()> {
     match spec {
         HandlerSpec::Native {
             chat_ref,
@@ -290,40 +321,24 @@ fn dispatch(spec: &HandlerSpec, _workgraph_dir: &Path) -> Result<()> {
             *resume,
             model.as_deref(),
             endpoint.as_deref(),
+            workgraph_dir,
         ),
-        HandlerSpec::Claude { chat_ref, model } => dispatch_claude(chat_ref, model.as_deref()),
-        HandlerSpec::Codex { chat_ref, model } => dispatch_codex(chat_ref, model.as_deref()),
-        HandlerSpec::OpenCode { chat_ref, model } => dispatch_opencode(chat_ref, model.as_deref()),
+        HandlerSpec::Claude { chat_ref, model } => {
+            dispatch_claude(chat_ref, model.as_deref(), workgraph_dir)
+        }
+        HandlerSpec::Codex { chat_ref, model } => {
+            dispatch_codex(chat_ref, model.as_deref(), workgraph_dir)
+        }
+        HandlerSpec::OpenCode { chat_ref, model } => {
+            dispatch_opencode(chat_ref, model.as_deref(), workgraph_dir)
+        }
         HandlerSpec::Gemini { .. } => Err(anyhow!(
             "gemini adapter not yet implemented (Phase 7). Use --executor native for now."
         )),
     }
 }
 
-fn dispatch_opencode(chat_ref: &str, model: Option<&str>) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let self_exe =
-            std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
-        let mut cmd = std::process::Command::new(&self_exe);
-        cmd.arg("opencode-handler").arg("--chat").arg(chat_ref);
-        if let Some(m) = model {
-            cmd.arg("-m").arg(m);
-        }
-        let err = cmd.exec();
-        Err(anyhow!("exec wg opencode-handler failed: {}", err))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (chat_ref, model);
-        Err(anyhow!(
-            "spawn-task dispatch not yet supported on this platform"
-        ))
-    }
-}
-
-fn dispatch_codex(chat_ref: &str, model: Option<&str>) -> Result<()> {
+fn dispatch_codex(chat_ref: &str, model: Option<&str>, workgraph_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -331,6 +346,7 @@ fn dispatch_codex(chat_ref: &str, model: Option<&str>) -> Result<()> {
             std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
         let mut cmd = std::process::Command::new(&self_exe);
         cmd.arg("codex-handler").arg("--chat").arg(chat_ref);
+        cmd.env("WG_DIR", workgraph_dir);
         if let Some(m) = model {
             cmd.arg("-m").arg(m);
         }
@@ -339,14 +355,38 @@ fn dispatch_codex(chat_ref: &str, model: Option<&str>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (chat_ref, model);
+        let _ = (chat_ref, model, workgraph_dir);
         Err(anyhow!(
             "spawn-task dispatch not yet supported on this platform"
         ))
     }
 }
 
-fn dispatch_claude(chat_ref: &str, model: Option<&str>) -> Result<()> {
+fn dispatch_opencode(chat_ref: &str, model: Option<&str>, workgraph_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let self_exe =
+            std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.arg("opencode-handler").arg("--chat").arg(chat_ref);
+        cmd.env("WG_DIR", workgraph_dir);
+        if let Some(m) = model {
+            cmd.arg("-m").arg(m);
+        }
+        let err = cmd.exec();
+        Err(anyhow!("exec wg opencode-handler failed: {}", err))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (chat_ref, model, workgraph_dir);
+        Err(anyhow!(
+            "spawn-task dispatch not yet supported on this platform"
+        ))
+    }
+}
+
+fn dispatch_claude(chat_ref: &str, model: Option<&str>, workgraph_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -354,6 +394,7 @@ fn dispatch_claude(chat_ref: &str, model: Option<&str>) -> Result<()> {
             std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
         let mut cmd = std::process::Command::new(&self_exe);
         cmd.arg("claude-handler").arg("--chat").arg(chat_ref);
+        cmd.env("WG_DIR", workgraph_dir);
         // Coordinator role is implicit for `coordinator-*` refs; pass
         // explicit role if the caller set one via role_override.
         if let Some(m) = model {
@@ -364,7 +405,7 @@ fn dispatch_claude(chat_ref: &str, model: Option<&str>) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (chat_ref, model);
+        let _ = (chat_ref, model, workgraph_dir);
         Err(anyhow!(
             "spawn-task dispatch not yet supported on this platform"
         ))
@@ -377,6 +418,7 @@ fn dispatch_native(
     resume: bool,
     model: Option<&str>,
     endpoint: Option<&str>,
+    workgraph_dir: &Path,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -386,6 +428,7 @@ fn dispatch_native(
             std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
         let mut cmd = std::process::Command::new(&self_exe);
         cmd.arg("nex").arg("--chat").arg(chat_ref);
+        cmd.env("WG_DIR", workgraph_dir);
         if resume {
             cmd.arg("--resume");
         }
@@ -406,7 +449,7 @@ fn dispatch_native(
     #[cfg(not(unix))]
     {
         // Fallback on non-Unix: spawn + wait + propagate exit code.
-        let _ = (chat_ref, role, resume, model, endpoint);
+        let _ = (chat_ref, role, resume, model, endpoint, workgraph_dir);
         Err(anyhow!(
             "spawn-task dispatch not yet supported on this platform"
         ))
@@ -426,14 +469,29 @@ mod tests {
         }
     }
 
-    /// Save and restore WG_EXECUTOR_TYPE + WG_MODEL across a test body.
-    /// `set_exec` / `set_model` configure the env for the duration of `f`.
-    /// Env restoration runs even on panic via Drop, so failed assertions
-    /// don't leak into other tests.
+    /// Save and restore WG_EXECUTOR_TYPE + WG_MODEL + WG_GLOBAL_DIR across a
+    /// test body. `set_exec` / `set_model` configure the env for the duration
+    /// of `f`. Env restoration runs even on panic via Drop, so failed
+    /// assertions don't leak into other tests.
+    ///
+    /// `WG_GLOBAL_DIR` is repointed at a fresh empty tempdir for the duration
+    /// of `f`. `resolve_handler` calls `Config::load_or_default`, which merges
+    /// the machine-global `~/.wg/config.toml` and consults `~/.wg/active-profile`;
+    /// on a developer machine that has, say, an active `opencode` profile, the
+    /// global `[dispatcher].model = "opencode:openrouter/…"` executor-qualified
+    /// route leaks in and overrides the `WG_EXECUTOR_TYPE=native` hint these
+    /// tests pin — routing to OpenCode and failing the `expected Native handler`
+    /// assertions. Pointing `WG_GLOBAL_DIR` at an empty dir makes
+    /// `Config::global_dir()` (the single chokepoint for global config +
+    /// active-profile) resolve to nothing, so these tests depend only on the
+    /// per-test tempdir + env, never the global profile. We override
+    /// `WG_GLOBAL_DIR` rather than `HOME` so sibling tests that shell out to
+    /// `git` are unaffected.
     fn with_env<R>(set_exec: Option<&str>, set_model: Option<&str>, f: impl FnOnce() -> R) -> R {
         struct EnvGuard {
             saved_exec: Option<String>,
             saved_model: Option<String>,
+            saved_global_dir: Option<String>,
         }
         impl Drop for EnvGuard {
             fn drop(&mut self) {
@@ -446,14 +504,23 @@ mod tests {
                         Some(v) => std::env::set_var("WG_MODEL", v),
                         None => std::env::remove_var("WG_MODEL"),
                     }
+                    match self.saved_global_dir.take() {
+                        Some(v) => std::env::set_var("WG_GLOBAL_DIR", v),
+                        None => std::env::remove_var("WG_GLOBAL_DIR"),
+                    }
                 }
             }
         }
+        // Keep the tempdir alive for the whole body; dropped after `_guard`
+        // restores the env (drop order is reverse of declaration).
+        let global = tempfile::tempdir().unwrap();
         let _guard = EnvGuard {
             saved_exec: std::env::var("WG_EXECUTOR_TYPE").ok(),
             saved_model: std::env::var("WG_MODEL").ok(),
+            saved_global_dir: std::env::var("WG_GLOBAL_DIR").ok(),
         };
         unsafe {
+            std::env::set_var("WG_GLOBAL_DIR", global.path());
             match set_exec {
                 Some(v) => std::env::set_var("WG_EXECUTOR_TYPE", v),
                 None => std::env::remove_var("WG_EXECUTOR_TYPE"),
@@ -897,5 +964,85 @@ mod tests {
                 preview
             );
         });
+    }
+
+    #[test]
+    #[serial]
+    fn external_worker_executors_get_worker_only_spawn_task_error() {
+        // OpenCode is intentionally excluded: it now ships a live chat handler
+        // (`wg opencode-handler --chat`), so it maps to a HandlerSpec rather
+        // than the worker-only error (see
+        // `opencode_executor_maps_to_opencode_handler`). The remaining
+        // external CLIs stay worker-only.
+        for executor in ["aider", "goose", "qwen", "cline", "crush", "amplifier"] {
+            with_env(Some(executor), Some("claude:opus"), || {
+                let dir = tempfile::tempdir().unwrap();
+                let task = mktask(".chat-0");
+
+                let err = resolve_handler(dir.path(), &task, None)
+                    .expect_err("external worker executor must not map to a live handler")
+                    .to_string();
+
+                assert!(
+                    err.contains(executor),
+                    "error should name executor '{}': {}",
+                    executor,
+                    err
+                );
+                assert!(
+                    err.contains("worker-only"),
+                    "error should explain worker-only boundary: {}",
+                    err
+                );
+                assert!(
+                    err.contains("spawn-task/live chat"),
+                    "error should name the rejected live path: {}",
+                    err
+                );
+            });
+        }
+    }
+
+    /// Goal #5 (fix-opencode-build): opencode is chat-capable. With
+    /// `WG_EXECUTOR_TYPE=opencode` and an opencode model, a `.chat-*` task must
+    /// resolve to the OpenCode handler whose preview names `wg opencode-handler
+    /// --chat` and carries the model explicitly — NOT the worker-only error.
+    #[test]
+    #[serial]
+    fn opencode_executor_maps_to_opencode_handler() {
+        with_env(
+            Some("opencode"),
+            Some("opencode:openrouter/stepfun/step-3.7-flash"),
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let task = mktask(".chat-0");
+
+                let spec = resolve_handler(dir.path(), &task, None)
+                    .expect("opencode must map to a live handler, not the worker-only error");
+
+                match &spec {
+                    HandlerSpec::OpenCode { model, .. } => {
+                        // The inner model is normalized to the openrouter spec.
+                        assert_eq!(model.as_deref(), Some("openrouter:stepfun/step-3.7-flash"));
+                    }
+                    other => panic!(
+                        "expected OpenCode handler, got: {}",
+                        other.command_preview()
+                    ),
+                }
+
+                let preview = spec.command_preview();
+                assert!(
+                    preview.contains("wg opencode-handler --chat"),
+                    "preview must dispatch to the opencode handler: {}",
+                    preview
+                );
+                assert!(
+                    preview.contains("openrouter:stepfun/step-3.7-flash"),
+                    "preview must pass the resolved model explicitly: {}",
+                    preview
+                );
+            },
+        );
     }
 }

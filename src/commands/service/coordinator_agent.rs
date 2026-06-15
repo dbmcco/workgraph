@@ -185,10 +185,7 @@ pub(crate) const HANDLER_IDLE_POLL_MS: u64 = 200;
 pub(crate) const COORDINATOR_TURN_TIMEOUT_SECS: u64 = 300;
 
 pub(crate) fn tui_driver_deferral_pid(chat_dir: &Path) -> Option<u32> {
-    workgraph::session_lock::read_tui_driver_sentinel(chat_dir)
-        .ok()
-        .flatten()
-        .and_then(|info| info.alive.then_some(info.pid))
+    workgraph::session_lock::active_tui_driver_pid(chat_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,10 +591,17 @@ impl CoordinatorAgent {
             return false;
         }
         // Send SIGINT (not SIGKILL) — Claude CLI treats this as "stop generating"
-        unsafe {
-            libc::kill(pid as i32, libc::SIGINT);
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGINT);
+            }
+            true
         }
-        true
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Shut down the coordinator agent.
@@ -611,6 +615,7 @@ impl CoordinatorAgent {
     pub fn shutdown(self) {
         let pid = *self.pid.lock().unwrap_or_else(|e| e.into_inner());
         if pid > 0 {
+            #[cfg(unix)]
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
@@ -950,8 +955,9 @@ fn subprocess_coordinator_loop(
 
         let wg_bin = std::env::current_exe().unwrap_or_else(|_| "wg".into());
         let mut cmd = Command::new(&wg_bin);
-        cmd.arg("spawn-task").arg(&task_id);
+        cmd.arg("--dir").arg(dir).arg("spawn-task").arg(&task_id);
         cmd.current_dir(dir.parent().unwrap_or(dir));
+        cmd.env("WG_DIR", dir);
         cmd.env("WG_EXECUTOR_TYPE", &effective_exec);
         if let Some(p) = provider {
             cmd.env("WG_PROVIDER", p);
@@ -988,8 +994,9 @@ fn subprocess_coordinator_loop(
             .map(|e| e.name.as_str())
             .unwrap_or("none");
         logger.info(&format!(
-            "Coordinator-{}: spawning via `wg spawn-task {}` (executor={}, model={:?}, endpoint={}, stderr_log={:?})",
+            "Coordinator-{}: spawning via `wg --dir {} spawn-task {}` (executor={}, model={:?}, endpoint={}, stderr_log={:?})",
             coordinator_id,
+            dir.display(),
             task_id,
             effective_exec,
             effective_model_override,
@@ -1079,6 +1086,16 @@ fn subprocess_coordinator_loop(
         *alive.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *pid.lock().unwrap_or_else(|e| e.into_inner()) = 0;
 
+        // A cooperative release marker that targeted the handler we just
+        // reaped has done its job — clear it so the next respawn (fresh
+        // PID) starts clean. Without this, a marker left on disk would
+        // linger; a successor handler ignores it via the generation-aware
+        // `release_requested_for` check, but clearing here keeps the
+        // on-disk state honest and avoids confusing `wg session` readers.
+        if workgraph::session_lock::release_target(&chat_dir) == Some(child_pid) {
+            workgraph::session_lock::clear_release_marker(&chat_dir);
+        }
+
         let success = matches!(&exit_status, Ok(s) if s.success());
         // Read the live session-lock holder right at exit time. If the
         // child crashed *because* it lost a startup race against another
@@ -1111,6 +1128,24 @@ fn subprocess_coordinator_loop(
                 // consumer is connected.
                 let idle_threshold = std::time::Duration::from_secs(CHAT_IDLE_THRESHOLD_SECS);
                 if chat::chat_session_is_idle(dir, coordinator_id, idle_threshold) {
+                    // Do NOT abandon a chat a live TUI is actively driving.
+                    // A fresh TUI-created chat starts with an empty inbox and
+                    // no cursor activity, so it looks "idle" — but if the
+                    // handler exited at turns=0 (e.g. a cooperative release
+                    // during the TUI's takeover handoff) and we gave up here,
+                    // the chat would be left stopped with no handler, exactly
+                    // the fix-nex-chat23-eof-resume failure. While the TUI
+                    // sentinel is alive, defer and respawn so the chat keeps a
+                    // handler available for the next message instead of dying.
+                    if let Some(tui_pid) = tui_driver_deferral_pid(&chat_dir) {
+                        logger.info(&format!(
+                            "Coordinator-{}: looks idle but a live TUI (pid={}) is driving this chat — \
+                             deferring 2s and keeping a handler available (no idle-exit).",
+                            coordinator_id, tui_pid
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    }
                     logger.info(&format!(
                         "Coordinator-{}: idle (no consumer + empty inbox for {}s) — exiting supervisor (no respawn).",
                         coordinator_id, CHAT_IDLE_THRESHOLD_SECS
@@ -1919,8 +1954,17 @@ mod tests {
         let chat_dir = tmp.path().join("chat");
         workgraph::session_lock::write_tui_driver_sentinel(&chat_dir, std::process::id()).unwrap();
 
+        assert_eq!(tui_driver_deferral_pid(&chat_dir), None);
+
+        workgraph::session_lock::write_tui_driver_sentinel(&chat_dir, std::process::id()).unwrap();
+        let lock = workgraph::session_lock::SessionLock::acquire(
+            &chat_dir,
+            workgraph::session_lock::HandlerKind::InteractiveNex,
+        )
+        .unwrap();
         assert_eq!(tui_driver_deferral_pid(&chat_dir), Some(std::process::id()));
 
+        drop(lock);
         workgraph::session_lock::clear_tui_driver_sentinel(&chat_dir);
         assert_eq!(tui_driver_deferral_pid(&chat_dir), None);
 

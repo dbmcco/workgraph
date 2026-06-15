@@ -1162,7 +1162,7 @@ pub struct AddNewExecutorChoice {
     pub internal_executor: &'static str,
 }
 
-/// The three executor options offered in Add-new mode.
+/// The executor options offered in Add-new mode.
 pub const ADD_NEW_EXECUTOR_CHOICES: &[AddNewExecutorChoice] = &[
     AddNewExecutorChoice {
         label: "claude",
@@ -1173,14 +1173,421 @@ pub const ADD_NEW_EXECUTOR_CHOICES: &[AddNewExecutorChoice] = &[
         internal_executor: "codex",
     },
     AddNewExecutorChoice {
+        label: "opencode",
+        internal_executor: "opencode",
+    },
+    AddNewExecutorChoice {
         label: "nex",
         internal_executor: "native",
+    },
+    // External chat-capable CLIs prototyped after the established executors so
+    // their addition does not shift the indices the launcher tests pin
+    // (claude=0, codex=1, opencode=2, nex=3) — prototype-octomind-dexto-chat.
+    AddNewExecutorChoice {
+        label: "octomind",
+        internal_executor: "octomind",
+    },
+    AddNewExecutorChoice {
+        label: "dexto",
+        internal_executor: "dexto",
     },
     AddNewExecutorChoice {
         label: "Custom Command",
         internal_executor: "command",
     },
 ];
+
+/// One endpoint suggestion offered by the Add-new endpoint field's
+/// autocomplete, built from configured `[[llm_endpoints.endpoints]]`.
+///
+/// Surfaced ONLY when the Add-new executor is `nex`/native — claude /
+/// codex / opencode / custom-command never show endpoint suggestions
+/// (claude & codex auth themselves; opencode selects its provider via
+/// the model route). The fields mirror the config entry so the dropdown
+/// can show name-first with URL/provider/default as secondary detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndpointSuggestion {
+    /// Endpoint display name (`name` in config). This is what gets
+    /// written into the endpoint field when the suggestion is accepted —
+    /// `wg nex -e <name>` resolves a configured name just as it resolves
+    /// a bare URL, so the launched argv stays consistent.
+    pub name: String,
+    /// Endpoint URL, if configured (shown as secondary detail).
+    pub url: Option<String>,
+    /// Provider type ("openrouter", "openai", "local", ...).
+    pub provider: String,
+    /// Whether this is the config's default endpoint (`is_default`).
+    pub is_default: bool,
+}
+
+impl EndpointSuggestion {
+    /// The synthetic "blank = OpenRouter default" option offered for
+    /// OpenRouter-routed nex models (nex-openrouter-default-ui). It carries
+    /// an empty `name` so accepting it leaves the endpoint field blank —
+    /// which `resolved_launch_args` / `build_nex_chat_pty_args` translate
+    /// into "no `-e` flag, route to OpenRouter". It is identified by its
+    /// empty name (a real configured endpoint always has a name).
+    pub fn openrouter_default() -> Self {
+        EndpointSuggestion {
+            name: String::new(),
+            url: None,
+            provider: "openrouter".to_string(),
+            is_default: false,
+        }
+    }
+
+    /// True for the synthetic OpenRouter-default option (blank name). Real
+    /// configured endpoints always have a non-empty name, so a blank name
+    /// unambiguously marks the synthetic "no endpoint / OpenRouter" row.
+    pub fn is_openrouter_default(&self) -> bool {
+        self.name.is_empty()
+    }
+
+    /// Primary label shown in the endpoint dropdown. Normally the configured
+    /// `name`; for the synthetic OpenRouter-default option (blank name) it
+    /// renders a friendly, self-explanatory label so the "leave blank to use
+    /// OpenRouter" path is an obvious, selectable choice rather than an empty
+    /// row.
+    pub fn display_name(&self) -> String {
+        if self.is_openrouter_default() {
+            "OpenRouter (default — leave endpoint blank)".to_string()
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+/// Build the endpoint-autocomplete suggestion list from the effective WG
+/// config. Preserves config order; the default endpoint (if any) is
+/// surfaced via [`EndpointSuggestion::is_default`] so the launcher can
+/// preselect it. Returns an empty vec when no endpoints are configured.
+pub fn build_endpoint_suggestions(config: &Config) -> Vec<EndpointSuggestion> {
+    config
+        .llm_endpoints
+        .endpoints
+        .iter()
+        .map(|ep| EndpointSuggestion {
+            name: ep.name.clone(),
+            url: ep.url.clone(),
+            provider: ep.provider.clone(),
+            is_default: ep.is_default,
+        })
+        .collect()
+}
+
+/// Build endpoint suggestions for the launcher picker, unioning the
+/// effective (merged) config's endpoints with the *global* config's
+/// endpoints so globally-configured endpoint names are always selectable —
+/// even when the project's local config has not opted into global endpoint
+/// inheritance (`[llm_endpoints] inherit_global`, opt-in by default; see
+/// `apply_endpoint_inheritance_policy`). Without this, an endpoint declared
+/// only in `~/.wg/config.toml` would never appear in the new-chat picker
+/// for a project that declares its own (or no) endpoints.
+///
+/// Project-local / effective entries take precedence: they appear first and
+/// suppress any global entry that shares their `name`, so a locally
+/// overridden endpoint keeps its local URL/provider/default flag.
+pub fn build_endpoint_suggestions_with_global(
+    effective: &Config,
+    global: Option<&Config>,
+) -> Vec<EndpointSuggestion> {
+    let mut out = build_endpoint_suggestions(effective);
+    let mut seen: HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
+    if let Some(g) = global {
+        for ep in &g.llm_endpoints.endpoints {
+            if seen.insert(ep.name.clone()) {
+                out.push(EndpointSuggestion {
+                    name: ep.name.clone(),
+                    url: ep.url.clone(),
+                    provider: ep.provider.clone(),
+                    is_default: ep.is_default,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// One model suggestion offered by the Add-new Model field's fuzzy
+/// autocomplete (add-model-fuzzy). Built at launcher-open time from the
+/// model registry, a curated network-free list of popular OpenRouter
+/// routes, recent launcher history, and configured endpoint default
+/// models.
+///
+/// Unlike [`EndpointSuggestion`], a model suggestion is executor-AGNOSTIC
+/// at build time: it stores the canonical bare model id plus its native
+/// provider. The executor-specific launch spec is computed only when the
+/// suggestion is ACCEPTED (see [`LauncherState::accept_model_suggestion`]),
+/// because the same model normalizes differently per executor — e.g.
+/// `minimax/minimax-m3` becomes `openrouter/minimax/minimax-m3` for
+/// `opencode` but `openrouter:minimax/minimax-m3` for `nex`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSuggestion {
+    /// Canonical model id WITHOUT any executor/provider prefix
+    /// (e.g. `minimax/minimax-m3`, `anthropic/claude-opus-4-6`,
+    /// `qwen3-coder`). Matching runs against this and the per-executor
+    /// normalizer turns it into a launch spec.
+    pub id: String,
+    /// Native provider for this model (`openrouter`, `anthropic`,
+    /// `openai`, `google`, `local`, or empty when unknown). Drives
+    /// executor-aware normalization and is shown as secondary detail.
+    pub provider: String,
+    /// Short source/tier label shown as secondary detail
+    /// ("frontier", "mid", "budget", "recent", "endpoint", "curated").
+    pub source: String,
+}
+
+/// A curated, network-free set of popular OpenRouter model routes used to
+/// seed the launcher's model autocomplete (add-model-fuzzy). These are
+/// intentionally NOT in the pricing-bearing model registry (which drives
+/// cost estimation): they exist only so common routes a user is likely to
+/// type — `minimax/minimax-m3`, `qwen/qwen3-coder`, `deepseek/deepseek-v3.2`,
+/// … — are findable by fuzzy search without a credentialed OpenRouter API
+/// call. Remote search stays available via `wg models search`; this list
+/// keeps the hot TUI path local and cache-free.
+pub const CURATED_OPENROUTER_MODELS: &[&str] = &[
+    "minimax/minimax-m3",
+    "qwen/qwen3-coder",
+    "qwen/qwen3-max",
+    "deepseek/deepseek-v3.2",
+    "deepseek/deepseek-r1",
+    "moonshotai/kimi-k2",
+    "x-ai/grok-4",
+    "z-ai/glm-4.6",
+    "anthropic/claude-opus-4-6",
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-5.5",
+    "google/gemini-2.5-pro",
+];
+
+/// Map a user-facing provider/executor prefix (as parsed by
+/// [`parse_model_spec`]) to the registry-style "home" provider used by
+/// [`ModelSuggestion::provider`]. Routing-only prefixes that don't name a
+/// model home (`nex`, `local`, `native`, …) collapse to an empty string so
+/// the nex normalizer treats their bare ids as `nex:<model>`.
+fn registry_provider_from_prefix(prefix: &str) -> String {
+    match prefix {
+        "openrouter" => "openrouter",
+        "claude" => "anthropic",
+        "openai" | "codex" => "openai",
+        "gemini" => "google",
+        _ => "",
+    }
+    .to_string()
+}
+
+/// Short model name: the last `/`-separated segment of an id.
+fn model_short_name(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// Whether a chat PTY pane for `executor` should forward the child's OWN
+/// scroll keys (PageUp/Home/…) into the PTY instead of driving tmux copy-mode.
+///
+/// This is true ONLY for executors that take over the terminal **alternate
+/// screen** (so tmux copy-mode has no scrollback to walk) — currently just
+/// `opencode`. claude / codex / nex keep the tmux copy-mode path, and so do
+/// the prototyped `octomind` / `dexto` REPLs: both were verified to be
+/// line-oriented (no `ESC[?1049h` alt-screen takeover), so their tmux
+/// scrollback works normally — strictly better than OpenCode. Keeping them off
+/// the child-scroll path is what makes their scrolling "not worse than
+/// OpenCode" (prototype-octomind-dexto-chat).
+pub fn executor_uses_child_scroll_keys(executor: &str) -> bool {
+    executor == "opencode"
+}
+
+/// Normalize a selected [`ModelSuggestion`] into the launch spec to persist
+/// for the given `executor` (add-model-fuzzy). This is the single place that
+/// encodes per-executor route conventions:
+/// - `opencode` → OpenCode's `openrouter/<vendor>/<model>` route (reusing
+///   [`workgraph::chat_command::opencode_model_arg`] so the persisted spec and
+///   the launched argv always agree),
+/// - `nex`/`native` → a WG model spec: `openrouter:<vendor>/<model>` for an
+///   OpenRouter/vendor-route model, else `nex:<model>` for a bare id,
+/// - `claude` → `claude:<short>`, `codex` → `codex:<short>`,
+/// - anything else (e.g. `command`) → the id unchanged.
+pub fn normalize_model_for_executor(id: &str, provider: &str, executor: &str) -> String {
+    let id = id.trim();
+    match executor {
+        "opencode" => {
+            workgraph::chat_command::opencode_model_arg(id).unwrap_or_else(|| id.to_string())
+        }
+        "octomind" => {
+            // Octomind shares WG's `provider:route` model spelling, so persist
+            // the `openrouter:<vendor>/<model>` form its `-m` flag consumes.
+            workgraph::chat_command::octomind_model_arg(id).unwrap_or_else(|| id.to_string())
+        }
+        "dexto" => {
+            // Dexto drives OpenRouter via a generated agent YAML; persist the
+            // canonical WG model spec so the YAML and any display agree.
+            if provider == "openrouter" || id.contains('/') {
+                format!(
+                    "openrouter:{}",
+                    id.strip_prefix("openrouter/").unwrap_or(id)
+                )
+            } else {
+                id.to_string()
+            }
+        }
+        "native" | "nex" => {
+            if provider == "openrouter" || id.contains('/') {
+                format!(
+                    "openrouter:{}",
+                    id.strip_prefix("openrouter/").unwrap_or(id)
+                )
+            } else {
+                format!("nex:{}", id)
+            }
+        }
+        "claude" => format!("claude:{}", model_short_name(id)),
+        "codex" => format!("codex:{}", model_short_name(id)),
+        _ => id.to_string(),
+    }
+}
+
+/// fzf-style fuzzy score of `query` against `haystack` (case-insensitive).
+/// The query is split on whitespace into terms; EVERY term must match the
+/// haystack (as a contiguous substring or, failing that, an in-order
+/// subsequence) or `None` is returned. Higher score = better: substring
+/// matches and earlier/adjacent positions rank above scattered
+/// subsequences, and shorter haystacks edge out longer ones on ties. An
+/// empty query matches everything with score 0 (full-list view).
+pub fn fuzzy_match_score(haystack: &str, query: &str) -> Option<i64> {
+    let hay = haystack.to_lowercase();
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let mut total = 0i64;
+    for term in q.split_whitespace() {
+        total += fuzzy_term_score(&hay, term)?;
+    }
+    Some(total)
+}
+
+/// Score a single (already-lowercased) term against an already-lowercased
+/// haystack. Substring match is strongly preferred; otherwise fall back to
+/// an in-order subsequence match.
+fn fuzzy_term_score(hay: &str, term: &str) -> Option<i64> {
+    if term.is_empty() {
+        return Some(0);
+    }
+    if let Some(pos) = hay.find(term) {
+        // Contiguous substring: big base, earlier is better, longer
+        // matched runs are better.
+        return Some(1000 - pos as i64 + (term.chars().count() as i64) * 4);
+    }
+    // Subsequence fallback: every term char must appear in order.
+    let hay_chars: Vec<char> = hay.chars().collect();
+    let mut hi = 0usize;
+    let mut last_pos: Option<usize> = None;
+    let mut score = 0i64;
+    for tc in term.chars() {
+        let mut found = false;
+        while hi < hay_chars.len() {
+            if hay_chars[hi] == tc {
+                if let Some(lp) = last_pos {
+                    if hi == lp + 1 {
+                        score += 5; // reward adjacency
+                    }
+                }
+                last_pos = Some(hi);
+                hi += 1;
+                found = true;
+                break;
+            }
+            hi += 1;
+        }
+        if !found {
+            return None;
+        }
+    }
+    Some(score + 100 - hay_chars.len() as i64)
+}
+
+/// Build the model-autocomplete suggestion list (add-model-fuzzy) from all
+/// local, network-free sources, de-duplicated by id (first occurrence
+/// wins). Order: recent launcher history first (most relevant for the
+/// empty-field view), then the registry (tier-ordered by the caller's
+/// BTreeMap iteration), the curated OpenRouter routes, and finally
+/// configured endpoint default models.
+pub fn build_model_suggestions(
+    config: &Config,
+    registry: &workgraph::models::ModelRegistry,
+    recent_models: &[String],
+) -> Vec<ModelSuggestion> {
+    let mut out: Vec<ModelSuggestion> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    fn push(
+        out: &mut Vec<ModelSuggestion>,
+        seen: &mut std::collections::HashSet<String>,
+        id: String,
+        provider: String,
+        source: &str,
+    ) {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            return;
+        }
+        if !seen.insert(id.to_lowercase()) {
+            return;
+        }
+        out.push(ModelSuggestion {
+            id,
+            provider,
+            source: source.to_string(),
+        });
+    }
+
+    // 1. Recent launcher-history models (parse off any routing prefix).
+    for m in recent_models {
+        let spec = workgraph::config::parse_model_spec(m);
+        let provider = spec
+            .provider
+            .as_deref()
+            .map(registry_provider_from_prefix)
+            .unwrap_or_default();
+        push(&mut out, &mut seen, spec.model_id, provider, "recent");
+    }
+
+    // 2. Model registry (richest: id + provider + tier).
+    for entry in registry.models.values() {
+        push(
+            &mut out,
+            &mut seen,
+            entry.id.clone(),
+            entry.provider.clone(),
+            &entry.tier.to_string(),
+        );
+    }
+
+    // 3. Curated OpenRouter routes (network-free hot-path seeds).
+    for id in CURATED_OPENROUTER_MODELS {
+        push(
+            &mut out,
+            &mut seen,
+            (*id).to_string(),
+            "openrouter".to_string(),
+            "curated",
+        );
+    }
+
+    // 4. Configured endpoint default models.
+    for ep in &config.llm_endpoints.endpoints {
+        if let Some(m) = ep.model.as_deref().filter(|m| !m.is_empty()) {
+            let spec = workgraph::config::parse_model_spec(m);
+            let provider = spec
+                .provider
+                .as_deref()
+                .map(registry_provider_from_prefix)
+                .unwrap_or_else(|| registry_provider_from_prefix(&ep.provider));
+            push(&mut out, &mut seen, spec.model_id, provider, "endpoint");
+        }
+    }
+
+    out
+}
 
 /// State for the full-pane coordinator launcher.
 ///
@@ -1206,17 +1613,39 @@ pub struct LauncherState {
     // ── Add-new-mode state ──
     /// Index into `ADD_NEW_EXECUTOR_CHOICES`.
     pub add_executor_idx: usize,
-    /// User-typed model spec (free text).
+    /// User-typed model spec (free text). Also doubles as the live fuzzy
+    /// query that filters [`LauncherState::model_suggestions`] while the
+    /// Model field is focused (add-model-fuzzy).
     pub add_model: String,
-    /// User-typed endpoint URL (free text). Only relevant when the
-    /// selected Add-new executor is `nex`.
+    /// Model fuzzy-autocomplete suggestions, built from the model registry,
+    /// curated OpenRouter routes, recent launcher history, and configured
+    /// endpoint default models at launcher-open time. Executor-agnostic;
+    /// normalization happens on accept. Empty when no source produced any.
+    pub model_suggestions: Vec<ModelSuggestion>,
+    /// Highlighted row within the *filtered* model suggestion list
+    /// (see [`LauncherState::filtered_model_suggestions`]). Indexes the
+    /// filtered view, not `model_suggestions`; clamped on read.
+    pub model_suggestion_selected: usize,
+    /// User-typed endpoint value (free text). Only relevant when the
+    /// selected Add-new executor is `nex`. Holds either a configured
+    /// endpoint *name* (when accepted from autocomplete) or a raw
+    /// `http(s)://` URL (typed directly). Whatever sits here is what
+    /// the launch persists and what `wg nex -e` receives verbatim.
     pub add_endpoint: String,
+    /// Endpoint autocomplete suggestions, built from configured
+    /// `[[llm_endpoints.endpoints]]` at launcher-open time. Only
+    /// surfaced when the Add-new executor is `nex`. Empty otherwise.
+    pub endpoint_suggestions: Vec<EndpointSuggestion>,
+    /// Highlighted row within the *filtered* endpoint suggestion list
+    /// (see [`LauncherState::filtered_endpoint_suggestions`]). Indexes
+    /// the filtered view, not `endpoint_suggestions`; clamped on read.
+    pub endpoint_suggestion_selected: usize,
 
     // ── Status / IPC flags ──
     /// True between Enter-to-launch and the IPC roundtrip completing.
     /// Closes the input gate (no double-submit, no field edits) and
     /// keeps the pane visible so we don't briefly fall back to the
-    /// previously-active chat while `wg service create-coordinator`
+    /// previously-active chat while `wg chat create --json`
     /// runs on the worker thread. Cleared in `drain_commands` —
     /// success drops the launcher entirely; failure resets this flag
     /// so the user can fix their selection and retry.
@@ -1350,17 +1779,29 @@ pub fn build_codex_chat_pty_args(
 /// path or create a divergent session shape from the working CLI invocation.
 pub fn build_nex_chat_pty_args(chat_model: Option<&str>, endpoint: Option<&str>) -> Vec<String> {
     let mut args = vec!["nex".to_string()];
+    let endpoint = endpoint.filter(|ep| !ep.is_empty());
     if let Some(m) = chat_model.filter(|m| !m.is_empty()) {
-        let spec = workgraph::config::parse_model_spec(m);
-        let model = if spec.model_id.is_empty() {
-            m.to_string()
+        // With NO endpoint, a bare `vendor/model` or `openrouter:` route is an
+        // OpenRouter route: keep the explicit `openrouter:` spec so `wg nex`
+        // targets OpenRouter, never the bare-name oai-compat/local default
+        // (nex-optional-openrouter-endpoint). With an explicit endpoint, strip
+        // the provider prefix — an oai-compat server reads a colon as a
+        // LoRA-adapter reference and 400s otherwise.
+        let normalized = workgraph::config::normalize_bare_openrouter_route(m);
+        let model = if endpoint.is_none() && workgraph::config::model_is_openrouter(&normalized) {
+            normalized
         } else {
-            spec.model_id
+            let spec = workgraph::config::parse_model_spec(m);
+            if spec.model_id.is_empty() {
+                m.to_string()
+            } else {
+                spec.model_id
+            }
         };
         args.push("-m".to_string());
         args.push(model);
     }
-    if let Some(ep) = endpoint.filter(|ep| !ep.is_empty()) {
+    if let Some(ep) = endpoint {
         args.push("-e".to_string());
         args.push(ep.to_string());
     }
@@ -1388,6 +1829,22 @@ pub fn filter_models_for_executor(
     }
     compatible.append(&mut other);
     compatible
+}
+
+/// Ranking boost added to a model suggestion's fuzzy score so models whose
+/// native provider naturally fits the selected executor float to the top of
+/// the dropdown (add-model-fuzzy). Never excludes anything — a non-matching
+/// provider just gets no boost, so any model is still selectable for any
+/// executor (the same permissive stance as [`filter_models_for_executor`]).
+fn executor_model_boost(provider: &str, executor: &str) -> i64 {
+    let fits = match executor {
+        "claude" => provider == "anthropic",
+        "codex" => provider == "openai",
+        // opencode/octomind/dexto/nex/native are OpenRouter-first.
+        "opencode" | "octomind" | "dexto" | "nex" | "native" => provider == "openrouter",
+        _ => false,
+    };
+    if fits { 10 } else { 0 }
 }
 
 impl LauncherState {
@@ -1436,13 +1893,265 @@ impl LauncherState {
         self.add_executor_choice().label == "nex"
     }
 
+    /// True when the Add-new Model field currently resolves to an OpenRouter
+    /// route — either a bare `vendor/model` slug (e.g. `minimax/minimax-m3`)
+    /// or an explicit `openrouter:` spec. For such models the endpoint is
+    /// OPTIONAL: a blank endpoint intentionally defaults to OpenRouter
+    /// (nex-optional-openrouter-endpoint), so the launcher must NOT present
+    /// the endpoint as "required" and SHOULD offer "blank = OpenRouter" as a
+    /// first-class, selectable option (nex-openrouter-default-ui).
+    ///
+    /// Only meaningful for the `nex` executor; mirrors the normalization in
+    /// [`build_nex_chat_pty_args`] so the UI copy matches the launched argv.
+    pub fn add_model_routes_to_openrouter(&self) -> bool {
+        if !self.add_new_show_endpoint() {
+            return false;
+        }
+        let m = self.add_model.trim();
+        if m.is_empty() {
+            return false;
+        }
+        let normalized = workgraph::config::normalize_bare_openrouter_route(m);
+        workgraph::config::model_is_openrouter(&normalized)
+    }
+
+    /// True when the current endpoint text is a raw `http(s)://` URL the
+    /// user is typing directly. In that state autocomplete steps aside
+    /// entirely — no suggestions are shown and accept is a no-op — so a
+    /// custom URL is never overwritten by a named-endpoint match. The
+    /// spec is explicit: "autocomplete must not block custom URLs".
+    pub fn endpoint_input_is_raw_url(&self) -> bool {
+        let t = self.add_endpoint.trim();
+        t.starts_with("http://") || t.starts_with("https://")
+    }
+
+    /// The endpoint suggestions matching the current endpoint text,
+    /// case-insensitively, by name / URL / provider. Returns the full
+    /// list when the field is empty (so the default is reachable on first
+    /// focus) and an empty list when the user is typing a raw URL (so a
+    /// custom URL is never shadowed by suggestions). Only meaningful when
+    /// the Add-new executor is `nex`.
+    pub fn filtered_endpoint_suggestions(&self) -> Vec<EndpointSuggestion> {
+        if !self.add_new_show_endpoint() || self.endpoint_input_is_raw_url() {
+            return Vec::new();
+        }
+        let q = self.add_endpoint.trim().to_lowercase();
+        let mut out: Vec<EndpointSuggestion> = Vec::new();
+        // First-class "blank = OpenRouter default" option for OpenRouter-routed
+        // nex models (nex-openrouter-default-ui). Sits at the top of the list so
+        // it is preselected on first focus; accepting it leaves the endpoint
+        // blank (its name is empty), which routes to OpenRouter with no `-e`.
+        // Surfaced only when the query is empty or matches "openrouter"/"default"
+        // so a specific endpoint search still narrows the list.
+        if self.add_model_routes_to_openrouter()
+            && (q.is_empty() || "openrouter default".contains(&q))
+        {
+            out.push(EndpointSuggestion::openrouter_default());
+        }
+        out.extend(
+            self.endpoint_suggestions
+                .iter()
+                .filter(|s| {
+                    if q.is_empty() {
+                        return true;
+                    }
+                    s.name.to_lowercase().contains(&q)
+                        || s.url
+                            .as_deref()
+                            .is_some_and(|u| u.to_lowercase().contains(&q))
+                        || s.provider.to_lowercase().contains(&q)
+                })
+                .cloned(),
+        );
+        out
+    }
+
+    /// The currently-highlighted endpoint suggestion, clamping the stored
+    /// index into the live filtered view. `None` when there are no
+    /// matching suggestions (e.g. raw-URL entry or no configured
+    /// endpoints).
+    pub fn highlighted_endpoint_suggestion(&self) -> Option<EndpointSuggestion> {
+        let filtered = self.filtered_endpoint_suggestions();
+        if filtered.is_empty() {
+            return None;
+        }
+        let idx = self
+            .endpoint_suggestion_selected
+            .min(filtered.len().saturating_sub(1));
+        filtered.get(idx).cloned()
+    }
+
+    /// Move the endpoint-suggestion highlight by `delta` rows within the
+    /// filtered view, clamped to its bounds. No-op when there are no
+    /// suggestions to navigate.
+    pub fn move_endpoint_suggestion(&mut self, delta: isize) {
+        let len = self.filtered_endpoint_suggestions().len();
+        if len == 0 {
+            self.endpoint_suggestion_selected = 0;
+            return;
+        }
+        let cur = self.endpoint_suggestion_selected.min(len.saturating_sub(1)) as isize;
+        let next = (cur + delta).clamp(0, len as isize - 1);
+        self.endpoint_suggestion_selected = next as usize;
+    }
+
+    /// Accept the highlighted endpoint suggestion: write its *name* into
+    /// the endpoint field. `wg nex -e <name>` resolves a configured name
+    /// just like a URL, so persisting the name keeps the `.chat-N` task,
+    /// CoordinatorState, and Nex argv consistent. Returns `true` when a
+    /// suggestion was accepted, `false` when there was nothing to accept
+    /// (raw-URL entry or empty suggestion list) — the caller then treats
+    /// the keypress as a plain submit/advance.
+    pub fn accept_endpoint_suggestion(&mut self) -> bool {
+        match self.highlighted_endpoint_suggestion() {
+            Some(sug) => {
+                self.add_endpoint = sug.name;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Preselect the default endpoint (or the first one) in the
+    /// suggestion list so it is highlighted the moment the Endpoint field
+    /// is first focused. Leaves the typed text untouched — preselection
+    /// is highlight-only; nothing is written until the user accepts.
+    pub fn preselect_default_endpoint(&mut self) {
+        // For OpenRouter-routed models the synthetic "blank = OpenRouter"
+        // option is prepended at the top of the filtered list, so highlight
+        // it (index 0) — keeping it selected launches against OpenRouter with
+        // no endpoint, the intended default (nex-openrouter-default-ui).
+        if self.add_model_routes_to_openrouter() {
+            self.endpoint_suggestion_selected = 0;
+            return;
+        }
+        let default_idx = self
+            .endpoint_suggestions
+            .iter()
+            .position(|s| s.is_default)
+            .unwrap_or(0);
+        self.endpoint_suggestion_selected = default_idx;
+    }
+
+    /// In Add-new mode: whether the Model field shows fuzzy suggestions.
+    /// Shown for every executor EXCEPT `command` (whose Model field is a raw
+    /// command line), and suppressed while the typed text already looks like
+    /// a deliberate fully-qualified spec (see
+    /// [`model_input_is_explicit_spec`]). (add-model-fuzzy)
+    pub fn add_new_show_model_suggestions(&self) -> bool {
+        if !matches!(self.mode, LauncherMode::AddNew) {
+            return false;
+        }
+        if self.add_executor_choice().internal_executor == "command" {
+            return false;
+        }
+        !self.model_input_is_explicit_spec()
+    }
+
+    /// True when the typed model text already looks like a deliberate,
+    /// fully-qualified spec rather than a search fragment — it carries a
+    /// vendor-route separator (`/`) or a recognized provider/executor prefix
+    /// (`nex:`, `claude:`, `openrouter:`, …). In that state model
+    /// autocomplete steps aside entirely (no dropdown; accept is a no-op) so
+    /// an exact spec the user typed is never overwritten by a fuzzy match —
+    /// the mirror of [`endpoint_input_is_raw_url`]. The spec is explicit:
+    /// "autocomplete must not block unknown/custom models."
+    pub fn model_input_is_explicit_spec(&self) -> bool {
+        let t = self.add_model.trim();
+        if t.is_empty() {
+            return false;
+        }
+        if t.contains('/') {
+            return true;
+        }
+        t.split_once(':')
+            .is_some_and(|(p, _)| workgraph::config::KNOWN_PROVIDERS.contains(&p))
+    }
+
+    /// The model suggestions matching the current Model text, fuzzy-ranked
+    /// (fzf-style) and reordered so models compatible with the selected
+    /// executor float up. Returns the full list when the field is empty (so
+    /// suggestions are reachable on first focus) and an empty list when the
+    /// field is hidden or the user is typing an explicit spec. (add-model-fuzzy)
+    pub fn filtered_model_suggestions(&self) -> Vec<ModelSuggestion> {
+        if !self.add_new_show_model_suggestions() {
+            return Vec::new();
+        }
+        let q = self.add_model.trim();
+        let executor = self.add_executor_choice().internal_executor;
+        let mut scored: Vec<(i64, usize, ModelSuggestion)> = self
+            .model_suggestions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let hay = format!("{} {} {}", s.id, s.provider, s.source);
+                let base = fuzzy_match_score(&hay, q)?;
+                Some((
+                    base + executor_model_boost(&s.provider, executor),
+                    i,
+                    s.clone(),
+                ))
+            })
+            .collect();
+        // Higher score first; original order breaks ties (keeps recent /
+        // registry priority stable for the empty-query view).
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, s)| s).collect()
+    }
+
+    /// The currently-highlighted model suggestion, clamping the stored index
+    /// into the live filtered view. `None` when there are no matches.
+    pub fn highlighted_model_suggestion(&self) -> Option<ModelSuggestion> {
+        let filtered = self.filtered_model_suggestions();
+        if filtered.is_empty() {
+            return None;
+        }
+        let idx = self
+            .model_suggestion_selected
+            .min(filtered.len().saturating_sub(1));
+        filtered.get(idx).cloned()
+    }
+
+    /// Move the model-suggestion highlight by `delta` rows within the
+    /// filtered view, clamped to its bounds. No-op when there is nothing to
+    /// navigate.
+    pub fn move_model_suggestion(&mut self, delta: isize) {
+        let len = self.filtered_model_suggestions().len();
+        if len == 0 {
+            self.model_suggestion_selected = 0;
+            return;
+        }
+        let cur = self.model_suggestion_selected.min(len.saturating_sub(1)) as isize;
+        let next = (cur + delta).clamp(0, len as isize - 1);
+        self.model_suggestion_selected = next as usize;
+    }
+
+    /// Accept the highlighted model suggestion: normalize it for the current
+    /// executor (see [`normalize_model_for_executor`]) and write the result
+    /// into the Model field. Returns `true` when a suggestion was accepted,
+    /// `false` when there was nothing to accept (explicit-spec text or no
+    /// matching suggestion) — the caller then treats the keypress as a plain
+    /// submit/advance, preserving arbitrary free-text model entry.
+    pub fn accept_model_suggestion(&mut self) -> bool {
+        match self.highlighted_model_suggestion() {
+            Some(sug) => {
+                let executor = self.add_executor_choice().internal_executor;
+                self.add_model = normalize_model_for_executor(&sug.id, &sug.provider, executor);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Switch the launcher into Add-new mode. Resets the form fields so
     /// stale state from a previous open doesn't bleed through.
     pub fn enter_add_new(&mut self) {
         self.mode = LauncherMode::AddNew;
         self.add_executor_idx = 0;
         self.add_model.clear();
+        self.model_suggestion_selected = 0;
         self.add_endpoint.clear();
+        self.preselect_default_endpoint();
         self.active_section = LauncherSection::AddNew(AddNewField::Executor);
     }
 
@@ -1472,6 +2181,21 @@ impl LauncherState {
             }
             (LauncherMode::AddNew, _) => LauncherSection::AddNew(AddNewField::Executor),
         };
+        self.preselect_on_endpoint_focus();
+    }
+
+    /// When focus has just landed on the nex Endpoint field, highlight the
+    /// most sensible default suggestion: the synthetic "blank = OpenRouter"
+    /// row for an OpenRouter-routed model, or the configured default endpoint
+    /// otherwise (nex-openrouter-default-ui). No-op for any other field, so
+    /// it's safe to call unconditionally at the tail of section navigation.
+    fn preselect_on_endpoint_focus(&mut self) {
+        if matches!(
+            self.active_section,
+            LauncherSection::AddNew(AddNewField::Endpoint)
+        ) {
+            self.preselect_default_endpoint();
+        }
     }
 
     /// Cycle to the previous form field — inverse of `next_section`.
@@ -1498,6 +2222,7 @@ impl LauncherState {
             }
             (LauncherMode::AddNew, _) => LauncherSection::AddNew(AddNewField::Executor),
         };
+        self.preselect_on_endpoint_focus();
     }
 
     /// Resolve the (executor, model, endpoint) tuple that Launch will
@@ -4009,6 +4734,67 @@ impl Default for LogPaneState {
     }
 }
 
+impl LogPaneState {
+    pub(crate) fn max_scroll(&self) -> usize {
+        self.total_wrapped_lines
+            .saturating_sub(self.viewport_height)
+    }
+
+    fn normalized_scroll(&self) -> usize {
+        let max_scroll = self.max_scroll();
+        if self.auto_tail || self.scroll > max_scroll {
+            max_scroll
+        } else {
+            self.scroll
+        }
+    }
+
+    pub(crate) fn follow_tail_or_clamp(&mut self) {
+        self.scroll = self.normalized_scroll();
+    }
+
+    pub(crate) fn scroll_up(&mut self, amount: usize) {
+        let max_scroll = self.max_scroll();
+        let current = self.normalized_scroll();
+        self.scroll = current.saturating_sub(amount);
+        if max_scroll > 0 && amount > 0 {
+            self.auto_tail = false;
+        }
+    }
+
+    pub(crate) fn scroll_down(&mut self, amount: usize) {
+        let max_scroll = self.max_scroll();
+        let current = self.normalized_scroll();
+        self.scroll = current.saturating_add(amount).min(max_scroll);
+        if self.scroll >= max_scroll {
+            self.auto_tail = true;
+            self.has_new_content = false;
+        }
+    }
+
+    pub(crate) fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+        self.auto_tail = false;
+    }
+
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+        self.auto_tail = true;
+        self.has_new_content = false;
+    }
+
+    pub(crate) fn jump_to_scroll(&mut self, position: usize) {
+        let max_scroll = self.max_scroll();
+        self.scroll = position.min(max_scroll);
+        if self.scroll >= max_scroll {
+            self.auto_tail = true;
+            self.has_new_content = false;
+        } else {
+            self.auto_tail = false;
+        }
+    }
+}
+
 /// State for the Coordinator Log panel (panel 7) — shows daemon activity log.
 pub struct CoordLogState {
     pub scroll: usize,
@@ -5233,6 +6019,10 @@ pub struct VizApp {
     /// Ordered list of coordinator IDs shown as tabs. This is ephemeral TUI
     /// state — closing a tab removes it here without touching the graph task.
     pub active_tabs: Vec<u32>,
+    /// Freshly-created chat whose focus is protected until a graph refresh
+    /// observes it. This covers the create-chat race where IPC returns the new
+    /// cid before the TUI's cached graph/tab data has caught up.
+    pending_new_chat_focus: Option<u32>,
     /// Coordinator IDs the user explicitly closed this session.
     /// Prevents closed tabs from reappearing on graph refresh.
     closed_tabs: std::collections::HashSet<u32>,
@@ -5797,6 +6587,7 @@ impl VizApp {
             },
             active_coordinator_id: 0,
             active_tabs: Vec::new(),
+            pending_new_chat_focus: None,
             closed_tabs: std::collections::HashSet::new(),
             coordinator_chats: HashMap::new(),
             chat: ChatState::default(),
@@ -10263,40 +11054,22 @@ impl VizApp {
 
     /// Scroll log pane up.
     pub fn log_scroll_up(&mut self, amount: usize) {
-        self.log_pane.scroll = self.log_pane.scroll.saturating_sub(amount);
-        // User scrolled up — disable auto-tail.
-        self.log_pane.auto_tail = false;
+        self.log_pane.scroll_up(amount);
     }
 
     /// Scroll log pane down.
     pub fn log_scroll_down(&mut self, amount: usize) {
-        let max_scroll = self
-            .log_pane
-            .total_wrapped_lines
-            .saturating_sub(self.log_pane.viewport_height);
-        self.log_pane.scroll = (self.log_pane.scroll + amount).min(max_scroll);
-        // If we reached the bottom, resume auto-tail and clear "new output" indicator.
-        if self.log_pane.scroll >= max_scroll {
-            self.log_pane.auto_tail = true;
-            self.log_pane.has_new_content = false;
-        }
+        self.log_pane.scroll_down(amount);
     }
 
     /// Scroll log pane to the very top.
     pub fn log_scroll_to_top(&mut self) {
-        self.log_pane.scroll = 0;
-        self.log_pane.auto_tail = false;
+        self.log_pane.scroll_to_top();
     }
 
     /// Scroll log pane to the very bottom.
     pub fn log_scroll_to_bottom(&mut self) {
-        let max_scroll = self
-            .log_pane
-            .total_wrapped_lines
-            .saturating_sub(self.log_pane.viewport_height);
-        self.log_pane.scroll = max_scroll;
-        self.log_pane.auto_tail = true;
-        self.log_pane.has_new_content = false;
+        self.log_pane.scroll_to_bottom();
     }
 
     /// Toggle log pane JSON mode.
@@ -10841,6 +11614,7 @@ impl VizApp {
             },
             active_coordinator_id: 0,
             active_tabs: Vec::new(),
+            pending_new_chat_focus: None,
             closed_tabs: std::collections::HashSet::new(),
             coordinator_chats: HashMap::new(),
             chat: ChatState::default(),
@@ -11294,6 +12068,30 @@ impl VizApp {
         }
     }
 
+    fn parse_first_json_value(output: &str) -> Option<serde_json::Value> {
+        for (start, _) in output.match_indices('{') {
+            let mut stream = serde_json::Deserializer::from_str(&output[start..])
+                .into_iter::<serde_json::Value>();
+            if let Some(Ok(value)) = stream.next() {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn parse_created_coordinator_id(output: &str) -> Option<u32> {
+        let data = Self::parse_first_json_value(output)?;
+        data.get("coordinator_id")
+            .or_else(|| data.get("chat_id"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .or_else(|| {
+                data.get("task_id")
+                    .and_then(|value| value.as_str())
+                    .and_then(workgraph::chat_id::parse_chat_task_id)
+            })
+    }
+
     /// Drain any completed background commands and apply their effects.
     /// Returns `true` if any commands were processed.
     pub fn drain_commands(&mut self) -> bool {
@@ -11392,31 +12190,10 @@ impl VizApp {
                         // and new-chat-ready — fix-tui-new symptom 2.
                         self.launcher = None;
                         self.input_mode = InputMode::Normal;
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&result.output)
-                        {
-                            if let Some(cid) = data["coordinator_id"].as_u64() {
-                                let cid = cid as u32;
-                                self.force_refresh();
-                                // Eagerly record the new tab BEFORE
-                                // switching focus. Without this, a
-                                // subsequent `sync_active_tabs_from_graph`
-                                // — fired by the trailing force_refresh
-                                // below or any later refresh — sees
-                                // `active_coordinator_id` missing from
-                                // `active_tabs` and (pre-fix) flipped
-                                // focus back to `active_tabs[0]`, the
-                                // previous chat. fix-new-chat-4.
-                                if !self.active_tabs.contains(&cid) {
-                                    self.active_tabs.push(cid);
-                                }
-                                self.closed_tabs.remove(&cid);
-                                self.switch_coordinator(cid);
-                                self.right_panel_tab = RightPanelTab::Chat;
-                                self.push_toast(
-                                    format!("Chat {} created", cid),
-                                    ToastSeverity::Info,
-                                );
-                            }
+                        if let Some(cid) = Self::parse_created_coordinator_id(&result.output) {
+                            self.force_refresh();
+                            self.focus_newly_created_chat(cid);
+                            self.push_toast(format!("Chat {} created", cid), ToastSeverity::Info);
                         } else {
                             self.push_toast("New chat created".to_string(), ToastSeverity::Info);
                         }
@@ -13123,11 +13900,7 @@ impl VizApp {
             );
         }
         // Save TUI focus state.
-        let open_tabs: Vec<String> = self
-            .list_coordinator_ids_and_labels()
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect();
+        let open_tabs = self.open_tab_labels_for_persistence();
         save_tui_state(
             &self.workgraph_dir,
             self.active_coordinator_id,
@@ -13139,17 +13912,33 @@ impl VizApp {
     /// Persist the current tab list and active tab to tui-state.json.
     /// Best-effort: failure logs a warning but doesn't block operation.
     pub fn persist_tab_state(&self) {
-        let open_tabs: Vec<String> = self
-            .list_coordinator_ids_and_labels()
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect();
+        let open_tabs = self.open_tab_labels_for_persistence();
         save_tui_state(
             &self.workgraph_dir,
             self.active_coordinator_id,
             &self.right_panel_tab,
             &open_tabs,
         );
+    }
+
+    fn open_tab_labels_for_persistence(&self) -> Vec<String> {
+        if self.active_tabs.is_empty() {
+            return self
+                .list_coordinator_ids_and_labels()
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect();
+        }
+        self.active_tabs
+            .iter()
+            .filter(|&&id| !self.closed_tabs.contains(&id))
+            .map(|&id| {
+                self.cached_coordinator_id_set
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| workgraph::chat_id::format_chat_task_id(id))
+            })
+            .collect()
     }
 
     /// Load the next page of older chat messages for the active coordinator.
@@ -13667,8 +14456,15 @@ impl VizApp {
         // release and swaps the observer pane for an owner pane
         // when it happens.
         if self.chat_pty_mode && self.chat_pty_observer {
-            let task_id = workgraph::chat_id::format_chat_task_id(self.active_coordinator_id);
-            let chat_dir = self.workgraph_dir.join("chat").join(&task_id);
+            // Resolve through the session registry using the dot-less
+            // `chat-N` ref the handler runs under: the live handler holds
+            // its lock/marker under the UUID session dir, not the literal
+            // `chat/.chat-N` join. Writing to the literal path would leave a
+            // marker the handler never sees (and never cleans up).
+            // `request_release` records the live holder's PID so only that
+            // handler generation acts on it.
+            let chat_ref = workgraph::chat_id::format_chat_session_ref(self.active_coordinator_id);
+            let chat_dir = workgraph::chat::chat_dir_for_ref(&self.workgraph_dir, &chat_ref);
             if let Err(e) = workgraph::session_lock::request_release(&chat_dir) {
                 eprintln!("[tui] failed to write release marker for takeover: {}", e);
             } else {
@@ -13894,9 +14690,36 @@ impl VizApp {
         }
     }
 
+    /// Focus a chat created by the TUI launcher immediately after the IPC
+    /// success result is observed. The graph and cached tab metadata can lag
+    /// this result by one or more refresh ticks, so this eagerly seeds every
+    /// focus surface that the chat tab renderer and key router consult.
+    fn focus_newly_created_chat(&mut self, cid: u32) {
+        self.pending_new_chat_focus = Some(cid);
+        self.closed_tabs.remove(&cid);
+        if !self.active_tabs.contains(&cid) {
+            self.active_tabs.push(cid);
+        }
+        self.cached_coordinator_id_set
+            .entry(cid)
+            .or_insert_with(|| workgraph::chat_id::format_chat_task_id(cid));
+        self.rebuild_active_tab_entries_from_cache();
+
+        self.right_panel_tab = RightPanelTab::Chat;
+        self.switch_coordinator(cid);
+        self.focused_panel = FocusedPanel::RightPanel;
+        self.rebuild_active_tab_entries_from_cache();
+    }
+
     /// Switch to a different coordinator session.
     /// Saves the current chat state to the coordinator_chats map and loads the target.
     pub fn switch_coordinator(&mut self, target_id: u32) {
+        if self
+            .pending_new_chat_focus
+            .is_some_and(|pending| pending != target_id)
+        {
+            self.pending_new_chat_focus = None;
+        }
         if target_id == self.active_coordinator_id {
             return;
         }
@@ -14281,12 +15104,27 @@ impl VizApp {
                             .unwrap_or_else(|| config.agent.model.clone())
                     });
                     let endpoint = chat_endpoint.clone().or_else(|| {
-                        config
-                            .llm_endpoints
-                            .endpoints
-                            .iter()
-                            .find(|e| e.is_default)
-                            .and_then(|e| e.url.clone())
+                        // Blank endpoint + an OpenRouter model → route to
+                        // OpenRouter intentionally (nex-optional-openrouter-
+                        // endpoint). Do NOT fall back to the local/default
+                        // endpoint URL — that silently sends an OpenRouter
+                        // model to a local server. The model is normalized to
+                        // an explicit `openrouter:` spec in
+                        // build_nex_chat_pty_args, so nex resolves OpenRouter
+                        // on its own.
+                        let or_route = workgraph::config::model_is_openrouter(
+                            &workgraph::config::normalize_bare_openrouter_route(&model),
+                        );
+                        if or_route {
+                            None
+                        } else {
+                            config
+                                .llm_endpoints
+                                .endpoints
+                                .iter()
+                                .find(|e| e.is_default)
+                                .and_then(|e| e.url.clone())
+                        }
                     });
                     let args = build_nex_chat_pty_args(Some(&model), endpoint.as_deref());
                     let project_root = self
@@ -14385,6 +15223,77 @@ impl VizApp {
                         Some(chat_dir.as_path()),
                     );
                     ("codex".to_string(), args, Some(project_root))
+                }
+                "opencode" => {
+                    let project_root = self
+                        .workgraph_dir
+                        .parent()
+                        .unwrap_or(&self.workgraph_dir)
+                        .to_path_buf();
+                    let mut args: Vec<String> = Vec::new();
+                    if let Some(model_arg) = chat_model
+                        .as_deref()
+                        .and_then(workgraph::chat_command::opencode_model_arg)
+                    {
+                        args.push("--model".to_string());
+                        args.push(model_arg);
+                    }
+                    ("opencode".to_string(), args, Some(project_root))
+                }
+                "octomind" => {
+                    // Octomind's interactive `run` REPL is line-oriented (NOT
+                    // alt-screen, verified), so tmux scrollback works without
+                    // the OpenCode child-scroll workaround. `-m` takes WG's
+                    // `openrouter:<vendor>/<model>` spelling verbatim, and
+                    // `-n <session>` resumes the named session if it already
+                    // exists — mapping onto WG chat continuity across relaunch.
+                    let project_root = self
+                        .workgraph_dir
+                        .parent()
+                        .unwrap_or(&self.workgraph_dir)
+                        .to_path_buf();
+                    let mut args = vec!["run".to_string()];
+                    if let Some(model_arg) = chat_model
+                        .as_deref()
+                        .and_then(workgraph::chat_command::octomind_model_arg)
+                    {
+                        args.push("-m".to_string());
+                        args.push(model_arg);
+                    }
+                    args.push("-n".to_string());
+                    args.push(chat_ref.clone());
+                    args.push("--sandbox".to_string());
+                    ("octomind".to_string(), args, Some(project_root))
+                }
+                "dexto" => {
+                    // Dexto's --model flag rejects provider/model OpenRouter
+                    // routes, so WG pins the typed model through a generated
+                    // per-chat agent YAML (provider: openrouter). Its Ink CLI is
+                    // also NOT alt-screen (verified), so tmux scrollback works.
+                    let project_root = self
+                        .workgraph_dir
+                        .parent()
+                        .unwrap_or(&self.workgraph_dir)
+                        .to_path_buf();
+                    let agent_path = match workgraph::chat_command::write_dexto_agent_config(
+                        &chat_dir,
+                        chat_model.as_deref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "[tui] failed to write dexto agent config in {}: {e}",
+                                chat_dir.display()
+                            );
+                            return;
+                        }
+                    };
+                    let args = vec![
+                        "--agent".to_string(),
+                        agent_path.display().to_string(),
+                        "--auto-approve".to_string(),
+                    ];
+                    ("dexto".to_string(), args, Some(project_root))
                 }
                 _ => {
                     // Unknown executor — leave file-tailing path in charge.
@@ -14535,7 +15444,7 @@ impl VizApp {
             )
         };
         match spawn_result {
-            Ok(pane) => {
+            Ok(mut pane) => {
                 // Record spawn info for use in the death panel if this pane later exits.
                 if let Some(cid) = pending
                     .task_id
@@ -14545,6 +15454,16 @@ impl VizApp {
                     let spawn_cmd = format!("{} {}", pending.bin, pending.args.join(" "));
                     self.chat_last_spawn_info
                         .insert(cid, (pending.executor.clone(), spawn_cmd));
+                }
+                // OpenCode runs its own full-screen alt-screen TUI that owns
+                // its message-history scrollback. tmux copy-mode can't walk an
+                // alt-screen child's (non-existent) history, so WG's scroll
+                // controls must forward OpenCode's own scroll keys into the
+                // PTY instead. Executor-scoped: claude/codex/nex — and the
+                // line-oriented octomind/dexto REPLs — keep the tmux copy-mode
+                // path (fix-opencode-tui, prototype-octomind-dexto-chat).
+                if executor_uses_child_scroll_keys(&pending.executor) {
+                    pane.set_child_scroll_keys(true);
                 }
                 self.task_panes.insert(pending.task_id, pane);
                 self.chat_pty_mode = true;
@@ -14786,6 +15705,28 @@ impl VizApp {
             return;
         }
 
+        // Union the effective (merged) endpoints with the *global* config's
+        // endpoints so globally-configured endpoint names are selectable in the
+        // picker even when this project hasn't opted into global endpoint
+        // inheritance (nex-openrouter-default-ui). Project-local entries win.
+        let global_config = Config::load_global().ok().flatten();
+        let endpoint_suggestions =
+            build_endpoint_suggestions_with_global(&config, global_config.as_ref());
+        // Preselect the default endpoint up front so it is already
+        // highlighted if/when the user reaches the nex Endpoint field.
+        let endpoint_suggestion_selected = endpoint_suggestions
+            .iter()
+            .position(|s| s.is_default)
+            .unwrap_or(0);
+
+        // Build the model fuzzy-autocomplete suggestions from local,
+        // network-free sources (add-model-fuzzy): registry + curated
+        // OpenRouter routes + recent launcher history + endpoint defaults.
+        let registry =
+            workgraph::models::ModelRegistry::load(&self.workgraph_dir).unwrap_or_default();
+        let recent_models = workgraph::launcher_history::recent_models(20).unwrap_or_default();
+        let model_suggestions = build_model_suggestions(&config, &registry, &recent_models);
+
         self.launcher = Some(LauncherState {
             mode: LauncherMode::Default,
             active_section: LauncherSection::Defaults,
@@ -14794,7 +15735,11 @@ impl VizApp {
             default_selected: 0,
             add_executor_idx: 0,
             add_model: String::new(),
+            model_suggestions,
+            model_suggestion_selected: 0,
             add_endpoint: String::new(),
+            endpoint_suggestions,
+            endpoint_suggestion_selected,
             creating: false,
             last_error: None,
         });
@@ -14863,7 +15808,11 @@ impl VizApp {
             return;
         }
 
-        let mut args = vec!["service".to_string(), "create-coordinator".to_string()];
+        let mut args = vec![
+            "chat".to_string(),
+            "create".to_string(),
+            "--json".to_string(),
+        ];
 
         if !name.is_empty() {
             args.push("--name".to_string());
@@ -14919,7 +15868,11 @@ impl VizApp {
 
     /// Create a coordinator by name (used for auto-creation on first-use).
     pub fn create_coordinator(&mut self, name: Option<String>) {
-        let mut args = vec!["service".to_string(), "create-coordinator".to_string()];
+        let mut args = vec![
+            "chat".to_string(),
+            "create".to_string(),
+            "--json".to_string(),
+        ];
         if let Some(n) = name {
             let name_trimmed = n.trim().to_string();
             if !name_trimmed.is_empty() {
@@ -15399,10 +16352,17 @@ impl VizApp {
     /// the 2 MB+ `graph.jsonl` on every frame (the original 55 % CPU bug).
     pub fn refresh_chat_tab_caches(&mut self, graph: &workgraph::graph::WorkGraph) {
         let coordinator_entries = Self::list_coordinator_ids_and_labels_from_graph(graph);
+        let pending_seen_in_graph = self
+            .pending_new_chat_focus
+            .is_some_and(|pending| coordinator_entries.iter().any(|(id, _)| *id == pending));
         self.cached_coordinator_id_set = coordinator_entries
             .iter()
             .map(|(id, label)| (*id, label.clone()))
             .collect();
+        self.protect_pending_new_chat_focus_in_cache();
+        if pending_seen_in_graph {
+            self.pending_new_chat_focus = None;
+        }
         self.rebuild_active_tab_entries_from_cache();
         self.cached_user_board_entries = Self::list_user_board_entries_from_graph(graph);
     }
@@ -15421,9 +16381,28 @@ impl VizApp {
             .filter_map(|&id| {
                 self.cached_coordinator_id_set
                     .get(&id)
-                    .map(|label| (id, label.clone()))
+                    .cloned()
+                    .or_else(|| {
+                        (self.pending_new_chat_focus == Some(id)
+                            && self.active_coordinator_id == id
+                            && !self.closed_tabs.contains(&id))
+                        .then(|| workgraph::chat_id::format_chat_task_id(id))
+                    })
+                    .map(|label| (id, label))
             })
             .collect();
+    }
+
+    fn protect_pending_new_chat_focus_in_cache(&mut self) {
+        let Some(cid) = self.pending_new_chat_focus else {
+            return;
+        };
+        if cid != self.active_coordinator_id || self.closed_tabs.contains(&cid) {
+            return;
+        }
+        self.cached_coordinator_id_set
+            .entry(cid)
+            .or_insert_with(|| workgraph::chat_id::format_chat_task_id(cid));
     }
 
     /// Count chats that occupy a slot toward `coordinator.max_coordinators`.
@@ -15524,10 +16503,24 @@ impl VizApp {
     ///   - Remove tabs for chats that no longer exist (abandoned/archived).
     pub fn sync_active_tabs_from_graph(&mut self) {
         let entries = self.list_coordinator_ids_and_labels(); // canonical labels, sorted
-        let current: std::collections::HashMap<u32, String> = entries
+        let pending_seen_in_graph = self
+            .pending_new_chat_focus
+            .is_some_and(|pending| entries.iter().any(|(id, _)| *id == pending));
+        let mut current: std::collections::HashMap<u32, String> = entries
             .iter()
             .map(|(id, label)| (*id, label.clone()))
             .collect();
+        if let Some(cid) = self.pending_new_chat_focus
+            && cid == self.active_coordinator_id
+            && !self.closed_tabs.contains(&cid)
+        {
+            current
+                .entry(cid)
+                .or_insert_with(|| workgraph::chat_id::format_chat_task_id(cid));
+        }
+        if pending_seen_in_graph {
+            self.pending_new_chat_focus = None;
+        }
         let sorted_ids: Vec<u32> = entries.iter().map(|(id, _)| *id).collect();
         // Add newly-appeared chats in sorted order so the tab bar is stable
         for &id in &sorted_ids {
@@ -15569,6 +16562,9 @@ impl VizApp {
     pub fn close_tab(&mut self, cid: u32) {
         self.active_tabs.retain(|&id| id != cid);
         self.closed_tabs.insert(cid);
+        if self.pending_new_chat_focus == Some(cid) {
+            self.pending_new_chat_focus = None;
+        }
         if self.active_coordinator_id == cid {
             if let Some(&next) = self.active_tabs.first() {
                 self.switch_coordinator(next);
@@ -24257,7 +25253,11 @@ mod tui_chat_tests {
             default_selected: 0,
             add_executor_idx: 0,
             add_model: String::new(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
             add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
             creating: true,
             last_error: None,
         });
@@ -24267,7 +25267,15 @@ mod tui_chat_tests {
         app.cmd_tx
             .send(CommandResult {
                 success: true,
-                output: r#"{"coordinator_id": 1}"#.to_string(),
+                output: concat!(
+                    "{\n",
+                    "  \"chat_id\": 1,\n",
+                    "  \"coordinator_id\": 1,\n",
+                    "  \"task_id\": \".chat-1\"\n",
+                    "}\n",
+                    "warning: 'wg service create-chat' is deprecated; use 'wg chat create' instead.\n",
+                )
+                .to_string(),
                 effect: CommandEffect::CreateCoordinator,
             })
             .expect("cmd channel should accept send");
@@ -24336,7 +25344,11 @@ mod tui_chat_tests {
             default_selected: 0,
             add_executor_idx: 0,
             add_model: String::new(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
             add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
             creating: true,
             last_error: None,
         });
@@ -24370,6 +25382,87 @@ mod tui_chat_tests {
         assert_eq!(app.input_mode, InputMode::Normal);
     }
 
+    /// Regression for fix-tui-new-2: the active tab cache can be refreshed
+    /// from a stale graph after the create-chat result has already focused
+    /// the new cid. That stale cache must not hide the new active tab, move
+    /// focus back to the old chat, or persist an open-tab list that omits the
+    /// newly-created chat.
+    #[test]
+    fn drain_commands_create_coordinator_preserves_new_chat_focus_through_stale_cache_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let (viz, wg_dir) = setup_workgraph_with_coordinators(&tmp, &[0]);
+
+        let mut app = build_test_app(&viz, &wg_dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.cmd_tx = tx;
+        app.cmd_rx = rx;
+        app.active_coordinator_id = 0;
+        app.active_tabs = vec![0];
+        app.launcher = Some(LauncherState {
+            mode: LauncherMode::Default,
+            active_section: LauncherSection::Defaults,
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 0,
+            add_model: String::new(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
+            add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
+            creating: true,
+            last_error: None,
+        });
+        app.input_mode = InputMode::Launcher;
+
+        app.cmd_tx
+            .send(CommandResult {
+                success: true,
+                output: r#"{"coordinator_id": 1}"#.to_string(),
+                effect: CommandEffect::CreateCoordinator,
+            })
+            .expect("cmd channel should accept send");
+
+        app.drain_commands();
+
+        let stale_graph = workgraph::parser::load_graph(&wg_dir.join("graph.jsonl"))
+            .expect("stale graph fixture should load");
+        app.refresh_chat_tab_caches(&stale_graph);
+        app.sync_active_tabs_from_graph();
+
+        assert_eq!(
+            app.active_coordinator_id, 1,
+            "stale graph/cache refreshes must not restore focus to the previous chat"
+        );
+        assert_eq!(
+            app.right_panel_tab,
+            RightPanelTab::Chat,
+            "new-chat focus must stay on the Chat pane"
+        );
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "keyboard focus must move to the freshly-created chat pane"
+        );
+        assert!(
+            app.cached_chat_tab_entries
+                .iter()
+                .any(|(cid, label)| *cid == 1 && label == ".chat-1"),
+            "cached_chat_tab_entries must keep the freshly-created active tab visible while graph.jsonl lags: {:?}",
+            app.cached_chat_tab_entries
+        );
+
+        let saved = load_tui_state(&wg_dir).expect("create focus should persist TUI state");
+        assert_eq!(saved.active_coordinator_id, 1);
+        assert_eq!(saved.active, ".chat-1");
+        assert!(
+            saved.open_tabs.iter().any(|tab| tab == ".chat-1"),
+            "persisted open_tabs must include the new chat even when graph cache is stale: {:?}",
+            saved.open_tabs
+        );
+    }
+
     /// Regression lock: when the IPC FAILS, the launcher must stay
     /// visible AND `creating` must reset, so the user can fix their
     /// selection (e.g. invalid model name, bad endpoint) and retry
@@ -24393,7 +25486,11 @@ mod tui_chat_tests {
             default_selected: 0,
             add_executor_idx: 0,
             add_model: String::new(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
             add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
             creating: true,
             last_error: None,
         });
@@ -25957,7 +27054,11 @@ mod launcher_redesign_tests {
             default_selected: 0,
             add_executor_idx: 0,
             add_model: String::new(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
             add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
             creating: false,
             last_error: None,
         }
@@ -26022,20 +27123,107 @@ mod launcher_redesign_tests {
         state.mode = LauncherMode::AddNew;
         // claude (idx 0)
         state.add_executor_idx = 0;
-        assert!(!state.add_new_show_endpoint());
+        assert!(
+            !state.add_new_show_endpoint(),
+            "claude must never show an endpoint field"
+        );
         // codex (idx 1)
         state.add_executor_idx = 1;
-        assert!(!state.add_new_show_endpoint());
-        // nex (idx 2)
+        assert!(
+            !state.add_new_show_endpoint(),
+            "codex must never show an endpoint field"
+        );
+        // opencode (idx 2)
         state.add_executor_idx = 2;
+        assert!(
+            !state.add_new_show_endpoint(),
+            "opencode must never show an endpoint field"
+        );
+        // nex (idx 3)
+        state.add_executor_idx = 3;
         assert!(state.add_new_show_endpoint());
+        // octomind / dexto are OpenRouter-first (model route selects the
+        // provider) → no endpoint field, like opencode.
+        let octomind_idx = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .position(|c| c.label == "octomind")
+            .unwrap();
+        state.add_executor_idx = octomind_idx;
+        assert!(
+            !state.add_new_show_endpoint(),
+            "octomind must never show an endpoint field"
+        );
+        let dexto_idx = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .position(|c| c.label == "dexto")
+            .unwrap();
+        state.add_executor_idx = dexto_idx;
+        assert!(
+            !state.add_new_show_endpoint(),
+            "dexto must never show an endpoint field"
+        );
+    }
+
+    #[test]
+    fn add_new_octomind_resolves_model_without_endpoint() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .position(|c| c.label == "octomind")
+            .unwrap();
+        // Bare OpenRouter route typed by the user — must be preserved as the
+        // octomind `openrouter:<vendor>/<model>` spec, never a default.
+        state.add_model = "minimax/minimax-m3".into();
+        state.add_endpoint = "https://stale.example".into();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "octomind");
+        assert_eq!(model.as_deref(), Some("minimax/minimax-m3"));
+        assert!(endpoint.is_none(), "octomind must never carry an endpoint");
+    }
+
+    #[test]
+    fn add_new_dexto_resolves_model_without_endpoint() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .position(|c| c.label == "dexto")
+            .unwrap();
+        state.add_model = "minimax/minimax-m3".into();
+        state.add_endpoint = "https://stale.example".into();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "dexto");
+        assert_eq!(model.as_deref(), Some("minimax/minimax-m3"));
+        assert!(endpoint.is_none(), "dexto must never carry an endpoint");
+    }
+
+    #[test]
+    fn add_new_nex_blank_endpoint_openrouter_model_resolves_without_endpoint() {
+        // nex-optional-openrouter-endpoint: the endpoint is OPTIONAL for nex.
+        // Selecting/typing an OpenRouter model and leaving the endpoint blank
+        // resolves to (native, model, None) — no endpoint required, no stale
+        // default injected.
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 3; // nex
+        state.add_model = "minimax/minimax-m3".into();
+        state.add_endpoint = "".into(); // blank — first-class option
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "native");
+        assert_eq!(model.as_deref(), Some("minimax/minimax-m3"));
+        assert!(
+            endpoint.is_none(),
+            "blank endpoint for an OpenRouter nex model must resolve to no endpoint, got {:?}",
+            endpoint
+        );
     }
 
     #[test]
     fn add_new_with_nex_resolves_with_endpoint() {
         let mut state = make_state();
         state.mode = LauncherMode::AddNew;
-        state.add_executor_idx = 2; // nex
+        state.add_executor_idx = 3; // nex (now at index 3 after opencode)
         state.add_model = "qwen3-coder".into();
         state.add_endpoint = "https://lambda01.tail334fe6.ts.net:30000".into();
         let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
@@ -26080,7 +27268,12 @@ mod launcher_redesign_tests {
     fn add_new_custom_command_resolves_command_line() {
         let mut state = make_state();
         state.mode = LauncherMode::AddNew;
-        state.add_executor_idx = 3; // Custom Command
+        // Look up Custom Command's index so adding executors before it
+        // (octomind/dexto) doesn't silently retarget this test.
+        state.add_executor_idx = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .position(|c| c.label == "Custom Command")
+            .unwrap();
         state.add_model = "tail -f /tmp/test.log".into();
         let (executor, command, endpoint) = state.resolved_launch_args().unwrap();
         assert_eq!(executor, "command");
@@ -26089,10 +27282,36 @@ mod launcher_redesign_tests {
     }
 
     #[test]
+    fn add_new_with_opencode_resolves_without_endpoint() {
+        let mut state = make_state();
+        state.mode = LauncherMode::AddNew;
+        state.add_executor_idx = 2; // opencode
+        state.add_model = "opencode:openrouter/stepfun/step-3.7-flash".into();
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "opencode");
+        assert_eq!(
+            model.as_deref(),
+            Some("opencode:openrouter/stepfun/step-3.7-flash")
+        );
+        assert!(endpoint.is_none(), "opencode must never carry an endpoint");
+    }
+
+    #[test]
     fn add_new_executor_choices_match_spec() {
         // The dialog offers built-in LLM presets plus a generic command pane.
         let labels: Vec<_> = ADD_NEW_EXECUTOR_CHOICES.iter().map(|c| c.label).collect();
-        assert_eq!(labels, vec!["claude", "codex", "nex", "Custom Command"]);
+        assert_eq!(
+            labels,
+            vec![
+                "claude",
+                "codex",
+                "opencode",
+                "nex",
+                "octomind",
+                "dexto",
+                "Custom Command"
+            ]
+        );
         // nex must lower to internal "native" — that's the executor
         // handler name the dispatch layer uses.
         let nex = ADD_NEW_EXECUTOR_CHOICES
@@ -26100,6 +27319,11 @@ mod launcher_redesign_tests {
             .find(|c| c.label == "nex")
             .unwrap();
         assert_eq!(nex.internal_executor, "native");
+        let opencode = ADD_NEW_EXECUTOR_CHOICES
+            .iter()
+            .find(|c| c.label == "opencode")
+            .unwrap();
+        assert_eq!(opencode.internal_executor, "opencode");
         let command = ADD_NEW_EXECUTOR_CHOICES
             .iter()
             .find(|c| c.label == "Custom Command")
@@ -26135,13 +27359,862 @@ mod launcher_redesign_tests {
     fn next_section_add_new_includes_endpoint_for_nex() {
         let mut state = make_state();
         state.mode = LauncherMode::AddNew;
-        state.add_executor_idx = 2; // nex
+        state.add_executor_idx = 3; // nex (now at index 3 after opencode insertion)
         state.active_section = LauncherSection::AddNew(AddNewField::Model);
         state.next_section();
         assert_eq!(
             state.active_section,
             LauncherSection::AddNew(AddNewField::Endpoint),
             "nex executor: Tab from Model goes through the Endpoint field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod launcher_endpoint_autocomplete_tests {
+    use super::{
+        AddNewField, EndpointSuggestion, LauncherMode, LauncherSection, LauncherState,
+        build_endpoint_suggestions, build_endpoint_suggestions_with_global,
+    };
+    use workgraph::config::{Config, EndpointConfig};
+
+    fn ep(name: &str, url: Option<&str>, provider: &str, is_default: bool) -> EndpointSuggestion {
+        EndpointSuggestion {
+            name: name.to_string(),
+            url: url.map(String::from),
+            provider: provider.to_string(),
+            is_default,
+        }
+    }
+
+    fn config_with_endpoints(eps: Vec<EndpointConfig>) -> Config {
+        let mut config = Config::default();
+        config.llm_endpoints.endpoints = eps;
+        config
+    }
+
+    fn endpoint_cfg(name: &str, url: &str, provider: &str, is_default: bool) -> EndpointConfig {
+        EndpointConfig {
+            name: name.to_string(),
+            provider: provider.to_string(),
+            url: Some(url.to_string()),
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            api_key_env: None,
+            api_key_ref: None,
+            is_default,
+            context_window: None,
+        }
+    }
+
+    /// A nex-mode launcher state preloaded with the given suggestions.
+    fn nex_state(suggestions: Vec<EndpointSuggestion>) -> LauncherState {
+        LauncherState {
+            mode: LauncherMode::AddNew,
+            active_section: LauncherSection::AddNew(AddNewField::Endpoint),
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: 3, // nex
+            add_model: "qwen3-coder".into(),
+            model_suggestions: Vec::new(),
+            model_suggestion_selected: 0,
+            add_endpoint: String::new(),
+            endpoint_suggestions: suggestions,
+            endpoint_suggestion_selected: 0,
+            creating: false,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn build_suggestions_maps_config_endpoints_in_order() {
+        let config = config_with_endpoints(vec![
+            endpoint_cfg("local", "http://127.0.0.1:8088", "local", false),
+            endpoint_cfg("lambda", "https://lambda01:30000", "openrouter", true),
+        ]);
+        let sug = build_endpoint_suggestions(&config);
+        assert_eq!(sug.len(), 2);
+        assert_eq!(
+            sug[0],
+            ep("local", Some("http://127.0.0.1:8088"), "local", false)
+        );
+        assert_eq!(
+            sug[1],
+            ep("lambda", Some("https://lambda01:30000"), "openrouter", true)
+        );
+    }
+
+    #[test]
+    fn build_suggestions_empty_when_no_endpoints() {
+        let config = Config::default();
+        assert!(build_endpoint_suggestions(&config).is_empty());
+    }
+
+    #[test]
+    fn filtered_returns_all_when_empty_query() {
+        let state = nex_state(vec![
+            ep("local", Some("http://a"), "local", false),
+            ep("lambda", Some("http://b"), "openrouter", true),
+        ]);
+        assert_eq!(state.filtered_endpoint_suggestions().len(), 2);
+    }
+
+    #[test]
+    fn filtered_matches_name_url_and_provider_case_insensitively() {
+        let mut state = nex_state(vec![
+            ep("local-gpu", Some("http://127.0.0.1:8088"), "local", false),
+            ep("lambda", Some("https://lambda01:30000"), "openrouter", true),
+        ]);
+        // by name
+        state.add_endpoint = "LAMB".into();
+        let f = state.filtered_endpoint_suggestions();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "lambda");
+        // by provider
+        state.add_endpoint = "openrouter".into();
+        assert_eq!(state.filtered_endpoint_suggestions()[0].name, "lambda");
+        // by url fragment
+        state.add_endpoint = "8088".into();
+        assert_eq!(state.filtered_endpoint_suggestions()[0].name, "local-gpu");
+    }
+
+    #[test]
+    fn filtered_suppressed_for_raw_url_entry() {
+        let mut state = nex_state(vec![ep(
+            "local",
+            Some("http://127.0.0.1:8088"),
+            "local",
+            true,
+        )]);
+        state.add_endpoint = "http://my-custom:9000".into();
+        assert!(state.endpoint_input_is_raw_url());
+        assert!(
+            state.filtered_endpoint_suggestions().is_empty(),
+            "raw URL entry must not surface suggestions that could shadow it"
+        );
+        // https too
+        state.add_endpoint = "https://secure:443".into();
+        assert!(state.filtered_endpoint_suggestions().is_empty());
+    }
+
+    #[test]
+    fn filtered_empty_when_executor_not_nex() {
+        let mut state = nex_state(vec![ep("local", Some("http://a"), "local", true)]);
+        state.add_executor_idx = 0; // claude
+        assert!(
+            state.filtered_endpoint_suggestions().is_empty(),
+            "endpoint suggestions are nex-only"
+        );
+    }
+
+    #[test]
+    fn preselect_default_highlights_default_endpoint() {
+        let mut state = nex_state(vec![
+            ep("local", Some("http://a"), "local", false),
+            ep("lambda", Some("http://b"), "openrouter", true),
+            ep("other", Some("http://c"), "openai", false),
+        ]);
+        state.preselect_default_endpoint();
+        assert_eq!(state.endpoint_suggestion_selected, 1);
+        let hi = state.highlighted_endpoint_suggestion().unwrap();
+        assert_eq!(hi.name, "lambda");
+        assert!(hi.is_default);
+    }
+
+    #[test]
+    fn preselect_falls_back_to_first_when_no_default() {
+        let mut state = nex_state(vec![
+            ep("local", Some("http://a"), "local", false),
+            ep("lambda", Some("http://b"), "openrouter", false),
+        ]);
+        state.preselect_default_endpoint();
+        assert_eq!(state.endpoint_suggestion_selected, 0);
+    }
+
+    #[test]
+    fn move_suggestion_clamps_within_filtered_bounds() {
+        let mut state = nex_state(vec![
+            ep("a", Some("http://a"), "p", false),
+            ep("b", Some("http://b"), "p", false),
+        ]);
+        state.move_endpoint_suggestion(-1);
+        assert_eq!(state.endpoint_suggestion_selected, 0, "clamps at top");
+        state.move_endpoint_suggestion(1);
+        assert_eq!(state.endpoint_suggestion_selected, 1);
+        state.move_endpoint_suggestion(1);
+        assert_eq!(state.endpoint_suggestion_selected, 1, "clamps at bottom");
+    }
+
+    #[test]
+    fn accept_writes_endpoint_name_not_url() {
+        let mut state = nex_state(vec![
+            ep("local", Some("http://127.0.0.1:8088"), "local", false),
+            ep("lambda", Some("https://lambda01:30000"), "openrouter", true),
+        ]);
+        state.endpoint_suggestion_selected = 1;
+        assert!(state.accept_endpoint_suggestion());
+        assert_eq!(
+            state.add_endpoint, "lambda",
+            "accepting fills the endpoint NAME; wg nex -e resolves names"
+        );
+        // resolved launch args carry that name verbatim
+        let (executor, _model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "native");
+        assert_eq!(endpoint.as_deref(), Some("lambda"));
+    }
+
+    #[test]
+    fn accept_is_noop_for_raw_url() {
+        let mut state = nex_state(vec![ep(
+            "local",
+            Some("http://127.0.0.1:8088"),
+            "local",
+            true,
+        )]);
+        state.add_endpoint = "http://my-custom:9000".into();
+        assert!(
+            !state.accept_endpoint_suggestion(),
+            "raw URL entry: nothing to accept"
+        );
+        assert_eq!(
+            state.add_endpoint, "http://my-custom:9000",
+            "the custom URL must be preserved verbatim"
+        );
+        let (_e, _m, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(endpoint.as_deref(), Some("http://my-custom:9000"));
+    }
+
+    #[test]
+    fn accept_is_noop_when_no_endpoints_configured() {
+        let mut state = nex_state(vec![]);
+        assert!(!state.accept_endpoint_suggestion());
+        assert!(state.add_endpoint.is_empty());
+    }
+
+    #[test]
+    fn highlighted_clamps_stale_index_after_filtering() {
+        let mut state = nex_state(vec![
+            ep("local", Some("http://a"), "local", false),
+            ep("lambda", Some("http://b"), "openrouter", true),
+        ]);
+        state.endpoint_suggestion_selected = 1;
+        // Filter down to a single match; the stale index must clamp.
+        state.add_endpoint = "local".into();
+        let hi = state.highlighted_endpoint_suggestion().unwrap();
+        assert_eq!(hi.name, "local");
+    }
+
+    // ── Global endpoint union (nex-openrouter-default-ui) ──────────────────
+
+    #[test]
+    fn with_global_unions_local_and_global_endpoints() {
+        let local = config_with_endpoints(vec![endpoint_cfg("local", "http://a", "local", false)]);
+        let global = config_with_endpoints(vec![endpoint_cfg(
+            "global-lambda",
+            "http://b",
+            "openrouter",
+            true,
+        )]);
+        let sug = build_endpoint_suggestions_with_global(&local, Some(&global));
+        assert_eq!(sug.len(), 2, "both local and global endpoints surface");
+        assert_eq!(sug[0].name, "local", "local entries come first");
+        assert_eq!(sug[1].name, "global-lambda", "global names are appended");
+    }
+
+    #[test]
+    fn with_global_local_wins_on_name_collision() {
+        // Same name in both: the local (effective) entry must win and the
+        // global duplicate must be suppressed.
+        let local = config_with_endpoints(vec![endpoint_cfg(
+            "shared",
+            "http://local-url",
+            "local",
+            false,
+        )]);
+        let global = config_with_endpoints(vec![endpoint_cfg(
+            "shared",
+            "http://global-url",
+            "openrouter",
+            true,
+        )]);
+        let sug = build_endpoint_suggestions_with_global(&local, Some(&global));
+        assert_eq!(sug.len(), 1, "the duplicate name is deduped");
+        assert_eq!(sug[0].url.as_deref(), Some("http://local-url"));
+        assert_eq!(sug[0].provider, "local");
+    }
+
+    #[test]
+    fn with_global_none_is_just_local() {
+        let local = config_with_endpoints(vec![endpoint_cfg("local", "http://a", "local", true)]);
+        let sug = build_endpoint_suggestions_with_global(&local, None);
+        assert_eq!(sug, build_endpoint_suggestions(&local));
+    }
+
+    #[test]
+    fn with_global_surfaces_global_when_local_has_none() {
+        // The opt-in-inheritance case the fix targets: local declares no
+        // endpoints (so the merged config dropped global ones), yet the picker
+        // must still surface globally-configured names.
+        let local = Config::default();
+        let global = config_with_endpoints(vec![
+            endpoint_cfg("g1", "http://g1", "openrouter", false),
+            endpoint_cfg("g2", "http://g2", "local", true),
+        ]);
+        let sug = build_endpoint_suggestions_with_global(&local, Some(&global));
+        let names: Vec<&str> = sug.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["g1", "g2"]);
+    }
+
+    // ── OpenRouter-default synthetic option (nex-openrouter-default-ui) ─────
+
+    #[test]
+    fn add_model_routes_to_openrouter_detects_routes() {
+        let mut state = nex_state(vec![]);
+        // bare vendor/model slug → OpenRouter route
+        state.add_model = "minimax/minimax-m3".into();
+        assert!(state.add_model_routes_to_openrouter());
+        // explicit openrouter: prefix
+        state.add_model = "openrouter:anthropic/claude-opus-4-7".into();
+        assert!(state.add_model_routes_to_openrouter());
+        // bare local name → NOT openrouter
+        state.add_model = "qwen3-coder".into();
+        assert!(!state.add_model_routes_to_openrouter());
+        // claude family bare name → NOT openrouter
+        state.add_model = "opus".into();
+        assert!(!state.add_model_routes_to_openrouter());
+        // empty → NOT openrouter
+        state.add_model = "".into();
+        assert!(!state.add_model_routes_to_openrouter());
+        // non-nex executor → never openrouter-default (no endpoint field)
+        state.add_model = "minimax/minimax-m3".into();
+        state.add_executor_idx = 0; // claude
+        assert!(!state.add_model_routes_to_openrouter());
+    }
+
+    #[test]
+    fn openrouter_model_prepends_synthetic_default_option() {
+        let mut state = nex_state(vec![ep("lambda", Some("http://b"), "openrouter", true)]);
+        state.add_model = "minimax/minimax-m3".into();
+        let f = state.filtered_endpoint_suggestions();
+        assert_eq!(f.len(), 2, "synthetic OpenRouter row + configured endpoint");
+        assert!(
+            f[0].is_openrouter_default(),
+            "the synthetic OpenRouter-default option is first"
+        );
+        assert!(f[0].name.is_empty(), "synthetic option has a blank name");
+        assert!(
+            f[0].display_name().contains("OpenRouter"),
+            "synthetic option renders a friendly OpenRouter label"
+        );
+        assert_eq!(f[1].name, "lambda");
+    }
+
+    #[test]
+    fn local_model_has_no_synthetic_default_option() {
+        let mut state = nex_state(vec![ep("local", Some("http://a"), "local", true)]);
+        state.add_model = "qwen3-coder".into();
+        let f = state.filtered_endpoint_suggestions();
+        assert_eq!(f.len(), 1);
+        assert!(
+            !f[0].is_openrouter_default(),
+            "local nex model must NOT get an OpenRouter-default row"
+        );
+        assert_eq!(f[0].name, "local");
+    }
+
+    #[test]
+    fn synthetic_default_filtered_out_by_specific_query() {
+        let mut state = nex_state(vec![ep("lambda", Some("http://b"), "openrouter", true)]);
+        state.add_model = "minimax/minimax-m3".into();
+        // Typing a specific endpoint name narrows past the synthetic row.
+        state.add_endpoint = "lambda".into();
+        let f = state.filtered_endpoint_suggestions();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, "lambda");
+    }
+
+    #[test]
+    fn accept_openrouter_default_leaves_endpoint_blank() {
+        let mut state = nex_state(vec![ep("lambda", Some("http://b"), "openrouter", true)]);
+        state.add_model = "minimax/minimax-m3".into();
+        // Synthetic option is preselected at index 0.
+        state.preselect_default_endpoint();
+        assert_eq!(state.endpoint_suggestion_selected, 0);
+        assert!(state.accept_endpoint_suggestion());
+        assert!(
+            state.add_endpoint.is_empty(),
+            "accepting the OpenRouter-default option keeps the endpoint blank"
+        );
+        // Resolves to native + the OpenRouter model with NO endpoint.
+        let (executor, model, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "native");
+        assert_eq!(model.as_deref(), Some("minimax/minimax-m3"));
+        assert!(endpoint.is_none(), "blank endpoint → route to OpenRouter");
+    }
+
+    #[test]
+    fn preselect_highlights_openrouter_default_for_or_model() {
+        // Even with a configured is_default endpoint present, an OpenRouter
+        // model preselects the synthetic blank/OpenRouter option at the top.
+        let mut state = nex_state(vec![
+            ep("local", Some("http://a"), "local", false),
+            ep("lambda", Some("http://b"), "openrouter", true),
+        ]);
+        state.add_model = "minimax/minimax-m3".into();
+        state.preselect_default_endpoint();
+        assert_eq!(state.endpoint_suggestion_selected, 0);
+        let hi = state.highlighted_endpoint_suggestion().unwrap();
+        assert!(hi.is_openrouter_default());
+    }
+
+    #[test]
+    fn named_endpoint_still_selectable_for_openrouter_model() {
+        // Requirement 4: selecting a configured endpoint NAME still passes it
+        // verbatim, even when the synthetic OpenRouter-default row is present.
+        let mut state = nex_state(vec![ep("lambda", Some("http://b"), "openrouter", true)]);
+        state.add_model = "minimax/minimax-m3".into();
+        // index 0 = synthetic, index 1 = "lambda"
+        state.endpoint_suggestion_selected = 1;
+        assert!(state.accept_endpoint_suggestion());
+        assert_eq!(state.add_endpoint, "lambda");
+        let (_e, _m, endpoint) = state.resolved_launch_args().unwrap();
+        assert_eq!(endpoint.as_deref(), Some("lambda"));
+    }
+}
+
+#[cfg(test)]
+mod launcher_model_autocomplete_tests {
+    use super::{
+        AddNewField, LauncherMode, LauncherSection, LauncherState, ModelSuggestion,
+        build_model_suggestions, fuzzy_match_score, normalize_model_for_executor,
+    };
+    use workgraph::config::{Config, EndpointConfig};
+    use workgraph::models::{ModelEntry, ModelRegistry, ModelTier};
+
+    fn sug(id: &str, provider: &str, source: &str) -> ModelSuggestion {
+        ModelSuggestion {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    /// An Add-new launcher state on the Model field with the given executor
+    /// index and a preloaded suggestion list.
+    fn model_state(executor_idx: usize, suggestions: Vec<ModelSuggestion>) -> LauncherState {
+        LauncherState {
+            mode: LauncherMode::AddNew,
+            active_section: LauncherSection::AddNew(AddNewField::Model),
+            name: String::new(),
+            presets: LauncherState::default_presets(),
+            default_selected: 0,
+            add_executor_idx: executor_idx,
+            add_model: String::new(),
+            model_suggestions: suggestions,
+            model_suggestion_selected: 0,
+            add_endpoint: String::new(),
+            endpoint_suggestions: Vec::new(),
+            endpoint_suggestion_selected: 0,
+            creating: false,
+            last_error: None,
+        }
+    }
+
+    // Executor indices: 0=claude, 1=codex, 2=opencode, 3=nex.
+    const OPENCODE: usize = 2;
+    const NEX: usize = 3;
+
+    // ── fuzzy matcher ──────────────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_matches_multiword_substrings() {
+        // "minimax m3" finds minimax/minimax-m3 (both terms as substrings).
+        assert!(fuzzy_match_score("minimax/minimax-m3 openrouter curated", "minimax m3").is_some());
+        // "qwen coder" finds qwen/qwen3-coder.
+        assert!(fuzzy_match_score("qwen/qwen3-coder openrouter curated", "qwen coder").is_some());
+        // single-word substrings
+        assert!(fuzzy_match_score("deepseek/deepseek-r1 openrouter mid", "deepseek").is_some());
+        assert!(fuzzy_match_score("anthropic/claude-sonnet-4-6 anthropic mid", "sonnet").is_some());
+    }
+
+    #[test]
+    fn fuzzy_rejects_absent_terms() {
+        // "m3" present but "qwen" absent → no match (every term must match).
+        assert!(fuzzy_match_score("minimax/minimax-m3 openrouter curated", "qwen m3").is_none());
+        assert!(fuzzy_match_score("deepseek/deepseek-r1 openrouter mid", "gpt").is_none());
+    }
+
+    #[test]
+    fn fuzzy_empty_query_matches_everything() {
+        assert_eq!(fuzzy_match_score("anything here", ""), Some(0));
+        assert_eq!(fuzzy_match_score("anything here", "   "), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_substring_outranks_scattered_subsequence() {
+        // Contiguous "opus" beats a scattered o..p..u..s subsequence.
+        let contiguous = fuzzy_match_score("claude-opus-4-6", "opus").unwrap();
+        let scattered = fuzzy_match_score("o-p-u-s-cattered-xyz", "opus").unwrap();
+        assert!(
+            contiguous > scattered,
+            "substring ({contiguous}) must outrank subsequence ({scattered})"
+        );
+    }
+
+    // ── build_model_suggestions: sources + dedup ───────────────────────
+
+    fn registry_with(ids: &[(&str, &str, ModelTier)]) -> ModelRegistry {
+        let mut reg = ModelRegistry {
+            default_model: None,
+            models: Default::default(),
+        };
+        for (id, provider, tier) in ids {
+            reg.models.insert(
+                (*id).to_string(),
+                ModelEntry {
+                    id: (*id).to_string(),
+                    provider: (*provider).to_string(),
+                    cost_per_1m_input: 1.0,
+                    cost_per_1m_output: 2.0,
+                    context_window: 0,
+                    capabilities: vec![],
+                    tier: tier.clone(),
+                },
+            );
+        }
+        reg
+    }
+
+    #[test]
+    fn build_includes_registry_curated_recent_and_endpoint_sources() {
+        let mut config = Config::default();
+        config.llm_endpoints.endpoints = vec![EndpointConfig {
+            name: "ep".into(),
+            provider: "openrouter".into(),
+            url: Some("http://x".into()),
+            model: Some("openrouter:special/endpoint-model".into()),
+            api_key: None,
+            api_key_file: None,
+            api_key_env: None,
+            api_key_ref: None,
+            is_default: false,
+            context_window: None,
+        }];
+        let registry =
+            registry_with(&[("deepseek/deepseek-chat", "openrouter", ModelTier::Budget)]);
+        let recent = vec!["nex:my-recent-model".to_string()];
+
+        let out = build_model_suggestions(&config, &registry, &recent);
+        let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
+
+        // registry
+        assert!(
+            ids.contains(&"deepseek/deepseek-chat"),
+            "registry model present: {ids:?}"
+        );
+        // curated (network-free seed) — the task's headline routes
+        assert!(
+            ids.contains(&"minimax/minimax-m3"),
+            "curated minimax present: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"qwen/qwen3-coder"),
+            "curated qwen coder present: {ids:?}"
+        );
+        // recent (routing prefix stripped to bare id)
+        assert!(
+            ids.contains(&"my-recent-model"),
+            "recent model present: {ids:?}"
+        );
+        // endpoint default model (provider prefix stripped)
+        assert!(
+            ids.contains(&"special/endpoint-model"),
+            "endpoint model present: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn build_dedups_by_id_first_source_wins() {
+        let config = Config::default();
+        // minimax is curated; also surface it via recent so we can assert
+        // dedup keeps a single entry (recent wins, ordered first).
+        let registry = ModelRegistry {
+            default_model: None,
+            models: Default::default(),
+        };
+        let recent = vec!["openrouter:minimax/minimax-m3".to_string()];
+        let out = build_model_suggestions(&config, &registry, &recent);
+        let minimax: Vec<&ModelSuggestion> = out
+            .iter()
+            .filter(|s| s.id == "minimax/minimax-m3")
+            .collect();
+        assert_eq!(
+            minimax.len(),
+            1,
+            "minimax must be de-duplicated across sources"
+        );
+        assert_eq!(
+            minimax[0].source, "recent",
+            "recent source wins (listed first)"
+        );
+    }
+
+    // ── executor-aware normalization (the heart of the feature) ────────
+
+    #[test]
+    fn normalize_opencode_minimax_to_openrouter_route() {
+        // The OpenCode/OpenRouter path from the task description.
+        assert_eq!(
+            normalize_model_for_executor("minimax/minimax-m3", "openrouter", "opencode"),
+            "openrouter/minimax/minimax-m3"
+        );
+        // Already-prefixed stays single-prefixed.
+        assert_eq!(
+            normalize_model_for_executor("openrouter/minimax/minimax-m3", "openrouter", "opencode"),
+            "openrouter/minimax/minimax-m3"
+        );
+    }
+
+    #[test]
+    fn normalize_nex_openrouter_and_bare() {
+        // OpenRouter/vendor-route model → openrouter:<vendor/model> spec.
+        assert_eq!(
+            normalize_model_for_executor("minimax/minimax-m3", "openrouter", "nex"),
+            "openrouter:minimax/minimax-m3"
+        );
+        // Bare id with no vendor route → nex:<model>.
+        assert_eq!(
+            normalize_model_for_executor("qwen3-coder", "", "nex"),
+            "nex:qwen3-coder"
+        );
+        // native is an alias of nex.
+        assert_eq!(
+            normalize_model_for_executor("deepseek/deepseek-r1", "openrouter", "native"),
+            "openrouter:deepseek/deepseek-r1"
+        );
+    }
+
+    #[test]
+    fn child_scroll_keys_only_for_opencode_not_octomind_or_dexto() {
+        // The "not worse than OpenCode" scroll invariant: only opencode (which
+        // owns the alternate screen) forwards child scroll keys. octomind/dexto
+        // are line-oriented REPLs (verified non-alt-screen), so they stay on
+        // the tmux copy-mode path like claude/codex/nex — real scrollback.
+        assert!(super::executor_uses_child_scroll_keys("opencode"));
+        assert!(!super::executor_uses_child_scroll_keys("octomind"));
+        assert!(!super::executor_uses_child_scroll_keys("dexto"));
+        assert!(!super::executor_uses_child_scroll_keys("claude"));
+        assert!(!super::executor_uses_child_scroll_keys("codex"));
+        assert!(!super::executor_uses_child_scroll_keys("native"));
+    }
+
+    #[test]
+    fn normalize_octomind_and_dexto_preserve_openrouter_route() {
+        // octomind shares WG's provider:route spelling.
+        assert_eq!(
+            normalize_model_for_executor("minimax/minimax-m3", "openrouter", "octomind"),
+            "openrouter:minimax/minimax-m3"
+        );
+        // A single-token id octomind already knows passes through.
+        assert_eq!(
+            normalize_model_for_executor("qwen3-coder", "", "octomind"),
+            "qwen3-coder"
+        );
+        // dexto persists the canonical WG spec; the generated agent YAML
+        // carries the raw route.
+        assert_eq!(
+            normalize_model_for_executor("minimax/minimax-m3", "openrouter", "dexto"),
+            "openrouter:minimax/minimax-m3"
+        );
+        assert_eq!(
+            workgraph::chat_command::dexto_openrouter_model(&normalize_model_for_executor(
+                "minimax/minimax-m3",
+                "openrouter",
+                "dexto"
+            )),
+            Some("minimax/minimax-m3".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_claude_and_codex_use_short_name() {
+        assert_eq!(
+            normalize_model_for_executor("anthropic/claude-opus-4-6", "anthropic", "claude"),
+            "claude:claude-opus-4-6"
+        );
+        assert_eq!(
+            normalize_model_for_executor("openai/gpt-4o", "openai", "codex"),
+            "codex:gpt-4o"
+        );
+    }
+
+    #[test]
+    fn same_model_normalizes_differently_per_executor() {
+        // The render/accept scoping requirement: one selected model, two
+        // executor-correct specs.
+        let id = "minimax/minimax-m3";
+        let oc = normalize_model_for_executor(id, "openrouter", "opencode");
+        let nex = normalize_model_for_executor(id, "openrouter", "nex");
+        assert_eq!(oc, "openrouter/minimax/minimax-m3");
+        assert_eq!(nex, "openrouter:minimax/minimax-m3");
+        assert_ne!(oc, nex);
+    }
+
+    // ── filtering / explicit-spec suppression / accept ─────────────────
+
+    #[test]
+    fn filtered_returns_all_for_empty_query() {
+        let state = model_state(
+            NEX,
+            vec![
+                sug("minimax/minimax-m3", "openrouter", "curated"),
+                sug("qwen3-coder", "", "recent"),
+            ],
+        );
+        assert_eq!(state.filtered_model_suggestions().len(), 2);
+    }
+
+    #[test]
+    fn filtered_fuzzy_narrows_to_match() {
+        let mut state = model_state(
+            OPENCODE,
+            vec![
+                sug("minimax/minimax-m3", "openrouter", "curated"),
+                sug("deepseek/deepseek-r1", "openrouter", "mid"),
+                sug("qwen/qwen3-coder", "openrouter", "curated"),
+            ],
+        );
+        state.add_model = "minimax m3".into();
+        let f = state.filtered_model_suggestions();
+        assert_eq!(f.len(), 1, "fuzzy 'minimax m3' narrows to one: {f:?}");
+        assert_eq!(f[0].id, "minimax/minimax-m3");
+    }
+
+    #[test]
+    fn suggestions_suppressed_for_explicit_spec_text() {
+        let mut state = model_state(
+            NEX,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        // A vendor route the user typed deliberately — never overwrite it.
+        state.add_model = "minimax/minimax-m3".into();
+        assert!(state.model_input_is_explicit_spec());
+        assert!(state.filtered_model_suggestions().is_empty());
+        // A provider-prefixed spec.
+        state.add_model = "nex:qwen3-coder".into();
+        assert!(state.model_input_is_explicit_spec());
+        assert!(state.filtered_model_suggestions().is_empty());
+        // A bare fragment is NOT an explicit spec → suggestions return.
+        state.add_model = "minimax".into();
+        assert!(!state.model_input_is_explicit_spec());
+        assert!(!state.filtered_model_suggestions().is_empty());
+    }
+
+    #[test]
+    fn suggestions_suppressed_for_command_executor() {
+        // Custom-command executor is the last choice; its Model field is a
+        // raw command line, never a model picker.
+        let last = super::ADD_NEW_EXECUTOR_CHOICES.len() - 1;
+        assert_eq!(
+            super::ADD_NEW_EXECUTOR_CHOICES[last].internal_executor,
+            "command"
+        );
+        let state = model_state(
+            last,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        assert!(!state.add_new_show_model_suggestions());
+        assert!(state.filtered_model_suggestions().is_empty());
+    }
+
+    #[test]
+    fn accept_opencode_writes_openrouter_route() {
+        let mut state = model_state(
+            OPENCODE,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        state.add_model = "minimax m3".into();
+        assert!(state.accept_model_suggestion());
+        assert_eq!(state.add_model, "openrouter/minimax/minimax-m3");
+        // The launch args carry that exact spec.
+        let (executor, model, _ep) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "opencode");
+        assert_eq!(model.as_deref(), Some("openrouter/minimax/minimax-m3"));
+    }
+
+    #[test]
+    fn accept_nex_writes_openrouter_spec() {
+        let mut state = model_state(
+            NEX,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        state.add_model = "minimax".into();
+        assert!(state.accept_model_suggestion());
+        assert_eq!(state.add_model, "openrouter:minimax/minimax-m3");
+        let (executor, model, _ep) = state.resolved_launch_args().unwrap();
+        assert_eq!(executor, "native");
+        assert_eq!(model.as_deref(), Some("openrouter:minimax/minimax-m3"));
+    }
+
+    #[test]
+    fn accept_is_noop_for_free_text_with_no_match() {
+        let mut state = model_state(
+            NEX,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        // Arbitrary custom model that matches nothing → free text preserved.
+        state.add_model = "my-totally-custom-thing".into();
+        assert!(!state.accept_model_suggestion());
+        assert_eq!(state.add_model, "my-totally-custom-thing");
+    }
+
+    #[test]
+    fn accept_is_noop_for_explicit_spec_even_if_it_would_match() {
+        // User typed a full route that fuzzy-matches a suggestion; the
+        // explicit spec must NOT be overwritten.
+        let mut state = model_state(
+            NEX,
+            vec![sug("minimax/minimax-m3", "openrouter", "curated")],
+        );
+        state.add_model = "openrouter:minimax/minimax-m3".into();
+        assert!(!state.accept_model_suggestion());
+        assert_eq!(state.add_model, "openrouter:minimax/minimax-m3");
+    }
+
+    #[test]
+    fn move_clamps_within_filtered_bounds() {
+        let mut state = model_state(
+            NEX,
+            vec![
+                sug("a/one", "openrouter", "c"),
+                sug("b/two", "openrouter", "c"),
+            ],
+        );
+        state.move_model_suggestion(-1);
+        assert_eq!(state.model_suggestion_selected, 0, "clamps at top");
+        state.move_model_suggestion(1);
+        assert_eq!(state.model_suggestion_selected, 1);
+        state.move_model_suggestion(1);
+        assert_eq!(state.model_suggestion_selected, 1, "clamps at bottom");
+    }
+
+    #[test]
+    fn executor_compatible_models_rank_first() {
+        // claude executor should float the anthropic model above an
+        // openrouter one on an empty query (boost on tie).
+        let state = model_state(
+            0, // claude
+            vec![
+                sug("minimax/minimax-m3", "openrouter", "curated"),
+                sug("anthropic/claude-opus-4-6", "anthropic", "frontier"),
+            ],
+        );
+        let f = state.filtered_model_suggestions();
+        assert_eq!(
+            f[0].id, "anthropic/claude-opus-4-6",
+            "claude-compatible model ranks first: {f:?}"
         );
     }
 }
@@ -26603,6 +28676,86 @@ mod agent_stream_tests {
         assert_eq!(LogViewMode::RawPretty.label(), "raw");
         assert_eq!(LogViewMode::WgLog.label(), "wg-log");
     }
+
+    #[test]
+    fn test_log_scroll_state_line_increments_and_bounds() {
+        let mut state = LogPaneState {
+            total_wrapped_lines: 100,
+            viewport_height: 20,
+            ..LogPaneState::default()
+        };
+
+        state.scroll_to_bottom();
+        assert_eq!(state.scroll, 80);
+        assert!(state.auto_tail);
+
+        state.scroll_up(1);
+        assert_eq!(state.scroll, 79);
+        assert!(!state.auto_tail);
+
+        state.scroll_down(1);
+        assert_eq!(state.scroll, 80);
+        assert!(state.auto_tail);
+
+        state.scroll_up(500);
+        assert_eq!(state.scroll, 0);
+        assert!(!state.auto_tail);
+
+        state.scroll_down(500);
+        assert_eq!(state.scroll, 80);
+        assert!(state.auto_tail);
+    }
+
+    #[test]
+    fn test_log_scroll_state_page_increments_from_live_tail_sentinel() {
+        let mut state = LogPaneState {
+            scroll: usize::MAX,
+            auto_tail: true,
+            total_wrapped_lines: 120,
+            viewport_height: 17,
+            ..LogPaneState::default()
+        };
+
+        state.scroll_up(17);
+        assert_eq!(
+            state.scroll, 86,
+            "PageUp from live-tail must normalize to the real bottom before subtracting"
+        );
+        assert!(!state.auto_tail);
+
+        state.scroll_down(17);
+        assert_eq!(state.scroll, 103);
+        assert!(state.auto_tail);
+    }
+
+    #[test]
+    fn test_log_scroll_preserves_position_while_new_events_arrive() {
+        let mut state = LogPaneState {
+            scroll: 45,
+            auto_tail: false,
+            total_wrapped_lines: 100,
+            viewport_height: 20,
+            ..LogPaneState::default()
+        };
+
+        state.total_wrapped_lines = 130;
+        state.follow_tail_or_clamp();
+        assert_eq!(
+            state.scroll, 45,
+            "Scrolled-up log view must preserve the same top visual line as content grows"
+        );
+        assert!(!state.auto_tail);
+
+        state.scroll_to_bottom();
+        assert_eq!(state.scroll, 110);
+        state.total_wrapped_lines = 150;
+        state.follow_tail_or_clamp();
+        assert_eq!(
+            state.scroll, 130,
+            "Live-tail mode must follow newly appended log content"
+        );
+        assert!(state.auto_tail);
+    }
 }
 
 #[cfg(test)]
@@ -26932,6 +29085,39 @@ mod build_nex_chat_pty_args_tests {
                 "-e",
                 "https://lambda01.tail334fe6.ts.net:30000"
             ]
+        );
+    }
+
+    #[test]
+    fn blank_endpoint_bare_vendor_model_routes_to_openrouter() {
+        // nex-optional-openrouter-endpoint: leaving the endpoint blank for a
+        // bare `vendor/model` route must keep an explicit `openrouter:` spec
+        // and emit NO `-e` flag — so `wg nex` targets OpenRouter, not a local
+        // endpoint.
+        let args = build_nex_chat_pty_args(Some("minimax/minimax-m3"), None);
+        assert_eq!(args, vec!["nex", "-m", "openrouter:minimax/minimax-m3"]);
+        assert!(
+            !args.iter().any(|a| a == "-e"),
+            "blank endpoint must not emit a -e flag: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn blank_endpoint_openrouter_prefixed_model_keeps_prefix_no_endpoint() {
+        let args = build_nex_chat_pty_args(Some("openrouter:minimax/minimax-m3"), Some(""));
+        assert_eq!(args, vec!["nex", "-m", "openrouter:minimax/minimax-m3"]);
+    }
+
+    #[test]
+    fn explicit_endpoint_strips_prefix_for_oai_compat_server() {
+        // With an explicit endpoint, the provider prefix is stripped (oai-compat
+        // servers read a colon as a LoRA ref). A bare slash route is NOT
+        // rewritten to openrouter — the endpoint dictates the route.
+        let args = build_nex_chat_pty_args(Some("minimax/minimax-m3"), Some("lambda01"));
+        assert_eq!(
+            args,
+            vec!["nex", "-m", "minimax/minimax-m3", "-e", "lambda01"]
         );
     }
 

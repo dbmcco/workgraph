@@ -28,6 +28,11 @@ pub trait Provider: Send + Sync {
     /// The model this provider is configured with.
     fn model(&self) -> &str;
 
+    /// Endpoint name or label when known. Used for diagnostics only.
+    fn endpoint_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Maximum tokens per response.
     fn max_tokens(&self) -> u32;
 
@@ -100,6 +105,7 @@ fn build_inline_url_client(
     let client = OpenAiClient::new(key, model, None)
         .context("initialize oai-compat client for inline URL")?
         .with_provider_hint("oai-compat")
+        .with_endpoint_name(url)
         .with_base_url(&base);
     Ok(client)
 }
@@ -157,6 +163,41 @@ fn parse_endpoint_model_shorthand(
     (None, model.to_string())
 }
 
+fn resolve_explicit_endpoint(
+    config: &crate::config::Config,
+    config_root: &Path,
+    name: &str,
+) -> Result<Option<crate::config::EndpointConfig>> {
+    if let Some(ep) = config.llm_endpoints.find_by_name(name) {
+        return Ok(Some(ep.clone()));
+    }
+
+    let global = crate::config::Config::load_global()
+        .with_context(|| "Failed to load global WG config while resolving named endpoint")?;
+    let Some(global) = global else {
+        return Ok(None);
+    };
+    let Some(ep) = global.llm_endpoints.find_by_name(name).cloned() else {
+        return Ok(None);
+    };
+
+    if matches!(
+        crate::config::provider_to_native_provider(&ep.provider),
+        "openrouter" | "oai-compat" | "openai" | "local"
+    ) {
+        eprintln!(
+            "[native-exec] using global endpoint '{}' from {}. \
+             To make this visible in project config, set [llm_endpoints] inherit_global = true in {}.",
+            name,
+            crate::config::Config::global_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.wg/config.toml".to_string()),
+            config_root.join("config.toml").display(),
+        );
+    }
+    Ok(Some(ep))
+}
+
 /// Create a provider, optionally overriding the provider name, endpoint, and/or API key.
 ///
 /// Resolution order for API key (WG credential contract — see
@@ -179,6 +220,32 @@ fn parse_endpoint_model_shorthand(
 /// 2. `[native_executor]` section's `api_base` field (legacy)
 pub fn create_provider_ext(
     workgraph_dir: &Path,
+    model: &str,
+    provider_override: Option<&str>,
+    endpoint_name: Option<&str>,
+    api_key_override: Option<&str>,
+) -> Result<Box<dyn Provider>> {
+    let config = crate::config::Config::load_or_default(workgraph_dir);
+    let config_val = crate::config::Config::load_merged_toml_value(workgraph_dir).ok();
+    create_provider_ext_with_config(
+        workgraph_dir,
+        &config,
+        config_val.as_ref(),
+        model,
+        provider_override,
+        endpoint_name,
+        api_key_override,
+    )
+}
+
+/// Create a provider against an already-resolved config.
+///
+/// Standalone `nex` uses this to avoid re-loading WG global/project
+/// configuration after its `.nex` runtime config has already been merged.
+pub fn create_provider_ext_with_config(
+    config_root: &Path,
+    config: &crate::config::Config,
+    config_val: Option<&toml::Value>,
     model: &str,
     provider_override: Option<&str>,
     endpoint_name: Option<&str>,
@@ -229,13 +296,30 @@ pub fn create_provider_ext(
         )?));
     }
 
-    let config = crate::config::Config::load_or_default(workgraph_dir);
+    // A bare `vendor/model` route with NO endpoint is an OpenRouter route
+    // (nex-optional-openrouter-endpoint): `wg nex -m minimax/minimax-m3`
+    // should reach OpenRouter, not the bare-name oai-compat/local default.
+    // Normalize to `openrouter:<route>` so provider resolution below targets
+    // OpenRouter directly. Skipped when an endpoint is given — that endpoint's
+    // provider dictates the route, so the model stays verbatim.
+    let openrouter_normalized: String;
+    let model = if endpoint_name.is_none() {
+        openrouter_normalized = crate::config::normalize_bare_openrouter_route(model);
+        openrouter_normalized.as_str()
+    } else {
+        model
+    };
 
     // Endpoint-in-model shorthand — see `parse_endpoint_model_shorthand`.
     let (endpoint_name_owned, effective_model_str) =
-        parse_endpoint_model_shorthand(&config, model, endpoint_name);
+        parse_endpoint_model_shorthand(config, model, endpoint_name);
     let endpoint_name = endpoint_name_owned.as_deref();
     let model = effective_model_str.as_str();
+    let explicit_endpoint = endpoint_name.and_then(|name| {
+        resolve_explicit_endpoint(config, config_root, name)
+            .ok()
+            .flatten()
+    });
 
     // Early endpoint lookup (by name only). If the caller passed an
     // explicit `-e <name>` OR the shorthand matched a named endpoint,
@@ -252,14 +336,15 @@ pub fn create_provider_ext(
     // tag ("oai-compat") flows downstream and `provider.name()` reports
     // it consistently.
     let endpoint_provider_override: Option<String> = endpoint_name
-        .and_then(|name| config.llm_endpoints.find_by_name(name))
+        .and_then(|name| {
+            explicit_endpoint
+                .as_ref()
+                .filter(|ep| ep.name == name)
+                .or_else(|| config.llm_endpoints.find_by_name(name))
+        })
         .map(|ep| crate::config::provider_to_native_provider(&ep.provider).to_string());
 
-    // Load merged TOML value (global + local) for legacy [native_executor] access
-    let config_val: Option<toml::Value> =
-        crate::config::Config::load_merged_toml_value(workgraph_dir).ok();
-
-    let native_cfg = config_val.as_ref().and_then(|v| v.get("native_executor"));
+    let native_cfg = config_val.and_then(|v| v.get("native_executor"));
 
     // Parse unified provider:model spec (e.g. "openrouter:deepseek/deepseek-v3.2").
     // When a known provider prefix is present, it takes priority over all other
@@ -337,19 +422,22 @@ pub fn create_provider_ext(
     };
 
     // Look up endpoint config: by name first, then by provider, then default endpoint
-    let endpoint = endpoint_name
-        .and_then(|name| config.llm_endpoints.find_by_name(name))
-        .or_else(|| config.llm_endpoints.find_for_provider(&provider_name))
-        .or_else(|| config.llm_endpoints.find_default());
+    let endpoint = if let Some(ep) = explicit_endpoint.as_ref() {
+        Some(ep)
+    } else if let Some(ep) = config.llm_endpoints.find_for_provider(&provider_name) {
+        Some(ep)
+    } else {
+        config
+            .llm_endpoints
+            .find_default()
+            .filter(|ep| provider_name != "openrouter" || ep.provider == "openrouter")
+    };
     // STRICT key resolution: read api_key / api_key_file / api_key_env
     // from the matched endpoint's config — NEVER fall back to implicit
     // provider env vars (ANTHROPIC_API_KEY etc). See create_provider_ext
     // doc comment for the WG credential contract.
-    let endpoint_key = endpoint.and_then(|ep| {
-        ep.resolve_api_key_strict(Some(workgraph_dir))
-            .ok()
-            .flatten()
-    });
+    let endpoint_key =
+        endpoint.and_then(|ep| ep.resolve_api_key_strict(Some(config_root)).ok().flatten());
     let endpoint_url = endpoint.and_then(|ep| ep.url.clone());
     let endpoint_context_window = endpoint.and_then(|ep| ep.context_window);
     let endpoint_name_owned: Option<String> = endpoint.map(|ep| ep.name.clone());
@@ -439,7 +527,7 @@ pub fn create_provider_ext(
             // Validate model against cached OpenRouter model list (openrouter only)
             if provider_name == "openrouter" {
                 let validation =
-                    super::openai_client::validate_openrouter_model(&client.model, workgraph_dir);
+                    super::openai_client::validate_openrouter_model(&client.model, config_root);
                 if let Some(ref warning) = validation.warning {
                     eprintln!("[native-exec] WARNING: {}", warning);
                 }
@@ -588,6 +676,206 @@ mod tests {
         assert!(looks_like_claude_model("SONNET"));
         assert!(looks_like_claude_model("Claude-Sonnet-4-6"));
         assert!(looks_like_claude_model("CLAUDE3"));
+    }
+
+    // ── nex-optional-openrouter-endpoint: provider-layer routing ──────────
+
+    fn config_with_local_default() -> Config {
+        let mut config = Config::default();
+        config.llm_endpoints = EndpointsConfig {
+            inherit_global: false,
+            endpoints: vec![EndpointConfig {
+                name: "local-gpu".to_string(),
+                provider: "local".to_string(),
+                url: Some("http://127.0.0.1:8088/v1".to_string()),
+                model: None,
+                api_key: None,
+                api_key_env: None,
+                api_key_ref: None,
+                api_key_file: None,
+                is_default: true,
+                context_window: None,
+            }],
+        };
+        config
+    }
+
+    #[test]
+    fn bare_vendor_model_no_endpoint_routes_to_openrouter_not_local_default() {
+        // `wg nex -m minimax/minimax-m3` with no `-e` and a local is_default
+        // endpoint configured must route to OpenRouter, NOT the local server.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local_default();
+        let client = create_provider_ext_with_config(
+            dir.path(),
+            &config,
+            None,
+            "minimax/minimax-m3",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.name(),
+            "openrouter",
+            "bare vendor/model with no endpoint must resolve to the openrouter provider"
+        );
+        assert_ne!(
+            client.endpoint_name(),
+            Some("local-gpu"),
+            "must NOT adopt the local is_default endpoint for an openrouter route"
+        );
+    }
+
+    #[test]
+    fn openrouter_prefixed_model_no_endpoint_does_not_adopt_local_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local_default();
+        let client = create_provider_ext_with_config(
+            dir.path(),
+            &config,
+            None,
+            "openrouter:minimax/minimax-m3",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(client.name(), "openrouter");
+        assert_ne!(client.endpoint_name(), Some("local-gpu"));
+    }
+
+    #[test]
+    fn openrouter_model_prefers_configured_openrouter_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config_with_local_default();
+        config.llm_endpoints.endpoints.push(EndpointConfig {
+            name: "my-openrouter".to_string(),
+            provider: "openrouter".to_string(),
+            url: Some("https://openrouter.ai/api/v1".to_string()),
+            model: None,
+            api_key: None,
+            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
+            api_key_ref: None,
+            api_key_file: None,
+            is_default: false,
+            context_window: None,
+        });
+        let client = create_provider_ext_with_config(
+            dir.path(),
+            &config,
+            None,
+            "minimax/minimax-m3",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(client.name(), "openrouter");
+        assert_eq!(
+            client.endpoint_name(),
+            Some("my-openrouter"),
+            "configured openrouter endpoint should win over the local default"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_name_can_resolve_from_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let key_file = global_dir.path().join("openrouter.key");
+        std::fs::write(&key_file, "test-key\n").unwrap();
+        std::fs::write(
+            global_dir.path().join("config.toml"),
+            format!(
+                r#"
+[[llm_endpoints.endpoints]]
+name = "openrouter"
+provider = "openrouter"
+url = "https://openrouter.ai/api/v1"
+api_key_file = "{}"
+"#,
+                key_file.display()
+            ),
+        )
+        .unwrap();
+
+        let old = std::env::var_os("WG_GLOBAL_DIR");
+        unsafe {
+            std::env::set_var("WG_GLOBAL_DIR", global_dir.path());
+        }
+        let result = create_provider_ext_with_config(
+            dir.path(),
+            &Config::default(),
+            None,
+            "openrouter:deepseek/deepseek-v4-flash",
+            None,
+            Some("openrouter"),
+            None,
+        );
+        unsafe {
+            if let Some(old) = old {
+                std::env::set_var("WG_GLOBAL_DIR", old);
+            } else {
+                std::env::remove_var("WG_GLOBAL_DIR");
+            }
+        }
+
+        let client = result.unwrap();
+        assert_eq!(client.name(), "openrouter");
+        assert_eq!(client.endpoint_name(), Some("openrouter"));
+    }
+
+    #[test]
+    fn bare_alias_without_slash_still_uses_local_default() {
+        // Regression guard: a slashless bare model is NOT an openrouter route,
+        // so the historical local is_default fallback is preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local_default();
+        let client = create_provider_ext_with_config(
+            dir.path(),
+            &config,
+            None,
+            "qwen3-coder-30b",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.endpoint_name(),
+            Some("local-gpu"),
+            "slashless bare model keeps the local default endpoint"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_keeps_bare_model_off_openrouter() {
+        // With an explicit `-e local-gpu`, the bare model is NOT rewritten to
+        // openrouter — the endpoint's provider dictates the route.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_local_default();
+        let client = create_provider_ext_with_config(
+            dir.path(),
+            &config,
+            None,
+            "minimax/minimax-m3",
+            None,
+            Some("local-gpu"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.endpoint_name(),
+            Some("local-gpu"),
+            "an explicit endpoint must still resolve to that endpoint"
+        );
+        assert_ne!(
+            client.name(),
+            "openrouter",
+            "explicit endpoint means no openrouter normalization"
+        );
     }
 
     #[test]

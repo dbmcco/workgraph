@@ -17,6 +17,28 @@ fn clear_dispatcher_executor_for_model(config: &mut Config, model: &str) -> Opti
     ))
 }
 
+fn print_executor_choices_section() {
+    println!("[executor choices]");
+    println!(
+        "  core = {}",
+        workgraph::executor_discovery::CORE_EXECUTORS.join(", ")
+    );
+    println!(
+        "  stable_external = {}",
+        workgraph::executor_discovery::STABLE_EXTERNAL_EXECUTORS.join(", ")
+    );
+    println!(
+        "  provider_specific = {}",
+        workgraph::executor_discovery::PROVIDER_SPECIFIC_EXECUTORS.join(", ")
+    );
+    println!(
+        "  experimental_external = {}",
+        workgraph::executor_discovery::EXPERIMENTAL_EXTERNAL_EXECUTORS.join(", ")
+    );
+    println!("  discovery = \"wg executors --all\" (shows installed/usable status)");
+    println!();
+}
+
 /// When model/endpoint changes land, a soft reload (`Reconfigure` IPC)
 /// isn't enough — already-spawned coordinator subprocesses keep their
 /// old env. We restart the daemon instead so the coordinator respawns
@@ -142,6 +164,7 @@ pub fn show(dir: &Path, scope: Option<ConfigScope>, json: bool) -> Result<()> {
             config.coordinator.escalate_on_retry
         );
         println!();
+        print_executor_choices_section();
         println!("[agency]");
         println!("  auto_evaluate = {}", config.agency.auto_evaluate);
         println!("  auto_assign = {}", config.agency.auto_assign);
@@ -752,10 +775,9 @@ pub fn update(
                 e
             );
         }
-        config.agent.model = m.to_string();
+        config.pin_default_route_model(m);
         println!("Set agent.model = \"{}\"", m);
         if coordinator_model.is_none() {
-            config.coordinator.model = Some(m.to_string());
             config.coordinator.provider = None;
             println!("Set dispatcher.model = \"{}\"", m);
             if coordinator_executor.is_none()
@@ -1064,6 +1086,25 @@ pub fn update(
         );
     }
 
+    let direct_global_routing_change = matches!(scope, ConfigScope::Global)
+        && (model.is_some()
+            || endpoint.is_some()
+            || coordinator_model.is_some()
+            || !tier_specs.is_empty()
+            || !set_models.is_empty()
+            || !set_providers.is_empty()
+            || !set_endpoints.is_empty()
+            || !role_models.is_empty()
+            || !role_providers.is_empty()
+            || flip_inference_model.is_some()
+            || flip_comparison_model.is_some()
+            || flip_model.is_some());
+    let active_profile_to_clear = if direct_global_routing_change {
+        workgraph::profile::named::active().unwrap_or(None)
+    } else {
+        None
+    };
+
     if changed {
         // Snapshot local config.toml before overwriting — only after all
         // validation has passed, so a failed `wg config` run doesn't leave
@@ -1078,6 +1119,13 @@ pub fn update(
                 config.save_global()?;
                 let path = Config::global_config_path()?;
                 println!("Global configuration saved to {}", path.display());
+                if let Some(prev) = active_profile_to_clear {
+                    workgraph::profile::named::set_active(None)?;
+                    println!(
+                        "Active profile cleared (was: {}) because global model routing was edited directly.",
+                        prev
+                    );
+                }
             }
             ConfigScope::Local => {
                 config.save(dir)?;
@@ -1140,6 +1188,8 @@ pub fn list(dir: &Path, json: bool) -> Result<()> {
                 source
             );
         }
+        println!();
+        print_executor_choices_section();
     }
 
     Ok(())

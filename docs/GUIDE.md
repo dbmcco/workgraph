@@ -70,6 +70,13 @@ wg migrate config --dry-run    # preview changes
 wg migrate config --all        # rewrite global + local; backs up to .pre-migrate.<timestamp>
 ```
 
+Standalone `nex` is a separate human REPL surface. Use `nex` when you want
+`.nex/` or `~/.nex/` sessions that are not owned by a WG task graph. Use
+`wg nex` when the session belongs to a WG project and should live in
+`.wg/chat/`. See [Standalone nex Setup and Migration](guides/standalone-nex.md)
+for the setup, precedence, and migration rules. Autonomous WG agents do not
+read human `~/.nex` model or endpoint state.
+
 ### Initialize a project
 
 ```bash
@@ -224,7 +231,7 @@ Set values with:
 
 ```bash
 wg config --max-agents 8
-wg config --model claude:sonnet
+wg config --model claude:opus
 wg config --poll-interval 120
 
 # Agency
@@ -370,14 +377,15 @@ wg config --triage-max-log-bytes 50000
 ```bash
 wg add "Simple fix" --model claude:haiku
 wg add "Complex design" --model claude:opus
-wg edit my-task --model claude:sonnet
+wg edit my-task --model claude:opus
 wg spawn my-task --model claude:haiku
-wg config --model claude:sonnet
+wg config --model claude:opus
 wg service reload
 ```
 
-**Cost tips.** Use **haiku** for simple formatting/linting, **sonnet** for
-typical coding, **opus** for complex reasoning and architecture.
+**Cost tips.** Use **haiku** for simple formatting/linting and **opus** for the
+default worker route. Configure **sonnet** only when you intentionally want a
+lower-cost override for a specific task or project.
 
 **Alternative providers.** wg supports
 [OpenRouter](https://openrouter.ai/) and any OpenAI-compatible API. Configure

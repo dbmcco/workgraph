@@ -1570,6 +1570,7 @@ impl ExecutorRegistry {
                     command: "codex".to_string(),
                     args: vec![
                         "exec".to_string(),
+                        "--ignore-user-config".to_string(),
                         "--json".to_string(),
                         "--skip-git-repo-check".to_string(),
                         "--dangerously-bypass-approvals-and-sandbox".to_string(),
@@ -1583,7 +1584,97 @@ impl ExecutorRegistry {
                         r#"developer_instructions="You are a non-interactive batch worker. You MUST complete the task by writing files to disk and creating at least one git commit before declaring done. A prose summary without file writes or commits is a task failure. Use shell tools (Read, Write, Edit, Bash) to do real work; do not describe work in the response.""#.to_string(),
                     ],
                     env: HashMap::new(),
-                    // No default template — uses scope-based build_prompt() assembly.
+                    // No default template: uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "crush" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "crush".to_string(),
+                    command: "crush".to_string(),
+                    args: vec!["run".to_string(), "--quiet".to_string()],
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
+                        env
+                    },
+                    // Experimental: Crush accepts one-shot prompts, but the
+                    // exact non-interactive flags should be verified against
+                    // the installed CLI before making this a stable profile.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "amplifier" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "amplifier".to_string(),
+                    command: "amplifier".to_string(),
+                    args: vec![
+                        "run".to_string(),
+                        "--mode".to_string(),
+                        "single".to_string(),
+                        "--output-format".to_string(),
+                        "json".to_string(),
+                        "--bundle".to_string(),
+                        "wg".to_string(),
+                    ],
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
+                        env
+                    },
+                    // Amplifier expects the task prompt as a positional
+                    // argument; the spawn adapter bridges prompt.txt to argv.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "octomind" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "octomind".to_string(),
+                    command: "octomind".to_string(),
+                    // Octomind's non-interactive surface (`run --format jsonl`,
+                    // reading the task prompt on stdin). The live-chat path uses
+                    // interactive `octomind run` built in chat_command/state; this
+                    // default config exists so the registry can enumerate the
+                    // executor (prototype-octomind-dexto-chat).
+                    args: vec![
+                        "run".to_string(),
+                        "--format".to_string(),
+                        "jsonl".to_string(),
+                    ],
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
+                        env
+                    },
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "dexto" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "dexto".to_string(),
+                    command: "dexto".to_string(),
+                    // Dexto's headless surface (`dexto run`). The live-chat path
+                    // generates a per-chat agent YAML and uses the interactive
+                    // Ink CLI; this default config exists so the registry can
+                    // enumerate the executor (prototype-octomind-dexto-chat).
+                    args: vec!["run".to_string()],
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
+                        env
+                    },
                     prompt_template: None,
                     working_dir: Some("{{working_dir}}".to_string()),
                     timeout: None,
@@ -1617,6 +1708,89 @@ impl ExecutorRegistry {
                         env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
                         env
                     },
+                    // No default template: uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "opencode" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "opencode".to_string(),
+                    command: "opencode".to_string(),
+                    args: vec![
+                        "run".to_string(),
+                        "--format".to_string(),
+                        "json".to_string(),
+                        "--dangerously-skip-permissions".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    // No default template: uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "aider" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "aider".to_string(),
+                    command: "aider".to_string(),
+                    args: vec!["--yes-always".to_string()],
+                    env: HashMap::new(),
+                    // No default template: uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "goose" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "goose".to_string(),
+                    command: "goose".to_string(),
+                    args: vec![
+                        "run".to_string(),
+                        "--no-session".to_string(),
+                        "--output-format".to_string(),
+                        "json".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    // No default template — uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "qwen" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "qwen".to_string(),
+                    command: "qwen".to_string(),
+                    args: vec![
+                        "--output-format".to_string(),
+                        "json".to_string(),
+                        "--yolo".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    // No default template — uses scope-based build_prompt() assembly.
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
+            "cline" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "cline".to_string(),
+                    command: "cline".to_string(),
+                    args: vec![
+                        "--json".to_string(),
+                        "--auto-approve".to_string(),
+                        "true".to_string(),
+                    ],
+                    env: HashMap::new(),
                     // No default template — uses scope-based build_prompt() assembly.
                     prompt_template: None,
                     working_dir: Some("{{working_dir}}".to_string()),
@@ -1637,7 +1811,7 @@ impl ExecutorRegistry {
                 },
             }),
             _ => Err(anyhow!(
-                "Unknown executor '{}'. Available: claude, codex, native, shell, default",
+                "Unknown executor '{}'. Available: claude, codex, native, shell, opencode, aider, crush, amplifier, goose, qwen, cline, default",
                 name,
             )),
         }
@@ -1656,7 +1830,18 @@ impl ExecutorRegistry {
         }
 
         // Create default executor configs if they don't exist
-        for name in ["claude", "codex", "shell"] {
+        for name in [
+            "claude",
+            "codex",
+            "shell",
+            "opencode",
+            "aider",
+            "crush",
+            "amplifier",
+            "goose",
+            "qwen",
+            "cline",
+        ] {
             let config_path = self.config_dir.join(format!("{}.toml", name));
             if !config_path.exists() {
                 let config = self.default_config(name)?;
@@ -1863,9 +2048,95 @@ template = "Work on {{task_id}}"
         assert_eq!(codex_config.executor.executor_type, "codex");
         assert_eq!(codex_config.executor.command, "codex");
 
+        let opencode_config = registry.load_config("opencode").unwrap();
+        assert_eq!(opencode_config.executor.executor_type, "opencode");
+        assert_eq!(opencode_config.executor.command, "opencode");
+
+        let aider_config = registry.load_config("aider").unwrap();
+        assert_eq!(aider_config.executor.executor_type, "aider");
+        assert_eq!(aider_config.executor.command, "aider");
+
         let shell_config = registry.load_config("shell").unwrap();
         assert_eq!(shell_config.executor.executor_type, "shell");
         assert_eq!(shell_config.executor.command, "bash");
+
+        let goose_config = registry.load_config("goose").unwrap();
+        assert_eq!(goose_config.executor.executor_type, "goose");
+        assert_eq!(goose_config.executor.command, "goose");
+        assert_eq!(
+            goose_config.executor.args,
+            vec!["run", "--no-session", "--output-format", "json"]
+        );
+        assert!(goose_config.executor.prompt_template.is_none());
+
+        let qwen_config = registry.load_config("qwen").unwrap();
+        assert_eq!(qwen_config.executor.executor_type, "qwen");
+        assert_eq!(qwen_config.executor.command, "qwen");
+        assert_eq!(
+            qwen_config.executor.args,
+            vec!["--output-format", "json", "--yolo"]
+        );
+        assert!(qwen_config.executor.prompt_template.is_none());
+
+        let cline_config = registry.load_config("cline").unwrap();
+        assert_eq!(cline_config.executor.executor_type, "cline");
+        assert_eq!(cline_config.executor.command, "cline");
+        assert_eq!(
+            cline_config.executor.args,
+            vec!["--json", "--auto-approve", "true"]
+        );
+        assert!(cline_config.executor.prompt_template.is_none());
+
+        let crush_config = registry.load_config("crush").unwrap();
+        assert_eq!(crush_config.executor.executor_type, "crush");
+        assert_eq!(crush_config.executor.command, "crush");
+
+        let amplifier_config = registry.load_config("amplifier").unwrap();
+        assert_eq!(amplifier_config.executor.executor_type, "amplifier");
+        assert_eq!(amplifier_config.executor.command, "amplifier");
+        assert_eq!(
+            amplifier_config.executor.args,
+            vec![
+                "run",
+                "--mode",
+                "single",
+                "--output-format",
+                "json",
+                "--bundle",
+                "wg",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_registry_loads_defaults_for_all_worker_only_externals() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ExecutorRegistry::new(temp_dir.path());
+
+        for kind in crate::dispatch::ExecutorKind::EXTERNAL_CLIS {
+            let name = kind.as_str();
+            let config = registry
+                .load_config(name)
+                .unwrap_or_else(|err| panic!("default config for {name} should load: {err}"));
+
+            assert_eq!(
+                config.executor.executor_type, name,
+                "default config type should match executor name for {name}"
+            );
+            assert!(
+                !config.executor.command.is_empty(),
+                "default config should define a command for {name}"
+            );
+            assert_eq!(
+                config.executor.working_dir.as_deref(),
+                Some("{{working_dir}}"),
+                "worker-only executor {name} should run inside the task worktree"
+            );
+            assert!(
+                config.executor.prompt_template.is_none(),
+                "worker-only executor {name} should use spawn-time prompt assembly"
+            );
+        }
     }
 
     #[test]
@@ -1880,7 +2151,14 @@ template = "Work on {{task_id}}"
         // Should create executor configs
         assert!(workgraph_dir.join("executors/claude.toml").exists());
         assert!(workgraph_dir.join("executors/codex.toml").exists());
+        assert!(workgraph_dir.join("executors/opencode.toml").exists());
+        assert!(workgraph_dir.join("executors/aider.toml").exists());
         assert!(workgraph_dir.join("executors/shell.toml").exists());
+        assert!(workgraph_dir.join("executors/crush.toml").exists());
+        assert!(workgraph_dir.join("executors/amplifier.toml").exists());
+        assert!(workgraph_dir.join("executors/goose.toml").exists());
+        assert!(workgraph_dir.join("executors/qwen.toml").exists());
+        assert!(workgraph_dir.join("executors/cline.toml").exists());
     }
 
     #[test]
@@ -2272,9 +2550,10 @@ args = ["--custom-flag"]
         assert_eq!(config.executor.command, "codex");
         // Base invocation flags
         assert_eq!(
-            &config.executor.args[0..4],
+            &config.executor.args[0..5],
             &[
                 "exec".to_string(),
+                "--ignore-user-config".to_string(),
                 "--json".to_string(),
                 "--skip-git-repo-check".to_string(),
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
@@ -2302,6 +2581,46 @@ args = ["--custom-flag"]
     }
 
     #[test]
+    fn test_registry_default_config_opencode_shape() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ExecutorRegistry::new(temp_dir.path());
+        let config = registry.load_config("opencode").unwrap();
+
+        assert_eq!(config.executor.executor_type, "opencode");
+        assert_eq!(config.executor.command, "opencode");
+        assert_eq!(
+            config.executor.args,
+            vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ]
+        );
+        assert_eq!(
+            config.executor.working_dir,
+            Some("{{working_dir}}".to_string())
+        );
+        assert!(config.executor.prompt_template.is_none());
+    }
+
+    #[test]
+    fn test_registry_default_config_aider_shape() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ExecutorRegistry::new(temp_dir.path());
+        let config = registry.load_config("aider").unwrap();
+
+        assert_eq!(config.executor.executor_type, "aider");
+        assert_eq!(config.executor.command, "aider");
+        assert_eq!(config.executor.args, vec!["--yes-always".to_string()]);
+        assert_eq!(
+            config.executor.working_dir,
+            Some("{{working_dir}}".to_string())
+        );
+        assert!(config.executor.prompt_template.is_none());
+    }
+
+    #[test]
     fn test_registry_default_config_shell_has_env() {
         let temp_dir = TempDir::new().unwrap();
         let registry = ExecutorRegistry::new(temp_dir.path());
@@ -2315,6 +2634,49 @@ args = ["--custom-flag"]
             config.executor.env.get("TASK_TITLE"),
             Some(&"{{task_title}}".to_string())
         );
+    }
+
+    #[test]
+    fn test_registry_default_config_amplifier_shape() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ExecutorRegistry::new(temp_dir.path());
+        let config = registry.load_config("amplifier").unwrap();
+
+        assert_eq!(config.executor.executor_type, "amplifier");
+        assert_eq!(config.executor.command, "amplifier");
+        assert_eq!(
+            config.executor.args,
+            vec![
+                "run",
+                "--mode",
+                "single",
+                "--output-format",
+                "json",
+                "--bundle",
+                "wg",
+            ]
+        );
+        assert_eq!(
+            config.executor.working_dir,
+            Some("{{working_dir}}".to_string())
+        );
+        assert!(config.executor.prompt_template.is_none());
+    }
+
+    #[test]
+    fn test_registry_default_config_crush_is_experimental_shape() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = ExecutorRegistry::new(temp_dir.path());
+        let config = registry.load_config("crush").unwrap();
+
+        assert_eq!(config.executor.executor_type, "crush");
+        assert_eq!(config.executor.command, "crush");
+        assert_eq!(config.executor.args, vec!["run", "--quiet"]);
+        assert_eq!(
+            config.executor.working_dir,
+            Some("{{working_dir}}".to_string())
+        );
+        assert!(config.executor.prompt_template.is_none());
     }
 
     #[test]

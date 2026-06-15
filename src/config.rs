@@ -1207,8 +1207,9 @@ impl DispatchRole {
     ///
     /// Metacognition/routing roles (assigner, compactor, triage, evaluator, etc.) default
     /// to Fast so they use haiku and don't burn budget on every dispatch. TaskAgent runs
-    /// at Standard (sonnet) — typical implementation work. Evolver, Creator, and
-    /// Verification get Premium (opus) because they require strong reasoning:
+    /// at Standard; starter/default profiles intentionally map Standard to the
+    /// top worker model so ordinary task dispatch does not silently downgrade.
+    /// Evolver, Creator, and Verification get Premium because they require strong reasoning:
     /// evolver redesigns the agency, creator decomposes work into new tasks, and
     /// verification is the correctness gate.
     pub fn default_tier(&self) -> Tier {
@@ -1353,7 +1354,7 @@ impl Tier {
     pub fn default_alias(&self) -> &'static str {
         match self {
             Self::Fast => "haiku",
-            Self::Standard => "sonnet",
+            Self::Standard => "opus",
             Self::Premium => "opus",
         }
     }
@@ -1671,6 +1672,24 @@ pub struct ResolvedModel {
     pub endpoint: Option<String>,
 }
 
+impl ResolvedModel {
+    /// Return the model spec that should be handed to spawn planning.
+    ///
+    /// `resolve_model_for_role` keeps API identity split into `model` and
+    /// `provider` so lightweight HTTP callers can pick clients cleanly. Spawn
+    /// planning, however, derives the executor from a single provider:model
+    /// route. Reattach the provider here so CLI-backed routes such as
+    /// `codex:gpt-5.5` cannot collapse to bare `gpt-5.5` and accidentally
+    /// stay paired with the default Claude executor.
+    pub fn spawn_model_spec(&self) -> String {
+        let Some(provider) = self.provider.as_deref() else {
+            return self.model.clone();
+        };
+        let prefix = native_provider_to_prefix(provider);
+        format!("{prefix}:{}", self.model)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified provider:model naming
 // ---------------------------------------------------------------------------
@@ -1771,6 +1790,39 @@ pub fn parse_model_spec(spec: &str) -> ModelSpec {
     }
 }
 
+/// Normalize a bare `vendor/model` route into the canonical
+/// `openrouter:<vendor>/<model>` model spec.
+///
+/// A bare route — a slash and no recognized provider prefix, e.g.
+/// `minimax/minimax-m3` — launched on the Nex/native executor with no
+/// explicit endpoint is an OpenRouter route (nex-optional-openrouter-endpoint).
+/// Normalizing it up front means downstream provider resolution targets
+/// OpenRouter directly instead of falling through to the bare-name
+/// oai-compat/local default and silently hitting a local server.
+///
+/// Specs that already carry a provider prefix (`openrouter:...`,
+/// `claude:...`, `nex:...`, …) or have no slash (`qwen3-coder`, `opus`) are
+/// returned unchanged — only an unqualified `vendor/model` is rewritten.
+pub fn normalize_bare_openrouter_route(model: &str) -> String {
+    let spec = parse_model_spec(model);
+    if spec.provider.is_none() && spec.model_id.contains('/') {
+        format!("openrouter:{}", spec.model_id)
+    } else {
+        model.to_string()
+    }
+}
+
+/// Whether a model spec routes to OpenRouter — i.e. it carries the
+/// `openrouter:` provider prefix. Call after
+/// [`normalize_bare_openrouter_route`] so bare `vendor/model` routes are
+/// already canonicalized.
+pub fn model_is_openrouter(model: &str) -> bool {
+    matches!(
+        parse_model_spec(model).provider.as_deref(),
+        Some("openrouter")
+    )
+}
+
 /// Parse a model spec **strictly**: requires `provider:model` format.
 ///
 /// Returns an error with a helpful migration message for:
@@ -1808,13 +1860,32 @@ pub fn parse_model_spec_strict(spec: &str) -> Result<ModelSpec, ModelSpecError> 
         return Err(ModelSpecError {
             input: spec.to_string(),
             message: format!(
-                "amplifier executor was removed; use claude:/codex:/nex: instead \
-                 (got '{}'). The previous `amplifier` handler delegated to a CLI that \
-                 was never tested in this codebase and silently failed at spawn time. \
-                 Migrate to `claude:opus`, `codex:gpt-5.4`, or `nex:<model>` with a \
-                 matching `-e <ENDPOINT>`.",
+                "`amplifier` is an executor name, not a model provider prefix \
+                 (got '{}'). Use `--executor amplifier` or `[dispatcher].executor = \
+                 \"amplifier\"`, and keep model specs on provider prefixes such as \
+                 `claude:opus`, `codex:gpt-5.5`, `openrouter:<model>`, or \
+                 `nex:<model>` with a matching `-e <ENDPOINT>`.",
                 spec,
             ),
+        });
+    }
+
+    // Executor-qualified routes (e.g. `opencode:openrouter/stepfun/step-3.7-flash`):
+    // external CLI executors are addressed by an *executor* name prefix, not a
+    // model-provider prefix, so they are intentionally NOT in `KNOWN_PROVIDERS`.
+    // `parse_executor_model_route` makes these first-class model strings on the
+    // spawn path, and the opencode starter profile ships them, so the strict
+    // validator must accept them too (otherwise `wg profile show` / `wg config
+    // lint` flags a valid profile). `amplifier` is excluded above on purpose
+    // (it keeps its dedicated "executor name, not a provider" error).
+    if let Some((prefix, rest)) = spec.split_once(':')
+        && !rest.trim().is_empty()
+        && crate::dispatch::ExecutorKind::from_str(prefix)
+            .is_some_and(|kind| kind.is_external_cli())
+    {
+        return Ok(ModelSpec {
+            provider: Some(prefix.to_string()),
+            model_id: rest.to_string(),
         });
     }
 
@@ -3922,6 +3993,14 @@ impl Config {
     /// Return the global WG directory.
     ///
     /// Resolution order matches `main.rs::resolve_workgraph_dir`:
+    /// 0. `$WG_GLOBAL_DIR` if set — an explicit override used to point WG's
+    ///    global config + active-profile lookup at a specific directory.
+    ///    This is the single chokepoint both `global_config_path()` and
+    ///    `profile::named::active_pointer_path()` flow through, so setting it
+    ///    isolates *all* machine-global state (config.toml, active-profile,
+    ///    profiles/) in one shot. Tests use it to stay independent of the
+    ///    developer machine's `~/.wg` (e.g. an active `opencode` profile),
+    ///    without perturbing `HOME` for sibling tests that shell out to git.
     /// 1. `~/.wg` if it exists (modern, written by `wg init`).
     /// 2. `~/.workgraph` if it exists (legacy).
     /// 3. `~/.wg` (default — new installs get the modern name).
@@ -3930,6 +4009,12 @@ impl Config {
     /// but `Config::load_global()` reads `~/.workgraph/config.toml`, silently
     /// dropping every global key.
     pub fn global_dir() -> anyhow::Result<PathBuf> {
+        if let Some(dir) = std::env::var_os("WG_GLOBAL_DIR") {
+            let dir = PathBuf::from(dir);
+            if !dir.as_os_str().is_empty() {
+                return Ok(dir);
+            }
+        }
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         let modern = home.join(".wg");
@@ -4367,12 +4452,96 @@ impl Config {
         }
 
         if let Some(m) = effective_model {
-            self.coordinator.model = Some(m.clone());
-            self.agent.model = m.clone();
+            self.pin_default_route_model(&m);
             summary.push(format!("model → {}", m));
         }
 
         Ok(summary)
+    }
+
+    /// Pin the user-visible default worker route to one exact model spec.
+    ///
+    /// This updates every default/task-agent surface that can otherwise fall
+    /// through to a lower tier: agent/dispatcher model, `[models.default]`,
+    /// `[models.task_agent]`, and the standard/premium tier aliases. For known
+    /// CLI profiles (claude/codex), starter agency pins are moved to the
+    /// matching cheap model too; custom role overrides are preserved.
+    pub fn pin_default_route_model(&mut self, model: &str) {
+        self.agent.model = model.to_string();
+        self.coordinator.model = Some(model.to_string());
+        let role = RoleModelConfig {
+            provider: None,
+            model: Some(model.to_string()),
+            tier: None,
+            endpoint: None,
+        };
+        self.models.default = Some(role.clone());
+        self.models.task_agent = Some(role);
+        self.tiers.standard = Some(model.to_string());
+        self.tiers.premium = Some(model.to_string());
+        self.pin_provider_companion_defaults(model);
+    }
+
+    fn pin_provider_companion_defaults(&mut self, model: &str) {
+        let spec = parse_model_spec(model);
+        let Some(provider) = spec.provider.as_deref() else {
+            return;
+        };
+        let (fast, agency) = match provider {
+            "claude" | "anthropic" => ("claude:haiku", "claude:haiku"),
+            "codex" => ("codex:gpt-5.4-mini", "codex:gpt-5.4-mini"),
+            _ => return,
+        };
+
+        if self.tier_model_is_absent_or_starter(self.tiers.fast.as_deref()) {
+            self.tiers.fast = Some(fast.to_string());
+        }
+        for role in [
+            DispatchRole::Evaluator,
+            DispatchRole::Assigner,
+            DispatchRole::FlipInference,
+            DispatchRole::FlipComparison,
+        ] {
+            self.set_role_model_if_absent_or_starter(role, agency);
+        }
+    }
+
+    fn tier_model_is_absent_or_starter(&self, model: Option<&str>) -> bool {
+        match model {
+            None => true,
+            Some(model) => Self::is_starter_agency_model(model),
+        }
+    }
+
+    fn set_role_model_if_absent_or_starter(&mut self, role: DispatchRole, model: &str) {
+        let slot = self.models.get_role_mut(role);
+        let replace = match slot.as_ref() {
+            None => true,
+            Some(cfg) => {
+                cfg.provider.is_none()
+                    && cfg.tier.is_none()
+                    && cfg.endpoint.is_none()
+                    && match cfg.model.as_deref() {
+                        None => true,
+                        Some(existing) => Self::is_starter_agency_model(existing),
+                    }
+            }
+        };
+        if replace {
+            *slot = Some(RoleModelConfig {
+                provider: None,
+                model: Some(model.to_string()),
+                tier: None,
+                endpoint: None,
+            });
+        }
+    }
+
+    fn is_starter_agency_model(model: &str) -> bool {
+        matches!(
+            model,
+            "haiku" | "claude:haiku" | "gpt-5.4-mini" | "codex:gpt-5.4-mini"
+        )
     }
 
     /// Save configuration to the global path (~/.wg/config.toml).
@@ -7026,6 +7195,69 @@ provider = "openrouter"
     }
 
     #[test]
+    fn test_normalize_bare_openrouter_route_bare_vendor_model() {
+        // The canonical case from the task: a bare `vendor/model` route
+        // becomes the OpenRouter spec.
+        assert_eq!(
+            normalize_bare_openrouter_route("minimax/minimax-m3"),
+            "openrouter:minimax/minimax-m3"
+        );
+        assert_eq!(
+            normalize_bare_openrouter_route("deepseek/deepseek-v3.2"),
+            "openrouter:deepseek/deepseek-v3.2"
+        );
+    }
+
+    #[test]
+    fn test_normalize_bare_openrouter_route_preserves_prefixed_specs() {
+        // Already-qualified specs are returned unchanged — including an
+        // explicit `openrouter:` prefix (idempotent) and non-openrouter
+        // providers.
+        assert_eq!(
+            normalize_bare_openrouter_route("openrouter:minimax/minimax-m3"),
+            "openrouter:minimax/minimax-m3"
+        );
+        assert_eq!(
+            normalize_bare_openrouter_route("claude:opus"),
+            "claude:opus"
+        );
+        assert_eq!(
+            normalize_bare_openrouter_route("nex:qwen3-coder"),
+            "nex:qwen3-coder"
+        );
+    }
+
+    #[test]
+    fn test_normalize_bare_openrouter_route_preserves_bare_names_without_slash() {
+        // A bare name with no slash is NOT a vendor/model route — left alone
+        // (resolves via the usual alias/local path, not OpenRouter).
+        assert_eq!(normalize_bare_openrouter_route("opus"), "opus");
+        assert_eq!(
+            normalize_bare_openrouter_route("qwen3-coder-30b"),
+            "qwen3-coder-30b"
+        );
+        // Ollama-style tag with a colon (unknown prefix) and no slash stays bare.
+        assert_eq!(
+            normalize_bare_openrouter_route("deepseek-coder-v2:16b"),
+            "deepseek-coder-v2:16b"
+        );
+    }
+
+    #[test]
+    fn test_model_is_openrouter() {
+        assert!(model_is_openrouter("openrouter:minimax/minimax-m3"));
+        // After normalization a bare route is openrouter:
+        assert!(model_is_openrouter(&normalize_bare_openrouter_route(
+            "minimax/minimax-m3"
+        )));
+        // A bare route is NOT openrouter until normalized.
+        assert!(!model_is_openrouter("minimax/minimax-m3"));
+        assert!(!model_is_openrouter("claude:opus"));
+        assert!(!model_is_openrouter("nex:qwen3-coder"));
+        assert!(!model_is_openrouter("opus"));
+    }
+
+    #[test]
     fn test_parse_model_spec_ollama_model_tag() {
         // Ollama model tags contain `:` but the prefix isn't a known provider
         let spec = parse_model_spec("deepseek-coder-v2:16b");
@@ -7072,34 +7304,55 @@ provider = "openrouter"
     }
 
     #[test]
-    fn test_parse_model_spec_strict_rejects_amplifier_with_migration_message() {
-        // amplifier was a CLI handler that was never tested; removed entirely.
-        // Strict parsing must reject `amplifier:foo` with a clear migration
-        // message so users coming back to old configs get pointed at
-        // claude:/codex:/nex: instead of getting a generic "unknown provider"
-        // error.
+    fn test_parse_model_spec_strict_rejects_amplifier_as_provider() {
+        // amplifier is a CLI executor, not a model provider. Strict parsing
+        // must reject `amplifier:foo` without implying that the executor
+        // surface itself is unavailable.
         let err = parse_model_spec_strict("amplifier:claude-3-haiku")
             .expect_err("amplifier: prefix must be rejected");
         assert!(
-            err.message.contains("amplifier executor was removed"),
-            "error must call out the removal explicitly, got: {}",
+            err.message.contains("executor name") && err.message.contains("not a model provider"),
+            "error must distinguish executor name from provider prefix, got: {}",
             err.message,
         );
         assert!(
             err.message.contains("claude:")
                 && err.message.contains("codex:")
+                && err.message.contains("openrouter:")
                 && err.message.contains("nex:"),
-            "error must list the three valid handler prefixes, got: {}",
+            "error must list valid provider/model prefixes, got: {}",
             err.message,
         );
     }
 
     #[test]
     fn test_amplifier_not_in_known_providers() {
-        // Belt-and-suspenders: KNOWN_PROVIDERS should never contain "amplifier"
-        // — the strict parser branches on the prefix before this check, but
-        // pinning this guards against a future re-introduction.
+        // Belt-and-suspenders: `amplifier` is restored as an executor name,
+        // but it must not silently become a model provider prefix.
         assert!(!KNOWN_PROVIDERS.contains(&"amplifier"));
+    }
+
+    #[test]
+    fn test_parse_model_spec_strict_accepts_opencode_executor_route() {
+        // `opencode:openrouter/<vendor>/<model>` is a first-class
+        // executor-qualified route (see parse_executor_model_route) and the
+        // opencode starter profile ships it, so strict validation must accept
+        // it — otherwise `wg profile show` / `wg config lint` falsely flag a
+        // valid opencode profile as "Unknown provider 'opencode'".
+        let spec = parse_model_spec_strict("opencode:openrouter/stepfun/step-3.7-flash")
+            .expect("opencode executor route must validate");
+        assert_eq!(spec.provider.as_deref(), Some("opencode"));
+        assert_eq!(spec.model_id, "openrouter/stepfun/step-3.7-flash");
+
+        // The premium route too.
+        assert!(parse_model_spec_strict("opencode:openrouter/minimax/minimax-m2.7").is_ok());
+
+        // Other worker-only external CLIs compose the same way.
+        assert!(parse_model_spec_strict("aider:openrouter/x/y").is_ok());
+
+        // But an empty route and a genuinely unknown provider still fail.
+        assert!(parse_model_spec_strict("opencode:").is_err());
+        assert!(parse_model_spec_strict("foobar:gpt-4").is_err());
     }
 
     #[test]
@@ -7313,6 +7566,27 @@ model = "local:qwen3-coder"
     }
 
     #[test]
+    fn test_resolve_model_for_role_codex_spawn_spec_is_atomic() {
+        let mut config = Config::default();
+        config.models.task_agent = Some(RoleModelConfig {
+            model: Some("codex:gpt-5.5".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::TaskAgent);
+
+        assert_eq!(resolved.model, "gpt-5.5");
+        assert_eq!(resolved.provider, Some("codex".to_string()));
+        assert_eq!(
+            resolved.spawn_model_spec(),
+            "codex:gpt-5.5",
+            "dispatch must pass a provider-qualified model into plan_spawn so codex-class routing cannot be paired with executor=claude"
+        );
+    }
+
+    #[test]
     fn test_resolve_model_for_role_provider_prefix_overrides_separate_provider() {
         let mut config = Config::default();
         config.models.evaluator = Some(RoleModelConfig {
@@ -7402,7 +7676,7 @@ model = "local:qwen3-coder"
         let config = Config::default();
         let tiers = config.effective_tiers();
         assert_eq!(tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(tiers.standard.as_deref(), Some("claude:sonnet"));
+        assert_eq!(tiers.standard.as_deref(), Some("claude:opus"));
         assert_eq!(tiers.premium.as_deref(), Some("claude:opus"));
     }
 
@@ -7412,7 +7686,7 @@ model = "local:qwen3-coder"
         config.profile = Some("anthropic".into());
         let tiers = config.effective_tiers();
         assert_eq!(tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(tiers.standard.as_deref(), Some("claude:sonnet"));
+        assert_eq!(tiers.standard.as_deref(), Some("claude:opus"));
         assert_eq!(tiers.premium.as_deref(), Some("claude:opus"));
     }
 
@@ -7446,7 +7720,7 @@ model = "local:qwen3-coder"
         let tiers = config.effective_tiers();
         // Unknown profile produces no tiers, so hardcoded defaults are used
         assert_eq!(tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(tiers.standard.as_deref(), Some("claude:sonnet"));
+        assert_eq!(tiers.standard.as_deref(), Some("claude:opus"));
         assert_eq!(tiers.premium.as_deref(), Some("claude:opus"));
     }
 
@@ -7457,7 +7731,7 @@ model = "local:qwen3-coder"
         // Dynamic profiles return None from resolve_tiers(), so defaults are used
         let tiers = config.effective_tiers();
         assert_eq!(tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(tiers.standard.as_deref(), Some("claude:sonnet"));
+        assert_eq!(tiers.standard.as_deref(), Some("claude:opus"));
         assert_eq!(tiers.premium.as_deref(), Some("claude:opus"));
     }
 
@@ -8422,9 +8696,15 @@ fetch_max_chars = 16000
     }
 
     #[test]
-    fn test_alias_claude_sonnet_resolves_to_bare_sonnet() {
-        let config = Config::default();
-        let resolved = config.resolve_model_for_role(DispatchRole::TaskAgent);
+    fn test_alias_claude_sonnet_resolves_to_bare_sonnet_when_explicit() {
+        let mut config = Config::default();
+        config.models.evaluator = Some(RoleModelConfig {
+            model: Some("claude:sonnet".to_string()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let resolved = config.resolve_model_for_role(DispatchRole::Evaluator);
         assert_eq!(
             resolved.model, "sonnet",
             "claude:sonnet must resolve to bare 'sonnet', not a dated model ID"

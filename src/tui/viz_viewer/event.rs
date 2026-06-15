@@ -607,16 +607,22 @@ pub(crate) fn handle_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
             .chat_agent_death
             .contains_key(&app.active_coordinator_id);
     if vendor_pty_active {
-        // Modal contract (implement-tui-modal): when chat PTY has focus, the
-        // ONLY key allowed to break out is Ctrl+T. Every other keystroke —
-        // letters, digits, Enter, Ctrl+N, Ctrl+W, Ctrl+anything — flows to
-        // the embedded REPL. Earlier versions intercepted Ctrl+N and Ctrl+W
-        // as global "escape hatches" so users could break in to the launcher
-        // / retire-chat dialog from inside a PTY; that contradicts the modal
-        // model. Use Ctrl+T to enter command mode, then `n`/`w` (see
-        // implement-tui-command).
+        // Modal contract (implement-tui-modal): when chat PTY has focus, most
+        // keystrokes flow to the embedded REPL. Two host-TUI escapes remain:
+        // Ctrl+T toggles command mode, and `+` opens the new-chat launcher
+        // because the visible Chat tab advertises `[+]` as the add-chat path.
+        // Other letters, digits, Enter, Ctrl+N, Ctrl+W, Ctrl+anything still
+        // go to the embedded REPL. Use Ctrl+T to enter command mode, then
+        // `n`/`w` for the command-mode aliases (see implement-tui-command).
         let is_toggle =
             matches!(code, KeyCode::Char('t')) && modifiers.contains(KeyModifiers::CONTROL);
+        let is_plus_launcher = matches!(code, KeyCode::Char('+'))
+            && !modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+        if is_plus_launcher {
+            app.open_launcher();
+            return;
+        }
         let is_scroll_toggle =
             matches!(code, KeyCode::Char(']')) && modifiers.contains(KeyModifiers::CONTROL);
         if is_scroll_toggle {
@@ -1440,8 +1446,8 @@ pub(super) fn handle_launcher_mouse_click(app: &mut VizApp, row: u16, column: u1
 fn handle_launcher_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
     use super::state::{ADD_NEW_EXECUTOR_CHOICES, AddNewField, LauncherMode, LauncherSection};
 
-    // While a previous Enter is still in-flight (waiting for `wg
-    // service create-coordinator` IPC to return), swallow keys so the
+    // While a previous Enter is still in-flight (waiting for `wg chat
+    // create --json` to return), swallow keys so the
     // user can't double-submit, Esc-cancel a half-created chat, or
     // mutate fields whose values were already shipped. The pane is
     // visible during this window — see fix-tui-new symptom 2.
@@ -1488,6 +1494,26 @@ fn handle_launcher_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
         if modifiers.contains(KeyModifiers::SHIFT) {
             launcher.prev_section();
         } else {
+            // In the nex Endpoint field, a forward Tab first accepts the
+            // highlighted endpoint suggestion (filling its name) — then
+            // advances. A raw URL has no suggestions, so Tab just moves
+            // on, preserving custom-URL entry.
+            if matches!(
+                launcher.active_section,
+                LauncherSection::AddNew(AddNewField::Endpoint)
+            ) {
+                launcher.accept_endpoint_suggestion();
+            }
+            // In the Model field, a forward Tab first accepts the highlighted
+            // model suggestion (filling its executor-normalized spec) — then
+            // advances. Explicit-spec / free-text entries have no suggestion
+            // to accept, so Tab just advances, preserving custom models.
+            if matches!(
+                launcher.active_section,
+                LauncherSection::AddNew(AddNewField::Model)
+            ) {
+                launcher.accept_model_suggestion();
+            }
             launcher.next_section();
         }
         return;
@@ -1562,30 +1588,66 @@ fn handle_launcher_input(app: &mut VizApp, code: KeyCode, modifiers: KeyModifier
             _ => {}
         },
         LauncherSection::AddNew(AddNewField::Model) => match code {
+            // Up/Down navigate the model fuzzy-autocomplete dropdown. These
+            // are no-ops when there is nothing to navigate (explicit-spec
+            // entry or no matching suggestions), so they never interfere
+            // with typing a custom model spec.
+            KeyCode::Up => {
+                launcher.move_model_suggestion(-1);
+            }
+            KeyCode::Down => {
+                launcher.move_model_suggestion(1);
+            }
             KeyCode::Enter => {
+                // Accept the highlighted suggestion (filling its
+                // executor-normalized spec) before launching, so Enter is a
+                // one-key "pick & go". With no suggestion to accept the typed
+                // free-text model launches verbatim.
+                launcher.accept_model_suggestion();
                 app.launch_from_launcher();
             }
             KeyCode::Char(c)
                 if !modifiers.contains(KeyModifiers::CONTROL) && is_safe_launcher_field_char(c) =>
             {
                 launcher.add_model.push(c);
+                // Re-filtering changes the list; highlight the top match.
+                launcher.model_suggestion_selected = 0;
             }
             KeyCode::Backspace => {
                 launcher.add_model.pop();
+                launcher.model_suggestion_selected = 0;
             }
             _ => {}
         },
         LauncherSection::AddNew(AddNewField::Endpoint) => match code {
+            // Up/Down navigate the endpoint autocomplete dropdown. These
+            // are no-ops when there is nothing to navigate (raw URL entry
+            // or no configured endpoints), so they never interfere with
+            // typing a custom URL.
+            KeyCode::Up => {
+                launcher.move_endpoint_suggestion(-1);
+            }
+            KeyCode::Down => {
+                launcher.move_endpoint_suggestion(1);
+            }
             KeyCode::Enter => {
+                // Accept the highlighted suggestion (filling its name)
+                // before launching, so Enter is a one-key "pick & go".
+                // For a raw URL there is no suggestion to accept, so the
+                // typed URL launches verbatim.
+                launcher.accept_endpoint_suggestion();
                 app.launch_from_launcher();
             }
             KeyCode::Char(c)
                 if !modifiers.contains(KeyModifiers::CONTROL) && is_safe_launcher_field_char(c) =>
             {
                 launcher.add_endpoint.push(c);
+                // Re-filtering changes the list; highlight the top match.
+                launcher.endpoint_suggestion_selected = 0;
             }
             KeyCode::Backspace => {
                 launcher.add_endpoint.pop();
+                launcher.endpoint_suggestion_selected = 0;
             }
             _ => {}
         },
@@ -2486,9 +2548,13 @@ fn handle_graph_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifiers) {
                 if d == '4' && app.right_panel_visible && app.right_panel_tab == RightPanelTab::Log
                 {
                     app.cycle_log_view();
+                    app.focused_panel = FocusedPanel::RightPanel;
                 } else {
                     app.right_panel_visible = true;
                     app.right_panel_tab = tab;
+                    if tab == RightPanelTab::Log {
+                        app.focused_panel = FocusedPanel::RightPanel;
+                    }
                 }
             }
         }
@@ -2923,10 +2989,12 @@ fn handle_right_panel_key(app: &mut VizApp, code: KeyCode, modifiers: KeyModifie
 
         // PgUp/PgDn fast scroll
         KeyCode::PageUp => {
-            right_panel_scroll_up(app, 10);
+            let amount = right_panel_page_amount(app);
+            right_panel_scroll_up(app, amount);
         }
         KeyCode::PageDown => {
-            right_panel_scroll_down(app, 10);
+            let amount = right_panel_page_amount(app);
+            right_panel_scroll_down(app, amount);
         }
 
         // Home/End: jump to top/bottom of content
@@ -3346,7 +3414,13 @@ fn poll_chat_pty_takeover(app: &mut VizApp) -> bool {
         None => return false,
     };
     let task_id = workgraph::chat_id::format_chat_task_id(app.active_coordinator_id);
-    let chat_dir = app.workgraph_dir.join("chat").join(&task_id);
+    // Resolve through the registry using the dot-less `chat-N` ref the
+    // handler runs under: the handler holds its lock under the UUID
+    // session dir, not the literal `chat/.chat-N` join. Reading the
+    // literal path would always see "no holder" and report a premature
+    // (false) release.
+    let chat_ref = workgraph::chat_id::format_chat_session_ref(app.active_coordinator_id);
+    let chat_dir = workgraph::chat::chat_dir_for_ref(&app.workgraph_dir, &chat_ref);
     // Has the handler released?
     let released = match workgraph::session_lock::read_holder(&chat_dir) {
         Ok(None) => true,
@@ -3415,6 +3489,13 @@ fn toggle_chat_pty_mode(app: &mut VizApp) {
     app.task_panes.remove(&task_id);
     app.chat_pty_mode = false;
     app.maybe_auto_enable_chat_pty();
+}
+
+fn right_panel_page_amount(app: &VizApp) -> usize {
+    match app.right_panel_tab {
+        RightPanelTab::Log => app.log_pane.viewport_height.max(1),
+        _ => 10,
+    }
 }
 
 fn right_panel_scroll_up(app: &mut VizApp, amount: usize) {
@@ -4939,14 +5020,7 @@ fn vscrollbar_jump_panel(app: &mut VizApp, row: u16) {
             if max_scroll == 0 {
                 return;
             }
-            app.log_pane.scroll = jump(max_scroll);
-            // Update auto-tail based on whether the user dragged to the bottom.
-            if app.log_pane.scroll >= max_scroll {
-                app.log_pane.auto_tail = true;
-                app.log_pane.has_new_content = false;
-            } else {
-                app.log_pane.auto_tail = false;
-            }
+            app.log_pane.jump_to_scroll(jump(max_scroll));
         }
         RightPanelTab::Messages => {
             let total = app.messages_panel.total_wrapped_lines;
@@ -6218,6 +6292,115 @@ mod scrollbar_tests {
         handle_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 19, 119);
         assert!(app.scrollbar_drag.is_none());
         assert_eq!(app.hud_scroll, 80); // preserved
+    }
+
+    #[test]
+    fn graph_four_focuses_log_then_keys_scroll_log_viewport() {
+        let (mut app, _tmp) = build_test_app();
+        app.focused_panel = FocusedPanel::Graph;
+        app.right_panel_visible = false;
+        app.right_panel_tab = RightPanelTab::Detail;
+        app.log_pane.total_wrapped_lines = 120;
+        app.log_pane.viewport_height = 17;
+        app.log_pane.scroll = usize::MAX;
+        app.log_pane.auto_tail = true;
+
+        handle_key(&mut app, KeyCode::Char('4'), KeyModifiers::NONE);
+
+        assert_eq!(app.right_panel_tab, RightPanelTab::Log);
+        assert!(app.right_panel_visible);
+        assert_eq!(
+            app.focused_panel,
+            FocusedPanel::RightPanel,
+            "Opening the Log tab from graph focus should focus it so arrows/PageUp work"
+        );
+
+        handle_key(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(
+            app.log_pane.scroll, 86,
+            "PageUp should move by the log viewport height, not the legacy fixed 10 lines"
+        );
+        assert!(!app.log_pane.auto_tail);
+
+        handle_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.log_pane.scroll, 85);
+
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.log_pane.scroll, 86);
+
+        handle_key(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.log_pane.scroll, 0);
+        assert!(!app.log_pane.auto_tail);
+
+        handle_key(&mut app, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.log_pane.scroll, 103);
+        assert!(app.log_pane.auto_tail);
+    }
+
+    #[test]
+    fn mouse_wheel_over_log_pane_routes_to_log_scroll() {
+        let (mut app, _tmp) = build_test_app();
+        app.right_panel_tab = RightPanelTab::Log;
+        app.focused_panel = FocusedPanel::Graph;
+        app.log_pane.total_wrapped_lines = 100;
+        app.log_pane.viewport_height = 20;
+        app.log_pane.scroll = usize::MAX;
+        app.log_pane.auto_tail = true;
+        app.last_right_content_area = Rect {
+            x: 60,
+            y: 1,
+            width: 40,
+            height: 20,
+        };
+        app.last_graph_area = Rect {
+            x: 0,
+            y: 1,
+            width: 60,
+            height: 20,
+        };
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_panel_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        handle_mouse(&mut app, MouseEventKind::ScrollUp, 10, 80);
+        assert_eq!(app.log_pane.scroll, 77);
+        assert!(!app.log_pane.auto_tail);
+
+        handle_mouse(&mut app, MouseEventKind::ScrollDown, 10, 80);
+        assert_eq!(app.log_pane.scroll, 80);
+        assert!(app.log_pane.auto_tail);
+    }
+
+    #[test]
+    fn log_scrollbar_click_drag_updates_log_scroll_and_tail_state() {
+        let (mut app, _tmp) = build_test_app();
+        app.right_panel_tab = RightPanelTab::Log;
+        app.log_pane.total_wrapped_lines = 100;
+        app.log_pane.viewport_height = 20;
+        app.last_panel_scrollbar_area = Rect {
+            x: 119,
+            y: 0,
+            width: 1,
+            height: 20,
+        };
+        app.last_graph_scrollbar_area = Rect::default();
+        app.last_graph_hscrollbar_area = Rect::default();
+
+        handle_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 119);
+        assert_eq!(app.scrollbar_drag, Some(ScrollbarDragTarget::Panel));
+        assert_eq!(app.focused_panel, FocusedPanel::RightPanel);
+        assert!(
+            app.log_pane.scroll > 0 && app.log_pane.scroll < 80,
+            "mid-track click should jump into the middle of the log"
+        );
+        assert!(!app.log_pane.auto_tail);
+
+        handle_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 19, 119);
+        assert_eq!(app.log_pane.scroll, 80);
+        assert!(app.log_pane.auto_tail);
+
+        handle_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 19, 119);
+        assert!(app.scrollbar_drag.is_none());
     }
 
     #[test]
@@ -9054,6 +9237,25 @@ mod chat_tab_navigation_tests {
         );
     }
 
+    /// The visible Chat tab advertises `[+]` as the add-chat affordance.
+    /// It must work even when the embedded chat PTY currently owns focus.
+    #[test]
+    fn pty_mode_plus_opens_launcher() {
+        let (mut app, _tmp) = build_app_with_chats(&[0]);
+        app.right_panel_tab = RightPanelTab::Chat;
+        app.focused_panel = FocusedPanel::RightPanel;
+        app.chat_pty_mode = true;
+        app.chat_pty_forwards_stdin = true;
+
+        super::handle_key(&mut app, KeyCode::Char('+'), KeyModifiers::NONE);
+
+        assert!(
+            app.launcher.is_some(),
+            "'+' in PTY mode must open the new-chat launcher"
+        );
+        assert_eq!(app.input_mode, super::super::state::InputMode::Launcher);
+    }
+
     /// fix-new-chat-2 regression lock: while the new-chat launcher (or
     /// any non-Normal `InputMode`) is open, ZERO keystrokes may reach
     /// the underlying chat-pane PTY child's stdin. The pre-fix bug:
@@ -9670,6 +9872,306 @@ mod chat_tab_navigation_tests {
             pane_after.child_input_bytes_written() > bytes_before,
             "Without death info, 'r' must reach the PTY child's stdin \
              (death-panel guard must not over-block)"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Endpoint autocomplete key handling (add-nex-endpoint)
+    // ──────────────────────────────────────────────────────────────────
+
+    use super::super::state::{AddNewField, EndpointSuggestion, LauncherSection};
+
+    fn ep_sug(name: &str, url: &str, provider: &str, is_default: bool) -> EndpointSuggestion {
+        EndpointSuggestion {
+            name: name.to_string(),
+            url: Some(url.to_string()),
+            provider: provider.to_string(),
+            is_default,
+        }
+    }
+
+    /// Open the launcher in Add-new/nex mode focused on the Endpoint
+    /// field, preloaded with two endpoint suggestions (lambda is default).
+    fn launcher_on_endpoint_field() -> (VizApp, tempfile::TempDir) {
+        let (mut app, tmp) = build_app_with_chats(&[0]);
+        app.open_launcher();
+        assert!(app.launcher.is_some(), "launcher must open");
+        {
+            let l = app.launcher.as_mut().unwrap();
+            l.enter_add_new();
+            l.add_executor_idx = 3; // nex
+            l.add_model = "qwen3-coder".into();
+            l.endpoint_suggestions = vec![
+                ep_sug("local-gpu", "http://127.0.0.1:8088", "local", false),
+                ep_sug("lambda", "https://lambda01:30000", "openrouter", true),
+            ];
+            l.preselect_default_endpoint();
+            l.active_section = LauncherSection::AddNew(AddNewField::Endpoint);
+        }
+        (app, tmp)
+    }
+
+    fn key(app: &mut VizApp, code: KeyCode) {
+        super::handle_launcher_input(app, code, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn endpoint_field_preselects_default_on_focus() {
+        let (app, _tmp) = launcher_on_endpoint_field();
+        let l = app.launcher.as_ref().unwrap();
+        let hi = l.highlighted_endpoint_suggestion().unwrap();
+        assert_eq!(hi.name, "lambda", "the default endpoint is preselected");
+        assert!(hi.is_default);
+    }
+
+    #[test]
+    fn endpoint_typing_filters_and_resets_highlight() {
+        let (mut app, _tmp) = launcher_on_endpoint_field();
+        // Highlight currently on the default (index 1). Typing "local"
+        // narrows to one match and resets the highlight to the top.
+        for c in "local".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(l.add_endpoint, "local");
+        let filtered = l.filtered_endpoint_suggestions();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "local-gpu");
+        assert_eq!(l.endpoint_suggestion_selected, 0);
+    }
+
+    #[test]
+    fn endpoint_down_then_tab_accepts_named_suggestion_and_advances() {
+        let (mut app, _tmp) = launcher_on_endpoint_field();
+        // Move highlight to index 0 (local-gpu): default is index 1, so Up.
+        key(&mut app, KeyCode::Up);
+        // Tab accepts the highlighted suggestion and advances to Name.
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(
+            l.add_endpoint, "local-gpu",
+            "Tab fills the endpoint NAME from the highlighted suggestion"
+        );
+        assert_eq!(
+            l.active_section,
+            LauncherSection::AddNew(AddNewField::Name),
+            "Tab advances past the Endpoint field after accepting"
+        );
+    }
+
+    #[test]
+    fn endpoint_tab_accepts_default_when_untouched() {
+        let (mut app, _tmp) = launcher_on_endpoint_field();
+        // Straight Tab with the preselected default accepts "lambda".
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(l.add_endpoint, "lambda");
+    }
+
+    #[test]
+    fn endpoint_raw_url_typed_char_by_char_is_preserved() {
+        let (mut app, _tmp) = launcher_on_endpoint_field();
+        let url = "http://my-custom:9000/v1";
+        for c in url.chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        {
+            let l = app.launcher.as_ref().unwrap();
+            assert_eq!(l.add_endpoint, url);
+            assert!(
+                l.filtered_endpoint_suggestions().is_empty(),
+                "raw URL suppresses suggestions"
+            );
+        }
+        // Tab must NOT overwrite the custom URL (nothing to accept).
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(
+            l.add_endpoint, url,
+            "Tab on a raw URL only advances; it must not clobber the URL"
+        );
+        assert_eq!(l.active_section, LauncherSection::AddNew(AddNewField::Name));
+    }
+
+    #[test]
+    fn endpoint_backspace_reexposes_suggestions_after_raw_url() {
+        let (mut app, _tmp) = launcher_on_endpoint_field();
+        let typed = "http://x";
+        for c in typed.chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert!(
+            app.launcher
+                .as_ref()
+                .unwrap()
+                .filtered_endpoint_suggestions()
+                .is_empty(),
+            "while it is a raw URL, suggestions are hidden"
+        );
+        // Delete back to empty → suggestions return.
+        for _ in 0..typed.len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        let l = app.launcher.as_ref().unwrap();
+        assert!(l.add_endpoint.is_empty());
+        assert_eq!(l.filtered_endpoint_suggestions().len(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Model fuzzy-autocomplete key handling (add-model-fuzzy)
+    // ──────────────────────────────────────────────────────────────────
+
+    use super::super::state::ModelSuggestion;
+
+    fn model_sug(id: &str, provider: &str, source: &str) -> ModelSuggestion {
+        ModelSuggestion {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    /// Open the launcher in Add-new mode focused on the Model field, with
+    /// the given executor index and a preloaded model-suggestion list.
+    fn launcher_on_model_field(executor_idx: usize) -> (VizApp, tempfile::TempDir) {
+        let (mut app, tmp) = build_app_with_chats(&[0]);
+        app.open_launcher();
+        assert!(app.launcher.is_some(), "launcher must open");
+        {
+            let l = app.launcher.as_mut().unwrap();
+            l.enter_add_new();
+            l.add_executor_idx = executor_idx;
+            l.add_model = String::new();
+            l.model_suggestions = vec![
+                model_sug("minimax/minimax-m3", "openrouter", "curated"),
+                model_sug("deepseek/deepseek-r1", "openrouter", "mid"),
+                model_sug("qwen/qwen3-coder", "openrouter", "curated"),
+            ];
+            l.model_suggestion_selected = 0;
+            l.active_section = LauncherSection::AddNew(AddNewField::Model);
+        }
+        (app, tmp)
+    }
+
+    #[test]
+    fn model_typing_filters_and_resets_highlight() {
+        let (mut app, _tmp) = launcher_on_model_field(3); // nex
+        // Move highlight off the top first so we can prove typing resets it.
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.launcher.as_ref().unwrap().model_suggestion_selected, 1);
+        for c in "minimax m3".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(l.add_model, "minimax m3");
+        let f = l.filtered_model_suggestions();
+        assert_eq!(f.len(), 1, "fuzzy narrows to one: {f:?}");
+        assert_eq!(f[0].id, "minimax/minimax-m3");
+        assert_eq!(
+            l.model_suggestion_selected, 0,
+            "typing resets highlight to top"
+        );
+    }
+
+    #[test]
+    fn model_tab_accepts_suggestion_normalized_for_opencode_and_advances() {
+        let (mut app, _tmp) = launcher_on_model_field(2); // opencode
+        for c in "minimax m3".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(
+            l.add_model, "openrouter/minimax/minimax-m3",
+            "Tab fills the opencode-normalized route"
+        );
+        // opencode has no Endpoint field → Tab from Model advances to Name.
+        assert_eq!(l.active_section, LauncherSection::AddNew(AddNewField::Name));
+    }
+
+    #[test]
+    fn model_tab_accepts_suggestion_normalized_for_nex_and_advances_to_endpoint() {
+        let (mut app, _tmp) = launcher_on_model_field(3); // nex
+        for c in "minimax m3".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(
+            l.add_model, "openrouter:minimax/minimax-m3",
+            "Tab fills the nex-normalized spec"
+        );
+        // nex DOES have an Endpoint field → Tab from Model lands there, so
+        // model autocomplete composes with endpoint autocomplete.
+        assert_eq!(
+            l.active_section,
+            LauncherSection::AddNew(AddNewField::Endpoint)
+        );
+    }
+
+    #[test]
+    fn model_down_navigates_then_enter_accepts_highlighted() {
+        let (mut app, _tmp) = launcher_on_model_field(3); // nex
+        // Down twice → highlight qwen/qwen3-coder (index 2) on the full list.
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        // Accept via the state API directly (Enter would also launch).
+        let accepted = app.launcher.as_mut().unwrap().accept_model_suggestion();
+        assert!(accepted);
+        assert_eq!(
+            app.launcher.as_ref().unwrap().add_model,
+            "openrouter:qwen/qwen3-coder"
+        );
+    }
+
+    #[test]
+    fn model_arbitrary_free_text_is_preserved_through_tab() {
+        let (mut app, _tmp) = launcher_on_model_field(3); // nex
+        // Type a custom spec that matches no suggestion AND is an explicit
+        // spec (contains ':'). Tab must NOT overwrite it.
+        let custom = "myvendor:my-custom-model-x";
+        for c in custom.chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        {
+            let l = app.launcher.as_ref().unwrap();
+            assert_eq!(l.add_model, custom);
+            assert!(
+                l.filtered_model_suggestions().is_empty(),
+                "explicit-spec text suppresses suggestions"
+            );
+        }
+        key(&mut app, KeyCode::Tab);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(
+            l.add_model, custom,
+            "Tab on free-text/explicit-spec only advances; never clobbers the typed model"
+        );
+    }
+
+    #[test]
+    fn model_backspace_reexposes_suggestions_after_explicit_spec() {
+        let (mut app, _tmp) = launcher_on_model_field(3); // nex
+        let typed = "minimax/m"; // contains '/' → explicit spec, suggestions hidden
+        for c in typed.chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        assert!(
+            app.launcher
+                .as_ref()
+                .unwrap()
+                .filtered_model_suggestions()
+                .is_empty(),
+            "while text carries a '/' route it is an explicit spec; suggestions hidden"
+        );
+        // Delete the '/m' so it is a bare fragment again → suggestions return.
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        let l = app.launcher.as_ref().unwrap();
+        assert_eq!(l.add_model, "minimax");
+        assert!(
+            !l.filtered_model_suggestions().is_empty(),
+            "a bare fragment re-exposes fuzzy suggestions"
         );
     }
 }

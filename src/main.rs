@@ -718,7 +718,7 @@ fn main() -> Result<()> {
     // `~/.config/gh` on first use without requiring `gh init`.
     let is_repl_style = matches!(
         cli.command,
-        Some(Commands::Nex { .. }) | Some(Commands::TuiNex { .. }) | Some(Commands::TuiPty { .. })
+        Some(Commands::Nex(_)) | Some(Commands::TuiNex { .. }) | Some(Commands::TuiPty { .. })
     );
     if is_repl_style
         && !workgraph_dir.exists()
@@ -760,8 +760,11 @@ fn main() -> Result<()> {
         );
     }
 
-    // Track user-facing command usage only; keep hidden subprocess surfaces out of help telemetry.
-    if !is_internal_command(&command) {
+    // Track user-facing command usage only; keep hidden subprocess surfaces out
+    // of help telemetry. `wg upgrade --dry-run` is intentionally write-free,
+    // including command telemetry in the target WG dir.
+    let skip_usage_log = matches!(&command, Commands::Upgrade { dry_run: true, .. });
+    if !is_internal_command(&command) && !skip_usage_log {
         workgraph::usage::append_usage_log(&workgraph_dir, command_name(&command));
     }
 
@@ -2966,6 +2969,29 @@ fn main() -> Result<()> {
                 no_copy,
             ),
         },
+        Commands::Upgrade {
+            dry_run,
+            yes,
+            source,
+            target_ref,
+            source_dir,
+            clean,
+            rollback,
+            migrate_secrets,
+        } => commands::upgrade::run(
+            &workgraph_dir,
+            commands::upgrade::UpgradeArgs {
+                dry_run,
+                yes,
+                source,
+                target_ref,
+                source_dir,
+                clean,
+                rollback,
+                migrate_secrets,
+            },
+            cli.json,
+        ),
         Commands::Agents {
             command,
             alive,
@@ -3191,23 +3217,31 @@ fn main() -> Result<()> {
             )
         }
         Commands::TuiDump {} => {
-            let snap = tui::viz_viewer::screen_dump::client_dump(&workgraph_dir)?;
-            if cli.json {
-                let j = serde_json::json!({
-                    "width": snap.width,
-                    "height": snap.height,
-                    "active_tab": snap.active_tab,
-                    "focused_panel": snap.focused_panel,
-                    "selected_task": snap.selected_task,
-                    "input_mode": snap.input_mode,
-                    "coordinator_id": snap.coordinator_id,
-                    "text": snap.text,
-                });
-                println!("{}", serde_json::to_string_pretty(&j)?);
-            } else {
-                println!("{}", snap.text);
+            #[cfg(unix)]
+            {
+                let snap = tui::viz_viewer::screen_dump::client_dump(&workgraph_dir)?;
+                if cli.json {
+                    let j = serde_json::json!({
+                        "width": snap.width,
+                        "height": snap.height,
+                        "active_tab": snap.active_tab,
+                        "focused_panel": snap.focused_panel,
+                        "selected_task": snap.selected_task,
+                        "input_mode": snap.input_mode,
+                        "coordinator_id": snap.coordinator_id,
+                        "text": snap.text,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&j)?);
+                } else {
+                    println!("{}", snap.text);
+                }
+                Ok(())
             }
-            Ok(())
+
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!("wg tui-dump is only supported on Unix platforms")
+            }
         }
         Commands::Screencast { command } => match command {
             ScreencastCommands::Render {
@@ -3498,44 +3532,7 @@ fn main() -> Result<()> {
                 global,
             ),
         },
-        Commands::Nex {
-            model,
-            endpoint,
-            system_prompt,
-            message,
-            max_turns,
-            chatty,
-            verbose,
-            read_only,
-            resume,
-            role,
-            chat_id,
-            chat_ref,
-            autonomous,
-            no_mcp,
-            eval_mode,
-            idle_timeout_secs,
-            minimal_tools,
-        } => commands::nex::run(
-            &workgraph_dir,
-            model.as_deref(),
-            endpoint.as_deref(),
-            system_prompt.as_deref(),
-            message.as_deref(),
-            max_turns,
-            chatty,
-            verbose,
-            read_only,
-            resume.as_deref(),
-            role.as_deref(),
-            chat_id,
-            chat_ref.as_deref(),
-            autonomous,
-            no_mcp,
-            eval_mode,
-            idle_timeout_secs,
-            minimal_tools,
-        ),
+        Commands::Nex(args) => commands::nex::run_args(&workgraph_dir, &args, "wg nex"),
         Commands::TuiNex { model, endpoint } => {
             commands::tui_nex::run(&workgraph_dir, model.as_deref(), endpoint.as_deref())
         }
@@ -3703,6 +3700,7 @@ fn parse_failure_class(s: &str) -> Option<workgraph::graph::FailureClass> {
         "api-error-5xx-transient" => Some(FailureClass::ApiError5xxTransient),
         "agent-hard-timeout" => Some(FailureClass::AgentHardTimeout),
         "agent-exit-nonzero" => Some(FailureClass::AgentExitNonzero),
+        "executor-config" => Some(FailureClass::ExecutorConfig),
         "wrapper-internal" => Some(FailureClass::WrapperInternal),
         _ => None,
     }

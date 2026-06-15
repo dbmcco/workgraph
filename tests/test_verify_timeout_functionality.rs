@@ -4,7 +4,15 @@ use tempfile::TempDir;
 
 use workgraph::config::CoordinatorConfig;
 use workgraph::graph::{Node, PRIORITY_DEFAULT, Status, Task, WorkGraph, parse_delay};
-use workgraph::parser::load_graph;
+use workgraph::parser::{load_graph, save_graph};
+
+fn wg_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_wg"));
+    cmd.env_remove("WG_DIR");
+    cmd.env_remove("WG_TASK_ID");
+    cmd.env_remove("WG_AGENT_ID");
+    cmd
+}
 
 /// Helper to load a WG task graph from a directory (mimics load_workgraph)
 fn load_workgraph(dir: &Path) -> Result<(WorkGraph, std::path::PathBuf)> {
@@ -194,13 +202,13 @@ fn test_cli_verify_timeout_flag() -> Result<()> {
     let project_root = temp_dir.path();
 
     // Initialize a WG project
-    std::process::Command::new("wg")
+    wg_command()
         .args(&["init", "--route", "claude-cli"])
         .current_dir(project_root)
         .output()?;
 
     // Create a task with verify timeout using CLI
-    let output = std::process::Command::new("wg")
+    let output = wg_command()
         .args(&[
             "add",
             "Test CLI verify timeout",
@@ -241,19 +249,77 @@ fn test_cli_verify_timeout_flag() -> Result<()> {
 }
 
 #[test]
+fn test_cli_done_uses_task_verify_timeout() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let project_root = temp_dir.path();
+
+    std::fs::create_dir(project_root.join(".wg"))?;
+    let graph_path = project_root.join(".wg").join("graph.jsonl");
+    let mut graph = WorkGraph::new();
+    let mut task = create_task_with_timeout("timeout-task", Some("1s".to_string()));
+    task.title = "CLI done verify timeout".to_string();
+    task.status = Status::InProgress;
+    task.verify = Some("exec python3 -c 'import time; time.sleep(5)'".to_string());
+    graph.add_node(Node::Task(task));
+    save_graph(&graph, &graph_path)?;
+
+    let started = std::time::Instant::now();
+    let output = wg_command()
+        .args(&["done", "timeout-task", "--skip-smoke"])
+        .current_dir(project_root)
+        .output()?;
+    let elapsed = started.elapsed();
+
+    assert!(
+        !output.status.success(),
+        "wg done should fail when verify times out.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "task-specific verify timeout was not applied; elapsed {:?}",
+        elapsed,
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Verify command timed out after 1s"),
+        "stderr should report the task-specific timeout, got: {}",
+        stderr,
+    );
+
+    let (graph, _) = load_workgraph(project_root)?;
+    let task = graph
+        .get_task("timeout-task")
+        .ok_or_else(|| anyhow::anyhow!("timeout-task not found"))?;
+    assert_eq!(task.status, Status::InProgress);
+    assert_eq!(task.verify_failures, 1);
+    assert!(
+        task.log
+            .iter()
+            .any(|entry| entry.message.contains("Verify FAILED (exit code timeout")),
+        "verify timeout failure should be logged, got: {:?}",
+        task.log,
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_verify_timeout_in_task_serialization() -> Result<()> {
     // Test that tasks with verify_timeout roundtrip correctly through serialization
     let temp_dir = TempDir::new()?;
     let project_root = temp_dir.path();
 
     // Initialize WG
-    std::process::Command::new("wg")
+    wg_command()
         .args(&["init", "--route", "claude-cli"])
         .current_dir(project_root)
         .output()?;
 
     // Add task with verify timeout
-    std::process::Command::new("wg")
+    wg_command()
         .args(&["add", "Serialization test", "--verify-timeout", "999s"])
         .current_dir(project_root)
         .output()?;
@@ -277,7 +343,7 @@ fn test_verify_timeout_different_duration_formats() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let project_root = temp_dir.path();
 
-    std::process::Command::new("wg")
+    wg_command()
         .args(&["init", "--route", "claude-cli"])
         .current_dir(project_root)
         .output()?;
@@ -288,7 +354,7 @@ fn test_verify_timeout_different_duration_formats() -> Result<()> {
     for (timeout, expected) in test_cases {
         let title = format!("Test timeout {}", timeout);
 
-        let output = std::process::Command::new("wg")
+        let output = wg_command()
             .args(&["add", &title, "--verify-timeout", timeout])
             .current_dir(project_root)
             .output()?;
@@ -348,13 +414,13 @@ fn test_legacy_verify_flag_is_rejected() -> Result<()> {
     // The legacy --verify flag is intentionally hard-removed; validation now
     // lives in the task description under a ## Validation section.
     let temp_dir = TempDir::new()?;
-    std::process::Command::new("wg")
+    wg_command()
         .args(&["init", "--route", "claude-cli"])
         .current_dir(temp_dir.path())
         .output()?;
 
     // Legacy commands should still work
-    let output = std::process::Command::new("wg")
+    let output = wg_command()
         .args(&["add", "Legacy test", "--verify", "cargo test"])
         .current_dir(temp_dir.path())
         .output()?;

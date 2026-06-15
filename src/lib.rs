@@ -18,6 +18,7 @@
 extern crate self as workgraph;
 
 pub mod agency;
+pub mod atomic_file;
 pub mod chat;
 pub mod chat_command;
 pub mod chat_id;
@@ -51,6 +52,10 @@ pub mod metrics;
 pub mod model_benchmarks;
 pub mod model_routes;
 pub mod models;
+#[path = "commands/nex.rs"]
+pub mod nex;
+pub mod nex_cli;
+pub mod nex_runtime;
 pub mod notify;
 pub mod parser;
 pub mod plan_validator;
@@ -73,6 +78,7 @@ pub mod telegram_commands;
 pub mod usage;
 pub mod vendor_history;
 pub mod verify_lint;
+pub mod workgraph_dir;
 
 pub use config::MatrixConfig;
 pub use graph::WorkGraph;

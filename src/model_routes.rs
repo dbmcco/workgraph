@@ -19,31 +19,54 @@ pub const WORKGRAPH_LOCAL_DEFAULT_ROUTE: &str = "workgraph.local_default";
 pub const WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE: &str = "workgraph.custom_placeholder";
 
 pub fn model_for_route(route_id: &str) -> String {
-    let registry = load_registry();
-    registry
-        .get("model_routes")
-        .and_then(|routes| routes.get(route_id))
-        .and_then(|route| route.get("model"))
-        .and_then(|model| model.as_str())
-        .filter(|model| !model.trim().is_empty())
-        .map(str::to_string)
+    if let Some(registry) = load_registry() {
+        return registry
+            .get("model_routes")
+            .and_then(|routes| routes.get(route_id))
+            .and_then(|route| route.get("model"))
+            .and_then(|model| model.as_str())
+            .filter(|model| !model.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("Central model route {route_id} is missing a model"));
+    }
+
+    fallback_model_for_route(route_id)
         .unwrap_or_else(|| panic!("Central model route {route_id} is missing a model"))
+        .to_string()
 }
 
 pub fn spec_for_route(provider_prefix: &str, route_id: &str) -> String {
     format!("{}:{}", provider_prefix, model_for_route(route_id))
 }
 
-fn load_registry() -> toml::Value {
-    let path = registry_path().unwrap_or_else(|| {
-        panic!("Unable to find central model route registry. Set {REGISTRY_ENV}.")
-    });
+fn load_registry() -> Option<toml::Value> {
+    let path = registry_path()?;
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!("Failed to read central model route registry {path:?}: {err}")
     });
-    toml::from_str(&raw).unwrap_or_else(|err| {
+    Some(toml::from_str(&raw).unwrap_or_else(|err| {
         panic!("Failed to parse central model route registry {path:?}: {err}")
-    })
+    }))
+}
+
+fn fallback_model_for_route(route_id: &str) -> Option<&'static str> {
+    match route_id {
+        WORKGRAPH_OPENROUTER_FAST_ROUTE => Some("anthropic/claude-haiku-4-5"),
+        WORKGRAPH_OPENROUTER_STANDARD_ROUTE => Some("anthropic/claude-sonnet-4-6"),
+        WORKGRAPH_OPENROUTER_PREMIUM_ROUTE => Some("anthropic/claude-opus-4-6"),
+        WORKGRAPH_CLAUDE_CLI_FAST_ROUTE => Some("haiku"),
+        WORKGRAPH_CLAUDE_CLI_STANDARD_ROUTE => Some("opus"),
+        WORKGRAPH_CLAUDE_CLI_PREMIUM_ROUTE => Some("opus"),
+        WORKGRAPH_CODEX_CLI_FAST_ROUTE => Some("gpt-5.4-mini"),
+        WORKGRAPH_CODEX_CLI_STANDARD_ROUTE => Some("gpt-5.5"),
+        WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE => Some("gpt-5.5"),
+        WORKGRAPH_ZAI_GLM_FAST_ROUTE => Some("glm-5.1"),
+        WORKGRAPH_ZAI_GLM_STANDARD_ROUTE => Some("glm-5.1"),
+        WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE => Some("glm-5.1"),
+        WORKGRAPH_LOCAL_DEFAULT_ROUTE => Some("qwen3-coder-30b"),
+        WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE => Some("model"),
+        _ => None,
+    }
 }
 
 fn registry_path() -> Option<PathBuf> {

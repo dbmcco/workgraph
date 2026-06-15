@@ -61,6 +61,40 @@ fn fresh_workgraph(tmp: &TempDir) -> PathBuf {
     wg_dir
 }
 
+#[test]
+fn short_dir_flag_resolves_workgraph_dir() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("fakehome");
+    fs::create_dir_all(&home).unwrap();
+    let wg_dir = fresh_workgraph(&tmp);
+
+    let out = Command::new(wg_binary())
+        .arg("-d")
+        .arg(&wg_dir)
+        .arg("status")
+        .env("HOME", &home)
+        .env_remove("WG_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn wg");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "wg -d <dir> status should succeed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("Tasks:"),
+        "status output should include task summary, got:\n{}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // test_defaults_no_user_config
 // ---------------------------------------------------------------------------
@@ -133,8 +167,10 @@ fn config_init_global_writes_minimal_canonical() {
     );
     assert!(body.contains("[tiers]"));
     assert!(body.contains("fast = \"codex:gpt-5.4-mini\""));
-    assert!(body.contains("standard = \"codex:gpt-5.4\""));
+    assert!(body.contains("standard = \"codex:gpt-5.5\""));
     assert!(body.contains("premium = \"codex:gpt-5.5\""));
+    assert!(body.contains("[models.default]"));
+    assert!(body.contains("[models.task_agent]"));
     assert!(body.contains("[models.evaluator]"));
     assert!(body.contains("[models.assigner]"));
 
@@ -153,12 +189,15 @@ fn config_init_global_writes_minimal_canonical() {
 
     // The file must parse cleanly as a `Config` — that's the round-trip
     // guarantee the profile-as-snapshot model rests on.
-    let parsed: Result<workgraph::config::Config, _> = toml::from_str(&body);
-    assert!(
-        parsed.is_ok(),
-        "global config must round-trip through Config; got: {:?}\n{}",
-        parsed.err(),
-        body,
+    let cfg: workgraph::config::Config = toml::from_str(&body)
+        .unwrap_or_else(|e| panic!("global config must round-trip through Config: {e}\n{body}"));
+    assert_eq!(cfg.tiers.standard.as_deref(), Some("codex:gpt-5.5"));
+    assert_eq!(
+        cfg.models
+            .task_agent
+            .as_ref()
+            .and_then(|m| m.model.as_deref()),
+        Some("codex:gpt-5.5")
     );
 }
 
@@ -215,6 +254,14 @@ fn config_init_route_codex_cli_produces_complete_codex_config() {
     let cfg = parsed.unwrap();
     assert_eq!(cfg.agent.model, "codex:gpt-5.5");
     assert_eq!(cfg.coordinator.model.as_deref(), Some("codex:gpt-5.5"));
+    assert_eq!(cfg.tiers.standard.as_deref(), Some("codex:gpt-5.5"));
+    assert_eq!(
+        cfg.models
+            .task_agent
+            .as_ref()
+            .and_then(|m| m.model.as_deref()),
+        Some("codex:gpt-5.5")
+    );
 }
 
 #[test]

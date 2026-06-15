@@ -6,17 +6,22 @@
 //! missing from PATH, it shouldn't be offered as an option.
 //!
 //! `native` is always available (it's this binary itself). The CLI
-//! adapters (`claude`, `codex`, `gemini`) are probed by looking for
-//! the binary on PATH.
+//! adapters (`claude`, `codex`, `gemini`, stable worker CLIs, and
+//! experimental worker CLIs) are probed by looking for the binary on PATH.
 
 use std::path::PathBuf;
+
+pub const CORE_EXECUTORS: &[&str] = &["native", "claude", "codex", "shell"];
+pub const STABLE_EXTERNAL_EXECUTORS: &[&str] = &["opencode", "aider", "goose", "qwen", "cline"];
+pub const PROVIDER_SPECIFIC_EXECUTORS: &[&str] = &["gemini"];
+pub const EXPERIMENTAL_EXTERNAL_EXECUTORS: &[&str] = &["octomind", "dexto", "crush", "amplifier"];
 
 /// One executor, whether it's usable here, and where the backing
 /// binary lives (if applicable).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorInfo {
     /// Short name matching `coordinator.executor` config values:
-    /// "native", "claude", "codex", "gemini".
+    /// "native", "claude", "codex", "gemini", "opencode", etc.
     pub name: &'static str,
     /// Human-readable description.
     pub description: &'static str,
@@ -83,9 +88,59 @@ const EXECUTORS: &[ExecutorSpec] = &[
         binary_candidates: &["codex"],
     },
     ExecutorSpec {
+        name: "shell",
+        description: "Shell command executor (`bash -c`; no LLM)",
+        binary_candidates: &["bash"],
+    },
+    ExecutorSpec {
         name: "gemini",
         description: "Google Gemini CLI",
         binary_candidates: &["gemini"],
+    },
+    ExecutorSpec {
+        name: "opencode",
+        description: "Stable OpenCode CLI worker (`opencode run --format json`)",
+        binary_candidates: &["opencode"],
+    },
+    ExecutorSpec {
+        name: "aider",
+        description: "Stable Aider CLI worker (`aider --message-file ... --yes-always`)",
+        binary_candidates: &["aider"],
+    },
+    ExecutorSpec {
+        name: "goose",
+        description: "Stable Goose CLI worker (`goose run --no-session -i ...`)",
+        binary_candidates: &["goose"],
+    },
+    ExecutorSpec {
+        name: "qwen",
+        description: "Stable Qwen Code CLI worker (`qwen --output-format json --yolo`)",
+        binary_candidates: &["qwen", "qwen-code", "qwen_code"],
+    },
+    ExecutorSpec {
+        name: "cline",
+        description: "Stable Cline CLI worker (`cline --json --auto-approve true`)",
+        binary_candidates: &["cline"],
+    },
+    ExecutorSpec {
+        name: "octomind",
+        description: "Octomind CLI live chat (`octomind run -m openrouter:<vendor>/<model>`; line-oriented REPL, tmux-safe)",
+        binary_candidates: &["octomind"],
+    },
+    ExecutorSpec {
+        name: "dexto",
+        description: "Dexto CLI live chat (`dexto --agent <yml>`; OpenRouter via generated agent config)",
+        binary_candidates: &["dexto"],
+    },
+    ExecutorSpec {
+        name: "crush",
+        description: "Experimental Crush CLI worker (`crush run`; verify flags against your installed version)",
+        binary_candidates: &["crush"],
+    },
+    ExecutorSpec {
+        name: "amplifier",
+        description: "Experimental Amplifier CLI worker (`amplifier run --mode single --output-format json --bundle wg`)",
+        binary_candidates: &["amplifier"],
     },
 ];
 
@@ -152,8 +207,35 @@ mod tests {
         assert!(names.contains(&"native"));
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
+        assert!(names.contains(&"shell"));
         assert!(names.contains(&"gemini"));
-        assert!(!names.contains(&"amplifier"));
+        assert!(names.contains(&"opencode"));
+        assert!(names.contains(&"aider"));
+        assert!(names.contains(&"goose"));
+        assert!(names.contains(&"qwen"));
+        assert!(names.contains(&"cline"));
+        assert!(names.contains(&"crush"));
+        assert!(names.contains(&"amplifier"));
+        assert!(names.contains(&"octomind"));
+        assert!(names.contains(&"dexto"));
+    }
+
+    #[test]
+    fn executor_choice_groups_match_discovery_names() {
+        let names: Vec<_> = discover().into_iter().map(|e| e.name).collect();
+        for group in [
+            CORE_EXECUTORS,
+            STABLE_EXTERNAL_EXECUTORS,
+            PROVIDER_SPECIFIC_EXECUTORS,
+            EXPERIMENTAL_EXTERNAL_EXECUTORS,
+        ] {
+            for name in group {
+                assert!(
+                    names.contains(name),
+                    "choice group includes {name}, but discovery omitted it"
+                );
+            }
+        }
     }
 
     #[test]

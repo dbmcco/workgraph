@@ -23,7 +23,7 @@ use workgraph::graph::{
 };
 use workgraph::messages;
 use workgraph::parser::{load_graph, modify_graph};
-use workgraph::query::ready_tasks_with_peers_cycle_aware;
+use workgraph::query::{blocked_open_cycle_diagnostics, ready_tasks_with_peers_cycle_aware};
 use workgraph::service::registry::AgentRegistry;
 
 use super::triage;
@@ -218,6 +218,9 @@ fn check_ready_or_return(
                 "[dispatcher] No ready tasks (terminal: {}/{})",
                 terminal, total
             );
+            for diagnostic in blocked_open_cycle_diagnostics(graph, &cycle_analysis) {
+                eprintln!("[dispatcher] Warning: {}", diagnostic.message());
+            }
         }
         return Some(TickResult {
             agents_alive: alive_count,
@@ -4133,7 +4136,7 @@ fn spawn_agents_for_ready_tasks(
             Some(
                 config
                     .resolve_model_for_role(workgraph::config::DispatchRole::Assigner)
-                    .model,
+                    .spawn_model_spec(),
             )
         } else {
             default_model.map(String::from)
@@ -4692,7 +4695,7 @@ pub fn coordinator_tick(
     let effective_model = model.map(String::from).unwrap_or_else(|| {
         config
             .resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent)
-            .model
+            .spawn_model_spec()
     });
     let spawned = spawn_agents_for_ready_tasks(
         dir,

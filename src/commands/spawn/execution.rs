@@ -126,13 +126,29 @@ pub(crate) fn spawn_agent_inner(
     // The plan-derived endpoint is the only source consulted when assembling
     // native-executor argv flags below; there is no fallback ad-hoc lookup.
     let config = Config::load_or_default(dir);
-    let plan = plan_spawn(task, &config, Some(executor_name), model)?;
+    // Get task model preference. When unset, consult tag_routing rules and
+    // task-level tier overrides so these existing spawn-time model fallbacks
+    // also flow through the authoritative SpawnPlan.
+    let task_model = task.model.clone().or_else(|| {
+        if let Some(ref tier_str) = task.tier
+            && let Ok(tier) = tier_str.parse::<workgraph::config::Tier>()
+            && let Some(resolved) = config.resolve_tier(tier)
+        {
+            return Some(resolved.model);
+        }
+        workgraph::config::resolve_tag_routing(&config.tag_routing, &task.tags)
+            .map(|rule| rule.model.clone())
+    });
+    let plan_default_model = task_model.as_deref().or(model);
+    let plan = plan_spawn(task, &config, Some(executor_name), plan_default_model)?;
     eprintln!(
         "[{}] {}: {}",
         spawned_by,
         task_id,
         plan.provenance.log_line(&plan)
     );
+    let resolved_executor_name = plan.executor.as_str();
+    let resolved_model_for_spawn = Some(plan.model.raw.clone());
 
     // Only allow spawning on tasks that are Open or Blocked
     match task.status {
@@ -195,10 +211,12 @@ pub(crate) fn spawn_agent_inner(
     // Resolve context scope (config was loaded earlier for plan_spawn)
 
     // Check OpenRouter cost caps before proceeding with expensive operations
-    if let Some(provider) = model.and_then(|m| workgraph::config::parse_model_spec(m).provider)
+    if let Some(provider) = resolved_model_for_spawn
+        .as_deref()
+        .and_then(|m| workgraph::config::parse_model_spec(m).provider)
         && provider == "openrouter"
     {
-        check_openrouter_cost_caps(&config, dir, task_id, model)?;
+        check_openrouter_cost_caps(&config, dir, task_id, resolved_model_for_spawn.as_deref())?;
     }
 
     let scope = resolve_task_scope(task, &config, dir);
@@ -264,30 +282,13 @@ pub(crate) fn spawn_agent_inner(
     let task_timeout = task.timeout.clone();
     // Capture the task's quality tier (may be set by tier escalation on retry)
     let task_tier = task.tier.clone();
-    // Get task model preference. When unset, consult tag_routing
-    // rules so a whole subgraph tagged `frontend` (etc.) can pick
-    // up a specific model without editing each task. Explicit
-    // per-task models always win — tag routing is only the fallback
-    // when nothing else is set on the task.
-    let task_model = task.model.clone().or_else(|| {
-        // Task-level tier override (set by tier escalation on retry)
-        if let Some(ref tier_str) = task.tier {
-            if let Ok(tier) = tier_str.parse::<workgraph::config::Tier>() {
-                if let Some(resolved) = config.resolve_tier(tier) {
-                    return Some(resolved.model);
-                }
-            }
-        }
-        workgraph::config::resolve_tag_routing(&config.tag_routing, &task.tags)
-            .map(|rule| rule.model.clone())
-    });
     // Get session_id for resume (from previous wg wait)
     let resume_session_id = task.session_id.clone();
     // Resolve exec_mode: task.exec_mode > role.default_exec_mode > "full"
     let resolved_exec_mode = resolve_task_exec_mode(task, dir);
     // Load executor config using the registry
     let executor_registry = ExecutorRegistry::new(dir);
-    let executor_config = executor_registry.load_config(executor_name)?;
+    let executor_config = executor_registry.load_config(resolved_executor_name)?;
 
     // For shell executor, we need an exec command
     if executor_config.executor.executor_type == "shell" && task_exec.is_none() {
@@ -302,14 +303,14 @@ pub(crate) fn spawn_agent_inner(
     let resolved_task_agent =
         config.resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent);
     let resolved = resolve_model_and_provider(
-        task_model.clone(),
+        resolved_model_for_spawn.clone(),
         task_provider.clone(),
         agent_preferred_model,
         agent_preferred_provider.clone(),
         executor_config.executor.model.clone(),
         Some(resolved_task_agent.model.clone()),
         resolved_task_agent.provider.clone(),
-        model,
+        resolved_model_for_spawn.as_deref(),
         config.coordinator.provider.clone(),
     );
 
@@ -318,8 +319,12 @@ pub(crate) fn spawn_agent_inner(
     // actual API model ID, provider, and endpoint. Built-in tier aliases
     // (haiku/sonnet/opus) are kept as-is for backward compatibility with the
     // Claude CLI, which understands them natively.
-    let (effective_model, registry_provider, registry_endpoint) =
-        resolve_model_via_registry(resolved.model, task_model.as_ref(), &config, dir)?;
+    let (effective_model, registry_provider, registry_endpoint) = resolve_model_via_registry(
+        resolved.model,
+        resolved_model_for_spawn.as_ref(),
+        &config,
+        dir,
+    )?;
 
     // --- Pre-flight model validation ---
     // Validate OpenRouter-style models against the cached model list before spawning.
@@ -346,9 +351,22 @@ pub(crate) fn spawn_agent_inner(
         (model, warning)
     };
 
-    // Override model in template vars with effective model
+    // Provider is still resolved by resolve_model_and_provider() above.
+    // The registry may contribute a provider if the model matched a registry entry;
+    // use it only when the tier cascade didn't already produce one.
+    let effective_provider: Option<String> = resolved.provider.or(registry_provider.clone());
+
+    // Override model in template vars with the effective model. External CLI
+    // adapters receive their native model spelling here too, so TOML-backed
+    // configs that use `{{model}}` do not have to understand WG's
+    // `provider:model` syntax.
     if let Some(ref m) = effective_model {
-        vars.model = m.clone();
+        vars.model = model_template_value_for_executor(
+            &executor_config.executor.executor_type,
+            Some(m),
+            effective_provider.as_deref(),
+        )
+        .unwrap_or_else(|| m.clone());
     }
 
     // Load agent registry with lock for concurrent safety.
@@ -480,7 +498,7 @@ pub(crate) fn spawn_agent_inner(
                     Agent Identity: {}\n\
                     === End of Spawn Metadata ===\n\n",
                 task_id,
-                executor_name,
+                resolved_executor_name,
                 vars.model,
                 scope,
                 resolved_exec_mode.as_str(),
@@ -497,11 +515,6 @@ pub(crate) fn spawn_agent_inner(
     // Use resolved exec_mode (already accounts for role defaults)
     let exec_mode = resolved_exec_mode.as_str();
 
-    // Provider is still resolved by resolve_model_and_provider() above.
-    // The registry may contribute a provider if the model matched a registry entry;
-    // use it only when the tier cascade didn't already produce one.
-    let effective_provider: Option<String> = resolved.provider.or(registry_provider.clone());
-
     // Endpoint resolution: plan.endpoint is the single source of truth. For
     // executors that don't need an endpoint (claude/codex/shell),
     // plan.endpoint is None and the argv builder skips --endpoint-* flags
@@ -513,6 +526,12 @@ pub(crate) fn spawn_agent_inner(
     let effective_endpoint_url: Option<String> = endpoint_config.and_then(|ep| ep.url.clone());
     let effective_api_key: Option<String> =
         endpoint_config.and_then(|ep| ep.resolve_api_key(Some(dir)).ok().flatten());
+
+    let effective_working_dir = worktree_info
+        .as_ref()
+        .map(|wt| wt.path.as_path())
+        .or_else(|| settings.working_dir.as_deref().map(Path::new));
+    preflight_executor_command(&settings, resolved_executor_name, effective_working_dir)?;
 
     // Validate endpoint resolution for registry-resolved models — but only
     // when the plan actually selected an endpoint. If plan.endpoint is None
@@ -663,16 +682,7 @@ pub(crate) fn spawn_agent_inner(
     if let Some(ref url) = effective_endpoint_url {
         cmd.env("WG_ENDPOINT_URL", url);
     }
-    if let Some(ref key) = effective_api_key {
-        cmd.env("WG_API_KEY", key);
-        // Also set the provider-specific env var (e.g. OPENROUTER_API_KEY) so the
-        // native executor and any child processes can find the key via standard env vars.
-        if let Some(ep) = endpoint_config {
-            for var_name in EndpointConfig::env_var_names_for_provider(&ep.provider) {
-                cmd.env(var_name, key);
-            }
-        }
-    }
+    inject_api_key_env(&mut cmd, endpoint_config, &effective_api_key);
 
     // Set working directory: worktree overrides settings.working_dir
     if let Some(ref wt) = worktree_info {
@@ -712,7 +722,7 @@ pub(crate) fn spawn_agent_inner(
     // where two concurrent spawns both pass the status check.
     // Use modify_graph for atomic claim under flock.
     let spawned_by_clone = spawned_by.to_string();
-    let executor_name_clone = executor_name;
+    let executor_name_clone = resolved_executor_name.to_string();
     let effective_model_clone = effective_model.clone();
     let task_title_for_audit_clone = task_title_for_audit.clone();
     let task_agent_for_audit_clone = task_agent_for_audit.clone();
@@ -839,7 +849,7 @@ pub(crate) fn spawn_agent_inner(
             }
             return Err(anyhow::anyhow!(
                 "Failed to spawn executor '{}' (command: {}): {}",
-                executor_name,
+                resolved_executor_name,
                 settings.command,
                 e
             ));
@@ -852,7 +862,7 @@ pub(crate) fn spawn_agent_inner(
     let agent_id = locked_registry.register_agent_with_model(
         pid,
         task_id,
-        executor_name,
+        resolved_executor_name,
         &output_file_str,
         effective_model.as_deref(),
     );
@@ -893,7 +903,7 @@ pub(crate) fn spawn_agent_inner(
         "agent_id": agent_id,
         "pid": pid,
         "task_id": task_id,
-        "executor": executor_name,
+        "executor": resolved_executor_name,
         "model": &effective_model,
         "started_at": Utc::now().to_rfc3339(),
         "timeout_secs": effective_timeout_secs,
@@ -908,7 +918,7 @@ pub(crate) fn spawn_agent_inner(
         agent_id,
         pid,
         task_id: task_id.to_string(),
-        executor: executor_name.to_string(),
+        executor: resolved_executor_name.to_string(),
         executor_type: settings.executor_type.clone(),
         output_file: output_file_str,
         model: effective_model,
@@ -957,7 +967,436 @@ pub(crate) fn should_create_worktree(
 /// here means the spawn writes no prompt.txt and the resulting subprocess
 /// receives empty stdin — exactly the codex bug.
 fn executor_uses_auto_prompt(executor_type: &str) -> bool {
-    matches!(executor_type, "claude" | "codex" | "native")
+    matches!(
+        executor_type,
+        "claude"
+            | "codex"
+            | "native"
+            | "opencode"
+            | "aider"
+            | "goose"
+            | "qwen"
+            | "qwen-code"
+            | "qwen_code"
+            | "cline"
+            | "crush"
+            | "amplifier"
+            | "octomind"
+            | "dexto"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalCliModelStyle {
+    /// `--model openrouter/<model-id>`
+    ProviderSlashModel,
+    /// `--provider openrouter --model <model-id>`
+    ProviderFlagAndModel,
+    /// `--model <model-id>` after the CLI has been configured for OpenRouter.
+    BareOpenRouterModel,
+    /// `--model openrouter:<model-id>` — the provider-colon-route spelling
+    /// Octomind's `-m`/`--model` flag consumes (e.g.
+    /// `--model openrouter:minimax/minimax-m3`).
+    ProviderColonModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ExternalCliModelArgs {
+    provider: Option<(&'static str, String)>,
+    model: Option<(&'static str, String)>,
+}
+
+impl ExternalCliModelArgs {
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some((flag, value)) = &self.provider {
+            args.push((*flag).to_string());
+            args.push(value.clone());
+        }
+        if let Some((flag, value)) = &self.model {
+            args.push((*flag).to_string());
+            args.push(value.clone());
+        }
+        args
+    }
+}
+
+fn external_cli_model_style(executor_type: &str) -> Option<ExternalCliModelStyle> {
+    match executor_type {
+        "opencode" | "aider" | "crush" => Some(ExternalCliModelStyle::ProviderSlashModel),
+        "goose" | "cline" => Some(ExternalCliModelStyle::ProviderFlagAndModel),
+        "qwen" | "qwen-code" | "qwen_code" => Some(ExternalCliModelStyle::BareOpenRouterModel),
+        // Octomind's `-m` takes WG's `openrouter:<vendor>/<model>` spelling.
+        // (Dexto is intentionally absent: its CLI rejects provider/model
+        // routes and requires a generated agent YAML, so it has no worker-path
+        // argv model style — prototype-octomind-dexto-chat.)
+        "octomind" => Some(ExternalCliModelStyle::ProviderColonModel),
+        _ => None,
+    }
+}
+
+fn openrouter_model_id(model: &str, effective_provider: Option<&str>) -> Option<String> {
+    let spec = workgraph::config::parse_model_spec(model);
+    let provider_from_model = spec
+        .provider
+        .as_deref()
+        .map(workgraph::config::provider_to_native_provider);
+    let provider = effective_provider.or(provider_from_model);
+    if provider == Some("openrouter") {
+        Some(
+            spec.model_id
+                .strip_prefix("openrouter/")
+                .unwrap_or(&spec.model_id)
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn external_cli_model_args(
+    executor_type: &str,
+    effective_model: Option<&str>,
+    effective_provider: Option<&str>,
+) -> ExternalCliModelArgs {
+    let Some(model) = effective_model else {
+        return ExternalCliModelArgs::default();
+    };
+    let Some(style) = external_cli_model_style(executor_type) else {
+        return ExternalCliModelArgs::default();
+    };
+
+    if let Some(openrouter_model) = openrouter_model_id(model, effective_provider) {
+        return match style {
+            ExternalCliModelStyle::ProviderSlashModel => ExternalCliModelArgs {
+                provider: None,
+                model: Some(("--model", format!("openrouter/{}", openrouter_model))),
+            },
+            ExternalCliModelStyle::ProviderFlagAndModel => ExternalCliModelArgs {
+                provider: Some(("--provider", "openrouter".to_string())),
+                model: Some(("--model", openrouter_model)),
+            },
+            ExternalCliModelStyle::BareOpenRouterModel => ExternalCliModelArgs {
+                provider: None,
+                model: Some(("--model", openrouter_model)),
+            },
+            ExternalCliModelStyle::ProviderColonModel => ExternalCliModelArgs {
+                provider: None,
+                model: Some(("--model", format!("openrouter:{}", openrouter_model))),
+            },
+        };
+    }
+
+    ExternalCliModelArgs {
+        provider: effective_provider.map(|p| ("--provider", p.to_string())),
+        model: Some(("--model", model.to_string())),
+    }
+}
+
+fn model_template_value_for_executor(
+    executor_type: &str,
+    effective_model: Option<&str>,
+    effective_provider: Option<&str>,
+) -> Option<String> {
+    let model = effective_model?;
+    let style = external_cli_model_style(executor_type)?;
+    let openrouter_model = openrouter_model_id(model, effective_provider)?;
+    Some(match style {
+        ExternalCliModelStyle::ProviderSlashModel => format!("openrouter/{}", openrouter_model),
+        ExternalCliModelStyle::ProviderColonModel => format!("openrouter:{}", openrouter_model),
+        ExternalCliModelStyle::ProviderFlagAndModel
+        | ExternalCliModelStyle::BareOpenRouterModel => openrouter_model,
+    })
+}
+
+fn args_have_flag(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        flags.iter().any(|flag| {
+            arg == flag
+                || arg
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    })
+}
+
+fn append_external_cli_model_args(
+    cmd_parts: &mut Vec<String>,
+    existing_args: &[String],
+    model_args: ExternalCliModelArgs,
+) {
+    if let Some((flag, value)) = model_args.provider
+        && !args_have_flag(existing_args, &["--provider", "-P"])
+    {
+        cmd_parts.push(flag.to_string());
+        cmd_parts.push(shell_escape(&value));
+    }
+    if let Some((flag, value)) = model_args.model
+        && !args_have_flag(existing_args, &["--model", "-m"])
+    {
+        cmd_parts.push(flag.to_string());
+        cmd_parts.push(shell_escape(&value));
+    }
+}
+
+fn write_executor_prompt_file(
+    output_dir: &Path,
+    settings: &workgraph::service::executor::ExecutorSettings,
+) -> Result<std::path::PathBuf> {
+    let prompt_content = settings
+        .prompt_template
+        .as_ref()
+        .map(|pt| pt.template.clone())
+        .unwrap_or_default();
+    let prompt_file = output_dir.join("prompt.txt");
+    fs::write(&prompt_file, &prompt_content)
+        .with_context(|| format!("Failed to write prompt file: {:?}", prompt_file))?;
+    Ok(prompt_file)
+}
+
+fn external_prompt_command(
+    settings: &workgraph::service::executor::ExecutorSettings,
+    output_dir: &Path,
+    effective_model: &Option<String>,
+    effective_provider: &Option<String>,
+    delivery: ExternalPromptDelivery,
+) -> Result<String> {
+    // Explicit-model contract: external CLIs that take a `--model` flag MUST
+    // receive an explicitly resolved model. Running them with no model means
+    // silently inheriting the CLI's own internal default — exactly the
+    // "ran on the wrong model" class of bug WG forbids. If model resolution
+    // yielded nothing AND the user hasn't hard-coded a model in
+    // `[executor].args`, fail loudly instead of falling back. (Amplifier has
+    // no model style and is exempt — it manages its own model.)
+    if external_cli_model_style(&settings.executor_type).is_some()
+        && effective_model.is_none()
+        && !args_have_flag(&settings.args, &["--model", "-m"])
+    {
+        anyhow::bail!(
+            "executor '{}' requires an explicitly resolved model, but model resolution \
+             produced none. Set a model on the task (`-m {}:openrouter/<vendor>/<model>`), \
+             the active profile, or `[agent].model` — WG will not fall back to the CLI's \
+             internal default.",
+            settings.executor_type,
+            settings.executor_type,
+        );
+    }
+    let prompt_file = write_executor_prompt_file(output_dir, settings)?;
+    let mut cmd_parts = vec![shell_escape(&settings.command)];
+    for arg in &settings.args {
+        cmd_parts.push(shell_escape(arg));
+    }
+    append_external_cli_model_args(
+        &mut cmd_parts,
+        &settings.args,
+        external_cli_model_args(
+            &settings.executor_type,
+            effective_model.as_deref(),
+            effective_provider.as_deref(),
+        ),
+    );
+
+    match delivery {
+        ExternalPromptDelivery::OpenCodeFile => {
+            cmd_parts.push(shell_escape("Complete the attached WG task prompt."));
+            if !args_have_flag(&settings.args, &["--file", "-f", "--attach"]) {
+                cmd_parts.push("--file".to_string());
+                cmd_parts.push(shell_escape(&prompt_file.to_string_lossy()));
+            }
+            Ok(cmd_parts.join(" "))
+        }
+        ExternalPromptDelivery::AiderMessageFile => {
+            if !args_have_flag(&settings.args, &["--message-file", "--message"]) {
+                cmd_parts.push("--message-file".to_string());
+                cmd_parts.push(shell_escape(&prompt_file.to_string_lossy()));
+            }
+            Ok(cmd_parts.join(" "))
+        }
+        ExternalPromptDelivery::GooseInputFile => {
+            if !args_have_flag(
+                &settings.args,
+                &["-i", "--input", "--input-file", "-t", "--text"],
+            ) {
+                cmd_parts.push("-i".to_string());
+                cmd_parts.push(shell_escape(&prompt_file.to_string_lossy()));
+            }
+            Ok(cmd_parts.join(" "))
+        }
+        ExternalPromptDelivery::QwenPromptAndStdin => {
+            if !args_have_flag(&settings.args, &["--prompt", "-p"]) {
+                cmd_parts.push("--prompt".to_string());
+                cmd_parts.push(shell_escape(
+                    "Complete the WG task prompt supplied on stdin.",
+                ));
+            }
+            let command = cmd_parts.join(" ");
+            Ok(prompt_file_command(
+                &prompt_file.to_string_lossy(),
+                &command,
+            ))
+        }
+        ExternalPromptDelivery::ClinePositionalPromptAndStdin => {
+            cmd_parts.push(shell_escape(
+                "Complete the WG task prompt supplied on stdin.",
+            ));
+            let command = cmd_parts.join(" ");
+            Ok(prompt_file_command(
+                &prompt_file.to_string_lossy(),
+                &command,
+            ))
+        }
+        ExternalPromptDelivery::Stdin => {
+            let command = cmd_parts.join(" ");
+            Ok(prompt_file_command(
+                &prompt_file.to_string_lossy(),
+                &command,
+            ))
+        }
+        ExternalPromptDelivery::Argument => Ok(prompt_file_as_last_argument_command(
+            &prompt_file.to_string_lossy(),
+            &cmd_parts,
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalPromptDelivery {
+    OpenCodeFile,
+    AiderMessageFile,
+    GooseInputFile,
+    QwenPromptAndStdin,
+    ClinePositionalPromptAndStdin,
+    Stdin,
+    Argument,
+}
+
+fn prompt_file_as_last_argument_command(prompt_file: &str, cmd_parts: &[String]) -> String {
+    let mut parts = vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        shell_escape(r#"PROMPT=$(cat "$1"); shift; exec "$@" "$PROMPT""#),
+        "--".to_string(),
+        shell_escape(prompt_file),
+    ];
+    parts.extend(cmd_parts.iter().cloned());
+    parts.join(" ")
+}
+
+fn preflight_executor_command(
+    settings: &workgraph::service::executor::ExecutorSettings,
+    executor_name: &str,
+    working_dir: Option<&Path>,
+) -> Result<()> {
+    let command = settings.command.trim();
+    if command.is_empty() {
+        anyhow::bail!(
+            "Executor '{}' has an empty command in .wg/executors/{}.toml. \
+             Set [executor].command to an installed binary and put flags in [executor].args.",
+            executor_name,
+            executor_name,
+        );
+    }
+
+    if command_contains_path_separator(command) {
+        let command_path = Path::new(command);
+        let candidate = if command_path.is_absolute() {
+            command_path.to_path_buf()
+        } else if let Some(wd) = working_dir {
+            wd.join(command_path)
+        } else {
+            command_path.to_path_buf()
+        };
+        if is_executable_file(&candidate) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Executor '{}' command '{}' is not an executable file at '{}'. \
+             Check .wg/executors/{}.toml, install the binary, or set an absolute command path.{}",
+            executor_name,
+            command,
+            candidate.display(),
+            executor_name,
+            executor_setup_hint(executor_name),
+        );
+    }
+
+    if which_on_path(command).is_some() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Executor '{}' command '{}' was not found on PATH. \
+         Install the '{}' binary, put it on PATH, or set [executor].command in .wg/executors/{}.toml.{}",
+        executor_name,
+        command,
+        command,
+        executor_name,
+        executor_setup_hint(executor_name),
+    );
+}
+
+fn executor_setup_hint(executor_name: &str) -> &'static str {
+    match executor_name {
+        "amplifier" => {
+            " Expected default command: amplifier run --mode single --output-format json --bundle wg <prompt>."
+        }
+        "crush" => {
+            " The built-in Crush surface is experimental; verify `crush run --help` for your installed version or override the template."
+        }
+        _ => "",
+    }
+}
+
+fn command_contains_path_separator(command: &str) -> bool {
+    command.contains('/') || command.contains('\\')
+}
+
+fn which_on_path(command: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(md) => md.is_file() && (md.permissions().mode() & 0o111 != 0),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn inject_api_key_env(
+    cmd: &mut Command,
+    endpoint_config: Option<&EndpointConfig>,
+    effective_api_key: &Option<String>,
+) {
+    if let Some(key) = effective_api_key {
+        cmd.env("WG_API_KEY", key);
+        // Also set the provider-specific env var (e.g. OPENROUTER_API_KEY)
+        // so external CLIs can discover the key through their standard
+        // environment without putting secrets in argv or run.sh.
+        if let Some(ep) = endpoint_config {
+            for var_name in EndpointConfig::env_var_names_for_provider(&ep.provider) {
+                cmd.env(var_name, key);
+            }
+        }
+    }
 }
 
 /// Build the inner command string for the executor.
@@ -1189,6 +1628,55 @@ fn build_inner_command(
             }
             cmd_parts.join(" ")
         }
+        "opencode" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::OpenCodeFile,
+        )?,
+        "aider" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::AiderMessageFile,
+        )?,
+        "goose" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::GooseInputFile,
+        )?,
+        "qwen" | "qwen-code" | "qwen_code" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::QwenPromptAndStdin,
+        )?,
+        "cline" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::ClinePositionalPromptAndStdin,
+        )?,
+        "crush" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::Stdin,
+        )?,
+        "amplifier" => external_prompt_command(
+            settings,
+            output_dir,
+            effective_model,
+            effective_provider,
+            ExternalPromptDelivery::Argument,
+        )?,
         "shell" => {
             format!(
                 "{} -c {}",
@@ -1972,10 +2460,202 @@ mod tests {
     }
 
     #[test]
+    fn test_executor_uses_auto_prompt_includes_external_cli_adapters() {
+        for kind in workgraph::dispatch::ExecutorKind::EXTERNAL_CLIS
+            .iter()
+            .map(|kind| kind.as_str())
+            .chain(["qwen-code", "qwen_code"])
+        {
+            assert!(
+                executor_uses_auto_prompt(kind),
+                "{} must auto-build prompt",
+                kind
+            );
+        }
+    }
+
+    #[test]
     fn test_executor_uses_auto_prompt_excludes_shell_and_unknown() {
         assert!(!executor_uses_auto_prompt("shell"));
         assert!(!executor_uses_auto_prompt(""));
         assert!(!executor_uses_auto_prompt("custom"));
+    }
+
+    // --- external CLI model normalization tests ---
+
+    fn normalized_args(executor_type: &str) -> Vec<String> {
+        external_cli_model_args(
+            executor_type,
+            Some("openrouter:deepseek/deepseek-v3.2"),
+            Some("openrouter"),
+        )
+        .to_vec()
+    }
+
+    #[test]
+    fn test_external_cli_model_args_opencode_and_aider_use_provider_slash() {
+        for executor_type in ["opencode", "aider"] {
+            assert_eq!(
+                normalized_args(executor_type),
+                vec![
+                    "--model".to_string(),
+                    "openrouter/deepseek/deepseek-v3.2".to_string()
+                ],
+                "{} should receive OpenRouter provider/model slash syntax",
+                executor_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_external_cli_model_args_goose_uses_provider_flag_and_bare_model() {
+        assert_eq!(
+            normalized_args("goose"),
+            vec![
+                "--provider".to_string(),
+                "openrouter".to_string(),
+                "--model".to_string(),
+                "deepseek/deepseek-v3.2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_cline_uses_provider_flag_and_bare_model() {
+        assert_eq!(
+            normalized_args("cline"),
+            vec![
+                "--provider".to_string(),
+                "openrouter".to_string(),
+                "--model".to_string(),
+                "deepseek/deepseek-v3.2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_octomind_uses_provider_colon_model() {
+        // Octomind's `-m` takes WG's `openrouter:<vendor>/<model>` spelling, so
+        // a worker spawn preserves the typed route rather than silently falling
+        // back to octomind's default (prototype-octomind-dexto-chat).
+        assert_eq!(
+            normalized_args("octomind"),
+            vec![
+                "--model".to_string(),
+                "openrouter:deepseek/deepseek-v3.2".to_string()
+            ]
+        );
+        // minimax/minimax-m3 specifically (the task's named regression model).
+        assert_eq!(
+            external_cli_model_args("octomind", Some("minimax/minimax-m3"), Some("openrouter"))
+                .to_vec(),
+            vec![
+                "--model".to_string(),
+                "openrouter:minimax/minimax-m3".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_qwen_uses_bare_model() {
+        assert_eq!(
+            normalized_args("qwen"),
+            vec!["--model".to_string(), "deepseek/deepseek-v3.2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_crush_uses_provider_slash() {
+        assert_eq!(
+            normalized_args("crush"),
+            vec![
+                "--model".to_string(),
+                "openrouter/deepseek/deepseek-v3.2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_accept_provider_from_resolution() {
+        assert_eq!(
+            external_cli_model_args(
+                "opencode",
+                Some("deepseek/deepseek-v3.2"),
+                Some("openrouter"),
+            )
+            .to_vec(),
+            vec![
+                "--model".to_string(),
+                "openrouter/deepseek/deepseek-v3.2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_external_cli_model_args_do_not_duplicate_openrouter_prefix() {
+        for executor_type in ["opencode", "aider"] {
+            assert_eq!(
+                external_cli_model_args(
+                    executor_type,
+                    Some("openrouter/deepseek/deepseek-v3.2"),
+                    Some("openrouter"),
+                )
+                .to_vec(),
+                vec![
+                    "--model".to_string(),
+                    "openrouter/deepseek/deepseek-v3.2".to_string()
+                ],
+                "{} should accept already-normalized OpenRouter model syntax",
+                executor_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_external_cli_model_args_do_not_change_builtin_or_amplifier_defaults() {
+        for executor_type in ["claude", "codex", "native", "amplifier"] {
+            assert!(
+                external_cli_model_args(
+                    executor_type,
+                    Some("openrouter:deepseek/deepseek-v3.2"),
+                    Some("openrouter"),
+                )
+                .to_vec()
+                .is_empty(),
+                "{} model behavior should stay on its existing path",
+                executor_type
+            );
+            assert_eq!(
+                model_template_value_for_executor(
+                    executor_type,
+                    Some("openrouter:deepseek/deepseek-v3.2"),
+                    Some("openrouter"),
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_external_cli_model_template_value_matches_cli_style() {
+        assert_eq!(
+            model_template_value_for_executor(
+                "opencode",
+                Some("openrouter:deepseek/deepseek-v3.2"),
+                Some("openrouter"),
+            )
+            .as_deref(),
+            Some("openrouter/deepseek/deepseek-v3.2")
+        );
+        assert_eq!(
+            model_template_value_for_executor(
+                "goose",
+                Some("openrouter:deepseek/deepseek-v3.2"),
+                Some("openrouter"),
+            )
+            .as_deref(),
+            Some("deepseek/deepseek-v3.2")
+        );
     }
 
     // --- should_create_worktree tests ---
@@ -2771,6 +3451,592 @@ mod tests {
                 .to_string()
                 .contains("not found in config"),
             "Error should mention registration"
+        );
+    }
+
+    fn external_test_settings(
+        executor_type: &str,
+        command: &str,
+        args: &[&str],
+    ) -> workgraph::service::executor::ExecutorSettings {
+        workgraph::service::executor::ExecutorSettings {
+            executor_type: executor_type.to_string(),
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: std::collections::HashMap::new(),
+            prompt_template: Some(PromptTemplate {
+                template: "Investigate task".to_string(),
+            }),
+            working_dir: Some("/tmp".to_string()),
+            timeout: None,
+            model: None,
+        }
+    }
+
+    fn test_template_vars() -> TemplateVars {
+        TemplateVars {
+            task_id: "task-1".to_string(),
+            task_title: "Task".to_string(),
+            task_description: "Desc".to_string(),
+            task_context: "Context".to_string(),
+            task_identity: String::new(),
+            working_dir: "/tmp".to_string(),
+            skills_preamble: String::new(),
+            model: String::new(),
+            task_loop_info: String::new(),
+            task_verify: None,
+            max_child_tasks: 0,
+            max_task_depth: 0,
+            has_failed_deps: false,
+            failed_deps_info: String::new(),
+            in_worktree: false,
+        }
+    }
+
+    fn default_external_settings(
+        workgraph_dir: &Path,
+        executor_type: &str,
+    ) -> workgraph::service::executor::ExecutorSettings {
+        let registry = ExecutorRegistry::new(workgraph_dir);
+        let mut settings = registry.load_config(executor_type).unwrap().executor;
+        settings.prompt_template = Some(PromptTemplate {
+            template: "Investigate task".to_string(),
+        });
+        settings
+    }
+
+    #[test]
+    fn test_build_inner_command_opencode_default_uses_run_json_prompt_file_and_openrouter_model() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = default_external_settings(output_dir, "opencode");
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.contains("'opencode' 'run'"),
+            "OpenCode must use documented non-interactive `opencode run`: {}",
+            command
+        );
+        assert!(
+            command.contains("'--format' 'json'"),
+            "OpenCode should request JSON-capable output: {}",
+            command
+        );
+        assert!(
+            command.contains("--model 'openrouter/deepseek/deepseek-v3.2'"),
+            "OpenCode should receive provider/model slash syntax: {}",
+            command
+        );
+        assert!(
+            command.contains("--file "),
+            "OpenCode should receive the WG prompt as an attached file: {}",
+            command
+        );
+        let message_pos = command
+            .find("'Complete the attached WG task prompt.'")
+            .expect("OpenCode command should include an explicit message");
+        let file_pos = command
+            .find("--file ")
+            .expect("OpenCode command should attach prompt file");
+        assert!(
+            message_pos < file_pos,
+            "OpenCode --file is an array option; message must come before --file so it is not parsed as a second file: {}",
+            command
+        );
+        assert!(
+            !command.contains("openrouter:deepseek"),
+            "WG provider:model syntax must not leak into OpenCode argv: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "External CLI argv must not contain API keys or key file paths: {}",
+            command
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("prompt.txt")).unwrap(),
+            "Investigate task"
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_opencode_errors_when_model_unresolved() {
+        // Explicit-model contract (fix-opencode-build req #3): the opencode
+        // worker path must FAIL when model resolution produced nothing, never
+        // silently omit `--model` and inherit opencode's internal default.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = default_external_settings(output_dir, "opencode");
+        let vars = test_template_vars();
+
+        let result = build_inner_command(
+            &settings, "full", output_dir, &None, // <- no resolved model
+            &None, &None, &None, &None, &vars, &None, None,
+        );
+
+        let err = result.expect_err("opencode with no resolved model must be a hard error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("requires an explicitly resolved model"),
+            "error must explain the explicit-model contract, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_aider_default_uses_message_file_and_openrouter_model() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = default_external_settings(output_dir, "aider");
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.contains("'aider'"),
+            "Aider command should invoke the aider CLI: {}",
+            command
+        );
+        assert!(
+            command.contains("'--yes-always'"),
+            "Aider should avoid confirmation prompts in batch mode: {}",
+            command
+        );
+        assert!(
+            command.contains("--model 'openrouter/deepseek/deepseek-v3.2'"),
+            "Aider should receive provider/model slash syntax: {}",
+            command
+        );
+        assert!(
+            command.contains("--message-file "),
+            "Aider should receive the WG prompt through --message-file: {}",
+            command
+        );
+        assert!(
+            !command.contains(" --message '"),
+            "Aider must avoid interactive chat and inline --message prompts: {}",
+            command
+        );
+        assert!(
+            !command.contains("openrouter:deepseek"),
+            "WG provider:model syntax must not leak into Aider argv: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "External CLI argv must not contain API keys or key file paths: {}",
+            command
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("prompt.txt")).unwrap(),
+            "Investigate task"
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_goose_normalizes_provider_and_model_without_key_leak() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = external_test_settings(
+            "goose",
+            "goose",
+            &["run", "--no-session", "--output-format", "json"],
+        );
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.contains("--provider 'openrouter'"),
+            "Goose should receive a provider flag: {}",
+            command
+        );
+        assert!(
+            command.contains("--model 'deepseek/deepseek-v3.2'"),
+            "Goose should receive the bare OpenRouter model ID: {}",
+            command
+        );
+        assert!(
+            command.contains("-i "),
+            "Goose should receive the WG prompt as an input file: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "External CLI argv must not contain API keys or key file paths: {}",
+            command
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_qwen_uses_prompt_headless_model_and_output() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings =
+            external_test_settings("qwen", "qwen", &["--output-format", "json", "--yolo"]);
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.starts_with("cat "),
+            "Qwen should receive WG's assembled prompt through stdin: {}",
+            command
+        );
+        assert!(
+            command.contains("--prompt 'Complete the WG task prompt supplied on stdin.'"),
+            "Qwen should run in documented --prompt headless mode: {}",
+            command
+        );
+        assert!(
+            command.contains("'--output-format' 'json'"),
+            "Qwen should request machine-readable output where supported: {}",
+            command
+        );
+        assert!(
+            command.contains("'--yolo'"),
+            "Qwen Code's unattended approval flag is deliberately experimental and covered here so future changes are explicit: {}",
+            command
+        );
+        assert!(
+            command.contains("--model 'deepseek/deepseek-v3.2'"),
+            "Qwen should receive the bare OpenRouter model ID: {}",
+            command
+        );
+        assert!(
+            !command.contains("--provider"),
+            "Qwen's OpenRouter path relies on configured provider/auth, not a provider argv flag: {}",
+            command
+        );
+        assert!(
+            !command.contains("openrouter:deepseek"),
+            "WG provider:model syntax must not leak into Qwen argv: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "External CLI argv must not contain API keys or key file paths: {}",
+            command
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_amplifier_uses_prompt_argument_bridge() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = external_test_settings(
+            "amplifier",
+            "amplifier",
+            &[
+                "run",
+                "--mode",
+                "single",
+                "--output-format",
+                "json",
+                "--bundle",
+                "wg",
+            ],
+        );
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.contains("PROMPT=$(cat \"$1\"); shift; exec \"$@\" \"$PROMPT\""),
+            "Amplifier should bridge prompt.txt into a positional argument: {}",
+            command
+        );
+        assert!(
+            command.contains(
+                "'amplifier' 'run' '--mode' 'single' '--output-format' 'json' '--bundle' 'wg'"
+            ),
+            "Amplifier default command shape should be preserved: {}",
+            command
+        );
+        assert!(
+            !command.contains("--model"),
+            "Amplifier defaults should not treat amplifier as a native model provider: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret"),
+            "External CLI argv must not contain API keys: {}",
+            command
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("prompt.txt")).unwrap(),
+            "Investigate task"
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_cline_uses_headless_auto_approve_provider_model() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings =
+            external_test_settings("cline", "cline", &["--json", "--auto-approve", "true"]);
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert!(
+            command.starts_with("cat "),
+            "Cline should receive WG's assembled prompt through stdin: {}",
+            command
+        );
+        assert!(
+            command.contains("--json"),
+            "Cline should run in JSON-capable headless mode: {}",
+            command
+        );
+        assert!(
+            command.contains("'--auto-approve' 'true'"),
+            "Cline's unattended auto-approval flag is deliberately experimental and covered here so future changes are explicit: {}",
+            command
+        );
+        assert!(
+            command.contains("--provider 'openrouter'"),
+            "Cline should receive a provider flag where supported: {}",
+            command
+        );
+        assert!(
+            command.contains("--model 'deepseek/deepseek-v3.2'"),
+            "Cline should receive the bare OpenRouter model ID: {}",
+            command
+        );
+        assert!(
+            command.ends_with("'Complete the WG task prompt supplied on stdin.'"),
+            "Cline should get a positional headless task prompt: {}",
+            command
+        );
+        assert!(
+            !command.contains("openrouter:deepseek"),
+            "WG provider:model syntax must not leak into Cline argv: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "External CLI argv must not contain API keys or key file paths: {}",
+            command
+        );
+    }
+
+    #[test]
+    fn test_build_inner_command_generic_experimental_fallback_is_raw_argv_only() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let output_dir = temp_dir.path();
+        let settings = external_test_settings(
+            "experimental-runner",
+            "experimental-runner",
+            &["run", "--json", "--flag=value"],
+        );
+        let vars = test_template_vars();
+
+        let (command, fallback) = build_inner_command(
+            &settings,
+            "full",
+            output_dir,
+            &Some("openrouter:deepseek/deepseek-v3.2".to_string()),
+            &Some("openrouter".to_string()),
+            &None,
+            &None,
+            &Some("sk-or-secret".to_string()),
+            &vars,
+            &None,
+            None,
+        )
+        .unwrap();
+
+        assert!(fallback.is_none());
+        assert_eq!(
+            command, "'experimental-runner' 'run' '--json' '--flag=value'",
+            "Unknown experimental executor types should stay on the raw configured argv fallback"
+        );
+        assert!(
+            !output_dir.join("prompt.txt").exists(),
+            "The generic fallback must not imply prompt delivery; first-class adapters need explicit branches"
+        );
+        assert!(
+            !command.contains("--model") && !command.contains("--provider"),
+            "Generic fallback should not guess model/provider flags: {}",
+            command
+        );
+        assert!(
+            !command.contains("sk-or-secret") && !command.contains(".openrouter.key"),
+            "Generic fallback argv must not leak API credentials: {}",
+            command
+        );
+    }
+
+    #[test]
+    fn test_preflight_executor_command_missing_binary_actionable() {
+        let settings =
+            external_test_settings("amplifier", "wg-missing-amplifier-test-binary", &["run"]);
+        let err = preflight_executor_command(&settings, "amplifier", None)
+            .expect_err("missing binary should fail preflight")
+            .to_string();
+
+        assert!(
+            err.contains("amplifier") && err.contains("not found on PATH"),
+            "error should name the missing executor and PATH failure: {}",
+            err
+        );
+        assert!(
+            err.contains(".wg/executors/amplifier.toml") && err.contains("Install"),
+            "error should tell the user how to fix the executor command: {}",
+            err
+        );
+        assert!(
+            err.contains("amplifier run --mode single --output-format json --bundle wg"),
+            "Amplifier-specific setup hint should include the expected command: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_preflight_executor_command_relative_path_uses_working_dir() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let runner = temp_dir.path().join("runner");
+        std::fs::write(&runner, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&runner).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&runner, perms).unwrap();
+        }
+
+        let settings = external_test_settings("custom", "./runner", &[]);
+        preflight_executor_command(&settings, "custom", Some(temp_dir.path()))
+            .expect("relative command should resolve from working_dir");
+    }
+
+    #[test]
+    fn test_inject_api_key_env_sets_openrouter_env_without_file_path() {
+        let endpoint = EndpointConfig {
+            name: "openrouter".to_string(),
+            provider: "openrouter".to_string(),
+            url: Some("https://openrouter.ai/api/v1".to_string()),
+            model: None,
+            api_key: None,
+            api_key_file: Some("~/.openrouter.key".to_string()),
+            api_key_env: None,
+            api_key_ref: None,
+            is_default: true,
+            context_window: None,
+        };
+        let mut cmd = Command::new("true");
+        inject_api_key_env(&mut cmd, Some(&endpoint), &Some("sk-or-secret".to_string()));
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert!(envs.contains(&("WG_API_KEY".to_string(), Some("sk-or-secret".to_string()))));
+        assert!(envs.contains(&(
+            "OPENROUTER_API_KEY".to_string(),
+            Some("sk-or-secret".to_string())
+        )));
+        assert!(
+            envs.iter().all(|(key, value)| {
+                !key.contains(".openrouter.key")
+                    && value
+                        .as_deref()
+                        .map_or(true, |value| !value.contains(".openrouter.key"))
+            }),
+            "The configured key file path should not be propagated or printed: {:?}",
+            envs
         );
     }
 

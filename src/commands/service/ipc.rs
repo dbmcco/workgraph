@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream;
 
 use workgraph::config::Config;
 use workgraph::cron::{calculate_next_fire, parse_cron_expression};
+use workgraph::dispatch::ExecutorKind;
 use workgraph::graph::{Node, PRIORITY_DEFAULT, PRIORITY_HIGH, Status, Task};
 use workgraph::parser::{load_graph, modify_graph};
 use workgraph::service::registry::AgentRegistry;
@@ -1526,6 +1527,9 @@ pub fn create_chat_in_graph(
             "--command cannot be combined with --exec/--executor, --model, or --endpoint"
         );
     }
+    if let Some(msg) = worker_only_live_chat_executor_error(executor) {
+        anyhow::bail!("{}", msg);
+    }
     let graph_path = crate::commands::graph_path(dir);
     let mut graph =
         workgraph::parser::load_graph(&graph_path).with_context(|| "Failed to load graph")?;
@@ -1554,11 +1558,28 @@ pub fn create_chat_in_graph(
         )
     } else {
         let preset = workgraph::chat_command::preset_name_for_executor(executor, model);
-        (
-            workgraph::chat_command::argv_for_preset(&preset, model, endpoint, "wg"),
-            Some(project_root.display().to_string()),
-            Some(preset),
-        )
+        let mut argv = workgraph::chat_command::argv_for_preset(&preset, model, endpoint, "wg");
+        // Dexto drives OpenRouter via a generated per-chat agent YAML; write it
+        // now and substitute its absolute path so the stored command record is
+        // runnable even outside the TUI (prototype-octomind-dexto-chat).
+        if preset == "dexto" {
+            let chat_ref = format!("chat-{}", next_id);
+            let chat_dir = workgraph::chat::chat_dir_for_ref(dir, &chat_ref);
+            match workgraph::chat_command::write_dexto_agent_config(&chat_dir, model) {
+                Ok(path) => {
+                    if let Some(slot) = argv
+                        .iter_mut()
+                        .find(|a| a.as_str() == workgraph::chat_command::DEXTO_AGENT_CONFIG_FILE)
+                    {
+                        *slot = path.display().to_string();
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to write dexto agent config: {e}");
+                }
+            }
+        }
+        (argv, Some(project_root.display().to_string()), Some(preset))
     };
 
     let task = workgraph::graph::Task {
@@ -1922,6 +1943,9 @@ fn handle_set_coordinator_executor(
     if executor.is_none() && model.is_none() {
         return IpcResponse::error("at least one of --executor or --model must be provided");
     }
+    if let Some(msg) = worker_only_live_chat_executor_error(executor) {
+        return IpcResponse::error(&msg);
+    }
 
     let mut state = super::CoordinatorState::load_or_default_for(dir, coordinator_id);
     if let Some(e) = executor {
@@ -1955,6 +1979,18 @@ fn handle_set_coordinator_executor(
         "signaled_pid": handler_pid,
         "note": "supervisor will respawn the handler with the new settings",
     }))
+}
+
+fn worker_only_live_chat_executor_error(executor: Option<&str>) -> Option<String> {
+    let kind = ExecutorKind::from_str(executor?)?;
+    kind.is_worker_only_external().then(|| {
+        format!(
+            "executor '{}' is worker-only and cannot run as a live chat executor; \
+             use it for task-agent workers via the dispatcher or `wg spawn`, or choose \
+             a live chat executor such as claude, codex, opencode, or native/nex",
+            kind.as_str()
+        )
+    })
 }
 
 fn handle_stop_coordinator(dir: &Path, coordinator_id: u32) -> IpcResponse {
@@ -3519,6 +3555,139 @@ poll_interval = 120
             state.endpoint_override.as_deref(),
             Some("https://lambda01.tail334fe6.ts.net:30000"),
             "endpoint_override must persist (TUI restart reuses this on reattach)"
+        );
+    }
+
+    #[test]
+    fn test_create_chat_rejects_worker_only_external_executor() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("service")).unwrap();
+
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        // `aider` is still worker-only (no live chat handler), so it is
+        // rejected here. (OpenCode is NO LONGER rejected — see
+        // `test_create_chat_accepts_opencode_chat_capable_executor`.)
+        let err = create_chat_in_graph(
+            dir,
+            Some("Aider"),
+            Some("claude:opus"),
+            Some("aider"),
+            None,
+            None,
+        )
+        .expect_err("worker-only external executors must not create live chats")
+        .to_string();
+
+        assert!(err.contains("aider"), "error should name executor: {}", err);
+        assert!(
+            err.contains("worker-only"),
+            "error should explain worker-only boundary: {}",
+            err
+        );
+        assert!(
+            err.contains("live chat executor"),
+            "error should identify the live chat path: {}",
+            err
+        );
+
+        let graph = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        assert_eq!(
+            graph.tasks().count(),
+            0,
+            "failed live-chat create must not write a graph task"
+        );
+    }
+
+    /// Goal #5 (fix-opencode-build): opencode is chat-capable, so creating a
+    /// live chat with `--executor opencode` succeeds and writes a chat task.
+    #[test]
+    fn test_create_chat_accepts_opencode_chat_capable_executor() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("service")).unwrap();
+
+        let graph = workgraph::graph::WorkGraph::new();
+        workgraph::parser::save_graph(&graph, &dir.join("graph.jsonl")).unwrap();
+
+        let id = create_chat_in_graph(
+            dir,
+            Some("OpenCode"),
+            Some("opencode:openrouter/stepfun/step-3.7-flash"),
+            Some("opencode"),
+            None,
+            None,
+        )
+        .expect("opencode is chat-capable and must create a live chat");
+
+        let graph = workgraph::parser::load_graph(&dir.join("graph.jsonl")).unwrap();
+        assert_eq!(
+            graph.tasks().count(),
+            1,
+            "a successful opencode chat create must write exactly one chat task"
+        );
+        let task_id = workgraph::chat_id::format_chat_task_id(id);
+        let task = graph.get_task(&task_id).expect("chat task present");
+        assert_eq!(
+            task.model.as_deref(),
+            Some("opencode:openrouter/stepfun/step-3.7-flash"),
+            "chat task must carry the opencode route so plan_spawn dispatches via opencode"
+        );
+        assert_eq!(
+            task.executor_preset_name.as_deref(),
+            Some("opencode"),
+            "chat task must record the opencode executor override"
+        );
+        assert!(
+            task.endpoint.is_none(),
+            "opencode chat needs no endpoint override (OpenRouter route is implicit): {:?}",
+            task.endpoint
+        );
+        // The launch argv carries the OpenRouter model in opencode's
+        // `openrouter/<vendor>/<model>` spelling — and no endpoint flag.
+        assert!(
+            task.command_argv
+                .windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "openrouter/stepfun/step-3.7-flash"),
+            "opencode argv must pass the OpenRouter model explicitly: {:?}",
+            task.command_argv
+        );
+        assert!(
+            !task
+                .command_argv
+                .iter()
+                .any(|a| a == "-e" || a == "--endpoint"),
+            "opencode argv must not carry an endpoint flag: {:?}",
+            task.command_argv
+        );
+    }
+
+    #[test]
+    fn test_set_chat_executor_rejects_worker_only_external_executor() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("service")).unwrap();
+
+        let resp = handle_set_coordinator_executor(dir, 0, Some("aider"), None);
+
+        assert!(!resp.ok, "worker-only executor switch must fail");
+        let err = resp.error.expect("error message should be returned");
+        assert!(err.contains("aider"), "error should name executor: {}", err);
+        assert!(
+            err.contains("worker-only"),
+            "error should explain worker-only boundary: {}",
+            err
+        );
+        assert!(
+            err.contains("live chat executor"),
+            "error should identify the live chat path: {}",
+            err
+        );
+        assert!(
+            super::CoordinatorState::load_for(dir, 0).is_none(),
+            "failed executor switch must not persist coordinator state"
         );
     }
 

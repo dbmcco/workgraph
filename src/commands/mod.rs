@@ -79,7 +79,7 @@ pub mod model_cmd;
 pub mod models;
 pub mod msg;
 pub mod native_exec;
-pub mod nex;
+pub use workgraph::nex;
 pub mod next;
 #[cfg(any(feature = "matrix", feature = "matrix-lite"))]
 pub mod notify;
@@ -134,6 +134,7 @@ pub mod tradeoff;
 pub mod trajectory;
 pub mod tui_nex;
 pub mod tui_pty;
+pub mod upgrade;
 pub mod user;
 pub mod velocity;
 pub mod viz;

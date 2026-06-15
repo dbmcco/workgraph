@@ -74,7 +74,7 @@ pub fn create_worktree(
     for link_name in [active_name, ".wg"] {
         let symlink_path = worktree_dir.join(link_name);
         if !symlink_path.exists() {
-            std::os::unix::fs::symlink(&symlink_target, &symlink_path)
+            create_workgraph_link(&symlink_target, &symlink_path)
                 .with_context(|| format!("Failed to symlink {link_name} into worktree"))?;
         }
     }
@@ -95,6 +95,28 @@ pub fn create_worktree(
         branch,
         project_root: project_root.to_path_buf(),
     })
+}
+
+#[cfg(unix)]
+fn create_workgraph_link(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).context("Failed to symlink .wg into worktree")
+}
+
+#[cfg(windows)]
+fn create_workgraph_link(target: &Path, link: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(target, link).with_context(|| {
+        format!(
+            "Failed to symlink .wg into worktree from {} to {}",
+            link.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_workgraph_link(target: &Path, link: &Path) -> Result<()> {
+    let _ = (target, link);
+    anyhow::bail!("worktree .wg linking is not supported on this platform")
 }
 
 /// Find an existing worktree for a given task by scanning `.wg-worktrees/`

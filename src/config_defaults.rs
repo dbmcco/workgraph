@@ -519,19 +519,24 @@ fn split_role_models_routing(
     evaluator_model: &str,
     assigner_model: &str,
 ) -> ModelRoutingConfig {
+    let default_role = RoleModelConfig {
+        provider: None,
+        model: Some(default_model.to_string()),
+        tier: None,
+        endpoint: None,
+    };
+    let evaluator_role = RoleModelConfig {
+        provider: None,
+        model: Some(evaluator_model.to_string()),
+        tier: None,
+        endpoint: None,
+    };
     ModelRoutingConfig {
-        default: Some(RoleModelConfig {
-            provider: None,
-            model: Some(default_model.to_string()),
-            tier: None,
-            endpoint: None,
-        }),
-        evaluator: Some(RoleModelConfig {
-            provider: None,
-            model: Some(evaluator_model.to_string()),
-            tier: None,
-            endpoint: None,
-        }),
+        default: Some(default_role.clone()),
+        task_agent: Some(default_role),
+        evaluator: Some(evaluator_role.clone()),
+        flip_inference: Some(evaluator_role.clone()),
+        flip_comparison: Some(evaluator_role),
         assigner: Some(RoleModelConfig {
             provider: None,
             model: Some(assigner_model.to_string()),
@@ -577,7 +582,15 @@ mod tests {
         assert!(config.tiers.premium.is_some(), "premium tier must be set");
     }
 
-    fn assert_models_evaluator_and_assigner_pinned(config: &Config) {
+    fn assert_default_task_agent_evaluator_and_assigner_pinned(config: &Config) {
+        assert!(
+            config.models.default.is_some(),
+            "models.default must be set"
+        );
+        assert!(
+            config.models.task_agent.is_some(),
+            "models.task_agent must be set"
+        );
         assert!(
             config.models.evaluator.is_some(),
             "models.evaluator must be set"
@@ -639,7 +652,7 @@ mod tests {
         );
 
         // models.* pinned
-        assert_models_evaluator_and_assigner_pinned(&config);
+        assert_default_task_agent_evaluator_and_assigner_pinned(&config);
 
         // Round-trips through TOML cleanly
         let reloaded = round_trip(&config);
@@ -666,14 +679,14 @@ mod tests {
         // Tiers filled with provider-prefixed claude aliases (CLI resolves them).
         assert_tiers_filled(&config);
         assert_eq!(config.tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(config.tiers.standard.as_deref(), Some("claude:sonnet"));
+        assert_eq!(config.tiers.standard.as_deref(), Some("claude:opus"));
         assert_eq!(config.tiers.premium.as_deref(), Some("claude:opus"));
 
         // Worker / dispatcher default to opus (premium tier).
         assert_eq!(config.agent.model, "claude:opus");
         assert_eq!(config.coordinator.model.as_deref(), Some("claude:opus"));
 
-        assert_models_evaluator_and_assigner_pinned(&config);
+        assert_default_task_agent_evaluator_and_assigner_pinned(&config);
 
         let reloaded = round_trip(&config);
         assert_eq!(reloaded.tiers.standard, config.tiers.standard);
@@ -726,6 +739,12 @@ mod tests {
             config.agent.model, "openrouter:anthropic/claude-opus-4-7",
             "openrouter agent should default to opus equivalent"
         );
+        let task_agent = config.models.task_agent.as_ref().unwrap();
+        assert_eq!(
+            task_agent.model.as_deref(),
+            Some("openrouter:anthropic/claude-opus-4-7"),
+            "openrouter task_agent should default to opus equivalent"
+        );
         let evaluator = config.models.evaluator.as_ref().unwrap();
         assert_eq!(
             evaluator.model.as_deref(),
@@ -746,6 +765,13 @@ mod tests {
         assert_eq!(
             config.agent.model, "codex:gpt-5.5",
             "codex-cli agent should default to gpt-5.5 (premium tier — newest frontier)"
+        );
+        assert_eq!(config.tiers.standard.as_deref(), Some("codex:gpt-5.5"));
+        let task_agent = config.models.task_agent.as_ref().unwrap();
+        assert_eq!(
+            task_agent.model.as_deref(),
+            Some("codex:gpt-5.5"),
+            "codex-cli task_agent should default to gpt-5.5"
         );
         let evaluator = config.models.evaluator.as_ref().unwrap();
         assert_eq!(
@@ -848,7 +874,7 @@ mod tests {
         assert_eq!(config.agent.model, "codex:gpt-5.5");
         assert_eq!(config.coordinator.model.as_deref(), Some("codex:gpt-5.5"));
 
-        assert_models_evaluator_and_assigner_pinned(&config);
+        assert_default_task_agent_evaluator_and_assigner_pinned(&config);
 
         let reloaded = round_trip(&config);
         assert_eq!(reloaded.coordinator.executor, config.coordinator.executor);
@@ -889,7 +915,7 @@ mod tests {
 
         assert_eq!(config.agent.model, "nex:qwen3:4b");
 
-        assert_models_evaluator_and_assigner_pinned(&config);
+        assert_default_task_agent_evaluator_and_assigner_pinned(&config);
 
         let reloaded = round_trip(&config);
         assert_eq!(reloaded.tiers.fast, config.tiers.fast);
@@ -940,7 +966,7 @@ mod tests {
 
         assert_eq!(config.agent.model, "nex:my-special-model");
 
-        assert_models_evaluator_and_assigner_pinned(&config);
+        assert_default_task_agent_evaluator_and_assigner_pinned(&config);
 
         let reloaded = round_trip(&config);
         assert_eq!(reloaded.agent.model, config.agent.model);

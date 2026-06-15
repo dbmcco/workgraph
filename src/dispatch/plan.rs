@@ -24,7 +24,9 @@
 //!   pass `--endpoint`.
 //! - `executor=shell`   →  endpoint is always `None`.
 //! - `executor=codex`   →  endpoint is always `None` (codex CLI handles its own).
-//! - `executor=native`  →  endpoint is required; resolved via merged config
+//! - external worker CLIs (`opencode`, `aider`, etc.) → endpoint is always
+//!   `None` (their adapters handle provider/auth policy).
+//! - `executor=native` / `nex` → endpoint is required; resolved via merged config
 //!   (per-task → role → default).
 //!
 //! ## Provenance
@@ -36,7 +38,7 @@
 
 use crate::config::{Config, EndpointConfig, parse_model_spec, provider_to_executor};
 use crate::graph::Task;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 /// The executor kind that will run a spawned agent. This is the canonical
@@ -53,11 +55,67 @@ pub enum ExecutorKind {
     Shell,
     /// Codex CLI (`codex exec …`). Handles its own auth.
     Codex,
-    /// OpenCode CLI (`opencode run …`). Handles its own provider auth.
+    /// OpenCode CLI (`opencode run …`). Handles its own provider auth and has
+    /// a WG live-chat handler.
     OpenCode,
+    /// Aider CLI worker. One-shot task executor only, not a live chat handler.
+    Aider,
+    /// Goose CLI worker. One-shot task executor only, not a live chat handler.
+    Goose,
+    /// Qwen Code CLI worker. One-shot task executor only, not a live chat handler.
+    Qwen,
+    /// Cline CLI worker. One-shot task executor only, not a live chat handler.
+    Cline,
+    /// Crush CLI worker. One-shot task executor only, not a live chat handler.
+    Crush,
+    /// Amplifier CLI worker. Experimental one-shot task executor only.
+    Amplifier,
+    /// Octomind CLI. Chat-capable external CLI (`octomind run`); currently
+    /// integrated for the TUI live-chat PTY path only (no spawn-task handler).
+    Octomind,
+    /// Dexto CLI. Chat-capable external CLI (`dexto --agent`); currently
+    /// integrated for the TUI live-chat PTY path only (no spawn-task handler).
+    Dexto,
 }
 
 impl ExecutorKind {
+    /// External CLI adapters addressed by an *executor* name prefix
+    /// (`opencode:…`, `aider:…`, …) rather than a model-provider prefix.
+    /// These are intentionally NOT model providers — an executor is not a
+    /// provider — so prefix-routing code (`parse_executor_model_route`,
+    /// `handler_for_model`, profile activation, `wg add` model resolution)
+    /// keys off this set, not `KNOWN_PROVIDERS`.
+    ///
+    /// Membership here says nothing about chat-capability; see
+    /// [`WORKER_ONLY_EXTERNALS`](Self::WORKER_ONLY_EXTERNALS) for that.
+    pub const EXTERNAL_CLIS: &'static [ExecutorKind] = &[
+        ExecutorKind::OpenCode,
+        ExecutorKind::Aider,
+        ExecutorKind::Goose,
+        ExecutorKind::Qwen,
+        ExecutorKind::Cline,
+        ExecutorKind::Crush,
+        ExecutorKind::Amplifier,
+        ExecutorKind::Octomind,
+        ExecutorKind::Dexto,
+    ];
+
+    /// The subset of [`EXTERNAL_CLIS`](Self::EXTERNAL_CLIS) that can ONLY run
+    /// as one-shot task-agent workers and do NOT implement WG's live
+    /// chat/session protocol. `OpenCode` is deliberately absent: it ships a
+    /// live chat handler (`wg opencode-handler --chat`), so it is an external
+    /// CLI that is *also* chat-capable. `Octomind` / `Dexto` are likewise
+    /// absent: they are chat-capable external CLIs wired into the TUI
+    /// live-chat PTY path (see `prototype-octomind-dexto-chat`).
+    pub const WORKER_ONLY_EXTERNALS: &'static [ExecutorKind] = &[
+        ExecutorKind::Aider,
+        ExecutorKind::Goose,
+        ExecutorKind::Qwen,
+        ExecutorKind::Cline,
+        ExecutorKind::Crush,
+        ExecutorKind::Amplifier,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ExecutorKind::Claude => "claude",
@@ -65,16 +123,32 @@ impl ExecutorKind {
             ExecutorKind::Shell => "shell",
             ExecutorKind::Codex => "codex",
             ExecutorKind::OpenCode => "opencode",
+            ExecutorKind::Aider => "aider",
+            ExecutorKind::Goose => "goose",
+            ExecutorKind::Qwen => "qwen",
+            ExecutorKind::Cline => "cline",
+            ExecutorKind::Crush => "crush",
+            ExecutorKind::Amplifier => "amplifier",
+            ExecutorKind::Octomind => "octomind",
+            ExecutorKind::Dexto => "dexto",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(ExecutorKind::Claude),
-            "native" => Some(ExecutorKind::Native),
+            "native" | "nex" => Some(ExecutorKind::Native),
             "shell" => Some(ExecutorKind::Shell),
             "codex" => Some(ExecutorKind::Codex),
             "opencode" => Some(ExecutorKind::OpenCode),
+            "aider" => Some(ExecutorKind::Aider),
+            "goose" => Some(ExecutorKind::Goose),
+            "qwen" => Some(ExecutorKind::Qwen),
+            "cline" => Some(ExecutorKind::Cline),
+            "crush" => Some(ExecutorKind::Crush),
+            "amplifier" => Some(ExecutorKind::Amplifier),
+            "octomind" => Some(ExecutorKind::Octomind),
+            "dexto" => Some(ExecutorKind::Dexto),
             _ => None,
         }
     }
@@ -82,6 +156,25 @@ impl ExecutorKind {
     /// Whether this executor needs an `EndpointConfig` resolved.
     pub fn needs_endpoint(self) -> bool {
         matches!(self, ExecutorKind::Native)
+    }
+
+    /// Whether this executor is an external CLI adapter addressed by an
+    /// executor-name prefix (`opencode:…`, `aider:…`, …). Used by all the
+    /// prefix-routing call sites (spawn-path route parsing, `handler_for_model`,
+    /// profile activation, `wg add` model resolution).
+    pub fn is_external_cli(self) -> bool {
+        Self::EXTERNAL_CLIS.contains(&self)
+    }
+
+    /// Whether this executor is a worker-only external CLI adapter.
+    ///
+    /// These executors are valid for task-agent spawns through the worker
+    /// path, but they do not implement WG's live chat/session protocol. Used
+    /// to reject them from the live-chat path. `OpenCode` is NOT worker-only
+    /// (it has `wg opencode-handler --chat`), so this returns `false` for it
+    /// even though [`is_external_cli`](Self::is_external_cli) returns `true`.
+    pub fn is_worker_only_external(self) -> bool {
+        Self::WORKER_ONLY_EXTERNALS.contains(&self)
     }
 }
 
@@ -108,6 +201,37 @@ impl ResolvedModelSpec {
             model_id: parsed.model_id,
         }
     }
+}
+
+/// Executor-qualified model route split from a per-task model string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutorModelRoute {
+    executor: ExecutorKind,
+    model: String,
+}
+
+/// Parse worker-executor-qualified model routes such as
+/// `opencode:openrouter/stepfun/step-3.7-flash`.
+///
+/// This is intentionally narrower than `parse_model_spec`: `opencode` is an
+/// executor, not a model provider, so it must not be added to
+/// `KNOWN_PROVIDERS`. The only accepted nested provider shorthand today is
+/// OpenRouter's CLI spelling (`openrouter/<provider>/<model>`), which we
+/// normalize to WG's internal `openrouter:<provider>/<model>` model spec.
+fn parse_executor_model_route(raw: &str) -> Option<ExecutorModelRoute> {
+    let (prefix, rest) = raw.split_once(':')?;
+    let executor = ExecutorKind::from_str(prefix)?;
+    if !executor.is_external_cli() || rest.trim().is_empty() {
+        return None;
+    }
+
+    let model = if let Some(openrouter_model) = rest.strip_prefix("openrouter/") {
+        format!("openrouter:{}", openrouter_model)
+    } else {
+        rest.to_string()
+    };
+
+    Some(ExecutorModelRoute { executor, model })
 }
 
 /// Records *where* each field of a `SpawnPlan` came from. Logged on every
@@ -151,7 +275,7 @@ pub struct SpawnPlan {
     pub executor: ExecutorKind,
     pub model: ResolvedModelSpec,
     /// `None` for executors that handle their own endpoint (claude/codex/
-    /// shell). `Some(_)` only for `executor=native`.
+    /// shell/external workers). `Some(_)` only for `executor=native`.
     pub endpoint: Option<EndpointConfig>,
     /// Environment variables to set on the spawned process. Plan-level only;
     /// the spawn-execution layer is free to add wrapper-internal vars
@@ -197,6 +321,43 @@ pub fn plan_spawn(
             "[agent].model (fallback)".to_string(),
         )
     };
+    let executor_route = parse_executor_model_route(&model_raw);
+    let (model_raw, model_source) = if let Some(route) = executor_route.as_ref() {
+        (
+            route.model.clone(),
+            format!("{} (executor-qualified route {})", model_source, model_raw),
+        )
+    } else {
+        (model_raw, model_source)
+    };
+
+    // ----- 2a. Bare-route → OpenRouter normalization (nex only) -----
+    // A bare `vendor/model` route on the Nex/native executor with NO explicit
+    // endpoint is an OpenRouter route (nex-optional-openrouter-endpoint).
+    // Normalize it to `openrouter:<route>` so endpoint resolution below and
+    // the downstream nex provider target OpenRouter directly instead of
+    // silently falling back to the local `is_default` endpoint. An explicit
+    // endpoint (named or URL) keeps the model verbatim — the user picked the
+    // route, so the endpoint's provider dictates it.
+    let has_explicit_endpoint = task
+        .endpoint
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let (model_raw, model_source) = if executor == ExecutorKind::Native && !has_explicit_endpoint {
+        let normalized = crate::config::normalize_bare_openrouter_route(&model_raw);
+        if normalized != model_raw {
+            (
+                normalized,
+                format!("{} (bare route → openrouter default)", model_source),
+            )
+        } else {
+            (model_raw, model_source)
+        }
+    } else {
+        (model_raw, model_source)
+    };
+
     let model = ResolvedModelSpec::from_raw(&model_raw);
 
     // ----- 2b. Model-compat override -----
@@ -213,6 +374,19 @@ pub fn plan_spawn(
     // rewritten to native because the agency-level override sat in
     // resolve_executor's precedence step 3 and shadowed step 4).
     let (executor, executor_source) = enforce_model_compat(executor, executor_source, &model);
+    let (executor, executor_source) = if let Some(route) = executor_route {
+        (
+            route.executor,
+            format!(
+                "model-route override: task.model requested executor={} with inner model={}",
+                route.executor.as_str(),
+                model.raw
+            ),
+        )
+    } else {
+        (executor, executor_source)
+    };
+    validate_cli_backend_match(executor, &model)?;
 
     // ----- 3. Endpoint (executor-scoped) -----
     //
@@ -269,6 +443,28 @@ pub fn plan_spawn(
                 (
                     None,
                     format!("none (task.endpoint={:?} not found and no default)", ep_str),
+                )
+            }
+        } else if crate::config::model_is_openrouter(&model.raw) {
+            // No explicit endpoint + an OpenRouter model → route to OpenRouter
+            // intentionally (nex-optional-openrouter-endpoint), NOT the local
+            // `is_default` endpoint. Prefer a configured OpenRouter endpoint —
+            // it carries the URL + API key, which the spawn path forwards by
+            // name. With none configured, pass no endpoint and let the nex
+            // provider resolve the openrouter.ai default from the model's
+            // `openrouter:` prefix (still OpenRouter, never local).
+            if let Some(or_ep) = config.llm_endpoints.find_for_provider("openrouter") {
+                (
+                    Some(or_ep.clone()),
+                    "[llm_endpoints] provider=openrouter (openrouter model, no endpoint specified)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    None,
+                    "none (openrouter model, no openrouter endpoint configured — \
+                     nex uses the openrouter.ai default, not the local default)"
+                        .to_string(),
                 )
             }
         } else if let Some(default_ep) = config.llm_endpoints.find_default() {
@@ -356,6 +552,34 @@ fn enforce_model_compat(
     (kind, new_source)
 }
 
+/// Reject explicit CLI-backend mismatches before anything launches.
+///
+/// Native/OAI-compatible providers intentionally stay flexible because native
+/// and external executors can speak more than one backend. CLI-backed
+/// providers are different: the Claude CLI cannot run `codex:` models, and the
+/// Codex CLI cannot run `claude:` models. Letting those pairs through produces
+/// doomed agent exits with generic non-zero failure reasons.
+fn validate_cli_backend_match(executor: ExecutorKind, model: &ResolvedModelSpec) -> Result<()> {
+    let Some(provider) = model.provider.as_deref() else {
+        return Ok(());
+    };
+    match (executor, provider) {
+        (ExecutorKind::Claude, "codex") => Err(anyhow!(
+            "backend-mismatch: executor={} cannot run model={} (provider prefix '{}' requires executor=codex)",
+            executor.as_str(),
+            model.raw,
+            provider
+        )),
+        (ExecutorKind::Codex, "claude") => Err(anyhow!(
+            "backend-mismatch: executor={} cannot run model={} (provider prefix '{}' requires executor=claude)",
+            executor.as_str(),
+            model.raw,
+            provider
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Resolve which executor kind to use for a task spawn, with provenance.
 ///
 /// Precedence (highest first):
@@ -435,6 +659,172 @@ mod tests {
             is_default: true,
             context_window: None,
         }
+    }
+
+    fn external_worker_cases() -> Vec<(&'static str, ExecutorKind)> {
+        ExecutorKind::EXTERNAL_CLIS
+            .iter()
+            .copied()
+            .map(|kind| (kind.as_str(), kind))
+            .collect()
+    }
+
+    #[test]
+    fn test_executor_kind_recognizes_external_workers() {
+        for (name, kind) in external_worker_cases() {
+            assert_eq!(
+                ExecutorKind::from_str(name),
+                Some(kind),
+                "ExecutorKind must parse first-class external executor '{}'",
+                name
+            );
+            assert_eq!(kind.as_str(), name);
+            assert!(
+                kind.is_external_cli(),
+                "{} must be classified as an external CLI",
+                name
+            );
+            assert!(
+                !kind.needs_endpoint(),
+                "{} must not inherit native endpoint requirements",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_opencode_is_external_cli_but_not_worker_only() {
+        // OpenCode ships a live chat handler (`wg opencode-handler --chat`),
+        // so it is an external CLI (prefix-addressed, `opencode:…`) that is
+        // ALSO chat-capable — it must NOT be classified worker-only.
+        assert!(ExecutorKind::OpenCode.is_external_cli());
+        assert!(!ExecutorKind::OpenCode.is_worker_only_external());
+
+        // The remaining external CLIs are still worker-only (no chat handler).
+        for kind in [
+            ExecutorKind::Aider,
+            ExecutorKind::Goose,
+            ExecutorKind::Qwen,
+            ExecutorKind::Cline,
+            ExecutorKind::Crush,
+            ExecutorKind::Amplifier,
+        ] {
+            assert!(
+                kind.is_external_cli(),
+                "{} is an external CLI",
+                kind.as_str()
+            );
+            assert!(
+                kind.is_worker_only_external(),
+                "{} is still worker-only (no live chat handler)",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_native_nex_needs_endpoint() {
+        assert!(ExecutorKind::Native.needs_endpoint());
+        assert_eq!(ExecutorKind::from_str("nex"), Some(ExecutorKind::Native));
+        assert!(ExecutorKind::from_str("nex").unwrap().needs_endpoint());
+
+        for kind in [
+            ExecutorKind::Claude,
+            ExecutorKind::Codex,
+            ExecutorKind::Shell,
+            ExecutorKind::OpenCode,
+            ExecutorKind::Aider,
+            ExecutorKind::Goose,
+            ExecutorKind::Qwen,
+            ExecutorKind::Cline,
+            ExecutorKind::Crush,
+            ExecutorKind::Amplifier,
+        ] {
+            assert!(
+                !kind.needs_endpoint(),
+                "{} must not require EndpointConfig",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatcher_external_executor_survives_plan_spawn() {
+        for (name, kind) in external_worker_cases() {
+            let mut config = Config::default();
+            config.coordinator.executor = Some(name.to_string());
+            config
+                .llm_endpoints
+                .endpoints
+                .push(openrouter_default_endpoint());
+
+            let mut task = base_task("t1");
+            task.endpoint = Some("openrouter".to_string());
+
+            let plan = plan_spawn(
+                &task,
+                &config,
+                None,
+                Some("openrouter:deepseek/deepseek-v3.2"),
+            )
+            .unwrap();
+
+            assert_eq!(
+                plan.executor, kind,
+                "dispatcher.executor={} must survive plan_spawn; provenance={:?}",
+                name, plan.provenance
+            );
+            assert_eq!(
+                plan.env.get("WG_EXECUTOR_TYPE").map(String::as_str),
+                Some(name),
+                "SpawnPlan env must preserve the external executor name"
+            );
+            assert!(
+                plan.endpoint.is_none(),
+                "{} must not receive EndpointConfig even when task/default endpoints exist",
+                name
+            );
+            assert!(
+                plan.provenance.endpoint_source.contains(name),
+                "endpoint provenance should explain the external executor policy, got {:?}",
+                plan.provenance.endpoint_source
+            );
+        }
+    }
+
+    #[test]
+    fn test_agency_external_executor_survives_plan_spawn() {
+        for (name, kind) in external_worker_cases() {
+            let mut config = Config::default();
+            config.coordinator.executor = Some("claude".to_string());
+
+            let task = base_task("t1");
+            let plan = plan_spawn(&task, &config, Some(name), Some("claude:opus")).unwrap();
+
+            assert_eq!(
+                plan.executor, kind,
+                "agency executor {} must beat dispatcher default and survive plan_spawn",
+                name
+            );
+            assert_eq!(plan.provenance.executor_source, "agency.effective_executor");
+            assert_eq!(
+                plan.env.get("WG_EXECUTOR_TYPE").map(String::as_str),
+                Some(name)
+            );
+        }
+    }
+
+    #[test]
+    fn test_shell_still_beats_external_dispatcher_executor() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("opencode".to_string());
+
+        let mut task = base_task("t1");
+        task.exec = Some("echo hello".to_string());
+
+        let plan = plan_spawn(&task, &config, None, Some("claude:opus")).unwrap();
+        assert_eq!(plan.executor, ExecutorKind::Shell);
+        assert!(plan.provenance.executor_source.contains("task.exec"));
     }
 
     /// THE regression test. Reproduces the exact scenario that bit the user:
@@ -533,6 +923,172 @@ mod tests {
         assert!(line.contains("executor=native"));
         assert!(line.contains("model=openrouter:deepseek/deepseek-v3.2"));
         assert!(line.contains("endpoint=openrouter"));
+    }
+
+    fn local_default_endpoint() -> EndpointConfig {
+        EndpointConfig {
+            name: "local-gpu".to_string(),
+            provider: "local".to_string(),
+            url: Some("http://127.0.0.1:8088/v1".to_string()),
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            api_key_env: None,
+            api_key_ref: None,
+            is_default: true,
+            context_window: None,
+        }
+    }
+
+    fn nex_chat_task(model: &str) -> Task {
+        let mut task = base_task(".chat-1");
+        task.model = Some(model.to_string());
+        task
+    }
+
+    // ── nex-optional-openrouter-endpoint: blank endpoint defaults to OpenRouter ──
+
+    #[test]
+    fn bare_vendor_model_nex_no_endpoint_normalizes_to_openrouter() {
+        // The canonical TUI [+] flow: pick nex, type `minimax/minimax-m3`,
+        // leave endpoint blank. The bare route must normalize to the
+        // OpenRouter spec and MUST NOT carry the local is_default endpoint.
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(local_default_endpoint());
+
+        let task = nex_chat_task("minimax/minimax-m3");
+        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+
+        assert_eq!(plan.executor, ExecutorKind::Native);
+        assert_eq!(
+            plan.model.raw, "openrouter:minimax/minimax-m3",
+            "bare vendor/model on nex with no endpoint becomes an openrouter spec"
+        );
+        assert!(
+            plan.endpoint.is_none(),
+            "must NOT silently fall back to the local is_default endpoint; got {:?}",
+            plan.endpoint.as_ref().map(|e| &e.name)
+        );
+        assert!(
+            plan.provenance.endpoint_source.contains("openrouter"),
+            "endpoint provenance should name the openrouter route: {}",
+            plan.provenance.endpoint_source
+        );
+    }
+
+    #[test]
+    fn openrouter_model_nex_no_endpoint_does_not_fall_back_to_local_default() {
+        // Explicit `openrouter:` prefix + blank endpoint + only a local
+        // default configured → no local fallback.
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(local_default_endpoint());
+
+        let task = nex_chat_task("openrouter:minimax/minimax-m3");
+        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+
+        assert_eq!(plan.model.raw, "openrouter:minimax/minimax-m3");
+        assert!(
+            plan.endpoint.is_none(),
+            "openrouter model must not adopt the local default endpoint; got {:?}",
+            plan.endpoint.as_ref().map(|e| &e.name)
+        );
+    }
+
+    #[test]
+    fn openrouter_model_nex_no_endpoint_prefers_configured_openrouter_endpoint() {
+        // When an OpenRouter endpoint IS configured, a blank-endpoint
+        // openrouter model routes through it (carries URL + API key).
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(local_default_endpoint());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(openrouter_default_endpoint());
+
+        let task = nex_chat_task("minimax/minimax-m3");
+        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+
+        assert_eq!(plan.model.raw, "openrouter:minimax/minimax-m3");
+        assert_eq!(
+            plan.endpoint.as_ref().map(|e| e.name.as_str()),
+            Some("openrouter"),
+            "should select the configured openrouter endpoint, not the local default"
+        );
+        assert_eq!(
+            plan.endpoint.as_ref().and_then(|e| e.url.as_deref()),
+            Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    #[test]
+    fn explicit_named_endpoint_keeps_model_verbatim_and_endpoint() {
+        // Regression guard: the existing named-endpoint launch path must be
+        // untouched. Picking `lambda01` keeps the bare model verbatim (the
+        // endpoint dictates the route) and resolves that named endpoint.
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config.llm_endpoints.endpoints.push(EndpointConfig {
+            name: "lambda01".to_string(),
+            provider: "local".to_string(),
+            url: Some("https://lambda01.example:30000".to_string()),
+            model: None,
+            api_key: None,
+            api_key_file: None,
+            api_key_env: None,
+            api_key_ref: None,
+            is_default: false,
+            context_window: None,
+        });
+
+        let mut task = nex_chat_task("minimax/minimax-m3");
+        task.endpoint = Some("lambda01".to_string());
+        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+
+        assert_eq!(
+            plan.model.raw, "minimax/minimax-m3",
+            "an explicit endpoint means the user chose the route; model stays bare"
+        );
+        assert_eq!(
+            plan.endpoint.as_ref().map(|e| e.name.as_str()),
+            Some("lambda01")
+        );
+    }
+
+    #[test]
+    fn bare_alias_without_slash_keeps_local_default_fallback() {
+        // A bare alias WITHOUT a slash (e.g. a local model name) is not an
+        // OpenRouter route — the historical local is_default fallback stays.
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config
+            .llm_endpoints
+            .endpoints
+            .push(local_default_endpoint());
+
+        let task = nex_chat_task("qwen3-coder-30b");
+        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+
+        assert_eq!(
+            plan.model.raw, "qwen3-coder-30b",
+            "no slash → not rewritten"
+        );
+        assert_eq!(
+            plan.endpoint.as_ref().map(|e| e.name.as_str()),
+            Some("local-gpu"),
+            "bare local model still uses the configured default endpoint"
+        );
     }
 
     #[test]
@@ -703,6 +1259,165 @@ mod tests {
             !plan.provenance.executor_source.contains("model-compat"),
             "codex must not be rewritten by model-compat. provenance: {:?}",
             plan.provenance
+        );
+    }
+
+    #[test]
+    fn test_codex_model_routes_to_codex_atomically() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("claude".to_string());
+
+        let task = base_task("t1");
+        let plan = plan_spawn(&task, &config, None, Some("codex:gpt-5.5")).unwrap();
+
+        assert_eq!(
+            plan.executor,
+            ExecutorKind::Codex,
+            "codex-class model must not remain paired with executor=claude. provenance: {:?}",
+            plan.provenance
+        );
+        assert_eq!(plan.model.raw, "codex:gpt-5.5");
+        assert_eq!(
+            plan.env.get("WG_EXECUTOR_TYPE").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            plan.env.get("WG_MODEL").map(String::as_str),
+            Some("codex:gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn test_opencode_openrouter_model_route_is_atomic() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("native".to_string());
+        config.coordinator.model = Some("openrouter:default/model".to_string());
+
+        let mut task = base_task("t1");
+        task.model = Some("opencode:openrouter/stepfun/step-3.7-flash".to_string());
+
+        let plan = plan_spawn(
+            &task,
+            &config,
+            Some("native"),
+            Some("openrouter:default/model"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.executor,
+            ExecutorKind::OpenCode,
+            "opencode:openrouter/... must select the OpenCode executor atomically. provenance: {:?}",
+            plan.provenance
+        );
+        assert_eq!(
+            plan.model.raw, "openrouter:stepfun/step-3.7-flash",
+            "inner OpenRouter model must be normalized for existing model/provider resolution"
+        );
+        assert_eq!(
+            plan.env.get("WG_EXECUTOR_TYPE").map(String::as_str),
+            Some("opencode")
+        );
+        assert_eq!(
+            plan.env.get("WG_MODEL").map(String::as_str),
+            Some("openrouter:stepfun/step-3.7-flash")
+        );
+        assert!(plan.endpoint.is_none());
+        assert!(
+            plan.provenance
+                .executor_source
+                .contains("model-route override"),
+            "provenance should explain executor-qualified route, got {:?}",
+            plan.provenance.executor_source
+        );
+    }
+
+    /// Test C (fix-opencode-build): under the opencode profile, a `.chat-*`
+    /// task resolves to the OpenCode handler. The profile sets
+    /// `[dispatcher].model` (== `coordinator.model`) to the opencode route, so
+    /// a chat/coordinator task with no per-task model override cascades to it
+    /// and `parse_executor_model_route` flips the executor to OpenCode. This
+    /// is the same config-driven path `wg profile use opencode` activates.
+    #[test]
+    fn test_chat_task_resolves_to_opencode_handler_under_opencode_profile() {
+        let mut config = Config::default();
+        // Emulate the active opencode profile's default chat/coordinator model.
+        config.coordinator.model = Some("opencode:openrouter/stepfun/step-3.7-flash".to_string());
+
+        // A chat task carries no per-task model and no agency executor — it
+        // must inherit the profile's opencode route.
+        let task = base_task(".chat-foo");
+        let plan = plan_spawn(&task, &config, None, None).unwrap();
+
+        assert_eq!(
+            plan.executor,
+            ExecutorKind::OpenCode,
+            "a .chat-* task under the opencode profile must dispatch via the \
+             opencode handler; provenance={:?}",
+            plan.provenance
+        );
+
+        // Goal #5 proper: opencode REPLACES claude as the default chat handler.
+        // The daemon's CoordinatorAgent::start passes `executor=claude` by
+        // default (`executor.unwrap_or("claude")`); the opencode route on
+        // `coordinator.model` must still override that to OpenCode, otherwise a
+        // default chat would stay on claude under the opencode profile.
+        let plan_default_claude = plan_spawn(&task, &config, Some("claude"), None).unwrap();
+        assert_eq!(
+            plan_default_claude.executor,
+            ExecutorKind::OpenCode,
+            "the opencode coordinator.model route must override the daemon's \
+             default executor=claude; provenance={:?}",
+            plan_default_claude.provenance
+        );
+        // The inner model is normalized to the WG openrouter spec, and the
+        // explicit-model contract means it is never empty.
+        assert_eq!(plan.model.raw, "openrouter:stepfun/step-3.7-flash");
+        assert!(!plan.model.raw.is_empty());
+
+        // And handler_for_model agrees on the opencode route (single source of
+        // truth), so any direct caller routes identically.
+        assert_eq!(
+            crate::dispatch::handler_for_model("opencode:openrouter/stepfun/step-3.7-flash"),
+            ExecutorKind::OpenCode
+        );
+    }
+
+    #[test]
+    fn test_model_route_preserves_known_good_provider_routing() {
+        let config = Config::default();
+        let task = base_task("t1");
+
+        let cases = [
+            ("codex:gpt-5.5", ExecutorKind::Codex),
+            ("claude:opus", ExecutorKind::Claude),
+            ("nex:qwen3-coder", ExecutorKind::Native),
+            ("openrouter:stepfun/step-3.7-flash", ExecutorKind::Native),
+        ];
+
+        for (model, expected_executor) in cases {
+            let plan = plan_spawn(&task, &config, None, Some(model)).unwrap();
+            assert_eq!(
+                plan.executor, expected_executor,
+                "model {} should route to {:?}; provenance={:?}",
+                model, expected_executor, plan.provenance
+            );
+            assert_eq!(plan.model.raw, model);
+        }
+    }
+
+    #[test]
+    fn test_explicit_backend_mismatch_rejected_before_spawn() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("codex".to_string());
+
+        let task = base_task("t1");
+        let err = plan_spawn(&task, &config, None, Some("claude:opus"))
+            .expect_err("codex executor with claude model must be rejected before launch");
+
+        assert!(
+            err.to_string().contains("backend-mismatch"),
+            "error should carry specific backend-mismatch reason, got: {err}"
         );
     }
 
