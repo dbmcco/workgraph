@@ -3666,7 +3666,7 @@ exit $EXIT_CODE"#,
 fn sort_tasks_by_priority_with_features<'a>(
     graph: &workgraph::graph::WorkGraph,
     tasks: Vec<&'a workgraph::graph::Task>,
-    _config: &Config,
+    config: &Config,
 ) -> Vec<&'a workgraph::graph::Task> {
     use chrono::Utc;
 
@@ -3676,6 +3676,7 @@ fn sort_tasks_by_priority_with_features<'a>(
 
     let mut task_priorities: Vec<_> = tasks
         .into_iter()
+        .filter(|task| agency_lifecycle_enabled_for_dispatch(task, graph, config))
         .map(|task| {
             let mut effective_priority = task.priority;
 
@@ -3714,10 +3715,12 @@ fn sort_tasks_by_priority_with_features<'a>(
         .collect();
 
     // Sort by effective priority descending (higher number = higher priority),
-    // then by dispatch_count ascending (CFS-like fair share: prefer less-dispatched tasks)
+    // then by class (real work before lifecycle/system work), then by
+    // dispatch_count ascending (CFS-like fair share: prefer less-dispatched tasks).
     task_priorities.sort_by(|(a_task, a_prio), (b_task, b_prio)| {
         b_prio
             .cmp(a_prio)
+            .then(dispatch_task_class(a_task).cmp(&dispatch_task_class(b_task)))
             .then(a_task.dispatch_count.cmp(&b_task.dispatch_count))
     });
 
@@ -3744,6 +3747,44 @@ fn sort_tasks_by_priority_with_features<'a>(
     }
 
     sorted_tasks
+}
+
+fn agency_lifecycle_enabled_for_dispatch(
+    task: &workgraph::graph::Task,
+    graph: &workgraph::graph::WorkGraph,
+    config: &Config,
+) -> bool {
+    if task.id.starts_with(".assign-") {
+        return config.agency.auto_assign;
+    }
+    if task.id.starts_with(".evaluate-") {
+        return config.agency.auto_evaluate;
+    }
+    if let Some(source_id) = task.id.strip_prefix(".flip-") {
+        let source_has_flip_tag = graph
+            .get_task(source_id)
+            .map(|source| source.tags.iter().any(|tag| tag == "flip-eval"))
+            .unwrap_or(false);
+        return config.agency.auto_evaluate && (config.agency.flip_enabled || source_has_flip_tag);
+    }
+    if task.id.starts_with(".place-") {
+        return config.agency.auto_place;
+    }
+    true
+}
+
+fn dispatch_task_class(task: &workgraph::graph::Task) -> u8 {
+    if task.id.starts_with("drift-self-update-")
+        || workgraph::graph::is_agency_scaffold_task(&task.id)
+        || task
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "agency" | "drift-self-update"))
+    {
+        1
+    } else {
+        0
+    }
 }
 
 /// Compute priority inheritance for a task based on downstream dependencies.
@@ -6078,6 +6119,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_priority_sort_suppresses_disabled_agency_lifecycle_tasks() {
+        let mut config = Config::default();
+        config.agency.auto_assign = false;
+        config.agency.auto_evaluate = false;
+        config.agency.flip_enabled = true;
+
+        let mut graph = WorkGraph::new();
+        for id in [".assign-old", ".flip-old", ".evaluate-old", "real-work"] {
+            let mut task = Task::default();
+            task.id = id.to_string();
+            task.title = id.to_string();
+            task.status = Status::Open;
+            task.priority = workgraph::graph::PRIORITY_HIGH;
+            graph.add_node(Node::Task(task));
+        }
+
+        let tasks = [".assign-old", ".flip-old", ".evaluate-old", "real-work"]
+            .iter()
+            .map(|id| graph.get_task(id).unwrap())
+            .collect();
+
+        let sorted = sort_tasks_by_priority_with_features(&graph, tasks, &config);
+        let ids: Vec<&str> = sorted.iter().map(|t| t.id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec!["real-work"],
+            "disabled agency lifecycle tasks must not consume dispatch slots"
+        );
+    }
+
     /// When auto_assign=false, tasks without agent field should still be spawned.
     #[test]
     fn test_spawn_allows_unassigned_task_when_auto_assign_disabled() {
@@ -6982,6 +7055,33 @@ mod tests {
         assert_eq!(sorted[0].id, "task-critical");
         assert_eq!(sorted[1].id, "task-normal");
         assert_eq!(sorted[2].id, "task-low");
+    }
+
+    #[test]
+    fn test_dispatch_orders_real_work_before_agency_lifecycle_at_same_priority() {
+        let mut config = Config::default();
+        config.agency.auto_assign = true;
+        config.agency.auto_evaluate = true;
+        config.agency.flip_enabled = true;
+
+        let mut graph = WorkGraph::new();
+        for id in [".assign-old", ".flip-old", ".evaluate-old", "real-work"] {
+            let mut task = Task::default();
+            task.id = id.to_string();
+            task.title = id.to_string();
+            task.status = Status::Open;
+            task.priority = workgraph::graph::PRIORITY_HIGH;
+            task.created_at = Some(Utc::now().to_rfc3339());
+            graph.add_node(Node::Task(task));
+        }
+
+        let tasks = [".assign-old", ".flip-old", ".evaluate-old", "real-work"]
+            .iter()
+            .map(|id| graph.get_task(id).unwrap())
+            .collect();
+
+        let sorted = sort_tasks_by_priority_with_features(&graph, tasks, &config);
+        assert_eq!(sorted[0].id, "real-work");
     }
 
     #[test]

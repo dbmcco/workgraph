@@ -322,6 +322,9 @@ pub fn ready_tasks(graph: &WorkGraph) -> Vec<&Task> {
     graph
         .tasks()
         .filter(|task| {
+            if is_container_epic(task) {
+                return false;
+            }
             // Must be open or incomplete (retryable)
             if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
@@ -367,7 +370,7 @@ fn blocker_satisfied_for_dependent(
 ) -> bool {
     let blocker = graph.get_task(blocker_id);
     let blocker_dep_satisfied = blocker
-        .map(|t| t.status.is_dep_satisfied())
+        .map(|t| t.status.is_dep_satisfied() || is_open_container_epic(t))
         .unwrap_or(false);
     let blocker_pending_eval = blocker
         .map(|t| matches!(t.status, Status::PendingEval | Status::FailedPendingEval))
@@ -417,9 +420,22 @@ pub fn is_blocker_satisfied(
         // dispatch during burst graph construction).
         graph
             .get_task(blocker_id)
-            .map(|t| t.status.is_dep_satisfied())
+            .map(|t| t.status.is_dep_satisfied() || is_open_container_epic(t))
             .unwrap_or(false)
     }
+}
+
+fn is_container_epic(task: &Task) -> bool {
+    task.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "epic" | "container" | "container-epic" | "work-container"
+        )
+    })
+}
+
+fn is_open_container_epic(task: &Task) -> bool {
+    is_container_epic(task) && matches!(task.status, Status::Open | Status::Incomplete)
 }
 
 /// Like `is_blocker_satisfied` but also applies the eval gate: even when the
@@ -468,6 +484,9 @@ pub fn ready_tasks_with_peers<'a>(graph: &'a WorkGraph, workgraph_dir: &Path) ->
     graph
         .tasks()
         .filter(|task| {
+            if is_container_epic(task) {
+                return false;
+            }
             if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
@@ -503,6 +522,9 @@ pub fn ready_tasks_cycle_aware<'a>(
     let mut ready_tasks: Vec<&'a Task> = graph
         .tasks()
         .filter(|task| {
+            if is_container_epic(task) {
+                return false;
+            }
             if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
@@ -516,7 +538,7 @@ pub fn ready_tasks_cycle_aware<'a>(
             task.after.iter().all(|blocker_id| {
                 let blocker = graph.get_task(blocker_id);
                 let blocker_dep_satisfied = blocker
-                    .map(|t| t.status.is_dep_satisfied())
+                    .map(|t| t.status.is_dep_satisfied() || is_open_container_epic(t))
                     .unwrap_or(false);
                 let blocker_pending_eval = blocker
                     .map(|t| matches!(t.status, Status::PendingEval | Status::FailedPendingEval))
@@ -711,6 +733,9 @@ pub fn ready_tasks_with_peers_cycle_aware<'a>(
     graph
         .tasks()
         .filter(|task| {
+            if is_container_epic(task) {
+                return false;
+            }
             if !matches!(task.status, Status::Open | Status::Incomplete) {
                 return false;
             }
@@ -891,6 +916,28 @@ mod tests {
         let ready = ready_tasks(&graph);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "blocked");
+    }
+
+    #[test]
+    fn test_ready_tasks_unblocked_by_open_container_epic() {
+        let mut graph = WorkGraph::new();
+
+        let mut epic = make_task("epic", "Container Epic");
+        epic.tags = vec!["epic".to_string()];
+
+        let mut leaf = make_task("leaf", "Leaf task");
+        leaf.after = vec!["epic".to_string()];
+
+        graph.add_node(Node::Task(epic));
+        graph.add_node(Node::Task(leaf));
+
+        let ready = ready_tasks(&graph);
+        let ids: Vec<&str> = ready.iter().map(|t| t.id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"leaf"),
+            "leaf work should not wait forever for a container epic to be marked done"
+        );
     }
 
     #[test]

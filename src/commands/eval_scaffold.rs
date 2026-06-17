@@ -39,6 +39,15 @@ pub fn is_shell_task(task: &Task) -> bool {
     task.exec.is_some() || task.exec_mode.as_deref() == Some("shell")
 }
 
+fn is_container_task(task: &Task) -> bool {
+    task.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "epic" | "container" | "container-epic" | "work-container"
+        )
+    })
+}
+
 /// Returns true if a system task (dot-prefixed) should still go through the
 /// agency pipeline. `.verify-*` tasks are the primary example: they need
 /// intelligent agent matching via the same placement/assignment/evaluation
@@ -173,7 +182,7 @@ pub fn scaffold_full_pipeline(
     }
     // Skip shell executor tasks — they're commands, not agent work
     if let Some(task) = graph.get_task(task_id)
-        && is_shell_task(task)
+        && (is_shell_task(task) || is_container_task(task))
     {
         return false;
     }
@@ -238,7 +247,8 @@ pub fn scaffold_full_pipeline(
     }
 
     // 3. Create .flip-* task (depends on main task) — skip if skip-eval tagged
-    let run_flip = !skip_eval && should_run_flip(graph, task_id, config);
+    let run_flip =
+        !skip_eval && config.agency.auto_evaluate && should_run_flip(graph, task_id, config);
     if run_flip && graph.get_task(&flip_task_id).is_none() {
         let flip_resolved =
             config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
@@ -368,7 +378,7 @@ pub fn scaffold_assign_task(graph: &mut WorkGraph, task_id: &str, task_title: &s
 
     // Skip shell executor tasks — they're commands, not agent work
     if let Some(task) = graph.get_task(task_id)
-        && is_shell_task(task)
+        && (is_shell_task(task) || is_container_task(task))
     {
         return false;
     }
@@ -732,6 +742,36 @@ mod tests {
         assert!(graph.get_task(".evaluate-a").is_some());
         assert!(graph.get_task(".evaluate-b").is_some());
         assert!(graph.get_task(".evaluate-c").is_none());
+    }
+
+    #[test]
+    fn test_full_pipeline_respects_disabled_agency_flags() {
+        let dir = tempdir().unwrap();
+        let mut config = Config::default();
+        config.agency.auto_assign = false;
+        config.agency.auto_evaluate = false;
+        config.agency.flip_enabled = true;
+
+        let mut graph = WorkGraph::new();
+        graph.add_node(Node::Task(make_task("my-task", "My Task")));
+
+        let modified =
+            scaffold_full_pipeline(dir.path(), &mut graph, "my-task", "My Task", &config);
+
+        assert!(
+            !modified,
+            "publishing with auto_assign=false and auto_evaluate=false must not create lifecycle tasks"
+        );
+        assert!(graph.get_task(".assign-my-task").is_none());
+        assert!(graph.get_task(".flip-my-task").is_none());
+        assert!(graph.get_task(".evaluate-my-task").is_none());
+        assert!(
+            !graph
+                .get_task("my-task")
+                .unwrap()
+                .tags
+                .contains(&"eval-scheduled".to_string())
+        );
     }
 
     // --- FLIP scaffolding tests ---

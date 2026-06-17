@@ -200,7 +200,8 @@ fn check_zero_output(agent: &AgentEntry) -> Option<u64> {
     let stream_path = agent_dir.join(stream_event::STREAM_FILE_NAME);
 
     let has_output = (raw_path.exists() && file_has_content(&raw_path))
-        || (stream_path.exists() && file_has_content(&stream_path));
+        || (stream_path.exists() && file_has_content(&stream_path))
+        || file_has_content(output_path);
 
     if has_output {
         return None;
@@ -215,6 +216,9 @@ fn check_zero_output(agent: &AgentEntry) -> Option<u64> {
 
     let age_secs = age as u64;
     if age_secs >= ZERO_OUTPUT_KILL_THRESHOLD.as_secs() {
+        if agent_has_filesystem_progress_since(agent, started.with_timezone(&Utc), agent_dir) {
+            return None;
+        }
         // Don't flag as zero-output if agent has active child processes —
         // it may be waiting on a subprocess (e.g., slow model API startup,
         // compilation, or sub-agent initialization)
@@ -232,6 +236,66 @@ fn file_has_content(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() > 0)
         .unwrap_or(false)
+}
+
+fn agent_has_filesystem_progress_since(
+    agent: &AgentEntry,
+    started_at: DateTime<Utc>,
+    _agent_dir: &Path,
+) -> bool {
+    let Some(worktree_path) = agent.worktree_path.as_deref() else {
+        return false;
+    };
+    tree_has_file_modified_after(Path::new(worktree_path), started_at, 4096)
+}
+
+fn tree_has_file_modified_after(root: &Path, started_at: DateTime<Utc>, max_files: usize) -> bool {
+    if !root.exists() {
+        return false;
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    let mut checked = 0usize;
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+
+        if metadata.is_file() {
+            checked += 1;
+            if checked > max_files {
+                return false;
+            }
+            if let Ok(modified) = metadata.modified() {
+                let modified_at = DateTime::<Utc>::from(modified);
+                if modified_at > started_at {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if matches!(
+            name,
+            ".git" | ".workgraph" | "target" | "node_modules" | ".venv" | "__pycache__"
+        ) {
+            continue;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            stack.push(entry.path());
+        }
+    }
+
+    false
 }
 
 /// Run the zero-output detection sweep.
@@ -720,6 +784,41 @@ mod tests {
         let result = check_zero_output(&agent);
         assert!(result.is_some());
         assert!(result.unwrap() > ZERO_OUTPUT_KILL_THRESHOLD.as_secs());
+    }
+
+    #[test]
+    fn test_check_zero_output_skips_when_worktree_changed_after_start() {
+        let temp = TempDir::new().unwrap();
+        let agent_dir = temp.path().join("agent");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+
+        let raw_stream = agent_dir.join(stream_event::RAW_STREAM_FILE_NAME);
+        std::fs::write(&raw_stream, "").unwrap();
+        let output_file = agent_dir.join("output.log");
+        std::fs::write(&output_file, "").unwrap();
+        let progress_file = worktree.join("src").join("progress.txt");
+        std::fs::write(&progress_file, "worker made progress").unwrap();
+
+        let agent = AgentEntry {
+            id: "agent-1".into(),
+            pid: 99999,
+            task_id: "task-1".into(),
+            executor: "claude".into(),
+            started_at: "2020-01-01T00:00:00Z".into(),
+            last_heartbeat: Utc::now().to_rfc3339(),
+            status: AgentStatus::Working,
+            output_file: output_file.to_str().unwrap().into(),
+            model: None,
+            completed_at: None,
+            worktree_path: Some(worktree.to_str().unwrap().into()),
+        };
+
+        assert!(
+            check_zero_output(&agent).is_none(),
+            "filesystem progress after start should prevent zero-output kill"
+        );
     }
 
     #[test]

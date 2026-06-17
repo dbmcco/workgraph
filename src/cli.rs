@@ -729,7 +729,7 @@ pub enum Commands {
         #[arg(value_name = "TASK")]
         id: String,
         /// Only publish this single task (skip subgraph propagation)
-        #[arg(long, conflicts_with = "wcc")]
+        #[arg(long, alias = "no-cascade", conflicts_with = "wcc")]
         only: bool,
         /// Publish every task in the weakly-connected component of TASK
         /// (treats the dependency graph as undirected and unpauses the
