@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use worksgood::graph::{Node, Status, Task};
-use worksgood::parser::{load_graph, modify_graph};
+use worksgood::parser::{load_graph, load_graph_locked, lock_graph_file, modify_graph};
 
 use super::graph_path;
 

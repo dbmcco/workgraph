@@ -38,10 +38,18 @@ fn test_provider_health_error_classification() {
         ProviderErrorKind::FatalProvider
     );
 
-    // Rate limiting should be Transient
+    // Rate/session/capacity failures should back off the provider route.
     assert_eq!(
         classify_error(Some(1), "HTTP 429: Rate limit exceeded"),
-        ProviderErrorKind::Transient
+        ProviderErrorKind::FatalProvider
+    );
+    assert_eq!(
+        classify_error(Some(1), "Claude AI usage limit reached for this session"),
+        ProviderErrorKind::FatalProvider
+    );
+    assert_eq!(
+        classify_error(Some(1), "HTTP 529: provider overloaded"),
+        ProviderErrorKind::FatalProvider
     );
 
     // Network timeouts should be Transient
@@ -85,6 +93,11 @@ fn test_provider_health_provider_id_extraction() {
         extract_provider_id("native", Some("custom:model")),
         "native:custom"
     );
+    assert_eq!(
+        extract_provider_id("native", Some("openrouter:anthropic/claude-opus-4-7")),
+        "openrouter"
+    );
+    assert_eq!(extract_provider_id("opencode", Some("zai:glm-5.1")), "zai");
     assert_eq!(extract_provider_id("shell", None), "shell");
 }
 
@@ -145,6 +158,19 @@ fn test_provider_health_transient_errors_dont_trigger_pause() {
     let paused = health.check_and_apply_pauses(3, "pause");
     assert!(paused.is_empty());
     assert!(!health.service_paused);
+}
+
+#[test]
+fn test_provider_health_immediate_backoff_marks_unavailable() {
+    let mut health = ProviderHealth::default();
+
+    assert!(health.is_provider_available("claude"));
+    health.backoff_provider("claude", "session limit".to_string());
+
+    assert!(!health.is_provider_available("claude"));
+    let provider = health.providers.get("claude").unwrap();
+    assert!(provider.is_paused);
+    assert_eq!(provider.pause_reason.as_deref(), Some("session limit"));
 }
 
 /// Test fallback mode switches provider
@@ -317,7 +343,7 @@ fn test_provider_health_end_to_end_integration() -> Result<()> {
     );
     assert_eq!(
         classify_error(Some(1), "HTTP 429: Rate limit exceeded"),
-        ProviderErrorKind::Transient
+        ProviderErrorKind::FatalProvider
     );
     assert_eq!(
         classify_error(Some(1), "HTTP 413: Payload too large"),

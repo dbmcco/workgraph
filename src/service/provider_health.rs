@@ -169,6 +169,25 @@ impl ProviderHealth {
         provider.record_success();
     }
 
+    /// Mark a provider unavailable immediately. Used for retryable provider
+    /// failures such as rate/session/capacity limits where the next dispatch
+    /// attempt should choose a different configured route instead of burning a
+    /// task spawn attempt.
+    pub fn backoff_provider(&mut self, provider_id: &str, reason: String) {
+        let provider = self.get_or_create_provider(provider_id);
+        provider.last_failure_at = Some(Utc::now().to_rfc3339());
+        provider.last_error = Some(reason.clone());
+        provider.pause(reason);
+    }
+
+    /// Whether a provider is currently allowed for new spawns.
+    pub fn is_provider_available(&self, provider_id: &str) -> bool {
+        self.providers
+            .get(provider_id)
+            .map(|p| !p.is_paused)
+            .unwrap_or(true)
+    }
+
     /// Check if any providers should be paused and apply pause
     pub fn check_and_apply_pauses(&mut self, threshold: u32, behavior: &str) -> Vec<String> {
         let mut paused_providers = Vec::new();
@@ -285,6 +304,8 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
     // Auth/Authorization failures (Fatal-Provider)
     if stderr_lower.contains("authentication failed")
         || stderr_lower.contains("http 401")
+        || stderr_lower.contains("unauthorized")
+        || stderr_lower.contains("invalid api key")
         || stderr_lower.contains("access denied")
         || stderr_lower.contains("http 403")
         || stderr_lower.contains("check your api key")
@@ -319,8 +340,16 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
         || stderr_lower.contains("rate limit")
         || stderr_lower.contains("rate_limit_event")
         || stderr_lower.contains("retry-after")
+        || stderr_lower.contains("too many requests")
+        || stderr_lower.contains("session limit")
+        || stderr_lower.contains("usage limit")
+        || stderr_lower.contains("provider capacity")
+        || stderr_lower.contains("over capacity")
+        || stderr_lower.contains("overloaded")
+        || stderr_lower.contains("http 503")
+        || stderr_lower.contains("http 529")
     {
-        return ProviderErrorKind::Transient;
+        return ProviderErrorKind::FatalProvider;
     }
 
     // Network/Connectivity (Transient)
@@ -371,6 +400,20 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> ProviderErrorKind
 
 /// Extract provider/executor identifier from configuration
 pub fn extract_provider_id(executor: &str, model: Option<&str>) -> String {
+    if let Some(model) = model
+        && let Some(provider) = crate::config::parse_model_spec(model).provider
+    {
+        return match executor {
+            "native" => match provider.as_str() {
+                "nex" | "local" | "oai-compat" | "openai" | "native" => {
+                    format!("native:{}", provider)
+                }
+                _ => provider,
+            },
+            _ => provider,
+        };
+    }
+
     match executor {
         "claude" => "claude".to_string(),
         "native" => {
@@ -407,10 +450,10 @@ mod tests {
             ProviderErrorKind::FatalProvider
         );
 
-        // Rate limiting
+        // Rate/session/capacity limiting is provider-route backoff.
         assert_eq!(
             classify_error(Some(1), "HTTP 429: Rate limit exceeded"),
-            ProviderErrorKind::Transient
+            ProviderErrorKind::FatalProvider
         );
 
         // Context length

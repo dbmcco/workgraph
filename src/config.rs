@@ -2204,6 +2204,9 @@ pub fn provider_to_native_provider(provider: &str) -> &'static str {
 pub fn provider_to_resolved_provider(provider: &str) -> &'static str {
     match provider {
         "codex" => "codex",
+        "opencode" => "opencode",
+        "zai" => "zai",
+        "z-ai" => "z-ai",
         other => provider_to_native_provider(other),
     }
 }
@@ -4942,7 +4945,10 @@ impl Config {
                 // Parse provider:model format to get the registry lookup ID
                 let model_spec = parse_model_spec(m);
                 let lookup_id = &model_spec.model_id;
-                if !registry_ids.contains(lookup_id.as_str()) && !lookup_id.contains('/') {
+                if model_spec.provider.is_none()
+                    && !registry_ids.contains(lookup_id.as_str())
+                    && !lookup_id.contains('/')
+                {
                     result.warnings.push(ConfigDiagnostic {
                         rule: "unresolved-model-id".into(),
                         message: format!(
@@ -6961,6 +6967,19 @@ model = "claude:haiku"
     }
 
     #[test]
+    fn test_validate_config_provider_qualified_model_no_unresolved_warning() {
+        let mut config = Config::default();
+        config.models.default = Some(RoleModelConfig {
+            model: Some("zai:glm-5.1".to_string()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+        let v = config.validate_config();
+        assert!(v.warnings.iter().all(|w| w.rule != "unresolved-model-id"));
+    }
+
+    #[test]
     fn test_validate_config_registry_entry_non_anthropic_no_slash() {
         let mut config = Config::default();
         config.model_registry.push(ModelRegistryEntry {
@@ -7406,9 +7425,27 @@ provider = "openrouter"
     #[test]
     fn test_provider_to_resolved_provider_preserves_codex_route() {
         assert_eq!(provider_to_resolved_provider("codex"), "codex");
+        assert_eq!(provider_to_resolved_provider("zai"), "zai");
+        assert_eq!(provider_to_resolved_provider("z-ai"), "z-ai");
+        assert_eq!(provider_to_resolved_provider("opencode"), "opencode");
         assert_eq!(provider_to_resolved_provider("nex"), "oai-compat");
         assert_eq!(provider_to_resolved_provider("openrouter"), "openrouter");
         assert_eq!(provider_to_resolved_provider("claude"), "anthropic");
+    }
+
+    #[test]
+    fn test_resolved_zai_model_keeps_zai_spawn_prefix() {
+        let mut config = Config::default();
+        config.models.task_agent = Some(RoleModelConfig {
+            model: Some("zai:glm-5.1".into()),
+            provider: None,
+            tier: None,
+            endpoint: None,
+        });
+
+        let resolved = config.resolve_model_for_role(DispatchRole::TaskAgent);
+        assert_eq!(resolved.provider.as_deref(), Some("zai"));
+        assert_eq!(resolved.spawn_model_spec(), "zai:glm-5.1");
     }
 
     #[test]

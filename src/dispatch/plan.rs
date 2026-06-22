@@ -5,15 +5,14 @@
 //! 1. `task.exec` set, or `task.exec_mode == "shell"`  →  `Shell`  (final)
 //! 2. Per-task explicit override (currently `task.exec_mode` mapping to a
 //!    known executor, or future `task.executor` field)                  →  final
-//! 3. Agency-derived `agent_executor` (passed in by caller)              →  final
-//! 4. Local/global `[dispatcher].executor` (a.k.a. `coordinator.executor`) →  final
+//! 3. Agency-derived `agent_executor` (passed in by caller)              → hint
+//! 4. Local/global `[dispatcher].executor` (a.k.a. `coordinator.executor`) → hint
 //! 5. Default (`claude`)
 //!
-//! **Model spec NEVER overrides executor.** Once executor is resolved (e.g.
-//! via local `[dispatcher].executor=claude`), the model field is *not*
-//! consulted to override it. This is the regression that bit us: a global
-//! `is_default = openrouter` endpoint and a registry lookup of `opus` should
-//! NEVER cause a `claude`-pinned dispatcher to spawn a `native` executor.
+//! Provider-qualified model specs are authoritative. A stale
+//! `[dispatcher].executor = "claude"` paired with `model = "zai:glm-5.1"` or
+//! `model = "openrouter:…"` must not launch the Claude CLI; the provider
+//! prefix selects the compatible handler.
 //!
 //! ## Precedence (endpoint)
 //!
@@ -38,6 +37,7 @@
 
 use crate::config::{Config, EndpointConfig, parse_model_spec, provider_to_executor};
 use crate::graph::Task;
+use crate::service::{ProviderHealth, extract_provider_id};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
@@ -302,6 +302,17 @@ pub fn plan_spawn(
     agent_executor: Option<&str>,
     default_model: Option<&str>,
 ) -> Result<SpawnPlan> {
+    plan_spawn_with_provider_health(task, config, agent_executor, default_model, None)
+}
+
+/// Build a spawn plan while excluding providers currently marked unhealthy.
+pub fn plan_spawn_with_provider_health(
+    task: &Task,
+    config: &Config,
+    agent_executor: Option<&str>,
+    default_model: Option<&str>,
+    provider_health: Option<&ProviderHealth>,
+) -> Result<SpawnPlan> {
     // ----- 1. Executor -----
     let (executor, executor_source) = resolve_executor(task, config, agent_executor);
 
@@ -321,6 +332,18 @@ pub fn plan_spawn(
             "[agent].model (fallback)".to_string(),
         )
     };
+
+    let (model_raw, model_source) = choose_available_model(
+        task,
+        config,
+        default_model,
+        executor,
+        &executor_source,
+        model_raw,
+        model_source,
+        provider_health,
+    );
+
     let executor_route = parse_executor_model_route(&model_raw);
     let (model_raw, model_source) = if let Some(route) = executor_route.as_ref() {
         (
@@ -360,19 +383,9 @@ pub fn plan_spawn(
 
     let model = ResolvedModelSpec::from_raw(&model_raw);
 
-    // ----- 2b. Model-compat override -----
-    // The claude CLI cannot run non-Anthropic models — it would 404. If we
-    // ended up at executor=claude (whether via dispatcher.executor floor,
-    // agency-derived choice, or default fall-through) but the model has a
-    // non-Anthropic provider prefix (`local:`, `openrouter:`, `oai-compat:`,
-    // `openai:`), switch to the executor the model actually requires.
-    //
-    // This is the autohaiku-regression fix, moved here from
-    // `Agent::effective_executor_for_model` so it doesn't fire BEFORE the
-    // dispatcher's explicit executor choice (which is the bug
-    // `agency-still-picks` tracked: `wg init -x codex` was being silently
-    // rewritten to native because the agency-level override sat in
-    // resolve_executor's precedence step 3 and shadowed step 4).
+    // ----- 2b. Model-route override -----
+    // Provider-qualified model specs are the source of truth for the handler.
+    // Legacy executor keys are retained as hints for bare aliases only.
     let (executor, executor_source) = enforce_model_compat(executor, executor_source, &model);
     let (executor, executor_source) = if let Some(route) = executor_route {
         (
@@ -509,47 +522,177 @@ pub fn plan_spawn(
     })
 }
 
-/// If the resolved executor is `claude` but the model spec carries a
-/// non-Anthropic provider prefix, switch to the executor the model actually
-/// needs. The claude CLI cannot speak OpenAI-compat / openrouter / local
-/// endpoints — running it against `local:qwen3-coder` returns 404 and burns
-/// the spawn (the autohaiku regression).
-///
-/// This override only fires when the resolved executor is `claude`. It does
-/// NOT touch explicit non-claude executor choices (`-x codex`, `-x native`)
-/// — those are kept even with `local:` models, on the assumption that the
-/// chosen executor is OAI-compat-aware (codex, native) or the user knows
-/// what they're doing.
-///
-/// Bare aliases like `opus` / `sonnet` (no provider prefix) do NOT trigger
-/// the override — they're claude-compatible by convention.
+/// If the model spec carries a provider prefix, switch to the executor the
+/// provider requires. Bare aliases like `opus` / `sonnet` keep the resolved
+/// executor for backwards compatibility.
 fn enforce_model_compat(
     executor: ExecutorKind,
     executor_source: String,
     model: &ResolvedModelSpec,
 ) -> (ExecutorKind, String) {
-    if !matches!(executor, ExecutorKind::Claude) {
+    if executor == ExecutorKind::Shell || executor.is_external_cli() {
         return (executor, executor_source);
     }
     let Some(ref provider) = model.provider else {
         return (executor, executor_source);
     };
     let required = provider_to_executor(provider);
-    if required == "claude" {
+    if required == executor.as_str() {
         return (executor, executor_source);
     }
     let Some(kind) = ExecutorKind::from_str(required) else {
         return (executor, executor_source);
     };
     let new_source = format!(
-        "model-compat override: was claude (from {}), model={} prefix={} requires {}",
-        executor_source, model.raw, provider, required,
+        "model-route override: was {} (from {}), model={} prefix={} requires {}",
+        executor.as_str(),
+        executor_source,
+        model.raw,
+        provider,
+        required,
     );
     eprintln!(
-        "[dispatch] model-compat: claude (from {}) cannot run model '{}' (prefix '{}'); routing to '{}'",
-        executor_source, model.raw, provider, required,
+        "[dispatch] model-route: {} (from {}) cannot run model '{}' (prefix '{}'); routing to '{}'",
+        executor.as_str(),
+        executor_source,
+        model.raw,
+        provider,
+        required,
     );
     (kind, new_source)
+}
+
+fn choose_available_model(
+    task: &Task,
+    config: &Config,
+    default_model: Option<&str>,
+    base_executor: ExecutorKind,
+    base_executor_source: &str,
+    primary_model: String,
+    primary_source: String,
+    provider_health: Option<&ProviderHealth>,
+) -> (String, String) {
+    let Some(health) = provider_health else {
+        return (primary_model, primary_source);
+    };
+
+    let candidates = model_candidates(task, config, default_model, &primary_model, &primary_source);
+    for (candidate, source) in candidates {
+        let (candidate_model, candidate_executor) =
+            candidate_route(task, base_executor, base_executor_source, &candidate);
+        let provider_id = extract_provider_id(candidate_executor.as_str(), Some(&candidate_model));
+        if health.is_provider_available(&provider_id) {
+            if candidate_model != primary_model {
+                eprintln!(
+                    "[dispatch] provider-health: route '{}' unavailable; using model '{}' from {}",
+                    extract_provider_id(base_executor.as_str(), Some(&primary_model)),
+                    candidate_model,
+                    source
+                );
+            }
+            return (candidate_model, source);
+        }
+    }
+
+    (primary_model, primary_source)
+}
+
+fn model_candidates(
+    task: &Task,
+    config: &Config,
+    default_model: Option<&str>,
+    primary_model: &str,
+    primary_source: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    push_model_candidate(
+        &mut out,
+        primary_model.to_string(),
+        primary_source.to_string(),
+    );
+    if let Some(model) = task.model.as_deref() {
+        push_model_candidate(&mut out, model.to_string(), "task.model".to_string());
+    }
+    if let Some(model) = default_model {
+        push_model_candidate(
+            &mut out,
+            model.to_string(),
+            "dispatcher.default_model".to_string(),
+        );
+    }
+    push_model_candidate(
+        &mut out,
+        config
+            .resolve_model_for_role(crate::config::DispatchRole::TaskAgent)
+            .spawn_model_spec(),
+        "models.task_agent".to_string(),
+    );
+    if let Some(model) = config.coordinator.model.as_deref() {
+        push_model_candidate(
+            &mut out,
+            model.to_string(),
+            "[dispatcher].model".to_string(),
+        );
+    }
+    push_model_candidate(
+        &mut out,
+        config.agent.model.clone(),
+        "[agent].model".to_string(),
+    );
+    for tier in [
+        crate::config::Tier::Premium,
+        crate::config::Tier::Standard,
+        crate::config::Tier::Fast,
+    ] {
+        if let Some(resolved) = config.resolve_tier(tier) {
+            push_model_candidate(
+                &mut out,
+                resolved.spawn_model_spec(),
+                format!("tiers.{:?}", tier).to_ascii_lowercase(),
+            );
+        }
+    }
+    out
+}
+
+fn push_model_candidate(out: &mut Vec<(String, String)>, model: String, source: String) {
+    if model.trim().is_empty() {
+        return;
+    }
+    if out.iter().any(|(m, _)| m == &model) {
+        return;
+    }
+    out.push((model, source));
+}
+
+fn candidate_route(
+    task: &Task,
+    base_executor: ExecutorKind,
+    base_executor_source: &str,
+    raw_model: &str,
+) -> (String, ExecutorKind) {
+    let executor_route = parse_executor_model_route(raw_model);
+    let model_raw = executor_route
+        .as_ref()
+        .map(|route| route.model.clone())
+        .unwrap_or_else(|| raw_model.to_string());
+    let has_explicit_endpoint = task
+        .endpoint
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let model_raw = if base_executor == ExecutorKind::Native && !has_explicit_endpoint {
+        crate::config::normalize_bare_openrouter_route(&model_raw)
+    } else {
+        model_raw
+    };
+    let model = ResolvedModelSpec::from_raw(&model_raw);
+    let (executor, _) =
+        enforce_model_compat(base_executor, base_executor_source.to_string(), &model);
+    let executor = executor_route
+        .map(|route| route.executor)
+        .unwrap_or(executor);
+    (model_raw, executor)
 }
 
 /// Reject explicit CLI-backend mismatches before anything launches.
@@ -1105,12 +1248,16 @@ mod tests {
     }
 
     #[test]
-    fn test_default_executor_is_claude() {
+    fn test_default_model_prefix_selects_executor() {
         let config = Config::default();
         let task = base_task("t1");
         let plan = plan_spawn(&task, &config, None, None).unwrap();
-        assert_eq!(plan.executor, ExecutorKind::Claude);
-        assert_eq!(plan.provenance.executor_source, "default");
+        assert_eq!(
+            plan.executor,
+            ExecutorKind::Codex,
+            "built-in default codex model should select the codex handler"
+        );
+        assert!(plan.provenance.executor_source.contains("model-route"));
     }
 
     #[test]
@@ -1119,36 +1266,25 @@ mod tests {
         // the dispatcher default but not over an explicit [dispatcher].executor.
         let config = Config::default();
         let task = base_task("t1");
-        let plan = plan_spawn(&task, &config, Some("native"), None).unwrap();
+        let plan = plan_spawn(&task, &config, Some("native"), Some("opus")).unwrap();
         assert_eq!(plan.executor, ExecutorKind::Native);
         assert!(plan.provenance.executor_source.contains("agency"));
     }
 
-    /// Regression: agency-still-picks. With `wg init -x codex -m qwen3-coder
-    /// -e https://...`, the dispatcher's explicit `-x codex` MUST win, even
-    /// though the model is `local:qwen3-coder`. The previous fix
-    /// (agency-picks-claude) put a model-compat override INSIDE
-    /// `Agent::effective_executor_for_model` that fired any time the agent's
-    /// default-claude executor met a `local:` model — converting to "native"
-    /// and (via resolve_executor's precedence) overriding the dispatcher's
-    /// `-x codex` choice. This test pins down the correct behaviour: when
-    /// dispatcher explicitly chose codex, codex wins.
+    /// Stale executor pins must not beat provider-qualified models.
     #[test]
-    fn test_codex_executor_routes_codex_not_claude() {
+    fn test_local_model_overrides_stale_codex_executor_to_native() {
         let mut config = Config::default();
         config.coordinator.executor = Some("codex".to_string());
         config.coordinator.model = Some("local:qwen3-coder".to_string());
 
         let task = base_task("t1");
-        // agent_executor=None simulates an agent with no explicit choice
-        // (default claude executor). The dispatcher's `-x codex` floor
-        // must win.
         let plan = plan_spawn(&task, &config, None, Some("local:qwen3-coder")).unwrap();
 
         assert_eq!(
             plan.executor,
-            ExecutorKind::Codex,
-            "dispatcher.executor=codex MUST win when explicitly set, even with model={}. provenance: {:?}",
+            ExecutorKind::Native,
+            "model={} must select native even when stale dispatcher.executor=codex. provenance: {:?}",
             plan.model.raw,
             plan.provenance
         );
@@ -1194,8 +1330,8 @@ mod tests {
             plan.provenance
         );
         assert!(
-            plan.provenance.executor_source.contains("model-compat"),
-            "provenance must record the model-compat override, got {:?}",
+            plan.provenance.executor_source.contains("model-route"),
+            "provenance must record the model-route override, got {:?}",
             plan.provenance.executor_source
         );
     }
@@ -1242,22 +1378,19 @@ mod tests {
         }
     }
 
-    /// Codex with a local: model is fine — codex is OAI-compat-aware. The
-    /// model-compat override only fires for the claude executor (the only
-    /// CLI that genuinely can't speak non-Anthropic protocols). Without
-    /// this guard the dispatcher's explicit codex choice would be silently
-    /// rewritten.
+    /// Provider-qualified local routes select native even when a stale codex
+    /// executor key is present.
     #[test]
-    fn test_codex_executor_with_local_model_no_override() {
+    fn test_codex_executor_with_local_model_routes_to_native() {
         let mut config = Config::default();
         config.coordinator.executor = Some("codex".to_string());
 
         let task = base_task("t1");
         let plan = plan_spawn(&task, &config, None, Some("local:qwen3-coder")).unwrap();
-        assert_eq!(plan.executor, ExecutorKind::Codex);
+        assert_eq!(plan.executor, ExecutorKind::Native);
         assert!(
-            !plan.provenance.executor_source.contains("model-compat"),
-            "codex must not be rewritten by model-compat. provenance: {:?}",
+            plan.provenance.executor_source.contains("model-route"),
+            "codex must be rewritten by provider:model routing. provenance: {:?}",
             plan.provenance
         );
     }
@@ -1284,6 +1417,52 @@ mod tests {
         assert_eq!(
             plan.env.get("WG_MODEL").map(String::as_str),
             Some("codex:gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn test_zai_model_overrides_stale_claude_executor_to_opencode() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("claude".to_string());
+
+        let task = base_task("t1");
+        let plan = plan_spawn(&task, &config, None, Some("zai:glm-5.1")).unwrap();
+
+        assert_eq!(plan.executor, ExecutorKind::OpenCode);
+        assert_eq!(plan.model.raw, "zai:glm-5.1");
+        assert_eq!(
+            plan.env.get("WG_EXECUTOR_TYPE").map(String::as_str),
+            Some("opencode")
+        );
+    }
+
+    #[test]
+    fn test_provider_health_skips_paused_primary_model_route() {
+        let mut config = Config::default();
+        config.coordinator.executor = Some("claude".to_string());
+        config.agent.model = "claude:opus".to_string();
+        config.tiers.premium = Some("claude:opus".to_string());
+        config.tiers.standard = Some("codex:gpt-5.5".to_string());
+
+        let mut health = ProviderHealth::default();
+        health.backoff_provider("claude", "session limit".to_string());
+
+        let task = base_task("t1");
+        let plan = plan_spawn_with_provider_health(
+            &task,
+            &config,
+            None,
+            Some("claude:opus"),
+            Some(&health),
+        )
+        .unwrap();
+
+        assert_eq!(plan.executor, ExecutorKind::Codex);
+        assert_eq!(plan.model.raw, "codex:gpt-5.5");
+        assert!(
+            plan.provenance.model_source.contains("tiers.standard"),
+            "fallback source should identify the alternate configured route: {:?}",
+            plan.provenance
         );
     }
 
@@ -1407,18 +1586,16 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_backend_mismatch_rejected_before_spawn() {
+    fn test_model_provider_resolves_backend_mismatch_before_spawn() {
         let mut config = Config::default();
         config.coordinator.executor = Some("codex".to_string());
 
         let task = base_task("t1");
-        let err = plan_spawn(&task, &config, None, Some("claude:opus"))
-            .expect_err("codex executor with claude model must be rejected before launch");
+        let plan = plan_spawn(&task, &config, None, Some("claude:opus"))
+            .expect("model provider should pick a compatible handler before launch");
 
-        assert!(
-            err.to_string().contains("backend-mismatch"),
-            "error should carry specific backend-mismatch reason, got: {err}"
-        );
+        assert_eq!(plan.executor, ExecutorKind::Claude);
+        assert!(plan.provenance.executor_source.contains("model-route"));
     }
 
     /// Fix C regression-guard (fix-nex-chat / diagnose-wg-nex root cause #2):

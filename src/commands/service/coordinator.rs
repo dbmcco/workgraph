@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -28,46 +29,6 @@ use worksgood::service::registry::AgentRegistry;
 
 use super::triage;
 use crate::commands::{graph_path, is_process_alive, kill_process_graceful, spawn};
-
-fn maybe_override_executor_for_task_route(
-    default_executor: &str,
-    task_provider: Option<&str>,
-    task_model: Option<&str>,
-) -> String {
-    if default_executor != "claude" {
-        return default_executor.to_string();
-    }
-    if let Some(provider) = task_provider {
-        return worksgood::config::provider_to_executor(provider).to_string();
-    }
-    if let Some(model) = task_model
-        && let Some(provider) = worksgood::config::parse_model_spec(model).provider
-    {
-        return worksgood::config::provider_to_executor(&provider).to_string();
-    }
-    default_executor.to_string()
-}
-
-fn resolve_ready_task_executor(
-    default_executor: &str,
-    task_provider: Option<&str>,
-    task_model: Option<&str>,
-    agent: Option<&agency::Agent>,
-) -> String {
-    let routed =
-        maybe_override_executor_for_task_route(default_executor, task_provider, task_model);
-    if routed != default_executor || task_provider.is_some() || task_model.is_some() {
-        return routed;
-    }
-    if let Some(agent) = agent {
-        return maybe_override_executor_for_task_route(
-            default_executor,
-            agent.preferred_provider.as_deref(),
-            agent.preferred_model.as_deref(),
-        );
-    }
-    default_executor.to_string()
-}
 
 /// Result of a single coordinator tick
 pub struct TickResult {
@@ -4019,6 +3980,16 @@ fn spawn_agents_for_ready_tasks(
     // Memoize loaded WCC-profile configs by name for this tick so a component
     // of N profiled tasks loads each profile file at most once.
     let mut profile_cache = worksgood::dispatch::ProfileCache::new();
+    let mut provider_health = match worksgood::service::ProviderHealth::load(dir) {
+        Ok(health) => health,
+        Err(e) => {
+            eprintln!(
+                "[dispatcher] Warning: failed to load provider health for routing: {}",
+                e
+            );
+            worksgood::service::ProviderHealth::default()
+        }
+    };
 
     // Sort ready tasks by priority with starvation prevention and priority inheritance
     let final_ready = sort_tasks_by_priority_with_features(graph, ready_tasks_raw, config);
@@ -4226,61 +4197,107 @@ fn spawn_agents_for_ready_tasks(
             .as_ref()
             .and_then(|agent_hash| agency::find_agent_by_prefix(&agents_dir, agent_hash).ok());
         let agent_executor = agent_entity.as_ref().and_then(|a| a.explicit_executor());
-        let plan = match worksgood::dispatch::plan_spawn(
-            task,
-            eff_config,
-            agent_executor,
-            task_model.as_deref(),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[dispatcher] plan_spawn failed for {}: {}", task.id, e);
-                record_spawn_failure(
-                    &gp,
-                    &task.id,
-                    &format!("plan_spawn: {}", e),
-                    "unknown",
-                    task.exec_mode.as_deref(),
-                    config.coordinator.max_spawn_failures,
-                );
-                continue;
-            }
-        };
-        let effective_executor = plan.executor.as_str().to_string();
+        let executor_hint = agent_executor.or(Some(executor));
+        let mut attempted_provider_ids = HashSet::new();
+        loop {
+            let plan = match worksgood::dispatch::plan_spawn_with_provider_health(
+                task,
+                eff_config,
+                executor_hint,
+                task_model.as_deref(),
+                Some(&provider_health),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[dispatcher] plan_spawn failed for {}: {}", task.id, e);
+                    record_spawn_failure(
+                        &gp,
+                        &task.id,
+                        &format!("plan_spawn: {}", e),
+                        "unknown",
+                        task.exec_mode.as_deref(),
+                        config.coordinator.max_spawn_failures,
+                    );
+                    break;
+                }
+            };
+            let effective_executor = plan.executor.as_str().to_string();
+            let effective_model = plan.model.raw.clone();
+            let provider_id = worksgood::service::extract_provider_id(
+                &effective_executor,
+                Some(&effective_model),
+            );
 
-        // Provenance: every spawn emits one line tracing each decision back to
-        // the config knob that produced it. Eliminates silent-routing bugs.
-        eprintln!(
-            "[dispatcher] {}: {}",
-            task.id,
-            plan.provenance.log_line(&plan)
-        );
-        eprintln!(
-            "[dispatcher] Spawning agent for: {} - {} (executor: {})",
-            task.id, task.title, effective_executor
-        );
-        match spawn::spawn_agent(
-            dir,
-            &task.id,
-            &effective_executor,
-            task.timeout.as_deref(),
-            task_model.as_deref(),
-        ) {
-            Ok((agent_id, pid)) => {
-                eprintln!("[dispatcher] Spawned {} (PID {})", agent_id, pid);
-                record_dispatch(&gp, &task.id);
-                spawned += 1;
-            }
-            Err(e) => {
-                eprintln!("[dispatcher] Failed to spawn for {}: {}", task.id, e);
-                record_spawn_failure(
-                    &gp,
-                    &task.id,
-                    &format!("{}", e),
-                    &effective_executor,
-                    task.exec_mode.as_deref(),
-                    config.coordinator.max_spawn_failures,
+            if !attempted_provider_ids.insert(provider_id.clone()) {
+                eprintln!(
+                    "[dispatcher] No alternate healthy configured route remains for {} after provider {} failed; leaving task open for later retry",
+                    task.id, provider_id
                 );
+                break;
+            }
+
+            // Provenance: every spawn emits one line tracing each decision back to
+            // the config knob that produced it. Eliminates silent-routing bugs.
+            eprintln!(
+                "[dispatcher] {}: {}",
+                task.id,
+                plan.provenance.log_line(&plan)
+            );
+            eprintln!(
+                "[dispatcher] Spawning agent for: {} - {} (executor: {}, model: {})",
+                task.id, task.title, effective_executor, effective_model
+            );
+            match spawn::spawn_agent(
+                dir,
+                &task.id,
+                &effective_executor,
+                task.timeout.as_deref(),
+                Some(effective_model.as_str()),
+            ) {
+                Ok((agent_id, pid)) => {
+                    provider_health.record_success(&provider_id);
+                    if let Err(e) = provider_health.save(dir) {
+                        eprintln!(
+                            "[dispatcher] Warning: failed to save provider health: {}",
+                            e
+                        );
+                    }
+                    eprintln!("[dispatcher] Spawned {} (PID {})", agent_id, pid);
+                    record_dispatch(&gp, &task.id);
+                    spawned += 1;
+                    break;
+                }
+                Err(e) => {
+                    let error = format!("{}", e);
+                    let error_kind = worksgood::service::classify_error(None, &error);
+                    eprintln!("[dispatcher] Failed to spawn for {}: {}", task.id, error);
+                    if error_kind == worksgood::service::ProviderErrorKind::FatalProvider {
+                        provider_health.backoff_provider(
+                            &provider_id,
+                            format!("spawn failed for route {}: {}", provider_id, error),
+                        );
+                        if let Err(e) = provider_health.save(dir) {
+                            eprintln!(
+                                "[dispatcher] Warning: failed to save provider health after backoff: {}",
+                                e
+                            );
+                        }
+                        eprintln!(
+                            "[dispatcher] Provider route {} backed off; retrying {} with next configured route",
+                            provider_id, task.id
+                        );
+                        continue;
+                    }
+                    record_spawn_failure(
+                        &gp,
+                        &task.id,
+                        &error,
+                        &effective_executor,
+                        task.exec_mode.as_deref(),
+                        config.coordinator.max_spawn_failures,
+                    );
+                    break;
+                }
             }
         }
     }
@@ -6423,59 +6440,6 @@ mod tests {
         );
         let assign = graph.get_task(".assign-my-task").unwrap();
         assert_eq!(assign.status, Status::Open);
-    }
-
-    #[test]
-    fn test_task_route_promotes_default_claude_to_native_for_openrouter_model() {
-        let routed = maybe_override_executor_for_task_route(
-            "claude",
-            None,
-            Some("openrouter:minimax/minimax-m1"),
-        );
-        assert_eq!(routed, "native");
-    }
-
-    #[test]
-    fn test_task_route_promotes_default_claude_to_codex_for_codex_model() {
-        let routed =
-            maybe_override_executor_for_task_route("claude", None, Some("codex:gpt-5-codex"));
-        assert_eq!(routed, "codex");
-    }
-
-    #[test]
-    fn test_task_route_keeps_explicit_nondefault_executor() {
-        let routed = maybe_override_executor_for_task_route(
-            "shell",
-            Some("openrouter"),
-            Some("openrouter:minimax/minimax-m1"),
-        );
-        assert_eq!(routed, "shell");
-    }
-
-    #[test]
-    fn test_task_route_prefers_agent_preferred_model_when_task_model_absent() {
-        let agent = agency::Agent {
-            id: "agent-1".to_string(),
-            role_id: "role-1".to_string(),
-            tradeoff_id: "tradeoff-1".to_string(),
-            name: "Sample Agent".to_string(),
-            performance: agency::PerformanceRecord::default(),
-            lineage: agency::Lineage::default(),
-            capabilities: vec![],
-            rate: None,
-            capacity: None,
-            trust_level: Default::default(),
-            contact: None,
-            executor: "claude".to_string(),
-            preferred_model: Some("openrouter:minimax/minimax-m1".to_string()),
-            preferred_provider: Some("openrouter".to_string()),
-            deployment_history: vec![],
-            attractor_weight: 0.5,
-            staleness_flags: vec![],
-        };
-
-        let routed = resolve_ready_task_executor("claude", None, None, Some(&agent));
-        assert_eq!(routed, "native");
     }
 
     #[test]

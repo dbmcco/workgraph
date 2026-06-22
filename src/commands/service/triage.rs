@@ -11,7 +11,7 @@ use worksgood::config::Config;
 use worksgood::graph::{
     LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens,
 };
-use worksgood::parser::{load_graph, modify_graph};
+use worksgood::parser::{load_graph, load_graph_locked, lock_graph_file, modify_graph};
 use worksgood::profile;
 use worksgood::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
 use worksgood::service::{ProviderErrorKind, ProviderHealth, classify_error, extract_provider_id};
