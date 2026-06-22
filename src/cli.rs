@@ -142,7 +142,7 @@ pub enum Commands {
         /// What the rescue task needs to do differently. Becomes the
         /// rescue task's description — treat this as the next agent's
         /// assignment brief.
-        #[arg(long, short = 'd', alias = "desc")]
+        #[arg(long, alias = "desc")]
         description: String,
 
         /// Optional title override (default: `Rescue: <target>`).
@@ -174,7 +174,7 @@ pub enum Commands {
         title: String,
 
         /// Detailed description for the new task.
-        #[arg(long, short = 'd', alias = "desc")]
+        #[arg(long, alias = "desc")]
         description: Option<String>,
 
         /// Explicit ID for the new task (auto-derived from title if absent).
