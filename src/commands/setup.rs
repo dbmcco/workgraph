@@ -37,7 +37,15 @@ This file only covers things specific to this project. Add project-specific
 build commands, test commands, architecture notes, and service recipes here.
 
 **At the start of each session, run `wg quickstart` in your terminal to orient yourself.**
-Use `wg service start` to dispatch work — do not manually claim tasks.
+Default posture is `observe`: inspect via `wg show`, `wg list`, `wg status`, `wg viz`
+before acting. Do NOT run `wg service start` as a generic session kickoff or
+against a broad backlog — use it only for an explicit repo/task scope with a
+clear contract, runner, verification, and repair/follow-up policy. For repo
+implementation work, prefer a repo-local issue surface and repo-local
+Workgraph/Speedrift execution; link artifacts and failed attempts back as
+evidence, not as operating truth. Do not manually claim tasks you have not been
+scoped to. Subagents and repo-local execution surfaces are fine when they are
+the explicit execution surface — just don't fan out broad autonomous dispatch.
 
 This guide is written to both `CLAUDE.md` and `AGENTS.md` and kept in
 lock-step. The two files exist because Claude Code and Codex CLI look for
@@ -2835,7 +2843,15 @@ mod tests {
         assert!(CLAUDE_MD_DIRECTIVES.contains("wg agent-guide"));
         assert!(CLAUDE_MD_DIRECTIVES.contains("layer-2"));
         assert!(CLAUDE_MD_DIRECTIVES.contains("wg quickstart"));
+        // Boundary: wg service start is mentioned, but scoped to explicit
+        // repo/task execution — not a generic kickoff or broad-backlog dispatch.
         assert!(CLAUDE_MD_DIRECTIVES.contains("wg service start"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("Default posture is `observe`"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains(
+            "Do NOT run `wg service start` as a generic session kickoff"
+        ));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("explicit repo/task scope"));
+        assert!(CLAUDE_MD_DIRECTIVES.contains("repo-local execution surface"));
         assert!(CLAUDE_MD_DIRECTIVES.contains("lock-step"));
     }
 
