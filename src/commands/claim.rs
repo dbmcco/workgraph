@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::Path;
-use workgraph::graph::{LogEntry, Status};
-use workgraph::parser::modify_graph;
+use worksgood::graph::{LogEntry, Status};
+use worksgood::parser::modify_graph;
 
 #[cfg(test)]
 use super::graph_path;
 #[cfg(test)]
-use workgraph::parser::{load_graph, save_graph};
+use worksgood::parser::{load_graph, save_graph};
 
 /// Claim a task for work: sets status to InProgress, optionally assigns an actor
 pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
@@ -122,7 +122,7 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: actor.map(std::string::ToString::to_string),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: log_message,
         });
 
@@ -136,8 +136,9 @@ pub fn claim(dir: &Path, id: &str, actor: Option<&str>) -> Result<()> {
 
     super::notify_graph_changed(dir);
 
-    let config = workgraph::config::Config::load_or_default(dir);
-    let _ = workgraph::provenance::record(
+    // Record operation
+    let config = worksgood::config::Config::load_or_default(dir);
+    let _ = worksgood::provenance::record(
         dir,
         "claim",
         Some(id),
@@ -237,7 +238,7 @@ pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: prev_assigned.clone(),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: log_message,
         });
 
@@ -253,8 +254,9 @@ pub fn unclaim(dir: &Path, id: &str) -> Result<()> {
     // expects immediate response, not a settling-delayed tick.
     super::notify_kick(dir);
 
-    let config = workgraph::config::Config::load_or_default(dir);
-    let _ = workgraph::provenance::record(
+    // Record operation
+    let config = worksgood::config::Config::load_or_default(dir);
+    let _ = worksgood::provenance::record(
         dir,
         "unclaim",
         Some(id),
@@ -271,7 +273,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-    use workgraph::graph::{Node, Task, WorkGraph};
+    use worksgood::graph::{Node, Task, WorkGraph};
 
     fn make_task(id: &str, title: &str, status: Status) -> Task {
         Task {

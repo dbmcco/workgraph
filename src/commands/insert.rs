@@ -24,8 +24,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use workgraph::graph::{Node, Status, Task};
-use workgraph::parser::modify_graph;
+use worksgood::graph::{Node, Status, Task};
+use worksgood::parser::modify_graph;
 
 /// Which position in the graph to insert the new task at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +252,7 @@ pub fn run(
         .lock()
         .map(|s| s.clone())
         .unwrap_or_else(|_| derived_id.clone());
-    let _ = workgraph::provenance::record(
+    let _ = worksgood::provenance::record(
         dir,
         "insert",
         Some(&assigned_id),
@@ -263,7 +263,7 @@ pub fn run(
             "replace_edges": opts.replace_edges,
             "splice": opts.splice,
         }),
-        workgraph::provenance::DEFAULT_ROTATION_THRESHOLD,
+        worksgood::provenance::DEFAULT_ROTATION_THRESHOLD,
     );
     Ok(assigned_id)
 }
@@ -292,7 +292,7 @@ fn derive_id_from_title(title: &str) -> String {
 
 /// If `candidate` already exists in `graph`, append `-2`, `-3`, ... until
 /// a unique ID is found. Preserves the caller's intent for the base name.
-fn unique_id(graph: &workgraph::graph::WorkGraph, candidate: &str) -> String {
+fn unique_id(graph: &worksgood::graph::WorkGraph, candidate: &str) -> String {
     if graph.get_task(candidate).is_none() {
         return candidate.to_string();
     }
@@ -310,8 +310,8 @@ fn unique_id(graph: &workgraph::graph::WorkGraph, candidate: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use workgraph::parser::load_graph;
-    use workgraph::test_helpers::{make_task_with_status, setup_workgraph};
+    use worksgood::parser::load_graph;
+    use worksgood::test_helpers::{make_task_with_status, setup_workgraph};
 
     fn make(id: &str) -> Task {
         make_task_with_status(id, id, Status::Open)

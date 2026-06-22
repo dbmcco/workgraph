@@ -6,25 +6,25 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use workgraph::agency;
-use workgraph::agency::evolver::{self, EvolutionTrigger, EvolverState};
-use workgraph::agency::run_mode::{self, AssignmentPath};
-use workgraph::agency::{
+use worksgood::agency;
+use worksgood::agency::evolver::{self, EvolutionTrigger, EvolverState};
+use worksgood::agency::run_mode::{self, AssignmentPath};
+use worksgood::agency::{
     AssignerModeContext, AssignmentMode, AssignmentSource, Evaluation, TaskAssignmentRecord,
     count_assignment_records, eval_source, load_all_evaluations_or_warn,
     render_assigner_mode_context, save_assignment_record,
 };
-use workgraph::chat;
-use workgraph::config::{Config, DispatchRole};
-use workgraph::graph::{
+use worksgood::chat;
+use worksgood::config::{Config, DispatchRole};
+use worksgood::graph::{
     FailureClass, LogEntry, Node, PRIORITY_DEFAULT, PRIORITY_IDLE, PRIORITY_NORMAL, Priority,
     Status, Task, WaitCondition, WaitSpec, boost_priority, evaluate_all_cycle_failure_restarts,
     evaluate_all_cycle_iterations,
 };
-use workgraph::messages;
-use workgraph::parser::{load_graph, modify_graph};
-use workgraph::query::{blocked_open_cycle_diagnostics, ready_tasks_with_peers_cycle_aware};
-use workgraph::service::registry::AgentRegistry;
+use worksgood::messages;
+use worksgood::parser::{load_graph, modify_graph};
+use worksgood::query::{blocked_open_cycle_diagnostics, ready_tasks_with_peers_cycle_aware};
+use worksgood::service::registry::AgentRegistry;
 
 use super::triage;
 use crate::commands::{graph_path, is_process_alive, kill_process_graceful, spawn};
@@ -38,12 +38,12 @@ fn maybe_override_executor_for_task_route(
         return default_executor.to_string();
     }
     if let Some(provider) = task_provider {
-        return workgraph::config::provider_to_executor(provider).to_string();
+        return worksgood::config::provider_to_executor(provider).to_string();
     }
     if let Some(model) = task_model
-        && let Some(provider) = workgraph::config::parse_model_spec(model).provider
+        && let Some(provider) = worksgood::config::parse_model_spec(model).provider
     {
-        return workgraph::config::provider_to_executor(&provider).to_string();
+        return worksgood::config::provider_to_executor(&provider).to_string();
     }
     default_executor.to_string()
 }
@@ -135,7 +135,7 @@ fn cleanup_and_count_alive(
         }
         for (agent_id, pid) in &killed {
             if let Some(agent) = locked_registry.get_agent_mut(agent_id) {
-                agent.status = workgraph::service::registry::AgentStatus::Dead;
+                agent.status = worksgood::service::registry::AgentStatus::Dead;
                 if agent.completed_at.is_none() {
                     agent.completed_at = Some(Utc::now().to_rfc3339());
                 }
@@ -191,7 +191,7 @@ const DAEMON_MANAGED_TAGS: &[&str] = &[
 ];
 
 /// Check whether a task is managed by the daemon (not spawned as a regular agent).
-fn is_daemon_managed(task: &workgraph::graph::Task) -> bool {
+fn is_daemon_managed(task: &worksgood::graph::Task) -> bool {
     task.tags
         .iter()
         .any(|tag| DAEMON_MANAGED_TAGS.contains(&tag.as_str()))
@@ -200,7 +200,7 @@ fn is_daemon_managed(task: &workgraph::graph::Task) -> bool {
 /// Check whether any tasks are ready. Returns `None` with an early `TickResult`
 /// if no ready tasks exist.
 fn check_ready_or_return(
-    graph: &workgraph::graph::WorkGraph,
+    graph: &worksgood::graph::WorkGraph,
     alive_count: usize,
     dir: &Path,
 ) -> Option<TickResult> {
@@ -235,7 +235,7 @@ fn check_ready_or_return(
 /// Returns `true` if the condition is satisfied.
 fn evaluate_condition(
     condition: &WaitCondition,
-    graph: &workgraph::graph::WorkGraph,
+    graph: &worksgood::graph::WorkGraph,
     dir: &Path,
     task_id: &str,
     wait_started_at: Option<&str>,
@@ -332,7 +332,7 @@ fn has_non_agent_message_since(dir: &Path, task_id: &str, wait_started_at: Optio
 /// Evaluate all conditions in a WaitSpec.
 fn evaluate_wait_spec(
     spec: &WaitSpec,
-    graph: &workgraph::graph::WorkGraph,
+    graph: &worksgood::graph::WorkGraph,
     dir: &Path,
     task_id: &str,
     wait_started_at: Option<&str>,
@@ -351,7 +351,7 @@ fn evaluate_wait_spec(
 /// is in a terminal state that doesn't match the expected status).
 fn is_condition_unsatisfiable(
     condition: &WaitCondition,
-    graph: &workgraph::graph::WorkGraph,
+    graph: &worksgood::graph::WorkGraph,
 ) -> Option<String> {
     match condition {
         WaitCondition::TaskStatus {
@@ -376,7 +376,7 @@ fn is_condition_unsatisfiable(
 }
 
 /// Detect circular waits: task A waiting on task B, task B waiting on task A.
-fn detect_circular_waits(graph: &workgraph::graph::WorkGraph) -> Vec<Vec<String>> {
+fn detect_circular_waits(graph: &worksgood::graph::WorkGraph) -> Vec<Vec<String>> {
     let mut cycles = Vec::new();
     let waiting_tasks: Vec<_> = graph
         .tasks()
@@ -446,7 +446,7 @@ fn detect_circular_waits(graph: &workgraph::graph::WorkGraph) -> Vec<Vec<String>
 
 /// Build a brief graph state delta for resume context injection.
 /// Shows what changed while the task was waiting (~100 tokens).
-fn build_resume_delta(graph: &workgraph::graph::WorkGraph, task: &Task, dir: &Path) -> String {
+fn build_resume_delta(graph: &worksgood::graph::WorkGraph, task: &Task, dir: &Path) -> String {
     let mut delta = String::new();
     delta.push_str("## Resume Context\n");
 
@@ -514,7 +514,7 @@ fn build_resume_delta(graph: &workgraph::graph::WorkGraph, task: &Task, dir: &Pa
 
 /// Evaluate waiting tasks and transition them when conditions are met.
 /// Returns `true` if the graph was modified.
-fn evaluate_waiting_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> bool {
+fn evaluate_waiting_tasks(graph: &mut worksgood::graph::WorkGraph, dir: &Path) -> bool {
     let mut modified = false;
 
     // First, detect circular waits
@@ -531,7 +531,7 @@ fn evaluate_waiting_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!("Failed: circular wait detected ({})", cycle.join(" -> ")),
                 });
                 modified = true;
@@ -601,7 +601,7 @@ fn evaluate_waiting_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!("Failed: {}", reason),
                 });
                 modified = true;
@@ -630,7 +630,7 @@ fn evaluate_waiting_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: "Wait condition satisfied. Task ready for resume.".to_string(),
                 });
                 modified = true;
@@ -664,7 +664,7 @@ const RESURRECTION_COOLDOWN_SECS: i64 = 60;
 ///
 /// Guards: rate limit, sender whitelist, abandoned exclusion.
 /// Returns `true` if the graph was modified.
-fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> bool {
+fn resurrect_done_tasks(graph: &mut worksgood::graph::WorkGraph, dir: &Path) -> bool {
     let mut modified = false;
 
     // Collect Done tasks with unread messages from whitelisted senders
@@ -800,7 +800,7 @@ fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> 
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!(
                         "Resurrection: created child task '{}' ({} pending message(s), downstream active)",
                         child_id,
@@ -826,7 +826,7 @@ fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> 
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!(
                         "Resurrection: reopened due to {} pending message(s)",
                         triggering_msgs.len()
@@ -853,7 +853,7 @@ fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> 
                 assign_task.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: "Reopened for reassignment (source task resurrected)".to_string(),
                 });
                 eprintln!(
@@ -887,12 +887,12 @@ fn resurrect_done_tasks(graph: &mut workgraph::graph::WorkGraph, dir: &Path) -> 
 /// 4. Logs diagnostic info for stale blocked states
 ///
 /// Returns `true` if the graph was modified.
-/// Dispatcher-side wrapper around `workgraph::lifecycle::migrate_pending_validation_tasks`.
+/// Dispatcher-side wrapper around `worksgood::lifecycle::migrate_pending_validation_tasks`.
 /// Performs the migration and emits a `[dispatcher] Migrated …` banner per task
 /// so the operator sees the one-time event in `daemon.log`. Returns true if any
 /// task was migrated.
-fn migrate_pending_validation_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
-    let migrated = workgraph::lifecycle::migrate_pending_validation_tasks(graph);
+fn migrate_pending_validation_tasks(graph: &mut worksgood::graph::WorkGraph) -> bool {
+    let migrated = worksgood::lifecycle::migrate_pending_validation_tasks(graph);
     for id in &migrated {
         eprintln!(
             "[dispatcher] Migrated '{}' from PendingValidation to Done \
@@ -920,7 +920,7 @@ fn migrate_pending_validation_tasks(graph: &mut workgraph::graph::WorkGraph) -> 
 /// rescue. This phase only handles the success case.
 ///
 /// Returns true if any task was promoted.
-fn resolve_pending_eval_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
+fn resolve_pending_eval_tasks(graph: &mut worksgood::graph::WorkGraph) -> bool {
     let promotable: Vec<String> = graph
         .tasks()
         .filter(|t| t.status == Status::PendingEval)
@@ -954,10 +954,10 @@ fn resolve_pending_eval_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
             if task.completed_at.is_none() {
                 task.completed_at = Some(chrono::Utc::now().to_rfc3339());
             }
-            task.log.push(workgraph::graph::LogEntry {
+            task.log.push(worksgood::graph::LogEntry {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 actor: None,
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: "PendingEval → Done (evaluator passed; downstream unblocks)".to_string(),
             });
             eprintln!(
@@ -986,7 +986,7 @@ fn resolve_pending_eval_tasks(graph: &mut workgraph::graph::WorkGraph) -> bool {
 /// Returns true if any task was modified.
 fn resolve_failed_pending_eval_tasks(
     dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     let threshold = config.agency.eval_gate_threshold.unwrap_or(0.7);
@@ -1032,12 +1032,12 @@ fn resolve_failed_pending_eval_tasks(
             }
 
             // Eval is terminal — determine action
-            let evals = workgraph::agency::load_all_evaluations_or_warn(&evals_dir);
+            let evals = worksgood::agency::load_all_evaluations_or_warn(&evals_dir);
             let usable_score = evals
                 .iter()
                 .filter(|e| {
                     e.task_id == source_id
-                        && e.source != workgraph::agency::eval_source::FLIP
+                        && e.source != worksgood::agency::eval_source::FLIP
                         && e.source != "system"
                 })
                 .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
@@ -1086,7 +1086,7 @@ fn resolve_failed_pending_eval_tasks(
                     task.log.push(LogEntry {
                         timestamp: now,
                         actor: None,
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "FailedPendingEval → Done (rescued by eval: score={:.2} ≥ threshold={:.2})",
                             score, threshold
@@ -1110,7 +1110,7 @@ fn resolve_failed_pending_eval_tasks(
                     task.log.push(LogEntry {
                         timestamp: now,
                         actor: None,
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "FailedPendingEval → Failed (eval rejected: score={:.2} < threshold={:.2})",
                             score, threshold
@@ -1134,7 +1134,7 @@ fn resolve_failed_pending_eval_tasks(
                     task.log.push(LogEntry {
                         timestamp: now,
                         actor: None,
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "FailedPendingEval → Failed (rescue eval unavailable after {} attempts)",
                             max_meta_attempts
@@ -1159,7 +1159,7 @@ fn resolve_failed_pending_eval_tasks(
                     eval_task.log.push(LogEntry {
                         timestamp: now,
                         actor: None,
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "Rescue eval retry attempt {} (no usable score from previous run)",
                             attempts
@@ -1178,7 +1178,7 @@ fn resolve_failed_pending_eval_tasks(
     modified
 }
 
-fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> bool {
+fn unblock_stuck_tasks(graph: &mut worksgood::graph::WorkGraph, _dir: &Path) -> bool {
     let mut modified = false;
 
     // Collect blocked task IDs first
@@ -1211,7 +1211,7 @@ fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> 
                 task.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some("coordinator".to_string()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "Unblocked by coordinator scan — all dependencies satisfied or archived/deleted. Dependencies: {}",
                             task.after.join(", ")
@@ -1271,7 +1271,7 @@ fn unblock_stuck_tasks(graph: &mut workgraph::graph::WorkGraph, _dir: &Path) -> 
 ///
 /// Returns `true` if the graph was modified.
 fn build_auto_assign_tasks(
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
     dir: &Path,
 ) -> bool {
@@ -1288,7 +1288,7 @@ fn build_auto_assign_tasks(
             ready
                 .iter()
                 .filter(|t| t.agent.is_none() && t.assigned.is_none())
-                .filter(|t| !workgraph::graph::is_system_task(&t.id))
+                .filter(|t| !worksgood::graph::is_system_task(&t.id))
                 // Exclude shell tasks from auto-assign — they run commands, not agents
                 .filter(|t| t.exec.is_none() && t.exec_mode.as_deref() != Some("shell"))
                 .map(|t| (t.id.clone(), t.title.clone(), t.created_at.clone()))
@@ -1340,7 +1340,7 @@ fn build_auto_assign_tasks(
                         t.log.push(LogEntry {
                             timestamp: Utc::now().to_rfc3339(),
                             actor: Some("coordinator".to_string()),
-                            user: Some(workgraph::current_user()),
+                            user: Some(worksgood::current_user()),
                             message: reason,
                         });
                     }
@@ -1396,7 +1396,7 @@ fn build_auto_assign_tasks(
                 t.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!(
                         "Reopened for retry (was {:?}, source task still needs assignment)",
                         prev_status
@@ -1550,7 +1550,7 @@ fn build_auto_assign_tasks(
                         assign_task.log.push(LogEntry {
                             timestamp: Utc::now().to_rfc3339(),
                             actor: Some("coordinator".to_string()),
-                            user: Some(workgraph::current_user()),
+                            user: Some(worksgood::current_user()),
                             message: format!(
                                 "Assigned via Agency (agency_task_id={})",
                                 response.agency_task_id,
@@ -1579,10 +1579,10 @@ fn build_auto_assign_tasks(
                         );
                     }
 
-                    let _ = workgraph::parser::modify_graph(graph_path(dir), |fresh| {
+                    let _ = worksgood::parser::modify_graph(graph_path(dir), |fresh| {
                         // Copy assignment record task from local graph
                         for node in graph.nodes() {
-                            if let workgraph::graph::Node::Task(t) = node
+                            if let worksgood::graph::Node::Task(t) = node
                                 && let Some(ft) = fresh.get_task_mut(&t.id)
                             {
                                 ft.after = t.after.clone();
@@ -1649,7 +1649,7 @@ fn build_auto_assign_tasks(
         if let Some(task) = graph.get_task_mut(&source_id) {
             task.agent = Some(resolved_agent.id.clone());
             if let Some(ref mode) = verdict.exec_mode
-                && mode.parse::<workgraph::config::ExecMode>().is_ok()
+                && mode.parse::<worksgood::config::ExecMode>().is_ok()
             {
                 task.exec_mode = Some(mode.clone());
             }
@@ -1666,7 +1666,7 @@ fn build_auto_assign_tasks(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("coordinator".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "Lightweight assignment: agent={} ({}), exec_mode={}, context_scope={}, reason={}",
                     resolved_agent.name,
@@ -1714,7 +1714,7 @@ fn build_auto_assign_tasks(
                     task.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some("coordinator".to_string()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "Placement applied (via assignment): {}",
                             edges_added.join(" "),
@@ -1749,11 +1749,11 @@ fn build_auto_assign_tasks(
             assign_task.completed_at = Some(now);
             assign_task.model = Some(
                 config
-                    .resolve_model_for_role(workgraph::config::DispatchRole::Assigner)
+                    .resolve_model_for_role(worksgood::config::DispatchRole::Assigner)
                     .model,
             );
             assign_task.provider = config
-                .resolve_model_for_role(workgraph::config::DispatchRole::Assigner)
+                .resolve_model_for_role(worksgood::config::DispatchRole::Assigner)
                 .provider;
             assign_task.agent = config.agency.assigner_agent.clone();
             assign_task.token_usage = assign_token_usage;
@@ -1761,7 +1761,7 @@ fn build_auto_assign_tasks(
             assign_task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("coordinator".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!("Assigned via LLM (path: {:?})", assignment_path,),
             });
         }
@@ -1811,13 +1811,13 @@ fn build_auto_assign_tasks(
                 let ts = Utc::now().format("%Y%m%d-%H%M%S");
                 let create_task_id = format!(".create-needed-{}", ts);
                 let creator_resolved =
-                    config.resolve_model_for_role(workgraph::config::DispatchRole::Creator);
+                    config.resolve_model_for_role(worksgood::config::DispatchRole::Creator);
 
                 // Find most recently completed non-system task for graph connectivity
                 let causal_edge: Vec<String> = graph
                     .tasks()
                     .filter(|t| {
-                        t.status == Status::Done && !workgraph::graph::is_system_task(&t.id)
+                        t.status == Status::Done && !worksgood::graph::is_system_task(&t.id)
                     })
                     .max_by(|a, b| a.completed_at.cmp(&b.completed_at))
                     .map(|t| vec![t.id.clone()])
@@ -1869,6 +1869,7 @@ fn build_auto_assign_tasks(
                     model: Some(creator_resolved.model),
                     provider: creator_resolved.provider,
                     endpoint: None,
+                    profile: None,
                     command_argv: vec![],
                     working_dir: None,
                     executor_preset_name: None,
@@ -1953,7 +1954,7 @@ fn build_auto_assign_tasks(
 /// Returns `true` if the graph was modified.
 fn build_auto_evaluate_tasks(
     dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     let mut modified = false;
@@ -2061,7 +2062,7 @@ fn build_auto_evaluate_tasks(
 /// Returns `true` if the graph was modified.
 fn build_flip_verification_tasks(
     dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     let threshold = match config.agency.flip_verification_threshold {
@@ -2085,7 +2086,7 @@ fn build_flip_verification_tasks(
 
     let mut modified = false;
     let verification_resolved =
-        config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
+        config.resolve_model_for_role(worksgood::config::DispatchRole::Verification);
     let verification_model = verification_resolved.model;
 
     for eval in &low_flip {
@@ -2107,7 +2108,7 @@ fn build_flip_verification_tasks(
         }
 
         // Skip system tasks (dot-prefixed) to prevent verification loops
-        if workgraph::graph::is_system_task(source_task_id) {
+        if worksgood::graph::is_system_task(source_task_id) {
             continue;
         }
 
@@ -2120,7 +2121,7 @@ fn build_flip_verification_tasks(
                 // But exclude system evaluations (infrastructure failures) from this check
                 let has_low_eval = all_evals.iter().any(|e| {
                     e.task_id == *source_task_id
-                        && e.source != workgraph::agency::eval_source::FLIP
+                        && e.source != worksgood::agency::eval_source::FLIP
                         && e.source != "system"  // Skip infrastructure failures
                         && e.score < eval_threshold
                 });
@@ -2265,6 +2266,7 @@ fn build_flip_verification_tasks(
             model: Some(verification_model.clone()),
             provider: verification_resolved.provider.clone(),
             endpoint: None,
+            profile: None,
             command_argv: vec![],
             working_dir: None,
             executor_preset_name: None,
@@ -2329,7 +2331,7 @@ fn build_flip_verification_tasks(
             source.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("coordinator".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "FLIP score {:.2} below threshold {:.2} — triggering verification (model: {})",
                     eval.score, threshold, verification_model,
@@ -2385,7 +2387,7 @@ fn build_flip_verification_tasks(
 /// Returns `true` if the graph was modified.
 fn build_separate_verify_tasks(
     _dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     // Find tasks in PendingValidation that have a verify command and were
@@ -2417,7 +2419,7 @@ fn build_separate_verify_tasks(
 
     let mut modified = false;
     let verification_resolved =
-        config.resolve_model_for_role(workgraph::config::DispatchRole::Verification);
+        config.resolve_model_for_role(worksgood::config::DispatchRole::Verification);
     let verification_model = verification_resolved.model;
 
     for (source_task_id, source_title, source_desc, source_artifacts) in &candidates {
@@ -2429,7 +2431,7 @@ fn build_separate_verify_tasks(
         }
 
         // Skip system tasks to prevent verification loops
-        if workgraph::graph::is_system_task(source_task_id) {
+        if worksgood::graph::is_system_task(source_task_id) {
             continue;
         }
 
@@ -2540,6 +2542,7 @@ fn build_separate_verify_tasks(
             model: Some(verification_model.clone()),
             provider: verification_resolved.provider.clone(),
             endpoint: None,
+            profile: None,
             command_argv: vec![],
             working_dir: None,
             executor_preset_name: None,
@@ -2602,7 +2605,7 @@ fn build_separate_verify_tasks(
             source.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("coordinator".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "Separate verification triggered — spawning .sep-verify-{} agent",
                     source_task_id,
@@ -2630,7 +2633,7 @@ fn build_separate_verify_tasks(
 /// Returns `true` if the graph was modified.
 fn build_auto_evolve_task(
     dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     let agency_dir = dir.join("agency");
@@ -2679,7 +2682,7 @@ fn build_auto_evolve_task(
     // Causal edges: recently completed non-system tasks for graph connectivity
     let mut recent_completed: Vec<_> = graph
         .tasks()
-        .filter(|t| t.status == Status::Done && !workgraph::graph::is_system_task(&t.id))
+        .filter(|t| t.status == Status::Done && !worksgood::graph::is_system_task(&t.id))
         .map(|t| (t.id.clone(), t.completed_at.clone()))
         .collect();
     recent_completed.sort_by(|a, b| b.1.cmp(&a.1));
@@ -2712,7 +2715,7 @@ fn build_auto_evolve_task(
         trigger_reason, causal_list, budget, safe_strategies, budget, budget,
     );
 
-    let evolver_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evolver);
+    let evolver_resolved = config.resolve_model_for_role(worksgood::config::DispatchRole::Evolver);
 
     let evolve_task = Task {
         id: evolve_task_id.clone(),
@@ -2745,6 +2748,7 @@ fn build_auto_evolve_task(
         model: Some(evolver_resolved.model),
         provider: evolver_resolved.provider,
         endpoint: None,
+        profile: None,
         command_argv: vec![],
         working_dir: None,
         executor_preset_name: None,
@@ -2850,7 +2854,7 @@ fn build_auto_evolve_task(
 /// Returns `true` if the graph was modified.
 fn build_auto_create_task(
     dir: &Path,
-    graph: &mut workgraph::graph::WorkGraph,
+    graph: &mut worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     let agency_dir = dir.join("agency");
@@ -2871,7 +2875,7 @@ fn build_auto_create_task(
     // Collect completed (Done) non-system tasks, sorted by completed_at desc
     let mut completed_tasks: Vec<_> = graph
         .tasks()
-        .filter(|t| t.status == Status::Done && !workgraph::graph::is_system_task(&t.id))
+        .filter(|t| t.status == Status::Done && !worksgood::graph::is_system_task(&t.id))
         .map(|t| (t.id.clone(), t.completed_at.clone()))
         .collect();
     let completed_count = completed_tasks.len() as u32;
@@ -2902,7 +2906,7 @@ fn build_auto_create_task(
     let ts = Utc::now().format("%Y%m%d-%H%M%S");
     let create_task_id = format!(".create-{}", ts);
 
-    let creator_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Creator);
+    let creator_resolved = config.resolve_model_for_role(worksgood::config::DispatchRole::Creator);
 
     let trigger_list = trigger_ids
         .iter()
@@ -2953,6 +2957,7 @@ fn build_auto_create_task(
         model: Some(creator_resolved.model),
         provider: creator_resolved.provider,
         endpoint: None,
+        profile: None,
         command_argv: vec![],
         working_dir: None,
         executor_preset_name: None,
@@ -3204,7 +3209,7 @@ fn spawn_eval_inline(
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: Some(agent_id_clone.clone()),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: format!("Spawned eval inline{}", eval_model_msg),
         });
 
@@ -3276,7 +3281,7 @@ fn spawn_eval_inline(
     } else {
         DispatchRole::Evaluator
     };
-    let eval_dispatch = workgraph::service::llm::resolve_agency_dispatch(&config, eval_role);
+    let eval_dispatch = worksgood::service::llm::resolve_agency_dispatch(&config, eval_role);
     let eval_executor = eval_dispatch.handler.as_str();
     let eval_recorded_model = eval_dispatch.raw_spec.as_str();
     write_inline_artifacts(
@@ -3321,7 +3326,7 @@ fn spawn_eval_inline(
                     t.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some(agent_id_rollback.clone()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!("Eval spawn failed, reverting claim: {}", err_msg),
                     });
                     true
@@ -3406,7 +3411,7 @@ fn spawn_assign_inline(dir: &Path, assign_task_id: &str) -> Result<(String, u32)
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: Some(agent_id_clone.clone()),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: "Spawned assignment inline".to_string(),
         });
 
@@ -3464,7 +3469,7 @@ exit $EXIT_CODE"#,
     // run_lightweight_llm_call will actually invoke.
     let assign_config = Config::load_or_default(dir);
     let assign_dispatch =
-        workgraph::service::llm::resolve_agency_dispatch(&assign_config, DispatchRole::Assigner);
+        worksgood::service::llm::resolve_agency_dispatch(&assign_config, DispatchRole::Assigner);
     let assign_executor = assign_dispatch.handler.as_str();
     let assign_model = assign_dispatch.raw_spec.as_str();
     write_inline_artifacts(
@@ -3509,7 +3514,7 @@ exit $EXIT_CODE"#,
                     t.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some(agent_id_rollback.clone()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!("Assignment spawn failed, reverting claim: {}", err_msg),
                     });
                     true
@@ -3583,7 +3588,7 @@ fn spawn_shell_inline(dir: &Path, task_id: &str) -> Result<(String, u32)> {
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: Some(agent_id_clone.clone()),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: "Spawned shell task inline".to_string(),
         });
 
@@ -3635,7 +3640,7 @@ exit $EXIT_CODE"#,
                     t.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some(agent_id_rollback.clone()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!("Shell spawn failed, reverting claim: {}", err_msg),
                     });
                     true
@@ -3664,10 +3669,10 @@ exit $EXIT_CODE"#,
 /// 2. Starvation prevention: tasks waiting longer than threshold get priority bump
 /// 3. Priority inheritance: high-priority tasks blocked by low-priority deps boost the blockers
 fn sort_tasks_by_priority_with_features<'a>(
-    graph: &workgraph::graph::WorkGraph,
-    tasks: Vec<&'a workgraph::graph::Task>,
+    graph: &worksgood::graph::WorkGraph,
+    tasks: Vec<&'a worksgood::graph::Task>,
     config: &Config,
-) -> Vec<&'a workgraph::graph::Task> {
+) -> Vec<&'a worksgood::graph::Task> {
     use chrono::Utc;
 
     // Starvation prevention threshold: tasks older than this get priority boost
@@ -3750,8 +3755,8 @@ fn sort_tasks_by_priority_with_features<'a>(
 }
 
 fn agency_lifecycle_enabled_for_dispatch(
-    task: &workgraph::graph::Task,
-    graph: &workgraph::graph::WorkGraph,
+    task: &worksgood::graph::Task,
+    graph: &worksgood::graph::WorkGraph,
     config: &Config,
 ) -> bool {
     if task.id.starts_with(".assign-") {
@@ -3773,9 +3778,9 @@ fn agency_lifecycle_enabled_for_dispatch(
     true
 }
 
-fn dispatch_task_class(task: &workgraph::graph::Task) -> u8 {
+fn dispatch_task_class(task: &worksgood::graph::Task) -> u8 {
     if task.id.starts_with("drift-self-update-")
-        || workgraph::graph::is_agency_scaffold_task(&task.id)
+        || worksgood::graph::is_agency_scaffold_task(&task.id)
         || task
             .tags
             .iter()
@@ -3790,8 +3795,8 @@ fn dispatch_task_class(task: &workgraph::graph::Task) -> u8 {
 /// Compute priority inheritance for a task based on downstream dependencies.
 /// If this task blocks higher-priority tasks, inherit their priority.
 fn compute_priority_inheritance(
-    task: &workgraph::graph::Task,
-    graph: &workgraph::graph::WorkGraph,
+    task: &worksgood::graph::Task,
+    graph: &worksgood::graph::WorkGraph,
 ) -> Priority {
     let mut highest_inherited = task.priority;
 
@@ -3872,7 +3877,7 @@ fn check_respawn_throttle(task: &Task, graph_path: &Path) -> std::result::Result
                 t.log.push(LogEntry {
                     timestamp: now.to_rfc3339(),
                     actor: Some("coordinator".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: fail_msg.clone(),
                 });
                 true
@@ -3999,7 +4004,7 @@ fn record_spawn_failure(
 
 fn spawn_agents_for_ready_tasks(
     dir: &Path,
-    graph: &workgraph::graph::WorkGraph,
+    graph: &worksgood::graph::WorkGraph,
     executor: &str,
     config: &Config,
     default_model: Option<&str>,
@@ -4011,6 +4016,9 @@ fn spawn_agents_for_ready_tasks(
     let agents_dir = dir.join("agency").join("cache/agents");
     let gp = graph_path(dir);
     let mut spawned = 0;
+    // Memoize loaded WCC-profile configs by name for this tick so a component
+    // of N profiled tasks loads each profile file at most once.
+    let mut profile_cache = worksgood::dispatch::ProfileCache::new();
 
     // Sort ready tasks by priority with starvation prevention and priority inheritance
     let final_ready = sort_tasks_by_priority_with_features(graph, ready_tasks_raw, config);
@@ -4096,7 +4104,7 @@ fn spawn_agents_for_ready_tasks(
         // dependency on `.assign-*` prevents reaching here without an agent,
         // but this gate catches edge cases (e.g., pre-migration tasks without
         // the `.assign-*` blocking edge).
-        if auto_assign && !workgraph::graph::is_system_task(&task.id) && task.agent.is_none() {
+        if auto_assign && !worksgood::graph::is_system_task(&task.id) && task.agent.is_none() {
             continue;
         }
 
@@ -4171,12 +4179,32 @@ fn spawn_agents_for_ready_tasks(
             continue;
         }
 
+        // Per-WCC profile: if this task was stamped with a profile (via
+        // `wg publish --profile`), resolve a per-task effective config from
+        // that profile's complete snapshot and hand THAT to `plan_spawn`
+        // instead of the global config. A profile file carries the whole
+        // `coordinator.*` / `[models.*]` / `[llm_endpoints]` surface, so the
+        // existing executor/model/endpoint cascade transparently honors it.
+        // No profile ⇒ `effective_config_for_task` returns the global config
+        // unchanged (backward-compatible).
+        let eff_config =
+            worksgood::dispatch::effective_config_for_task(task, config, &mut profile_cache);
+        let eff_config: &Config = eff_config.as_ref();
+
         // Resolve model per-task: system tasks use their respective role models,
-        // all other tasks use the default (TaskAgent) model.
+        // all other tasks use the default (TaskAgent) model. When a profile is
+        // pinned, resolve the TaskAgent model from the PROFILE so the work
+        // task routes through the profile's model, not the global default.
         let task_model = if task.id.starts_with(".assign-") {
             Some(
-                config
-                    .resolve_model_for_role(workgraph::config::DispatchRole::Assigner)
+                eff_config
+                    .resolve_model_for_role(worksgood::config::DispatchRole::Assigner)
+                    .spawn_model_spec(),
+            )
+        } else if task.profile.is_some() {
+            Some(
+                eff_config
+                    .resolve_model_for_role(worksgood::config::DispatchRole::TaskAgent)
                     .spawn_model_spec(),
             )
         } else {
@@ -4198,9 +4226,9 @@ fn spawn_agents_for_ready_tasks(
             .as_ref()
             .and_then(|agent_hash| agency::find_agent_by_prefix(&agents_dir, agent_hash).ok());
         let agent_executor = agent_entity.as_ref().and_then(|a| a.explicit_executor());
-        let plan = match workgraph::dispatch::plan_spawn(
+        let plan = match worksgood::dispatch::plan_spawn(
             task,
-            config,
+            eff_config,
             agent_executor,
             task_model.as_deref(),
         ) {
@@ -4312,13 +4340,13 @@ fn auto_checkpoint_agents(dir: &Path, config: &Config) {
 /// Attempt auto-checkpoint for a single agent if thresholds are met.
 fn try_auto_checkpoint(
     dir: &Path,
-    agent: &workgraph::service::registry::AgentEntry,
+    agent: &worksgood::service::registry::AgentEntry,
     config: &Config,
     interval_turns: u32,
     interval_mins: u32,
 ) -> Result<()> {
     use crate::commands::checkpoint::{self, CheckpointType};
-    use workgraph::stream_event;
+    use worksgood::stream_event;
 
     let output_path = std::path::Path::new(&agent.output_file);
     let agent_dir = match output_path.parent() {
@@ -4447,9 +4475,9 @@ Focus on: files modified, features implemented, tests written, current status.
 Respond with ONLY the summary text, no JSON or formatting."#
     );
 
-    let result = workgraph::service::llm::run_lightweight_llm_call(
+    let result = worksgood::service::llm::run_lightweight_llm_call(
         config,
-        workgraph::config::DispatchRole::Triage,
+        worksgood::config::DispatchRole::Triage,
         &prompt,
         timeout_secs,
     )
@@ -4621,7 +4649,7 @@ pub fn coordinator_tick(
                 .collect();
             for task_id in &cron_task_ids {
                 if let Some(task) = graph.get_task_mut(task_id)
-                    && workgraph::cron::reset_cron_task(task)
+                    && worksgood::cron::reset_cron_task(task)
                 {
                     eprintln!(
                         "[dispatcher] Cron reset: '{}' → Open (next fire: {})",
@@ -4701,7 +4729,7 @@ pub fn coordinator_tick(
     }
 
     // Phase 5.6: Check if spawning is paused due to provider health failures.
-    match workgraph::service::ProviderHealth::load(dir) {
+    match worksgood::service::ProviderHealth::load(dir) {
         Ok(provider_health) if provider_health.should_pause_spawning() => {
             eprintln!(
                 "[dispatcher] Spawning paused: {}",
@@ -4735,7 +4763,7 @@ pub fn coordinator_tick(
     // Resolve task agent model: CLI override > models.task_agent > models.default > agent.model
     let effective_model = model.map(String::from).unwrap_or_else(|| {
         config
-            .resolve_model_for_role(workgraph::config::DispatchRole::TaskAgent)
+            .resolve_model_for_role(worksgood::config::DispatchRole::TaskAgent)
             .spawn_model_spec()
     });
     let spawned = spawn_agents_for_ready_tasks(
@@ -4799,7 +4827,7 @@ fn process_chat_inbox_for(dir: &Path, coordinator_id: u32) {
     let chat_ref_dir = dir
         .join("chat")
         .join(format!("coordinator-{}", coordinator_id));
-    if let Ok(Some(info)) = workgraph::session_lock::read_holder(&chat_ref_dir)
+    if let Ok(Some(info)) = worksgood::session_lock::read_holder(&chat_ref_dir)
         && info.alive
     {
         // A live handler owns this chat session — it'll write the
@@ -4874,13 +4902,13 @@ fn process_chat_inbox_for(dir: &Path, coordinator_id: u32) {
 /// The `coordinator_id` is included as routing context so the user board
 /// shows which coordinator/chat surface each message came from.
 pub fn forward_chat_to_user_board(dir: &Path, content: &str, coordinator_id: u32) {
-    use workgraph::graph::resolve_user_board_alias;
+    use worksgood::graph::resolve_user_board_alias;
 
-    let handle = workgraph::current_user();
+    let handle = worksgood::current_user();
     let alias = format!(".user-{}", handle);
 
     let graph_path = super::graph_path(dir);
-    let graph = match workgraph::parser::load_graph(&graph_path) {
+    let graph = match worksgood::parser::load_graph(&graph_path) {
         Ok(g) => g,
         Err(_) => return,
     };
@@ -4908,19 +4936,19 @@ mod tests {
     use super::*;
     use crate::commands::checkpoint::{self, CheckpointType};
     use tempfile::tempdir;
-    use workgraph::graph::{Node, Task, WorkGraph};
-    use workgraph::parser::{load_graph, save_graph};
-    use workgraph::stream_event::{self, StreamEvent, StreamWriter};
+    use worksgood::graph::{Node, Task, WorkGraph};
+    use worksgood::parser::{load_graph, save_graph};
+    use worksgood::stream_event::{self, StreamEvent, StreamWriter};
 
-    fn make_agent_entry(output_file: &std::path::Path) -> workgraph::service::registry::AgentEntry {
-        workgraph::service::registry::AgentEntry {
+    fn make_agent_entry(output_file: &std::path::Path) -> worksgood::service::registry::AgentEntry {
+        worksgood::service::registry::AgentEntry {
             id: "agent-1".to_string(),
             pid: std::process::id(),
             task_id: "t1".to_string(),
             executor: "test".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             last_heartbeat: chrono::Utc::now().to_rfc3339(),
-            status: workgraph::service::registry::AgentStatus::Working,
+            status: worksgood::service::registry::AgentStatus::Working,
             output_file: output_file.to_str().unwrap().to_string(),
             model: None,
             completed_at: None,
@@ -5099,7 +5127,7 @@ mod tests {
         write_stream_events(&agent_dir, 20, stream_event::now_ms() - 20 * 60_000);
 
         // Create a registry with a live agent (use PID 1 which should exist)
-        let mut registry = workgraph::service::registry::AgentRegistry::default();
+        let mut registry = worksgood::service::registry::AgentRegistry::default();
         let agent_entry = make_agent_entry(&output_file);
         registry
             .agents
@@ -6098,7 +6126,7 @@ mod tests {
     fn test_spawn_allows_assigned_agent_task_when_auto_assign_enabled() {
         // Verify the condition logic: task with agent set should NOT be skipped
         let has_agent = true; // agent = Some("abc123")
-        let is_system = workgraph::graph::is_system_task("my-task");
+        let is_system = worksgood::graph::is_system_task("my-task");
         let would_skip = true && !is_system && !has_agent;
         assert!(!would_skip, "task with agent field should NOT be skipped");
     }
@@ -6107,7 +6135,7 @@ mod tests {
     #[test]
     fn test_spawn_always_allows_system_tasks_when_auto_assign_enabled() {
         // System tasks like .assign-foo, .evaluate-foo should bypass auto_assign filter
-        let is_system = workgraph::graph::is_system_task(".assign-my-task");
+        let is_system = worksgood::graph::is_system_task(".assign-my-task");
         assert!(is_system, ".assign-* should be a system task");
 
         // The filter: skip if auto_assign && !is_system && agent.is_none()
@@ -6132,7 +6160,7 @@ mod tests {
             task.id = id.to_string();
             task.title = id.to_string();
             task.status = Status::Open;
-            task.priority = workgraph::graph::PRIORITY_HIGH;
+            task.priority = worksgood::graph::PRIORITY_HIGH;
             graph.add_node(Node::Task(task));
         }
 
@@ -6155,7 +6183,7 @@ mod tests {
     #[test]
     fn test_spawn_allows_unassigned_task_when_auto_assign_disabled() {
         let auto_assign = false;
-        let is_system = workgraph::graph::is_system_task("my-task");
+        let is_system = worksgood::graph::is_system_task("my-task");
         let has_agent = false; // no agent field
 
         let would_skip = auto_assign && !is_system && !has_agent;
@@ -6504,7 +6532,7 @@ mod tests {
         dimensions.insert("completeness".to_string(), 0.3);
         dimensions.insert("correctness".to_string(), 0.5);
 
-        let eval = workgraph::agency::Evaluation {
+        let eval = worksgood::agency::Evaluation {
             id: "flip-my-task-123".to_string(),
             task_id: "my-task".to_string(),
             agent_id: String::new(),
@@ -6516,7 +6544,7 @@ mod tests {
             evaluator: "flip:test".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             model: None,
-            source: workgraph::agency::eval_source::FLIP.to_string(),
+            source: worksgood::agency::eval_source::FLIP.to_string(),
             loop_iteration: 0,
         };
 
@@ -6629,7 +6657,7 @@ mod tests {
         let evals_dir = dir.path().join("agency").join("evaluations");
         std::fs::create_dir_all(&evals_dir).unwrap();
 
-        let eval = workgraph::agency::Evaluation {
+        let eval = worksgood::agency::Evaluation {
             id: "flip-t1-123".to_string(),
             task_id: "t1".to_string(),
             agent_id: String::new(),
@@ -6641,7 +6669,7 @@ mod tests {
             evaluator: "flip:test".to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             model: None,
-            source: workgraph::agency::eval_source::FLIP.to_string(),
+            source: worksgood::agency::eval_source::FLIP.to_string(),
             loop_iteration: 0,
         };
 
@@ -6875,7 +6903,7 @@ mod tests {
         let mut config = Config::default();
         config.coordinator.verify_mode = "separate".to_string();
 
-        let mut graph = workgraph::parser::load_graph(&graph_path).unwrap();
+        let mut graph = worksgood::parser::load_graph(&graph_path).unwrap();
         let modified = build_separate_verify_tasks(dir.path(), &mut graph, &config);
         assert!(modified, "should have created a verify task");
 
@@ -6973,7 +7001,7 @@ mod tests {
         let mut config = Config::default();
         config.coordinator.verify_mode = "separate".to_string();
 
-        let mut graph = workgraph::parser::load_graph(&graph_path).unwrap();
+        let mut graph = worksgood::parser::load_graph(&graph_path).unwrap();
         let modified1 = build_separate_verify_tasks(dir.path(), &mut graph, &config);
         assert!(modified1);
 
@@ -7006,7 +7034,7 @@ mod tests {
         let mut config = Config::default();
         config.coordinator.verify_mode = "separate".to_string();
 
-        let mut graph = workgraph::parser::load_graph(&graph_path).unwrap();
+        let mut graph = worksgood::parser::load_graph(&graph_path).unwrap();
         let modified = build_separate_verify_tasks(dir.path(), &mut graph, &config);
         assert!(!modified, "should not create verify task for system tasks");
     }
@@ -7021,22 +7049,22 @@ mod tests {
         let mut critical = Task::default();
         critical.id = "task-critical".to_string();
         critical.title = "Critical task".to_string();
-        critical.status = workgraph::graph::Status::Open;
-        critical.priority = workgraph::graph::PRIORITY_CRITICAL;
+        critical.status = worksgood::graph::Status::Open;
+        critical.priority = worksgood::graph::PRIORITY_CRITICAL;
         critical.created_at = Some(Utc::now().to_rfc3339());
 
         let mut normal = Task::default();
         normal.id = "task-normal".to_string();
         normal.title = "Normal task".to_string();
-        normal.status = workgraph::graph::Status::Open;
-        normal.priority = workgraph::graph::PRIORITY_NORMAL;
+        normal.status = worksgood::graph::Status::Open;
+        normal.priority = worksgood::graph::PRIORITY_NORMAL;
         normal.created_at = Some(Utc::now().to_rfc3339());
 
         let mut low = Task::default();
         low.id = "task-low".to_string();
         low.title = "Low task".to_string();
-        low.status = workgraph::graph::Status::Open;
-        low.priority = workgraph::graph::PRIORITY_LOW;
+        low.status = worksgood::graph::Status::Open;
+        low.priority = worksgood::graph::PRIORITY_LOW;
         low.created_at = Some(Utc::now().to_rfc3339());
 
         graph.add_node(Node::Task(normal.clone()));
@@ -7070,7 +7098,7 @@ mod tests {
             task.id = id.to_string();
             task.title = id.to_string();
             task.status = Status::Open;
-            task.priority = workgraph::graph::PRIORITY_HIGH;
+            task.priority = worksgood::graph::PRIORITY_HIGH;
             task.created_at = Some(Utc::now().to_rfc3339());
             graph.add_node(Node::Task(task));
         }
@@ -7092,16 +7120,16 @@ mod tests {
         let mut task_a = Task::default();
         task_a.id = "task-a".to_string();
         task_a.title = "Task A".to_string();
-        task_a.status = workgraph::graph::Status::Open;
-        task_a.priority = workgraph::graph::PRIORITY_NORMAL;
+        task_a.status = worksgood::graph::Status::Open;
+        task_a.priority = worksgood::graph::PRIORITY_NORMAL;
         task_a.dispatch_count = 3;
         task_a.created_at = Some(Utc::now().to_rfc3339());
 
         let mut task_b = Task::default();
         task_b.id = "task-b".to_string();
         task_b.title = "Task B".to_string();
-        task_b.status = workgraph::graph::Status::Open;
-        task_b.priority = workgraph::graph::PRIORITY_NORMAL;
+        task_b.status = worksgood::graph::Status::Open;
+        task_b.priority = worksgood::graph::PRIORITY_NORMAL;
         task_b.dispatch_count = 1;
         task_b.created_at = Some(Utc::now().to_rfc3339());
 
@@ -7128,15 +7156,15 @@ mod tests {
         let mut idle_task = Task::default();
         idle_task.id = "task-idle".to_string();
         idle_task.title = "Idle task".to_string();
-        idle_task.status = workgraph::graph::Status::Open;
-        idle_task.priority = workgraph::graph::PRIORITY_IDLE;
+        idle_task.status = worksgood::graph::Status::Open;
+        idle_task.priority = worksgood::graph::PRIORITY_IDLE;
         idle_task.created_at = Some(Utc::now().to_rfc3339());
 
         let mut normal_task = Task::default();
         normal_task.id = "task-normal".to_string();
         normal_task.title = "Normal task".to_string();
-        normal_task.status = workgraph::graph::Status::Open;
-        normal_task.priority = workgraph::graph::PRIORITY_NORMAL;
+        normal_task.status = worksgood::graph::Status::Open;
+        normal_task.priority = worksgood::graph::PRIORITY_NORMAL;
         normal_task.created_at = Some(Utc::now().to_rfc3339());
 
         // Case 1: Idle + Normal ready → Idle excluded
@@ -7175,8 +7203,8 @@ mod tests {
         let mut low_task = Task::default();
         low_task.id = "task-low".to_string();
         low_task.title = "Low task".to_string();
-        low_task.status = workgraph::graph::Status::Open;
-        low_task.priority = workgraph::graph::PRIORITY_LOW;
+        low_task.status = worksgood::graph::Status::Open;
+        low_task.priority = worksgood::graph::PRIORITY_LOW;
         low_task.created_at = Some(Utc::now().to_rfc3339());
         graph3.add_node(Node::Task(idle_task.clone()));
         graph3.add_node(Node::Task(low_task.clone()));
@@ -7209,16 +7237,16 @@ mod tests {
         let mut user_task = Task::default();
         user_task.id = "my-task".to_string();
         user_task.title = "My Task".to_string();
-        user_task.status = workgraph::graph::Status::Open;
-        user_task.priority = workgraph::graph::PRIORITY_NORMAL;
+        user_task.status = worksgood::graph::Status::Open;
+        user_task.priority = worksgood::graph::PRIORITY_NORMAL;
         graph.add_node(Node::Task(user_task));
 
         // Critical user task
         let mut critical_task = Task::default();
         critical_task.id = "crit-task".to_string();
         critical_task.title = "Critical Task".to_string();
-        critical_task.status = workgraph::graph::Status::Open;
-        critical_task.priority = workgraph::graph::PRIORITY_CRITICAL;
+        critical_task.status = worksgood::graph::Status::Open;
+        critical_task.priority = worksgood::graph::PRIORITY_CRITICAL;
         graph.add_node(Node::Task(critical_task));
 
         // Scaffold assign tasks
@@ -7229,14 +7257,14 @@ mod tests {
         let assign_normal = graph.get_task(".assign-my-task").unwrap();
         assert_eq!(
             assign_normal.priority,
-            workgraph::graph::PRIORITY_NORMAL,
+            worksgood::graph::PRIORITY_NORMAL,
             ".assign-* for Normal task should be Normal"
         );
 
         let assign_critical = graph.get_task(".assign-crit-task").unwrap();
         assert_eq!(
             assign_critical.priority,
-            workgraph::graph::PRIORITY_CRITICAL,
+            worksgood::graph::PRIORITY_CRITICAL,
             ".assign-* for Critical task should be Critical"
         );
     }
@@ -7365,7 +7393,7 @@ mod tests {
 
     #[test]
     fn test_is_daemon_managed_skips_chat_loop_tag() {
-        let chat_new = task_with_tags(".chat-2", &[workgraph::chat_id::CHAT_LOOP_TAG]);
+        let chat_new = task_with_tags(".chat-2", &[worksgood::chat_id::CHAT_LOOP_TAG]);
         assert!(
             is_daemon_managed(&chat_new),
             "chat-loop tagged tasks must be daemon-managed (bug A regression)"
@@ -7373,7 +7401,7 @@ mod tests {
 
         let chat_legacy = task_with_tags(
             ".coordinator-0",
-            &[workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG],
+            &[worksgood::chat_id::LEGACY_COORDINATOR_LOOP_TAG],
         );
         assert!(
             is_daemon_managed(&chat_legacy),
@@ -7393,14 +7421,14 @@ mod tests {
         // entry has callers in the codebase but the chat-loop entry
         // is here purely as a dispatcher-skip rule.
         assert!(
-            DAEMON_MANAGED_TAGS.contains(&workgraph::chat_id::CHAT_LOOP_TAG),
+            DAEMON_MANAGED_TAGS.contains(&worksgood::chat_id::CHAT_LOOP_TAG),
             "DAEMON_MANAGED_TAGS must contain '{}' to prevent dispatcher from claiming chat tasks",
-            workgraph::chat_id::CHAT_LOOP_TAG,
+            worksgood::chat_id::CHAT_LOOP_TAG,
         );
         assert!(
-            DAEMON_MANAGED_TAGS.contains(&workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG),
+            DAEMON_MANAGED_TAGS.contains(&worksgood::chat_id::LEGACY_COORDINATOR_LOOP_TAG),
             "DAEMON_MANAGED_TAGS must still contain legacy '{}' until migration is complete",
-            workgraph::chat_id::LEGACY_COORDINATOR_LOOP_TAG,
+            worksgood::chat_id::LEGACY_COORDINATOR_LOOP_TAG,
         );
     }
 }

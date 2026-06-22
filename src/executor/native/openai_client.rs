@@ -114,8 +114,10 @@ struct OaiResponseMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiToolCall>>,
-    /// Plaintext reasoning/thinking content (OpenRouter unified field).
-    #[serde(default)]
+    /// Plaintext reasoning/thinking content. `reasoning` is the
+    /// OpenRouter unified field; `reasoning_content` is the
+    /// vLLM/SGLang/DeepSeek OpenAI-compatible spelling.
+    #[serde(default, alias = "reasoning_content")]
     reasoning: Option<String>,
     /// Structured reasoning details (OpenRouter unified field).
     /// Passed back verbatim in subsequent requests to preserve reasoning context.
@@ -216,8 +218,11 @@ struct OaiStreamDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OaiStreamToolCall>>,
-    /// Reasoning/thinking content delta (OpenRouter streaming).
-    #[serde(default)]
+    /// Reasoning/thinking content delta. `reasoning` is the OpenRouter
+    /// unified field; `reasoning_content` is the vLLM / SGLang / DeepSeek
+    /// OpenAI-compatible spelling — accept both so reasoning is captured
+    /// (and kept out of the answer stream) regardless of server flavor.
+    #[serde(default, alias = "reasoning_content")]
     reasoning: Option<String>,
     /// Structured reasoning details delta (OpenRouter streaming).
     #[serde(default)]
@@ -253,6 +258,57 @@ struct OaiStreamToolCallFunction {
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_MAX_TOKENS: u32 = 16384;
 
+/// TCP connect timeout — a dead endpoint should fail fast.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Total-request timeout for **non-streaming** requests. A non-streaming
+/// completion returns a single body, so an overall cap is the right tool.
+const NON_STREAMING_TIMEOUT_SECS: u64 = 300;
+
+/// Default per-read (idle) timeout for the streaming body, in seconds.
+///
+/// reqwest's `read_timeout` resets on *every* received frame, so a healthy
+/// stream that keeps emitting tokens never trips it no matter how long the
+/// generation runs — only a genuinely stalled / silently-dropped connection
+/// does. This deliberately replaces a blanket total-request timeout on the
+/// streaming path: with reqwest 0.12, `Response::bytes_stream()` funnels
+/// *every* body error (total-timeout firing, connection drop, framing
+/// error) through `Kind::Decode`, whose Display is the unhelpful
+/// "error decoding response body". A total timeout therefore cut a
+/// long-but-healthy generation off around the cap and surfaced as exactly
+/// the cryptic "Stream interrupted ... error decoding response body" the
+/// user reported (~6300 tokens ≈ 300s at a steady local rate). 600s leaves
+/// generous headroom for local llama.cpp / vLLM prompt-processing stalls
+/// before the first token. Override via `WG_STREAM_READ_TIMEOUT_SECS`.
+const DEFAULT_STREAM_READ_TIMEOUT_SECS: u64 = 600;
+
+/// Per-read (idle) timeout for streaming bodies, honoring the
+/// `WG_STREAM_READ_TIMEOUT_SECS` override (0/invalid → default).
+fn stream_read_timeout() -> Duration {
+    let secs = std::env::var("WG_STREAM_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STREAM_READ_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Build the shared HTTP client used for both streaming and non-streaming
+/// OpenAI-compatible requests.
+///
+/// Note there is **no** total-request `.timeout(...)` here: that would cap
+/// healthy long streams (see [`DEFAULT_STREAM_READ_TIMEOUT_SECS`]). The
+/// streaming path is protected by `read_timeout` (idle/inactivity), and the
+/// non-streaming path applies its own per-request total timeout in
+/// `send_with_retry`.
+fn build_oai_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(stream_read_timeout())
+        .build()
+        .context("Failed to build HTTP client")
+}
+
 /// OpenAI-compatible chat completions client.
 ///
 /// Works with OpenRouter, direct OpenAI API, and any compatible endpoint.
@@ -283,10 +339,7 @@ pub struct OpenAiClient {
 impl OpenAiClient {
     /// Create a client with explicit configuration.
     pub fn new(api_key: String, model: &str, base_url: Option<&str>) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .context("Failed to build HTTP client")?;
+        let http = build_oai_http_client()?;
 
         Ok(Self {
             http,
@@ -586,7 +639,14 @@ impl OpenAiClient {
                         }
                     }
 
-                    let content = if text_parts.is_empty() {
+                    let content = if text_parts.is_empty() && tool_calls.is_empty() {
+                        // OpenAI-compatible servers reject assistant history
+                        // messages that contain only provider-specific hidden
+                        // reasoning fields. Preserve the turn with an empty
+                        // visible message instead of emitting neither
+                        // `content` nor `tool_calls`.
+                        Some(String::new())
+                    } else if text_parts.is_empty() {
                         None
                     } else {
                         Some(text_parts.join("\n"))
@@ -930,9 +990,11 @@ impl OpenAiClient {
             ));
         }
 
-        // Parse SSE stream and accumulate into a response
+        // Parse SSE stream and accumulate into a response. The buffer holds
+        // raw bytes so a multi-byte UTF-8 sequence split across two network
+        // chunks is reassembled intact (see `parse_next_oai_sse_data_bytes`).
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
 
         let mut response_id = String::new();
         let mut text_content = String::new();
@@ -949,32 +1011,32 @@ impl OpenAiClient {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    // Connection dropped mid-stream
+                    // Connection dropped mid-stream. Preserve the underlying
+                    // `reqwest::Error` in the chain (rather than stringifying
+                    // it) so upstream timeout/retry classification still works
+                    // — reqwest 0.12 collapses the *Display* to the generic
+                    // "error decoding response body" for all body errors.
                     if chunk_count == 0 {
-                        return Err(anyhow!(
-                            "Stream connection failed before receiving data: {}",
-                            e
-                        ));
+                        return Err(anyhow::Error::new(e)
+                            .context("Stream connection failed before receiving data"));
                     }
                     eprintln!(
                         "[openai-client] Stream interrupted after {} chunks: {}",
-                        chunk_count, e
+                        chunk_count,
+                        describe_reqwest_stream_error(&e)
                     );
                     // If we have a finish_reason, the response is likely complete
                     if finish_reason.is_some() {
                         break;
                     }
-                    return Err(anyhow!(
-                        "Stream interrupted after {} chunks: {}",
-                        chunk_count,
-                        e
-                    ));
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Stream interrupted after {} chunks", chunk_count)));
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend_from_slice(&chunk);
 
             // Process complete SSE data lines from the buffer
-            while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            while let Some(data) = parse_next_oai_sse_data_bytes(&mut buffer) {
                 if data == "[DONE]" {
                     break;
                 }
@@ -1109,7 +1171,9 @@ impl OpenAiClient {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        // Raw-byte buffer: reassembles UTF-8 sequences split across chunk
+        // boundaries (see `parse_next_oai_sse_data_bytes`).
+        let mut buffer: Vec<u8> = Vec::new();
         let mut response_id = String::new();
         let mut text_content = String::new();
         let mut reasoning_content = String::new();
@@ -1125,28 +1189,24 @@ impl OpenAiClient {
                 Ok(c) => c,
                 Err(e) => {
                     if chunk_count == 0 {
-                        return Err(anyhow!(
-                            "Stream connection failed before receiving data: {}",
-                            e
-                        ));
+                        return Err(anyhow::Error::new(e)
+                            .context("Stream connection failed before receiving data"));
                     }
                     eprintln!(
                         "[openai-client] Stream interrupted after {} chunks: {}",
-                        chunk_count, e
+                        chunk_count,
+                        describe_reqwest_stream_error(&e)
                     );
                     if finish_reason.is_some() {
                         break;
                     }
-                    return Err(anyhow!(
-                        "Stream interrupted after {} chunks: {}",
-                        chunk_count,
-                        e
-                    ));
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("Stream interrupted after {} chunks", chunk_count)));
                 }
             };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend_from_slice(&chunk);
 
-            while let Some(data) = parse_next_oai_sse_data(&mut buffer) {
+            while let Some(data) = parse_next_oai_sse_data_bytes(&mut buffer) {
                 if data == "[DONE]" {
                     break;
                 }
@@ -1327,6 +1387,9 @@ impl OpenAiClient {
                 .post(url)
                 .headers(headers)
                 .json(request)
+                // Non-streaming returns a single body, so a total-request
+                // timeout is appropriate here (unlike the streaming path).
+                .timeout(Duration::from_secs(NON_STREAMING_TIMEOUT_SECS))
                 .send()
                 .await;
 
@@ -2851,6 +2914,95 @@ fn parse_next_oai_sse_data(buffer: &mut String) -> Option<String> {
     }
 }
 
+/// Byte-oriented variant of [`parse_next_oai_sse_data`].
+///
+/// The streaming loop accumulates **raw bytes** (`Vec<u8>`) rather than a
+/// lossily-decoded `String`, because a network chunk can end in the middle
+/// of a multi-byte UTF-8 sequence. Decoding each chunk with
+/// `String::from_utf8_lossy` *before* re-assembly (the previous behavior)
+/// turned that split sequence into a U+FFFD replacement char, silently
+/// corrupting any non-ASCII output that happened to straddle a chunk
+/// boundary.
+///
+/// Splitting on `\n` (0x0A) is always safe: a UTF-8 continuation/lead byte
+/// is never 0x0A, so a complete SSE line never bisects a multi-byte
+/// character. We therefore only ever decode a *whole* line, where the byte
+/// boundaries are guaranteed valid. (`from_utf8_lossy` on a complete line is
+/// a no-op for well-formed UTF-8 and merely a safety net otherwise.)
+fn parse_next_oai_sse_data_bytes(buffer: &mut Vec<u8>) -> Option<String> {
+    loop {
+        let newline_pos = buffer.iter().position(|&b| b == b'\n')?;
+        let mut line_bytes = buffer[..newline_pos].to_vec();
+        buffer.drain(..newline_pos + 1);
+        if line_bytes.last() == Some(&b'\r') {
+            line_bytes.pop();
+        }
+        let line = String::from_utf8_lossy(&line_bytes);
+        let line = line.as_ref();
+
+        // Skip empty lines (SSE event separators) and comments
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+
+        // Extract data from "data: ..." lines
+        if let Some(data) = line.strip_prefix("data: ") {
+            return Some(data.to_string());
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            return Some(data.to_string());
+        }
+
+        // Skip unknown SSE fields (event:, id:, retry:, etc.)
+    }
+}
+
+/// Build a diagnostic description of a streaming body error.
+///
+/// reqwest 0.12's `Response::bytes_stream()` funnels *every* body failure
+/// through `Kind::Decode`, so the bare `Display` is always the unhelpful
+/// "error decoding response body" — whether the real cause was a timeout,
+/// a dropped connection, or a framing error. This classifies the error and
+/// walks its source chain so logs reveal the *actual* cause, which is what
+/// lets a future investigator tell a server-side drop apart from a
+/// client-side timeout without a packet capture.
+fn describe_reqwest_stream_error(e: &reqwest::Error) -> String {
+    let mut kinds = Vec::new();
+    if e.is_timeout() {
+        kinds.push("timeout");
+    }
+    if e.is_connect() {
+        kinds.push("connect");
+    }
+    if e.is_request() {
+        kinds.push("request");
+    }
+    if e.is_body() {
+        kinds.push("body");
+    }
+    if e.is_decode() {
+        kinds.push("decode");
+    }
+    let class = if kinds.is_empty() {
+        "unknown".to_string()
+    } else {
+        kinds.join("+")
+    };
+
+    let mut chain = Vec::new();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        chain.push(s.to_string());
+        src = s.source();
+    }
+
+    if chain.is_empty() {
+        format!("{} [class: {}]", e, class)
+    } else {
+        format!("{} [class: {}; cause: {}]", e, class, chain.join(" -> "))
+    }
+}
+
 /// Assemble a `MessagesResponse` from accumulated streaming state.
 fn assemble_oai_stream_response(
     response_id: String,
@@ -3210,6 +3362,42 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_messages_thinking_only_assistant_keeps_empty_content() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "exercise the system".to_string(),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "long hidden reasoning with no visible answer".to_string(),
+                    reasoning_details: None,
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "try again".to_string(),
+                }],
+            },
+        ];
+
+        let oai_msgs = OpenAiClient::translate_messages(&None, &messages);
+
+        assert_eq!(oai_msgs.len(), 3);
+        assert_eq!(oai_msgs[1].role, "assistant");
+        assert_eq!(oai_msgs[1].content.as_deref(), Some(""));
+        assert!(oai_msgs[1].tool_calls.is_none());
+
+        let json = serde_json::to_value(&oai_msgs[1]).unwrap();
+        assert_eq!(json["content"], "");
+        assert!(json.get("tool_calls").is_none());
+    }
+
+    #[test]
     fn test_translate_response_text_only() {
         let oai = OaiResponse {
             id: "chatcmpl-123".to_string(),
@@ -3416,6 +3604,76 @@ mod tests {
         let mut buf = "data: {\"cr\":true}\r\n\r\n".to_string();
         let data = parse_next_oai_sse_data(&mut buf).unwrap();
         assert_eq!(data, r#"{"cr":true}"#);
+    }
+
+    // ── Byte-oriented SSE parsing tests (decode resilience) ───────────────
+
+    #[test]
+    fn test_parse_oai_sse_bytes_basic() {
+        let mut buf = b"data: {\"id\":\"chatcmpl-1\"}\n\n".to_vec();
+        let data = parse_next_oai_sse_data_bytes(&mut buf).unwrap();
+        assert_eq!(data, r#"{"id":"chatcmpl-1"}"#);
+    }
+
+    #[test]
+    fn test_parse_oai_sse_bytes_crlf_and_comments() {
+        let mut buf = b": keep-alive\r\n\r\ndata: {\"ok\":true}\r\n".to_vec();
+        let data = parse_next_oai_sse_data_bytes(&mut buf).unwrap();
+        assert_eq!(data, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn test_parse_oai_sse_bytes_incomplete_returns_none() {
+        let mut buf = b"data: {\"partial".to_vec();
+        assert!(parse_next_oai_sse_data_bytes(&mut buf).is_none());
+        assert_eq!(buf, b"data: {\"partial");
+    }
+
+    /// Regression: a multi-byte UTF-8 sequence split across two network
+    /// chunks must be reassembled intact. The old code decoded each chunk
+    /// with `from_utf8_lossy` *before* reassembly, which corrupted the split
+    /// sequence into U+FFFD. With a raw-byte buffer the bytes are joined
+    /// first and only the complete line is decoded.
+    #[test]
+    fn test_parse_oai_sse_bytes_split_multibyte_utf8() {
+        // "世界" + emoji: 3-byte and 4-byte sequences, deliberately split.
+        let payload = "data: {\"content\":\"世界🌍\"}\n";
+        let bytes = payload.as_bytes();
+
+        // Split mid-way through a multi-byte char (byte 18 lands inside one of
+        // the CJK sequences for this payload).
+        let split_at = 18;
+        let (first, second) = bytes.split_at(split_at);
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(first);
+        // Incomplete line so far — no full line yet.
+        assert!(parse_next_oai_sse_data_bytes(&mut buf).is_none());
+        buf.extend_from_slice(second);
+
+        let data = parse_next_oai_sse_data_bytes(&mut buf).unwrap();
+        assert_eq!(data, r#"{"content":"世界🌍"}"#);
+        // The parsed JSON round-trips with the exact characters intact.
+        assert!(data.contains("世界🌍"));
+        assert!(!data.contains('\u{FFFD}'));
+    }
+
+    /// Demonstrates the *old* per-chunk decode bug for contrast: decoding
+    /// each raw chunk with `from_utf8_lossy` before reassembly corrupts a
+    /// split multi-byte sequence. This documents why the byte buffer is
+    /// necessary.
+    #[test]
+    fn test_old_per_chunk_lossy_decode_corrupts_split_utf8() {
+        let s = "世界🌍";
+        let bytes = s.as_bytes();
+        let (first, second) = bytes.split_at(2); // mid first CJK char
+        let mut reassembled = String::new();
+        reassembled.push_str(&String::from_utf8_lossy(first));
+        reassembled.push_str(&String::from_utf8_lossy(second));
+        // The per-chunk lossy path injects replacement chars — proving the
+        // bug the byte buffer fixes.
+        assert!(reassembled.contains('\u{FFFD}'));
+        assert_ne!(reassembled, s);
     }
 
     // ── Parse error handling tests ────────────────────────────────────────
@@ -3636,6 +3894,31 @@ mod tests {
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(chunk.usage.as_ref().unwrap().prompt_tokens, 10);
         assert_eq!(chunk.usage.as_ref().unwrap().completion_tokens, 5);
+    }
+
+    #[test]
+    fn test_stream_chunk_reasoning_field_openrouter() {
+        // OpenRouter spells the reasoning channel `reasoning`.
+        let json = r#"{"id":"gen-1","choices":[{"index":0,"delta":{"reasoning":"let me think"},"finish_reason":null}]}"#;
+        let chunk: OaiStreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning.as_deref(),
+            Some("let me think")
+        );
+        assert!(chunk.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_reasoning_content_alias_vllm() {
+        // vLLM / SGLang / DeepSeek spell the same channel
+        // `reasoning_content`; the serde alias maps it onto `reasoning`
+        // so it is captured (and kept out of the answer stream) too.
+        let json = r#"{"id":"gen-2","choices":[{"index":0,"delta":{"reasoning_content":"hidden CoT"},"finish_reason":null}]}"#;
+        let chunk: OaiStreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning.as_deref(),
+            Some("hidden CoT")
+        );
     }
 
     #[test]

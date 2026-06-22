@@ -14,8 +14,8 @@
 use chrono::Utc;
 use std::path::Path;
 
-use workgraph::config::Config;
-use workgraph::graph::{Node, PRIORITY_DEFAULT, Priority, Status, Task, WorkGraph, lower_priority};
+use worksgood::config::Config;
+use worksgood::graph::{Node, PRIORITY_DEFAULT, Priority, Status, Task, WorkGraph, lower_priority};
 
 /// Tags that mark tasks as part of the evaluation/assignment infrastructure.
 /// Tasks with these tags do not get their own eval tasks (no meta-evaluation).
@@ -101,7 +101,7 @@ pub fn scaffold_flip_task(graph: &mut WorkGraph, task_id: &str, config: &Config)
     let flip_task_id = format!(".flip-{}", task_id);
 
     // Skip system tasks (unless pipeline-eligible like .verify-*)
-    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
+    if worksgood::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
 
@@ -117,7 +117,7 @@ pub fn scaffold_flip_task(graph: &mut WorkGraph, task_id: &str, config: &Config)
         return false;
     }
 
-    let flip_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+    let flip_resolved = config.resolve_model_for_role(worksgood::config::DispatchRole::Evaluator);
 
     // Calculate auto-priority for flip task
     let priority = calculate_auto_priority(graph, task_id, "flip");
@@ -177,7 +177,7 @@ pub fn scaffold_full_pipeline(
     config: &Config,
 ) -> bool {
     // Skip system tasks (unless pipeline-eligible like .verify-*) and dominated-tag tasks
-    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
+    if worksgood::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
     // Skip shell executor tasks — they're commands, not agent work
@@ -251,7 +251,7 @@ pub fn scaffold_full_pipeline(
         !skip_eval && config.agency.auto_evaluate && should_run_flip(graph, task_id, config);
     if run_flip && graph.get_task(&flip_task_id).is_none() {
         let flip_resolved =
-            config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+            config.resolve_model_for_role(worksgood::config::DispatchRole::Evaluator);
         let flip_task = Task {
             id: flip_task_id.clone(),
             title: format!("FLIP: {}", task_id),
@@ -302,7 +302,7 @@ pub fn scaffold_full_pipeline(
         ));
 
         let eval_resolved =
-            config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+            config.resolve_model_for_role(worksgood::config::DispatchRole::Evaluator);
         let eval_task = Task {
             id: eval_task_id.clone(),
             title: format!("Evaluate: {}", task_title),
@@ -372,7 +372,7 @@ pub fn scaffold_assign_task(graph: &mut WorkGraph, task_id: &str, task_title: &s
     }
 
     // Skip system tasks (unless pipeline-eligible like .verify-*) — no assign for .evaluate, .flip, etc.
-    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
+    if worksgood::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
 
@@ -467,7 +467,7 @@ pub fn scaffold_eval_task(
     let eval_task_id = format!(".evaluate-{}", task_id);
 
     // Skip system tasks (unless pipeline-eligible like .verify-*)
-    if workgraph::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
+    if worksgood::graph::is_system_task(task_id) && !is_pipeline_eligible_system_task(task_id) {
         return false;
     }
 
@@ -521,7 +521,7 @@ pub fn scaffold_eval_task(
         task_id, task_id, task_id, task_id,
     ));
 
-    let eval_resolved = config.resolve_model_for_role(workgraph::config::DispatchRole::Evaluator);
+    let eval_resolved = config.resolve_model_for_role(worksgood::config::DispatchRole::Evaluator);
 
     // Calculate auto-priority for eval task
     let priority = calculate_auto_priority(graph, task_id, "evaluate");
@@ -563,7 +563,7 @@ pub fn scaffold_eval_task(
 
 /// Resolve the evaluator agent identity prompt, if an evaluator agent is configured.
 fn resolve_evaluator_identity(dir: &Path, config: &Config) -> Option<String> {
-    use workgraph::agency::{
+    use worksgood::agency::{
         load_agent, load_role, load_tradeoff, render_identity_prompt_rich, resolve_all_components,
         resolve_outcome,
     };
@@ -616,7 +616,7 @@ pub fn scaffold_eval_tasks_batch(
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use workgraph::graph::{Node, Status, Task, WorkGraph};
+    use worksgood::graph::{Node, Status, Task, WorkGraph};
 
     fn make_task(id: &str, title: &str) -> Task {
         Task {

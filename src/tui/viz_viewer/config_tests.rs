@@ -62,8 +62,8 @@ mod tui_config_tests {
     }
 
     /// Load config from disk for verification.
-    fn load_config(workgraph_dir: &std::path::Path) -> workgraph::config::Config {
-        workgraph::config::Config::load(workgraph_dir).unwrap()
+    fn load_config(workgraph_dir: &std::path::Path) -> worksgood::config::Config {
+        worksgood::config::Config::load(workgraph_dir).unwrap()
     }
 
     // ── Toggle Tests ─────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ mod tui_config_tests {
         let mut app = make_config_test_app(wg_dir);
 
         // Write initial config with agency.auto_evaluate = false
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.agency.auto_evaluate = false;
         config.save(wg_dir).unwrap();
 
@@ -109,7 +109,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.tui.show_token_counts = false;
         config.save(wg_dir).unwrap();
 
@@ -132,7 +132,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -152,7 +152,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.agency.auto_assign = false;
         config.save(wg_dir).unwrap();
 
@@ -171,7 +171,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.agency.auto_triage = true;
         config.save(wg_dir).unwrap();
 
@@ -193,7 +193,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.max_agents = 3;
         config.save(wg_dir).unwrap();
 
@@ -228,7 +228,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.max_agents = 3;
         config.save(wg_dir).unwrap();
 
@@ -261,7 +261,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.agent_timeout = "30m".to_string();
         config.save(wg_dir).unwrap();
 
@@ -289,7 +289,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -317,7 +317,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.executor = Some("claude".to_string());
         config.save(wg_dir).unwrap();
 
@@ -353,7 +353,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.executor = Some("claude".to_string());
         config.save(wg_dir).unwrap();
 
@@ -375,7 +375,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -409,7 +409,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -436,7 +436,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -469,7 +469,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -488,7 +488,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -509,7 +509,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -531,7 +531,7 @@ mod tui_config_tests {
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -571,7 +571,7 @@ mod tui_config_tests {
         let mut app = make_config_test_app(wg_dir);
 
         // Start with a rich config
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.max_agents = 3;
         config.coordinator.executor = Some("claude".to_string());
         config.agency.auto_evaluate = true;
@@ -604,7 +604,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -620,7 +620,7 @@ mod tui_config_tests {
         assert!(parsed.is_ok(), "Config file should be valid TOML");
 
         // Also ensure it can be deserialized back to Config
-        let deserialized: Result<workgraph::config::Config, _> = toml::from_str(&content);
+        let deserialized: Result<worksgood::config::Config, _> = toml::from_str(&content);
         assert!(
             deserialized.is_ok(),
             "Config file should deserialize to Config struct"
@@ -635,7 +635,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.max_agents = 3;
         config.save(wg_dir).unwrap();
 
@@ -660,7 +660,7 @@ mod tui_config_tests {
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -730,7 +730,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -749,7 +749,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -773,7 +773,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -803,7 +803,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -823,11 +823,11 @@ new_setting = "hello"
         let mut app = make_config_test_app(wg_dir);
 
         // Add an endpoint first
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config
             .llm_endpoints
             .endpoints
-            .push(workgraph::config::EndpointConfig {
+            .push(worksgood::config::EndpointConfig {
                 name: "to-remove".to_string(),
                 provider: "anthropic".to_string(),
                 url: None,
@@ -860,11 +860,11 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config
             .llm_endpoints
             .endpoints
-            .push(workgraph::config::EndpointConfig {
+            .push(worksgood::config::EndpointConfig {
                 name: "ep1".to_string(),
                 provider: "anthropic".to_string(),
                 url: None,
@@ -879,7 +879,7 @@ new_setting = "hello"
         config
             .llm_endpoints
             .endpoints
-            .push(workgraph::config::EndpointConfig {
+            .push(worksgood::config::EndpointConfig {
                 name: "ep2".to_string(),
                 provider: "openai".to_string(),
                 url: None,
@@ -919,7 +919,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.coordinator.max_agents = 3;
         config.save(wg_dir).unwrap();
 
@@ -951,7 +951,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -968,7 +968,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -988,7 +988,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.agency.auto_assign = false;
         config.agency.auto_evaluate = false;
         config.agency.auto_triage = false;
@@ -1021,7 +1021,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.viz.animations = "normal".to_string();
         config.save(wg_dir).unwrap();
 
@@ -1050,7 +1050,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.guardrails.max_child_tasks_per_agent = 25;
         config.save(wg_dir).unwrap();
 
@@ -1075,7 +1075,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let mut config = workgraph::config::Config::default();
+        let mut config = worksgood::config::Config::default();
         config.guardrails.max_task_depth = 8;
         config.save(wg_dir).unwrap();
 
@@ -1100,7 +1100,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();
@@ -1124,7 +1124,7 @@ new_setting = "hello"
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -1160,7 +1160,7 @@ new_setting = "hello"
         let tmp = tempfile::tempdir().unwrap();
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
         app.load_config_panel();
 
@@ -1182,7 +1182,7 @@ new_setting = "hello"
         let wg_dir = tmp.path();
         let mut app = make_config_test_app(wg_dir);
 
-        let config = workgraph::config::Config::default();
+        let config = worksgood::config::Config::default();
         config.save(wg_dir).unwrap();
 
         app.load_config_panel();

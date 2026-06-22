@@ -51,6 +51,33 @@ install target, with `--locked` so Cargo uses the checked-in lockfile during
 install. Forgetting this step is a common source of "why isn't this working"
 issues when testing changes.
 
+### Formatting & lint MUST match CI (run `cargo fmt` before pushing)
+
+CI's "Check & Lint" job (`.github/workflows/ci.yml`) fails fast on
+`cargo fmt --check`, then runs `cargo clippy`, both on the **stable** toolchain.
+rustfmt's output differs between stable and nightly (nightly collapses some
+`assert!(...)` / method-chain forms that stable re-expands) and can drift across
+stable releases — this caused two separate fmt-drift CI failures on the polish
+branch.
+
+The repo pins the toolchain in **`rust-toolchain.toml`** (`channel = "1.96.0"`,
+with `rustfmt` + `clippy` components) so local and CI use the *same* rustfmt.
+Because of that pin, the plain commands already do the right thing — **always run
+these before committing/pushing**:
+
+```
+cargo fmt              # formats with the pinned stable rustfmt (matches CI)
+cargo fmt --check      # must be clean — CI fast-fails here
+cargo clippy           # same invocation CI runs
+```
+
+Do **not** format with `cargo +nightly fmt` or an editor configured to run a
+nightly/standalone rustfmt — that reintroduces the drift. If `rustfmt`/`clippy`
+aren't installed for the pinned toolchain, rustup auto-installs them on first
+use; otherwise `rustup component add rustfmt clippy`. To bump Rust, edit
+`channel` in `rust-toolchain.toml` (keep it `>=` the version CI's `@stable`
+resolves to); the CI `nightly` job opts out via `cargo +nightly`.
+
 ## Service Configuration
 
 Pick a **(model, endpoint)** pair — the `wg` command derives the handler from the model spec's provider prefix:
@@ -86,6 +113,68 @@ This writes `~/.wg/active-profile` and hot-reloads the daemon.
 `wg profile show` / `list` / `create` / `edit` / `diff` / `init-starters`
 cover the rest of the management surface. Profiles overlay onto the
 global+local merge but never clobber project-local config.
+
+#### Flipping the active profile and reverting (the round-trip)
+
+The active profile is global state in `~/.wg/active-profile`. The chat agent
+flips it to run a batch of tasks on Anthropic credits, then reverts to hand work
+back to the in-process handler:
+
+```
+wg profile use claude     # flip: next workers run the claude profile (opus worker)
+# ... dispatch / run a batch on Anthropic credits ...
+wg profile use nex        # revert: back to the in-process localhost endpoint
+```
+
+`wg profile use codex` is the third flip target. Every `wg profile use` writes
+`~/.wg/active-profile` and **hot-reloads the running daemon** — already-spawned
+workers keep their model; the *next* worker the daemon spawns picks up the new
+profile (no daemon restart). Pass `--no-reload` to stage the switch without
+poking the daemon. Activation overlays on the global+local merge and never edits
+project-local config.
+
+#### `<name>:<route>` pins a model, it does not select an endpoint
+
+The optional `:<suffix>` in `wg profile use <name>:<suffix>` is a **model spec**,
+not an endpoint/route selector. It activates profile `<name>` and pins `<suffix>`
+as the default + task-agent route in one step (`models.default`,
+`models.task_agent`, `agent.model`, `dispatcher.model`, and the standard/premium
+tiers all become `<name>:<suffix>`):
+
+- `wg profile use claude:opus` → claude profile, default route pinned to `claude:opus`.
+- `wg profile use codex:gpt-5.5` → codex profile, default route pinned to `codex:gpt-5.5`.
+
+Because the suffix is a model id, **`nex:openrouter` is NOT the same as plain
+`nex`, and does NOT route to OpenRouter.** Plain `wg profile use nex` uses the
+profile's own default model (`nex:qwen3-coder-30b`) at the localhost endpoint
+`http://127.0.0.1:8088`. `wg profile use nex:openrouter` instead pins the literal
+model id `nex:openrouter` — i.e. it tells the in-process nex handler to send a
+model named `openrouter` to that same localhost endpoint (the endpoint is
+unchanged). That is almost never what you want.
+
+To actually run through OpenRouter, use the `openrouter:` provider prefix (the
+nex/native handler serves it), e.g. `wg config -m openrouter:anthropic/claude-opus-4-7`;
+a bare `vendor/model` route launched on the nex handler with no endpoint is
+auto-normalized to `openrouter:vendor/model`. There is no `wg profile use
+openrouter:…` form — `openrouter` is a provider prefix, not a profile name, and
+the model-qualified activation rejects it.
+
+**Decision — nex's default route is left on localhost (unchanged).** We
+deliberately do not repoint the `nex` profile's default to OpenRouter, because it
+is not low-risk:
+
+- The `nex` profile is by definition the in-process handler at a **localhost**
+  endpoint (it mirrors the `wg nex` subcommand); repointing the default would
+  change its identity and the local-endpoint contract the rest of these docs
+  build on.
+- The localhost endpoint needs no credential. An OpenRouter default would require
+  an `OPENROUTER_API_KEY` and reintroduce the "openrouter configured but no key"
+  silent failures the agency-pinning section below calls out.
+- There is no single canonical OpenRouter model to adopt as the default.
+- Even if set, `nex` and `nex:openrouter` would still differ: the suffix pins the
+  bogus model id `openrouter`, not an `openrouter:`-prefixed route. The premise
+  that the two could be made identical rests on reading the suffix as a route, so
+  the fix is this documentation, not a config change.
 
 API keys live in a credential store managed by `wg secret`. Endpoints
 should reference keys via `api_key_ref = "keyring:<name>"` (preferred);

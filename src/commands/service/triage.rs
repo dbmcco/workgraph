@@ -6,19 +6,19 @@ use std::fs;
 use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::Path;
 
-use workgraph::agency;
-use workgraph::config::Config;
-use workgraph::graph::{
+use worksgood::agency;
+use worksgood::config::Config;
+use worksgood::graph::{
     LogEntry, Status, Task, evaluate_cycle_iteration, parse_token_usage, parse_wg_tokens,
 };
-use workgraph::parser::{load_graph, load_graph_locked, lock_graph_file, modify_graph};
-use workgraph::profile;
-use workgraph::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
-use workgraph::service::{ProviderErrorKind, ProviderHealth, classify_error, extract_provider_id};
-use workgraph::stream_event::{self, StreamEvent};
+use worksgood::parser::{load_graph, modify_graph};
+use worksgood::profile;
+use worksgood::service::registry::{AgentEntry, AgentRegistry, AgentStatus};
+use worksgood::service::{ProviderErrorKind, ProviderHealth, classify_error, extract_provider_id};
+use worksgood::stream_event::{self, StreamEvent};
 
 use crate::commands::is_process_alive;
-use workgraph::metrics::log_metrics_summary;
+use worksgood::metrics::log_metrics_summary;
 
 /// Extract session_id from an agent's stream files (stream.jsonl or raw_stream.jsonl).
 fn extract_session_id(agent: &AgentEntry) -> Option<String> {
@@ -67,7 +67,7 @@ fn extract_session_id(agent: &AgentEntry) -> Option<String> {
 fn parse_token_usage_from_stream(
     agent_id: &str,
     dir: &Path,
-) -> Option<workgraph::graph::TokenUsage> {
+) -> Option<worksgood::graph::TokenUsage> {
     let agent_dir = dir.join("agents").join(agent_id);
     let stream_path = agent_dir.join(stream_event::STREAM_FILE_NAME);
     if !stream_path.exists() {
@@ -168,7 +168,7 @@ fn detect_dead_reason(
     // recycled by the OS. We verify by comparing the actual process start time
     // against the agent's registered start time.
     if let Ok(agent_start) = agent.started_at.parse::<chrono::DateTime<chrono::Utc>>()
-        && !workgraph::service::verify_process_identity(agent.pid, agent_start.timestamp())
+        && !worksgood::service::verify_process_identity(agent.pid, agent_start.timestamp())
     {
         return Some(DeadReason::PidReused);
     }
@@ -245,7 +245,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                 if now_ms - last_event_ms > STREAM_STALE_THRESHOLD_MS {
                     // Suppress warning if agent has active child processes
                     // (e.g., waiting on cargo build, wg commands, sub-agents)
-                    if workgraph::service::has_active_children(agent.pid) {
+                    if worksgood::service::has_active_children(agent.pid) {
                         eprintln!(
                             "[triage] Agent {} (task {}) stream stale for {}s but has active child processes — not stuck",
                             agent.id,
@@ -321,7 +321,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                             task.log.push(LogEntry {
                                 timestamp: Utc::now().to_rfc3339(),
                                 actor: Some("triage".to_string()),
-                                user: Some(workgraph::current_user()),
+                                user: Some(worksgood::current_user()),
                                 message: format!(
                                     "Triage failed ({}), task reset: agent '{}' (PID {}) process exited",
                                     e, agent_id, pid
@@ -352,7 +352,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     task.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: None,
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: reason_msg,
                     });
                 }
@@ -372,7 +372,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
                     task.log.push(LogEntry {
                         timestamp: Utc::now().to_rfc3339(),
                         actor: Some("coordinator".to_string()),
-                        user: Some(workgraph::current_user()),
+                        user: Some(worksgood::current_user()),
                         message: format!(
                             "Circuit breaker: auto-paused after {} agent deaths within {}s. \
                              Investigate and run `wg resume {}` when ready.",
@@ -580,7 +580,7 @@ pub(crate) fn cleanup_dead_agents(dir: &Path, graph_path: &Path) -> Result<Vec<S
 fn track_provider_health(
     dir: &Path,
     dead: &[(String, String, u32, String, DeadReason)],
-    locked_registry: &workgraph::service::LockedRegistry,
+    locked_registry: &worksgood::service::LockedRegistry,
     config: &Config,
 ) -> Result<()> {
     // Load current provider health state
@@ -644,7 +644,7 @@ fn track_provider_health(
             ProviderErrorKind::Transient | ProviderErrorKind::FatalTask => {
                 // For successful completion or non-provider errors, record success to reset counters
                 // But only if the task actually completed successfully
-                if task.status == workgraph::graph::Status::Done {
+                if task.status == worksgood::graph::Status::Done {
                     provider_health.record_success(&provider_id);
                 }
                 // For transient/task errors, don't count against provider health
@@ -866,9 +866,9 @@ fn run_triage(config: &Config, task: &Task, output_file: &str) -> Result<TriageV
     let log_content = read_truncated_log(output_file, max_log_bytes);
     let prompt = build_triage_prompt(task, &log_content);
 
-    let result = workgraph::service::llm::run_lightweight_llm_call(
+    let result = worksgood::service::llm::run_lightweight_llm_call(
         config,
-        workgraph::config::DispatchRole::Triage,
+        worksgood::config::DispatchRole::Triage,
         &prompt,
         timeout_secs,
     )
@@ -951,7 +951,7 @@ fn try_escalate_model(task: &mut Task, dir: &Path, config: &Config) {
         task.log.push(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
             actor: Some("escalation".to_string()),
-            user: Some(workgraph::current_user()),
+            user: Some(worksgood::current_user()),
             message: format!(
                 "Retrying with model {} ({}) after {} failed",
                 result.model, result.reason, old_model,
@@ -980,7 +980,7 @@ fn apply_triage_verdict(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("triage".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "Triage: work complete (agent '{}' PID {} died) — {}",
                     agent_id, pid, verdict.reason
@@ -1001,7 +1001,7 @@ fn apply_triage_verdict(
                 task.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("triage".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!(
                         "Triage: wanted continue but max retries exceeded ({}/{}) — failing task",
                         task.retry_count, max
@@ -1039,7 +1039,7 @@ fn apply_triage_verdict(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("triage".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "Triage: continuing (agent '{}' PID {} died) — {}",
                     agent_id, pid, verdict.reason
@@ -1061,7 +1061,7 @@ fn apply_triage_verdict(
                 task.log.push(LogEntry {
                     timestamp: Utc::now().to_rfc3339(),
                     actor: Some("triage".to_string()),
-                    user: Some(workgraph::current_user()),
+                    user: Some(worksgood::current_user()),
                     message: format!(
                         "Triage: wanted restart but max retries exceeded ({}/{}) — failing task",
                         task.retry_count, max
@@ -1080,7 +1080,7 @@ fn apply_triage_verdict(
             task.log.push(LogEntry {
                 timestamp: Utc::now().to_rfc3339(),
                 actor: Some("triage".to_string()),
-                user: Some(workgraph::current_user()),
+                user: Some(worksgood::current_user()),
                 message: format!(
                     "Triage: restarting (agent '{}' PID {} died) — {}",
                     agent_id, pid, verdict.reason
@@ -1178,7 +1178,7 @@ fn attempt_fallback_worktree_cleanup(_project_root: &Path, agent_id: &str) -> Re
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use workgraph::graph::Task;
+    use worksgood::graph::Task;
 
     /// Helper: call apply_triage_verdict with a dummy dir and default config
     /// (no profile set → no escalation).
@@ -1589,7 +1589,7 @@ mod tests {
     /// `.evaluate-*`, and `.assign-*` tasks.
     #[test]
     fn test_triage_token_extraction_fallback_to_wg_tokens() {
-        use workgraph::graph::{parse_token_usage, parse_wg_tokens};
+        use worksgood::graph::{parse_token_usage, parse_wg_tokens};
 
         let temp_dir = TempDir::new().unwrap();
         let log_path = temp_dir.path().join("output.log");
@@ -1772,7 +1772,7 @@ mod tests {
         .unwrap();
 
         // Create an in-progress task assigned to agent-1
-        let mut graph = workgraph::graph::WorkGraph::new();
+        let mut graph = worksgood::graph::WorkGraph::new();
         let task = Task {
             id: "task-1".to_string(),
             title: "Test Task".to_string(),
@@ -1780,8 +1780,8 @@ mod tests {
             assigned: Some("agent-1".to_string()),
             ..Default::default()
         };
-        graph.add_node(workgraph::graph::Node::Task(task));
-        workgraph::parser::save_graph(&graph, &gpath).unwrap();
+        graph.add_node(worksgood::graph::Node::Task(task));
+        worksgood::parser::save_graph(&graph, &gpath).unwrap();
 
         // Register an agent with a dead PID
         let mut registry = AgentRegistry::new();
@@ -1794,7 +1794,7 @@ mod tests {
         assert_eq!(cleaned[0], agent_id);
 
         // Verify task was unclaimed
-        let graph = workgraph::parser::load_graph(&gpath).unwrap();
+        let graph = worksgood::parser::load_graph(&gpath).unwrap();
         let task = graph.get_task("task-1").unwrap();
         assert_eq!(task.status, Status::Open, "Task should be reset to Open");
         assert!(task.assigned.is_none(), "Task should be unassigned");
@@ -1829,7 +1829,7 @@ mod tests {
         // No config override → default 30s grace period applies.
 
         // Create an in-progress task assigned to agent-1
-        let mut graph = workgraph::graph::WorkGraph::new();
+        let mut graph = worksgood::graph::WorkGraph::new();
         let task = Task {
             id: "task-1".to_string(),
             title: "Test Task".to_string(),
@@ -1837,8 +1837,8 @@ mod tests {
             assigned: Some("agent-1".to_string()),
             ..Default::default()
         };
-        graph.add_node(workgraph::graph::Node::Task(task));
-        workgraph::parser::save_graph(&graph, &gpath).unwrap();
+        graph.add_node(worksgood::graph::Node::Task(task));
+        worksgood::parser::save_graph(&graph, &gpath).unwrap();
 
         // Register an agent with a dead PID but FRESH start time (within grace period)
         let mut registry = AgentRegistry::new();
@@ -1854,7 +1854,7 @@ mod tests {
         );
 
         // Verify task is still in-progress
-        let graph = workgraph::parser::load_graph(&gpath).unwrap();
+        let graph = worksgood::parser::load_graph(&gpath).unwrap();
         let task = graph.get_task("task-1").unwrap();
         assert_eq!(
             task.status,
@@ -1874,7 +1874,7 @@ mod tests {
 
     /// Helper: write a ranked tiers file to the temp dir so escalation can find it.
     fn write_ranked_tiers_for_escalation(dir: &std::path::Path) {
-        use workgraph::model_benchmarks::{RankedModel, RankedTiers};
+        use worksgood::model_benchmarks::{RankedModel, RankedTiers};
         let ranked = RankedTiers {
             fast: vec![],
             standard: vec![

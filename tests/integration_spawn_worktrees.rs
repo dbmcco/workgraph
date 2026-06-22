@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
-use workgraph::graph::{Node, Status, Task, WorkGraph};
-use workgraph::parser::save_graph;
+use worksgood::graph::{Node, Status, Task, WorkGraph};
+use worksgood::parser::save_graph;
 
 fn wg_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("could not get current exe path");
