@@ -479,17 +479,20 @@ EXECUTORS & MODELS
 
   wg config -m claude:opus                                  # claude CLI handler
   wg config -m codex:gpt-5.5                                # codex CLI handler
-  wg config -m nex:qwen3-coder -e http://127.0.0.1:8088     # in-process nex handler
-  wg config -m openrouter:anthropic/claude-opus-4-7         # in-process nex handler
+  wg config -m nex:qwopus3.6:27b-mtp-q4 -e http://127.0.0.1:11434/v1
+                                                              # in-process nex handler via Ollama
+  wg config -m openrouter:anthropic/claude-opus-4-7         # opt-in OpenRouter route via nex
 
   Or pick a named profile (writes ~/.wg/active-profile, hot-reloads daemon):
 
   wg profile use claude         # Starter profile: claude:opus worker
   wg profile use codex          # Starter profile: codex:gpt-5.5
   wg profile use codex:gpt-5.5  # Codex profile with exact default/task-agent route
-  wg profile use nex            # Starter profile: in-process nex endpoint
+  wg profile use nex            # Starter profile: local Qwopus via Ollama
+  wg profile use opencode       # Starter profile: z.ai GLM via opencode
+  wg profile use pi             # Starter profile: Pi coding agent
   wg profile show               # Inspect active profile
-  wg profile init-starters      # Re-write the three starter profiles
+  wg profile init-starters      # Re-write built-in starter profiles
 
   Set a default model for all agents:
 
@@ -891,8 +894,8 @@ fn json_output() -> serde_json::Value {
             "model_spec_routing": "wg derives the handler from the model spec's provider prefix; --executor / --coordinator-executor is a deprecated legacy alias.",
             "claude": "wg config -m claude:opus (claude CLI handler)",
             "codex": "wg config -m codex:gpt-5.5 (codex CLI handler)",
-            "nex_local": "wg config -m nex:qwen3-coder -e http://127.0.0.1:8088 (in-process nex handler)",
-            "openrouter": "wg config -m openrouter:anthropic/claude-opus-4-7 (in-process nex handler)",
+            "nex_local": "wg config -m nex:qwopus3.6:27b-mtp-q4 -e http://127.0.0.1:11434/v1 (local Qwopus via nex)",
+            "openrouter": "wg config -m openrouter:anthropic/claude-opus-4-7 (explicit opt-in OpenRouter route via nex)",
             "set_model_cli": "wg service start --model claude:sonnet-4-6",
             "set_model_config": "[dispatcher] model = \"claude:sonnet-4-6\"",
             "per_task_model": "wg add \"task\" --model openrouter:google/gemini-2.5-flash",
@@ -909,8 +912,8 @@ fn json_output() -> serde_json::Value {
             "create": "wg profile create <name>",
             "edit": "wg profile edit <name>",
             "diff": "wg profile diff <a> <b>",
-            "init_starters": "wg profile init-starters (writes built-in starters: claude, codex, nex)",
-            "starters": ["claude (opus worker)", "codex (gpt-5.5)", "nex (in-process endpoint)"]
+            "init_starters": "wg profile init-starters (writes built-in starters: claude, codex, nex, opencode, pi)",
+            "starters": ["claude (opus worker)", "codex (gpt-5.5)", "nex (local Qwopus)", "opencode (z.ai GLM)", "pi (Pi coding agent)"]
         },
         "secrets": {
             "description": "Manage credentials in a backend (keyring | keystore | plaintext) plus passthrough URI schemes (op:// pass: env: literal:).",

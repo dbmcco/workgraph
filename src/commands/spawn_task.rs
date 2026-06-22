@@ -60,6 +60,10 @@ pub enum HandlerSpec {
         chat_ref: String,
         model: Option<String>,
     },
+    Pi {
+        chat_ref: String,
+        model: Option<String>,
+    },
     Gemini {
         chat_ref: String,
     },
@@ -107,6 +111,13 @@ impl HandlerSpec {
             }
             Self::OpenCode { chat_ref, model } => {
                 let mut s = format!("wg opencode-handler --chat {}", chat_ref);
+                if let Some(m) = model {
+                    s.push_str(&format!(" -m {}", m));
+                }
+                s
+            }
+            Self::Pi { chat_ref, model } => {
+                let mut s = format!("wg pi-handler --chat {}", chat_ref);
                 if let Some(m) = model {
                     s.push_str(&format!(" -m {}", m));
                 }
@@ -260,6 +271,7 @@ pub fn resolve_handler(
         ExecutorKind::Claude => HandlerSpec::Claude { chat_ref, model },
         ExecutorKind::Codex => HandlerSpec::Codex { chat_ref, model },
         ExecutorKind::OpenCode => HandlerSpec::OpenCode { chat_ref, model },
+        ExecutorKind::Pi => HandlerSpec::Pi { chat_ref, model },
         ExecutorKind::Aider
         | ExecutorKind::Goose
         | ExecutorKind::Qwen
@@ -332,6 +344,9 @@ fn dispatch(spec: &HandlerSpec, workgraph_dir: &Path) -> Result<()> {
         HandlerSpec::OpenCode { chat_ref, model } => {
             dispatch_opencode(chat_ref, model.as_deref(), workgraph_dir)
         }
+        HandlerSpec::Pi { chat_ref, model } => {
+            dispatch_pi(chat_ref, model.as_deref(), workgraph_dir)
+        }
         HandlerSpec::Gemini { .. } => Err(anyhow!(
             "gemini adapter not yet implemented (Phase 7). Use --executor native for now."
         )),
@@ -402,6 +417,30 @@ fn dispatch_claude(chat_ref: &str, model: Option<&str>, workgraph_dir: &Path) ->
         }
         let err = cmd.exec();
         Err(anyhow!("exec wg claude-handler failed: {}", err))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (chat_ref, model, workgraph_dir);
+        Err(anyhow!(
+            "spawn-task dispatch not yet supported on this platform"
+        ))
+    }
+}
+
+fn dispatch_pi(chat_ref: &str, model: Option<&str>, workgraph_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let self_exe =
+            std::env::current_exe().context("resolve current exe for spawn-task dispatch")?;
+        let mut cmd = std::process::Command::new(&self_exe);
+        cmd.arg("pi-handler").arg("--chat").arg(chat_ref);
+        cmd.env("WG_DIR", workgraph_dir);
+        if let Some(m) = model {
+            cmd.arg("-m").arg(m);
+        }
+        let err = cmd.exec();
+        Err(anyhow!("exec wg pi-handler failed: {}", err))
     }
     #[cfg(not(unix))]
     {
@@ -542,7 +581,7 @@ mod tests {
     #[test]
     #[serial]
     fn coordinator_task_gets_coordinator_role() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".wg")).unwrap();
             let task = mktask(".coordinator-0");
@@ -559,7 +598,7 @@ mod tests {
     #[test]
     #[serial]
     fn non_coordinator_task_gets_no_role() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             let task = mktask("my-task");
             let spec = resolve_handler(dir.path(), &task, None).unwrap();
@@ -575,7 +614,7 @@ mod tests {
     #[test]
     #[serial]
     fn role_override_wins() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             let task = mktask(".coordinator-0");
             let spec = resolve_handler(dir.path(), &task, Some("evaluator")).unwrap();
@@ -591,7 +630,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_true_when_journal_exists() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             let task = mktask("have-journal");
             let chat = dir.path().join("chat").join(&task.id);
@@ -608,7 +647,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_false_when_fresh() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             let task = mktask("fresh-task");
             let spec = resolve_handler(dir.path(), &task, None).unwrap();
@@ -628,7 +667,7 @@ mod tests {
     #[test]
     #[serial]
     fn dot_chat_id_strips_leading_dot_for_chat_ref() {
-        with_env(Some("native"), None, || {
+        with_env(Some("native"), Some("nex:qwopus3.6:27b-mtp-q4"), || {
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(dir.path().join(".wg")).unwrap();
             let task = mktask(".chat-7");
@@ -725,6 +764,7 @@ mod tests {
                 HandlerSpec::Claude { model, .. } => ("claude", model),
                 HandlerSpec::Codex { model, .. } => ("codex", model),
                 HandlerSpec::OpenCode { model, .. } => ("opencode", model),
+                HandlerSpec::Pi { model, .. } => ("pi", model),
                 HandlerSpec::Native { model, .. } => ("native", model),
                 HandlerSpec::Gemini { .. } => ("gemini", None),
             };
@@ -878,6 +918,7 @@ mod tests {
                     HandlerSpec::OpenCode { model, .. } => {
                         format!("OpenCode {{ model: {:?} }}", model)
                     }
+                    HandlerSpec::Pi { model, .. } => format!("Pi {{ model: {:?} }}", model),
                     HandlerSpec::Gemini { .. } => "Gemini".to_string(),
                 }
             ),

@@ -14,7 +14,8 @@ use std::path::PathBuf;
 pub const CORE_EXECUTORS: &[&str] = &["native", "claude", "codex", "shell"];
 pub const STABLE_EXTERNAL_EXECUTORS: &[&str] = &["opencode", "aider", "goose", "qwen", "cline"];
 pub const PROVIDER_SPECIFIC_EXECUTORS: &[&str] = &["gemini"];
-pub const EXPERIMENTAL_EXTERNAL_EXECUTORS: &[&str] = &["octomind", "dexto", "crush", "amplifier"];
+pub const EXPERIMENTAL_EXTERNAL_EXECUTORS: &[&str] =
+    &["octomind", "dexto", "crush", "amplifier", "pi"];
 
 /// One executor, whether it's usable here, and where the backing
 /// binary lives (if applicable).
@@ -142,7 +143,121 @@ const EXECUTORS: &[ExecutorSpec] = &[
         description: "Experimental Amplifier CLI worker (`amplifier run --mode single --output-format json --bundle wg`)",
         binary_candidates: &["amplifier"],
     },
+    ExecutorSpec {
+        name: "pi",
+        description: "Experimental Pi CLI (pi.dev) chat-capable handler (`wg pi-handler`; `--mode rpc` live chat, `-p`/`--mode json` worker)",
+        binary_candidates: &["pi"],
+    },
 ];
+
+/// The Node-host backing for a `pi:` route. WG spawns `node <host_script>`,
+/// which loads the built plugin bundle in-process. All three pieces must be
+/// present for the route to be satisfiable this way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PiNodeHost {
+    /// Absolute path to the `node` binary.
+    pub node: PathBuf,
+    /// Absolute path to `pi-plugin/host/wg-pi-host.mjs`.
+    pub host_script: PathBuf,
+    /// Absolute path to the built plugin bundle `pi-plugin/dist/index.js`.
+    pub plugin_bundle: PathBuf,
+}
+
+/// Which transports can satisfy a `pi:` route on this system.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PiRouteAvailability {
+    /// Absolute path to the `pi` binary, if found.
+    pub pi_binary: Option<PathBuf>,
+    /// The Node-host triple, if all three pieces are present.
+    pub node_host: Option<PiNodeHost>,
+}
+
+impl PiRouteAvailability {
+    /// True when at least one transport can run a `pi:` route.
+    pub fn satisfiable(&self) -> bool {
+        self.pi_binary.is_some() || self.node_host.is_some()
+    }
+}
+
+/// Probe injected PATH dirs for the first matching candidate binary.
+fn which_in_dirs(dirs: &[PathBuf], candidates: &[&str]) -> Option<PathBuf> {
+    for dir in dirs {
+        for name in candidates {
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Locate a plugin root that holds both the SDK host script and built bundle.
+fn locate_pi_node_host(plugin_dirs: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    for dir in plugin_dirs {
+        let host_script = dir.join("host").join("wg-pi-host.mjs");
+        let plugin_bundle = dir.join("dist").join("index.js");
+        if host_script.is_file() && plugin_bundle.is_file() {
+            return Some((host_script, plugin_bundle));
+        }
+    }
+    None
+}
+
+/// Pure satisfiability check over injected inputs.
+pub fn pi_route_availability_in(
+    path_dirs: &[PathBuf],
+    plugin_dirs: &[PathBuf],
+) -> PiRouteAvailability {
+    let pi_binary = which_in_dirs(path_dirs, &["pi"]);
+    let node_host = match (
+        which_in_dirs(path_dirs, &["node"]),
+        locate_pi_node_host(plugin_dirs),
+    ) {
+        (Some(node), Some((host_script, plugin_bundle))) => Some(PiNodeHost {
+            node,
+            host_script,
+            plugin_bundle,
+        }),
+        _ => None,
+    };
+    PiRouteAvailability {
+        pi_binary,
+        node_host,
+    }
+}
+
+/// Candidate `pi-plugin/` roots to probe for the Node-host bundle.
+pub fn pi_plugin_candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = std::env::var_os("WG_PI_PLUGIN_DIR") {
+        dirs.push(PathBuf::from(explicit));
+    }
+    dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pi-plugin"));
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        dirs.push(parent.join("pi-plugin"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(
+            PathBuf::from(home)
+                .join(".pi")
+                .join("agent")
+                .join("extensions")
+                .join("wg-pi-plugin"),
+        );
+    }
+    dirs
+}
+
+/// Determine whether a `pi:` route is satisfiable in the live environment.
+pub fn pi_route_availability() -> PiRouteAvailability {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    pi_route_availability_in(&path_dirs, &pi_plugin_candidate_dirs())
+}
 
 /// Look up each candidate on PATH via `which`-style lookup. Returns
 /// the absolute path of the first hit, or `None`.
@@ -218,6 +333,7 @@ mod tests {
         assert!(names.contains(&"amplifier"));
         assert!(names.contains(&"octomind"));
         assert!(names.contains(&"dexto"));
+        assert!(names.contains(&"pi"));
     }
 
     #[test]

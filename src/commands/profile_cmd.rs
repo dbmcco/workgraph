@@ -1093,7 +1093,7 @@ fn print_simple_diff(a: &[&str], b: &[&str]) {
     }
 }
 
-/// Write the three starter profiles to ~/.wg/profiles/ if missing.
+/// Write built-in starter profiles to ~/.wg/profiles/ if missing.
 pub fn init_starters(force: bool) -> Result<()> {
     let dir = named_profile::profiles_dir()?;
     std::fs::create_dir_all(&dir)
@@ -1178,7 +1178,10 @@ pub fn init_starters(force: bool) -> Result<()> {
         }
     );
     if written > 0 {
-        println!("Activate one with: wg profile use claude|codex|nex|opencode");
+        println!(
+            "Activate one with: wg profile use {}",
+            named_profile::STARTER_NAMES.join("|")
+        );
     }
 
     Ok(())

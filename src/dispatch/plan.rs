@@ -76,6 +76,10 @@ pub enum ExecutorKind {
     /// Dexto CLI. Chat-capable external CLI (`dexto --agent`); currently
     /// integrated for the TUI live-chat PTY path only (no spawn-task handler).
     Dexto,
+    /// Pi CLI (pi.dev). Chat-capable external CLI. It is prefix-addressed
+    /// (`pi:...`) and therefore part of EXTERNAL_CLIS, but it is not
+    /// worker-only; the handler/RPC contract lands separately.
+    Pi,
 }
 
 impl ExecutorKind {
@@ -98,6 +102,7 @@ impl ExecutorKind {
         ExecutorKind::Amplifier,
         ExecutorKind::Octomind,
         ExecutorKind::Dexto,
+        ExecutorKind::Pi,
     ];
 
     /// The subset of [`EXTERNAL_CLIS`](Self::EXTERNAL_CLIS) that can ONLY run
@@ -106,7 +111,9 @@ impl ExecutorKind {
     /// live chat handler (`wg opencode-handler --chat`), so it is an external
     /// CLI that is *also* chat-capable. `Octomind` / `Dexto` are likewise
     /// absent: they are chat-capable external CLIs wired into the TUI
-    /// live-chat PTY path (see `prototype-octomind-dexto-chat`).
+    /// live-chat PTY path (see `prototype-octomind-dexto-chat`). `Pi` is also
+    /// absent: it is a chat-capable external CLI whose handler is wired in a
+    /// later phase.
     pub const WORKER_ONLY_EXTERNALS: &'static [ExecutorKind] = &[
         ExecutorKind::Aider,
         ExecutorKind::Goose,
@@ -131,6 +138,7 @@ impl ExecutorKind {
             ExecutorKind::Amplifier => "amplifier",
             ExecutorKind::Octomind => "octomind",
             ExecutorKind::Dexto => "dexto",
+            ExecutorKind::Pi => "pi",
         }
     }
 
@@ -149,6 +157,7 @@ impl ExecutorKind {
             "amplifier" => Some(ExecutorKind::Amplifier),
             "octomind" => Some(ExecutorKind::Octomind),
             "dexto" => Some(ExecutorKind::Dexto),
+            "pi" => Some(ExecutorKind::Pi),
             _ => None,
         }
     }
@@ -836,12 +845,24 @@ mod tests {
     }
 
     #[test]
-    fn test_opencode_is_external_cli_but_not_worker_only() {
-        // OpenCode ships a live chat handler (`wg opencode-handler --chat`),
-        // so it is an external CLI (prefix-addressed, `opencode:…`) that is
-        // ALSO chat-capable — it must NOT be classified worker-only.
-        assert!(ExecutorKind::OpenCode.is_external_cli());
-        assert!(!ExecutorKind::OpenCode.is_worker_only_external());
+    fn test_chat_capable_external_clis_are_not_worker_only() {
+        for kind in [
+            ExecutorKind::OpenCode,
+            ExecutorKind::Octomind,
+            ExecutorKind::Dexto,
+            ExecutorKind::Pi,
+        ] {
+            assert!(
+                kind.is_external_cli(),
+                "{} is an external CLI",
+                kind.as_str()
+            );
+            assert!(
+                !kind.is_worker_only_external(),
+                "{} is chat-capable and must not be classified worker-only",
+                kind.as_str()
+            );
+        }
 
         // The remaining external CLIs are still worker-only (no chat handler).
         for kind in [
@@ -882,6 +903,9 @@ mod tests {
             ExecutorKind::Cline,
             ExecutorKind::Crush,
             ExecutorKind::Amplifier,
+            ExecutorKind::Octomind,
+            ExecutorKind::Dexto,
+            ExecutorKind::Pi,
         ] {
             assert!(
                 !kind.needs_endpoint(),
@@ -1521,7 +1545,7 @@ mod tests {
     fn test_chat_task_resolves_to_opencode_handler_under_opencode_profile() {
         let mut config = Config::default();
         // Emulate the active opencode profile's default chat/coordinator model.
-        config.coordinator.model = Some("opencode:openrouter/stepfun/step-3.7-flash".to_string());
+        config.coordinator.model = Some("opencode:zai/glm-5.2".to_string());
 
         // A chat task carries no per-task model and no agency executor — it
         // must inherit the profile's opencode route.
@@ -1549,15 +1573,15 @@ mod tests {
              default executor=claude; provenance={:?}",
             plan_default_claude.provenance
         );
-        // The inner model is normalized to the WG openrouter spec, and the
+        // The inner model is normalized to the WG Z.ai CLI/provider route, and the
         // explicit-model contract means it is never empty.
-        assert_eq!(plan.model.raw, "openrouter:stepfun/step-3.7-flash");
+        assert_eq!(plan.model.raw, "zai/glm-5.2");
         assert!(!plan.model.raw.is_empty());
 
         // And handler_for_model agrees on the opencode route (single source of
         // truth), so any direct caller routes identically.
         assert_eq!(
-            crate::dispatch::handler_for_model("opencode:openrouter/stepfun/step-3.7-flash"),
+            crate::dispatch::handler_for_model("opencode:zai/glm-5.2"),
             ExecutorKind::OpenCode
         );
     }

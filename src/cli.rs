@@ -2463,6 +2463,28 @@ pub enum Commands {
         model: Option<String>,
     },
 
+    /// Bridge pi.dev (pi-coding-agent) output <-> chat/<ref>/*.jsonl.
+    ///
+    /// Peer of `wg opencode-handler` for the `pi` executor. Spawns
+    /// `pi --mode rpc` when a pi binary is available, or a Node host when a
+    /// built wg-pi-plugin bundle is installed. Always passes the resolved
+    /// model explicitly via `--provider`/`--model`; credentials are read from
+    /// the environment, never argv.
+    #[command(name = "pi-handler")]
+    PiHandler {
+        #[arg(long = "chat")]
+        chat: String,
+
+        #[arg(long)]
+        resume: bool,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long, short = 'm')]
+        model: Option<String>,
+    },
+
     /// Print the WG directory that `wg` would use from here,
     /// and show which resolver step won (CLI flag / env / walk-up /
     /// home / default). Useful when you're confused about which graph
@@ -3356,7 +3378,7 @@ pub enum ProfileCommands {
         /// Second profile name (optional; if omitted, diff is base vs a)
         b: Option<String>,
     },
-    /// Write the three starter profiles (claude, codex, nex) to ~/.wg/profiles/
+    /// Write built-in starter profiles to ~/.wg/profiles/
     InitStarters {
         /// Overwrite existing starter files
         #[arg(long)]
@@ -5235,6 +5257,7 @@ pub fn command_name(cmd: &Commands) -> &'static str {
         Commands::ClaudeHandler { .. } => "claude-handler",
         Commands::CodexHandler { .. } => "codex-handler",
         Commands::OpenCodeHandler { .. } => "opencode-handler",
+        Commands::PiHandler { .. } => "pi-handler",
         Commands::NativeExec { .. } => "native-exec",
         Commands::Which { .. } => "which",
         Commands::Executors { .. } => "executors",
@@ -5252,6 +5275,7 @@ pub fn is_internal_command(cmd: &Commands) -> bool {
         Commands::SpawnTask { .. }
             | Commands::ClaudeHandler { .. }
             | Commands::OpenCodeHandler { .. }
+            | Commands::PiHandler { .. }
     )
 }
 

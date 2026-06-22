@@ -1,0 +1,46 @@
+description = "Pi Coding Agent: Z.ai GLM worker/chat route, OpenAI Codex premium route, Codex mini for agency meta-tasks"
+
+# Pi routes for worker/chat roles. These avoid OpenRouter by default:
+#   fast/standard = pi:zai/glm-5.2
+#   premium       = pi:openai/gpt-5.5
+# Local option when the Pi handler supports local provider routing:
+#   pi:ollama/qwopus3.6:27b-mtp-q4
+
+[agent]
+model = "pi:zai/glm-5.2"
+
+[dispatcher]
+model = "pi:zai/glm-5.2"
+max_agents = 8
+
+[tiers]
+fast = "pi:zai/glm-5.2"
+standard = "pi:zai/glm-5.2"
+premium = "pi:openai/gpt-5.5"
+
+[models.default]
+model = "pi:zai/glm-5.2"
+
+[models.task_agent]
+model = "pi:zai/glm-5.2"
+
+# Pi is an external worker/chat handler, not the one-shot agency evaluator.
+# Keep agency meta-tasks on the Codex CLI so PI usage does not fall back to
+# Anthropic or OpenRouter for assignment/evaluation/FLIP work.
+[models.evaluator]
+model = "codex:gpt-5.4-mini"
+
+[models.assigner]
+model = "codex:gpt-5.4-mini"
+
+[models.flip_inference]
+model = "codex:gpt-5.4-mini"
+
+[models.flip_comparison]
+model = "codex:gpt-5.4-mini"
+
+# Plugin install / placement notes:
+# - Global extension dir: ~/.pi/agent/extensions/
+# - Project extension dir: <repo>/.pi/extensions, gated by project_trust.
+# - Deterministic host path: node wg-pi-host.mjs from the optional pi-plugin/
+#   package once that upstream branch is adopted.

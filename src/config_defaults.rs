@@ -53,7 +53,7 @@ impl SetupRoute {
     /// One-line description for menus / summaries.
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Openrouter => "OpenRouter — one API key, every major provider (uses nex)",
+            Self::Openrouter => "OpenRouter — explicit opt-in API route (uses nex)",
             Self::ClaudeCli => "Claude Code CLI — local `claude` login, Anthropic models",
             Self::CodexCli => "OpenAI Codex CLI — local `codex` login, OpenAI models",
             Self::Local => "Local — Ollama / vLLM / llama.cpp on localhost (uses nex)",
@@ -78,10 +78,10 @@ impl SetupRoute {
     /// All five routes, in display order.
     pub fn all() -> &'static [SetupRoute] {
         &[
-            Self::Openrouter,
-            Self::ClaudeCli,
             Self::CodexCli,
             Self::Local,
+            Self::Openrouter,
+            Self::ClaudeCli,
             Self::NexCustom,
         ]
     }
@@ -117,7 +117,7 @@ impl SetupRoute {
         match executor {
             "claude" => Some(Self::ClaudeCli),
             "codex" => Some(Self::CodexCli),
-            "native" | "nex" => Some(Self::Openrouter),
+            "native" | "nex" => Some(Self::Local),
             _ => None,
         }
     }
@@ -679,7 +679,7 @@ mod tests {
         // Tiers filled with provider-prefixed claude aliases (CLI resolves them).
         assert_tiers_filled(&config);
         assert_eq!(config.tiers.fast.as_deref(), Some("claude:haiku"));
-        assert_eq!(config.tiers.standard.as_deref(), Some("claude:opus"));
+        assert_eq!(config.tiers.standard.as_deref(), Some("claude:sonnet"));
         assert_eq!(config.tiers.premium.as_deref(), Some("claude:opus"));
 
         // Worker / dispatcher default to opus (premium tier).
@@ -998,6 +998,8 @@ mod tests {
     #[test]
     fn test_route_all_returns_five_routes() {
         assert_eq!(SetupRoute::all().len(), 5);
+        assert_eq!(SetupRoute::all()[0], SetupRoute::CodexCli);
+        assert_eq!(SetupRoute::all()[1], SetupRoute::Local);
     }
 
     #[test]
@@ -1013,8 +1015,8 @@ mod tests {
     fn test_route_from_executor_reverse_mapping() {
         assert_eq!(SetupRoute::from_executor("claude"), SetupRoute::ClaudeCli);
         assert_eq!(SetupRoute::from_executor("codex"), SetupRoute::CodexCli);
-        assert_eq!(SetupRoute::from_executor("native"), SetupRoute::Openrouter);
-        assert_eq!(SetupRoute::from_executor("nex"), SetupRoute::Openrouter);
+        assert_eq!(SetupRoute::from_executor("native"), SetupRoute::Local);
+        assert_eq!(SetupRoute::from_executor("nex"), SetupRoute::Local);
         // Unknown -> claude-cli (sane default for new users)
         assert_eq!(SetupRoute::from_executor("unknown"), SetupRoute::ClaudeCli);
     }

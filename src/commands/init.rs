@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 use worksgood::config_defaults::{RouteParams, SetupRoute, config_for_route};
+use worksgood::dispatch::ExecutorKind;
 
 /// Default content for .wg/.gitignore
 const GITIGNORE_CONTENT: &str = r#"# WG gitignore
@@ -253,6 +254,14 @@ fn default_route_from_global_or_codex() -> SetupRoute {
 /// recognized provider prefix → `None` (caller falls back to the
 /// legacy required-executor path with a migration hint).
 fn executor_for_model_spec(model: &str) -> Option<&'static str> {
+    if let Some((prefix, rest)) = model.split_once(':')
+        && !rest.trim().is_empty()
+        && let Some(kind) = ExecutorKind::from_str(prefix)
+        && kind.is_external_cli()
+    {
+        return Some(kind.as_str());
+    }
+
     let spec = worksgood::config::parse_model_spec(model);
     spec.provider
         .as_deref()
@@ -278,7 +287,9 @@ fn suggested_model_for_executor(executor: &str) -> &'static str {
     match executor {
         "claude" => "claude:opus",
         "codex" => "codex:gpt-5.5",
-        "nex" | "native" => "nex:qwen3-coder -e <ENDPOINT>",
+        "nex" | "native" => "nex:qwopus3.6:27b-mtp-q4 -e http://127.0.0.1:11434/v1",
+        "opencode" => "opencode:zai/glm-5.2",
+        "pi" => "pi:zai/glm-5.2",
         "shell" => "shell  # exec_mode, not a model — keep the route",
         _ => "<provider>:<model>",
     }
@@ -388,14 +399,15 @@ pub fn run(
                 \n\
                   wg init -m claude:opus                                 # Anthropic Claude Code\n\
                   wg init -m codex:gpt-5.5                               # OpenAI Codex CLI\n\
-                  wg init -m nex:qwen3-coder -e http://127.0.0.1:8088    # local OAI-compat server (via nex)\n\
-                  wg init -m openrouter:anthropic/claude-opus-4-6        # OpenRouter via nex\n\
+                  wg init -m nex:qwopus3.6:27b-mtp-q4 -e http://127.0.0.1:11434/v1  # local Ollama via nex\n\
+                  wg init -m pi:zai/glm-5.2                              # Pi coding agent\n\
+                  wg init -m openrouter:anthropic/claude-opus-4-6        # explicit OpenRouter via nex\n\
                 \n\
                 Or pick a complete preset with --route:\n\
                 \n\
                   wg init --route claude-cli\n\
                   wg init --route openrouter\n\
-                  wg init --route local --endpoint http://127.0.0.1:8088 -m qwen3-coder\n\
+                  wg init --route local --endpoint http://127.0.0.1:11434/v1 -m qwopus3.6:27b-mtp-q4\n\
                 \n\
                 Tip: use `wg setup` for an interactive wizard."
             );
@@ -536,7 +548,7 @@ pub fn run(
 /// Write the chosen executor into the project's `config.toml`.
 ///
 /// When the executor maps to one of the known routes (claude → claude-cli,
-/// codex → codex-cli, nex/native → openrouter), the route's defaults are
+/// codex → codex-cli, nex/native → local), the route's defaults are
 /// used to populate `[tiers]` and the model registry — fixing the empty
 /// `[tiers]` bug from the old `wg init -x claude` flow.
 ///
@@ -552,7 +564,7 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
     let route = match canonical {
         "claude" => Some(SetupRoute::ClaudeCli),
         "codex" => Some(SetupRoute::CodexCli),
-        "native" => Some(SetupRoute::Openrouter),
+        "native" => Some(SetupRoute::Local),
         _ => None,
     };
 
@@ -562,6 +574,8 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
         let route_cfg = config_for_route(route, RouteParams::default());
         config.coordinator.executor = route_cfg.coordinator.executor.clone();
         config.agent.executor = route_cfg.agent.executor.clone();
+        config.llm_endpoints = route_cfg.llm_endpoints.clone();
+        config.openrouter = route_cfg.openrouter.clone();
         config.tiers = route_cfg.tiers.clone();
         if !route_cfg.model_registry.is_empty() {
             config.model_registry = route_cfg.model_registry.clone();
@@ -571,7 +585,11 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
         if config.coordinator.model.is_none() {
             config.coordinator.model = route_cfg.coordinator.model.clone();
         }
-        if config.agent.model.is_empty() || config.agent.model == "sonnet" {
+        let default_agent_model = worksgood::config::Config::default().agent.model;
+        if config.agent.model.is_empty()
+            || config.agent.model == "sonnet"
+            || config.agent.model == default_agent_model
+        {
             config.agent.model = route_cfg.agent.model.clone();
         }
         // Wire models.evaluator/assigner so eval doesn't fall back to a
@@ -579,6 +597,9 @@ fn apply_executor(dir: &Path, executor: &str) -> Result<()> {
         config.models = route_cfg.models.clone();
     } else {
         config.coordinator.executor = Some(canonical.to_string());
+        if ExecutorKind::from_str(canonical).is_some_and(|kind| kind.is_external_cli()) {
+            config.agent.executor = canonical.to_string();
+        }
     }
     worksgood::config::strip_redundant_executor_keys(&mut config);
     config.save(dir).context("Failed to save config.toml")?;
@@ -606,6 +627,7 @@ fn apply_model_endpoint(dir: &Path, model: Option<&str>, endpoint: Option<&str>)
     for line in &summary {
         println!("{}", line);
     }
+    worksgood::config::strip_redundant_executor_keys(&mut config);
     config.save(dir).context("Failed to save config.toml")?;
     Ok(())
 }
@@ -903,6 +925,51 @@ mod tests {
         assert_eq!(default_ep.provider, "local");
         // The endpoint itself carries the bare model name.
         assert_eq!(default_ep.model.as_deref(), Some("nemotron-h-8b"));
+    }
+
+    #[test]
+    fn test_init_with_pi_model_derives_pi_executor() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+
+        run_with_route(
+            &wg_dir,
+            true,
+            None,
+            Some("pi:zai/glm-5.2"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let config = Config::load(&wg_dir).unwrap();
+        assert_eq!(config.agent.model, "pi:zai/glm-5.2");
+        assert_eq!(config.coordinator.model.as_deref(), Some("pi:zai/glm-5.2"));
+        assert_eq!(config.agent.executor, Config::default().agent.executor);
+        assert_eq!(config.coordinator.executor, None);
+    }
+
+    #[test]
+    fn test_legacy_native_init_uses_local_route_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let wg_dir = tmp.path().join(".wg");
+
+        run(&wg_dir, true, Some("native"), None, None).unwrap();
+
+        let config = Config::load(&wg_dir).unwrap();
+        assert_eq!(config.agent.model, "nex:qwopus3.6:27b-mtp-q4");
+        assert_eq!(
+            config.tiers.standard.as_deref(),
+            Some("nex:qwopus3.6:27b-mtp-q4")
+        );
+        let endpoint = config
+            .llm_endpoints
+            .find_default()
+            .expect("local route should write a default endpoint");
+        assert_eq!(endpoint.provider, "local");
+        assert_eq!(endpoint.url.as_deref(), Some("http://localhost:11434/v1"));
+        assert!(config.openrouter.is_none());
     }
 
     #[test]

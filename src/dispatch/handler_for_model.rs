@@ -185,6 +185,18 @@ mod tests {
     }
 
     #[test]
+    fn test_pi_prefix_routes_to_pi_handler() {
+        assert_eq!(
+            handler_for_model("pi:zai/glm-5.2"),
+            ExecutorKind::Pi,
+            "pi: routes are executor-qualified and must select the Pi handler"
+        );
+        assert_eq!(handler_for_model("pi:openai/gpt-5.5"), ExecutorKind::Pi);
+        assert!(ExecutorKind::Pi.is_external_cli());
+        assert!(!ExecutorKind::Pi.is_worker_only_external());
+    }
+
+    #[test]
     fn test_unknown_prefix_treated_as_bare_name() {
         // `foobar:baz` has an unknown prefix, so parse_model_spec treats the
         // whole string as a bare name → claude. This matches the lenient

@@ -60,10 +60,10 @@ fn fallback_model_for_route(route_id: &str) -> Option<&'static str> {
         WORKGRAPH_CODEX_CLI_FAST_ROUTE => Some("gpt-5.4-mini"),
         WORKGRAPH_CODEX_CLI_STANDARD_ROUTE => Some("gpt-5.5"),
         WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE => Some("gpt-5.5"),
-        WORKGRAPH_ZAI_GLM_FAST_ROUTE => Some("glm-5.1"),
-        WORKGRAPH_ZAI_GLM_STANDARD_ROUTE => Some("glm-5.1"),
-        WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE => Some("glm-5.1"),
-        WORKGRAPH_LOCAL_DEFAULT_ROUTE => Some("qwen3-coder-30b"),
+        WORKGRAPH_ZAI_GLM_FAST_ROUTE => Some("glm-5.2"),
+        WORKGRAPH_ZAI_GLM_STANDARD_ROUTE => Some("glm-5.2"),
+        WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE => Some("glm-5.2"),
+        WORKGRAPH_LOCAL_DEFAULT_ROUTE => Some("qwopus3.6:27b-mtp-q4"),
         WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE => Some("model"),
         _ => None,
     }
@@ -140,18 +140,18 @@ mod tests {
         );
         assert_eq!(
             model_for_route(WORKGRAPH_CODEX_CLI_STANDARD_ROUTE),
-            "gpt-5.4"
+            "gpt-5.5"
         );
         assert_eq!(
             model_for_route(WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE),
             "gpt-5.5"
         );
-        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_FAST_ROUTE), "glm-5.1");
-        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_STANDARD_ROUTE), "glm-5.1");
-        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE), "glm-5.1");
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_FAST_ROUTE), "glm-5.2");
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_STANDARD_ROUTE), "glm-5.2");
+        assert_eq!(model_for_route(WORKGRAPH_ZAI_GLM_PREMIUM_ROUTE), "glm-5.2");
         assert_eq!(
             model_for_route(WORKGRAPH_LOCAL_DEFAULT_ROUTE),
-            "qwen2.5-coder:7b"
+            "qwopus3.6:27b-mtp-q4"
         );
         assert_eq!(
             model_for_route(WORKGRAPH_CUSTOM_PLACEHOLDER_ROUTE),
@@ -171,7 +171,7 @@ mod tests {
         );
         assert_eq!(
             spec_for_route("zai", WORKGRAPH_ZAI_GLM_STANDARD_ROUTE),
-            "zai:glm-5.1"
+            "zai:glm-5.2"
         );
     }
 }

@@ -14,7 +14,7 @@
 2. **Active pointer: `~/.wg/active-profile`** (one-line file containing the name). Absent file = no profile active = behave like today.
 3. **Command surface extends the existing `wg profile`** subcommand. New verbs: `use`, `create`, `edit`, `delete`, `diff`, `init-starters`. Existing verbs `list`, `show`, `set`, `refresh` stay (with adjusted semantics, see §3).
 4. **Hot-reload uses the existing `IpcRequest::Reconfigure`** that `wg config -m` already triggers. `wg profile use <name>` resolves the profile and sends the same IPC. No new IPC verb.
-5. **Three starter profiles ship via `wg profile init-starters`** (also auto-invoked the first time `wg setup` finishes): `claude`, `codex`, `nex` (matches the `wg nex` subcommand). Templates baked into the binary (see §7).
+5. **Built-in starter profiles ship via `wg profile init-starters`** (also auto-invoked the first time `wg setup` finishes): `claude`, `codex`, `nex` (matches the `wg nex` subcommand), `opencode`, and `pi`. Templates baked into the binary (see §7).
 6. **Switching semantics**: daemon picks up new profile on the next worker spawn. **In-flight workers keep their original config** (already true today for `wg config -m`). **Chat agents read profile name on startup and stay on that profile** for their lifetime — switching requires `wg chat <id> --restart` (already exists as `SetChatExecutor`).
 7. **Migration**: existing `~/.wg/config.toml` stays as the implicit base. `wg profile use <name>` overlays; `wg profile use --clear` reverts to base. No destructive rewrite — your old config is untouched.
 8. **`wg init --route codex-cli` no longer mutates global config.** It writes `~/.wg/profiles/codex.toml` and sets it active. (Resolves the open issue called out in the task description.)
@@ -278,7 +278,7 @@ Flag: `--no-reload` to skip the IPC.
 - Reason: when a user has 5+ profiles, "what's actually different between these two" is a real question.
 
 #### `wg profile init-starters [--force]`
-- Write the three starters (`claude`, `codex`, `nex`) to `~/.wg/profiles/` if missing.
+- Write built-in starters (`claude`, `codex`, `nex`, `opencode`, `pi`) to `~/.wg/profiles/` if missing.
 - `--force` overwrites existing starters (e.g., to pick up upstream model-string updates).
 - Auto-invoked at the end of `wg setup` if `~/.wg/profiles/` is empty.
 
@@ -304,7 +304,7 @@ Flag: `--no-reload` to skip the IPC.
 
 - `wg setup` interactive flow ends with: "Save these choices as a named profile? [y/N]". If yes, prompts for the profile name (default: route name, e.g., `claude-cli` → `claude`). Writes `~/.wg/profiles/<name>.toml` and offers to `use` it.
 - `wg init --route codex-cli` (currently writes to global config): rewires to write `~/.wg/profiles/codex.toml` and set it active. Old `~/.wg/config.toml` is left intact. (Resolves the open issue noted in the task description.)
-- First-run `wg setup` (no existing config) auto-invokes `wg profile init-starters` so the three starters always exist out of the box.
+- First-run `wg setup` (no existing config) auto-invokes `wg profile init-starters` so built-in starters exist out of the box.
 
 ---
 
@@ -446,7 +446,7 @@ The implementation task's smoke gate (`tests/smoke/scenarios/`) MUST include at 
 
 ## 7. Starter profile contents (final)
 
-The three starters, baked into the binary as `include_str!` templates and written by `wg profile init-starters`:
+The built-in starters, baked into the binary as `include_str!` templates and written by `wg profile init-starters`:
 
 ### 7.1 `claude.toml`
 See §2.5 example. Mirrors `wg init --route claude-cli` output minus the daemon-tuning keys.
@@ -459,7 +459,7 @@ See §2.5 example. Model strings cross-checked against `docs/config-ux-design.md
 - agency / fast / FLIP: `codex:gpt-5.4-mini`
 
 ### 7.3 `nex.toml`
-See §2.5 example. Defaults to `local:qwen3-coder-30b` at `http://127.0.0.1:8088`. The user is expected to edit both fields to match their local `wg nex` setup.
+See §2.5 example. Defaults to `nex:qwopus3.6:27b-mtp-q4` at `http://127.0.0.1:11434/v1` for local Ollama use. The user can edit both fields to match their local `wg nex` setup.
 
 **Per-machine workflow:**
 ```bash

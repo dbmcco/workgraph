@@ -24,9 +24,10 @@ pub const STARTER_CLAUDE: &str = include_str!("templates/claude.toml");
 pub const STARTER_CODEX: &str = include_str!("templates/codex.toml");
 pub const STARTER_NEX: &str = include_str!("templates/nex.toml");
 pub const STARTER_OPENCODE: &str = include_str!("templates/opencode.toml");
+pub const STARTER_PI: &str = include_str!("templates/pi.toml");
 
 /// The built-in starter profile names.
-pub const STARTER_NAMES: &[&str] = &["claude", "codex", "nex", "opencode"];
+pub const STARTER_NAMES: &[&str] = &["claude", "codex", "nex", "opencode", "pi"];
 
 /// Legacy starter name retired in favour of the canonical `nex` name (matching
 /// the `wg nex` subcommand). Recognised by `load()` and `init_starters()` so
@@ -41,6 +42,7 @@ pub fn starter_template(name: &str) -> Option<&'static str> {
         "codex" => Some(STARTER_CODEX),
         "nex" => Some(STARTER_NEX),
         "opencode" => Some(STARTER_OPENCODE),
+        "pi" => Some(STARTER_PI),
         _ => None,
     }
 }
@@ -164,7 +166,7 @@ pub fn load(name: &str) -> Result<NamedProfile> {
     }
     if !path.exists() {
         // Built-in starter fallback: a starter profile (`claude`, `codex`,
-        // `nex`, `opencode`) is usable via `wg profile use <name>` even when it
+        // `nex`, `opencode`, `pi`) is usable via `wg profile use <name>` even when it
         // has not been materialized to `~/.wg/profiles/<name>.toml` yet — the
         // canonical snapshot ships in the binary. This is strictly additive:
         // it only fires where `load()` previously errored (missing file), and
@@ -686,29 +688,24 @@ is_default = true
     }
 
     #[test]
-    fn test_opencode_starter_has_opencode_worker_and_claude_agency_models() {
-        // The opencode starter pins worker roles to opencode routes while
-        // keeping the agency one-shot roles on claude:haiku, per CLAUDE.md
-        // "Agency tasks run on claude CLI". It ships BOTH research-picked
-        // tiers: lightweight (stepfun, the proven live route) as the default
-        // worker/coordinator model, and premium (minimax-m2.7) on the premium
-        // tier (see research-opencode-default-models).
+    fn test_opencode_starter_has_zai_worker_and_codex_agency_models() {
+        // The opencode starter pins worker roles to Z.ai/GLM through OpenCode
+        // while keeping the agency one-shot roles on the Codex CLI. OpenRouter
+        // remains supported, but it should not be the starter default.
         let prof = parse_profile(STARTER_OPENCODE, Path::new("opencode.toml"), "opencode").unwrap();
-        let lightweight = "opencode:openrouter/stepfun/step-3.7-flash";
-        let premium = "opencode:openrouter/minimax/minimax-m2.7";
-        assert_eq!(prof.config.agent.model, lightweight);
-        assert_eq!(prof.config.coordinator.model.as_deref(), Some(lightweight));
-        assert_eq!(prof.config.tiers.fast.as_deref(), Some(lightweight));
-        assert_eq!(prof.config.tiers.standard.as_deref(), Some(lightweight));
-        // Premium tier escalates to the research premium pick.
-        assert_eq!(prof.config.tiers.premium.as_deref(), Some(premium));
+        let worker = "opencode:zai/glm-5.2";
+        assert_eq!(prof.config.agent.model, worker);
+        assert_eq!(prof.config.coordinator.model.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.fast.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.standard.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.premium.as_deref(), Some(worker));
         assert_eq!(
             prof.config
                 .models
                 .default
                 .as_ref()
                 .and_then(|m| m.model.as_deref()),
-            Some(lightweight)
+            Some(worker)
         );
         assert_eq!(
             prof.config
@@ -716,22 +713,19 @@ is_default = true
                 .task_agent
                 .as_ref()
                 .and_then(|m| m.model.as_deref()),
-            Some(lightweight)
+            Some(worker)
         );
-        // Both research-picked routes must be reachable from the profile.
         assert!(
-            prof.config.tiers.premium.as_deref() == Some(premium),
-            "premium tier must carry the research premium pick (minimax-m2.7)"
+            !STARTER_OPENCODE.contains("openrouter:"),
+            "opencode starter must not spend OpenRouter tokens by default"
         );
-        // Agency meta-roles stay on claude:haiku — opencode is worker-only and
-        // does not serve the agency one-shot LLM path.
         assert_eq!(
             prof.config
                 .models
                 .evaluator
                 .as_ref()
                 .and_then(|m| m.model.as_deref()),
-            Some("claude:haiku")
+            Some("codex:gpt-5.4-mini")
         );
         assert_eq!(
             prof.config
@@ -739,7 +733,50 @@ is_default = true
                 .assigner
                 .as_ref()
                 .and_then(|m| m.model.as_deref()),
-            Some("claude:haiku")
+            Some("codex:gpt-5.4-mini")
+        );
+    }
+
+    #[test]
+    fn test_pi_starter_has_pi_worker_and_codex_agency_models() {
+        let prof = parse_profile(STARTER_PI, Path::new("pi.toml"), "pi").unwrap();
+        let worker = "pi:zai/glm-5.2";
+        let premium = "pi:openai/gpt-5.5";
+        assert_eq!(prof.config.agent.model, worker);
+        assert_eq!(prof.config.coordinator.model.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.fast.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.standard.as_deref(), Some(worker));
+        assert_eq!(prof.config.tiers.premium.as_deref(), Some(premium));
+        assert_eq!(
+            prof.config
+                .models
+                .default
+                .as_ref()
+                .and_then(|m| m.model.as_deref()),
+            Some(worker)
+        );
+        assert_eq!(
+            prof.config
+                .models
+                .task_agent
+                .as_ref()
+                .and_then(|m| m.model.as_deref()),
+            Some(worker)
+        );
+        for role in [
+            prof.config.models.evaluator.as_ref(),
+            prof.config.models.assigner.as_ref(),
+            prof.config.models.flip_inference.as_ref(),
+            prof.config.models.flip_comparison.as_ref(),
+        ] {
+            assert_eq!(
+                role.and_then(|m| m.model.as_deref()),
+                Some("codex:gpt-5.4-mini")
+            );
+        }
+        assert!(
+            STARTER_PI.contains("pi:ollama/qwopus3.6:27b-mtp-q4"),
+            "pi starter should document the local Qwopus route"
         );
     }
 
@@ -1023,6 +1060,10 @@ assigner_agent = "local-agent"
         assert!(
             starter_template("nex").is_some(),
             "starter_template(\"nex\") must return the template"
+        );
+        assert!(
+            starter_template("pi").is_some(),
+            "starter_template(\"pi\") must return the template"
         );
         assert!(
             starter_template("wgnext").is_none(),

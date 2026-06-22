@@ -2141,10 +2141,7 @@ fn walk_strings_readonly<'a>(val: &'a toml::Value, path: &str, f: &mut dyn FnMut
 /// existing executor field stand and let the warning nudge the user
 /// toward `provider:model`.
 pub fn strip_redundant_executor_keys(config: &mut Config) {
-    let agent_implied: Option<&'static str> = parse_model_spec(&config.agent.model)
-        .provider
-        .as_deref()
-        .map(provider_to_executor);
+    let agent_implied = executor_implied_by_model_spec(&config.agent.model);
     if let Some(imp) = agent_implied
         && imp == config.agent.executor.as_str()
     {
@@ -2158,16 +2155,28 @@ pub fn strip_redundant_executor_keys(config: &mut Config) {
         .model
         .as_deref()
         .unwrap_or(&config.agent.model);
-    let dispatcher_implied: Option<&'static str> = parse_model_spec(dispatcher_model)
-        .provider
-        .as_deref()
-        .map(provider_to_executor);
+    let dispatcher_implied = executor_implied_by_model_spec(dispatcher_model);
     if let Some(imp) = dispatcher_implied
         && let Some(ref current) = config.coordinator.executor
         && imp == current.as_str()
     {
         config.coordinator.executor = None;
     }
+}
+
+fn executor_implied_by_model_spec(model: &str) -> Option<&'static str> {
+    if let Some((prefix, rest)) = model.split_once(':')
+        && !rest.trim().is_empty()
+        && let Some(kind) = crate::dispatch::ExecutorKind::from_str(prefix)
+        && kind.is_external_cli()
+    {
+        return Some(kind.as_str());
+    }
+
+    parse_model_spec(model)
+        .provider
+        .as_deref()
+        .map(provider_to_executor)
 }
 
 /// Map a provider prefix to the internal provider name used by the native executor.
@@ -8691,6 +8700,20 @@ fetch_max_chars = 16000
         // No endpoint → model stored verbatim, no local: prefix added.
         assert_eq!(config.coordinator.model.as_deref(), Some("claude:opus"));
         assert_eq!(config.agent.model, "claude:opus");
+    }
+
+    #[test]
+    fn strip_redundant_executor_keys_handles_external_cli_prefixes() {
+        let mut config = Config::default();
+        config.agent.executor = "pi".to_string();
+        config.agent.model = "pi:zai/glm-5.2".to_string();
+        config.coordinator.executor = Some("pi".to_string());
+        config.coordinator.model = Some("pi:zai/glm-5.2".to_string());
+
+        strip_redundant_executor_keys(&mut config);
+
+        assert_eq!(config.agent.executor, default_executor());
+        assert_eq!(config.coordinator.executor, None);
     }
 
     #[test]

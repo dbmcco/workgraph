@@ -1733,6 +1733,22 @@ impl ExecutorRegistry {
                     model: None,
                 },
             }),
+            "pi" => Ok(ExecutorConfig {
+                executor: ExecutorSettings {
+                    executor_type: "pi".to_string(),
+                    command: "pi".to_string(),
+                    args: vec!["--mode".to_string(), "json".to_string()],
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("WG_TASK_ID".to_string(), "{{task_id}}".to_string());
+                        env
+                    },
+                    prompt_template: None,
+                    working_dir: Some("{{working_dir}}".to_string()),
+                    timeout: None,
+                    model: None,
+                },
+            }),
             "aider" => Ok(ExecutorConfig {
                 executor: ExecutorSettings {
                     executor_type: "aider".to_string(),
@@ -1811,7 +1827,7 @@ impl ExecutorRegistry {
                 },
             }),
             _ => Err(anyhow!(
-                "Unknown executor '{}'. Available: claude, codex, native, shell, opencode, aider, crush, amplifier, goose, qwen, cline, default",
+                "Unknown executor '{}'. Available: claude, codex, native, shell, opencode, aider, crush, amplifier, goose, qwen, cline, pi, default",
                 name,
             )),
         }
@@ -1835,6 +1851,7 @@ impl ExecutorRegistry {
             "codex",
             "shell",
             "opencode",
+            "pi",
             "aider",
             "crush",
             "amplifier",
