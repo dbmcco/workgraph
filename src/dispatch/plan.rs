@@ -395,8 +395,17 @@ pub fn plan_spawn_with_provider_health(
     // ----- 2b. Model-route override -----
     // Provider-qualified model specs are the source of truth for the handler.
     // Legacy executor keys are retained as hints for bare aliases only.
+    //
+    // Shell is terminal: a task with `task.exec` set runs that command
+    // verbatim with no model, so a provider-qualified default model (e.g.
+    // `pi:zai/glm-5.2` once pi became the default executor) must NOT promote
+    // an external-CLI executor over the explicit Shell resolution. Without
+    // this guard, promoting any external-CLI executor (pi, opencode, ...) to
+    // the default would route `task.exec` shell commands into the LLM.
     let (executor, executor_source) = enforce_model_compat(executor, executor_source, &model);
-    let (executor, executor_source) = if let Some(route) = executor_route {
+    let (executor, executor_source) = if executor == ExecutorKind::Shell {
+        (executor, executor_source)
+    } else if let Some(route) = executor_route {
         (
             route.executor,
             format!(
@@ -1278,8 +1287,8 @@ mod tests {
         let plan = plan_spawn(&task, &config, None, None).unwrap();
         assert_eq!(
             plan.executor,
-            ExecutorKind::Codex,
-            "built-in default codex model should select the codex handler"
+            ExecutorKind::Pi,
+            "built-in default pi model should select the pi handler"
         );
         assert!(plan.provenance.executor_source.contains("model-route"));
     }

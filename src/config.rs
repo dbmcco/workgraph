@@ -11,8 +11,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::model_routes::{WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE, spec_for_route};
-
 /// Bare Claude tier aliases passed to the claude CLI.
 /// The CLI resolves these to the current production model — we do not track dated IDs.
 pub const CLAUDE_HAIKU_MODEL_ID: &str = "haiku";
@@ -3653,7 +3651,7 @@ pub struct ProjectConfig {
 }
 
 fn default_executor() -> String {
-    "codex".to_string()
+    "pi".to_string()
 }
 
 fn is_default_executor(s: &str) -> bool {
@@ -3661,7 +3659,11 @@ fn is_default_executor(s: &str) -> bool {
 }
 
 fn default_model() -> String {
-    spec_for_route("codex", WORKGRAPH_CODEX_CLI_PREMIUM_ROUTE)
+    // Pi is the default executor. Use the pi zai/glm-5.2 standard route as the
+    // default model spec — cheap, proven end-to-end in paia-os, and the upstream
+    // pi profile template's standard tier. Override per-repo or per-task for
+    // premium (pi:openai/gpt-5.5) or local (pi:ollama/...) routes.
+    "pi:zai/glm-5.2".to_string()
 }
 
 fn default_interval() -> u64 {
@@ -5096,10 +5098,10 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.agent.executor, "codex");
+        assert_eq!(config.agent.executor, "pi");
         assert!(
-            config.agent.model.starts_with("codex:"),
-            "default model should be codex-prefixed, got {}",
+            config.agent.model.starts_with("pi:"),
+            "default model should be pi-prefixed, got {}",
             config.agent.model
         );
         assert_eq!(config.agent.interval, 10);
@@ -5109,7 +5111,7 @@ mod tests {
     fn test_load_missing_config() {
         let temp_dir = TempDir::new().unwrap();
         let config = Config::load(temp_dir.path()).unwrap();
-        assert_eq!(config.agent.executor, "codex");
+        assert_eq!(config.agent.executor, "pi");
     }
 
     #[test]
