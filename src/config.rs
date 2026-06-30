@@ -3533,7 +3533,11 @@ impl CoordinatorConfig {
                 _ => "native".to_string(),
             }
         } else {
-            "codex".to_string()
+            // Match the agent default executor (pi) so the coordinator/dispatcher
+            // falls back to the same default as task agents when nothing is set
+            // explicitly. Previously this was a hardcoded "codex", which shadowed
+            // default_executor() for any repo without an explicit coordinator executor.
+            default_executor()
         }
     }
 }
@@ -7128,7 +7132,10 @@ model = "claude:haiku"
     #[test]
     fn test_effective_executor_default_no_provider() {
         let config = Config::default();
-        assert_eq!(config.coordinator.effective_executor(), "codex");
+        // With no executor/model/provider set, the coordinator falls back to the
+        // same default executor as task agents (pi), not a hardcoded codex.
+        assert_eq!(config.coordinator.effective_executor(), default_executor());
+        assert_eq!(default_executor(), "pi");
     }
 
     #[test]
@@ -8568,7 +8575,7 @@ max_agents = 8
         // Should produce valid default config
         let config: Config = merged.try_into().unwrap();
         assert_eq!(config.coordinator.max_agents, 8); // default
-        assert_eq!(config.coordinator.effective_executor(), "codex"); // default
+        assert_eq!(config.coordinator.effective_executor(), default_executor()); // default (pi)
     }
 
     #[test]
