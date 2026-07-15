@@ -27,7 +27,7 @@ git -C "$WORK/pi" apply --check "$PATCH"
 git -C "$WORK/pi" apply "$PATCH"
 
 echo "Installing Pi monorepo dependencies and building..."
-npm --prefix "$WORK/pi" install --ignore-scripts
+(cd "$WORK/pi" && npm install --ignore-scripts)
 npm --prefix "$WORK/pi" run build
 npm --prefix "$WORK/pi" --workspace @earendil-works/pi-coding-agent test -- output-guard.test.ts
 
