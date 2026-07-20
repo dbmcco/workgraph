@@ -488,6 +488,19 @@ impl RpcTransport {
             session_dir.to_string_lossy().to_string(),
         )];
         env_pairs.extend(secret_env.iter().cloned());
+        // The pi plugin's model bridge needs to know which provider/model to
+        // register alongside the --provider/--model argv we pass to pi. Without
+        // these, pi validates the provider/model before the plugin can register
+        // a custom provider (e.g. zai) and the spawn dies with
+        // "Model ... not found".
+        if let Some(marg) = marg {
+            env_pairs.push(("WG_PI_PROVIDER".to_string(), marg.provider.clone()));
+            env_pairs.push(("WG_MODEL".to_string(), format!("{}:{}", marg.provider, marg.model)));
+        }
+        // Suppress the Avery persona and turn-end memory writes for autonomous
+        // workgraph runs. pi-run.sh has the same guard; this closes the gap for
+        // the native pi-handler path used by the coordinator and `wg spawn-task`.
+        env_pairs.push(("PAIA_AVERY".to_string(), "0".to_string()));
         let child = HostedChild::new(pi_binary.to_string_lossy().to_string())
             .args(args)
             .env(env_pairs);
@@ -694,8 +707,9 @@ impl NodeHostTransport {
         // use its own configured/default model.
         if let Some(marg) = marg {
             cmd.env("WG_PI_PROVIDER", &marg.provider);
-            cmd.env("WG_PI_MODEL", &marg.model);
+            cmd.env("WG_MODEL", format!("{}:{}", marg.provider, marg.model));
         }
+        cmd.env("PAIA_AVERY", "0");
         if let Some(reasoning) = reasoning {
             cmd.env("WG_PI_REASONING", reasoning.as_str());
             cmd.env("WG_REASONING", reasoning.as_str());
